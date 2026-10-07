@@ -303,19 +303,21 @@ impl Default for DataSkippingNumIndexedCols {
 }
 
 impl TryFrom<&str> for DataSkippingNumIndexedCols {
-    type Error = KernelError;
+    type Error = crate::Error;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         let num: i64 = value.parse().map_err(|_| {
-            KernelError::generic("couldn't parse DataSkippingNumIndexedCols to an integer")
+            crate::Error::Kernel(KernelError::generic(
+                "couldn't parse DataSkippingNumIndexedCols to an integer",
+            ))
         })?;
         match num {
             -1 => Ok(DataSkippingNumIndexedCols::AllColumns),
             x => Ok(DataSkippingNumIndexedCols::NumColumns(
                 x.try_into().map_err(|_| {
-                    KernelError::generic(
+                    crate::Error::Kernel(KernelError::generic(
                         "couldn't parse DataSkippingNumIndexedCols to positive integer",
-                    )
+                    ))
                 })?,
             )),
         }

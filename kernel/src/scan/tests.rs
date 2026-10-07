@@ -727,7 +727,10 @@ fn scan_metadata_from_cancels_cached_metadata_consumption() {
         .unwrap();
 
     token.cancel();
-    assert!(matches!(metadata.next(), Some(Err(KernelError::Cancelled))));
+    assert!(matches!(
+        metadata.next(),
+        Some(Err(crate::Error::Kernel(KernelError::Cancelled)))
+    ));
 }
 
 // reading v0 with 3 files.
@@ -925,7 +928,7 @@ fn test_missing_column_row_group_skipping() {
 }
 
 #[test_log::test]
-fn test_scan_with_checkpoint() -> Result<()> {
+fn test_scan_with_checkpoint() -> crate::KernelResult<()> {
     let path = std::fs::canonicalize(PathBuf::from(
         "./tests/data/with_checkpoint_no_last_checkpoint/",
     ))?;
@@ -997,7 +1000,7 @@ fn test_scan_metadata_with_stats_columns() {
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
 
     assert!(
@@ -1586,7 +1589,7 @@ fn surviving_ids(parquet_bytes: Bytes, pred: &Pred) -> Vec<i64> {
     let mut ids: Vec<i64> = builder
         .build()
         .unwrap()
-        .map(Result::unwrap)
+        .map(std::result::Result::unwrap)
         .flat_map(|batch| {
             let add = batch
                 .column(0)
@@ -1941,7 +1944,7 @@ fn test_all_struct_parses_json_commit_stats() {
     for scan_metadata in scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap()
     {
         let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
@@ -2030,7 +2033,7 @@ fn test_skip_stats_disables_data_skipping() {
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
 
     let mut selected_file_count = 0;
@@ -2064,7 +2067,7 @@ fn test_with_stats_last_call_wins() {
     for scan_metadata in scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap()
     {
         let (underlying_data, _) = scan_metadata.scan_files.into_parts();
@@ -2095,7 +2098,7 @@ fn test_default_stats_options_no_struct_output() {
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
 
     assert!(

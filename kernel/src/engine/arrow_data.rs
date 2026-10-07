@@ -24,7 +24,7 @@ use crate::engine_data::{EngineData, GetData, RowVisitor, StringArrayAccessor};
 use crate::expressions::ArrayData;
 use crate::schema::{ColumnName, DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult, Result, ResultExt};
 
 /// ArrowEngineData holds an Arrow `RecordBatch`, implements `EngineData` so the kernel can extract
 /// from it.
@@ -49,7 +49,11 @@ impl EngineDataArrowExt for Box<dyn EngineData> {
         Ok(self
             .into_any()
             .downcast::<ArrowEngineData>()
-            .map_err(|_| delta_kernel::KernelError::EngineDataType("ArrowEngineData".to_string()))?
+            .map_err(|_| {
+                crate::Error::Kernel(delta_kernel::KernelError::EngineDataType(
+                    "ArrowEngineData".to_string(),
+                ))
+            })?
             .into())
     }
 }
@@ -59,7 +63,11 @@ impl EngineDataArrowExt for Result<Box<dyn EngineData>> {
         Ok(self?
             .into_any()
             .downcast::<ArrowEngineData>()
-            .map_err(|_| delta_kernel::KernelError::EngineDataType("ArrowEngineData".to_string()))?
+            .map_err(|_| {
+                crate::Error::Kernel(delta_kernel::KernelError::EngineDataType(
+                    "ArrowEngineData".to_string(),
+                ))
+            })?
             .into())
     }
 }
@@ -92,7 +100,7 @@ impl ArrowEngineData {
         engine_data
             .into_any()
             .downcast::<ArrowEngineData>()
-            .map_err(|_| KernelError::engine_data_type("ArrowEngineData"))
+            .map_err(|_| crate::Error::Kernel(KernelError::engine_data_type("ArrowEngineData")))
     }
 
     /// Get a reference to the `RecordBatch` this `ArrowEngineData` is wrapping
@@ -193,12 +201,14 @@ impl EngineData for ArrowEngineData {
         // Make sure the caller passed the correct number of column names
         let leaf_types = visitor.selected_column_names_and_types().1;
         if leaf_types.len() != leaf_columns.len() {
-            return Err(KernelError::MissingColumn(format!(
-                "Visitor expected {} column names, but caller passed {}",
-                leaf_types.len(),
-                leaf_columns.len()
-            ))
-            .with_backtrace());
+            return Err(crate::Error::Kernel(
+                KernelError::MissingColumn(format!(
+                    "Visitor expected {} column names, but caller passed {}",
+                    leaf_types.len(),
+                    leaf_columns.len()
+                ))
+                .with_backtrace(),
+            ));
         }
 
         // Build a map tracking the state of each column path:
@@ -227,7 +237,7 @@ impl EngineData for ArrowEngineData {
         );
 
         // Extract all columns, transitioning AwaitingGetter -> HasGetter
-        Self::extract_columns(&mut vec![], &mut column_map, &self.data)?;
+        Self::extract_columns(&mut vec![], &mut column_map, &self.data).into_public_result()?;
 
         // Extract getters in the requested column order, verifying state transitions
         let mut getters = Vec::with_capacity(leaf_columns.len());
@@ -235,19 +245,19 @@ impl EngineData for ArrowEngineData {
             match column_map.get(column.as_ref()) {
                 Some(ColumnState::HasGetter(getter)) => getters.push(*getter),
                 _ => {
-                    return Err(KernelError::MissingColumn(format!(
+                    return Err(crate::Error::Kernel(KernelError::MissingColumn(format!(
                         "Column {column} not found in the data"
-                    )));
+                    ))));
                 }
             }
         }
 
         if getters.len() != leaf_columns.len() {
-            return Err(KernelError::MissingColumn(format!(
+            return Err(crate::Error::Kernel(KernelError::MissingColumn(format!(
                 "Visitor expected {} leaf columns, but only {} were found in the data",
                 leaf_columns.len(),
                 getters.len()
-            )));
+            ))));
         }
         visitor.visit(self.len(), &getters)
     }
@@ -258,7 +268,10 @@ impl EngineData for ArrowEngineData {
         columns: Vec<ArrayData>,
     ) -> Result<Box<dyn EngineData>> {
         // Combine existing and new schema fields
-        let schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
+        let schema: ArrowSchema = schema
+            .as_ref()
+            .try_into_arrow()
+            .map_err(crate::Error::kernel)?;
         let mut combined_fields = self.data.schema().fields().to_vec();
         combined_fields.extend_from_slice(schema.fields());
         let combined_schema = Arc::new(ArrowSchema::new(combined_fields));
@@ -272,7 +285,8 @@ impl EngineData for ArrowEngineData {
         combined_columns.extend(new_columns);
 
         // Create a new ArrowEngineData with the combined schema and columns
-        let data = RecordBatch::try_new(combined_schema, combined_columns)?;
+        let data = RecordBatch::try_new(combined_schema, combined_columns)
+            .map_err(crate::Error::kernel)?;
         Ok(Box::new(ArrowEngineData { data }))
     }
 
@@ -282,14 +296,15 @@ impl EngineData for ArrowEngineData {
     ) -> Result<Box<dyn EngineData>> {
         require!(
             selection_vector.len() <= self.len(),
-            KernelError::InvalidSelectionVector(format!(
+            crate::Error::Kernel(KernelError::InvalidSelectionVector(format!(
                 "Selection vector is larger than data length: {} > {}",
                 selection_vector.len(),
                 self.len()
-            ))
+            )))
         );
         selection_vector.resize(self.len(), true);
-        let filtered = filter_record_batch(&self.data, &selection_vector.into())?;
+        let filtered = filter_record_batch(&self.data, &selection_vector.into())
+            .map_err(crate::Error::kernel)?;
         Ok(Box::new(Self::new(filtered)))
     }
 
@@ -413,7 +428,7 @@ impl ArrowEngineData {
                     .then_some(array as _)
             })
         };
-        let result: Result<&'a dyn GetData<'a>, _> = match data_type {
+        let result: std::result::Result<&'a dyn GetData<'a>, _> = match data_type {
             &DataType::BOOLEAN => {
                 debug!("Pushing boolean array for {}", ColumnName::new(path));
                 col.as_boolean_opt()
@@ -581,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_extract() -> Result<()> {
+    fn test_protocol_extract() -> crate::KernelResult<()> {
         let engine = SyncEngine::new();
         let handler = engine.json_handler();
         let json_strings: StringArray = vec![
@@ -607,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_columns() -> Result<()> {
+    fn test_append_columns() -> crate::KernelResult<()> {
         // Create initial ArrowEngineData with 2 rows and 2 columns
         let initial_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", ArrowDataType::Int32, false),
@@ -673,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_columns_row_mismatch() -> Result<()> {
+    fn test_append_columns_row_mismatch() -> crate::KernelResult<()> {
         // Create initial ArrowEngineData with 2 rows
         let initial_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
@@ -702,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_columns_schema_field_count_mismatch() -> Result<()> {
+    fn test_append_columns_schema_field_count_mismatch() -> crate::KernelResult<()> {
         let initial_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
             ArrowDataType::Int32,
@@ -733,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_columns_empty_existing_data() -> Result<()> {
+    fn test_append_columns_empty_existing_data() -> crate::KernelResult<()> {
         // Create empty ArrowEngineData with schema but no rows
         let initial_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
@@ -765,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_columns_empty_new_columns() -> Result<()> {
+    fn test_append_columns_empty_new_columns() -> crate::KernelResult<()> {
         // Create ArrowEngineData with some data
         let initial_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
@@ -792,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_columns_with_nulls() -> Result<()> {
+    fn test_append_columns_with_nulls() -> crate::KernelResult<()> {
         let initial_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
             ArrowDataType::Int32,
@@ -835,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_columns_various_data_types() -> Result<()> {
+    fn test_append_columns_various_data_types() -> crate::KernelResult<()> {
         let initial_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
             ArrowDataType::Int32,
@@ -880,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_single_column() -> Result<()> {
+    fn test_append_single_column() -> crate::KernelResult<()> {
         let initial_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", ArrowDataType::Int32, false),
             ArrowField::new("name", ArrowDataType::Utf8, true),
@@ -917,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_column_extraction() -> Result<()> {
+    fn test_binary_column_extraction() -> crate::KernelResult<()> {
         // Create a RecordBatch with binary data
         let binary_data: Vec<Option<&[u8]>> = vec![
             Some(b"hello"),
@@ -984,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_column_extraction_type_mismatch() -> Result<()> {
+    fn test_binary_column_extraction_type_mismatch() -> crate::KernelResult<()> {
         // Create a RecordBatch with Int32 data (not binary)
         let data: Vec<Option<i32>> = vec![Some(123)];
         let int_array = Int32Array::from(data);
@@ -1042,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn test_column_ordering_independence() -> Result<()> {
+    fn test_column_ordering_independence() -> crate::KernelResult<()> {
         // Schema: field_a, field_b, nested.x, nested.y
         let nested_fields = vec![
             ArrowField::new("x", ArrowDataType::Int32, false),
@@ -1120,7 +1135,7 @@ mod tests {
     }
 
     #[test]
-    fn test_visit_duplicate_column_error() -> Result<()> {
+    fn test_visit_duplicate_column_error() -> crate::KernelResult<()> {
         // Create batch with simple columns
         let batch = RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![
@@ -1165,7 +1180,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_array_out_of_bounds_errors() -> Result<()> {
+    fn test_run_array_out_of_bounds_errors() -> crate::KernelResult<()> {
         // Test that out of bounds errors include field name for all types
         let run_ends = Int64Array::from(vec![2]);
 
@@ -1213,7 +1228,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_array_extraction_via_visitor() -> Result<()> {
+    fn test_run_array_extraction_via_visitor() -> crate::KernelResult<()> {
         // Create RunArray columns with pattern: [val1, val1, null, null, val2]
         // Per Arrow spec: nulls are encoded as runs in the values child array
         let run_ends = Int64Array::from(vec![2, 4, 5]);
@@ -1617,7 +1632,7 @@ mod tests {
     #[case::utf8(Arc::new(StringArray::from(vec![Some("alice"), None, Some("charlie")])) as ArrayRef)]
     #[case::large_utf8(Arc::new(LargeStringArray::from(vec![Some("alice"), None, Some("charlie")])) as ArrayRef)]
     #[case::utf8_view(Arc::new(StringViewArray::from(vec![Some("alice"), None, Some("charlie")])) as ArrayRef)]
-    fn test_visit_rows_string_types(#[case] values: ArrayRef) -> Result<()> {
+    fn test_visit_rows_string_types(#[case] values: ArrayRef) -> crate::KernelResult<()> {
         let batch = RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "name",
@@ -1664,7 +1679,7 @@ mod tests {
 
     /// visit_rows must accept LargeBinary columns when the visitor declares DataType::BINARY.
     #[test]
-    fn test_visit_rows_large_binary() -> Result<()> {
+    fn test_visit_rows_large_binary() -> crate::KernelResult<()> {
         let batch = RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "data",
@@ -1715,7 +1730,7 @@ mod tests {
 
     /// visit_rows must accept ListView columns when the visitor declares a DataType::Array.
     #[test]
-    fn test_visit_rows_list_view() -> Result<()> {
+    fn test_visit_rows_list_view() -> crate::KernelResult<()> {
         // Build a ListViewArray with string values: [["a", "b"], ["c"]]
         let values = Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef;
         let field = Arc::new(ArrowField::new("item", ArrowDataType::Utf8, false));
@@ -1772,7 +1787,7 @@ mod tests {
     }
 
     #[test]
-    fn test_visit_rows_string_list() -> Result<()> {
+    fn test_visit_rows_string_list() -> crate::KernelResult<()> {
         // [["a", "b"], ["c"]] as a plain List<Utf8>.
         let values = Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef;
         let field = Arc::new(ArrowField::new("item", ArrowDataType::Utf8, false));
@@ -1860,7 +1875,7 @@ mod tests {
     }
 
     /// Wrap a single `items` column in an `ArrowEngineData`.
-    fn engine_data_with_items(items: ArrayRef) -> Result<ArrowEngineData> {
+    fn engine_data_with_items(items: ArrayRef) -> crate::KernelResult<ArrowEngineData> {
         let batch = RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "items",
@@ -1886,7 +1901,7 @@ mod tests {
         flavor: ListFlavor,
     ) -> Result<()> {
         let items = struct_list_fixture_as(&[&[1, 2], &[3]], flavor);
-        let arrow_data = engine_data_with_items(items)?;
+        let arrow_data = engine_data_with_items(items).map_err(crate::Error::Kernel)?;
 
         let mut visitor = StructListVisitor::default();
         arrow_data.visit_rows(&[ColumnName::new(["items"])], &mut visitor)?;
@@ -1899,7 +1914,8 @@ mod tests {
     #[test]
     fn test_visit_rows_struct_list_nullable_elements_rejected() -> Result<()> {
         let arrow_data =
-            engine_data_with_items(struct_list_fixture_as(&[&[1, 2]], ListFlavor::List))?;
+            engine_data_with_items(struct_list_fixture_as(&[&[1, 2]], ListFlavor::List))
+                .map_err(crate::Error::Kernel)?;
 
         struct NullableElementVisitor;
         impl RowVisitor for NullableElementVisitor {
@@ -2019,7 +2035,8 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_selection_vector_shorter_than_data_keeps_trailing_rows() -> Result<()> {
+    fn test_apply_selection_vector_shorter_than_data_keeps_trailing_rows() -> crate::KernelResult<()>
+    {
         let data = string_array_to_engine_data(StringArray::from(vec!["a", "b", "c"]));
         let filtered = data.apply_selection_vector(vec![false])?;
         let batch = extract_record_batch(filtered.as_ref())?;

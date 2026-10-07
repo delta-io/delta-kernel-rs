@@ -6,7 +6,7 @@ use std::task::{ready, Context, Poll};
 
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use delta_kernel::{FileMeta, KernelResult, Result};
+use delta_kernel::{FileMeta, KernelError, KernelResult, Result, ResultExt};
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use futures::FutureExt;
@@ -119,7 +119,11 @@ impl FileStream {
     /// bunch of sequential IO), it can be parallelized with decoding.
     fn start_next_file(&mut self) -> Option<KernelResult<FileOpenFuture>> {
         let file_meta = self.file_iter.pop_front()?;
-        Some(self.file_opener.open(file_meta, None))
+        Some(
+            self.file_opener
+                .open(file_meta, None)
+                .map_err(KernelError::from),
+        )
     }
 
     fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<KernelResult<RecordBatch>>> {
@@ -158,7 +162,7 @@ impl FileStream {
                         OnError::Skip => self.state = FileStreamState::Idle,
                         OnError::Fail => {
                             self.state = FileStreamState::Error;
-                            return Poll::Ready(Some(Err(e)));
+                            return Poll::Ready(Some(Err(delta_kernel::KernelError::from(e))));
                         }
                     },
                 },
@@ -194,7 +198,9 @@ impl FileStream {
                                 },
                                 OnError::Fail => {
                                     self.state = FileStreamState::Error;
-                                    return Poll::Ready(Some(Err(err)));
+                                    return Poll::Ready(Some(Err(
+                                        delta_kernel::KernelError::from(err),
+                                    )));
                                 }
                             }
                         }
@@ -224,5 +230,6 @@ impl Stream for FileStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.poll_inner(cx)
+            .map(|batch| batch.map(ResultExt::into_public_result))
     }
 }

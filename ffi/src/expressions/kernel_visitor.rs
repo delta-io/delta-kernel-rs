@@ -9,7 +9,7 @@ use delta_kernel::expressions::{
     JunctionPredicateOp, Predicate, Scalar, UnaryPredicateOp,
 };
 use delta_kernel::schema::{DataType, PrimitiveType};
-use delta_kernel::{KernelResult, Result};
+use delta_kernel::KernelResult;
 
 #[cfg(feature = "default-engine-base")]
 use crate::expressions::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
@@ -257,7 +257,7 @@ unsafe fn visit_expression_column_impl(
     let fields = slices
         .iter()
         .map(|slice| unsafe { String::try_from_slice(slice) })
-        .collect::<KernelResult<Vec<String>>>()?;
+        .collect::<delta_kernel::Result<Vec<String>>>()?;
     if fields.iter().any(|field| field.is_empty()) {
         return Err(delta_kernel::KernelError::generic(
             "column field part must not be empty",
@@ -293,7 +293,8 @@ pub unsafe extern "C" fn visit_expression_literal_string(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let value = unsafe { String::try_from_slice(&value) };
-    visit_expression_literal_string_impl(state, value).into_extern_result(&allocate_error)
+    visit_expression_literal_string_impl(state, value.map_err(delta_kernel::KernelError::from))
+        .into_extern_result(&allocate_error)
 }
 fn visit_expression_literal_string_impl(
     state: &mut KernelExpressionVisitorState,
@@ -509,7 +510,7 @@ pub(crate) enum NullTypeTag {
 impl TryFrom<u8> for NullTypeTag {
     type Error = delta_kernel::KernelError;
 
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
+    fn try_from(value: u8) -> KernelResult<Self> {
         match value {
             0 => Ok(Self::Boolean),
             1 => Ok(Self::Byte),
@@ -808,7 +809,12 @@ pub unsafe extern "C" fn visit_predicate_opaque(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name = unsafe { String::try_from_slice(&name) };
-    visit_predicate_opaque_impl(state, name, children).into_extern_result(&allocate_error)
+    visit_predicate_opaque_impl(
+        state,
+        name.map_err(delta_kernel::KernelError::from),
+        children,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 fn visit_predicate_opaque_impl(
@@ -854,8 +860,13 @@ pub unsafe extern "C" fn visit_predicate_opaque_with_eval(
     let name = unsafe { String::try_from_slice(&name) };
     // Wrap immediately so free_state fires exactly once on every exit path.
     let callbacks = Arc::new(FfiOpaqueEvalCallbacks::new(callbacks));
-    visit_predicate_opaque_with_eval_impl(state, name, children, callbacks)
-        .into_extern_result(&allocate_error)
+    visit_predicate_opaque_with_eval_impl(
+        state,
+        name.map_err(delta_kernel::KernelError::from),
+        children,
+        callbacks,
+    )
+    .into_extern_result(&allocate_error)
 }
 
 #[cfg(feature = "default-engine-base")]

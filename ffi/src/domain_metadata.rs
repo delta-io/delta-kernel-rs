@@ -32,7 +32,13 @@ pub unsafe extern "C" fn get_domain_metadata(
     let engine = unsafe { engine.as_ref() };
     let domain = unsafe { String::try_from_slice(&domain) };
 
-    get_domain_metadata_impl(snapshot, domain, engine, allocate_fn).into_extern_result(&engine)
+    get_domain_metadata_impl(
+        snapshot,
+        domain.map_err(delta_kernel::KernelError::from),
+        engine,
+        allocate_fn,
+    )
+    .into_extern_result(&engine)
 }
 
 fn get_domain_metadata_impl(

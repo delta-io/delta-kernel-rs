@@ -33,7 +33,7 @@ use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
     CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
     FoldWithOption as _, KernelError, KernelResult, ParquetFooter, ParquetHandler, PredicateRef,
-    Result, ResultIteratorStatic,
+    Result, ResultExt, ResultIteratorStatic,
 };
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
@@ -262,7 +262,8 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
                 write_context.stats_columns(),
                 write_context.physical_data_schema().as_ref(),
             )
-            .await?;
+            .await
+            .into_public_result()?;
         super::build_add_file_metadata(file_metadata, write_context)
     }
 }
@@ -299,7 +300,7 @@ async fn read_parquet_files_impl(
         let stream = FileStream::new(files, arrow_schema, file_opener)?.map_ok(
             |record_batch| -> Box<dyn EngineData> { Box::new(ArrowEngineData::new(record_batch)) },
         );
-        return Ok(Box::pin(stream));
+        return Ok(Box::pin(stream.map_err(KernelError::from)));
     }
 
     // an iterator of futures that open each file
@@ -350,6 +351,8 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             future,
             cancellation_token,
         )
+        .map(|iter| Box::new(iter.map(ResultExt::into_public_result)) as FileDataReadResultIterator)
+        .into_public_result()
     }
 
     /// Writes engine data to a Parquet file at the specified location.
@@ -374,11 +377,13 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         let store = self.store.clone();
 
         self.task_executor.block_on(async move {
-            let path = Path::from_url_path(location.path())?;
+            let path = Path::from_url_path(location.path()).map_err(delta_kernel::Error::kernel)?;
 
             // Get first batch to initialize writer with schema
             let first_batch = data.next().ok_or_else(|| {
-                KernelError::generic("Cannot write parquet file with empty data iterator")
+                delta_kernel::Error::Kernel(KernelError::generic(
+                    "Cannot write parquet file with empty data iterator",
+                ))
             })??;
             let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
             let first_record_batch: RecordBatch = (*first_arrow).into();
@@ -387,21 +392,28 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             let object_writer = ParquetObjectWriter::new(store, path);
             let schema = first_record_batch.schema();
             let mut writer =
-                AsyncArrowWriter::try_new_with_options(object_writer, schema, writer_options())?;
+                AsyncArrowWriter::try_new_with_options(object_writer, schema, writer_options())
+                    .map_err(delta_kernel::Error::kernel)?;
 
             // Write the first batch
-            writer.write(&first_record_batch).await?;
+            writer
+                .write(&first_record_batch)
+                .await
+                .map_err(delta_kernel::Error::kernel)?;
 
             // Write remaining batches
             for result in data {
                 let engine_data = result?;
                 let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)?;
                 let batch: RecordBatch = (*arrow_data).into();
-                writer.write(&batch).await?;
+                writer
+                    .write(&batch)
+                    .await
+                    .map_err(delta_kernel::Error::kernel)?;
             }
 
             // finish() writes the footer; bytes_written() is accurate only after finish().
-            writer.finish().await?;
+            writer.finish().await.map_err(delta_kernel::Error::kernel)?;
             Ok(writer.bytes_written() as u64)
         })
     }
@@ -423,27 +435,38 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             let metadata = if location.is_presigned() {
                 let client = reqwest::Client::new();
                 let response = client.get(location.as_str()).send().await.map_err(|e| {
-                    KernelError::generic(format!("Failed to fetch presigned URL: {e}"))
+                    delta_kernel::Error::Kernel(KernelError::generic(format!(
+                        "Failed to fetch presigned URL: {e}"
+                    )))
                 })?;
                 let bytes = response.bytes().await.map_err(|e| {
-                    KernelError::generic(format!("Failed to read response bytes: {e}"))
+                    delta_kernel::Error::Kernel(KernelError::generic(format!(
+                        "Failed to read response bytes: {e}"
+                    )))
                 })?;
-                ArrowReaderMetadata::load(&bytes, reader_options())?
+                ArrowReaderMetadata::load(&bytes, reader_options())
+                    .map_err(delta_kernel::Error::kernel)?
             } else {
-                let path = Path::from_url_path(location.path())?;
+                let path =
+                    Path::from_url_path(location.path()).map_err(delta_kernel::Error::kernel)?;
                 #[allow(deprecated)]
                 let mut reader = ParquetObjectReader::new(store, path).with_file_size(file_size);
-                ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?
+                ArrowReaderMetadata::load_async(&mut reader, reader_options())
+                    .await
+                    .map_err(delta_kernel::Error::kernel)?
             };
 
-            let schema = Arc::new(StructType::try_from_arrow(metadata.schema().as_ref())?);
+            let schema = Arc::new(
+                StructType::try_from_arrow(metadata.schema().as_ref())
+                    .map_err(delta_kernel::Error::kernel)?,
+            );
             Ok(ParquetFooter { schema })
         };
 
         // Race the footer read against cancellation so a cancelled request stops promptly.
         match cancellation_token {
             Some(token) => super::block_on_or_cancelled(&self.task_executor, token, footer_future)
-                .unwrap_or(Err(KernelError::Cancelled)),
+                .unwrap_or(Err(delta_kernel::Error::Kernel(KernelError::Cancelled))),
             None => self.task_executor.block_on(footer_future),
         }
     }
@@ -506,14 +529,14 @@ async fn open_parquet_file(
     let stream = builder.build()?;
 
     let stream = stream.map(move |rbr| {
-        fixup_parquet_read(
+        Ok(fixup_parquet_read(
             rbr?,
             &requested_ordering,
             row_indexes.as_mut(),
             Some(&file_location),
             Some(&table_schema),
-        )
-        .map(Into::into)
+        )?
+        .into())
     });
     Ok(stream.boxed())
 }
@@ -554,8 +577,16 @@ impl FileOpener for PresignedUrlOpener {
 
         Ok(Box::pin(async move {
             // fetch the file from the interweb
-            let reader = client.get(&file_location).send().await?.bytes().await?;
-            let metadata = ArrowReaderMetadata::load(&reader, reader_options())?;
+            let reader = client
+                .get(&file_location)
+                .send()
+                .await
+                .map_err(delta_kernel::Error::kernel)?
+                .bytes()
+                .await
+                .map_err(delta_kernel::Error::kernel)?;
+            let metadata = ArrowReaderMetadata::load(&reader, reader_options())
+                .map_err(delta_kernel::Error::kernel)?;
             let (requested_ordering, mask) = parquet_read_plan(&table_schema, &metadata)?;
 
             let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
@@ -568,13 +599,14 @@ impl FileOpener for PresignedUrlOpener {
                 })
                 .fold_with(limit, ParquetRecordBatchReaderBuilder::with_limit)
                 .with_batch_size(batch_size)
-                .build()?;
+                .build()
+                .map_err(delta_kernel::Error::kernel)?;
 
             let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
             let stream = futures::stream::iter(reader);
             let stream = stream.map(move |rbr| {
                 fixup_parquet_read(
-                    rbr?,
+                    rbr.map_err(delta_kernel::Error::kernel)?,
                     &requested_ordering,
                     row_indexes.as_mut(),
                     Some(&file_location),

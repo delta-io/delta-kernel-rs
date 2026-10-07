@@ -43,7 +43,7 @@
 //!
 //! # fn example(engine: &dyn Engine) -> Result<()> {
 //! // Create a snapshot for the table
-//! let table_root = Url::parse("file:///path/to/table")?;
+//! let table_root = "file:///path/to/table/";
 //! let snapshot = Snapshot::builder_for(table_root).build(engine)?;
 //!
 //! // Create a log compaction writer for versions 10-20

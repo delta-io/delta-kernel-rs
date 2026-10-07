@@ -19,7 +19,7 @@ use crate::schema::{SchemaRef, StructType};
 use crate::utils::FoldWithOption as _;
 use crate::{
     EngineData, FileDataReadResultIterator, FileMeta, FileSize, KernelResult, ParquetFooter,
-    ParquetHandler, PredicateRef, Result, ResultIteratorStatic,
+    ParquetHandler, PredicateRef, Result, ResultExt, ResultIteratorStatic,
 };
 
 #[derive(Constructor)]
@@ -55,6 +55,7 @@ pub(super) fn try_create_from_parquet(
             Some(&file_location),
             Some(&schema),
         )
+        .map_err(crate::KernelError::from)
     }))
 }
 
@@ -72,7 +73,9 @@ impl ParquetHandler for SyncParquetHandler {
             predicate,
             try_create_from_parquet,
         );
-        Ok(Box::new(iter.map(|data| Ok(Box::new(data?) as _))))
+        Ok(Box::new(
+            iter.map(|data| Ok(Box::new(data.into_public_result()?) as _)),
+        ))
     }
 
     /// Writes engine data to a Parquet file at the specified location.
@@ -90,7 +93,9 @@ impl ParquetHandler for SyncParquetHandler {
         mut data: ResultIteratorStatic<Box<dyn EngineData>>,
     ) -> Result<FileSize> {
         let first_batch = data.next().ok_or_else(|| {
-            crate::KernelError::generic("Cannot write parquet file with empty data iterator")
+            crate::Error::Kernel(crate::KernelError::generic(
+                "Cannot write parquet file with empty data iterator",
+            ))
         })??;
         let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
         let first_record_batch: crate::arrow::array::RecordBatch = (*first_arrow).into();
@@ -100,23 +105,26 @@ impl ParquetHandler for SyncParquetHandler {
             &mut buf,
             first_record_batch.schema(),
             writer_options(),
-        )?;
-        writer.write(&first_record_batch)?;
+        )
+        .map_err(crate::Error::kernel)?;
+        writer
+            .write(&first_record_batch)
+            .map_err(crate::Error::kernel)?;
         for result in data {
             let engine_data = result?;
             let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)?;
             let batch: crate::arrow::array::RecordBatch = (*arrow_data).into();
-            writer.write(&batch)?;
+            writer.write(&batch).map_err(crate::Error::kernel)?;
         }
-        writer.close()?; // writer must be closed to write the footer
+        writer.close().map_err(crate::Error::kernel)?; // writer must be closed to write the footer
         let size_in_bytes = buf.len() as u64;
 
-        put_bytes(self.store.as_ref(), &location, buf.into(), true)?;
+        put_bytes(self.store.as_ref(), &location, buf.into(), true).into_public_result()?;
         Ok(size_in_bytes)
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
-        parquet_footer(self.store.as_ref(), file)
+        parquet_footer(self.store.as_ref(), file).into_public_result()
     }
 }
 

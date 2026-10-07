@@ -50,17 +50,17 @@ impl LeafNodeWriter {
     ) -> Result<()> {
         // TODO(#3352): implement buffering appends, and add the other update kinds a leaf must
         // accept (existing-file moves/removals and deletion-vector updates).
-        Err(KernelError::unsupported(
+        Err(crate::Error::Kernel(KernelError::unsupported(
             "manifest commit leaf writer add_files is not yet supported",
-        ))
+        )))
     }
 
     /// Writes the buffered changes as a leaf manifest and returns its [`LeafNodeWriterResult`].
     #[internal_api]
     pub(crate) fn finish(self, _engine: &dyn Engine) -> Result<LeafNodeWriterResult> {
         // TODO(#3352): write the buffered changes as a leaf manifest.
-        Err(KernelError::unsupported(
+        Err(crate::Error::Kernel(KernelError::unsupported(
             "manifest commit leaf writer finish is not yet supported",
-        ))
+        )))
     }
 }

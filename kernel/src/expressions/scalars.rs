@@ -17,7 +17,7 @@ use crate::schema::{
     MapType, PrimitiveType, StructField, StructType,
 };
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult, Result, ResultExt};
 
 /// Pairs [`Into<Scalar>`] with [`ToDataType`] for infallible container conversions.
 ///
@@ -39,11 +39,11 @@ impl DecimalData {
         let bits = bits.into();
         require!(
             ty.precision() >= get_decimal_precision(bits),
-            KernelError::invalid_decimal(format!(
+            crate::Error::Kernel(KernelError::invalid_decimal(format!(
                 "Decimal value {} exceeds precision {}",
                 bits,
                 ty.precision()
-            ))
+            )))
         );
         Ok(Self { bits, ty })
     }
@@ -104,7 +104,8 @@ impl ArrayData {
                     Ok(v)
                 }
             })
-            .try_collect()?;
+            .try_collect()
+            .into_public_result()?;
         Ok(Self { tpe, elements })
     }
 
@@ -193,7 +194,8 @@ impl MapData {
                     Ok((k, v))
                 }
             })
-            .try_collect()?;
+            .try_collect()
+            .into_public_result()?;
         Ok(Self { data_type, pairs })
     }
 
@@ -257,31 +259,31 @@ impl StructData {
     pub fn try_new(fields: Vec<StructField>, values: Vec<Scalar>) -> Result<Self> {
         require!(
             fields.len() == values.len(),
-            KernelError::invalid_struct_data(format!(
+            crate::Error::Kernel(KernelError::invalid_struct_data(format!(
                 "Incorrect number of values for Struct fields, expected {} got {}",
                 fields.len(),
                 values.len()
-            ))
+            )))
         );
 
         for (f, a) in fields.iter().zip(&values) {
             require!(
                 f.data_type() == &a.data_type(),
-                KernelError::invalid_struct_data(format!(
+                crate::Error::Kernel(KernelError::invalid_struct_data(format!(
                     "Incorrect datatype for Struct field {:?}, expected {} got {}",
                     f.name(),
                     f.data_type(),
                     a.data_type()
-                ))
+                )))
             );
 
             require!(
                 f.is_nullable() || !a.is_null(),
-                KernelError::invalid_struct_data(format!(
+                crate::Error::Kernel(KernelError::invalid_struct_data(format!(
                     "Value for non-nullable field {:?} cannot be null, got {}",
                     f.name(),
                     a
-                ))
+                )))
             );
         }
 
@@ -696,12 +698,12 @@ macro_rules! impl_try_from_scalar {
     ( $(($variant:ident, $rust_type:ty)),* $(,)? ) => {
         $(
             impl TryFrom<Scalar> for $rust_type {
-                type Error = KernelError;
+                type Error = crate::Error;
 
                 fn try_from(scalar: Scalar) -> Result<Self> {
                     match scalar {
                         Scalar::$variant(value) => Ok(value.into()),
-                        other => Err(other.conversion_error(stringify!($rust_type))),
+                        other => Err(crate::Error::Kernel(other.conversion_error(stringify!($rust_type)))),
                     }
                 }
             }
@@ -727,8 +729,8 @@ impl_try_from_scalar!(
 
 /// Null becomes `None` when its typed null matches `T::to_data_type`; anything else must convert
 /// to `T`.
-impl<T: TryFrom<Scalar, Error = KernelError> + ToDataType> TryFrom<Scalar> for Option<T> {
-    type Error = KernelError;
+impl<T: TryFrom<Scalar, Error = crate::Error> + ToDataType> TryFrom<Scalar> for Option<T> {
+    type Error = crate::Error;
 
     fn try_from(scalar: Scalar) -> Result<Self> {
         match scalar {
@@ -736,7 +738,10 @@ impl<T: TryFrom<Scalar, Error = KernelError> + ToDataType> TryFrom<Scalar> for O
                 let expected = T::to_data_type();
                 require!(
                     data_type == expected,
-                    KernelError::scalar_conversion(expected.kind_name(), data_type.kind_name())
+                    crate::Error::Kernel(KernelError::scalar_conversion(
+                        expected.kind_name(),
+                        data_type.kind_name()
+                    ))
                 );
                 Ok(None)
             }
@@ -748,9 +753,9 @@ impl<T: TryFrom<Scalar, Error = KernelError> + ToDataType> TryFrom<Scalar> for O
 /// Extracts an array scalar's elements. Use `Vec<Option<T>>` for arrays that contain nulls.
 impl<T> TryFrom<Scalar> for Vec<T>
 where
-    T: GetStructField + TryFrom<Scalar, Error = KernelError>,
+    T: GetStructField + TryFrom<Scalar, Error = crate::Error>,
 {
-    type Error = KernelError;
+    type Error = crate::Error;
 
     fn try_from(scalar: Scalar) -> Result<Self> {
         let array: ArrayData = scalar.try_into()?;
@@ -758,7 +763,7 @@ where
         let expected = ArrayType::new(element.data_type().clone(), element.is_nullable());
         require!(
             array.array_type() == &expected,
-            KernelError::scalar_conversion(
+            crate::Error::Kernel(KernelError::scalar_conversion(
                 format!(
                     "array<{}, contains_null={}>",
                     expected.element_type().kind_name(),
@@ -769,28 +774,30 @@ where
                     array.array_type().element_type().kind_name(),
                     array.array_type().contains_null()
                 ),
-            )
+            ))
         );
         array
             .into_elements()
             .into_iter()
             .enumerate()
             .map(|(index, value)| {
-                T::try_from(value)
-                    .map_err(|error| add_scalar_path_context(error, format!("[{index}]")))
+                T::try_from(value).map_err(|error| {
+                    add_scalar_path_context(crate::KernelError::from(error), format!("[{index}]"))
+                })
             })
             .try_collect()
+            .into_public_result()
     }
 }
 
 /// Extracts a map scalar's entries. Use `HashMap<K, Option<V>>` for maps with null values.
 impl<K, V> TryFrom<Scalar> for HashMap<K, V>
 where
-    K: TryFrom<Scalar, Error = KernelError> + Eq + Hash,
-    V: GetStructField + TryFrom<Scalar, Error = KernelError>,
+    K: TryFrom<Scalar, Error = crate::Error> + Eq + Hash,
+    V: GetStructField + TryFrom<Scalar, Error = crate::Error>,
     K: ToDataType,
 {
-    type Error = KernelError;
+    type Error = crate::Error;
 
     fn try_from(scalar: Scalar) -> Result<Self> {
         let map: MapData = scalar.try_into()?;
@@ -802,7 +809,7 @@ where
         );
         require!(
             map.map_type() == &expected,
-            KernelError::scalar_conversion(
+            crate::Error::Kernel(KernelError::scalar_conversion(
                 format!(
                     "map<{}, {}, value_contains_null={}>",
                     expected.key_type().kind_name(),
@@ -815,16 +822,24 @@ where
                     map.map_type().value_type().kind_name(),
                     map.map_type().value_contains_null()
                 ),
-            )
+            ))
         );
         map.into_pairs()
             .into_iter()
             .enumerate()
             .map(|(index, (key, value))| {
-                let key = K::try_from(key)
-                    .map_err(|error| add_scalar_path_context(error, format!("[{index}].key")))?;
-                let value = V::try_from(value)
-                    .map_err(|error| add_scalar_path_context(error, format!("[{index}].value")))?;
+                let key = K::try_from(key).map_err(|error| {
+                    crate::Error::Kernel(add_scalar_path_context(
+                        crate::KernelError::from(error),
+                        format!("[{index}].key"),
+                    ))
+                })?;
+                let value = V::try_from(value).map_err(|error| {
+                    crate::Error::Kernel(add_scalar_path_context(
+                        crate::KernelError::from(error),
+                        format!("[{index}].value"),
+                    ))
+                })?;
                 Ok((key, value))
             })
             .try_collect()
@@ -852,10 +867,15 @@ impl PrimitiveType {
     ///
     /// # Errors
     ///
-    /// Returns [`KernelError::ParseError`] if `raw` is not a valid encoding of this type.
+    /// Returns [`crate::Error::Kernel`] containing [`KernelError::ParseError`] if `raw` is not a
+    /// valid encoding of this type.
     ///
     /// [partition value serialization]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
-    pub fn parse_scalar(&self, raw: &str) -> Result<Scalar, KernelError> {
+    pub fn parse_scalar(&self, raw: &str) -> Result<Scalar> {
+        self.parse_scalar_impl(raw).into_public_result()
+    }
+
+    fn parse_scalar_impl(&self, raw: &str) -> KernelResult<Scalar> {
         use PrimitiveType::*;
 
         if raw.is_empty() {
@@ -1243,7 +1263,7 @@ mod tests {
     fn test_geo_parse_scalar_unsupported(#[case] ptype: PrimitiveType) {
         let err = ptype.parse_scalar("anything").unwrap_err();
         assert!(
-            matches!(err, KernelError::Unsupported(_)),
+            matches!(err, crate::Error::Kernel(KernelError::Unsupported(_))),
             "expected Unsupported, got: {err:?}"
         );
     }
@@ -1273,7 +1293,7 @@ mod tests {
         expect_int: i128,
         expect_prec: u8,
         expect_scale: u8,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let s = PrimitiveType::decimal(expect_prec, expect_scale)?;
         match s.parse_scalar(raw)? {
             Scalar::Decimal(val) => {
@@ -1350,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_decimal() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_parse_decimal() -> std::result::Result<(), Box<dyn std::error::Error>> {
         assert_decimal("0.999", 999, 3, 3)?;
         assert_decimal("0", 0, 1, 0)?;
         assert_decimal("0.00", 0, 3, 2)?;
@@ -1370,7 +1390,7 @@ mod tests {
     fn expect_fail_parse(raw: &str, prec: u8, scale: u8) {
         let s = PrimitiveType::decimal(prec, scale).unwrap();
         match s.parse_scalar(raw) {
-            Err(KernelError::ParseError(..)) => {}
+            Err(crate::Error::Kernel(KernelError::ParseError(..))) => {}
             other => panic!("expected ParseError for {raw:?}, got {other:?}"),
         }
     }
@@ -2007,7 +2027,7 @@ mod tests {
     /// `TryFrom<Scalar>` must invert `Into<Scalar>` and produce the expected data type.
     fn assert_round_trip<T>(value: T, expected_type: impl Into<DataType>)
     where
-        T: Clone + Debug + PartialEq + Into<Scalar> + TryFrom<Scalar, Error = KernelError>,
+        T: Clone + Debug + PartialEq + Into<Scalar> + TryFrom<Scalar, Error = crate::Error>,
     {
         let scalar: Scalar = value.clone().into();
         assert_eq!(scalar.data_type(), expected_type.into());

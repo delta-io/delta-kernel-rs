@@ -18,7 +18,7 @@ use delta_kernel::object_store::ObjectStore;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
-use delta_kernel::{Result, Snapshot};
+use delta_kernel::Snapshot;
 use futures::stream::TryStreamExt;
 use futures::StreamExt;
 use itertools::Itertools;
@@ -30,7 +30,7 @@ use url::Url;
 
 // NB adapted from DAT: read all parquet files in the directory and concatenate them
 #[allow(deprecated)]
-async fn read_expected(path: &Path) -> Result<RecordBatch> {
+async fn read_expected(path: &Path) -> delta_kernel::KernelResult<RecordBatch> {
     let store = Arc::new(LocalFileSystem::new_with_prefix(path)?);
     let files = store.list(None).try_collect::<Vec<_>>().await?;
     let mut batches = vec![];
@@ -55,7 +55,7 @@ async fn read_expected(path: &Path) -> Result<RecordBatch> {
 }
 
 // copied from DAT
-fn sort_record_batch(batch: RecordBatch) -> Result<RecordBatch> {
+fn sort_record_batch(batch: RecordBatch) -> delta_kernel::KernelResult<RecordBatch> {
     if batch.num_rows() < 2 {
         // 0 or 1 rows doesn't need sorting
         return Ok(batch);
@@ -166,7 +166,7 @@ async fn latest_snapshot_test(
     engine: DefaultEngine<TokioBackgroundExecutor>,
     url: Url,
     expected_path: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let snapshot = Snapshot::builder_for(url).build(&engine)?;
     let scan = snapshot.scan_builder().build()?;
     let scan_res = scan.execute(Arc::new(engine))?;
@@ -237,7 +237,7 @@ macro_rules! golden_test {
     ($test_name:literal, $test_fn:expr) => {
         paste! {
             #[tokio::test]
-            async fn [<golden_ $test_name:snake>]() -> Result<(), Box<dyn std::error::Error>> {
+            async fn [<golden_ $test_name:snake>]() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 // we don't use _test_dir but we don't want it to go out of scope before the test
                 // is done since it will cleanup the directory when it runs drop
                 let (engine, table, expected, _test_dir) = setup_golden_table($test_name);
@@ -254,7 +254,7 @@ async fn canonicalized_paths_test(
     engine: DefaultEngine<TokioBackgroundExecutor>,
     table_root: Url,
     _expected: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // assert latest version is 1 and there are no files in the snapshot (add is removed)
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     assert_eq!(snapshot.version(), 1);
@@ -268,7 +268,7 @@ async fn checkpoint_test(
     engine: DefaultEngine<TokioBackgroundExecutor>,
     table_root: Url,
     _expected: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     let version = snapshot.version();
     let scan = snapshot.scan_builder().build().expect("build the scan");

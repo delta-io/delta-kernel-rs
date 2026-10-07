@@ -17,7 +17,7 @@ use delta_kernel::expressions::{
     StructData as KernelStructData,
 };
 use delta_kernel::schema::DataType as KernelDataType;
-use delta_kernel::{KernelError, KernelResult, Result};
+use delta_kernel::{KernelError, KernelResult, Result, ResultExt};
 
 /// Converts a kernel [`Scalar`](KernelScalar) into the equivalent DataFusion
 /// [`ScalarValue`](DFScalarValue).
@@ -46,15 +46,17 @@ pub fn to_df_scalar(scalar: &KernelScalar) -> Result<DFScalarValue> {
         KernelScalar::Decimal(d) => {
             DFScalarValue::Decimal128(Some(d.bits()), d.precision(), d.scale() as i8)
         }
-        KernelScalar::Struct(data) => struct_to_df_scalar(data)?,
-        KernelScalar::Array(data) => array_to_df_scalar(data)?,
-        KernelScalar::Map(data) => map_to_df_scalar(data)?,
+        KernelScalar::Struct(data) => struct_to_df_scalar(data).into_public_result()?,
+        KernelScalar::Array(data) => array_to_df_scalar(data).into_public_result()?,
+        KernelScalar::Map(data) => map_to_df_scalar(data).into_public_result()?,
         KernelScalar::IntervalYearMonth(_) | KernelScalar::IntervalDayTime(_) => {
-            return Err(KernelError::unsupported(
+            return Err(delta_kernel::Error::Kernel(KernelError::unsupported(
                 "interval scalars are not supported in the DataFusion executor",
-            ))
+            )))
         }
-        KernelScalar::Null(data_type) => datatype_to_df_null_scalar(data_type)?,
+        KernelScalar::Null(data_type) => {
+            datatype_to_df_null_scalar(data_type).into_public_result()?
+        }
     })
 }
 
@@ -66,7 +68,7 @@ fn datatype_to_df_null_scalar(data_type: &KernelDataType) -> KernelResult<DFScal
 
 /// Builds a `DFScalarValue::List` holding a single list row of the converted elements.
 fn array_to_df_scalar(data: &KernelArrayData) -> KernelResult<DFScalarValue> {
-    let elements: KernelResult<Vec<DFScalarValue>> =
+    let elements: Result<Vec<DFScalarValue>> =
         data.array_elements().iter().map(to_df_scalar).collect();
     // Name the list's element field from kernel's own ArrayType->Arrow conversion
     let element_field: ArrowField = data.array_type().try_into_arrow()?;

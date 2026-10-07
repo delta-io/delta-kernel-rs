@@ -16,7 +16,9 @@ use crate::error::{KernelError, Result};
 use crate::expressions::{ArrayData, Expression, ExpressionRef, PredicateRef, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
-use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, KernelResult, PredicateEvaluator};
+use crate::{
+    EngineData, EvaluationHandler, ExpressionEvaluator, KernelResult, PredicateEvaluator, ResultExt,
+};
 
 pub mod evaluate_expression;
 pub mod opaque;
@@ -30,9 +32,11 @@ mod tests;
 impl Scalar {
     /// Convert scalar to arrow array.
     pub fn to_array(&self, num_rows: usize) -> Result<ArrayRef> {
-        let data_type = ArrowDataType::try_from_kernel(&self.data_type())?;
+        let data_type =
+            ArrowDataType::try_from_kernel(&self.data_type()).map_err(crate::Error::kernel)?;
         let mut builder = array::make_builder(&data_type, num_rows);
-        self.append_to(&mut builder, num_rows)?;
+        self.append_to(&mut builder, num_rows)
+            .into_public_result()?;
         Ok(builder.finish())
     }
 
@@ -240,12 +244,13 @@ impl Scalar {
 impl ArrayData {
     /// Convert kernel [`ArrayData`] to an Arrow [`ArrayRef`] of the equivalent type.
     pub fn to_arrow(&self) -> Result<ArrayRef> {
-        let arrow_data_type = ArrowDataType::try_from_kernel(self.array_type().element_type())?;
+        let arrow_data_type = ArrowDataType::try_from_kernel(self.array_type().element_type())
+            .map_err(crate::Error::kernel)?;
 
         let elements = self.array_elements();
         let mut builder = array::make_builder(&arrow_data_type, elements.len());
         for element in elements {
-            element.append_to(&mut builder, 1)?;
+            element.append_to(&mut builder, 1).into_public_result()?;
         }
 
         Ok(builder.finish())
@@ -285,7 +290,12 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         schema: SchemaRef,
         rows: Vec<Vec<Scalar>>,
     ) -> Result<Box<dyn EngineData>> {
-        let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
+        let arrow_schema: Arc<ArrowSchema> = Arc::new(
+            schema
+                .as_ref()
+                .try_into_arrow()
+                .map_err(crate::Error::kernel)?,
+        );
         if rows.is_empty() {
             return Ok(Box::new(ArrowEngineData::new(RecordBatch::new_empty(
                 arrow_schema,
@@ -296,12 +306,12 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         let num_fields = schema.fields().len();
         for (row_idx, row) in rows.iter().enumerate() {
             if row.len() != num_fields {
-                return Err(KernelError::generic(format!(
+                return Err(crate::Error::Kernel(KernelError::generic(format!(
                     "Row {} has {} scalars but schema has {} fields",
                     row_idx,
                     row.len(),
                     num_fields
-                )));
+                ))));
             }
         }
 
@@ -316,22 +326,21 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             let field_name = fields[col_idx].name();
             for (row_idx, row) in rows.iter().enumerate() {
                 row[col_idx].append_to(builder.as_mut(), 1).map_err(|e| {
-                    KernelError::generic(format!(
+                    crate::Error::Kernel(KernelError::generic(format!(
                         "Row {row_idx}, field '{field_name}' \
                             (expected type {}, got {}): {e}",
                         fields[col_idx].data_type(),
                         row[col_idx].data_type()
-                    ))
+                    )))
                 })?;
             }
         }
 
         let arrays: Vec<ArrayRef> = builders.into_iter().map(|mut b| b.finish()).collect();
 
-        Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            arrow_schema,
-            arrays,
-        )?)))
+        Ok(Box::new(ArrowEngineData::new(
+            RecordBatch::try_new(arrow_schema, arrays).map_err(crate::Error::kernel)?,
+        )))
     }
 }
 
@@ -345,9 +354,10 @@ pub struct DefaultExpressionEvaluator {
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> Result<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.expression);
-        let batch = extract_record_batch(batch)?;
+        let batch = extract_record_batch(batch).into_public_result()?;
         // TODO(#3263): Validate nested fields.
-        validate_data_schema_top_level(&self.input_schema, batch.schema().as_ref())?;
+        validate_data_schema_top_level(&self.input_schema, batch.schema().as_ref())
+            .into_public_result()?;
         let batch = match (self.expression.as_ref(), &self.output_type) {
             (Expression::StructPatch(patch), DataType::Struct(_)) if patch.is_empty() => {
                 // Empty patch optimization: Skip expression evaluation and directly apply the
@@ -357,18 +367,20 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
                     None => Arc::new(StructArray::from(batch.clone())),
                     Some(path) => extract_column(batch, path)?,
                 };
-                apply_schema(&array, &self.output_type)?
+                apply_schema(&array, &self.output_type).into_public_result()?
             }
             (expr, output_type @ DataType::Struct(_)) => {
                 let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
-                apply_schema(&array_ref, output_type)?
+                apply_schema(&array_ref, output_type).into_public_result()?
             }
             (expr, output_type) => {
                 let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
-                let array_ref = apply_schema_to(&array_ref, output_type)?;
-                let arrow_type = ArrowDataType::try_from_kernel(output_type)?;
+                let array_ref = apply_schema_to(&array_ref, output_type).into_public_result()?;
+                let arrow_type =
+                    ArrowDataType::try_from_kernel(output_type).map_err(crate::Error::kernel)?;
                 let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
-                RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
+                RecordBatch::try_new(Arc::new(schema), vec![array_ref])
+                    .map_err(crate::Error::kernel)?
             }
         };
 
@@ -385,16 +397,18 @@ pub struct DefaultPredicateEvaluator {
 impl PredicateEvaluator for DefaultPredicateEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> Result<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.predicate);
-        let batch = extract_record_batch(batch)?;
+        let batch = extract_record_batch(batch).into_public_result()?;
         // TODO(#3263): Validate nested fields.
-        validate_data_schema_top_level(&self.input_schema, batch.schema().as_ref())?;
+        validate_data_schema_top_level(&self.input_schema, batch.schema().as_ref())
+            .into_public_result()?;
         let array = evaluate_predicate(&self.predicate, batch, false)?;
         let schema = ArrowSchema::new(vec![ArrowField::new(
             "output",
             ArrowDataType::Boolean,
             true,
         )]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])?;
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])
+            .map_err(crate::Error::kernel)?;
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 }

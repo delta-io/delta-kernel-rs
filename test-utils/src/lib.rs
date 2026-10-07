@@ -226,7 +226,7 @@ use url::Url;
 pub fn load_test_data(
     test_parent_dir: &str,
     test_name: &str,
-) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+) -> std::result::Result<tempfile::TempDir, Box<dyn std::error::Error>> {
     let path = format!("{test_parent_dir}/{test_name}.tar.zst");
     let tar = zstd::Decoder::new(std::fs::File::open(path)?)?;
     let mut archive = tar::Archive::new(tar);
@@ -254,7 +254,7 @@ pub fn load_test_data(
 pub fn copy_directory(
     source: &std::path::Path,
     dest: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(dest)?;
 
     for entry in std::fs::read_dir(source)? {
@@ -401,7 +401,7 @@ impl IntoArray for Vec<&'static str> {
 
 /// Generate a record batch from an iterator over (name, array) pairs. Each pair specifies a column
 /// name and the array to associate with it
-pub fn generate_batch<I, F>(items: I) -> Result<RecordBatch, ArrowError>
+pub fn generate_batch<I, F>(items: I) -> std::result::Result<RecordBatch, ArrowError>
 where
     I: IntoIterator<Item = (F, ArrayRef)>,
     F: AsRef<str>,
@@ -411,7 +411,7 @@ where
 
 /// Generate a RecordBatch with two columns (id: int, val: str), with values "1,2,3" and "a,b,c"
 /// respectively
-pub fn generate_simple_batch() -> Result<RecordBatch, ArrowError> {
+pub fn generate_simple_batch() -> std::result::Result<RecordBatch, ArrowError> {
     generate_batch(vec![
         ("id", vec![1, 2, 3].into_arrow_array()),
         ("val", vec!["a", "b", "c"].into_arrow_array()),
@@ -474,7 +474,7 @@ pub async fn add_commit(
     store: &DynObjectStore,
     version: u64,
     data: String,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let relative_path = delta_path_for_version(version, "json");
     let table_path = resolve_table_path(table_root, &relative_path)?;
     store.put(&table_path, data.into()).await?;
@@ -500,7 +500,7 @@ pub async fn add_staged_commit(
     store: &DynObjectStore,
     version: u64,
     data: String,
-) -> Result<Path, Box<dyn std::error::Error>> {
+) -> std::result::Result<Path, Box<dyn std::error::Error>> {
     let relative_path = staged_commit_path_for_version(version);
     let table_path = resolve_table_path(table_root, &relative_path)?;
     store.put(&table_path, data.into()).await?;
@@ -671,15 +671,19 @@ pub fn test_table_setup() -> Result<(
     String,
     Arc<DefaultEngine<TokioBackgroundExecutor>>,
 )> {
-    let temp_dir =
-        tempfile::tempdir().map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
+    let temp_dir = tempfile::tempdir().map_err(|e| {
+        delta_kernel::Error::Kernel(delta_kernel::KernelError::generic(e.to_string()))
+    })?;
     let table_path = temp_dir
         .path()
         .to_str()
-        .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))?
+        .ok_or_else(|| {
+            delta_kernel::Error::Kernel(delta_kernel::KernelError::generic("Invalid path"))
+        })?
         .to_string();
-    let table_url = url::Url::from_directory_path(&table_path)
-        .map_err(|_| delta_kernel::KernelError::generic("Invalid URL"))?;
+    let table_url = url::Url::from_directory_path(&table_path).map_err(|_| {
+        delta_kernel::Error::Kernel(delta_kernel::KernelError::generic("Invalid URL"))
+    })?;
     let engine = create_default_engine(&table_url)?;
     Ok((temp_dir, table_path, engine))
 }
@@ -694,15 +698,19 @@ pub fn test_table_setup_mt() -> Result<(
     String,
     Arc<DefaultEngine<TokioMultiThreadExecutor>>,
 )> {
-    let temp_dir =
-        tempfile::tempdir().map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
+    let temp_dir = tempfile::tempdir().map_err(|e| {
+        delta_kernel::Error::Kernel(delta_kernel::KernelError::generic(e.to_string()))
+    })?;
     let table_path = temp_dir
         .path()
         .to_str()
-        .ok_or_else(|| delta_kernel::KernelError::generic("Invalid path"))?
+        .ok_or_else(|| {
+            delta_kernel::Error::Kernel(delta_kernel::KernelError::generic("Invalid path"))
+        })?
         .to_string();
-    let table_url = url::Url::from_directory_path(&table_path)
-        .map_err(|_| delta_kernel::KernelError::generic("Invalid URL"))?;
+    let table_url = url::Url::from_directory_path(&table_path).map_err(|_| {
+        delta_kernel::Error::Kernel(delta_kernel::KernelError::generic("Invalid URL"))
+    })?;
     let engine = create_default_engine_mt_executor(&table_url)?;
     Ok((temp_dir, table_path, engine))
 }
@@ -749,7 +757,7 @@ pub async fn create_table(
     use_37_protocol: bool,
     reader_features: Vec<&str>,
     writer_features: Vec<&str>,
-) -> Result<Url, Box<dyn std::error::Error>> {
+) -> std::result::Result<Url, Box<dyn std::error::Error>> {
     create_table_impl(
         store,
         table_path,
@@ -775,7 +783,7 @@ pub async fn create_table_with_column_mapping_mode(
     reader_features: Vec<&str>,
     writer_features: Vec<&str>,
     column_mapping_mode: &str,
-) -> Result<Url, Box<dyn std::error::Error>> {
+) -> std::result::Result<Url, Box<dyn std::error::Error>> {
     create_table_impl(
         store,
         table_path,
@@ -799,7 +807,7 @@ async fn create_table_impl(
     mut reader_features: Vec<&str>,
     mut writer_features: Vec<&str>,
     column_mapping_mode: &str,
-) -> Result<Url, Box<dyn std::error::Error>> {
+) -> std::result::Result<Url, Box<dyn std::error::Error>> {
     let table_id = "test_id";
 
     // IcebergCompatV3 requires ColumnMapping, RowTracking, and DomainMetadata. Add them so callers
@@ -1021,10 +1029,10 @@ pub fn schema_with_column_defaults(
         })
         .collect();
     if !column_defaults.is_empty() {
-        return Err(KernelError::generic(format!(
+        return Err(delta_kernel::Error::Kernel(KernelError::generic(format!(
             "column defaults reference unknown top-level columns: {:?}",
             column_defaults.into_keys().collect::<Vec<_>>()
-        )));
+        ))));
     }
 
     Ok(Arc::new(StructType::try_new(augmented_fields)?))
@@ -1051,7 +1059,7 @@ pub async fn setup_test_table_p37(
     partition_columns: &[&str],
     local_directory: Option<&Url>,
     table_base_name: &str,
-) -> Result<
+) -> std::result::Result<
     (
         Url,
         DefaultEngine<TokioBackgroundExecutor>,
@@ -1087,7 +1095,7 @@ pub async fn setup_test_tables(
     partition_columns: &[&str],
     local_directory: Option<&Url>,
     table_base_name: &str,
-) -> Result<
+) -> std::result::Result<
     Vec<(
         Url,
         DefaultEngine<TokioBackgroundExecutor>,
@@ -1191,9 +1199,11 @@ pub async fn insert_data_with<E: TaskExecutor>(
     data_change: bool,
     is_blind_append: bool,
 ) -> Result<CommitResult> {
-    let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
-    let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
-        .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
+    let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())
+        .map_err(delta_kernel::Error::kernel)?;
+    let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).map_err(|e| {
+        delta_kernel::Error::Kernel(delta_kernel::KernelError::generic(e.to_string()))
+    })?;
     let mut txn = snapshot
         .transaction(committer, engine.as_ref())?
         .with_operation(operation.to_string())
@@ -1265,7 +1275,7 @@ pub fn set_json_value(
     value: &mut serde_json::Value,
     path: &str,
     new_value: serde_json::Value,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut path_string = path.replace(".", "/");
     path_string.insert(0, '/');
     let v = value
@@ -1278,7 +1288,7 @@ pub fn set_json_value(
 /// Returns a nested schema with 6 top-level fields including a nested struct:
 /// `[row_number: long, name: string, score: double, address: {street: string, city: string}, tag:
 /// string, value: int]`
-pub fn nested_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
+pub fn nested_schema() -> std::result::Result<SchemaRef, Box<dyn std::error::Error>> {
     Ok(schema_ref! {
         nullable "row_number": LONG,
         nullable "name": STRING,
@@ -1296,7 +1306,7 @@ pub fn nested_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
 ///
 /// Batch 1: rows 1..3, names alice/bob/charlie, streets st1..st3
 /// Batch 2: rows 4..6, names dave/eve/frank, streets st4..st6
-pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
+pub fn nested_batches() -> std::result::Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
     let schema = nested_schema()?;
     let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(schema.as_ref())?;
     let address_fields = match arrow_schema.field_with_name("address").unwrap().data_type() {
@@ -1311,7 +1321,7 @@ pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> 
                  cities: Vec<Option<&str>>,
                  tags: Vec<Option<&str>>,
                  values: Vec<Option<i32>>|
-     -> Result<RecordBatch, Box<dyn std::error::Error>> {
+     -> std::result::Result<RecordBatch, Box<dyn std::error::Error>> {
         let address_array = StructArray::new(
             address_fields.clone(),
             vec![
@@ -1425,7 +1435,7 @@ pub fn cm_properties(mode: &str) -> Vec<(&str, &str)> {
 pub fn resolve_field<'a>(
     schema: &'a delta_kernel::schema::StructType,
     path: &[impl AsRef<str>],
-) -> Result<&'a delta_kernel::schema::StructField, String> {
+) -> std::result::Result<&'a delta_kernel::schema::StructField, String> {
     let path_str: Vec<&str> = path.iter().map(|s| s.as_ref()).collect();
     let display = path_str.join(".");
     let (last, rest) = path.split_last().ok_or_else(|| "empty path".to_string())?;
@@ -1457,7 +1467,10 @@ pub fn assert_schema_has_field(schema: &delta_kernel::schema::StructType, path: 
     resolve_field(schema, path).unwrap();
 }
 
-pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {
+pub fn assert_result_error_with_message<T, E: ToString>(
+    res: std::result::Result<T, E>,
+    message: &str,
+) {
     match res {
         Ok(_) => panic!("Expected error, but got Ok result"),
         Err(error) => {
@@ -1504,7 +1517,7 @@ pub fn assert_row_ids_unique(batches: &[RecordBatch]) {
 pub fn create_add_files_metadata(
     add_files_schema: &SchemaRef,
     files: Vec<(&str, i64, i64, Option<i64>)>,
-) -> Result<Box<dyn delta_kernel::EngineData>, Box<dyn std::error::Error>> {
+) -> std::result::Result<Box<dyn delta_kernel::EngineData>, Box<dyn std::error::Error>> {
     let num_files = files.len();
 
     // Build arrays for each file
@@ -1610,7 +1623,7 @@ pub async fn write_batch_to_table(
     engine: &DefaultEngine<impl delta_kernel_default_engine::executor::TaskExecutor>,
     data: RecordBatch,
     partition_values: HashMap<String, Scalar>,
-) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+) -> std::result::Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let mut txn = snapshot
         .clone()
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
@@ -1877,7 +1890,7 @@ impl ParquetHandler for CapturingParquetHandler {
 pub fn read_add_infos(
     snapshot: &Snapshot,
     engine: &impl Engine,
-) -> Result<Vec<AddInfo>, Box<dyn std::error::Error>> {
+) -> std::result::Result<Vec<AddInfo>, Box<dyn std::error::Error>> {
     let schema = LOG_ADD_SCHEMA.clone();
     let batches = snapshot.log_segment().read_actions(engine, schema)?;
     let mut actions = Vec::new();
@@ -1985,7 +1998,7 @@ pub fn read_actions_from_commit(
     table_url: &Url,
     version: u64,
     action_type: &str,
-) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+) -> std::result::Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
     let table_path = table_url.to_file_path().expect("should be a file URL");
     let commit_path = table_path.join(format!("_delta_log/{version:020}.json"));
     let content = std::fs::read_to_string(commit_path)?;
@@ -2011,7 +2024,7 @@ pub struct AddActionRowTracking {
 pub fn get_row_tracking_add_actions(
     table_url: &Url,
     version: u64,
-) -> Result<Vec<AddActionRowTracking>, Box<dyn std::error::Error>> {
+) -> std::result::Result<Vec<AddActionRowTracking>, Box<dyn std::error::Error>> {
     let mut actions: Vec<AddActionRowTracking> =
         read_actions_from_commit(table_url, version, "add")?
             .into_iter()
@@ -2037,7 +2050,7 @@ pub struct MaterializedRowTrackingColumnNames {
 pub fn get_materialized_row_tracking_column_names(
     table_url: &Url,
     version: u64,
-) -> Result<MaterializedRowTrackingColumnNames, Box<dyn std::error::Error>> {
+) -> std::result::Result<MaterializedRowTrackingColumnNames, Box<dyn std::error::Error>> {
     let metadata_actions = read_actions_from_commit(table_url, version, "metaData")?;
     let config = metadata_actions
         .first()
@@ -2066,7 +2079,7 @@ pub fn get_materialized_row_tracking_column_names(
 pub async fn read_metadata_configuration_from_store(
     store: &DynObjectStore,
     version: u64,
-) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+) -> std::result::Result<HashMap<String, String>, Box<dyn std::error::Error>> {
     let path =
         delta_kernel::object_store::path::Path::from(format!("_delta_log/{version:020}.json"));
     let get_result = store.get(&path).await?;
@@ -2090,9 +2103,11 @@ pub fn remove_all_and_get_remove_actions(
     snapshot: &Arc<Snapshot>,
     table_url: &Url,
     engine: &impl Engine,
-) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+) -> std::result::Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
     let scan = snapshot.clone().scan_builder().build()?;
-    let all_scan_metadata: Vec<_> = scan.scan_metadata(engine)?.collect::<Result<Vec<_>, _>>()?;
+    let all_scan_metadata: Vec<_> = scan
+        .scan_metadata(engine)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut txn = snapshot
         .clone()

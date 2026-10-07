@@ -73,7 +73,7 @@ use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{Engine, KernelResult, Result, Snapshot};
+use delta_kernel::{Engine, KernelResult, Result, ResultExt, Snapshot};
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
@@ -108,7 +108,7 @@ pub const DEFAULT_SWEEP_MID_VERSION: u64 = 5;
 fn block_on_sync<F, Fut, T>(make_fut: F) -> KernelResult<T>
 where
     F: FnOnce() -> Fut + Send,
-    Fut: std::future::Future<Output = Result<T>>,
+    Fut: std::future::Future<Output = KernelResult<T>>,
     T: Send,
 {
     std::thread::scope(|s| {
@@ -1263,7 +1263,7 @@ impl TestTableBuilder {
     /// checkpoints.
     pub fn build(self) -> Result<TestTable> {
         validate_log_state(&self.log_state);
-        block_on_sync(|| self.build_async())
+        block_on_sync(|| self.build_async()).into_public_result()
     }
 
     async fn build_async(self) -> KernelResult<TestTable> {
@@ -1506,7 +1506,7 @@ async fn write_data_commit<E: TaskExecutor>(
         txn.add_files(add_files);
     }
 
-    txn.commit(engine)
+    Ok(txn.commit(engine)?)
 }
 
 /// Generate a single column of data based on its Arrow type.
@@ -2025,6 +2025,7 @@ mod tests {
                 .await
                 .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))
         })
+        .into_public_result()
     }
 
     /// Verifies every common table config builds successfully.
@@ -2631,13 +2632,17 @@ mod tests {
         path: &Path,
     ) -> Result<Option<serde_json::Value>> {
         let bytes = match store.get(path).await {
-            Ok(r) => r.bytes().await.map_err(delta_kernel::KernelError::from)?,
+            Ok(r) => r.bytes().await.map_err(delta_kernel::Error::kernel)?,
             Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
-            Err(e) => return Err(delta_kernel::KernelError::from(e)),
+            Err(e) => {
+                return Err(delta_kernel::Error::Kernel(
+                    delta_kernel::KernelError::from(e),
+                ))
+            }
         };
-        serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))
+        serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+            delta_kernel::Error::Kernel(delta_kernel::KernelError::generic(e.to_string()))
+        })
     }
 
     /// Read and parse the `_last_checkpoint` hint, if present.
@@ -2648,13 +2653,16 @@ mod tests {
             match try_read_json(&store, &path).await? {
                 Some(parsed) => {
                     let version = parsed["version"].as_u64().ok_or_else(|| {
-                        delta_kernel::KernelError::generic("hint missing `version` field")
+                        delta_kernel::Error::Kernel(delta_kernel::KernelError::generic(
+                            "hint missing `version` field",
+                        ))
                     })?;
                     Ok(Some(HintFile { version }))
                 }
                 None => Ok(None),
             }
         })
+        .into_public_result()
     }
 
     /// Read and parse a CRC file at `version`. Errors if the file is absent.
@@ -2666,6 +2674,7 @@ mod tests {
                 delta_kernel::KernelError::generic(format!("CRC at v={version} missing"))
             })
         })
+        .into_public_result()
     }
 
     /// Helper: list filenames (basenames only) directly under `_delta_log/` in
@@ -2683,12 +2692,13 @@ mod tests {
             let result = store
                 .list_with_delimiter(Some(&prefix))
                 .await
-                .map_err(delta_kernel::KernelError::from)?;
+                .map_err(delta_kernel::Error::kernel)?;
             Ok(result
                 .objects
                 .into_iter()
                 .filter_map(|m| m.location.filename().map(|s| s.to_string()))
                 .collect())
         })
+        .into_public_result()
     }
 }

@@ -35,7 +35,7 @@ use crate::common::write_utils::{
 };
 
 #[tokio::test]
-async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_append() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
@@ -124,7 +124,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn test_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_no_add_actions() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
@@ -157,7 +157,7 @@ async fn test_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn test_append_twice() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_append_twice() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
@@ -192,7 +192,7 @@ async fn test_append_twice() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn test_append_partitioned(
     #[case] transport_write_state: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -216,9 +216,15 @@ async fn test_append_partitioned(
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> Result<_> {
             let data = RecordBatch::try_new(
-                Arc::new(data_schema.as_ref().try_into_arrow()?),
+                Arc::new(
+                    data_schema
+                        .as_ref()
+                        .try_into_arrow()
+                        .map_err(delta_kernel::Error::kernel)?,
+                ),
                 vec![Arc::new(Int32Array::from(data.to_vec()))],
-            )?;
+            )
+            .map_err(delta_kernel::Error::kernel)?;
             Ok(Box::new(ArrowEngineData::new(data)))
         });
         let partition_vals = vec!["a", "b"];
@@ -345,7 +351,7 @@ async fn test_append_partitioned(
 }
 
 #[tokio::test]
-async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_append_invalid_schema() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
@@ -362,9 +368,15 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
         // create two new arrow record batches to append
         let append_data = [["a", "b"], ["c", "d"]].map(|data| -> Result<_> {
             let data = RecordBatch::try_new(
-                Arc::new(data_schema.as_ref().try_into_arrow()?),
+                Arc::new(
+                    data_schema
+                        .as_ref()
+                        .try_into_arrow()
+                        .map_err(delta_kernel::Error::kernel)?,
+                ),
                 vec![Arc::new(StringArray::from(data.to_vec()))],
-            )?;
+            )
+            .map_err(delta_kernel::Error::kernel)?;
             Ok(Box::new(ArrowEngineData::new(data)))
         });
 
@@ -384,8 +396,10 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 
         let mut add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
         assert!(add_files_metadata.all(|res| match res {
-            Err(KernelError::Arrow(ArrowError::InvalidArgumentError(_))) => true,
-            Err(KernelError::Backtraced { source, .. })
+            Err(delta_kernel::Error::Kernel(KernelError::Arrow(
+                ArrowError::InvalidArgumentError(_),
+            ))) => true,
+            Err(delta_kernel::Error::Kernel(KernelError::Backtraced { source, .. }))
                 if matches!(
                     &*source,
                     KernelError::Arrow(ArrowError::InvalidArgumentError(_))
@@ -398,7 +412,8 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 }
 
 #[tokio::test]
-async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::error::Error>> {
+async fn commit_rejects_add_missing_required_field(
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
     let schema = get_simple_int_schema();
 
@@ -487,7 +502,7 @@ async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::
 async fn commit_rejects_add_with_invalid_partition_keys(
     #[case] column_mapping_mode: Option<&str>,
     #[case] modifications: &[AddFilePartitionKeyModify<'_>],
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let table_schema = schema_ref! {
@@ -519,7 +534,8 @@ async fn commit_rejects_add_with_invalid_partition_keys(
         let data = RecordBatch::try_new(
             data_schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1]))],
-        )?;
+        )
+        .map_err(delta_kernel::Error::kernel)?;
         futures::executor::block_on(engine.write_parquet(&ArrowEngineData::new(data), &wc))
     };
 

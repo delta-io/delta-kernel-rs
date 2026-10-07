@@ -32,7 +32,7 @@ may differ.
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::transaction::CommitResult;
-# use delta_kernel::{Result, Snapshot};
+# use delta_kernel::{Error, Result, Snapshot};
 # #[tokio::main]
 # async fn main() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
@@ -58,14 +58,14 @@ let batch = RecordBatch::try_new(
         write_context
             .logical_data_schema()
             .as_ref()
-            .try_into_arrow()?,
+            .try_into_arrow().map_err(Error::kernel)?,
     ),
     vec![
         Arc::new(StringArray::from(vec!["Dave", "Eve", "Frank"])),
         Arc::new(Int32Array::from(vec![4, 5, 6])),
         Arc::new(StringArray::from(vec!["Austin", "Boston", "Chicago"])),
     ],
-)?;
+).map_err(Error::kernel)?;
 let data = ArrowEngineData::new(batch);
 let file_metadata = engine
     .write_parquet(&data, &write_context)

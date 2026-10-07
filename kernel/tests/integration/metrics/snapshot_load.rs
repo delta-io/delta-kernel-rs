@@ -92,7 +92,7 @@ fn external_snapshot_hint_api_builds_without_storage_io() -> Result<()> {
 
 #[cfg(feature = "internal-api")]
 #[test]
-fn external_snapshot_hint_accepts_parsed_advanced_crc() -> Result<()> {
+fn external_snapshot_hint_accepts_parsed_advanced_crc() -> delta_kernel::KernelResult<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(2).with_crc_at([1]))
         .with_data(1, 1)
@@ -293,7 +293,7 @@ async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> Result<()> {
 // TODO(#2337): re-enable when log compaction is re-enabled
 #[ignore = "log compaction is temporarily disabled (#2337)"]
 #[tokio::test]
-async fn snapshot_with_log_compaction_emits_expected_metrics() -> Result<()> {
+async fn snapshot_with_log_compaction_emits_expected_metrics() -> delta_kernel::KernelResult<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(2))
         .with_schema(simple_schema())
@@ -347,7 +347,7 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> Result<()> {
 /// When a CRC file exists at the target snapshot version, Protocol+Metadata are loaded
 /// directly from it, skipping all JSON log replay. The JSON handler is never called.
 #[tokio::test]
-async fn snapshot_with_crc_at_target_version_skips_json_replay() -> Result<()> {
+async fn snapshot_with_crc_at_target_version_skips_json_replay() -> delta_kernel::KernelResult<()> {
     // The crc-full golden table has commit 0 + a CRC file at version 0.
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/crc-full/"))
         .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;

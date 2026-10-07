@@ -89,7 +89,9 @@ fn replay_for_app_ids(
     log_segment: &LogSegment,
     engine: &dyn Engine,
 ) -> KernelResult<impl Iterator<Item = KernelResult<ActionsBatch>> + Send> {
-    log_segment.read_actions(engine, LOG_TXN_SCHEMA.clone())
+    Ok(log_segment
+        .read_actions(engine, LOG_TXN_SCHEMA.clone())?
+        .map(|result| result.map_err(crate::KernelError::from)))
 }
 
 #[cfg(test)]

@@ -589,7 +589,7 @@ mod tests {
     use crate::unit_test_utils::{
         install_thread_local_metrics_reporter, string_array_to_engine_data, CapturingReporter,
     };
-    use crate::Result;
+    use crate::{Result, ResultExt};
 
     // ============================================================================
     // Helpers
@@ -654,7 +654,11 @@ mod tests {
     }
 
     // Helper: write a compaction file
-    async fn write_compaction_file(store: &InMemory, start: u64, end: u64) -> Result<()> {
+    async fn write_compaction_file(
+        store: &InMemory,
+        start: u64,
+        end: u64,
+    ) -> crate::KernelResult<()> {
         let content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
         store
             .put(
@@ -671,7 +675,7 @@ mod tests {
         engine: Arc<SyncEngine>,
     }
 
-    fn setup_incremental_snapshot_test() -> Result<IncrementalSnapshotTestContext> {
+    fn setup_incremental_snapshot_test() -> crate::KernelResult<IncrementalSnapshotTestContext> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
         let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
@@ -717,7 +721,7 @@ mod tests {
     // ============================================================================
 
     #[test]
-    fn test_try_new_from_empty_log_tail() -> Result<()> {
+    fn test_try_new_from_empty_log_tail() -> crate::KernelResult<()> {
         let table = TestTableBuilder::new().build().unwrap();
         let engine = SyncEngine::new_with_store(table.store().clone());
 
@@ -744,7 +748,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_new_from_latest_commit_preservation() -> Result<()> {
+    async fn test_try_new_from_latest_commit_preservation() -> crate::KernelResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
         let engine = SyncEngine::new_with_store(store.clone());
@@ -834,7 +838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_new_from_version_boundary_cases() -> Result<()> {
+    async fn test_try_new_from_version_boundary_cases() -> crate::KernelResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
         let engine = SyncEngine::new_with_store(store.clone());
@@ -906,7 +910,8 @@ mod tests {
     // ============================================================================
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_skip_new_checkpoints_preserves_checkpoint_history_across_updates() -> Result<()> {
+    async fn test_skip_new_checkpoints_preserves_checkpoint_history_across_updates(
+    ) -> crate::KernelResult<()> {
         // ===== GIVEN =====
         let ctx = setup_incremental_snapshot_test()?;
         let table_root = ctx.url.as_str();
@@ -1039,7 +1044,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_skip_new_checkpoints_preserves_incremental_builder_boundaries() -> Result<()> {
+    async fn test_skip_new_checkpoints_preserves_incremental_builder_boundaries(
+    ) -> crate::KernelResult<()> {
         // ===== GIVEN =====
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 2).await?;
@@ -1097,7 +1103,10 @@ mod tests {
             .expect_err("version 2 does not exist");
 
         // ===== THEN =====
-        assert!(matches!(unavailable, KernelError::MissingVersion(2)));
+        assert!(matches!(
+            unavailable,
+            crate::Error::Kernel(KernelError::MissingVersion(2))
+        ));
 
         // ===== WHEN =====
         commit(
@@ -1116,7 +1125,7 @@ mod tests {
         // ===== THEN =====
         assert!(matches!(
             partially_available,
-            KernelError::MissingVersion(3)
+            crate::Error::Kernel(KernelError::MissingVersion(3))
         ));
 
         Ok(())
@@ -1128,7 +1137,7 @@ mod tests {
         #[values(false, true)] skip_new_checkpoints: bool,
     ) -> Result<()> {
         // ===== GIVEN =====
-        let ctx = setup_incremental_snapshot_test()?;
+        let ctx = setup_incremental_snapshot_test().into_public_result()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?;
         let base = Snapshot::builder_for(ctx.url.as_str())
             .at_version(0)
@@ -1167,7 +1176,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_clears_skipped_new_checkpoints_warning() -> Result<()> {
         // ===== GIVEN =====
-        let ctx = setup_incremental_snapshot_test()?;
+        let ctx = setup_incremental_snapshot_test().into_public_result()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?;
         let base = Snapshot::builder_for(ctx.url.as_str())
             .at_version(0)
@@ -1202,7 +1211,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_skip_new_checkpoints_rejects_missing_history_hidden_by_newer_checkpoint(
-    ) -> Result<()> {
+    ) -> crate::KernelResult<()> {
         // ===== GIVEN =====
         let ctx = setup_incremental_snapshot_test()?;
         let table_root = ctx.url.as_str();
@@ -1235,7 +1244,10 @@ mod tests {
 
         // ===== THEN =====
         let error = updated.expect_err("the missing commit must not be hidden by the checkpoint");
-        assert!(matches!(error, KernelError::MissingVersion(3)));
+        assert!(matches!(
+            error,
+            crate::Error::Kernel(KernelError::MissingVersion(3))
+        ));
 
         Ok(())
     }
@@ -1243,7 +1255,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_snapshot_picks_up_checkpoint_written_at_current_version() -> Result<()>
     {
-        let ctx = setup_incremental_snapshot_test()?;
+        let ctx = setup_incremental_snapshot_test().into_public_result()?;
 
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 2).await?;
 
@@ -1269,7 +1281,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_snapshot_picks_up_newer_checkpoint_below_current_version(
     ) -> Result<()> {
-        let ctx = setup_incremental_snapshot_test()?;
+        let ctx = setup_incremental_snapshot_test().into_public_result()?;
 
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
 
@@ -1303,7 +1315,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_explicit_same_version_request_keeps_existing_snapshot_after_checkpoint_write(
     ) -> Result<()> {
-        let ctx = setup_incremental_snapshot_test()?;
+        let ctx = setup_incremental_snapshot_test().into_public_result()?;
 
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 2).await?;
 
@@ -1337,7 +1349,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_at_or_below_snapshot_version_preserves_pm_from_commits_in_between(
     ) -> Result<()> {
-        let ctx = setup_incremental_snapshot_test()?;
+        let ctx = setup_incremental_snapshot_test().into_public_result()?;
         let table_root = ctx.url.as_str();
 
         // Commit 0: initial protocol (1, 2) + metadata + first file.
@@ -1437,7 +1449,7 @@ mod tests {
     //     iii. commits have (no protocol, new metadata)
     //     iv. commits have (no protocol, no metadata)
     #[tokio::test]
-    async fn test_snapshot_new_from() -> Result<()> {
+    async fn test_snapshot_new_from() -> crate::KernelResult<()> {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -1453,7 +1465,7 @@ mod tests {
             .build(&engine);
         assert!(matches!(
             snapshot_res,
-            Err(KernelError::Generic(msg)) if msg == "Requested snapshot version 0 is older than snapshot hint version 1"
+            Err(crate::Error::Kernel(KernelError::Generic(msg))) if msg == "Requested snapshot version 0 is older than snapshot hint version 1"
         ));
 
         // 2. new version == existing version
@@ -1539,7 +1551,7 @@ mod tests {
             Snapshot::builder_from(base_snapshot.clone())
                 .at_version(1)
                 .build(&engine),
-            Err(KernelError::MissingVersion(1))
+            Err(crate::Error::Kernel(KernelError::MissingVersion(1)))
         ));
 
         // b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
@@ -1607,7 +1619,7 @@ mod tests {
             Snapshot::builder_from(base_snapshot.clone())
                 .at_version(4)
                 .build(&engine),
-            Err(KernelError::MissingVersion(2))
+            Err(crate::Error::Kernel(KernelError::MissingVersion(2)))
         ));
 
         // ii. commits have (new protocol, no metadata)
@@ -1673,7 +1685,7 @@ mod tests {
         #[case] new_ckpt_v: u64,
         #[case] newly_listed_crc_v: Option<u64>,
         #[case] expected_crc_file_v: Option<u64>,
-    ) -> Result<()> {
+    ) -> crate::KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
 
@@ -1750,7 +1762,7 @@ mod tests {
         #[case] mode: IncrementalReplay,
         #[case] expected_crc_v: Option<u64>,
         #[values(false, true)] skip_new_checkpoints: bool,
-    ) -> Result<()> {
+    ) -> crate::KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?;
         ctx.store
@@ -1798,7 +1810,8 @@ mod tests {
     // rebuild would return Metadata from commit 2. `compare_snapshots` catches that on
     // `table_configuration`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_snapshot_drops_stale_crc_preserves_correct_metadata() -> Result<()> {
+    async fn test_incremental_snapshot_drops_stale_crc_preserves_correct_metadata(
+    ) -> crate::KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         let table_root = ctx.url.as_str();
 
@@ -1886,7 +1899,7 @@ mod tests {
     // it would fall back to CRC@v1 and regress to the pre-v2 configuration.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_snapshot_preserves_metadata_when_below_checkpoint_crc_is_stale(
-    ) -> Result<()> {
+    ) -> crate::KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         let table_root = ctx.url.as_str();
 
@@ -1970,8 +1983,8 @@ mod tests {
     // Verifies that a CRC carried through the v5 hop is dropped when the new checkpoint
     // invalidates it, so the rebuilt v10 snapshot has no CRC.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_snapshot_multi_hop_replay_then_rebuild_drops_stale_crc() -> Result<()>
-    {
+    async fn test_incremental_snapshot_multi_hop_replay_then_rebuild_drops_stale_crc(
+    ) -> crate::KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 11).await?;
 
@@ -2019,7 +2032,7 @@ mod tests {
 
     // test new CRC in new log segment (old log segment has old CRC)
     #[tokio::test]
-    async fn test_snapshot_new_from_crc() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_snapshot_new_from_crc() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
         let engine = SyncEngine::new_with_store(store.clone());
@@ -2154,8 +2167,12 @@ mod tests {
 
         // Create commits 0-2 and write compaction files to storage
         setup_test_table_with_commits(table_root, &store, 3).await?;
-        write_compaction_file(&store, 0, 1).await?;
-        write_compaction_file(&store, 0, 2).await?;
+        write_compaction_file(&store, 0, 1)
+            .await
+            .into_public_result()?;
+        write_compaction_file(&store, 0, 2)
+            .await
+            .into_public_result()?;
 
         // Compaction files exist on disk but should be skipped during listing
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -2180,8 +2197,12 @@ mod tests {
 
         // Create commits 0-2 with compaction files in storage
         setup_test_table_with_commits(table_root, &store, 3).await?;
-        write_compaction_file(&store, 0, 1).await?;
-        write_compaction_file(&store, 0, 2).await?;
+        write_compaction_file(&store, 0, 1)
+            .await
+            .into_public_result()?;
+        write_compaction_file(&store, 0, 2)
+            .await
+            .into_public_result()?;
 
         // Build base snapshot at v2
         let snapshot_v2 = Snapshot::builder_for(table_root)
@@ -2229,8 +2250,12 @@ mod tests {
 
         // Create commits 0-3 and compaction files (1,1) and (1,2)
         setup_test_table_with_commits(table_root, &store, 3).await?;
-        write_compaction_file(&store, 1, 1).await?;
-        write_compaction_file(&store, 1, 2).await?;
+        write_compaction_file(&store, 1, 1)
+            .await
+            .into_public_result()?;
+        write_compaction_file(&store, 1, 2)
+            .await
+            .into_public_result()?;
 
         // Build snapshot at v2 (includes both compaction files)
         let snapshot_v2 = Snapshot::builder_for(table_root)
@@ -2285,8 +2310,12 @@ mod tests {
 
         // Create commits 0-3 and compaction files (1,2) and (2,2)
         setup_test_table_with_commits(table_root, &store, 4).await?;
-        write_compaction_file(&store, 1, 2).await?;
-        write_compaction_file(&store, 2, 2).await?;
+        write_compaction_file(&store, 1, 2)
+            .await
+            .into_public_result()?;
+        write_compaction_file(&store, 2, 2)
+            .await
+            .into_public_result()?;
 
         // Build snapshot at v2
         let snapshot_v2 = Snapshot::builder_for(table_root)
@@ -2302,7 +2331,9 @@ mod tests {
         );
 
         // Add new compaction file (1,3) after building the base snapshot
-        write_compaction_file(&store, 1, 3).await?;
+        write_compaction_file(&store, 1, 3)
+            .await
+            .into_public_result()?;
 
         // Build v3 incrementally - the new (1,3) file gets filtered out because
         // the deduplication only looks at start version: 1 <= existing_snapshot_version (2)
@@ -2387,7 +2418,7 @@ mod tests {
         #[case] planted_crc_version: Option<u64>,
         #[case] mode: IncrementalReplay,
         #[case] expected_source: ProtocolMetadataSource,
-    ) -> Result<()> {
+    ) -> crate::KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
         if let Some(v) = planted_crc_version {
@@ -2461,7 +2492,7 @@ mod tests {
         #[case] planted_crc_version: Option<u64>,
         #[case] mode: IncrementalReplay,
         #[case] expected_source: ProtocolMetadataSource,
-    ) -> Result<()> {
+    ) -> crate::KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?;
         let base = Snapshot::builder_for(ctx.url.as_str())
@@ -2496,7 +2527,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_build_no_pm_change_classifies_full_replay() -> Result<()> {
-        let ctx = setup_incremental_snapshot_test()?;
+        let ctx = setup_incremental_snapshot_test().into_public_result()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
 
         let base = Snapshot::builder_for(ctx.url.as_str())
@@ -2518,7 +2549,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_fresh_build_missing_protocol_metadata_emits_failure() -> Result<()> {
-        let ctx = setup_incremental_snapshot_test()?;
+        let ctx = setup_incremental_snapshot_test().into_public_result()?;
         // A commit with only an add action: no protocol or metadata anywhere in the log.
         commit(
             ctx.url.as_str(),
@@ -2553,7 +2584,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_build_replay_error_emits_failure() -> Result<()> {
+    async fn test_incremental_build_replay_error_emits_failure() -> crate::KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?;
         let base = Snapshot::builder_for(ctx.url.as_str())
@@ -2592,7 +2623,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_version_regression_emits_log_segment_load_failure() -> Result<()> {
+    async fn test_incremental_version_regression_emits_log_segment_load_failure(
+    ) -> crate::KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?; // v0..=v5
         let base = Snapshot::builder_for(ctx.url.as_str())
@@ -2608,7 +2640,10 @@ mod tests {
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
         let result = Snapshot::builder_from(base).build(ctx.engine.as_ref());
-        assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
+        assert!(matches!(
+            result,
+            Err(crate::Error::Kernel(KernelError::InvalidLogSegment(_)))
+        ));
 
         let events = reporter.events();
         let failure = events
@@ -2631,7 +2666,8 @@ mod tests {
     // Case C.1: requesting a version beyond the log errors and emits a LogSegmentLoadFailure,
     // matching the fresh path (which also fails a request for an unavailable version).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_unavailable_version_emits_log_segment_load_failure() -> Result<()> {
+    async fn test_incremental_unavailable_version_emits_log_segment_load_failure(
+    ) -> crate::KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?; // v0..=v2
         let base = Snapshot::builder_for(ctx.url.as_str())
@@ -2645,7 +2681,10 @@ mod tests {
         let result = Snapshot::builder_from(base)
             .at_version(5)
             .build(ctx.engine.as_ref());
-        assert!(matches!(result, Err(KernelError::MissingVersion(3))));
+        assert!(matches!(
+            result,
+            Err(crate::Error::Kernel(KernelError::MissingVersion(3)))
+        ));
 
         let events = reporter.events();
         let failure = events
@@ -2669,7 +2708,7 @@ mod tests {
     // load was requested incrementally, so both events must still report Incremental.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_rebuild_reports_incremental_load_type() -> Result<()> {
-        let ctx = setup_incremental_snapshot_test()?;
+        let ctx = setup_incremental_snapshot_test().into_public_result()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
 
         let base = Snapshot::builder_for(ctx.url.as_str())

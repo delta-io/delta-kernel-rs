@@ -120,7 +120,12 @@ pub unsafe extern "C" fn read_parquet_file(
     let engine = unsafe { engine.clone_as_arc() };
     let physical_schema = unsafe { physical_schema.clone_as_arc() };
     let path = unsafe { TryFromStringSlice::try_from_slice(&file.path) };
-    let res = read_parquet_file_impl(engine.clone(), path, file, physical_schema);
+    let res = read_parquet_file_impl(
+        engine.clone(),
+        path.map_err(delta_kernel::KernelError::from),
+        file,
+        physical_schema,
+    );
     res.into_extern_result(&engine.as_ref())
 }
 
@@ -221,7 +226,7 @@ fn evaluate_expression_impl(
     batch: &dyn EngineData,
     evaluator: &dyn ExpressionEvaluator,
 ) -> KernelResult<Handle<ExclusiveEngineData>> {
-    evaluator.evaluate(batch).map(Into::into)
+    Ok(evaluator.evaluate(batch).map(Into::into)?)
 }
 
 #[cfg(test)]

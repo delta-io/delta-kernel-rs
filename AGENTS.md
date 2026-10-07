@@ -322,6 +322,13 @@ Keep this list updated when new protocol features are added to kernel.
 
 ## Code Style
 
+- Public APIs and public iterator items use `Result<T>`, whose error is the top-level `Error`.
+  Private operations use `KernelResult<T>`. Import `ResultExt` and call `.into_public_result()`
+  to explicitly wrap an existing kernel result at a public boundary. When constructing an error
+  at that boundary, wrap it directly in `Error::Kernel(...)`. For foreign errors convertible to
+  `KernelError`, use `.map_err(Error::kernel)`. `From<Error> for KernelError` unwraps the envelope
+  when private code calls a public API with `?`; the reverse conversion is explicit.
+  When a private function returns a public call's result directly, use `Ok(public_call()?)`.
 - Line width is 100 characters. Wrap comments and string literals at 100, not 80.
 - Place `use` imports at the top of the file (for non-test code) or at the top of the
   `mod tests` block (for test code): never inside function bodies.

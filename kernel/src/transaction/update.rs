@@ -50,7 +50,7 @@ use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation}
 use crate::utils::{current_time_ms, require, PhantomType};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::FileMeta;
-use crate::{DataType, Engine, Expression, KernelResult, Result};
+use crate::{DataType, Engine, Expression, KernelResult, Result, ResultExt};
 
 // =============================================================================
 // Update table transactions only
@@ -177,36 +177,39 @@ impl Transaction {
             .effective_table_config
             .is_feature_enabled(&TableFeature::IcebergCompatV3)
         {
-            return Err(KernelError::unsupported(
+            return Err(crate::Error::Kernel(KernelError::unsupported(
                 "Schema changes are not yet supported on tables with icebergCompatV3 enabled",
-            ));
+            )));
         }
         if self
             .effective_table_config
             .is_feature_enabled(&TableFeature::AllowColumnDefaults)
         {
-            return Err(KernelError::unsupported(
+            return Err(crate::Error::Kernel(KernelError::unsupported(
                 "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
-            ));
+            )));
         }
         require!(
             !changes.is_empty(),
-            KernelError::generic("with_schema_changes requires at least one schema operation")
+            crate::Error::Kernel(KernelError::generic(
+                "with_schema_changes requires at least one schema operation"
+            ))
         );
         require!(
             !self.has_data_file_actions(),
-            KernelError::invalid_transaction_state(
+            crate::Error::Kernel(KernelError::invalid_transaction_state(
                 "with_schema_changes must be called before staging data files"
-            )
+            ))
         );
         #[cfg(feature = "adaptive-metadata-in-dev")]
         require!(
             !matches!(self.manifest_write, Some(ManifestWrite::Commit(_))),
-            KernelError::invalid_transaction_state(
+            crate::Error::Kernel(KernelError::invalid_transaction_state(
                 "with_schema_changes cannot be called after staging a manifest commit"
-            )
+            ))
         );
-        self.effective_table_config = evolve_table_config(&self.effective_table_config, changes)?;
+        self.effective_table_config =
+            evolve_table_config(&self.effective_table_config, changes).into_public_result()?;
         self.should_emit_metadata = true;
         Ok(self)
     }
@@ -264,9 +267,9 @@ impl Transaction {
         high_water_mark: i64,
     ) -> Result<Self> {
         if self.provided_row_tracking_high_water_mark.is_some() {
-            return Err(KernelError::generic(
+            return Err(crate::Error::Kernel(KernelError::generic(
                 "Row-tracking high-water mark already specified in this transaction",
-            ));
+            )));
         }
         self.provided_row_tracking_high_water_mark = Some(high_water_mark);
         Ok(self)
@@ -285,19 +288,21 @@ impl Transaction {
     pub fn with_root_manifest_file(mut self, file: FileMeta) -> Result<Self> {
         require!(
             !matches!(self.manifest_write, Some(ManifestWrite::Commit(_))),
-            KernelError::invalid_transaction_state(
+            crate::Error::Kernel(KernelError::invalid_transaction_state(
                 "explicit root manifest and manifest commit are mutually exclusive"
-            )
+            ))
         );
         require!(
             self.effective_table_config
                 .is_feature_supported(&TableFeature::AdaptiveMetadataPreview),
-            KernelError::unsupported(
+            crate::Error::Kernel(KernelError::unsupported(
                 "root manifest file commit requires the adaptiveMetadata-preview feature"
-            )
+            ))
         );
         let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
-            KernelError::internal_error("existing-table transaction unexpectedly has no snapshot")
+            crate::Error::Kernel(KernelError::internal_error(
+                "existing-table transaction unexpectedly has no snapshot",
+            ))
         })?;
         self.manifest_write = Some(ManifestWrite::RootFile(RootManifestFile::new(
             file,
@@ -328,32 +333,35 @@ impl Transaction {
     ) -> Result<&mut ManifestCommitState> {
         match &self.manifest_write {
             Some(ManifestWrite::RootFile(_)) => {
-                return Err(KernelError::invalid_transaction_state(
-                    "explicit root manifest and manifest commit are mutually exclusive",
+                return Err(crate::Error::Kernel(
+                    KernelError::invalid_transaction_state(
+                        "explicit root manifest and manifest commit are mutually exclusive",
+                    ),
                 ))
             }
             // Repeated calls reuse the state from the first call.
             Some(ManifestWrite::Commit(_)) => {}
             None => {
                 let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
-                    KernelError::internal_error(
+                    crate::Error::Kernel(KernelError::internal_error(
                         "existing-table transaction unexpectedly has no snapshot",
-                    )
+                    ))
                 })?;
                 let state = ManifestCommitState::try_new(
                     engine,
                     read_snapshot,
                     self.get_commit_version(),
                     &self.effective_table_config,
-                )?;
+                )
+                .into_public_result()?;
                 self.manifest_write = Some(ManifestWrite::Commit(state));
             }
         }
         match &mut self.manifest_write {
             Some(ManifestWrite::Commit(state)) => Ok(state),
-            _ => Err(KernelError::internal_error(
+            _ => Err(crate::Error::Kernel(KernelError::internal_error(
                 "manifest commit state missing after initialization",
-            )),
+            ))),
         }
     }
 
@@ -492,11 +500,12 @@ impl Transaction {
         existing_data_files: impl Iterator<Item = Result<FilteredEngineData>>,
     ) -> Result<()> {
         if self.is_create_table() {
-            return Err(KernelError::generic(
+            return Err(crate::Error::Kernel(KernelError::generic(
                 "Deletion vector operations require an existing table",
-            ));
+            )));
         }
-        self.ensure_deletion_vectors_enabled()?;
+        self.ensure_deletion_vectors_enabled()
+            .into_public_result()?;
 
         let mut matched_dv_files = 0;
         let mut matched_files = Vec::new();
@@ -538,11 +547,11 @@ impl Transaction {
         }
 
         if matched_dv_files != new_dv_descriptors.len() {
-            return Err(KernelError::generic(format!(
+            return Err(crate::Error::Kernel(KernelError::generic(format!(
                 "Number of matched DV files does not match number of new DV descriptors: {} != {}",
                 matched_dv_files,
                 new_dv_descriptors.len()
-            )));
+            ))));
         }
 
         self.dv_matched_files.extend(matched_files);
@@ -755,6 +764,7 @@ impl<S> Transaction<S> {
                     with_data_change_data,
                     file_metadata_batch.selection_vector().to_vec(),
                 )
+                .map_err(crate::KernelError::from)
             },
         ))
     }
@@ -856,30 +866,30 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 let stats: Option<String> =
                     getters[Self::STATS_INDEX].get_opt(row_index, "stats")?;
                 let stats = stats.ok_or_else(|| {
-                    KernelError::generic(format!(
+                    crate::Error::Kernel(KernelError::generic(format!(
                         "update_deletion_vectors: file {path} has no stats; \
                          deletion vectors require an accurate {NUM_RECORDS}"
-                    ))
+                    )))
                 })?;
                 let mut parsed: serde_json::Value = serde_json::from_str(&stats).map_err(|e| {
-                    KernelError::generic(format!(
+                    crate::Error::Kernel(KernelError::generic(format!(
                         "update_deletion_vectors: stats for {path} is not valid JSON: {e}"
-                    ))
+                    )))
                 })?;
                 let stats_obj = parsed.as_object_mut().ok_or_else(|| {
-                    KernelError::generic(format!(
+                    crate::Error::Kernel(KernelError::generic(format!(
                         "update_deletion_vectors: stats for {path} is not a JSON object"
-                    ))
+                    )))
                 })?;
                 if stats_obj
                     .get(NUM_RECORDS)
                     .and_then(serde_json::Value::as_u64)
                     .is_none()
                 {
-                    return Err(KernelError::generic(format!(
+                    return Err(crate::Error::Kernel(KernelError::generic(format!(
                         "update_deletion_vectors: stats for {path} is missing {NUM_RECORDS} \
                          or it is not a non-negative integer"
-                    )));
+                    ))));
                 }
 
                 // Widen tightBounds to false (unless already false) instead of recomputing the
@@ -893,9 +903,9 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 } else {
                     stats_obj.insert(TIGHT_BOUNDS.to_string(), serde_json::Value::Bool(false));
                     serde_json::to_string(&parsed).map_err(|e| {
-                        KernelError::generic(format!(
+                        crate::Error::Kernel(KernelError::generic(format!(
                             "update_deletion_vectors: failed to re-serialize stats for {path}: {e}"
-                        ))
+                        )))
                     })?
                 };
                 let deletion_vector = Scalar::Struct(StructData::try_new(

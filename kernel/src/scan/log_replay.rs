@@ -31,7 +31,7 @@ use crate::schema::{
 use crate::struct_patch::{project_struct_preserving_nulls, ProjectionStructPatchBuilder};
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
-use crate::{Engine, ExpressionEvaluator, KernelError, KernelResult, Result};
+use crate::{Engine, ExpressionEvaluator, KernelError, KernelResult, Result, ResultExt};
 
 /// Read-time stats toggles consumed by [`ScanLogReplayProcessor`].
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -426,7 +426,9 @@ impl ScanLogReplayProcessor {
             skip_row_transforms,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state).map_err(|e| {
-            KernelError::generic(format!("Failed to serialize internal state: {e}"))
+            crate::Error::Kernel(KernelError::generic(format!(
+                "Failed to serialize internal state: {e}"
+            )))
         })?;
 
         Ok(SerializableScanState {
@@ -458,18 +460,18 @@ impl ScanLogReplayProcessor {
     ) -> Result<Self> {
         // Deserialize internal state from json
         let internal_state: InternalScanState = serde_json::from_slice(&state.internal_state_blob)
-            .map_err(KernelError::MalformedJson)?;
+            .map_err(|error| crate::Error::Kernel(KernelError::MalformedJson(error)))?;
         if let Some(schemas) = &internal_state.physical_stats_schemas {
-            schemas.validate()?;
+            schemas.validate().into_public_result()?;
         }
 
         // Reconstruct PhysicalPredicate from predicate and predicate schema
         let physical_predicate = match state.predicate {
             Some(predicate) => {
                 let Some(predicate_schema) = internal_state.predicate_schema else {
-                    return Err(KernelError::generic(
+                    return Err(crate::Error::Kernel(KernelError::generic(
                         "Invalid serialized internal state. Expected predicate schema.",
-                    ));
+                    )));
                 };
                 PhysicalPredicate::Some(predicate, predicate_schema)
             }
@@ -498,6 +500,7 @@ impl ScanLogReplayProcessor {
             internal_state.stats_options,
             internal_state.partition_values_options,
         )
+        .into_public_result()
     }
 
     fn transform_and_data_skip(
@@ -777,15 +780,17 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         let expected_getters = if is_log_batch { 12 } else { 8 };
         require!(
             getters.len() == expected_getters,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of AddRemoveDedupVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
 
         for row in 0..row_count {
             let selected = self.selection_vector[row];
-            self.selection_vector[row] = self.is_valid_add(row, getters, selected)?;
+            self.selection_vector[row] = self
+                .is_valid_add(row, getters, selected)
+                .into_public_result()?;
         }
 
         self.metrics
@@ -1027,9 +1032,9 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         } = actions_batch;
         require!(
             !is_log_batch,
-            KernelError::generic(
+            crate::Error::Kernel(KernelError::generic(
                 "Parallel checkpoint processor may only be applied to checkpoint files"
-            )
+            ))
         );
 
         let mut should_retry_transform_and_data_skip = false;
@@ -1047,7 +1052,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(crate::Error::Kernel(err)),
             };
 
         // Step 2: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
@@ -1056,7 +1061,8 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             Self::ADD_PATH_INDEX,
             Self::ADD_SIZE_INDEX,
             Self::ADD_DV_START_INDEX,
-        )?;
+        )
+        .into_public_result()?;
         let (dedup_selection, row_transform_exprs, active_add_file_sizes) = {
             let mut visitor = AddRemoveDedupVisitor::new(
                 deduplicator,
@@ -1087,19 +1093,22 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                 dedup_selection,
                 row_transform_exprs,
                 active_add_file_sizes,
-            )?
+            )
+            .into_public_result()?
         } else {
             RetryTransformAndDataSkipOutput {
-                transformed_actions: pre_dedup_transform_result?,
+                transformed_actions: pre_dedup_transform_result.into_public_result()?,
                 final_selection: dedup_selection,
                 row_transform_exprs,
                 active_add_file_sizes,
             }
         };
-        self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
+        self.record_selected_add_files(&final_selection, &active_add_file_sizes)
+            .into_public_result()?;
         let transformed_actions = self.project_stats_output(transformed_actions)?;
         let scan_metadata =
-            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
+            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)
+                .into_public_result()?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)
@@ -1150,7 +1159,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(crate::Error::Kernel(err)),
             };
 
         // Step 2: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
@@ -1193,19 +1202,22 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                 dedup_selection,
                 row_transform_exprs,
                 active_add_file_sizes,
-            )?
+            )
+            .into_public_result()?
         } else {
             RetryTransformAndDataSkipOutput {
-                transformed_actions: pre_dedup_transform_result?,
+                transformed_actions: pre_dedup_transform_result.into_public_result()?,
                 final_selection: dedup_selection,
                 row_transform_exprs,
                 active_add_file_sizes,
             }
         };
-        self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
+        self.record_selected_add_files(&final_selection, &active_add_file_sizes)
+            .into_public_result()?;
         let transformed_actions = self.project_stats_output(transformed_actions)?;
         let scan_metadata =
-            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
+            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)
+                .into_public_result()?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)
@@ -1250,7 +1262,12 @@ pub(crate) fn scan_action_iter(
         partition_values_options,
     )?;
     let metrics = processor.metrics.clone();
-    Ok((processor.process_actions_iter(action_iter), metrics))
+    Ok((
+        processor
+            .process_actions_iter(action_iter.map(ResultExt::into_public_result))
+            .map(|result| result.map_err(KernelError::from)),
+        metrics,
+    ))
 }
 
 #[cfg(test)]
@@ -1308,10 +1325,10 @@ mod tests {
         fn evaluate(&self, batch: &dyn EngineData) -> Result<Box<dyn EngineData>> {
             std::thread::sleep(self.delay);
             if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
-                Err(KernelError::ParseError(
+                Err(crate::Error::Kernel(KernelError::ParseError(
                     "retry".to_string(),
                     DataType::STRING,
-                ))
+                )))
             } else {
                 self.inner.evaluate(batch)
             }
@@ -1614,7 +1631,9 @@ mod tests {
     #[case::supported_not_enabled(RowTrackingState::SupportedNotEnabled)]
     #[case::enabled(RowTrackingState::Enabled)]
     #[case::suspended(RowTrackingState::Suspended)]
-    fn test_row_commit_version_patch(#[case] row_tracking_state: RowTrackingState) -> Result<()> {
+    fn test_row_commit_version_patch(
+        #[case] row_tracking_state: RowTrackingState,
+    ) -> crate::KernelResult<()> {
         let schema: SchemaRef = schema_ref! { nullable "value": INTEGER };
         let state_info = get_state_info(
             schema,
@@ -2081,7 +2100,7 @@ mod tests {
         obj["new_field"] = serde_json::json!("my_new_value");
         let invalid_blob = obj.to_string();
 
-        let res: Result<InternalScanState, _> = serde_json::from_str(&invalid_blob);
+        let res: std::result::Result<InternalScanState, _> = serde_json::from_str(&invalid_blob);
         assert_result_error_with_message(res, "unknown field");
     }
 
@@ -2098,7 +2117,8 @@ mod tests {
         obj["new_field"] = serde_json::json!("my_new_value");
         let invalid_blob = obj.to_string();
 
-        let res: Result<SerializableScanState, _> = serde_json::from_str(&invalid_blob);
+        let res: std::result::Result<SerializableScanState, _> =
+            serde_json::from_str(&invalid_blob);
         assert_result_error_with_message(res, "unknown field");
     }
 

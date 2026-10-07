@@ -60,7 +60,11 @@ impl CheckpointManifestReader {
             }
         };
 
-        let actions = Box::new(actions.map_ok(|batch_res| ActionsBatch::new(batch_res, false)));
+        let actions = Box::new(
+            actions
+                .map_ok(|batch_res| ActionsBatch::new(batch_res, false))
+                .map(|result| result.map_err(KernelError::from)),
+        );
         Ok(Self {
             actions,
             sidecar_visitor: SidecarVisitor::default(),
@@ -121,7 +125,7 @@ mod tests {
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::schema::schema_ref;
     use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
-    use crate::{Result, SnapshotRef};
+    use crate::SnapshotRef;
 
     /// Helper function to test manifest phase with expected add paths and sidecars
     fn verify_manifest_phase(
@@ -129,7 +133,7 @@ mod tests {
         snapshot: SnapshotRef,
         expected_add_paths: &[&str],
         expected_sidecars: &[&str],
-    ) -> Result<()> {
+    ) -> crate::KernelResult<()> {
         let log_segment = snapshot.log_segment();
         let log_root = log_segment.log_root.clone();
         assert_eq!(log_segment.listed.checkpoint_parts.len(), 1);
@@ -202,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_phase_extracts_file_paths() -> Result<()> {
+    fn test_manifest_phase_extracts_file_paths() -> crate::KernelResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("with_checkpoint_no_last_checkpoint")?;
         verify_manifest_phase(
             engine,
@@ -213,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_phase_early_finalize_error() -> Result<()> {
+    fn test_manifest_phase_early_finalize_error() -> crate::KernelResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("with_checkpoint_no_last_checkpoint")?;
 
         let manifest_phase = CheckpointManifestReader::try_new(
@@ -232,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_phase_collects_sidecars() -> Result<()> {
+    fn test_manifest_phase_collects_sidecars() -> crate::KernelResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
         verify_manifest_phase(
             engine,
@@ -246,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_phase_collects_sidecars_parquet() -> Result<()> {
+    fn test_manifest_phase_collects_sidecars_parquet() -> crate::KernelResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-parquet-with-sidecars")?;
         verify_manifest_phase(
             engine,

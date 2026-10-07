@@ -25,7 +25,7 @@ use delta_kernel::schema::{
     DataType as KernelDataType, PrimitiveType, SchemaRef as KernelSchemaRef, StructField,
     StructType,
 };
-use delta_kernel::{EngineData, KernelError, KernelResult, Result};
+use delta_kernel::{EngineData, KernelError, KernelResult, Result, ResultExt};
 
 use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
@@ -53,40 +53,47 @@ pub fn to_df_expr(
 ) -> Result<DFExpr> {
     match expr {
         KernelExpression::Literal(scalar) => Ok(lit(to_df_scalar(scalar)?)),
-        KernelExpression::Column(name) => column_to_df_expr(name, input_schema),
-        KernelExpression::Binary(binary) => binary_expr_to_df_expr(binary, input_schema),
+        KernelExpression::Column(name) => {
+            column_to_df_expr(name, input_schema).into_public_result()
+        }
+        KernelExpression::Binary(binary) => {
+            binary_expr_to_df_expr(binary, input_schema).into_public_result()
+        }
         KernelExpression::Variadic(variadic) => {
-            variadic_to_df_expr(variadic, input_schema, output_type)
+            variadic_to_df_expr(variadic, input_schema, output_type).into_public_result()
         }
         KernelExpression::Predicate(pred) => to_df_predicate_expr(pred, input_schema),
         KernelExpression::Struct(fields, nullability) => {
             struct_to_df_expr(fields, nullability.as_ref(), input_schema, output_type)
+                .into_public_result()
         }
         KernelExpression::StructPatch(patch) => {
-            struct_patch_to_df_expr(patch, input_schema, output_type)
+            struct_patch_to_df_expr(patch, input_schema, output_type).into_public_result()
         }
         KernelExpression::MapToStruct(map_to_struct) => {
-            map_to_struct_to_df_expr(map_to_struct, input_schema, output_type)
+            map_to_struct_to_df_expr(map_to_struct, input_schema, output_type).into_public_result()
         }
-        KernelExpression::ParseJson(parse) => parse_json_to_df_expr(parse, input_schema),
+        KernelExpression::ParseJson(parse) => {
+            parse_json_to_df_expr(parse, input_schema).into_public_result()
+        }
 
         KernelExpression::Unary(u) => match u.op {
-            UnaryExpressionOp::ToJson => Err(KernelError::unsupported(
-                "converting the ToJson expression is not yet supported",
+            UnaryExpressionOp::ToJson => Err(delta_kernel::Error::Kernel(
+                KernelError::unsupported("converting the ToJson expression is not yet supported"),
             )),
         },
 
         // TODO(#3007): implement once kernel's Cast semantics are clarified.
-        KernelExpression::Cast(_) => Err(KernelError::unsupported(
+        KernelExpression::Cast(_) => Err(delta_kernel::Error::Kernel(KernelError::unsupported(
             "converting a Cast expression is not yet supported",
-        )),
-
-        KernelExpression::Opaque(_) => Err(KernelError::unsupported(
-            "cannot convert an engine-defined Opaque expression",
-        )),
-        KernelExpression::Unknown(name) => Err(KernelError::unsupported(format!(
-            "cannot convert Unknown expression {name:?}"
         ))),
+
+        KernelExpression::Opaque(_) => Err(delta_kernel::Error::Kernel(KernelError::unsupported(
+            "cannot convert an engine-defined Opaque expression",
+        ))),
+        KernelExpression::Unknown(name) => Err(delta_kernel::Error::Kernel(
+            KernelError::unsupported(format!("cannot convert Unknown expression {name:?}")),
+        )),
     }
 }
 
@@ -155,7 +162,7 @@ fn variadic_to_df_expr(
             None => None,
         },
     };
-    let args: KernelResult<Vec<DFExpr>> = variadic
+    let args: Result<Vec<DFExpr>> = variadic
         .exprs
         .iter()
         .map(|e| to_df_expr(e, input_schema, arg_output_type))
@@ -512,11 +519,17 @@ impl ScalarUDFImpl for KernelMapToStructUdf {
         &self.signature
     }
 
-    fn return_type(&self, _arg_types: &[ArrowDataType]) -> Result<ArrowDataType, DataFusionError> {
+    fn return_type(
+        &self,
+        _arg_types: &[ArrowDataType],
+    ) -> std::result::Result<ArrowDataType, DataFusionError> {
         Ok(self.return_type.clone())
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
+    fn invoke_with_args(
+        &self,
+        args: ScalarFunctionArgs,
+    ) -> std::result::Result<ColumnarValue, DataFusionError> {
         let num_rows = args.number_rows;
         let [map] = take_function_args(self.name(), args.args)?;
         let batch = RecordBatch::try_from_iter([("map", map.into_array(num_rows)?)])?;
@@ -598,11 +611,17 @@ impl ScalarUDFImpl for ParseJsonUdf {
         &self.signature
     }
 
-    fn return_type(&self, _arg_types: &[ArrowDataType]) -> Result<ArrowDataType, DataFusionError> {
+    fn return_type(
+        &self,
+        _arg_types: &[ArrowDataType],
+    ) -> std::result::Result<ArrowDataType, DataFusionError> {
         Ok(self.return_type.clone())
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
+    fn invoke_with_args(
+        &self,
+        args: ScalarFunctionArgs,
+    ) -> std::result::Result<ColumnarValue, DataFusionError> {
         let num_rows = args.number_rows;
         let [json] = take_function_args(self.name(), args.args)?;
         let json = json.into_array(num_rows)?;

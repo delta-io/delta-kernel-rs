@@ -11,7 +11,7 @@ use delta_kernel::{Engine, Result, Snapshot, Version};
 use test_utils::create_default_engine;
 use url::Url;
 
-fn setup_test(rel_path: &str) -> Result<(Url, Arc<dyn Engine>), Box<dyn Error>> {
+fn setup_test(rel_path: &str) -> std::result::Result<(Url, Arc<dyn Engine>), Box<dyn Error>> {
     let abs = std::fs::canonicalize(PathBuf::from(rel_path))?;
     let url =
         Url::from_directory_path(&abs).map_err(|()| format!("could not build URL from {abs:?}"))?;
@@ -49,7 +49,7 @@ fn reads_all_commits_in_requested_order(
     #[case] ordering: Option<CommitOrdering>,
     #[case] snapshot_version: Version,
     #[case] expected_per_commit: Vec<(Version, Vec<usize>)>,
-) -> Result<(), Box<dyn Error>> {
+) -> std::result::Result<(), Box<dyn Error>> {
     let (url, engine) = setup_test("./tests/data/table-with-dv-small")?;
 
     let anchor_snapshot = Snapshot::builder_for(url.as_str())

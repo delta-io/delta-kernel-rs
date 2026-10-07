@@ -35,7 +35,7 @@ async fn write_parquet_file(
     table_url: &url::Url,
     file_suffix: &str,
     data: &delta_kernel::arrow::record_batch::RecordBatch,
-) -> Result<(String, usize), Box<dyn std::error::Error>> {
+) -> std::result::Result<(String, usize), Box<dyn std::error::Error>> {
     use delta_kernel::object_store::path::Path as ObjectStorePath;
 
     let parquet_data = record_batch_to_bytes(data);
@@ -64,7 +64,7 @@ fn count_total_scan_rows(
 fn test_table_scan(
     #[case] table_path: &str,
     #[case] expected_rows: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from(table_path))?;
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = test_utils::create_default_engine(&url)?;
@@ -84,7 +84,7 @@ fn verify_sorted_scan_results(
     batches: Vec<delta_kernel::arrow::record_batch::RecordBatch>,
     expected_ids: Vec<i32>,
     expected_values: &[&str],
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     use delta_kernel::arrow::array::{Array, Int32Array, StringArray};
 
     // Extract actual ids and values from batches
@@ -139,7 +139,8 @@ fn verify_sorted_scan_results(
 /// 5. Commits the deletion vectors in a transaction
 /// 6. Verifies that scanning only returns non-deleted rows
 #[tokio::test]
-async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_write_deletion_vectors_end_to_end(
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     // Create a table schema with id and value columns
@@ -312,7 +313,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     // Collect all rows to verify content
     let batches: Vec<_> = stream
         .map(|result| result.map(into_record_batch))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     // Verify the correct rows remain
     // File 1: all except 1, 2, 5, 7 => 0, 3, 4, 6, 8, 9
@@ -335,7 +336,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dv_update_stats_tight_bound(
     #[case] initial_tight_bounds: Option<bool>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Nested schema: a `point` struct with two leaf columns.
     let schema = schema_ref! {
         nullable "point": { nullable "x": INTEGER, nullable "y": INTEGER },

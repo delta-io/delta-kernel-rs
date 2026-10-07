@@ -188,9 +188,9 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
                     .map(|e| e.enter())
             })
             .ok_or_else(|| {
-                delta_kernel::KernelError::generic(
+                delta_kernel::Error::Kernel(delta_kernel::KernelError::generic(
                     "FFIUCCommitter can only be used with the default engine",
-                )
+                ))
             })?;
         self.inner.commit(engine, actions, commit_metadata)
     }

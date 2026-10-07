@@ -15,12 +15,27 @@ use crate::Version;
 
 /// An error returned by a Delta Kernel operation.
 #[derive(Debug, thiserror::Error)]
-// TODO(#2630): Remove non_exhaustive once Delta and Engine variants are introduced.
-#[non_exhaustive]
 pub enum Error {
     /// A failure represented by a kernel implementation error.
     #[error(transparent)]
     Kernel(KernelError),
+}
+
+impl Error {
+    /// Converts `error` into a [`KernelError`] and returns it wrapped in [`Error::Kernel`].
+    ///
+    /// Uses the input type's conversion, preserving existing error sources and backtraces.
+    pub fn kernel(error: impl Into<KernelError>) -> Self {
+        Self::Kernel(error.into())
+    }
+}
+
+impl From<Error> for KernelError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::Kernel(error) => error,
+        }
+    }
 }
 
 /// Details of a failed conversion from a scalar into a Rust value.
@@ -93,11 +108,35 @@ pub(crate) fn add_scalar_path_context(
     }
 }
 
-/// A [`std::result::Result`] that has the kernel [`KernelError`] as the error variant
-pub type Result<T, E = KernelError> = std::result::Result<T, E>;
+/// A result whose error is the public [`Error`].
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// A result whose error is a [`KernelError`].
 pub type KernelResult<T> = std::result::Result<T, KernelError>;
+
+/// Explicit conversion of a result into the public error contract.
+///
+/// Failures must be explicitly classified at public API boundaries:
+///
+/// ```compile_fail,E0277
+/// use delta_kernel::{KernelResult, Result};
+///
+/// fn public_operation(result: KernelResult<()>) -> Result<()> {
+///     result?;
+///     Ok(())
+/// }
+/// ```
+pub trait ResultExt<T> {
+    /// Consumes this result, preserving success values and wrapping failures in the corresponding
+    /// variant of [`Error`].
+    fn into_public_result(self) -> Result<T>;
+}
+
+impl<T> ResultExt<T> for KernelResult<T> {
+    fn into_public_result(self) -> Result<T> {
+        self.map_err(Error::Kernel)
+    }
+}
 
 /// A boxed, `Send` iterator of [`KernelResult<T>`] items.
 pub type KernelResultIterator<'a, T> = Box<dyn Iterator<Item = KernelResult<T>> + Send + 'a>;

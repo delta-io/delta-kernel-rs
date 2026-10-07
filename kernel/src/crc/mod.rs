@@ -18,6 +18,8 @@
 
 use std::collections::HashSet;
 
+use crate::ResultExt;
+
 mod delta;
 mod file_size_histogram;
 mod file_stats;
@@ -156,7 +158,7 @@ impl Crc {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit_opt,
         };
-        crc.validate()?;
+        crc.validate().into_public_result()?;
         Ok(crc)
     }
 
@@ -190,7 +192,10 @@ impl Crc {
 /// Refuses to serialize a degraded (non-`Complete`) CRC, so an invalid state can never
 /// round-trip through disk.
 impl Serialize for Crc {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         CrcRaw::try_from(self)
             .map_err(serde::ser::Error::custom)?
             .serialize(serializer)
@@ -261,7 +266,7 @@ impl Crc {
     /// Returns an error for malformed JSON or invalid counts, statistics, or histogram fields.
     #[internal_api]
     pub(crate) fn try_from_json_bytes(bytes: &[u8], version: Version) -> Result<Self> {
-        let raw: CrcRaw = serde_json::from_slice(bytes)?;
+        let raw: CrcRaw = serde_json::from_slice(bytes).map_err(crate::Error::kernel)?;
         // Per the Delta protocol spec, numMetadata and numProtocol MUST be 1 in any CRC file.
         // Reject malformed files at the deserialization boundary so callers can trust the value.
         for (name, value) in [
@@ -269,9 +274,9 @@ impl Crc {
             ("numProtocol", raw.num_protocol),
         ] {
             if value != 1 {
-                return Err(KernelError::generic(format!(
+                return Err(crate::Error::Kernel(KernelError::generic(format!(
                     "CRC file has invalid {name}: expected 1, got {value}"
-                )));
+                ))));
             }
         }
         for (name, value) in [
@@ -279,9 +284,9 @@ impl Crc {
             ("tableSizeBytes", raw.table_size_bytes),
         ] {
             if value < 0 {
-                return Err(KernelError::generic(format!(
+                return Err(crate::Error::Kernel(KernelError::generic(format!(
                     "CRC file has invalid {name}: expected a non-negative value, got {value}"
-                )));
+                ))));
             }
         }
         let file_stats_state = FileStatsState::Complete(FileStats::try_new(
@@ -309,7 +314,8 @@ impl Crc {
             raw.num_deletion_vectors_opt,
             raw.deleted_record_counts_histogram_opt
                 .map(TryInto::try_into)
-                .transpose()?,
+                .transpose()
+                .into_public_result()?,
             #[cfg(feature = "adaptive-metadata-in-dev")]
             raw.last_manifest_commit,
         )
@@ -319,7 +325,7 @@ impl Crc {
 /// Fails for non-`Complete` file stats: a degraded CRC has no well-defined on-disk shape.
 impl TryFrom<&Crc> for CrcRaw {
     type Error = KernelError;
-    fn try_from(crc: &Crc) -> Result<Self, Self::Error> {
+    fn try_from(crc: &Crc) -> KernelResult<Self> {
         crc.validate()?;
         let FileStatsState::Complete(stats) = &crc.file_stats_state else {
             return Err(KernelError::ChecksumWriteUnsupported(format!(
@@ -364,7 +370,7 @@ impl TryFrom<&Crc> for CrcRaw {
 /// ensuring malformed CRC files are rejected rather than causing panics later.
 fn de_validated_file_size_histogram<'de, D>(
     deserializer: D,
-) -> Result<Option<FileSizeHistogram>, D::Error>
+) -> std::result::Result<Option<FileSizeHistogram>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -541,7 +547,7 @@ struct DerivedDeletionStats {
 impl TryFrom<&[Add]> for DerivedDeletionStats {
     type Error = KernelError;
 
-    fn try_from(files: &[Add]) -> Result<Self> {
+    fn try_from(files: &[Add]) -> KernelResult<Self> {
         let cardinalities = || {
             files.iter().map(|add| {
                 add.deletion_vector
@@ -549,15 +555,21 @@ impl TryFrom<&[Add]> for DerivedDeletionStats {
                     .map_or(0, |deletion_vector| deletion_vector.cardinality)
             })
         };
-        let histogram = DeletedRecordCountsHistogram::try_from_cardinalities(cardinalities())?;
-        let deleted_records = checked_sum("allFiles deleted-record total", cardinalities())?;
+        let histogram = DeletedRecordCountsHistogram::try_from_cardinalities(cardinalities())
+            .into_public_result()?;
+        let deleted_records =
+            checked_sum("allFiles deleted-record total", cardinalities()).into_public_result()?;
         let deletion_vectors = i64::try_from(
             files
                 .iter()
                 .filter(|add| add.deletion_vector.is_some())
                 .count(),
         )
-        .map_err(|_| KernelError::generic("allFiles deletion-vector count exceeds i64"))?;
+        .map_err(|_| {
+            crate::Error::Kernel(KernelError::generic(
+                "allFiles deletion-vector count exceeds i64",
+            ))
+        })?;
         Ok(Self {
             deleted_records,
             deletion_vectors,
@@ -616,8 +628,8 @@ struct DeletedRecordCountsHistogramRaw {
 impl TryFrom<DeletedRecordCountsHistogramRaw> for DeletedRecordCountsHistogram {
     type Error = KernelError;
 
-    fn try_from(value: DeletedRecordCountsHistogramRaw) -> Result<Self> {
-        Self::try_new(value.deleted_record_counts.into())
+    fn try_from(value: DeletedRecordCountsHistogramRaw) -> KernelResult<Self> {
+        Ok(Self::try_new(value.deleted_record_counts.into())?)
     }
 }
 
@@ -628,7 +640,7 @@ impl DeletedRecordCountsHistogram {
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn try_new(deleted_record_counts: Vec<i64>) -> Result<Self> {
-        Self::validate(&deleted_record_counts)?;
+        Self::validate(&deleted_record_counts).into_public_result()?;
         Ok(Self {
             deleted_record_counts,
         })
@@ -656,7 +668,7 @@ impl DeletedRecordCountsHistogram {
             };
             bins[bin] += 1;
         }
-        Self::try_new(bins)
+        Ok(Self::try_new(bins)?)
     }
 
     fn validate(deleted_record_counts: &[i64]) -> KernelResult<()> {

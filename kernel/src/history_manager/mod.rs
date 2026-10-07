@@ -35,7 +35,7 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
 use crate::utils::require;
-use crate::{Engine, KernelError as DeltaError, KernelResult, Result, Version};
+use crate::{Engine, KernelError as DeltaError, KernelResult, Result, ResultExt, Version};
 
 pub(crate) mod search;
 
@@ -114,7 +114,7 @@ fn get_timestamp_search_bounds(
     snapshot: &Snapshot,
     log_segment: &LogSegment,
     timestamp: Timestamp,
-) -> Result<TimestampSearchBounds, LogHistoryError> {
+) -> std::result::Result<TimestampSearchBounds, LogHistoryError> {
     debug_assert!(log_segment.end_version == snapshot.version());
     let table_config = snapshot.table_configuration();
 
@@ -215,7 +215,7 @@ fn linear_search_file_mod_timestamps(
     commits: &[ParsedLogPath],
     timestamp: Timestamp,
     bound: Bound,
-) -> Result<CommitAt, LogHistoryError> {
+) -> std::result::Result<CommitAt, LogHistoryError> {
     if commits.is_empty() {
         return Err(LogHistoryError::out_of_range(
             timestamp,
@@ -287,7 +287,7 @@ fn binary_search_ict_timestamps(
     timestamp: Timestamp,
     bound: Bound,
     engine: &dyn Engine,
-) -> Result<CommitAt, LogHistoryError> {
+) -> std::result::Result<CommitAt, LogHistoryError> {
     if commits.is_empty() {
         return Err(LogHistoryError::out_of_range(
             timestamp,
@@ -303,11 +303,12 @@ fn binary_search_ict_timestamps(
         hi_version, "ICT binary search over version range"
     );
 
-    let commit_to_ict = |commit: &ParsedLogPath| -> Result<Timestamp, LogHistoryError> {
-        commit
-            .read_in_commit_timestamp(engine)
-            .map_err(|e| LogHistoryError::internal("failed to read in-commit timestamp", e))
-    };
+    let commit_to_ict =
+        |commit: &ParsedLogPath| -> std::result::Result<Timestamp, LogHistoryError> {
+            commit
+                .read_in_commit_timestamp(engine)
+                .map_err(|e| LogHistoryError::internal("failed to read in-commit timestamp", e))
+        };
 
     match binary_search_by_key_with_bounds(commits, timestamp, commit_to_ict, bound) {
         Ok(idx) => {
@@ -384,12 +385,15 @@ pub(crate) fn timestamp_to_version(
     timestamp: Timestamp,
     bound: Bound,
     resolved_commit_type: HistoryCommitType,
-) -> Result<CommitAt, LogHistoryError> {
+) -> std::result::Result<CommitAt, LogHistoryError> {
     // Short-circuit: compare against snapshot's timestamp to avoid log segment rebuild.
     // This optimization mirrors Delta Spark and Java Kernel behavior.
-    let snap_ts = snapshot
-        .get_timestamp(engine)
-        .map_err(|e| LogHistoryError::internal("failed to get snapshot timestamp", e))?;
+    let snap_ts = snapshot.get_timestamp(engine).map_err(|e| {
+        LogHistoryError::internal(
+            "failed to get snapshot timestamp",
+            crate::KernelError::from(e),
+        )
+    })?;
     match (timestamp.cmp(&snap_ts), bound) {
         // Exact match: snapshot version satisfies both bounds
         (Ordering::Equal, _) => return Ok(CommitAt::new(snapshot.version(), snap_ts)),
@@ -429,8 +433,11 @@ pub(crate) fn timestamp_to_version(
                 HistoryCommitType::Recreatable,
             )
             .map_err(|e| match e {
-                DeltaError::LogHistory(inner) => *inner,
-                _ => LogHistoryError::internal("failed to get earliest commit", e),
+                crate::Error::Kernel(DeltaError::LogHistory(inner)) => *inner,
+                _ => LogHistoryError::internal(
+                    "failed to get earliest commit",
+                    crate::KernelError::from(e),
+                ),
             })?;
             let limit = snapshot
                 .version()
@@ -541,7 +548,7 @@ pub fn latest_version_as_of(
         Bound::GreatestLower,
         resolved_commit_type,
     )
-    .map_err(Into::into)
+    .map_err(crate::Error::kernel)
 }
 
 /// Gets the first [`CommitAt`] (version and timestamp) with a timestamp at or after `timestamp`.
@@ -582,7 +589,7 @@ pub fn first_version_after(
         Bound::LeastUpper,
         resolved_commit_type,
     )
-    .map_err(Into::into)
+    .map_err(crate::Error::kernel)
 }
 
 /// Converts a timestamp range to a corresponding version range.
@@ -639,11 +646,12 @@ pub fn timestamp_range_to_versions(
         // The `start_timestamp` must be no greater than the `end_timestamp`.
         require!(
             start_timestamp <= end_timestamp,
-            LogHistoryError::InvalidTimestampRange {
-                start_timestamp,
-                end_timestamp
-            }
-            .into()
+            crate::Error::Kernel(crate::KernelError::from(
+                LogHistoryError::InvalidTimestampRange {
+                    start_timestamp,
+                    end_timestamp
+                }
+            ))
         );
     }
 
@@ -687,7 +695,8 @@ pub fn timestamp_range_to_versions(
 
             Ok(end_version)
         })
-        .transpose()?;
+        .transpose()
+        .into_public_result()?;
 
     Ok((start_version, end_version))
 }
@@ -897,10 +906,12 @@ pub fn get_earliest_commit(
             engine,
             log_root,
             earliest_ratified_commit_version,
-        ),
+        )
+        .into_public_result(),
 
         HistoryCommitType::Recreatable => {
             get_earliest_recreatable_commit(engine, log_root, earliest_ratified_commit_version)
+                .into_public_result()
         }
     }
 }
@@ -1597,7 +1608,7 @@ mod tests {
     async fn test_timestamp_range_to_versions(
         #[case] start: Timestamp,
         #[case] end: Option<Timestamp>,
-        #[case] expected: Result<(Version, Option<Version>), ()>,
+        #[case] expected: std::result::Result<(Version, Option<Version>), ()>,
     ) {
         let timestamps = [
             (50, None),
@@ -1637,7 +1648,7 @@ mod tests {
         assert!(
             matches!(
                 res,
-                Err(crate::KernelError::LogHistory(ref e))
+                Err(crate::Error::Kernel(crate::KernelError::LogHistory(ref e)))
                     if matches!(**e, LogHistoryError::InvalidTimestampRange { .. })
             ),
             "{res:?}"
@@ -1664,7 +1675,7 @@ mod tests {
         assert!(
             matches!(
                 res,
-                Err(crate::KernelError::LogHistory(ref e))
+                Err(crate::Error::Kernel(crate::KernelError::LogHistory(ref e)))
                     if matches!(**e, LogHistoryError::EmptyTimestampRange { between_version: 0, .. })
             ),
             "{res:?}"
@@ -2018,7 +2029,7 @@ mod tests {
     async fn test_timestamp_range_file_mod_only(
         #[case] start: Timestamp,
         #[case] end: Option<Timestamp>,
-        #[case] expected: Result<(Version, Option<Version>), ()>,
+        #[case] expected: std::result::Result<(Version, Option<Version>), ()>,
     ) {
         let table =
             mock_table_with_timestamps(&[(100, None), (200, None), (300, None)], None).await;
@@ -2047,7 +2058,7 @@ mod tests {
     async fn test_timestamp_range_ict_from_creation(
         #[case] start: Timestamp,
         #[case] end: Option<Timestamp>,
-        #[case] expected: Result<(Version, Option<Version>), ()>,
+        #[case] expected: std::result::Result<(Version, Option<Version>), ()>,
     ) {
         let table =
             mock_table_with_timestamps(&[(0, Some(100)), (0, Some(200)), (0, Some(300))], Some(0))

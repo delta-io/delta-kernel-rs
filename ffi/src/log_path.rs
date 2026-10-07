@@ -71,6 +71,6 @@ impl FfiLogPath {
             last_modified: self.last_modified,
             size: self.size,
         };
-        LogPath::try_new(file_meta)
+        Ok(LogPath::try_new(file_meta)?)
     }
 }

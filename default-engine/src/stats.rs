@@ -24,7 +24,7 @@ use delta_kernel::column_trie::ColumnTrie;
 use delta_kernel::engine::arrow_utils::fix_nested_null_masks;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::schema::{DataType as KernelDataType, StructType};
-use delta_kernel::{KernelError, KernelResult, Result};
+use delta_kernel::{KernelError, KernelResult, Result, ResultExt};
 
 /// Maximum prefix length for string statistics (Delta protocol requirement).
 const STRING_PREFIX_LENGTH: usize = 32;
@@ -519,11 +519,10 @@ pub fn collect_stats(
     physical_schema: &StructType,
 ) -> Result<StructArray> {
     let null_count_only_columns = interval_column_names(physical_schema, stats_columns);
-    reduce_stats(&collect_stats_raw(
-        batch,
-        stats_columns,
-        &null_count_only_columns,
-    )?)
+    reduce_stats(
+        &collect_stats_raw(batch, stats_columns, &null_count_only_columns).into_public_result()?,
+    )
+    .into_public_result()
 }
 
 #[cfg(test)]
@@ -625,10 +624,12 @@ fn collect_stats_raw(
 /// # use delta_kernel::expressions::column_name;
 /// # use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
 /// # use delta_kernel_default_engine::stats::FileStatsAccumulator;
+/// # use delta_kernel::Error;
 /// # fn main() -> delta_kernel::Result<()> {
 /// let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 /// let row_group = |ids: Vec<i64>| {
 ///     RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(ids))])
+///         .map_err(Error::kernel)
 /// };
 /// let physical_schema = StructType::try_new([StructField::not_null("id", KernelDataType::LONG)])?;
 ///
@@ -692,6 +693,7 @@ impl FileStatsAccumulator {
         // Catch every error path in one place, so no failure can leave publishable state behind.
         self.try_merge(batch)
             .inspect_err(|_| self.state = AccumulatorState::Failed)
+            .into_public_result()
     }
 
     fn try_merge(&mut self, batch: &RecordBatch) -> KernelResult<()> {
@@ -740,18 +742,25 @@ impl FileStatsAccumulator {
     /// single row.
     pub fn finish(self) -> Result<Option<StructArray>> {
         let AccumulatorState::Open(row_groups) = self.state else {
-            return Err(KernelError::stats_validation(FAILED));
+            return Err(delta_kernel::Error::Kernel(KernelError::stats_validation(
+                FAILED,
+            )));
         };
         if row_groups.is_empty() {
             return Ok(None);
         }
         let rows: Vec<&dyn Array> = row_groups.iter().map(|s| s as &dyn Array).collect();
-        let combined = concat(&rows)
-            .map_err(|e| KernelError::generic(format!("concat per-row-group stats: {e}")))?;
-        let combined = combined
-            .as_struct_opt()
-            .ok_or_else(|| KernelError::internal_error("concatenated stats are not a struct"))?;
-        reduce_stats(combined).map(Some)
+        let combined = concat(&rows).map_err(|e| {
+            delta_kernel::Error::Kernel(KernelError::generic(format!(
+                "concat per-row-group stats: {e}"
+            )))
+        })?;
+        let combined = combined.as_struct_opt().ok_or_else(|| {
+            delta_kernel::Error::Kernel(KernelError::internal_error(
+                "concatenated stats are not a struct",
+            ))
+        })?;
+        reduce_stats(combined).map(Some).into_public_result()
     }
 }
 
@@ -919,7 +928,10 @@ mod tests {
 
     use super::*;
 
-    fn collect_stats(batch: &RecordBatch, stats_columns: &[ColumnName]) -> Result<StructArray> {
+    fn collect_stats(
+        batch: &RecordBatch,
+        stats_columns: &[ColumnName],
+    ) -> delta_kernel::KernelResult<StructArray> {
         super::collect_stats_for_test(batch, stats_columns)
     }
 
@@ -2532,15 +2544,9 @@ mod tests {
     // A malformed stats tree is a kernel bug, not bad caller input, so the guards report
     // `InternalError`.
     fn assert_internal_error(result: Result<impl std::fmt::Debug>, needle: &str) {
-        let err = result.expect_err("must be rejected");
-        // `KernelError::internal_error` captures a backtrace, which wraps the variant in
-        // `Backtraced`.
-        let mut variant = &err;
-        while let KernelError::Backtraced { source, .. } = variant {
-            variant = source;
-        }
+        let err = KernelError::from(result.expect_err("must be rejected"));
         assert!(
-            matches!(variant, KernelError::InternalError(_)),
+            matches!(err.without_backtrace(), KernelError::InternalError(_)),
             "expected an internal error, got: {err}"
         );
         assert!(
@@ -2557,14 +2563,17 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_internal_error(reduce_stats(&stats), "unknown stats section");
+        assert_internal_error(
+            reduce_stats(&stats).into_public_result(),
+            "unknown stats section",
+        );
     }
 
     #[test]
     fn test_reduce_stats_children_rejects_non_struct() {
         let leaf = Arc::new(Int64Array::from(vec![1])) as ArrayRef;
         assert_internal_error(
-            reduce_stats_children(&leaf, &reduce_count_leaf),
+            reduce_stats_children(&leaf, &reduce_count_leaf).into_public_result(),
             "expected struct in stats sub-tree",
         );
     }
@@ -2572,9 +2581,12 @@ mod tests {
     #[test]
     fn test_leaf_reducers_reject_wrong_type() {
         let strings = Arc::new(StringArray::from(vec!["a"])) as ArrayRef;
-        assert_internal_error(reduce_count_leaf(&strings), "expected Int64 count leaf");
         assert_internal_error(
-            reduce_bool_and_leaf(&strings),
+            reduce_count_leaf(&strings).into_public_result(),
+            "expected Int64 count leaf",
+        );
+        assert_internal_error(
+            reduce_bool_and_leaf(&strings).into_public_result(),
             "expected Boolean tightBounds leaf",
         );
     }
@@ -2584,9 +2596,15 @@ mod tests {
     #[test]
     fn test_leaf_reducers_reject_null_leaves() {
         let counts = Arc::new(Int64Array::from(vec![Some(1), None])) as ArrayRef;
-        assert_internal_error(reduce_count_leaf(&counts), "null count leaf");
+        assert_internal_error(
+            reduce_count_leaf(&counts).into_public_result(),
+            "null count leaf",
+        );
         let tight = Arc::new(BooleanArray::from(vec![Some(true), None])) as ArrayRef;
-        assert_internal_error(reduce_bool_and_leaf(&tight), "null tightBounds leaf");
+        assert_internal_error(
+            reduce_bool_and_leaf(&tight).into_public_result(),
+            "null tightBounds leaf",
+        );
     }
 
     #[rstest::rstest]
@@ -2686,7 +2704,7 @@ mod tests {
             .merge(&second)
             .expect_err("a batch whose schema differs must be rejected");
         assert!(
-            matches!(err, KernelError::Schema(_)),
+            matches!(err, delta_kernel::Error::Kernel(KernelError::Schema(_))),
             "expected a schema error, got: {err}"
         );
         // A failed merge is terminal, so the first row group can never be published on its own.
@@ -2696,7 +2714,7 @@ mod tests {
             .expect_err("an accumulator that failed a merge must not publish statistics");
         // Its own variant, so callers can match the failure without matching on the message.
         assert!(
-            matches!(&err, KernelError::StatsValidation(msg) if msg == FAILED),
+            matches!(&err, delta_kernel::Error::Kernel(KernelError::StatsValidation(msg)) if msg == FAILED),
             "expected a stats validation error, got: {err}"
         );
     }
@@ -2724,7 +2742,7 @@ mod tests {
             .merge(&renamed)
             .expect_err("a batch deriving a different stats shape must be rejected");
         assert!(
-            matches!(err, KernelError::Schema(_)),
+            matches!(err, delta_kernel::Error::Kernel(KernelError::Schema(_))),
             "expected a schema error, got: {err}"
         );
         assert_result_error_with_message(acc.finish(), FAILED);

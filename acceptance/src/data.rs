@@ -13,7 +13,7 @@ use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{Engine, KernelError, KernelResult, Result};
+use delta_kernel::{Engine, KernelError, KernelResult, Result, ResultExt};
 use futures::stream::TryStreamExt;
 use futures::StreamExt;
 use itertools::Itertools;
@@ -23,26 +23,35 @@ use crate::{TestCaseInfo, TestResult};
 #[allow(deprecated)]
 pub async fn read_golden(path: &Path, _version: Option<&str>) -> Result<RecordBatch> {
     let expected_root = path.join("expected").join("latest").join("table_content");
-    let store = Arc::new(LocalFileSystem::new_with_prefix(&expected_root)?);
-    let files: Vec<_> = store.list(None).try_collect().await?;
+    let store = Arc::new(
+        LocalFileSystem::new_with_prefix(&expected_root).map_err(delta_kernel::Error::kernel)?,
+    );
+    let files: Vec<_> = store
+        .list(None)
+        .try_collect()
+        .await
+        .map_err(delta_kernel::Error::kernel)?;
     let mut batches = vec![];
     let mut schema = None;
     for meta in files.into_iter() {
         if let Some(ext) = meta.location.extension() {
             if ext == "parquet" {
                 let reader = ParquetObjectReader::new(store.clone(), meta.location);
-                let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+                let builder = ParquetRecordBatchStreamBuilder::new(reader)
+                    .await
+                    .map_err(delta_kernel::Error::kernel)?;
                 if schema.is_none() {
                     schema = Some(builder.schema().clone());
                 }
-                let mut stream = builder.build()?;
+                let mut stream = builder.build().map_err(delta_kernel::Error::kernel)?;
                 while let Some(batch) = stream.next().await {
-                    batches.push(batch?);
+                    batches.push(batch.map_err(delta_kernel::Error::kernel)?);
                 }
             }
         }
     }
-    let all_data = concat_batches(&schema.unwrap(), &batches)?;
+    let all_data =
+        concat_batches(&schema.unwrap(), &batches).map_err(delta_kernel::Error::kernel)?;
     Ok(all_data)
 }
 
@@ -89,17 +98,29 @@ pub fn assert_data_matches(
     result_schema: &SchemaRef,
     expected: RecordBatch,
 ) -> Result<()> {
-    let all_data = concat_batches(result_schema, result.iter())?;
+    let all_data =
+        concat_batches(result_schema, result.iter()).map_err(delta_kernel::Error::kernel)?;
 
     // Validate schemas match
-    assert_schema_fields_match(all_data.schema().as_ref(), expected.schema().as_ref())?;
+    assert_schema_fields_match(all_data.schema().as_ref(), expected.schema().as_ref())
+        .into_public_result()?;
 
     // Format both batches as strings for order-independent comparison
     let actual_str = pretty_format_batches(std::slice::from_ref(&all_data))
-        .map_err(|e| KernelError::generic(format!("Failed to format actual: {}", e)))?
+        .map_err(|e| {
+            delta_kernel::Error::Kernel(KernelError::generic(format!(
+                "Failed to format actual: {}",
+                e
+            )))
+        })?
         .to_string();
     let expected_str = pretty_format_batches(std::slice::from_ref(&expected))
-        .map_err(|e| KernelError::generic(format!("Failed to format expected: {}", e)))?
+        .map_err(|e| {
+            delta_kernel::Error::Kernel(KernelError::generic(format!(
+                "Failed to format expected: {}",
+                e
+            )))
+        })?
         .to_string();
 
     let mut actual_lines: Vec<&str> = actual_str.trim().lines().collect();
@@ -117,11 +138,11 @@ pub fn assert_data_matches(
 
     // Compare sorted lines
     if actual_lines != expected_lines {
-        return Err(KernelError::generic(format!(
+        return Err(delta_kernel::Error::Kernel(KernelError::generic(format!(
             "Data mismatch:\nExpected:\n{}\nActual:\n{}",
             expected_lines.join("\n"),
             actual_lines.join("\n")
-        )));
+        ))));
     }
 
     Ok(())

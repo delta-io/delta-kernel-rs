@@ -36,10 +36,10 @@ pub fn log_tail_from_commits(commits: &[Commit], mut table_root: Url) -> Result<
         .into_iter()
         .map(|c| {
             let file_size = c.file_size.try_into().map_err(|_| {
-                KernelError::generic(format!(
+                delta_kernel::Error::Kernel(KernelError::generic(format!(
                     "commit file_size {} does not fit in FileSize",
                     c.file_size
-                ))
+                )))
             })?;
             LogPath::staged_commit(
                 table_root.clone(),
@@ -63,14 +63,17 @@ pub fn log_tail_from_commits(commits: &[Commit], mut table_root: Url) -> Result<
 /// Returns an error if the response's location is not a valid URL, if [`log_tail_from_commits`]
 /// fails, or if `latest_table_version` is negative.
 pub fn snapshot_builder_from_load_table(resp: &LoadTableResponse) -> Result<SnapshotBuilder> {
-    let table_root = Url::parse(&resp.metadata.location)
-        .map_err(|e| KernelError::generic(format!("invalid table location: {e}")))?;
+    let table_root = Url::parse(&resp.metadata.location).map_err(|e| {
+        delta_kernel::Error::Kernel(KernelError::generic(format!("invalid table location: {e}")))
+    })?;
     let log_tail = log_tail_from_commits(&resp.commits, table_root.clone())?;
     let mut builder = Snapshot::builder_for(table_root).with_log_tail(log_tail);
     if let Some(version) = resp.latest_table_version {
-        let max_catalog_version: u64 = version
-            .try_into()
-            .map_err(|_| KernelError::generic("catalog reported a negative table version"))?;
+        let max_catalog_version: u64 = version.try_into().map_err(|_| {
+            delta_kernel::Error::Kernel(KernelError::generic(
+                "catalog reported a negative table version",
+            ))
+        })?;
         builder = builder.with_max_catalog_version(max_catalog_version);
     }
     Ok(builder)

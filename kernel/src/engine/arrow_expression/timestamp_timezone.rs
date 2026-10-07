@@ -17,7 +17,7 @@ use chrono_tz::Tz;
 
 use crate::arrow::compute::kernels::cast_utils::string_to_datetime;
 use crate::expressions::MapToStructOptions;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 /// A validated timezone used to interpret an offset-less `TIMESTAMP` value.
 ///
@@ -42,7 +42,7 @@ impl Default for TimestampTimezone {
 impl FromStr for TimestampTimezone {
     type Err = KernelError;
 
-    fn from_str(value: &str) -> Result<Self> {
+    fn from_str(value: &str) -> KernelResult<Self> {
         let timezone = if value.starts_with(['+', '-']) {
             parse_normalized_fixed_offset(value).map(Self::Fixed)
         } else {

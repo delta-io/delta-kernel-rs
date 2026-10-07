@@ -443,6 +443,10 @@ an opaque pointer when the API needs one.
 
 ### Error handling
 
+Rust public results contain `delta_kernel::Error`. Unwrap its `Kernel` variant before the existing
+`FFIKernelError` conversion. `IntoExternResult` accepts both public `Result` and private
+`KernelResult`; both use the same allocator, error codes, and message ownership rules.
+
 There are two error directions, with opposite message owners:
 
 | Direction | Result envelope | Message construction | Final owner |

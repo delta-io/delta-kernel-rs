@@ -538,7 +538,9 @@ fn scan_metadata_iter_init_impl(
 ) -> KernelResult<Handle<SharedScanMetadataIterator>> {
     let scan_metadata = scan.scan_metadata(engine.engine().as_ref())?;
     let data = ScanMetadataIterator {
-        data: Mutex::new(Box::new(scan_metadata)),
+        data: Mutex::new(Box::new(
+            scan_metadata.map(|item| item.map_err(KernelError::from)),
+        )),
         engine: engine.clone(),
     };
     Ok(Arc::new(data).into())

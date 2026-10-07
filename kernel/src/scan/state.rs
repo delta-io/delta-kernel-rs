@@ -16,7 +16,7 @@ use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGet
 use crate::scan::get_transform_for_row;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
 use crate::utils::require;
-use crate::{Engine, EngineData, ExpressionRef, KernelError, KernelResult, Result};
+use crate::{Engine, EngineData, ExpressionRef, KernelError, KernelResult, Result, ResultExt};
 
 /// this struct can be used by an engine to materialize a selection vector
 #[derive(Default, Debug, Clone, PartialEq, Eq, From)]
@@ -49,6 +49,7 @@ impl DvInfo {
                     .map_err(|_| KernelError::deletion_vector("cardinality must be non-negative"))
             })
             .transpose()
+            .into_public_result()
     }
 
     /// Check if this DvInfo contains a Deletion Vector. This is mostly used to know if the
@@ -62,13 +63,14 @@ impl DvInfo {
         engine: &dyn Engine,
         table_root: &url::Url,
     ) -> KernelResult<Option<RoaringTreemap>> {
-        self.deletion_vector
+        Ok(self
+            .deletion_vector
             .as_ref()
             .map(|dv_descriptor| {
                 let storage = engine.storage_handler();
                 dv_descriptor.read(storage, table_root)
             })
-            .transpose()
+            .transpose()?)
     }
 
     pub fn get_selection_vector(
@@ -76,7 +78,7 @@ impl DvInfo {
         engine: &dyn Engine,
         table_root: &url::Url,
     ) -> Result<Option<Vec<bool>>> {
-        let dv_treemap = self.get_treemap(engine, table_root)?;
+        let dv_treemap = self.get_treemap(engine, table_root).into_public_result()?;
         Ok(dv_treemap.map(deletion_treemap_to_bools))
     }
 
@@ -194,10 +196,10 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
     ) -> Result<()> {
         require!(
             getters.len() == 14,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of ScanFileVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         for row_index in rows {
             // Since path column is required, use it to detect presence of an Add action
@@ -214,10 +216,11 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
                         }
                     });
 
-                let dv_index = SCAN_ROW_SCHEMA
-                    .index_of("deletionVector")
-                    .ok_or_else(|| KernelError::missing_column("deletionVector"))?;
-                let deletion_vector = visit_deletion_vector_at(row_index, &getters[dv_index..])?;
+                let dv_index = SCAN_ROW_SCHEMA.index_of("deletionVector").ok_or_else(|| {
+                    crate::Error::Kernel(KernelError::missing_column("deletionVector"))
+                })?;
+                let deletion_vector = visit_deletion_vector_at(row_index, &getters[dv_index..])
+                    .into_public_result()?;
                 let dv_info = DvInfo { deletion_vector };
                 let partition_values =
                     getters[9].get(row_index, "scanFile.fileConstantValues.partitionValues")?;
@@ -260,7 +263,10 @@ mod tests {
         });
 
         let error = dv_info.cardinality().unwrap_err();
-        assert!(matches!(&error, KernelError::DeletionVector(_)), "{error}");
+        assert!(
+            matches!(&error, crate::Error::Kernel(KernelError::DeletionVector(_))),
+            "{error}"
+        );
         assert_eq!(
             error.to_string(),
             "Deletion Vector error: cardinality must be non-negative"

@@ -93,9 +93,9 @@ impl<'a> ColumnDefault<'a> {
         match &self.parsed_sql {
             None => Ok(None),
             Some(Expression::Literal(scalar)) => Ok(Some(scalar.clone())),
-            Some(other) => Err(KernelError::generic(format!(
+            Some(other) => Err(crate::Error::Kernel(KernelError::generic(format!(
                 "kernel cannot evaluate non-literal column default expression: {other:?}"
-            ))),
+            )))),
         }
     }
 

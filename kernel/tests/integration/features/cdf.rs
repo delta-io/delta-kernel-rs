@@ -73,7 +73,7 @@ fn read_cdf_for_table_with_batch_size(
 }
 
 #[test]
-fn cdf_with_deletion_vector() -> Result<(), Box<dyn error::Error>> {
+fn cdf_with_deletion_vector() -> std::result::Result<(), Box<dyn error::Error>> {
     let batches = read_cdf_for_table("cdf-table-with-dv", 0, None, None)?;
     // Each commit performs the following:
     // 0. Insert  0..=9
@@ -119,7 +119,8 @@ fn cdf_with_deletion_vector() -> Result<(), Box<dyn error::Error>> {
 }
 
 #[test]
-fn cdf_with_deletion_vector_is_batch_size_invariant() -> Result<(), Box<dyn error::Error>> {
+fn cdf_with_deletion_vector_is_batch_size_invariant(
+) -> std::result::Result<(), Box<dyn error::Error>> {
     let expected = read_cdf_for_table("cdf-table-with-dv", 0, None, None)?;
     for batch_size in [1usize, 2, 3, 4, 7] {
         let actual = read_cdf_for_table_with_batch_size(
@@ -144,7 +145,7 @@ fn cdf_with_deletion_vector_is_batch_size_invariant() -> Result<(), Box<dyn erro
 }
 
 #[test]
-fn basic_cdf() -> Result<(), Box<dyn error::Error>> {
+fn basic_cdf() -> std::result::Result<(), Box<dyn error::Error>> {
     let batches = read_cdf_for_table("cdf-table", 0, None, None)?;
     let mut expected = vec![
         "+----+--------+------------+------------------+-----------------+",
@@ -181,7 +182,7 @@ fn basic_cdf() -> Result<(), Box<dyn error::Error>> {
 }
 
 #[test]
-fn cdf_non_partitioned() -> Result<(), Box<dyn error::Error>> {
+fn cdf_non_partitioned() -> std::result::Result<(), Box<dyn error::Error>> {
     let batches = read_cdf_for_table("cdf-table-non-partitioned", 0, None, None)?;
     let mut expected = vec![
              "+----+--------+------------+-------------------+---------------+--------------+----------------+------------------+-----------------+",
@@ -220,7 +221,7 @@ fn cdf_non_partitioned() -> Result<(), Box<dyn error::Error>> {
 }
 
 #[test]
-fn cdf_with_cdc_and_dvs() -> Result<(), Box<dyn error::Error>> {
+fn cdf_with_cdc_and_dvs() -> std::result::Result<(), Box<dyn error::Error>> {
     let batches = read_cdf_for_table("cdf-table-with-cdc-and-dvs", 0, None, None)?;
     let mut expected = vec![
         "+----+--------------------+------------------+-----------------+",
@@ -436,13 +437,18 @@ fn invalid_range_end_before_start() {
     let res = read_cdf_for_table("cdf-table-simple", 1, 0, None);
     let expected_msg =
         "Failed to build LogSegment: start_version cannot be greater than end_version";
-    assert!(matches!(res, Err(KernelError::Generic(msg)) if msg == expected_msg));
+    assert!(
+        matches!(res, Err(delta_kernel::Error::Kernel(KernelError::Generic(msg))) if msg == expected_msg)
+    );
 }
 
 #[test]
 fn invalid_range_start_after_last_version_of_table() {
     let res = read_cdf_for_table("cdf-table-simple", 3, 4, None);
-    assert!(matches!(res, Err(KernelError::EmptyLog)));
+    assert!(matches!(
+        res,
+        Err(delta_kernel::Error::Kernel(KernelError::EmptyLog))
+    ));
 }
 
 #[test]
@@ -585,7 +591,7 @@ fn conditional_delete_two_rows() -> Result<()> {
 }
 
 #[test]
-fn cdf_with_column_mapping_name_mode() -> Result<(), Box<dyn error::Error>> {
+fn cdf_with_column_mapping_name_mode() -> std::result::Result<(), Box<dyn error::Error>> {
     // NOTE: these tables only have CDF enabled in version 1+, so we start reading from 1. This is
     // due to pyspark limitation while writing: we were unable to create a table with column
     // mapping + CDF enabled in commit 0, so we created with column mapping and enabled CDF in
@@ -628,7 +634,7 @@ fn cdf_with_column_mapping_name_mode() -> Result<(), Box<dyn error::Error>> {
 /// `table_changes` log-replay, so `execute()` never tries to read the phantom parquet
 /// file and returns zero rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cdf_per_cell_null_on_malformed_stats() -> Result<(), Box<dyn error::Error>> {
+async fn cdf_per_cell_null_on_malformed_stats() -> std::result::Result<(), Box<dyn error::Error>> {
     let schema = schema_ref! {
         nullable "EventTime": TIMESTAMP,
         nullable "UserId": LONG,
@@ -684,7 +690,7 @@ async fn cdf_per_cell_null_on_malformed_stats() -> Result<(), Box<dyn error::Err
 }
 
 #[test]
-fn cdf_with_column_mapping_id_mode() -> Result<(), Box<dyn error::Error>> {
+fn cdf_with_column_mapping_id_mode() -> std::result::Result<(), Box<dyn error::Error>> {
     // NOTE: these tables only have CDF enabled in version 1+, so we start reading from 1. This is
     // due to pyspark limitation while writing: we were unable to create a table with column
     // mapping + CDF enabled in commit 0, so we created with column mapping and enabled CDF in

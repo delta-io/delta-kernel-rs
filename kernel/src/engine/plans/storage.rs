@@ -9,7 +9,8 @@ use url::Url;
 
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
 use crate::{
-    FileMeta, FileSlice, KernelError, KernelResult, Result, ResultIteratorStatic, StorageHandler,
+    FileMeta, FileSlice, KernelError, KernelResult, Result, ResultExt, ResultIteratorStatic,
+    StorageHandler,
 };
 
 /// A [`StorageHandler`] that delegates to a [`PlanExecutor`].
@@ -20,45 +21,54 @@ pub struct PlanBasedStorageHandler {
 
 impl PlanBasedStorageHandler {
     fn execute_io(&self, op: IoOperation) -> KernelResult<PlanResult> {
-        self.executor.execute_op(Operation::IoOperation(op))
+        Ok(self.executor.execute_op(Operation::IoOperation(op))?)
     }
 }
 
 impl StorageHandler for PlanBasedStorageHandler {
     fn list_from(&self, path: &Url) -> Result<ResultIteratorStatic<FileMeta>> {
-        self.execute_io(IoOperation::file_listing(path.clone()))?
+        self.execute_io(IoOperation::file_listing(path.clone()))
+            .into_public_result()?
             .into_file_meta()
     }
 
     fn read_files(&self, files: Vec<FileSlice>) -> Result<ResultIteratorStatic<Bytes>> {
-        self.execute_io(IoOperation::read_bytes(files))?
+        self.execute_io(IoOperation::read_bytes(files))
+            .into_public_result()?
             .into_bytes()
     }
 
     fn copy_atomic(&self, src: &Url, dest: &Url) -> Result<()> {
-        self.execute_io(IoOperation::atomic_copy(src.clone(), dest.clone()))?
+        self.execute_io(IoOperation::atomic_copy(src.clone(), dest.clone()))
+            .into_public_result()?
             .into_unit()
     }
 
     fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> Result<()> {
-        self.execute_io(IoOperation::write_bytes(path.clone(), data, overwrite))?
+        self.execute_io(IoOperation::write_bytes(path.clone(), data, overwrite))
+            .into_public_result()?
             .into_unit()
     }
 
     fn head(&self, path: &Url) -> Result<FileMeta> {
-        self.execute_io(IoOperation::head_file(path.clone()))?
+        self.execute_io(IoOperation::head_file(path.clone()))
+            .into_public_result()?
             .into_file_meta()?
             .exactly_one()
-            .map_err(|e| KernelError::generic(format!("Expected exactly one file meta: {e}")))?
+            .map_err(|e| {
+                crate::Error::Kernel(KernelError::generic(format!(
+                    "Expected exactly one file meta: {e}"
+                )))
+            })?
     }
 
     fn delete(&self, _path: &Url) -> Result<()> {
         // TODO(#2820): implement here once supported as IoOperation.
         // Intentionally do not use a fallback because we expect this SHOULD be implemented via
         // plan-execution.
-        Err(KernelError::unsupported(
+        Err(crate::Error::Kernel(KernelError::unsupported(
             "PlanBasedStorageHandler does not yet implement delete",
-        ))
+        )))
     }
 }
 
@@ -139,7 +149,10 @@ mod tests {
         let err = storage
             .put(&url, bytes::Bytes::from_static(b"second"), false)
             .unwrap_err();
-        assert!(matches!(err, KernelError::FileAlreadyExists(_)));
+        assert!(matches!(
+            err,
+            crate::Error::Kernel(KernelError::FileAlreadyExists(_))
+        ));
 
         // With `overwrite = true`, the second write succeeds.
         storage
@@ -161,6 +174,9 @@ mod tests {
         // Errors on missing file
         let url = Url::from_file_path(tmp.path().join("missing.json")).unwrap();
         let err = make_handler().head(&url).unwrap_err();
-        assert!(matches!(err, KernelError::FileNotFound(_)));
+        assert!(matches!(
+            err,
+            crate::Error::Kernel(KernelError::FileNotFound(_))
+        ));
     }
 }

@@ -206,7 +206,9 @@ impl CommitAction {
     /// (present iff both protocol and metadata are known at this commit).
     fn protocol_validation(&self, table_config: &Option<TableConfiguration>) -> KernelResult<()> {
         match (table_config, &self.protocol) {
-            (Some(table_config), _) => table_config.ensure_operation_supported(Operation::Scan),
+            (Some(table_config), _) => {
+                Ok(table_config.ensure_operation_supported(Operation::Scan)?)
+            }
             (None, Some(protocol)) => ensure_table_can_be_read(protocol),
             (None, None) => Ok(()),
         }

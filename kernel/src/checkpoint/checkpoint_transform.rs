@@ -126,7 +126,7 @@ pub(crate) fn build_checkpoint_transform(
         }
     }
 
-    patch_builder.build()
+    Ok(patch_builder.build()?)
 }
 
 /// Builds a read schema that includes `stats_parsed` and optionally `partitionValues_parsed`
@@ -172,6 +172,7 @@ pub(crate) fn build_checkpoint_read_schema(
                 )
             })
             .build(add_struct)
+            .map_err(crate::KernelError::from)
     })
 }
 

@@ -72,7 +72,7 @@ async fn test_create_table_with_row_tracking(
     )]
     activation: (&str, &str),
     #[values(false, true)] with_data: bool,
-) -> Result<()> {
+) -> delta_kernel::KernelResult<()> {
     let (key, value) = activation;
     let expect_property_enabled = key == "delta.enableRowTracking";
 
@@ -191,7 +191,8 @@ async fn test_create_table_with_row_tracking(
 /// Verifies that CTAS with multiple files assigns non-overlapping baseRowId ranges and
 /// computes the correct cumulative high water mark.
 #[tokio::test]
-async fn test_create_table_with_multiple_files_and_row_tracking() -> Result<()> {
+async fn test_create_table_with_multiple_files_and_row_tracking() -> delta_kernel::KernelResult<()>
+{
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = super::simple_schema()?;
@@ -315,7 +316,8 @@ fn test_create_table_with_row_tracking_and_clustering() -> Result<()> {
 /// Both features generate domain metadata and the add files need row tracking columns.
 /// Verifies that both domain metadata entries survive when add files are also written.
 #[tokio::test]
-async fn test_create_table_with_row_tracking_and_clustering_and_data() -> Result<()> {
+async fn test_create_table_with_row_tracking_and_clustering_and_data(
+) -> delta_kernel::KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = super::simple_schema()?;

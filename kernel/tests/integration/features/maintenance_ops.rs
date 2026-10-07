@@ -152,7 +152,7 @@ async fn checkpoint_crc_writes_reject_unsupported_table_features(
     #[case] reader_features: &[&str],
     #[case] writer_features: &[&str],
     #[case] checkpoint_spec: Option<CheckpointSpec>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
     let store = LocalFileSystem::new();

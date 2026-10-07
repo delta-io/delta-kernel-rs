@@ -8,7 +8,7 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::path::LogRoot;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::schema::schema_ref;
-use crate::{KernelResult, Result, Version};
+use crate::{KernelResult, Result, ResultExt, Version};
 
 /// The type of commit operation being performed. This communicates to the committer whether this
 /// is a table creation or a write to an existing table, and whether the table is catalog-managed.
@@ -167,6 +167,7 @@ impl CommitMetadata {
         self.log_root
             .new_commit_path(self.version)
             .map(|p| p.location)
+            .into_public_result()
     }
 
     /// The staged commit path is the absolute path (e.g.
@@ -175,6 +176,7 @@ impl CommitMetadata {
         self.log_root
             .new_staged_commit_path(self.version)
             .map(|p| p.location)
+            .into_public_result()
     }
 
     /// The version to which the transaction is being committed.
@@ -221,9 +223,9 @@ impl CommitMetadata {
             .as_ref()
             .or(pm.read_protocol.as_ref())
             .ok_or_else(|| {
-                crate::KernelError::internal_error(
+                crate::Error::Kernel(crate::KernelError::internal_error(
                     "CommitProtocolMetadata should have at least one protocol",
-                )
+                ))
             })
     }
 
@@ -235,9 +237,9 @@ impl CommitMetadata {
             .as_ref()
             .or(pm.read_metadata.as_ref())
             .ok_or_else(|| {
-                crate::KernelError::internal_error(
+                crate::Error::Kernel(crate::KernelError::internal_error(
                     "CommitProtocolMetadata should have at least one metadata",
-                )
+                ))
             })
     }
 
@@ -297,8 +299,9 @@ impl CommitMetadata {
         writer_features: Vec<&str>,
         configuration: HashMap<String, String>,
     ) -> Result<Self> {
-        let log_root = crate::path::LogRoot::new(table_root)?;
-        let protocol = Protocol::try_new_modern(reader_features, writer_features)?;
+        let log_root = crate::path::LogRoot::new(table_root).into_public_result()?;
+        let protocol =
+            Protocol::try_new_modern(reader_features, writer_features).into_public_result()?;
         let schema = schema_ref! {};
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, configuration)?;
         Ok(Self::new(
@@ -307,7 +310,8 @@ impl CommitMetadata {
             CommitType::PathBasedWrite,
             0,
             None,
-            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None)?,
+            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None)
+                .into_public_result()?,
             vec![],
         ))
     }

@@ -168,6 +168,7 @@ mod tests {
     use crate::actions::{Sidecar, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA};
     use crate::committer::FileSystemCommitter;
     use crate::crc::{Crc, DomainMetadataState, SetTransactionState};
+    use crate::create_row;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
@@ -178,7 +179,6 @@ mod tests {
         write_commit,
     };
     use crate::unit_test_utils::{assert_result_error_with_message, MockTableConfigurationBuilder};
-    use crate::{create_row, Result};
 
     fn manifest_file(location: &str, size: u64) -> KernelResult<FileMeta> {
         Ok(FileMeta {
@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_checkpoint_action_builds_a_self_contained_action() -> Result<()> {
+    fn compute_checkpoint_action_builds_a_self_contained_action() -> crate::KernelResult<()> {
         let (engine, table_root) = setup_table()?;
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let manifest = root_manifest(
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn compute_checkpoint_action_allows_replacing_a_checkpoint_that_covers_the_snapshot(
-    ) -> Result<()> {
+    ) -> crate::KernelResult<()> {
         let (engine, table_root) = setup_table()?;
         let existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
         write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)?;
@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_checkpoint_action_rejects_a_stale_checkpoint() -> Result<()> {
+    fn compute_checkpoint_action_rejects_a_stale_checkpoint() -> crate::KernelResult<()> {
         let (engine, table_root) = setup_table()?;
         let existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
         write_commit(&engine, &table_root, 1, existing.into_engine_data(&engine)?)?;
@@ -304,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_checkpoint_action_prunes_expired_transactions() -> Result<()> {
+    fn compute_checkpoint_action_prunes_expired_transactions() -> crate::KernelResult<()> {
         let (engine, table_root) = setup_table()?;
         let expired = SetTransaction::new("app-1".to_string(), 5, Some(0));
         write_commit(
@@ -329,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_checkpoint_action_new_change_wins() -> Result<()> {
+    fn compute_checkpoint_action_new_change_wins() -> crate::KernelResult<()> {
         let (engine, table_root) = setup_table()?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
@@ -372,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn new_preserves_an_absolute_file_location() -> Result<()> {
+    fn new_preserves_an_absolute_file_location() -> crate::KernelResult<()> {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///t/", schema, "test")
@@ -389,7 +389,8 @@ mod tests {
     // A checkpoint holds complete state, so its inline entries win and stale top-level entries
     // from before it are ignored.
     #[test]
-    fn scan_non_content_metadata_prefers_checkpoint_inline_over_stale_top_level() -> Result<()> {
+    fn scan_non_content_metadata_prefers_checkpoint_inline_over_stale_top_level(
+    ) -> crate::KernelResult<()> {
         let (engine, table_root) = setup_table()?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
@@ -436,7 +437,8 @@ mod tests {
     // (as an external writer would, with no tombstone), must not come back in the rebuilt
     // checkpoint from those older log entries.
     #[test]
-    fn compute_checkpoint_action_does_not_resurrect_entries_the_checkpoint_dropped() -> Result<()> {
+    fn compute_checkpoint_action_does_not_resurrect_entries_the_checkpoint_dropped(
+    ) -> crate::KernelResult<()> {
         let (engine, table_root) = setup_table()?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
@@ -475,7 +477,8 @@ mod tests {
     // The existing checkpoint spilled txns/domain metadata into sidecar files that can't be read
     // yet; replacing it would drop that state, so the commit is refused.
     #[test]
-    fn compute_checkpoint_action_rejects_a_checkpoint_that_spills_to_sidecars() -> Result<()> {
+    fn compute_checkpoint_action_rejects_a_checkpoint_that_spills_to_sidecars(
+    ) -> crate::KernelResult<()> {
         let (engine, table_root) = setup_table()?;
         let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let mut existing = CheckpointAction::new(
@@ -516,7 +519,8 @@ mod tests {
     }
 
     #[test]
-    fn scan_non_content_metadata_uses_crc_fast_path_with_existing_checkpoint() -> Result<()> {
+    fn scan_non_content_metadata_uses_crc_fast_path_with_existing_checkpoint(
+    ) -> crate::KernelResult<()> {
         let (engine, table_root) = setup_table()?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
@@ -557,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_non_content_metadata_uses_crc_fast_path() -> Result<()> {
+    fn scan_non_content_metadata_uses_crc_fast_path() -> crate::KernelResult<()> {
         let (engine, table_root) = setup_table()?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
@@ -593,7 +597,7 @@ mod tests {
     fn compute_checkpoint_action_folds_prior_checkpoint_nested_set(
         #[case] dm_changes: Vec<DomainMetadata>,
         #[case] domain_kept: bool,
-    ) -> Result<()> {
+    ) -> crate::KernelResult<()> {
         let (engine, table_root) = setup_table()?;
         let config = Snapshot::builder_for(table_root.clone())
             .build(&engine)?
@@ -641,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_non_content_metadata_scans_past_a_partial_crc() -> Result<()> {
+    fn scan_non_content_metadata_scans_past_a_partial_crc() -> crate::KernelResult<()> {
         let (engine, table_root) = setup_table()?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 

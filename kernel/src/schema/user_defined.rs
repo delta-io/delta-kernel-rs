@@ -62,19 +62,19 @@ impl UserDefinedType {
     ) -> Result<Self> {
         let sql_type = sql_type.into();
         if contains_udt(&sql_type) {
-            return Err(KernelError::schema(
+            return Err(crate::Error::Kernel(KernelError::schema(
                 "A UDT sqlType must not contain another UDT",
-            ));
+            )));
         }
         if contains_metadata_column(&sql_type) {
-            return Err(KernelError::schema(
+            return Err(crate::Error::Kernel(KernelError::schema(
                 "A UDT sqlType must not contain a metadata column",
-            ));
+            )));
         }
         if annotation.contains_key("type") || annotation.contains_key("sqlType") {
-            return Err(KernelError::schema(
+            return Err(crate::Error::Kernel(KernelError::schema(
                 "UDT annotation keys type and sqlType are reserved",
-            ));
+            )));
         }
         Ok(Self {
             sql_type: Box::new(sql_type),
@@ -96,7 +96,7 @@ impl UserDefinedType {
 }
 
 impl Serialize for UserDefinedType {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         // The required `type` and `sqlType` members are separate from the engine annotation.
         const REQUIRED_UDT_FIELD_COUNT: usize = 2;
 
@@ -112,7 +112,7 @@ impl Serialize for UserDefinedType {
 }
 
 impl<'de> Deserialize<'de> for UserDefinedType {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct Repr {
             #[serde(rename = "type")]
@@ -133,9 +133,9 @@ impl<'de> Deserialize<'de> for UserDefinedType {
 struct ContainsUdt;
 
 impl<'a> SchemaTransform<'a> for ContainsUdt {
-    transform_output_type!(|'a, T| Result<(), ()>);
+    transform_output_type!(|'a, T| std::result::Result<(), ()>);
 
-    fn transform_user_defined(&mut self, _: &'a UserDefinedType) -> Result<(), ()> {
+    fn transform_user_defined(&mut self, _: &'a UserDefinedType) -> std::result::Result<(), ()> {
         Err(())
     }
 }
@@ -147,9 +147,9 @@ fn contains_udt(data_type: &DataType) -> bool {
 struct ContainsMetadataColumn;
 
 impl<'a> SchemaTransform<'a> for ContainsMetadataColumn {
-    transform_output_type!(|'a, T| Result<(), ()>);
+    transform_output_type!(|'a, T| std::result::Result<(), ()>);
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), ()> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> std::result::Result<(), ()> {
         if field.is_metadata_column() {
             Err(())
         } else {
@@ -485,11 +485,11 @@ mod tests {
     fn schema_transform_treats_udt_as_leaf() {
         struct RejectPrimitives;
         impl<'a> SchemaTransform<'a> for RejectPrimitives {
-            transform_output_type!(|'a, T| Result<(), ()>);
+            transform_output_type!(|'a, T| std::result::Result<(), ()>);
             fn transform_primitive(
                 &mut self,
                 _: &'a super::super::PrimitiveType,
-            ) -> Result<(), ()> {
+            ) -> std::result::Result<(), ()> {
                 Err(())
             }
         }

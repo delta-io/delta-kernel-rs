@@ -41,9 +41,9 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
         )
     );
     let data = serde_json::to_vec(crc)?;
-    engine
+    Ok(engine
         .storage_handler()
-        .put(path, data.into(), false /* overwrite */)
+        .put(path, data.into(), false /* overwrite */)?)
 }
 
 #[cfg(test)]

@@ -249,7 +249,7 @@ pub(crate) fn parse_partition_value_raw(
         (Some(v), Some(primitive)) if v.is_empty() => Ok(primitive
             .empty_string_partition_cast()
             .unwrap_or_else(|| Scalar::Null(data_type.clone()))),
-        (Some(v), Some(primitive)) => primitive.parse_scalar(v),
+        (Some(v), Some(primitive)) => Ok(primitive.parse_scalar(v)?),
         (Some(_), None) => Err(KernelError::generic(format!(
             "Unexpected partition column type: {data_type:?}"
         ))),
@@ -265,7 +265,6 @@ mod tests {
     use crate::expressions::{col, BinaryExpressionOp};
     use crate::schema::{schema, schema_ref, DataType, PrimitiveType};
     use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::Result;
 
     // Tests for parse_partition_value function
     #[test]
@@ -690,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn get_transform_expr_generates_stable_row_commit_versions() -> Result<()> {
+    fn get_transform_expr_generates_stable_row_commit_versions() -> crate::KernelResult<()> {
         let transform_spec = vec![FieldTransformSpec::GenerateRowCommitVersion {
             field_name: "row_commit_version_col".to_string(),
         }];

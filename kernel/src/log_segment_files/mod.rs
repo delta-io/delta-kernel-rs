@@ -76,7 +76,9 @@ pub(crate) fn list_delta_log_from_storage(
     end_version: Version,
     cancellation_token: Option<&CancellationTokenRef>,
 ) -> Result<impl Iterator<Item = Result<ParsedLogPath>>> {
-    let start_from = log_root.join(&format!("{start_version:020}"))?;
+    let start_from = log_root
+        .join(&format!("{start_version:020}"))
+        .map_err(crate::Error::kernel)?;
     let log_root_str = log_root.to_string();
     let files = storage
         .list_from_with_cancellation(&start_from, cancellation_token.cloned())?
@@ -624,7 +626,13 @@ impl LogSegmentFiles {
         let end = end_version.unwrap_or(Version::MAX);
         let fs_iter =
             list_delta_log_from_storage(storage, log_root, start, end, cancellation_token)?;
-        Self::build_log_segment_files(fs_iter, log_tail, start, end_version, checkpoint_handling)
+        Self::build_log_segment_files(
+            fs_iter.map(|result| result.map_err(KernelError::from)),
+            log_tail,
+            start,
+            end_version,
+            checkpoint_handling,
+        )
     }
 
     /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that

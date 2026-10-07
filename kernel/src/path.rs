@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, KernelResult, Result, Version};
+use crate::{Engine, FileMeta, KernelError, KernelResult, Result, ResultExt, Version};
 
 /// The delta log subdirectory with a trailing slash for directory URL joins.
 pub(crate) const DELTA_LOG_DIR_WITH_SLASH: &str = "_delta_log/";
@@ -410,7 +410,7 @@ impl ParsedLogPath<FileMeta> {
                     KernelError::generic("In-Commit Timestamp not found in commit file")
                 })
             }
-            Some(Err(err)) => Err(err),
+            Some(Err(err)) => Err(crate::KernelError::from(err)),
             None => Err(KernelError::generic("Commit file contains no actions")),
         }
     }
@@ -475,11 +475,11 @@ impl ParsedLogPath<Url> {
     #[internal_api]
     pub(crate) fn new_crc(table_root: &Url, version: Version) -> Result<Self> {
         let filename = format!("{version:020}.crc");
-        let path = Self::create_path(table_root, filename)?;
+        let path = Self::create_path(table_root, filename).into_public_result()?;
         if !matches!(path.file_type, LogPathFileType::Crc) {
-            return Err(KernelError::internal_error(
+            return Err(crate::Error::Kernel(KernelError::internal_error(
                 "ParsedLogPath::new_crc created a non-CRC path",
-            ));
+            )));
         }
         Ok(path)
     }

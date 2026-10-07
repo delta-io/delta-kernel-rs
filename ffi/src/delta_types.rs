@@ -439,12 +439,12 @@ impl FfiProtocol {
         let writer_features = Option::<&FfiStringArray>::from(&self.writer_features)
             .map(|value| unsafe { value.try_to_strings() })
             .transpose()?;
-        Protocol::try_new(
+        Ok(Protocol::try_new(
             self.min_reader_version,
             self.min_writer_version,
             reader_features,
             writer_features,
-        )
+        )?)
     }
 }
 
@@ -523,11 +523,11 @@ impl FfiSidecar {
 
 impl FfiFileSizeHistogram {
     pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<FileSizeHistogram> {
-        FileSizeHistogram::try_new(
+        Ok(FileSizeHistogram::try_new(
             unsafe { self.sorted_bin_boundaries.try_as_slice() }?.to_vec(),
             unsafe { self.file_counts.try_as_slice() }?.to_vec(),
             unsafe { self.total_bytes.try_as_slice() }?.to_vec(),
-        )
+        )?)
     }
 }
 
@@ -611,7 +611,7 @@ impl FfiLastCheckpoint {
         let v2_checkpoint = unsafe { self.v2_checkpoint.as_ref() }
             .map(|value| unsafe { value.try_to_kernel() })
             .transpose()?;
-        LastCheckpointHint::from_parts(
+        Ok(LastCheckpointHint::from_parts(
             self.version,
             self.size,
             parts,
@@ -621,7 +621,7 @@ impl FfiLastCheckpoint {
             checksum,
             tags,
             v2_checkpoint,
-        )
+        )?)
     }
 }
 
@@ -637,13 +637,13 @@ impl From<FfiDeletionVectorStorageType> for DeletionVectorStorageType {
 
 impl FfiDeletionVectorDescriptor {
     pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<DeletionVectorDescriptor> {
-        DeletionVectorDescriptor::try_new(
+        Ok(DeletionVectorDescriptor::try_new(
             self.storage_type.into(),
             unsafe { self.path_or_inline_dv.try_to_string() }?,
             Option::<&i32>::from(&self.offset).copied(),
             self.size_in_bytes,
             self.cardinality,
-        )
+        )?)
     }
 }
 
@@ -720,8 +720,12 @@ impl FfiSetTransactionState {
     pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<SetTransactionState> {
         let transactions = unsafe { self.transactions.try_to_vec() }?;
         match self.kind {
-            FfiSetTransactionStateKind::Complete => SetTransactionState::try_complete(transactions),
-            FfiSetTransactionStateKind::Partial => SetTransactionState::try_partial(transactions),
+            FfiSetTransactionStateKind::Complete => {
+                Ok(SetTransactionState::try_complete(transactions)?)
+            }
+            FfiSetTransactionStateKind::Partial => {
+                Ok(SetTransactionState::try_partial(transactions)?)
+            }
         }
     }
 }
@@ -740,10 +744,10 @@ impl FfiDomainMetadataState {
         let domain_metadata = unsafe { self.domain_metadata.try_to_vec() }?;
         match self.kind {
             FfiDomainMetadataStateKind::Complete => {
-                DomainMetadataState::try_complete(domain_metadata)
+                Ok(DomainMetadataState::try_complete(domain_metadata)?)
             }
             FfiDomainMetadataStateKind::Partial => {
-                DomainMetadataState::try_partial(domain_metadata)
+                Ok(DomainMetadataState::try_partial(domain_metadata)?)
             }
         }
     }
@@ -751,9 +755,9 @@ impl FfiDomainMetadataState {
 
 impl FfiDeletedRecordCountsHistogram {
     pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<DeletedRecordCountsHistogram> {
-        DeletedRecordCountsHistogram::try_new(
+        Ok(DeletedRecordCountsHistogram::try_new(
             unsafe { self.deleted_record_counts.try_as_slice() }?.to_vec(),
-        )
+        )?)
     }
 }
 
@@ -769,7 +773,7 @@ impl FfiCrc {
             unsafe { self.deleted_record_counts_histogram.as_ref() }
                 .map(|value| unsafe { value.try_to_kernel() })
                 .transpose()?;
-        Crc::try_from_parts(
+        Ok(Crc::try_from_parts(
             self.version,
             unsafe { self.metadata.try_to_kernel() }?,
             unsafe { self.protocol.try_to_kernel() }?,
@@ -784,7 +788,7 @@ impl FfiCrc {
             deleted_record_counts_histogram,
             #[cfg(feature = "adaptive-metadata-in-dev")]
             None,
-        )
+        )?)
     }
 }
 

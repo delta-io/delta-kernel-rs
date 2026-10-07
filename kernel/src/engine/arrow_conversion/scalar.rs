@@ -21,7 +21,7 @@ use crate::arrow::array::Array;
 use crate::arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
 use crate::expressions::Scalar;
 use crate::schema::DataType;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult, Result, ResultExt};
 
 /// Extracts a primitive kernel [`Scalar`] from the given row of an Arrow array.
 ///
@@ -39,15 +39,15 @@ use crate::{KernelError, KernelResult, Result};
 /// - The decimal precision/scale is invalid
 pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> Result<Scalar> {
     if row_idx >= array.len() {
-        return Err(KernelError::generic(format!(
+        return Err(crate::Error::Kernel(KernelError::generic(format!(
             "row index {row_idx} out of bounds for array of length {}",
             array.len()
-        )));
+        ))));
     }
     if array.is_null(row_idx) {
-        return Ok(Scalar::Null(arrow_primitive_to_kernel_type(
-            array.data_type(),
-        )?));
+        return Ok(Scalar::Null(
+            arrow_primitive_to_kernel_type(array.data_type()).into_public_result()?,
+        ));
     }
     match array.data_type() {
         ArrowDataType::Int8 => Ok(Scalar::Byte(
@@ -101,9 +101,9 @@ pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> Result<Sca
         )),
         ArrowDataType::Decimal128(precision, scale) => {
             if *scale < 0 {
-                return Err(KernelError::generic(format!(
+                return Err(crate::Error::Kernel(KernelError::generic(format!(
                     "negative decimal scale ({scale}) is not supported"
-                )));
+                ))));
             }
             let value = array.as_primitive::<Decimal128Type>().value(row_idx);
             Scalar::decimal(value, *precision, *scale as u8)
@@ -114,9 +114,9 @@ pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> Result<Sca
         ArrowDataType::LargeBinary => Ok(Scalar::Binary(
             array.as_binary::<i64>().value(row_idx).to_vec(),
         )),
-        other => Err(KernelError::generic(format!(
+        other => Err(crate::Error::Kernel(KernelError::generic(format!(
             "unsupported Arrow type for primitive scalar extraction: {other:?}"
-        ))),
+        )))),
     }
 }
 
@@ -153,7 +153,7 @@ fn arrow_primitive_to_kernel_type(arrow_type: &ArrowDataType) -> KernelResult<Da
                     "negative decimal scale ({s}) is not supported"
                 )));
             }
-            DataType::decimal(*p, *s as u8)
+            Ok(DataType::decimal(*p, *s as u8)?)
         }
         ArrowDataType::Binary | ArrowDataType::LargeBinary => Ok(DataType::BINARY),
         other => Err(KernelError::generic(format!(

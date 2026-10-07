@@ -166,7 +166,7 @@ pub fn validate_timestamp(commit_info: &serde_json::Value) {
 /// Check that the timestamps in commit_info and add actions are within 10s of SystemTime::now().
 pub fn check_action_timestamps<'a>(
     parsed_commits: impl Iterator<Item = &'a serde_json::Value>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let now: i64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis()
@@ -211,16 +211,22 @@ pub async fn write_data_and_check_result_and_stats(
     schema: SchemaRef,
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     expected_since_commit: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut txn = test_utils::load_and_begin_transaction(table_url.clone(), engine.as_ref())?
         .with_data_change(true);
 
     // create two new arrow record batches to append
     let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> Result<_> {
         let data = RecordBatch::try_new(
-            Arc::new(schema.as_ref().try_into_arrow()?),
+            Arc::new(
+                schema
+                    .as_ref()
+                    .try_into_arrow()
+                    .map_err(delta_kernel::Error::kernel)?,
+            ),
             vec![Arc::new(Int32Array::from(data.to_vec()))],
-        )?;
+        )
+        .map_err(delta_kernel::Error::kernel)?;
         Ok(Box::new(ArrowEngineData::new(data)))
     });
 
@@ -275,7 +281,7 @@ pub fn set_table_properties(
     engine: &dyn Engine,
     current_version: Version,
     properties: &[(&str, &str)],
-) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+) -> std::result::Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let v0_path = std::path::Path::new(table_path).join("_delta_log/00000000000000000000.json");
     let mut meta: serde_json::Value = std::fs::read_to_string(&v0_path)?
         .lines()
@@ -370,7 +376,7 @@ pub async fn create_dv_table_with_files(
     schema: Arc<StructType>,
     partition_values: &[(&str, Option<&str>)],
     file_paths: &[&str],
-) -> Result<
+) -> std::result::Result<
     (
         Arc<DynObjectStore>,
         Arc<dyn delta_kernel::Engine>,
@@ -466,7 +472,9 @@ pub fn get_scan_files(
     engine: &dyn delta_kernel::Engine,
 ) -> Result<Vec<FilteredEngineData>> {
     let scan = snapshot.scan_builder().build()?;
-    let all_scan_metadata: Vec<_> = scan.scan_metadata(engine)?.collect::<Result<Vec<_>, _>>()?;
+    let all_scan_metadata: Vec<_> = scan
+        .scan_metadata(engine)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     Ok(all_scan_metadata
         .into_iter()
@@ -480,7 +488,7 @@ pub async fn write_deletion_vector_to_store(
     write_context: &BoundWriteContext,
     dv: KernelDeletionVector,
     prefix: &str,
-) -> Result<DeletionVectorDescriptor, Box<dyn std::error::Error>> {
+) -> std::result::Result<DeletionVectorDescriptor, Box<dyn std::error::Error>> {
     let dv_path = write_context.new_deletion_vector_path(String::from(prefix));
     let dv_object_path = Path::parse(dv_path.absolute_path()?.path())?;
 
@@ -498,7 +506,7 @@ pub async fn write_deletion_vector_to_store(
 pub fn create_dv_update_transaction(
     table_url: &Url,
     engine: &dyn Engine,
-) -> Result<Transaction, Box<dyn std::error::Error>> {
+) -> std::result::Result<Transaction, Box<dyn std::error::Error>> {
     Ok(load_and_begin_transaction(table_url.clone(), engine)?
         .with_engine_info("test engine")
         .with_operation("DELETE".to_string()))

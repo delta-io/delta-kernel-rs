@@ -59,7 +59,9 @@ pub trait DeletionVector: Sized {
         let treemap: RoaringTreemap = self.into_iter().collect();
         let mut serialized = Vec::new();
         treemap.serialize_into(&mut serialized).map_err(|e| {
-            KernelError::generic(format!("Failed to serialize deletion vector: {e}"))
+            crate::Error::Kernel(KernelError::generic(format!(
+                "Failed to serialize deletion vector: {e}"
+            )))
         })?;
         Ok(Bytes::from(serialized))
     }
@@ -163,7 +165,9 @@ impl DeletionVector for KernelDeletionVector {
     fn serialize(self) -> Result<Bytes> {
         let mut serialized = Vec::new();
         self.dv.serialize_into(&mut serialized).map_err(|e| {
-            KernelError::generic(format!("Failed to serialize deletion vector: {e}"))
+            crate::Error::Kernel(KernelError::generic(format!(
+                "Failed to serialize deletion vector: {e}"
+            )))
         })?;
         Ok(Bytes::from(serialized))
     }
@@ -271,9 +275,11 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         // Write version byte on first write
         if self.current_offset == 0 {
             // Write header.
-            self.writer
-                .write_all(&[1u8])
-                .map_err(|e| KernelError::generic(format!("Failed to write version byte: {e}")))?;
+            self.writer.write_all(&[1u8]).map_err(|e| {
+                crate::Error::Kernel(KernelError::generic(format!(
+                    "Failed to write version byte: {e}"
+                )))
+            })?;
             self.current_offset = 1;
         }
 
@@ -286,33 +292,36 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         //
         // [1] https://github.com/delta-io/delta/blob/b388f280d083d4cf92c6434e4f7a549fc26cd1fa/spark/src/main/scala/org/apache/spark/sql/delta/deletionvectors/RoaringBitmapArray.scala#L311
         if dv_size > i32::MAX as usize {
-            return Err(KernelError::generic(
+            return Err(crate::Error::Kernel(KernelError::generic(
                 "Deletion vector size exceeds maximum allowed size",
-            ));
+            )));
         }
 
         // Record the offset where this DV size starts.
-        let dv_offset: i32 = self
-            .current_offset
-            .try_into()
-            .map_err(|_| KernelError::generic("Deletion vector offset doesn't fit in i32"))?;
+        let dv_offset: i32 = self.current_offset.try_into().map_err(|_| {
+            crate::Error::Kernel(KernelError::generic(
+                "Deletion vector offset doesn't fit in i32",
+            ))
+        })?;
 
         // Write size (big-endian, as per Delta spec)
         let size_bytes = (dv_size as u32).to_be_bytes();
-        self.writer
-            .write_all(&size_bytes)
-            .map_err(|e| KernelError::generic(format!("Failed to write size: {e}")))?;
+        self.writer.write_all(&size_bytes).map_err(|e| {
+            crate::Error::Kernel(KernelError::generic(format!("Failed to write size: {e}")))
+        })?;
 
         // Write magic number (little-endian)
         // This is the RoaringBitmapArray format magic
         let magic: u32 = 1681511377;
-        self.writer
-            .write_all(&magic.to_le_bytes())
-            .map_err(|e| KernelError::generic(format!("Failed to write magic: {e}")))?;
+        self.writer.write_all(&magic.to_le_bytes()).map_err(|e| {
+            crate::Error::Kernel(KernelError::generic(format!("Failed to write magic: {e}")))
+        })?;
 
         // Write the serialized treemap
         self.writer.write_all(&serialized).map_err(|e| {
-            KernelError::generic(format!("Failed to write deletion vector data: {e}"))
+            crate::Error::Kernel(KernelError::generic(format!(
+                "Failed to write deletion vector data: {e}"
+            )))
         })?;
 
         // Calculate and write CRC32 checksum (big-endian)
@@ -324,7 +333,11 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         let checksum = digest.finalize();
         self.writer
             .write_all(&checksum.to_be_bytes())
-            .map_err(|e| KernelError::generic(format!("Failed to write CRC32 checksum: {e}")))?;
+            .map_err(|e| {
+                crate::Error::Kernel(KernelError::generic(format!(
+                    "Failed to write CRC32 checksum: {e}"
+                )))
+            })?;
 
         // Update offset for next write (size_prefix + magic + data + crc)
         let bytes_written = 4 + dv_size + 4; // size + (magic + data) + crc
@@ -361,9 +374,9 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         // without breaking downstream code.
         //
 
-        self.writer
-            .flush()
-            .map_err(|e| KernelError::generic(format!("Failed to flush writer: {e}")))
+        self.writer.flush().map_err(|e| {
+            crate::Error::Kernel(KernelError::generic(format!("Failed to flush writer: {e}")))
+        })
     }
 }
 

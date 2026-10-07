@@ -16,7 +16,7 @@ use crate::engine::arrow_expression::evaluate_expression::{extract_column, extra
 use crate::expressions::ColumnName;
 use crate::plans::ir::nodes::{Agg, Aggregate, NonNullByOperands};
 use crate::schema::DataType;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult, Result, ResultExt};
 
 /// A specific row of input: `(batch index, row index)`.
 type InputRow = (usize, usize);
@@ -94,10 +94,10 @@ pub(super) fn eval_aggregate(
 
 // Extracts the named column from each of the input batches
 fn extract_column_values(input: &[RecordBatch], name: &ColumnName) -> KernelResult<Vec<ArrayRef>> {
-    input
+    Ok(input
         .iter()
         .map(|batch| extract_column(batch, name))
-        .try_collect()
+        .try_collect()?)
 }
 
 // Thin wrapper around arrow `interleave` that converts our `&[ArrayRef]` into `&[&dyn Array]`
@@ -178,7 +178,7 @@ impl BoundAggregate for LongAccumulatorAgg {
 
     fn prepare<'a>(&'a self, batch: &'a RecordBatch) -> Result<Box<dyn AggUpdater + 'a>> {
         Ok(Box::new(LongAccumulatorUpdater {
-            values: extract_long_column(batch, &self.value)?,
+            values: extract_long_column(batch, &self.value).into_public_result()?,
             op: self.op,
         }))
     }
@@ -186,7 +186,11 @@ impl BoundAggregate for LongAccumulatorAgg {
     fn finalize(&self, states: &[&dyn Any], _input: &[RecordBatch]) -> Result<ArrayRef> {
         let values = states
             .iter()
-            .map(|state| Ok(downcast_state::<LongAccumulatorState>(*state)?.0))
+            .map(|state| {
+                Ok(downcast_state::<LongAccumulatorState>(*state)
+                    .into_public_result()?
+                    .0)
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Arc::new(Int64Array::from(values)))
     }
@@ -200,7 +204,7 @@ struct LongAccumulatorUpdater<'a> {
 impl AggUpdater for LongAccumulatorUpdater<'_> {
     fn update(&self, state: &mut dyn Any, (_, row_idx): InputRow) -> Result<()> {
         if self.values.is_valid(row_idx) {
-            let state = downcast_state_mut::<LongAccumulatorState>(state)?;
+            let state = downcast_state_mut::<LongAccumulatorState>(state).into_public_result()?;
             let candidate = self.values.value(row_idx);
             match self.op {
                 LongAccumulator::MinMax(cmp) => {
@@ -212,7 +216,9 @@ impl AggUpdater for LongAccumulatorUpdater<'_> {
                     state.0 = Some(match state.0 {
                         None => candidate,
                         Some(sum) => i64::checked_add(sum, candidate).ok_or_else(|| {
-                            KernelError::generic("SyncPlanExecutor SUM aggregate overflowed i64")
+                            crate::Error::Kernel(KernelError::generic(
+                                "SyncPlanExecutor SUM aggregate overflowed i64",
+                            ))
                         })?,
                     });
                 }
@@ -256,7 +262,7 @@ impl BoundAggregate for CountAgg {
     fn finalize(&self, states: &[&dyn Any], _input: &[RecordBatch]) -> Result<ArrayRef> {
         let values = states
             .iter()
-            .map(|state| Ok(downcast_state::<CountState>(*state)?.0))
+            .map(|state| Ok(downcast_state::<CountState>(*state).into_public_result()?.0))
             .collect::<Result<Vec<_>>>()?;
         Ok(Arc::new(Int64Array::from(values)))
     }
@@ -267,9 +273,11 @@ struct CountUpdater<'a>(Option<&'a ArrayRef>);
 impl AggUpdater for CountUpdater<'_> {
     fn update(&self, state: &mut dyn Any, (_, row_idx): InputRow) -> Result<()> {
         if self.0.is_none_or(|values| values.is_valid(row_idx)) {
-            let state = downcast_state_mut::<CountState>(state)?;
+            let state = downcast_state_mut::<CountState>(state).into_public_result()?;
             state.0 = i64::checked_add(state.0, 1).ok_or_else(|| {
-                KernelError::generic("SyncPlanExecutor COUNT aggregate overflowed i64")
+                crate::Error::Kernel(KernelError::generic(
+                    "SyncPlanExecutor COUNT aggregate overflowed i64",
+                ))
             })?;
         }
         Ok(())
@@ -311,13 +319,13 @@ impl BoundAggregate for NonNullByAgg {
     fn prepare<'a>(&'a self, batch: &'a RecordBatch) -> Result<Box<dyn AggUpdater + 'a>> {
         Ok(Box::new(NonNullByUpdater {
             null_sentinels: extract_column_ref(batch, &self.null_sentinel)?,
-            keys: extract_long_column(batch, &self.key)?,
+            keys: extract_long_column(batch, &self.key).into_public_result()?,
             comparison: self.comparison,
         }))
     }
 
     fn finalize(&self, states: &[&dyn Any], input: &[RecordBatch]) -> Result<ArrayRef> {
-        let mut arrays = extract_column_values(input, &self.value)?;
+        let mut arrays = extract_column_values(input, &self.value).into_public_result()?;
         arrays.push(new_null_array(&self.output_type, 1));
 
         // Groups with no winner interleave from the one-row null array we appended above.
@@ -325,12 +333,14 @@ impl BoundAggregate for NonNullByAgg {
         let rows: Vec<_> = states
             .iter()
             .map(|state| -> Result<_> {
-                let winner = downcast_state::<NonNullByState>(*state)?.0;
+                let winner = downcast_state::<NonNullByState>(*state)
+                    .into_public_result()?
+                    .0;
                 Ok(winner.map_or(initial_row, |(row, _)| row))
             })
             .try_collect()?;
 
-        interleave_column_values(&arrays, &rows)
+        interleave_column_values(&arrays, &rows).into_public_result()
     }
 }
 
@@ -343,7 +353,7 @@ struct NonNullByUpdater<'a> {
 impl AggUpdater for NonNullByUpdater<'_> {
     fn update(&self, state: &mut dyn Any, (batch_idx, row_idx): InputRow) -> Result<()> {
         if self.null_sentinels.is_valid(row_idx) && self.keys.is_valid(row_idx) {
-            let state = downcast_state_mut::<NonNullByState>(state)?;
+            let state = downcast_state_mut::<NonNullByState>(state).into_public_result()?;
             let best = state.0.map(|(_, best)| best);
             let candidate = self.keys.value(row_idx);
             if self.comparison.replaces(best, candidate) {
@@ -409,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn grouped_aggregate_routes_rows_to_every_agg() -> Result<()> {
+    fn grouped_aggregate_routes_rows_to_every_agg() -> crate::KernelResult<()> {
         let input = RecordBatch::try_from_iter([
             (
                 "group",
@@ -473,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn non_null_by_selects_across_batches() -> Result<()> {
+    fn non_null_by_selects_across_batches() -> crate::KernelResult<()> {
         let aggregate = Aggregate {
             group_by: vec![],
             aggs: vec![
@@ -523,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_input_distinguishes_grouped_and_ungrouped_aggregates() -> Result<()> {
+    fn empty_input_distinguishes_grouped_and_ungrouped_aggregates() -> crate::KernelResult<()> {
         let ungrouped = Aggregate {
             group_by: vec![],
             aggs: vec![
@@ -606,7 +616,7 @@ mod tests {
     fn sum_and_count_null_patterns(
         #[case] values: &[Option<i64>],
         #[case] expected: &str,
-    ) -> Result<()> {
+    ) -> crate::KernelResult<()> {
         let input = RecordBatch::try_from_iter([(
             "value",
             Arc::new(Int64Array::from(values.to_vec())) as ArrayRef,
@@ -629,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn count_over_struct_counts_non_null_structs() -> Result<()> {
+    fn count_over_struct_counts_non_null_structs() -> crate::KernelResult<()> {
         let nested = Arc::new(StructArray::from(vec![(
             Arc::new(Field::new("x", ArrowDataType::Int64, true)),
             Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])) as ArrayRef,
@@ -664,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_resolves_nested_columns_over_top_level_traps() -> Result<()> {
+    fn aggregate_resolves_nested_columns_over_top_level_traps() -> crate::KernelResult<()> {
         let outer = StructArray::from(vec![
             (
                 Arc::new(Field::new("group", ArrowDataType::Utf8, false)),
@@ -725,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn non_null_by_can_select_a_null_value() -> Result<()> {
+    fn non_null_by_can_select_a_null_value() -> crate::KernelResult<()> {
         let input = RecordBatch::try_from_iter([
             (
                 "value",

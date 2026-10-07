@@ -34,7 +34,9 @@ use crate::table_properties::TableProperties;
 use crate::utils::require;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::{create_row, Engine};
-use crate::{EngineData, FileMeta, FileSize, KernelError, KernelResult, Result, RowVisitor as _};
+use crate::{
+    EngineData, FileMeta, FileSize, KernelError, KernelResult, Result, ResultExt, RowVisitor as _,
+};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
@@ -399,10 +401,10 @@ impl Metadata {
         // Note: We don't have to look for nested metadata columns because that is already validated
         // when creating a StructType.
         if let Some(metadata_field) = schema.fields().find(|field| field.is_metadata_column()) {
-            return Err(KernelError::Schema(format!(
+            return Err(crate::Error::Kernel(KernelError::Schema(format!(
                 "Table schema must not contain metadata columns. Found metadata column: '{}'",
                 metadata_field.name
-            )));
+            ))));
         }
 
         Ok(Self {
@@ -414,7 +416,7 @@ impl Metadata {
             // both for legacy reasons and to enable possible support for other formats in the
             // future (See delta-io/delta#87).
             format: Format::default(),
-            schema_string: serde_json::to_string(&schema)?,
+            schema_string: serde_json::to_string(&schema).map_err(crate::Error::kernel)?,
             partition_columns,
             created_time: Some(created_time),
             configuration,
@@ -494,15 +496,17 @@ impl Metadata {
                     .to_string()
                     .starts_with(SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX)
             {
-                KernelError::schema(format!(
-                    "Table schema is too deeply nested: decoding metaData.schemaString exceeded \
-                     serde_json's recursion limit: {error}"
-                ))
-                .with_backtrace()
+                crate::Error::Kernel(
+                    KernelError::schema(format!(
+                        "Table schema is too deeply nested: decoding metaData.schemaString exceeded \
+                         serde_json's recursion limit: {error}"
+                    ))
+                    .with_backtrace(),
+                )
             } else if is_unsupported_delta_type_error(&error) {
-                KernelError::schema(error.to_string()).with_backtrace()
+                crate::Error::Kernel(KernelError::schema(error.to_string()).with_backtrace())
             } else {
-                error.into()
+                crate::Error::kernel(error)
             }
         })
     }
@@ -609,13 +613,13 @@ struct ProtocolRaw {
 impl TryFrom<ProtocolRaw> for Protocol {
     type Error = KernelError;
 
-    fn try_from(protocol: ProtocolRaw) -> Result<Self> {
-        Protocol::try_new(
+    fn try_from(protocol: ProtocolRaw) -> KernelResult<Self> {
+        Ok(Protocol::try_new(
             protocol.min_reader_version,
             protocol.min_writer_version,
             protocol.reader_features,
             protocol.writer_features,
-        )
+        )?)
     }
 }
 
@@ -634,12 +638,12 @@ impl Protocol {
         reader_features: impl IntoIterator<Item = impl Into<TableFeature>>,
         writer_features: impl IntoIterator<Item = impl Into<TableFeature>>,
     ) -> KernelResult<Self> {
-        Self::try_new(
+        Ok(Self::try_new(
             TABLE_FEATURES_MIN_READER_VERSION,
             TABLE_FEATURES_MIN_WRITER_VERSION,
             Some(reader_features),
             Some(writer_features),
-        )
+        )?)
     }
 
     /// Try to create a new legacy Protocol instance with the given reader/writer versions
@@ -648,12 +652,12 @@ impl Protocol {
         min_reader_version: i32,
         min_writer_version: i32,
     ) -> KernelResult<Self> {
-        Self::try_new(
+        Ok(Self::try_new(
             min_reader_version,
             min_writer_version,
             TableFeature::NO_LIST,
             TableFeature::NO_LIST,
-        )
+        )?)
     }
 
     /// Try to create a new Protocol instance from reader/writer versions and table features.
@@ -666,15 +670,15 @@ impl Protocol {
     ) -> Result<Self> {
         require!(
             min_reader_version >= MIN_VALID_RW_VERSION,
-            KernelError::InvalidProtocol(format!(
+            crate::Error::Kernel(KernelError::InvalidProtocol(format!(
                 "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {min_reader_version}"
-            ))
+            )))
         );
         require!(
             min_writer_version >= MIN_VALID_RW_VERSION,
-            KernelError::InvalidProtocol(format!(
+            crate::Error::Kernel(KernelError::InvalidProtocol(format!(
                 "min_writer_version must be >= {MIN_VALID_RW_VERSION}, got {min_writer_version}"
-            ))
+            )))
         );
 
         let reader_features = parse_features(reader_features);
@@ -685,16 +689,16 @@ impl Protocol {
         if min_reader_version == TABLE_FEATURES_MIN_READER_VERSION {
             require!(
                 reader_features.is_some(),
-                KernelError::invalid_protocol(
+                crate::Error::Kernel(KernelError::invalid_protocol(
                     "Reader features must be present when minimum reader version = 3"
-                )
+                ))
             );
         } else {
             require!(
                 reader_features.is_none(),
-                KernelError::invalid_protocol(
+                crate::Error::Kernel(KernelError::invalid_protocol(
                     "Reader features must not be present when minimum reader version != 3"
-                )
+                ))
             );
         }
 
@@ -703,16 +707,16 @@ impl Protocol {
         if min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION {
             require!(
                 writer_features.is_some(),
-                KernelError::invalid_protocol(
+                crate::Error::Kernel(KernelError::invalid_protocol(
                     "Writer features must be present when minimum writer version = 7"
-                )
+                ))
             );
         } else {
             require!(
                 writer_features.is_none(),
-                KernelError::invalid_protocol(
+                crate::Error::Kernel(KernelError::invalid_protocol(
                     "Writer features must not be present when minimum writer version != 7"
-                )
+                ))
             );
         }
 
@@ -728,12 +732,12 @@ impl Protocol {
                         FeatureType::ReaderWriter | FeatureType::Unknown
                     ) || !writer_features.contains(*feature)
                 }) {
-                    return Err(KernelError::invalid_protocol(format!(
+                    return Err(crate::Error::Kernel(KernelError::invalid_protocol(format!(
                         "Reader features must contain only ReaderWriter features that are also \
                          listed in writer features, but {offending:?} is not \
                          (readerFeatures={reader_features:?}, writerFeatures={writer_features:?}, \
                          minReaderVersion={min_reader_version}, minWriterVersion={min_writer_version})"
-                    )));
+                    ))));
                 }
 
                 // Every ReaderWriter feature in writerFeatures must also appear in readerFeatures.
@@ -760,7 +764,7 @@ impl Protocol {
                     if LEGACY_READER_FEATURES.contains(feature) {
                         legacy_orphans.push(feature);
                     } else {
-                        return Err(KernelError::invalid_protocol(format!(
+                        return Err(crate::Error::Kernel(KernelError::invalid_protocol(format!(
                             "Writer features must be Writer-only or also listed in reader features, \
                              but ReaderWriter feature {feature:?} is listed in writerFeatures and \
                              missing from readerFeatures \
@@ -768,7 +772,7 @@ impl Protocol {
                              writerFeatures={writer_features:?}, \
                              minReaderVersion={min_reader_version}, \
                              minWriterVersion={min_writer_version})"
-                        )));
+                        ))));
                     }
                 }
                 // Reached only once the whole writer list is known valid.
@@ -796,20 +800,20 @@ impl Protocol {
                         }
                     }
                 }) {
-                    return Err(KernelError::invalid_protocol(format!(
+                    return Err(crate::Error::Kernel(KernelError::invalid_protocol(format!(
                         "Writer features must be Writer-only or also listed in reader features, \
                          but ReaderWriter feature {offending:?} is listed in writerFeatures with \
                          no reader features present \
                          (writerFeatures={writer_features:?}, minReaderVersion={min_reader_version}, \
                          minWriterVersion={min_writer_version})"
-                    )));
+                    ))));
                 }
                 Ok(())
             }
             (Some(_), None) => Err(KernelError::invalid_protocol(
                 "Reader features should be present in writer features",
             )),
-        }?;
+        }.into_public_result()?;
 
         Ok(Protocol {
             min_reader_version,
@@ -1071,7 +1075,7 @@ pub(crate) struct Add {
 
 fn deserialize_partition_values<'de, D>(
     deserializer: D,
-) -> Result<HashMap<String, String>, D::Error>
+) -> std::result::Result<HashMap<String, String>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -1084,7 +1088,7 @@ where
             formatter.write_str("a map of nullable partition values")
         }
 
-        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
         where
             A: MapAccess<'de>,
         {
@@ -1356,7 +1360,7 @@ impl LastManifestCommit {
             version,
             content_root_version,
         };
-        last_manifest_commit.validate()?;
+        last_manifest_commit.validate().into_public_result()?;
         Ok(last_manifest_commit)
     }
 
@@ -1474,7 +1478,10 @@ impl Serialize for CheckpointAction {
     /// `try_into_scalar` (`checkpointMetadata`, `contentRoot`, `protocol`, `metaData`,
     /// then `txn`, `domainMetadata`, and the `txn`/`domainMetadata` sidecars). Validates first,
     /// so an invalid action can never be written through serde either.
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         self.validate().map_err(serde::ser::Error::custom)?;
         let checkpoint_metadata = CheckpointMetadata {
             version: self.version,
@@ -1526,7 +1533,7 @@ impl<'de> Deserialize<'de> for CheckpointAction {
     /// checkpointMetadata.version` invariant. The one intended difference is unknown elements:
     /// this path fails closed on an unrecognized element key (see [`CheckpointActionElement`]),
     /// whereas the visitor skips it for forward compatibility.
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         let elements = Vec::<CheckpointActionElement>::deserialize(deserializer)?;
         Self::from_elements(elements).map_err(serde::de::Error::custom)
     }
@@ -1662,8 +1669,9 @@ impl CheckpointAction {
         create_row(
             engine,
             LOG_CHECKPOINT_SCHEMA.clone(),
-            self.try_into_scalar()?,
+            self.try_into_scalar().into_public_result()?,
         )
+        .into_public_result()
     }
 
     /// Parse the first `checkpoint` action in `data`, ignoring any later ones. Rows without a
@@ -1687,7 +1695,9 @@ impl CheckpointAction {
         fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> Result<()> {
             require!(
                 slot.replace(value).is_none(),
-                KernelError::generic(format!("duplicate `{name}` element in checkpoint action"))
+                crate::Error::Kernel(KernelError::generic(format!(
+                    "duplicate `{name}` element in checkpoint action"
+                )))
             );
             Ok(())
         }
@@ -1716,18 +1726,18 @@ impl CheckpointAction {
                     SET_TRANSACTION_NAME => txn_sidecars.push(cs.sidecar),
                     DOMAIN_METADATA_NAME => domain_metadata_sidecars.push(cs.sidecar),
                     other => {
-                        return Err(KernelError::generic(format!(
+                        return Err(crate::Error::Kernel(KernelError::generic(format!(
                             "checkpoint sidecar has unsupported type `{other}`"
-                        )))
+                        ))))
                     }
                 },
             }
         }
 
         let missing = |field: &str| {
-            KernelError::generic(format!(
+            crate::Error::Kernel(KernelError::generic(format!(
                 "checkpoint action is missing required `{field}` element"
-            ))
+            )))
         };
         let action = CheckpointAction {
             version: version.ok_or_else(|| missing(CHECKPOINT_METADATA_NAME))?,
@@ -1739,7 +1749,7 @@ impl CheckpointAction {
             txn_sidecars,
             domain_metadata_sidecars,
         };
-        action.validate()?;
+        action.validate().into_public_result()?;
         Ok(action)
     }
 
@@ -1783,9 +1793,10 @@ impl CheckpointAction {
     pub(crate) fn root_filemeta(&self, table_root: &Url) -> Result<FileMeta> {
         let content_root = &self.content_root;
         Ok(FileMeta {
-            location: resolve_amt_location(&content_root.path, table_root)?,
+            location: resolve_amt_location(&content_root.path, table_root).into_public_result()?,
             last_modified: i64::MAX,
-            size: to_file_size(content_root.size_in_bytes, "checkpoint contentRoot")?,
+            size: to_file_size(content_root.size_in_bytes, "checkpoint contentRoot")
+                .into_public_result()?,
         })
     }
 
@@ -2108,8 +2119,8 @@ mod tests {
                 ),
             );
             let error = match result.unwrap_err() {
-                KernelError::Backtraced { source, .. } => *source,
-                error => error,
+                crate::Error::Kernel(KernelError::Backtraced { source, .. }) => *source,
+                error => crate::KernelError::from(error),
             };
             assert!(matches!(error, KernelError::Schema(_)));
         } else {
@@ -2164,8 +2175,8 @@ mod tests {
         // Error conversion captures a backtrace only when enabled, so normalize both forms before
         // checking the underlying error.
         let error = match metadata.parse_schema().unwrap_err() {
-            KernelError::Backtraced { source, .. } => *source,
-            error => error,
+            crate::Error::Kernel(KernelError::Backtraced { source, .. }) => *source,
+            error => crate::KernelError::from(error),
         };
         match expected_error {
             "MalformedJson" => {
@@ -2451,7 +2462,7 @@ mod tests {
                     reader_features,
                     writer_features
                 ),
-                Err(KernelError::InvalidProtocol(_)),
+                Err(crate::Error::Kernel(KernelError::InvalidProtocol(_))),
             ));
         }
     }
@@ -2835,7 +2846,7 @@ mod tests {
         let writer_features_array = list_builder.finish();
 
         let commit_schema = LOG_PROTOCOL_SCHEMA.clone();
-        let engine_data = create_row(&engine, commit_schema, protocol);
+        let engine_data = create_row(&engine, commit_schema, protocol).unwrap();
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "protocol",
@@ -3111,7 +3122,7 @@ mod tests {
         #[case] path: &str,
         #[case] size_in_bytes: i64,
         #[case] expected_location: &str,
-        #[case] expected: Result<FileSize, &str>,
+        #[case] expected: std::result::Result<FileSize, &str>,
     ) {
         let table_root = Url::parse(table_root).unwrap();
         let checkpoint_action = CheckpointAction {
@@ -3175,7 +3186,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_scalar_round_trip() -> Result<()> {
+    fn test_checkpoint_action_scalar_round_trip() -> crate::KernelResult<()> {
         let engine = ExprEngine::new();
         let action = sample_checkpoint_action();
         let scalar = action.clone().try_into_scalar()?;
@@ -3206,7 +3217,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_wire_format() -> Result<()> {
+    fn test_checkpoint_action_wire_format() -> crate::KernelResult<()> {
         // Build the action's engine data, then write it out through the engine JSON writer and
         // pin the exact bytes. This is the only guard on the wire format: element order, camelCase
         // field names, the sidecar `type` discriminator, and the JSON writer's null omission (the
@@ -3252,7 +3263,8 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_round_trip_multiple_and_empty_collections() -> Result<()> {
+    fn test_checkpoint_action_round_trip_multiple_and_empty_collections() -> crate::KernelResult<()>
+    {
         // Exercise the write loops and the reader's accumulation for count > 1 (two txns, two
         // domainMetadata, two same-type sidecars) and count 0 (empty domainMetadata sidecars).
         let sidecar = |path: &str| Sidecar {
@@ -3308,7 +3320,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_round_trip_protocol_with_features() -> Result<()> {
+    fn test_checkpoint_action_round_trip_protocol_with_features() -> crate::KernelResult<()> {
         // A (3, 7) protocol with the same ReaderWriter feature in both lists (required by the
         // read-time feature-consistency check) must survive scalar conversion -> parse.
         let action = CheckpointAction {

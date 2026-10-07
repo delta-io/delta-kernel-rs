@@ -119,33 +119,33 @@ impl FileSizeHistogram {
     ) -> Result<Self> {
         require!(
             sorted_bin_boundaries.len() >= 2,
-            KernelError::internal_error(format!(
+            crate::Error::Kernel(KernelError::internal_error(format!(
                 "sorted_bin_boundaries must have at least 2 elements, got {}",
                 sorted_bin_boundaries.len()
-            ))
+            )))
         );
         require!(
             sorted_bin_boundaries[0] == 0,
-            KernelError::internal_error(format!(
+            crate::Error::Kernel(KernelError::internal_error(format!(
                 "First boundary must be 0, got {}",
                 sorted_bin_boundaries[0]
-            ))
+            )))
         );
         require!(
             sorted_bin_boundaries.len() == file_counts.len()
                 && sorted_bin_boundaries.len() == total_bytes.len(),
-            KernelError::internal_error(format!(
+            crate::Error::Kernel(KernelError::internal_error(format!(
                 "All arrays must have the same length: boundaries={}, file_counts={}, total_bytes={}",
                 sorted_bin_boundaries.len(),
                 file_counts.len(),
                 total_bytes.len()
-            ))
+            )))
         );
         require!(
             sorted_bin_boundaries.windows(2).all(|w| w[0] < w[1]),
-            KernelError::internal_error(
+            crate::Error::Kernel(KernelError::internal_error(
                 "sorted_bin_boundaries must be sorted in strictly ascending order"
-            )
+            ))
         );
         Ok(Self {
             sorted_bin_boundaries,
@@ -162,7 +162,11 @@ impl FileSizeHistogram {
         sorted_bin_boundaries: Vec<i64>,
     ) -> KernelResult<Self> {
         let len = sorted_bin_boundaries.len();
-        Self::try_new(sorted_bin_boundaries, vec![0; len], vec![0; len])
+        Ok(Self::try_new(
+            sorted_bin_boundaries,
+            vec![0; len],
+            vec![0; len],
+        )?)
     }
 
     /// Creates a default histogram with the standard 95 bin boundaries and zero counts.

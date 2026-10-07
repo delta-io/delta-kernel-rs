@@ -151,7 +151,7 @@ async fn create_or_get_base_snapshot(
             println!("Creating new Delta table...");
             let schema = parse_schema(schema_str)?;
             create_table(url, &schema, engine).await?;
-            Snapshot::builder_for(url.clone()).build(engine)
+            Ok(Snapshot::builder_for(url.clone()).build(engine)?)
         }
     }
 }

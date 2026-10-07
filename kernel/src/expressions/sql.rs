@@ -100,7 +100,7 @@ fn parse_binary_literal(trimmed: &str) -> KernelResult<Scalar> {
 /// `DATE` keyword is optional and may have 0 or more whitespace before the apostrophe.
 fn parse_date_literal(trimmed: &str, sql: &str) -> KernelResult<Scalar> {
     let raw = unwrap_quoted_body(trimmed, &["DATE"], &PrimitiveType::Date, sql)?;
-    PrimitiveType::Date.parse_scalar(&raw)
+    Ok(PrimitiveType::Date.parse_scalar(&raw)?)
 }
 
 /// Parse a zoneless (wall-clock) `Scalar::TimestampNtz` from a trimmed string.
@@ -116,7 +116,7 @@ fn parse_timestamp_ntz_literal(trimmed: &str, sql: &str) -> KernelResult<Scalar>
         &PrimitiveType::TimestampNtz,
         sql,
     )?;
-    PrimitiveType::TimestampNtz.parse_scalar(&raw)
+    Ok(PrimitiveType::TimestampNtz.parse_scalar(&raw)?)
 }
 
 /// Parse a `Scalar::Timestamp` (local-time-zone) from a trimmed string in ISO 8601 / RFC 3339 form
@@ -135,7 +135,7 @@ fn parse_timestamp_ltz_literal(trimmed: &str, sql: &str) -> KernelResult<Scalar>
         sql,
     )?;
     require_utc_z_suffix(&raw, sql)?;
-    PrimitiveType::Timestamp.parse_scalar(&raw)
+    Ok(PrimitiveType::Timestamp.parse_scalar(&raw)?)
 }
 
 /// Strip the typed-literal keyword prefix, if any, and return the inner literal value, unquoted and

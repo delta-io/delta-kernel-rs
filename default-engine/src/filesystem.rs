@@ -4,7 +4,7 @@ use bytes::Bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
 use delta_kernel::{
-    CancellationTokenRef, FileMeta, FileSlice, KernelError, KernelResult, Result,
+    CancellationTokenRef, FileMeta, FileSlice, KernelError, KernelResult, Result, ResultExt,
     ResultIteratorStatic, StorageHandler,
 };
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
@@ -208,8 +208,9 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
             self.task_executor.clone(),
             future,
             cancellation_token,
-        )?;
-        Ok(iter)
+        )
+        .into_public_result()?;
+        Ok(Box::new(iter.map(ResultExt::into_public_result)))
     }
 
     /// Read data specified by the start and end offset from the file.
@@ -232,32 +233,35 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
             self.task_executor.clone(),
             future,
             cancellation_token,
-        )?;
-        Ok(iter)
+        )
+        .into_public_result()?;
+        Ok(Box::new(iter.map(ResultExt::into_public_result)))
     }
 
     fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> Result<()> {
-        let path = Path::from_url_path(path.path())?;
+        let path = Path::from_url_path(path.path()).map_err(delta_kernel::Error::kernel)?;
         self.task_executor
             .block_on(put_impl(self.inner.clone(), path, data, overwrite))
+            .into_public_result()
     }
 
     fn copy_atomic(&self, src: &Url, dest: &Url) -> Result<()> {
-        let src_path = Path::from_url_path(src.path())?;
-        let dest_path = Path::from_url_path(dest.path())?;
+        let src_path = Path::from_url_path(src.path()).map_err(delta_kernel::Error::kernel)?;
+        let dest_path = Path::from_url_path(dest.path()).map_err(delta_kernel::Error::kernel)?;
         let future = copy_atomic_impl(self.inner.clone(), src_path, dest_path);
-        self.task_executor.block_on(future)
+        self.task_executor.block_on(future).into_public_result()
     }
 
     fn head(&self, path: &Url) -> Result<FileMeta> {
         let future = head_impl(self.inner.clone(), path.clone());
-        self.task_executor.block_on(future)
+        self.task_executor.block_on(future).into_public_result()
     }
 
     fn delete(&self, path: &Url) -> Result<()> {
-        let path = Path::from_url_path(path.path())?;
+        let path = Path::from_url_path(path.path()).map_err(delta_kernel::Error::kernel)?;
         self.task_executor
             .block_on(delete_impl(self.inner.clone(), path))
+            .into_public_result()
     }
 }
 
@@ -487,7 +491,9 @@ mod tests {
         // copy to existing fails
         assert!(matches!(
             handler.copy_atomic(&src_url, &dest_url),
-            Err(KernelError::FileAlreadyExists(_))
+            Err(delta_kernel::Error::Kernel(KernelError::FileAlreadyExists(
+                _
+            )))
         ));
 
         // copy from non-existing fails
@@ -528,7 +534,10 @@ mod tests {
         let missing_url = Url::from_file_path(tmp.path().join("missing.txt")).unwrap();
         let result = handler.head(&missing_url);
 
-        assert!(matches!(result, Err(KernelError::FileNotFound(_))));
+        assert!(matches!(
+            result,
+            Err(delta_kernel::Error::Kernel(KernelError::FileNotFound(_)))
+        ));
     }
 
     #[test]
@@ -561,7 +570,9 @@ mod tests {
         let new_data = Bytes::from("updated");
         assert!(matches!(
             handler.put(&file_url, new_data.clone(), false),
-            Err(KernelError::FileAlreadyExists(_))
+            Err(delta_kernel::Error::Kernel(KernelError::FileAlreadyExists(
+                _
+            )))
         ));
 
         // Put with overwrite=true should succeed
@@ -589,7 +600,7 @@ mod tests {
 
         assert!(matches!(
             handler.head(&file_url),
-            Err(KernelError::FileNotFound(_))
+            Err(delta_kernel::Error::Kernel(KernelError::FileNotFound(_)))
         ));
     }
 
@@ -600,7 +611,7 @@ mod tests {
         let missing_url = Url::from_file_path(tmp.path().join("missing.txt")).unwrap();
         assert!(matches!(
             handler.head(&missing_url),
-            Err(KernelError::FileNotFound(_))
+            Err(delta_kernel::Error::Kernel(KernelError::FileNotFound(_)))
         ));
         handler.delete(&missing_url).unwrap();
     }
@@ -613,9 +624,15 @@ mod tests {
         let token: CancellationTokenRef = Arc::new(test_utils::TestCancellationToken::cancelled());
 
         let listed = handler.list_from_with_cancellation(&url, Some(token.clone()));
-        assert!(matches!(listed, Err(KernelError::Cancelled)));
+        assert!(matches!(
+            listed,
+            Err(delta_kernel::Error::Kernel(KernelError::Cancelled))
+        ));
 
         let read = handler.read_files_with_cancellation(vec![(url, None)], Some(token));
-        assert!(matches!(read, Err(KernelError::Cancelled)));
+        assert!(matches!(
+            read,
+            Err(delta_kernel::Error::Kernel(KernelError::Cancelled))
+        ));
     }
 }

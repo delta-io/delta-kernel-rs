@@ -16,7 +16,7 @@ use crate::unit_test_utils::{
     assert_result_error_with_message, create_valid_add_file_batch, MockProtocolBuilder,
     MockTableConfigurationBuilder,
 };
-use crate::{create_row, FileMeta, Result};
+use crate::{create_row, FileMeta};
 
 fn adaptive_table_config() -> TableConfiguration {
     MockTableConfigurationBuilder::new()
@@ -41,7 +41,7 @@ fn dummy_root_manifest_file_meta(txn: &Transaction) -> FileMeta {
 // === with_root_manifest_file staging ===
 
 #[test]
-fn with_root_manifest_file_rejects_non_adaptive_table() -> Result<()> {
+fn with_root_manifest_file_rejects_non_adaptive_table() -> crate::KernelResult<()> {
     let (_engine, txn, _tempdir) = create_existing_table_txn()?;
     let file = dummy_root_manifest_file_meta(&txn);
     assert_result_error_with_message(
@@ -52,7 +52,7 @@ fn with_root_manifest_file_rejects_non_adaptive_table() -> Result<()> {
 }
 
 #[test]
-fn validate_manifest_write_allows_root_manifest_on_adaptive_table() -> Result<()> {
+fn validate_manifest_write_allows_root_manifest_on_adaptive_table() -> crate::KernelResult<()> {
     let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     let file = dummy_root_manifest_file_meta(&txn);
@@ -62,7 +62,7 @@ fn validate_manifest_write_allows_root_manifest_on_adaptive_table() -> Result<()
 }
 
 #[test]
-fn validate_manifest_write_rejects_root_manifest_with_file_actions() -> Result<()> {
+fn validate_manifest_write_rejects_root_manifest_with_file_actions() -> crate::KernelResult<()> {
     let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     let file = dummy_root_manifest_file_meta(&txn);
@@ -78,7 +78,7 @@ fn validate_manifest_write_rejects_root_manifest_with_file_actions() -> Result<(
 // === with_manifest_commit staging ===
 
 #[test]
-fn with_manifest_commit_succeeds_on_adaptive_table() -> Result<()> {
+fn with_manifest_commit_succeeds_on_adaptive_table() -> crate::KernelResult<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     txn.with_manifest_commit(engine.as_ref())?;
@@ -87,7 +87,7 @@ fn with_manifest_commit_succeeds_on_adaptive_table() -> Result<()> {
 }
 
 #[test]
-fn with_manifest_commit_rejects_non_adaptive_table() -> Result<()> {
+fn with_manifest_commit_rejects_non_adaptive_table() -> crate::KernelResult<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     let result = txn.with_manifest_commit(engine.as_ref());
     assert_result_error_with_message(result, "adaptiveMetadata-preview");
@@ -98,7 +98,7 @@ fn with_manifest_commit_rejects_non_adaptive_table() -> Result<()> {
 // in a non-adaptive config after staging: the second call succeeds only if it skips try_new (which
 // rejects non-adaptive configs).
 #[test]
-fn with_manifest_commit_reuses_state_on_repeated_calls() -> Result<()> {
+fn with_manifest_commit_reuses_state_on_repeated_calls() -> crate::KernelResult<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     txn.with_manifest_commit(engine.as_ref())?;
@@ -113,7 +113,7 @@ fn with_manifest_commit_reuses_state_on_repeated_calls() -> Result<()> {
 // === mutual exclusion (enforced when staging) ===
 
 #[test]
-fn with_manifest_commit_rejects_when_root_manifest_staged() -> Result<()> {
+fn with_manifest_commit_rejects_when_root_manifest_staged() -> crate::KernelResult<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     let file = dummy_root_manifest_file_meta(&txn);
@@ -126,7 +126,7 @@ fn with_manifest_commit_rejects_when_root_manifest_staged() -> Result<()> {
 }
 
 #[test]
-fn with_root_manifest_file_rejects_when_manifest_commit_staged() -> Result<()> {
+fn with_root_manifest_file_rejects_when_manifest_commit_staged() -> crate::KernelResult<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     txn.with_manifest_commit(engine.as_ref())?;
@@ -139,7 +139,7 @@ fn with_root_manifest_file_rejects_when_manifest_commit_staged() -> Result<()> {
 
 // A `checkpoint` action covering the snapshot's own version is fine to start a manifest commit on.
 #[test]
-fn manifest_commit_allows_checkpoint_covering_the_snapshot() -> Result<()> {
+fn manifest_commit_allows_checkpoint_covering_the_snapshot() -> crate::KernelResult<()> {
     let (engine, table_root) = setup_table()?;
     write_commit(
         &engine,
@@ -156,7 +156,7 @@ fn manifest_commit_allows_checkpoint_covering_the_snapshot() -> Result<()> {
 
 // A delta commit landing after the last `checkpoint` action is not yet supported.
 #[test]
-fn manifest_commit_rejects_delta_commits_after_last_checkpoint() -> Result<()> {
+fn manifest_commit_rejects_delta_commits_after_last_checkpoint() -> crate::KernelResult<()> {
     let (engine, table_root) = setup_table()?;
     write_commit(
         &engine,
@@ -185,7 +185,7 @@ fn manifest_commit_rejects_delta_commits_after_last_checkpoint() -> Result<()> {
 // The leaf writer's physical schema must come from the effective table config passed to try_new,
 // not from the read snapshot (which may predate schema evolution).
 #[test]
-fn new_leaf_node_writer_uses_effective_config_schema_not_snapshot() -> Result<()> {
+fn new_leaf_node_writer_uses_effective_config_schema_not_snapshot() -> crate::KernelResult<()> {
     let (engine, table_root) = setup_table()?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let config = adaptive_table_config();
@@ -196,7 +196,7 @@ fn new_leaf_node_writer_uses_effective_config_schema_not_snapshot() -> Result<()
 }
 
 #[test]
-fn with_schema_changes_rejects_after_staging_manifest_commit() -> Result<()> {
+fn with_schema_changes_rejects_after_staging_manifest_commit() -> crate::KernelResult<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     txn.with_manifest_commit(engine.as_ref())?;
@@ -209,7 +209,7 @@ fn with_schema_changes_rejects_after_staging_manifest_commit() -> Result<()> {
 }
 
 #[test]
-fn manifest_commit_after_schema_change_uses_evolved_schema() -> Result<()> {
+fn manifest_commit_after_schema_change_uses_evolved_schema() -> crate::KernelResult<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     let mut txn = txn.with_schema_changes(vec![SchemaOperation::add_column(
@@ -227,7 +227,7 @@ fn manifest_commit_after_schema_change_uses_evolved_schema() -> Result<()> {
 // === commit ===
 
 #[test]
-fn commit_rejects_pending_manifest_commit() -> Result<()> {
+fn commit_rejects_pending_manifest_commit() -> crate::KernelResult<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     txn.with_manifest_commit(engine.as_ref())?;
@@ -238,7 +238,7 @@ fn commit_rejects_pending_manifest_commit() -> Result<()> {
 // === leaf writer ===
 
 #[test]
-fn leaf_writer_ops_unsupported() -> Result<()> {
+fn leaf_writer_ops_unsupported() -> crate::KernelResult<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     let mut leaf_writer = txn

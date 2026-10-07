@@ -87,7 +87,8 @@ impl ArrowFFIData {
         let sa: StructArray = batch.into();
         let array_data: ArrayData = sa.into();
         let array = FFI_ArrowArray::new(&array_data);
-        let schema = FFI_ArrowSchema::try_from(array_data.data_type())?;
+        let schema = FFI_ArrowSchema::try_from(array_data.data_type())
+            .map_err(delta_kernel::Error::kernel)?;
         Ok(Self { array, schema })
     }
 }

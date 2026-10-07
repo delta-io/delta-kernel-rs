@@ -17,7 +17,7 @@ use crate::object_store::DynObjectStore;
 use crate::schema::SchemaRef;
 use crate::{
     EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, KernelError,
-    KernelResult, PredicateRef, Result, ResultIterator,
+    KernelResult, PredicateRef, Result, ResultExt, ResultIterator,
 };
 
 #[derive(Constructor)]
@@ -36,7 +36,10 @@ pub(super) fn try_create_from_json(
     let json = ReaderBuilder::new(json_schema)
         .with_coerce_primitive(true)
         .build(BufReader::new(Cursor::new(data)))?
-        .map(move |data| fixup_json_read(data?, &reorder_indices, &file_location));
+        .map(move |data| {
+            fixup_json_read(data?, &reorder_indices, &file_location)
+                .map_err(crate::KernelError::from)
+        });
     Ok(json)
 }
 
@@ -54,7 +57,9 @@ impl JsonHandler for SyncJsonHandler {
             predicate,
             try_create_from_json,
         );
-        Ok(Box::new(iter.map(|data| Ok(Box::new(data?) as _))))
+        Ok(Box::new(
+            iter.map(|data| Ok(Box::new(data.into_public_result()?) as _)),
+        ))
     }
 
     fn parse_json(
@@ -73,7 +78,7 @@ impl JsonHandler for SyncJsonHandler {
     ) -> Result<FileSize> {
         let buf = to_json_bytes(data)?;
         let size = buf.len() as FileSize;
-        put_bytes(self.store.as_ref(), path, buf.into(), overwrite)?;
+        put_bytes(self.store.as_ref(), path, buf.into(), overwrite).into_public_result()?;
         Ok(size)
     }
 }
@@ -92,7 +97,7 @@ mod tests {
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 
     // Helper function to create test data
-    fn create_test_data(values: Vec<&str>) -> Result<Box<dyn EngineData>> {
+    fn create_test_data(values: Vec<&str>) -> crate::KernelResult<Box<dyn EngineData>> {
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "dog",
             ArrowDataType::Utf8,
@@ -104,7 +109,7 @@ mod tests {
     }
 
     // Helper function to read and parse JSON file
-    fn read_json_file(path: &Path) -> Result<Vec<serde_json::Value>> {
+    fn read_json_file(path: &Path) -> crate::KernelResult<Vec<serde_json::Value>> {
         let file = std::fs::read_to_string(path)?;
         let json: Vec<_> = serde_json::Deserializer::from_str(&file)
             .into_iter::<serde_json::Value>()
@@ -115,15 +120,15 @@ mod tests {
 
     #[test]
     fn test_write_json_file_without_overwrite() -> Result<()> {
-        do_test_write_json_file(false)
+        do_test_write_json_file(false).into_public_result()
     }
 
     #[test]
     fn test_write_json_file_overwrite() -> Result<()> {
-        do_test_write_json_file(true)
+        do_test_write_json_file(true).into_public_result()
     }
 
-    fn do_test_write_json_file(overwrite: bool) -> Result<()> {
+    fn do_test_write_json_file(overwrite: bool) -> crate::KernelResult<()> {
         let test_dir = TempDir::new().unwrap();
         let path = test_dir.path().join("00000000000000000001.json");
         let handler = SyncJsonHandler::new(None);
@@ -155,7 +160,10 @@ mod tests {
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {
             // Verify the second write fails with FileAlreadyExists error
-            assert!(matches!(result, Err(KernelError::FileAlreadyExists(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::FileAlreadyExists(_)))
+            ));
         }
 
         Ok(())

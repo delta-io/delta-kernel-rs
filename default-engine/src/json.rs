@@ -21,7 +21,7 @@ use delta_kernel::object_store::{
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{
     CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler,
-    KernelError, KernelResult, PredicateRef, Result, ResultIterator,
+    KernelError, KernelResult, PredicateRef, Result, ResultExt, ResultIterator,
 };
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
@@ -112,7 +112,7 @@ async fn read_json_files_impl(
             let batch_stream = open_json_file(store, json_arrow_schema, batch_size, file).await?;
             // Re-insert synthesized metadata columns (e.g. file path) at their schema positions.
             let tagged = batch_stream
-                .map(move |result| fixup_json_read(result?, &reorder_indices, &file_path))
+                .map(move |result| Ok(fixup_json_read(result?, &reorder_indices, &file_path)?))
                 .boxed();
             Ok::<_, KernelError>(tagged)
         }
@@ -191,6 +191,8 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             future,
             cancellation_token,
         )
+        .map(|iter| Box::new(iter.map(ResultExt::into_public_result)) as FileDataReadResultIterator)
+        .into_public_result()
     }
 
     // note: for now we just buffer all the data and write it out all at once
@@ -200,12 +202,14 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         data: ResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> Result<FileSize> {
-        self.task_executor.block_on(write_json_file_impl(
-            self.store.clone(),
-            path.clone(),
-            to_json_bytes(data)?,
-            overwrite,
-        ))
+        self.task_executor
+            .block_on(write_json_file_impl(
+                self.store.clone(),
+                path.clone(),
+                to_json_bytes(data)?,
+                overwrite,
+            ))
+            .into_public_result()
     }
 }
 
@@ -709,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_invalid_json() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_read_invalid_json() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let _ = tracing_subscriber::fmt().try_init();
         let (_temp_file1, file_url1) = make_invalid_named_temp();
         let (_temp_file2, file_url2) = make_invalid_named_temp();
@@ -853,7 +857,7 @@ mod tests {
     }
 
     // Helper function to create test data
-    fn create_test_data(values: Vec<&str>) -> Result<Box<dyn EngineData>> {
+    fn create_test_data(values: Vec<&str>) -> delta_kernel::KernelResult<Box<dyn EngineData>> {
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "dog",
             DataType::Utf8,
@@ -865,7 +869,10 @@ mod tests {
     }
 
     // Helper function to read JSON file asynchronously
-    async fn read_json_file(store: &Arc<InMemory>, path: &Path) -> Result<Vec<serde_json::Value>> {
+    async fn read_json_file(
+        store: &Arc<InMemory>,
+        path: &Path,
+    ) -> delta_kernel::KernelResult<Vec<serde_json::Value>> {
         let content = store.get(path).await?;
         let file_bytes = content.bytes().await?;
         let file_string =
@@ -881,16 +888,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_json_file_without_overwrite() -> Result<()> {
+    async fn test_write_json_file_without_overwrite() -> KernelResult<()> {
         do_test_write_json_file(false).await
     }
 
     #[tokio::test]
-    async fn test_write_json_file_overwrite() -> Result<()> {
+    async fn test_write_json_file_overwrite() -> KernelResult<()> {
         do_test_write_json_file(true).await
     }
 
-    async fn do_test_write_json_file(overwrite: bool) -> Result<()> {
+    async fn do_test_write_json_file(overwrite: bool) -> delta_kernel::KernelResult<()> {
         let store = Arc::new(InMemory::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let handler = DefaultJsonHandler::new(store.clone(), executor);
@@ -924,7 +931,7 @@ mod tests {
         } else {
             // Verify the second write fails with FileAlreadyExists error
             match result {
-                Err(KernelError::FileAlreadyExists(err_path)) => {
+                Err(delta_kernel::Error::Kernel(KernelError::FileAlreadyExists(err_path))) => {
                     assert_eq!(err_path, object_path.to_string());
                 }
                 _ => panic!("Expected FileAlreadyExists error, got: {result:?}"),

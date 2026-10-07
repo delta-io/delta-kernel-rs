@@ -28,7 +28,9 @@ use delta_kernel::scan::{scan_row_schema, PartitionValuesOptions, StatsOptions};
 use delta_kernel::schema::{schema_ref, DataType, MapType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{Engine, Expression as Expr, KernelError, Predicate as Pred, Result, Snapshot};
+use delta_kernel::{
+    Engine, Expression as Expr, KernelError, Predicate as Pred, Result, ResultExt, Snapshot,
+};
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::Deserializer;
@@ -87,7 +89,7 @@ async fn append_only_enforces_data_change_for_file_actions(
     #[case] data_change: bool,
     #[case] selection_vector: &[bool],
     #[case] expected_error: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
     let schema = schema_ref! { nullable "number": INTEGER };
@@ -119,7 +121,8 @@ async fn append_only_enforces_data_change_for_file_actions(
 
     let staged_batches = (0..2)
         .map(|index| {
-            let scan_files = selected_scan_file_batch(snapshot.clone(), engine.as_ref())?;
+            let scan_files =
+                selected_scan_file_batch(snapshot.clone(), engine.as_ref()).into_public_result()?;
             let (data, _) = scan_files.into_parts();
             assert_eq!(data.len(), selection_vector.len());
             let selection_vector = if index == batch_index {
@@ -208,7 +211,7 @@ async fn append_only_enforces_data_change_for_file_actions(
 fn selected_scan_file_batch(
     snapshot: Arc<Snapshot>,
     engine: &dyn Engine,
-) -> Result<FilteredEngineData> {
+) -> delta_kernel::KernelResult<FilteredEngineData> {
     for scan_files in get_scan_files(snapshot, engine)? {
         let data = scan_files.apply_selection_vector()?;
         if !data.is_empty() {
@@ -330,7 +333,7 @@ async fn commit_validates_staged_remove_fields(
     #[case] modification: StagedRemoveFileModification,
     #[case] selection_vector: &[bool],
     #[case] expected_error: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // === Create table ===
     let schema = get_simple_int_schema();
     let (table_url, engine, _store, _table_name) =
@@ -412,7 +415,8 @@ async fn commit_validates_staged_remove_fields(
 }
 
 #[tokio::test]
-async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_remove_files_adds_expected_entries(
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // This test verifies that Remove actions generated from scan metadata contain all expected
     // fields from the Remove struct (defined in kernel/src/actions/mod.rs).
     //
@@ -575,7 +579,7 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[tokio::test]
 async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_extended_metadata(
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // v1: create a `number: INTEGER` adaptiveMetadata table and append a data file.
     let (_tmp_dir, table_url, engine, snapshot) =
         create_number_table(vec!["adaptiveMetadata-preview"], vec![], "id", true).await?;
@@ -629,7 +633,7 @@ async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_e
 async fn test_remove_scanned_file_sets_extended_metadata(
     #[case] missing_fields: &[ExtendedMetadataField],
     #[case] expected_extended_file_metadata: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_url, engine, snapshot) =
         create_number_table(vec![], vec![], "none", true).await?;
 
@@ -677,7 +681,7 @@ async fn test_remove_scanned_file_sets_extended_metadata(
 
 #[tokio::test]
 async fn test_update_deletion_vectors_adds_expected_entries(
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // This test verifies that deletion vector updates write proper Remove and Add actions
     // to the transaction log.
     //
@@ -716,7 +720,7 @@ async fn test_update_deletion_vectors_adds_expected_entries(
     let scan = snapshot.clone().scan_builder().build()?;
     let all_scan_metadata: Vec<_> = scan
         .scan_metadata(engine.as_ref())?
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     // Extract scan files for DV update
     let scan_files: Vec<_> = all_scan_metadata
@@ -1065,7 +1069,7 @@ async fn test_update_deletion_vectors_rejects_corrupted_scan_files(
     #[case] modification: ScanFileModification,
     #[case] expected_error: &str,
     #[values(0, 1, 2)] invalid_batch_index: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     const BATCH_COUNT: usize = 3;
 
     let schema = schema_ref! {
@@ -1228,7 +1232,7 @@ fn string_map_array(values: &[(&str, Option<&str>)]) -> ArrayRef {
 #[tokio::test]
 async fn test_update_deletion_vectors_multiple_files(
     #[case] partition_values: &[(&str, Option<&str>)],
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // This test verifies that update_deletion_vectors can update multiple files
     // in a single call, creating proper Remove and Add actions for each file.
     let _ = tracing_subscriber::fmt::try_init();
@@ -1364,7 +1368,7 @@ async fn test_update_deletion_vectors_respects_selection_vector(
     #[case] selection_vector: &[bool],
     #[case] target_indexes: &[usize],
     #[case] expect_mismatch: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let schema = schema_ref! {
         nullable "id": INTEGER,
         nullable "value": STRING,
@@ -1429,7 +1433,7 @@ async fn test_update_deletion_vectors_respects_selection_vector(
     let batches = get_scan_files(snapshot, engine.as_ref())?
         .into_iter()
         .map(|scan_files| scan_files.apply_selection_vector().map(into_record_batch))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     let batch = concat_batches(&batches[0].schema(), &batches)?;
     let scan_files = FilteredEngineData::try_new(
         Box::new(ArrowEngineData::new(batch)),
@@ -1533,7 +1537,7 @@ async fn test_update_deletion_vectors_respects_selection_vector(
 
 #[tokio::test]
 async fn test_remove_files_verify_files_excluded_from_scan(
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Adds and then removes files and then verifies they don't appear in the scan.
 
     // setup tracing
@@ -1629,7 +1633,7 @@ fn with_missing_extended_metadata_fields(
     engine: &dyn Engine,
     scan_files: FilteredEngineData,
     missing_fields: &[ExtendedMetadataField],
-) -> Result<FilteredEngineData, Box<dyn std::error::Error>> {
+) -> std::result::Result<FilteredEngineData, Box<dyn std::error::Error>> {
     let (data, selection_vector) = scan_files.into_parts();
     let map_type = MapType::new(DataType::STRING, DataType::STRING, true);
     let tags = if missing_fields.contains(&ExtendedMetadataField::Tags) {
@@ -1661,8 +1665,8 @@ fn with_missing_extended_metadata_fields(
 }
 
 #[tokio::test]
-async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn test_remove_files_with_modified_selection_vector(
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // This test verifies that we can selectively remove files by:
     // 1. Calling remove_files multiple times with different subsets
     // 2. Modifying the selection vector to choose which files to remove
@@ -1828,7 +1832,7 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
 async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
     #[case] use_struct_stats_checkpoint: bool,
     #[case] use_predicate: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = get_simple_int_schema();
@@ -1967,7 +1971,7 @@ async fn test_remove_files_partitioned_with_parsed_columns(
     #[case] predicate: Option<Pred>,
     #[case] expected_partitions: &[&str],
     #[case] expect_stats: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let partition_col = "country";
@@ -1998,9 +2002,15 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         let write_state = txn.write_state()?;
         let append_data = [[1, 2, 3], [10, 20, 30]].map(|data| -> delta_kernel::Result<_> {
             let data = RecordBatch::try_new(
-                Arc::new(data_schema.as_ref().try_into_arrow()?),
+                Arc::new(
+                    data_schema
+                        .as_ref()
+                        .try_into_arrow()
+                        .map_err(delta_kernel::Error::kernel)?,
+                ),
                 vec![Arc::new(Int32Array::from(data.to_vec()))],
-            )?;
+            )
+            .map_err(delta_kernel::Error::kernel)?;
             Ok(Box::new(ArrowEngineData::new(data)))
         });
         for (data, partition_val) in append_data.into_iter().zip(["usa", "japan"]) {
@@ -2080,7 +2090,7 @@ async fn test_remove_files_partitioned_with_parsed_columns(
 fn modify_staged_remove_file(
     batch: &RecordBatch,
     modification: StagedRemoveFileModification,
-) -> Result<RecordBatch, ArrowError> {
+) -> std::result::Result<RecordBatch, ArrowError> {
     let field_index = batch.schema().index_of(modification.field)?;
     let modified_value = match modification.value {
         StagedRemoveFileFieldValue::Null => {
@@ -2115,7 +2125,8 @@ type DvSmallTableSetup = (
 ///
 /// Returns `(temp_dir, table_path, engine, snapshot)`. Keep `temp_dir` alive for the test;
 /// `table_path` lets callers read commit JSON directly off disk.
-fn setup_table_with_dv_small() -> Result<DvSmallTableSetup, Box<dyn std::error::Error>> {
+fn setup_table_with_dv_small() -> std::result::Result<DvSmallTableSetup, Box<dyn std::error::Error>>
+{
     let temp_dir = tempfile::tempdir()?;
     let table_path = temp_dir.path().join("table-with-dv-small");
     let source_path = std::fs::canonicalize(std::path::PathBuf::from(
@@ -2141,7 +2152,10 @@ async fn create_number_table(
     writer_features: Vec<&str>,
     column_mapping_mode: &str,
     use_37_protocol: bool,
-) -> Result<(tempfile::TempDir, Url, Arc<dyn Engine>, Arc<Snapshot>), Box<dyn std::error::Error>> {
+) -> std::result::Result<
+    (tempfile::TempDir, Url, Arc<dyn Engine>, Arc<Snapshot>),
+    Box<dyn std::error::Error>,
+> {
     let temp_dir = tempfile::tempdir()?;
     let temp_dir_url =
         Url::from_directory_path(temp_dir.path()).expect("tempdir path must be a valid URL");

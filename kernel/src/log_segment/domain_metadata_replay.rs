@@ -124,7 +124,9 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<impl Iterator<Item = KernelResult<ActionsBatch>> + Send> {
-        self.read_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())
+        Ok(self
+            .read_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())?
+            .map(|result| result.map_err(crate::KernelError::from)))
     }
 }
 

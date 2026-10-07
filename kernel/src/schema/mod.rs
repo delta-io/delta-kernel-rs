@@ -26,7 +26,7 @@ use crate::table_features::{
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::{require, CollectInto};
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult, Result, ResultExt};
 
 pub(crate) mod column_default;
 pub use column_default::ColumnDefault;
@@ -345,17 +345,17 @@ impl MetadataColumnSpec {
 }
 
 impl FromStr for MetadataColumnSpec {
-    type Err = KernelError;
+    type Err = crate::Error;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> Result<Self> {
         match s {
             "row_index" => Ok(Self::RowIndex),
             "row_id" => Ok(Self::RowId),
             "row_commit_version" => Ok(Self::RowCommitVersion),
             "_file" => Ok(Self::FilePath),
-            _ => Err(KernelError::Schema(format!(
+            _ => Err(crate::Error::Kernel(KernelError::Schema(format!(
                 "Unknown metadata column spec: {s}"
-            ))),
+            )))),
         }
     }
 }
@@ -531,14 +531,16 @@ impl StructField {
             None => return Ok(None),
             Some(MetadataValue::String(s)) => s.clone(),
             Some(other) => {
-                return Err(KernelError::schema(format!(
+                return Err(crate::Error::Kernel(KernelError::schema(format!(
                     "Field '{}' has a non-string `{}` annotation: {other}",
                     self.name,
                     ColumnMetadataKey::CurrentDefault.as_ref(),
-                )))
+                ))))
             }
         };
-        ColumnDefault::new(raw_sql, &self.data_type).map(Some)
+        ColumnDefault::new(raw_sql, &self.data_type)
+            .map(Some)
+            .into_public_result()
     }
 
     /// Validates and extracts pre-existing column-mapping annotations on this field, returning
@@ -725,6 +727,7 @@ impl StructField {
         MakePhysical::new(column_mapping_mode)
             .transform_struct_field(self)
             .map(|f| f.into_owned())
+            .into_public_result()
     }
 
     pub(crate) fn has_invariants(&self) -> bool {
@@ -886,15 +889,15 @@ impl StructType {
         for (i, field) in fields.into_iter().enumerate() {
             // Verify that there are no nested metadata columns
             if !matches!(field.data_type, DataType::Primitive(_)) {
-                Self::ensure_no_metadata_columns_in_field(&field)?;
+                Self::ensure_no_metadata_columns_in_field(&field).into_public_result()?;
             }
 
             // Check for duplicate metadata columns
             if let Some(metadata_column_spec) = field.get_metadata_column_spec() {
                 if metadata_columns.insert(metadata_column_spec, i).is_some() {
-                    return Err(KernelError::schema(format!(
+                    return Err(crate::Error::Kernel(KernelError::schema(format!(
                         "Duplicate metadata column: {metadata_column_spec:?}",
-                    )));
+                    ))));
                 }
             }
 
@@ -902,10 +905,10 @@ impl StructType {
             // only by case.
             let key = field.name.to_lowercase();
             if !seen_lowercase_names.insert(key) {
-                return Err(KernelError::schema(format!(
+                return Err(crate::Error::Kernel(KernelError::schema(format!(
                     "Duplicate field name (case-insensitive): '{}'",
                     field.name
-                )));
+                ))));
             }
 
             field_map.insert(field.name.clone(), field);
@@ -923,12 +926,13 @@ impl StructType {
     /// This constructor collects all fields from the iterator, returning the first error
     /// encountered, or a new [`StructType`] if all fields are successfully collected and validated.
     pub fn try_from_results<E: Into<KernelError>>(
-        fields: impl IntoIterator<Item = Result<StructField, E>>,
+        fields: impl IntoIterator<Item = std::result::Result<StructField, E>>,
     ) -> Result<Self> {
         fields
             .into_iter()
             .map(|result| result.map_err(Into::into))
-            .process_results(|iter| Self::try_new(iter))?
+            .process_results(|iter| Self::try_new(iter))
+            .into_public_result()?
     }
 
     pub fn builder() -> StructTypeBuilder {
@@ -1025,7 +1029,7 @@ impl StructType {
     pub fn field_at<'a>(&'a self, col: &ColumnName) -> Result<&'a StructField> {
         let mut field = None;
         self.visit_fields_of_path(col, |f| field = Some(f))?;
-        field.ok_or_else(|| KernelError::generic("Empty path"))
+        field.ok_or_else(|| crate::Error::Kernel(KernelError::generic("Empty path")))
     }
 
     /// Checks whether this schema contains the field at the given column path.
@@ -1045,6 +1049,7 @@ impl StructType {
         visit_field: impl FnMut(&'a StructField),
     ) -> Result<()> {
         self.visit_fields_of_path_by(col, |s, name| s.field(name), visit_field)
+            .into_public_result()
     }
 
     /// Resolves a column path through nested structs, returning references to all
@@ -1248,7 +1253,10 @@ impl StructType {
     #[internal_api]
     pub(crate) fn make_physical(&self, column_mapping_mode: ColumnMappingMode) -> Result<Self> {
         let mut transformer = MakePhysical::new(column_mapping_mode);
-        transformer.transform_struct(self).map(|s| s.into_owned())
+        transformer
+            .transform_struct(self)
+            .map(|s| s.into_owned())
+            .into_public_result()
     }
 
     /// Validates that there are no metadata columns in the given fields.
@@ -1533,9 +1541,9 @@ impl DoubleEndedIterator for StructFieldRefIter<'_> {
 struct InvariantChecker;
 
 impl<'a> SchemaTransform<'a> for InvariantChecker {
-    transform_output_type!(|'a, T| Result<(), ()>);
+    transform_output_type!(|'a, T| std::result::Result<(), ()>);
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), ()> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> std::result::Result<(), ()> {
         if field.has_invariants() {
             Err(())
         } else {
@@ -1557,16 +1565,16 @@ pub(crate) fn schema_has_invariants(schema: &Schema) -> bool {
 struct NonNullFieldChecker;
 
 impl<'a> SchemaTransform<'a> for NonNullFieldChecker {
-    transform_output_type!(|'a, T| Result<(), ()>);
+    transform_output_type!(|'a, T| std::result::Result<(), ()>);
 
     /// Skip recursion into variant internals. The `metadata` and `value` fields inside a
     /// `Variant` are protocol-defined, always non-null, and not user-controlled, so they
     /// must not be treated as user-declared non-null columns.
-    fn transform_variant(&mut self, _stype: &'a StructType) -> Result<(), ()> {
+    fn transform_variant(&mut self, _stype: &'a StructType) -> std::result::Result<(), ()> {
         Ok(())
     }
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), ()> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> std::result::Result<(), ()> {
         if !field.is_nullable() {
             return Err(());
         }
@@ -1648,7 +1656,7 @@ struct StructTypeSerDeHelper {
 }
 
 impl Serialize for StructType {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
@@ -1661,7 +1669,7 @@ impl Serialize for StructType {
 }
 
 impl<'de> Deserialize<'de> for StructType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
         Self: Sized,
@@ -1835,7 +1843,7 @@ impl GeometryType {
     /// Constructs a GeometryType from the given CRS, or returns an error if the CRS is
     /// not in AUTHORITY:CODE form.
     pub fn try_new(crs: &str) -> Result<Self> {
-        validate_crs(crs)?;
+        validate_crs(crs).into_public_result()?;
         Ok(Self {
             crs: crs.to_string(),
         })
@@ -1868,7 +1876,7 @@ impl GeographyType {
     /// Constructs a GeographyType from the given CRS and edge interpolation algorithm, or
     /// returns an error if the CRS is not in AUTHORITY:CODE form.
     pub fn try_new(crs: &str, algorithm: EdgeInterpolationAlgorithm) -> Result<Self> {
-        validate_crs(crs)?;
+        validate_crs(crs).into_public_result()?;
         Ok(Self {
             crs: crs.to_string(),
             algorithm,
@@ -1902,15 +1910,15 @@ impl DecimalType {
     pub fn try_new(precision: u8, scale: u8) -> Result<Self> {
         require!(
             0 < precision && precision <= 38,
-            KernelError::invalid_decimal(format!(
+            crate::Error::Kernel(KernelError::invalid_decimal(format!(
                 "precision must be in range 1..38 inclusive, found: {precision}."
-            ))
+            )))
         );
         require!(
             scale <= precision,
-            KernelError::invalid_decimal(format!(
+            crate::Error::Kernel(KernelError::invalid_decimal(format!(
                 "scale must be in range 0..{precision} inclusive, found: {scale}."
-            ))
+            )))
         );
         Ok(Self { precision, scale })
     }
@@ -2051,7 +2059,7 @@ impl PrimitiveType {
 fn serialize_decimal<S: serde::Serializer>(
     dtype: &DecimalType,
     serializer: S,
-) -> Result<S::Ok, S::Error> {
+) -> std::result::Result<S::Ok, S::Error> {
     serializer.serialize_str(&format!("decimal({},{})", dtype.precision(), dtype.scale()))
 }
 
@@ -2059,14 +2067,14 @@ fn serialize_decimal<S: serde::Serializer>(
 fn serialize_geotype<T: std::fmt::Display, S: serde::Serializer>(
     value: &T,
     serializer: S,
-) -> Result<S::Ok, S::Error> {
+) -> std::result::Result<S::Ok, S::Error> {
     serializer.serialize_str(&value.to_string())
 }
 
 fn serialize_variant<S: serde::Serializer>(
     _: &StructType,
     serializer: S,
-) -> Result<S::Ok, S::Error> {
+) -> std::result::Result<S::Ok, S::Error> {
     serializer.serialize_str("variant")
 }
 
@@ -2128,7 +2136,7 @@ fn normalize_interval_type(s: &str) -> Option<PrimitiveType> {
 // The derived impl would produce: "unknown variant `interval second`, expected one of ..."
 // This impl produces: "Unsupported Delta table type: 'interval second'"
 impl<'de> serde::Deserialize<'de> for PrimitiveType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
@@ -2295,7 +2303,7 @@ impl From<SchemaRef> for DataType {
 // clear "Unsupported Delta table type: 'X'" message. We deserialize to Value first, then
 // dispatch based on structure (string -> Primitive/Variant, object -> Array/Struct/Map).
 impl<'de> serde::Deserialize<'de> for DataType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
@@ -2388,19 +2396,23 @@ impl DataType {
                         .values_mut()
                         .find(|field| field.name().to_lowercase() == lowered)
                         .ok_or_else(|| {
-                            KernelError::schema(format!("field '{name}' does not exist"))
+                            crate::Error::Kernel(KernelError::schema(format!(
+                                "field '{name}' does not exist"
+                            )))
                         })?
                         .data_type
                 }
                 (segment, data_type) => {
-                    return Err(KernelError::schema(format!(
+                    return Err(crate::Error::Kernel(KernelError::schema(format!(
                         "path segment {segment:?} does not match {data_type}"
-                    )))
+                    ))))
                 }
             };
         }
         let DataType::Struct(target) = data_type else {
-            return Err(KernelError::schema("path target is not a struct"));
+            return Err(crate::Error::Kernel(KernelError::schema(
+                "path target is not a struct",
+            )));
         };
         Ok(target)
     }
@@ -2430,7 +2442,7 @@ impl DataType {
 
     /// Create a new struct type from a fallible iterator of fields.
     pub fn try_struct_type_from_results<E: Into<KernelError>>(
-        fields: impl IntoIterator<Item = Result<StructField, E>>,
+        fields: impl IntoIterator<Item = std::result::Result<StructField, E>>,
     ) -> Result<Self> {
         StructType::try_from_results(fields).map(Self::from)
     }
@@ -2787,7 +2799,8 @@ mod tests {
     #[case("geography(vincenty)", "expected 'geography(<crs>, <algorithm>)'")]
     #[case("geography(EPSG:4326, vincenty, karney)", "Matching variant not found")]
     fn test_invalid_geo_format(#[case] invalid_type: &str, #[case] expected_error: &str) {
-        let result: Result<StructField, _> = serde_json::from_str(&geo_field_json(invalid_type));
+        let result: std::result::Result<StructField, _> =
+            serde_json::from_str(&geo_field_json(invalid_type));
         let err = result.expect_err(&format!("expected '{invalid_type}' to be rejected"));
         assert!(
             err.to_string().contains(expected_error),
@@ -3060,7 +3073,7 @@ mod tests {
                 "metadata": {{}}
             }}"#
         );
-        let result: Result<StructField, _> = serde_json::from_str(&data);
+        let result: std::result::Result<StructField, _> = serde_json::from_str(&data);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let expected_msg = format!("Unsupported Delta table type: '{unsupported_type}'");
@@ -3146,7 +3159,7 @@ mod tests {
                 "metadata": {{}}
             }}"#
         );
-        let result: Result<StructField, _> = serde_json::from_str(&data);
+        let result: std::result::Result<StructField, _> = serde_json::from_str(&data);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -3480,11 +3493,11 @@ mod tests {
     #[test]
     fn test_read_schemas() {
         let file = std::fs::File::open("./tests/serde/schema.json").unwrap();
-        let schema: Result<Schema, _> = serde_json::from_reader(file);
+        let schema: std::result::Result<Schema, _> = serde_json::from_reader(file);
         assert!(schema.is_ok());
 
         let file = std::fs::File::open("./tests/serde/checkpoint_schema.json").unwrap();
-        let schema: Result<Schema, _> = serde_json::from_reader(file);
+        let schema: std::result::Result<Schema, _> = serde_json::from_reader(file);
         assert!(schema.is_ok())
     }
 
@@ -4334,7 +4347,7 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_column_serialization() -> Result<()> {
+    fn test_metadata_column_serialization() -> crate::KernelResult<()> {
         let field = StructField::create_metadata_column("test_row_id", MetadataColumnSpec::RowId);
 
         // Test that serialization works

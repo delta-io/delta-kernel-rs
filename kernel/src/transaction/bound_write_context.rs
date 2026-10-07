@@ -225,16 +225,16 @@ impl BoundWriteContext {
             .table_root
             .make_relative(file_location)
             .ok_or_else(|| {
-                KernelError::internal_error(format!(
+                crate::Error::Kernel(KernelError::internal_error(format!(
                     "file '{}' is not under table root '{}'",
                     file_location, self.write_state.table_root
-                ))
+                )))
             })?;
         if relative.starts_with("..") {
-            return Err(KernelError::internal_error(format!(
+            return Err(crate::Error::Kernel(KernelError::internal_error(format!(
                 "file '{}' is not under table root '{}'",
                 file_location, self.write_state.table_root
-            )));
+            ))));
         }
         Ok(relative)
     }
@@ -606,7 +606,10 @@ mod tests {
     #[case::error_different_host("s3://other-bucket/table/abc.parquet", Err(()))]
     #[case::error_outside_table_root("s3://bucket/other/abc.parquet", Err(()))]
     #[test]
-    fn test_resolve_file_path(#[case] file_url: &str, #[case] expected: Result<&str, ()>) {
+    fn test_resolve_file_path(
+        #[case] file_url: &str,
+        #[case] expected: std::result::Result<&str, ()>,
+    ) {
         let wc = make_write_context(ColumnMappingMode::None, vec![], HashMap::new(), false, 2);
         let file = Url::parse(file_url).unwrap();
         match expected {

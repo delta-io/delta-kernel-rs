@@ -13,7 +13,7 @@ use crate::error::KernelError;
 use crate::expressions::{column_name, ColumnName};
 use crate::schema::{ColumnNamesAndTypes, DataType, DecimalType, PrimitiveType};
 use crate::utils::require;
-use crate::{KernelResult, Result};
+use crate::{KernelResult, Result, ResultExt};
 
 /// Verifies that add file statistics contain required columns.
 ///
@@ -43,7 +43,8 @@ impl StatsColumnVerifier {
         }
 
         for (col, data_type) in &self.required_columns {
-            self.verify_column(add_files, col, data_type)?;
+            self.verify_column(add_files, col, data_type)
+                .into_public_result()?;
         }
 
         Ok(())
@@ -276,10 +277,10 @@ impl RowVisitor for ColumnStatsValidator<'_> {
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> Result<()> {
         require!(
             getters.len() == 5,
-            KernelError::internal_error(format!(
+            crate::Error::Kernel(KernelError::internal_error(format!(
                 "Expected 5 getters for column stats validation, got {}",
                 getters.len()
-            ))
+            )))
         );
 
         for row_idx in 0..row_count {
@@ -294,10 +295,14 @@ impl RowVisitor for ColumnStatsValidator<'_> {
             if null_count.is_none() {
                 self.missing_null_count.push(path.clone());
             }
-            if !(all_null || is_stat_present(getters[3], row_idx, self.data_type)?) {
+            if !(all_null
+                || is_stat_present(getters[3], row_idx, self.data_type).into_public_result()?)
+            {
                 self.missing_min.push(path.clone());
             }
-            if !(all_null || is_stat_present(getters[4], row_idx, self.data_type)?) {
+            if !(all_null
+                || is_stat_present(getters[4], row_idx, self.data_type).into_public_result()?)
+            {
                 self.missing_max.push(path);
             }
         }
@@ -322,9 +327,11 @@ pub fn verify_num_records_present(add_files: &[Box<dyn crate::EngineData>]) -> R
         }
     }
     if let Some(path) = first_missing {
-        return Err(KernelError::stats_validation(format!(
-            "'stats.numRecords' is required for this table (see \
+        return Err(crate::Error::Kernel(KernelError::stats_validation(
+            format!(
+                "'stats.numRecords' is required for this table (see \
              `TableConfiguration::requires_stats_num_records`), but is missing for file '{path}'",
+            ),
         )));
     }
     Ok(())
@@ -344,10 +351,10 @@ impl RowVisitor for NumRecordsValidator<'_> {
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> Result<()> {
         require!(
             getters.len() == 2,
-            KernelError::internal_error(format!(
+            crate::Error::Kernel(KernelError::internal_error(format!(
                 "Expected 2 getters for numRecords validation, got {}",
                 getters.len()
-            ))
+            )))
         );
         for row_idx in 0..row_count {
             if getters[1].get_long(row_idx, NUM_RECORDS)?.is_none() {

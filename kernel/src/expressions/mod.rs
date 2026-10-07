@@ -422,14 +422,16 @@ pub struct OpaquePredicate {
 fn fail_serialize_opaque_predicate<S>(
     _value: &OpaquePredicate,
     _serializer: S,
-) -> Result<S::Ok, S::Error>
+) -> std::result::Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
     Err(ser::Error::custom("Cannot serialize an Opaque Predicate"))
 }
 
-fn fail_deserialize_opaque_predicate<'de, D>(_deserializer: D) -> Result<OpaquePredicate, D::Error>
+fn fail_deserialize_opaque_predicate<'de, D>(
+    _deserializer: D,
+) -> std::result::Result<OpaquePredicate, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -471,7 +473,7 @@ impl OpaqueExpression {
 fn fail_serialize_opaque_expression<S>(
     _value: &OpaqueExpression,
     _serializer: S,
-) -> Result<S::Ok, S::Error>
+) -> std::result::Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -480,7 +482,7 @@ where
 
 fn fail_deserialize_opaque_expression<'de, D>(
     _deserializer: D,
-) -> Result<OpaqueExpression, D::Error>
+) -> std::result::Result<OpaqueExpression, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -880,7 +882,9 @@ impl Expression {
         P: TryInto<ExpressionStructPatch>,
         KernelError: From<P::Error>,
     {
-        Ok(Self::StructPatch(patch.try_into()?))
+        Ok(Self::StructPatch(
+            patch.try_into().map_err(crate::Error::kernel)?,
+        ))
     }
 
     /// Create a new predicate `self IS NULL`

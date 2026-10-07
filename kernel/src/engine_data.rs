@@ -33,10 +33,12 @@ pub struct FilteredEngineData {
 impl FilteredEngineData {
     pub fn try_new(data: Box<dyn EngineData>, selection_vector: Vec<bool>) -> Result<Self> {
         if selection_vector.len() > data.len() {
-            return Err(KernelError::InvalidSelectionVector(format!(
-                "Selection vector is larger than data length: {} > {}",
-                selection_vector.len(),
-                data.len()
+            return Err(crate::Error::Kernel(KernelError::InvalidSelectionVector(
+                format!(
+                    "Selection vector is larger than data length: {} > {}",
+                    selection_vector.len(),
+                    data.len()
+                ),
             )));
         }
         Ok(Self {
@@ -241,7 +243,7 @@ macro_rules! impl_default_get {
         $(
             fn $name(&'a self, _row_index: usize, field_name: &str) -> Result<Option<$typ>> {
                 debug!("Asked for type {} on {field_name}, but using default error impl.", stringify!($typ));
-                Err(KernelError::UnexpectedColumnType(format!("{field_name} is not of type {}", stringify!($typ))).with_backtrace())
+                Err(crate::Error::Kernel(KernelError::UnexpectedColumnType(format!("{field_name} is not of type {}", stringify!($typ))).with_backtrace()))
             }
         )*
     };
@@ -311,8 +313,10 @@ pub trait TypedGetData<'a, T> {
     fn get(&'a self, row_index: usize, field_name: &str) -> Result<T> {
         let val = self.get_opt(row_index, field_name)?;
         val.ok_or_else(|| {
-            KernelError::MissingData(format!("Data missing for field {field_name}"))
-                .with_backtrace()
+            crate::Error::Kernel(
+                KernelError::MissingData(format!("Data missing for field {field_name}"))
+                    .with_backtrace(),
+            )
         })
     }
 }
@@ -622,7 +626,7 @@ pub(crate) fn filter_by_predicate(
             batch.len()
         ))
     );
-    batch.apply_selection_vector(visitor.selection_vector)
+    Ok(batch.apply_selection_vector(visitor.selection_vector)?)
 }
 
 #[cfg(test)]

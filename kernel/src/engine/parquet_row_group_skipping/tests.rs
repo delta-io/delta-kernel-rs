@@ -1155,7 +1155,10 @@ fn checkpoint_filter_multi_row_group_skipping() {
 
     // Only RG1 (x in [400, 600]) survives: max(x) = 600 > 500.
     let reader = builder.build().unwrap();
-    let batches: Vec<_> = reader.into_iter().collect::<Result<_, _>>().unwrap();
+    let batches: Vec<_> = reader
+        .into_iter()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 2);
 }

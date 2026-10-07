@@ -231,7 +231,7 @@ impl StructDataFields {
         Ok(Self { expected, fields })
     }
 
-    pub(crate) fn take_field<T: TryFrom<Scalar, Error = KernelError>>(
+    pub(crate) fn take_field<T: TryFrom<Scalar, Error = crate::Error>>(
         &mut self,
         field_name: &str,
     ) -> KernelResult<T> {
@@ -265,7 +265,8 @@ impl StructDataFields {
             )
         );
 
-        T::try_from(value).map_err(|error| add_scalar_path_context(error, field_name))
+        T::try_from(value)
+            .map_err(|error| add_scalar_path_context(crate::KernelError::from(error), field_name))
     }
 
     /// Verifies that every named field was consumed.

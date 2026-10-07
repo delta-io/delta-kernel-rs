@@ -20,6 +20,17 @@ log replay or checkpoint writes, kernel receives opaque `EngineData` batches, in
 visitor pattern, updates a selection vector, and hands them back to the engine: it never
 deserializes the full batch into in-memory structs.
 
+## Errors
+
+Public operations use `Result<T>`, including public conversion traits and lazy iterator
+items. `Error` is exhaustive and wraps implementation failures in `Error::Kernel(KernelError)`.
+`KernelError` remains non-exhaustive. Private operations use `KernelResult<T>` and explicitly expose
+failures through `ResultExt::into_public_result()`. Errors constructed at a public boundary are
+wrapped directly in `Error::Kernel(...)`. Foreign errors convertible to `KernelError` use
+`.map_err(Error::kernel)` to convert and classify the failure. The reverse `From<Error> for
+KernelError` conversion preserves the payload, source, and backtrace when private code calls a
+public API.
+
 ## Snapshot
 
 `Snapshot` (`kernel/src/snapshot/`) is the primary entry point for operations on an existing table.

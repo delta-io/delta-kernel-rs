@@ -43,7 +43,7 @@ use crate::{FileMeta, KernelResult, LogPath, Result, Snapshot};
 fn test_deleted_file_retention_timestamp(
     #[case] retention: Option<Duration>,
     #[case] expected_timestamp: i64,
-) -> Result<()> {
+) -> crate::KernelResult<()> {
     let reference_time_secs = 10_000;
     let reference_time = Duration::from_secs(reference_time_secs);
 
@@ -78,7 +78,7 @@ fn test_verify_written_size(
 }
 
 #[tokio::test]
-async fn test_create_checkpoint_metadata_batch() -> Result<()> {
+async fn test_create_checkpoint_metadata_batch() -> crate::KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -158,7 +158,7 @@ async fn test_create_checkpoint_metadata_batch() -> Result<()> {
 }
 
 #[test]
-fn test_create_last_checkpoint_data() -> Result<()> {
+fn test_create_last_checkpoint_data() -> crate::KernelResult<()> {
     let version = 10;
     let total_actions_counter = 100;
     let add_actions_counter = 75;
@@ -310,7 +310,7 @@ fn try_finalize_checkpoint(
         metadata.size,
         0, /* num_sidecars */
     )?;
-    writer.finalize(engine, &last_checkpoint_stats)
+    Ok(writer.finalize(engine, &last_checkpoint_stats)?)
 }
 
 /// Helper to verify the contents of the `_last_checkpoint` file
@@ -344,7 +344,7 @@ async fn read_last_checkpoint_file(store: &Arc<InMemory>) -> KernelResult<Value>
 /// - A table that does not support v2Checkpoint
 /// - No version specified (latest version is used)
 #[tokio::test]
-async fn test_v1_checkpoint_latest_version_by_default() -> Result<()> {
+async fn test_v1_checkpoint_latest_version_by_default() -> crate::KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -422,7 +422,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> Result<()> {
 /// - A table that does not support v2Checkpoint
 /// - A specific version specified (version 0)
 #[tokio::test]
-async fn test_v1_checkpoint_specific_version() -> Result<()> {
+async fn test_v1_checkpoint_specific_version() -> crate::KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -487,7 +487,8 @@ async fn test_v1_checkpoint_specific_version() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> Result<()> {
+async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted(
+) -> crate::KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -577,7 +578,7 @@ fn test_last_checkpoint_hint_stats_rejects_invalid_input(
 /// - A table that does supports v2Checkpoint
 /// - No version specified (latest version is used)
 #[tokio::test]
-async fn test_v2_checkpoint_supported_table() -> Result<()> {
+async fn test_v2_checkpoint_supported_table() -> crate::KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -652,7 +653,7 @@ async fn test_v2_checkpoint_supported_table() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_no_checkpoint_on_unpublished_snapshot() -> Result<()> {
+async fn test_no_checkpoint_on_unpublished_snapshot() -> crate::KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -696,7 +697,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> Result<()> {
 
     assert!(matches!(
         snapshot.create_checkpoint_writer(&engine).unwrap_err(),
-        crate::KernelError::UnpublishedVersion(1)
+        crate::Error::Kernel(crate::KernelError::UnpublishedVersion(1))
     ));
     Ok(())
 }
@@ -715,7 +716,7 @@ fn create_add_action_with_stats(path: &str, num_records: i64) -> Action {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_snapshot_checkpoint() -> Result<()> {
+async fn test_snapshot_checkpoint() -> crate::KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -967,7 +968,8 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer() -> Result<()> {
+async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
+) -> crate::KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1128,7 +1130,7 @@ async fn test_stats_config_round_trip(
     #[values(true, false)] struct1: bool,
     #[values(true, false)] json2: bool,
     #[values(true, false)] struct2: bool,
-) -> Result<()> {
+) -> crate::KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     let table_root = Url::parse("memory:///")?;
@@ -1195,7 +1197,7 @@ async fn test_stats_config_round_trip_partitioned(
     #[values(true, false)] struct1: bool,
     #[values(true, false)] json2: bool,
     #[values(true, false)] struct2: bool,
-) -> Result<()> {
+) -> crate::KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     let table_root = Url::parse("memory:///")?;
@@ -1307,7 +1309,7 @@ async fn test_stats_config_round_trip_partitioned(
 // NullCountStatsTransform), but the stats_parsed data from the old checkpoint lacks it,
 // causing an Arrow schema mismatch in the COALESCE expression.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint_with_varchar_metadata_on_field() -> Result<()> {
+async fn test_checkpoint_with_varchar_metadata_on_field() -> crate::KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 

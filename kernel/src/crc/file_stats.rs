@@ -18,7 +18,7 @@ use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::expressions::column_name;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{EngineData, KernelError, KernelResult, Result, RowVisitor};
+use crate::{EngineData, KernelError, KernelResult, Result, ResultExt, RowVisitor};
 
 /// File-level statistics for a table version: total file count, size, and histogram.
 ///
@@ -56,15 +56,15 @@ impl FileStats {
             ("tableSizeBytes", table_size_bytes),
         ] {
             if value < 0 {
-                return Err(KernelError::generic(format!(
+                return Err(crate::Error::Kernel(KernelError::generic(format!(
                     "CRC has invalid {name}: expected a non-negative value, got {value}"
-                )));
+                ))));
             }
         }
         let file_size_histogram = file_size_histogram
             .map(FileSizeHistogram::check_non_negative)
             .transpose()
-            .map_err(|error| KernelError::generic(error.to_string()))?;
+            .map_err(|error| crate::Error::Kernel(KernelError::generic(error.to_string())))?;
         Ok(Self {
             num_files,
             table_size_bytes,
@@ -257,10 +257,10 @@ impl RowVisitor for FileStatsVisitor<'_, '_> {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == 1,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of FileStatsVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         for i in 0..row_count {
             let selected = match self.selection_vector {
@@ -270,11 +270,11 @@ impl RowVisitor for FileStatsVisitor<'_, '_> {
             if selected {
                 let size: i64 = getters[0].get(i, "size")?;
                 self.count += 1;
-                self.total_size += size_to_u64(size)?;
+                self.total_size += size_to_u64(size).into_public_result()?;
                 if self.is_remove {
-                    self.histogram.remove(size)?;
+                    self.histogram.remove(size).into_public_result()?;
                 } else {
-                    self.histogram.insert(size)?;
+                    self.histogram.insert(size).into_public_result()?;
                 }
             }
         }

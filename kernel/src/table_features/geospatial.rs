@@ -5,7 +5,7 @@ use crate::schema::{PrimitiveType, Schema};
 use crate::table_configuration::TableConfiguration;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 /// Returns `true` if the schema contains at least one geometry or geography column,
 /// including nested structs, arrays, and maps.
@@ -16,9 +16,9 @@ fn schema_contains_geospatial(schema: &Schema) -> bool {
 struct UsesGeo;
 
 impl<'a> SchemaTransform<'a> for UsesGeo {
-    transform_output_type!(|'a, T| Result<(), ()>);
+    transform_output_type!(|'a, T| std::result::Result<(), ()>);
 
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Result<(), ()> {
+    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> std::result::Result<(), ()> {
         match ptype {
             PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => Err(()),
             _ => Ok(()),

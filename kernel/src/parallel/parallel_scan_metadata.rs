@@ -226,7 +226,9 @@ impl ParallelState {
     pub fn into_bytes(self) -> Result<Vec<u8>> {
         let state = self.into_serializable_state()?;
         serde_json::to_vec(&state).map_err(|e| {
-            KernelError::generic(format!("Failed to serialize ParallelState to bytes: {e}"))
+            crate::Error::Kernel(KernelError::generic(format!(
+                "Failed to serialize ParallelState to bytes: {e}"
+            )))
         })
     }
 
@@ -240,8 +242,8 @@ impl ParallelState {
     /// - `bytes`: The serialized bytes from a previous `into_bytes()` call
     #[allow(unused)]
     pub fn from_bytes(engine: &dyn Engine, bytes: &[u8]) -> Result<Self> {
-        let state: SerializableScanState =
-            serde_json::from_slice(bytes).map_err(KernelError::MalformedJson)?;
+        let state: SerializableScanState = serde_json::from_slice(bytes)
+            .map_err(|error| crate::Error::Kernel(KernelError::MalformedJson(error)))?;
         Self::from_serializable_state(engine, state)
     }
 }

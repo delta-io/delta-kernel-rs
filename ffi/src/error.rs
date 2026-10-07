@@ -1,5 +1,5 @@
 use delta_kernel::snapshot::SnapshotHintError;
-use delta_kernel::{KernelError, Result};
+use delta_kernel::{Error, KernelError, KernelResult, Result, ResultExt};
 use tracing::warn;
 
 use crate::handle::Handle;
@@ -80,6 +80,12 @@ pub enum FFIKernelError {
     StartVersionNotFound = 51,
     InvalidGeoParamsError = 52,
     MaxCatalogVersionError = 53,
+}
+
+impl From<Error> for FFIKernelError {
+    fn from(error: Error) -> Self {
+        KernelError::from(error).into()
+    }
 }
 
 impl From<KernelError> for FFIKernelError {
@@ -262,6 +268,12 @@ impl<T> IntoExternResult<T> for Result<T> {
     }
 }
 
+impl<T> IntoExternResult<T> for KernelResult<T> {
+    unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T> {
+        unsafe { self.into_public_result().into_extern_result(alloc) }
+    }
+}
+
 /// An error that can be returned from engine-side execution (e.g during an upcall).
 ///
 /// This is intended to be a kernel-allocated error which Engines can return TO kernel. It is the
@@ -401,7 +413,44 @@ impl From<EngineExecError> for KernelError {
 
 #[cfg(test)]
 mod error_code_tests {
+    use std::backtrace::Backtrace;
+
+    use rstest::rstest;
+
     use super::*;
+    use crate::ffi_test_utils::{allocate_err, recover_error};
+
+    #[rstest]
+    fn public_and_kernel_results_preserve_ffi_errors(
+        #[values(false, true)] public: bool,
+        #[values(false, true)] backtraced: bool,
+    ) {
+        let error = KernelError::MissingVersion(7);
+        let error = if backtraced {
+            KernelError::Backtraced {
+                source: Box::new(error),
+                backtrace: Box::new(Backtrace::disabled()),
+            }
+        } else {
+            error
+        };
+        let expected_message = error.to_string();
+        let result: KernelResult<()> = Err(error);
+        let allocator: AllocateErrorFn = allocate_err;
+        let result = unsafe {
+            if public {
+                result.into_public_result().into_extern_result(&allocator)
+            } else {
+                result.into_extern_result(&allocator)
+            }
+        };
+        let ExternResult::Err(error) = result else {
+            panic!("error was lost at the FFI boundary");
+        };
+        let error = unsafe { recover_error(error) };
+        assert_eq!(error.etype, FFIKernelError::MissingVersionError);
+        assert_eq!(error.message, expected_message);
+    }
 
     fn exec_error(etype: FFIKernelError, message: &str) -> EngineExecError {
         let message: Handle<ExclusiveRustString> = Box::new(message.to_string()).into();

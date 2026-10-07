@@ -16,7 +16,9 @@ use crate::scan::state_info::StateInfo;
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
 use crate::schema::{MetadataColumnSpec, SchemaRef};
 use crate::utils::FoldWithOption as _;
-use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult, PredicateRef, Result};
+use crate::{
+    Engine, EngineData, FileMeta, KernelError, KernelResult, PredicateRef, Result, ResultExt,
+};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
 /// data feed from the table.
@@ -112,10 +114,10 @@ impl TableChangesScanBuilder {
         // Row-tracking CDF requires row-level reconciliation by row IDs, which this
         // scanner does not perform.
         if self.table_changes.mode != CdfMode::ChangeDataFeed {
-            return Err(KernelError::unsupported(
+            return Err(crate::Error::Kernel(KernelError::unsupported(
                 "A row-tracking TableChanges cannot be scanned for data; use \
                  TableChanges::scan_file_listing instead",
-            ));
+            )));
         }
         // Predicates may reference any column in the full CDF-extended schema even when
         // `with_schema` narrows the output. Resolve predicate columns against the full schema
@@ -126,9 +128,9 @@ impl TableChangesScanBuilder {
         if logical_read_schema.contains_metadata_column(&MetadataColumnSpec::RowId)
             || logical_read_schema.contains_metadata_column(&MetadataColumnSpec::RowCommitVersion)
         {
-            return Err(KernelError::unsupported(
+            return Err(crate::Error::Kernel(KernelError::unsupported(
                 "Row ID and Row Commit Version metadata are unsupported in CDF scans",
-            ));
+            )));
         }
 
         // Create StateInfo using CDF field classifier
@@ -141,7 +143,8 @@ impl TableChangesScanBuilder {
             &StatsOptions::default(),
             &PartitionValuesOptions::default(),
             CdfTransformFieldClassifier,
-        )?;
+        )
+        .into_public_result()?;
 
         Ok(TableChangesScan {
             table_changes: self.table_changes,
@@ -218,7 +221,7 @@ impl TableChangesScan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> Result<impl Iterator<Item = Result<Box<dyn EngineData>>>> {
-        let scan_metadata = self.scan_metadata(engine.clone())?;
+        let scan_metadata = self.scan_metadata(engine.clone()).into_public_result()?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
         let table_root = self.table_changes.table_root().clone();
@@ -243,7 +246,8 @@ impl TableChangesScan {
                 )
             }) // Iterator-Result-Iterator-Result
             .flatten_ok() // Iterator-Result-Result
-            .map(|x| x?); // Iterator-Result
+            .map(|x| x?)
+            .map(ResultExt::into_public_result); // Iterator-Result
 
         Ok(result)
     }
@@ -353,7 +357,7 @@ fn read_scan_file(
             logical.and_then(|data| data.apply_selection_vector(sv))
         });
         selection_vector = rest;
-        result
+        result.map_err(crate::KernelError::from)
     });
     Ok(result)
 }

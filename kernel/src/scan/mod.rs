@@ -47,8 +47,8 @@ use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::{require, FoldWithOption as _, IteratorExt};
 use crate::{
-    Engine, EngineData, FileMeta, KernelError, KernelResult, Result, ResultIteratorStatic,
-    SnapshotRef, Version,
+    Engine, EngineData, FileMeta, KernelError, KernelResult, Result, ResultExt,
+    ResultIteratorStatic, SnapshotRef, Version,
 };
 
 pub(crate) mod data_skipping;
@@ -282,16 +282,16 @@ impl StatsOptions {
         if self.variant_min_max {
             require!(
                 !matches!(self.struct_stats, StructStats::None),
-                KernelError::unsupported(
+                crate::Error::Kernel(KernelError::unsupported(
                     "StatsOptions::with_variant_min_max_stats requires struct stats output"
-                )
+                ))
             );
             require!(
                 !self.synthesize_json,
-                KernelError::unsupported(
+                crate::Error::Kernel(KernelError::unsupported(
                     "StatsOptions::with_variant_min_max_stats cannot be combined with JSON stats \
                      synthesis"
-                )
+                ))
             );
         }
         Ok(())
@@ -341,7 +341,7 @@ pub struct ScanBuilder {
 }
 
 impl std::fmt::Debug for ScanBuilder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScanBuilder")
             .field("logical_read_schema", &self.logical_read_schema)
             .field("predicate", &self.predicate)
@@ -433,6 +433,7 @@ impl ScanBuilder {
     /// the selected fields cannot form a valid statistics schema.
     pub fn stats_output_schemas(&self) -> Result<Option<StatsOutputSchemas>> {
         build_stats_output_schemas(self.snapshot.table_configuration(), &self.stats)
+            .into_public_result()
     }
 
     /// Attach an opaque, caller-supplied correlation id for joining this scan's metric events to
@@ -509,10 +510,10 @@ impl ScanBuilder {
         // counts downstream and panics in the arrow layer. Users must populate the
         // schema with ALTER TABLE ADD COLUMN before scanning.
         if table_schema.num_fields() == 0 {
-            return Err(KernelError::generic(
+            return Err(crate::Error::Kernel(KernelError::generic(
                 "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
                  to add at least one column before scanning",
-            ));
+            )));
         }
 
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
@@ -532,7 +533,8 @@ impl ScanBuilder {
             &self.stats,
             &self.partition_values,
             (), // No classifier, default is for scans
-        )?;
+        )
+        .into_public_result()?;
 
         // Retain the transform spec but skip building per-file expressions, which also skips the
         // per-row partition-value parse done only to build them.
@@ -829,7 +831,7 @@ fn build_stats_output_schemas(
 }
 
 impl std::fmt::Debug for Scan {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Scan")
             .field("schema", &self.state_info.logical_schema)
             .field("predicate", &self.state_info.physical_predicate)
@@ -966,8 +968,11 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> Result<impl Iterator<Item = Result<ScanMetadata>>> {
-        let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
+        let actions_with_checkpoint_info =
+            self.replay_for_scan_metadata(engine).into_public_result()?;
         self.scan_metadata_inner(engine, actions_with_checkpoint_info)
+            .map(|iter| iter.map(ResultExt::into_public_result))
+            .into_public_result()
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of
@@ -1024,11 +1029,11 @@ impl Scan {
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
 
         if existing_version > self.snapshot.version() {
-            return Err(KernelError::Generic(format!(
+            return Err(crate::Error::Kernel(KernelError::Generic(format!(
                 "existing_version {} is greater than current version {}",
                 existing_version,
                 self.snapshot.version()
-            )));
+            ))));
         }
 
         // in order to be processed by our log replay, we must re-shape the existing scan metadata
@@ -1067,7 +1072,9 @@ impl Scan {
                 },
             };
             return Ok(Box::new(
-                self.scan_metadata_inner(engine, actions_with_checkpoint_info)?,
+                self.scan_metadata_inner(engine, actions_with_checkpoint_info)
+                    .into_public_result()?
+                    .map(ResultExt::into_public_result),
             ));
         }
 
@@ -1115,7 +1122,10 @@ impl Scan {
             self.cancellation_token.clone(),
         );
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
-            actions: result.actions.chain(existing_actions),
+            actions: result
+                .actions
+                .map(|result| result.map_err(KernelError::from))
+                .chain(existing_actions),
             checkpoint_info: CheckpointReadInfo {
                 has_stats_parsed: false,
                 has_partition_values_parsed: false,
@@ -1123,10 +1133,11 @@ impl Scan {
             },
         };
 
-        Ok(Box::new(self.scan_metadata_inner(
-            engine,
-            actions_with_checkpoint_info,
-        )?))
+        Ok(Box::new(
+            self.scan_metadata_inner(engine, actions_with_checkpoint_info)
+                .into_public_result()?
+                .map(ResultExt::into_public_result),
+        ))
     }
 
     fn scan_metadata_inner(
@@ -1202,11 +1213,12 @@ impl Scan {
         let needs_leaf_schema = self.state_info.physical_stats_read_schema().is_some()
             || self.state_info.physical_partition_schema.is_some();
         let shape = if needs_leaf_schema {
-            CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
+            CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)
+                .into_public_result()?
         } else {
-            CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?
+            CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot).into_public_result()?
         };
-        self.build_metadata_scan_plan(&shape)
+        self.build_metadata_scan_plan(&shape).into_public_result()
     }
 
     // Factored out to facilitate testing
@@ -1220,7 +1232,8 @@ impl Scan {
             self.checkpoint_read_options();
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
         // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
-        self.snapshot
+        let result = self
+            .snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
                 engine,
@@ -1233,7 +1246,13 @@ impl Scan {
                     .as_ref()
                     .map(|s| s.as_ref()),
                 self.cancellation_token.as_ref(),
-            )
+            )?;
+        Ok(ActionsWithCheckpointInfo {
+            actions: result
+                .actions
+                .map(|result| result.map_err(KernelError::from)),
+            checkpoint_info: result.checkpoint_info,
+        })
     }
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
@@ -1308,15 +1327,14 @@ impl Scan {
     /// # use delta_kernel::{Engine, Result};
     /// # use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
     /// # use delta_kernel::Snapshot;
-    /// # use url::Url;
     /// # use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
     /// # use delta_kernel::object_store::local::LocalFileSystem;
     /// # fn main() -> Result<()> {
     /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
-    /// let table_root = Url::parse("file:///path/to/table")?;
+    /// let table_root = "file:///path/to/table/";
     ///
     /// // Build a snapshot
-    /// let snapshot = Snapshot::builder_for(table_root.clone())
+    /// let snapshot = Snapshot::builder_for(table_root)
     ///     .at_version(5) // Optional: specify a time-travel version (default is latest version)
     ///     .build(engine.as_ref())?;
     /// let scan = snapshot.scan_builder().build()?;
@@ -1358,10 +1376,10 @@ impl Scan {
         // Fail fast rather than silently ignore a caller-supplied token: the parallel path does
         // not thread cancellation, so honoring a set token would require dropping it on the floor.
         if self.cancellation_token.is_some() {
-            return Err(KernelError::unsupported(
+            return Err(crate::Error::Kernel(KernelError::unsupported(
                 "cancellation is not supported by parallel_scan_metadata; \
                  use scan_metadata for a cancellable scan",
-            ));
+            )));
         }
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
@@ -1382,7 +1400,8 @@ impl Scan {
             checkpoint_info,
             self.stats_options(),
             self.partition_values_options(),
-        )?;
+        )
+        .into_public_result()?;
         let sequential = SequentialPhase::try_new(
             processor,
             self.snapshot.log_segment(),
@@ -1410,11 +1429,11 @@ impl Scan {
         engine: Arc<dyn Engine>,
     ) -> Result<impl Iterator<Item = Result<Box<dyn EngineData>>>> {
         if self.state_info.skip_row_transforms {
-            return Err(KernelError::unsupported(
+            return Err(crate::Error::Kernel(KernelError::unsupported(
                 "Scan::execute is not supported when the scan was built with \
                  without_row_transforms; use scan_metadata for listing and read data with your \
                  own reader",
-            ));
+            )));
         }
 
         fn scan_metadata_callback(batches: &mut Vec<state::ScanFile>, file: state::ScanFile) {
@@ -1506,13 +1525,13 @@ impl Scan {
                         logical.and_then(|data| data.apply_selection_vector(sv))
                     });
                     selection_vector = rest;
-                    result
+                    result.map_err(crate::KernelError::from)
                 }))
             })
             // Iterator<Result<Iterator<Result<Box<dyn EngineData>>>>> to Iterator<Result<Result<Box<dyn EngineData>>>>
             .flatten_ok()
             // Iterator<Result<Result<Box<dyn EngineData>>>> to Iterator<Result<Box<dyn EngineData>>>
-            .map(|x| x?);
+            .map(|x| x?).map(ResultExt::into_public_result);
         Ok(result)
     }
 }

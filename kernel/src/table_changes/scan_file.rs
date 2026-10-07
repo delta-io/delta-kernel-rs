@@ -17,7 +17,7 @@ use crate::expressions::{col, lit, Expression};
 use crate::scan::state::DvInfo;
 use crate::schema::{lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, SchemaRef};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result, RowVisitor};
+use crate::{KernelError, KernelResult, Result, ResultExt, RowVisitor};
 
 // The type of action associated with a [`CdfScanFile`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,20 +339,23 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == CDF_SCAN_FILE_GETTER_COUNT,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of CdfScanFileVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         for row_index in 0..row_count {
             if !self.selection_vector[row_index] {
                 continue;
             }
 
-            let file_side = if let Some(side) = read_file_side(row_index, getters, &ADD_FILE_SIDE)?
+            let file_side = if let Some(side) =
+                read_file_side(row_index, getters, &ADD_FILE_SIDE).into_public_result()?
             {
                 side
-            } else if let Some(side) = read_file_side(row_index, getters, &REMOVE_FILE_SIDE)? {
+            } else if let Some(side) =
+                read_file_side(row_index, getters, &REMOVE_FILE_SIDE).into_public_result()?
+            {
                 side
             } else if let Some(path) =
                 getters[CDC_PATH_INDEX].get_opt(row_index, "scanFile.cdc.path")?

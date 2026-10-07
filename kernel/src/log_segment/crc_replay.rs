@@ -36,7 +36,7 @@ use crate::schema::{
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, KernelResult, Result, RowVisitor, Version};
+use crate::{Engine, FileMeta, KernelError, KernelResult, Result, ResultExt, RowVisitor, Version};
 
 static REPLAY_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     // size is the only Add leaf the visitor reads, and it is required, so its presence marks
@@ -606,7 +606,7 @@ impl RowVisitor for CommitCrcVisitor<'_> {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
-        check_visitor_getters(getters, N_FIXED_COLS, "CommitCrcVisitor")?;
+        check_visitor_getters(getters, N_FIXED_COLS, "CommitCrcVisitor").into_public_result()?;
         if row_count == 0 {
             return Ok(());
         }
@@ -626,11 +626,14 @@ impl RowVisitor for CommitCrcVisitor<'_> {
             if let Some(path) = remove_path {
                 let remove_size: Option<i64> =
                     getters[COL_REMOVE_SIZE].get_opt(i, "remove.size")?;
-                self.acc.on_remove(&path, remove_size)?;
+                self.acc
+                    .on_remove(&path, remove_size)
+                    .into_public_result()?;
             }
 
             self.acc
-                .apply_shared_columns(i, &getters[N_CRC_SPECIFIC_COLS..])?;
+                .apply_shared_columns(i, &getters[N_CRC_SPECIFIC_COLS..])
+                .into_public_result()?;
         }
         Ok(())
     }
@@ -667,9 +670,12 @@ impl RowVisitor for CheckpointCrcVisitor<'_> {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
-        check_visitor_getters(getters, N_SHARED_SINGLE_LEAF_COLS, "CheckpointCrcVisitor")?;
+        check_visitor_getters(getters, N_SHARED_SINGLE_LEAF_COLS, "CheckpointCrcVisitor")
+            .into_public_result()?;
         for i in 0..row_count {
-            self.acc.apply_shared_columns(i, getters)?;
+            self.acc
+                .apply_shared_columns(i, getters)
+                .into_public_result()?;
         }
         Ok(())
     }

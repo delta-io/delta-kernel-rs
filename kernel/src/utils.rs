@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use delta_kernel_derive::internal_api;
 use url::Url;
 
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult, Result, ResultExt};
 
 /// Phantom type parameter `T`: The containing type mentions but does not own any instance of `T`.
 ///
@@ -72,30 +72,30 @@ impl<I: IntoIterator, T: FromIterator<I::Item>> CollectInto<T> for I {
 #[internal_api]
 pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> Result<Url> {
     let uri = uri.as_ref();
-    let uri_type = resolve_uri_type(uri)?;
+    let uri_type = resolve_uri_type(uri).into_public_result()?;
     let url = match uri_type {
         UriType::LocalPath(path) => {
             if !path.exists() {
                 // When we support writes, create a directory if we can
-                return Err(KernelError::InvalidTableLocation(format!(
-                    "Path does not exist: {path:?}"
+                return Err(crate::Error::Kernel(KernelError::InvalidTableLocation(
+                    format!("Path does not exist: {path:?}"),
                 )));
             }
             if !path.is_dir() {
-                return Err(KernelError::InvalidTableLocation(format!(
-                    "{path:?} is not a directory"
+                return Err(crate::Error::Kernel(KernelError::InvalidTableLocation(
+                    format!("{path:?} is not a directory"),
                 )));
             }
             let path = std::fs::canonicalize(path).map_err(|err| {
                 let msg = format!("Invalid table location: {uri} Error: {err:?}");
-                KernelError::InvalidTableLocation(msg)
+                crate::Error::Kernel(KernelError::InvalidTableLocation(msg))
             })?;
             Url::from_directory_path(path.clone()).map_err(|_| {
                 let msg = format!(
                     "Could not construct a URL from canonicalized path: {path:?}.\n\
                      Something must be very wrong with the table path."
                 );
-                KernelError::InvalidTableLocation(msg)
+                crate::Error::Kernel(KernelError::InvalidTableLocation(msg))
             })?
         }
         UriType::Url(url) => url,
@@ -175,8 +175,8 @@ pub(crate) trait FoldWithOption: Sized {
     fn try_fold_with<U, E>(
         self,
         opt: Option<U>,
-        f: impl FnOnce(Self, U) -> Result<Self, E>,
-    ) -> Result<Self, E> {
+        f: impl FnOnce(Self, U) -> std::result::Result<Self, E>,
+    ) -> std::result::Result<Self, E> {
         match opt {
             Some(value) => f(self, value),
             None => Ok(self),

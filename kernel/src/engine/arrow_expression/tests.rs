@@ -13,6 +13,7 @@ use crate::arrow::array::{
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
+use crate::arrow::error::ArrowError;
 use crate::engine::arrow_conversion::TryIntoKernel as _;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_expression::evaluate_expression::to_json;
@@ -34,7 +35,7 @@ use crate::schema::{
 use crate::unit_test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]
 use crate::unit_test_utils::{geography_type, geometry_type};
-use crate::KernelResult;
+use crate::{KernelResult, ResultExt};
 
 #[test]
 fn test_array_column() {
@@ -699,7 +700,7 @@ impl ArrowOpaqueExpressionOp for OpaqueLessThanOp {
         result_type: Option<&KernelDataType>,
     ) -> Result<ArrayRef> {
         assert!(matches!(result_type, None | Some(&KernelDataType::BOOLEAN)));
-        let result = self.eval_pred(args, batch, false)?;
+        let result = self.eval_pred(args, batch, false).into_public_result()?;
         Ok(Arc::new(result))
     }
 }
@@ -715,7 +716,7 @@ impl ArrowOpaquePredicateOp for OpaqueLessThanOp {
         batch: &RecordBatch,
         inverted: bool,
     ) -> Result<BooleanArray> {
-        self.eval_pred(args, batch, inverted)
+        self.eval_pred(args, batch, inverted).into_public_result()
     }
 
     fn eval_pred_scalar(
@@ -992,20 +993,17 @@ fn test_to_json_with_null_struct() {
     assert_eq!(json_array.value(0), r#"{"int_field":42}"#);
 }
 
-#[test]
-fn test_to_json_with_non_struct_array() {
-    // Test that to_json fails when input is not a StructArray
-    let int_array = Int32Array::from(vec![1, 2, 3]);
-    let result = to_json(&int_array);
-    assert_result_error_with_message(result, "TO_JSON can only be applied to struct arrays");
-
-    let string_array = StringArray::from(vec!["hello", "world"]);
-    let result = to_json(&string_array);
-    assert_result_error_with_message(result, "TO_JSON can only be applied to struct arrays");
-
-    let boolean_array = BooleanArray::from(vec![true, false]);
-    let result = to_json(&boolean_array);
-    assert_result_error_with_message(result, "TO_JSON can only be applied to struct arrays");
+#[rstest]
+#[case::int(Arc::new(Int32Array::from(vec![1, 2, 3])))]
+#[case::string(Arc::new(StringArray::from(vec!["hello", "world"])))]
+#[case::boolean(Arc::new(BooleanArray::from(vec![true, false])))]
+fn test_to_json_with_non_struct_array(#[case] array: ArrayRef) {
+    let crate::Error::Kernel(error) = to_json(&array).unwrap_err();
+    assert!(matches!(
+        error.without_backtrace(),
+        KernelError::Arrow(ArrowError::InvalidArgumentError(message))
+            if message.contains("TO_JSON can only be applied to struct arrays")
+    ));
 }
 
 #[test]

@@ -120,7 +120,10 @@ pub(crate) enum CheckpointType {
 // fires if a read-in hint is ever serialized back -- in which case failing closed is correct.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl Serialize for CheckpointType {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         match self {
             CheckpointType::AdaptiveMetadataTree => {
                 serializer.serialize_str("AdaptiveMetadataTree")
@@ -239,7 +242,8 @@ impl LastCheckpointHint {
     ) -> Result<Self> {
         let checkpoint_schema = checkpoint_schema
             .map(|schema| serde_json::from_str::<crate::schema::StructType>(&schema).map(Arc::new))
-            .transpose()?;
+            .transpose()
+            .map_err(crate::Error::kernel)?;
         Ok(Self {
             version,
             size,
@@ -331,7 +335,9 @@ impl LastCheckpointHint {
     /// Returns the path of the `_last_checkpoint` file given the log root of a table.
     #[internal_api]
     pub(crate) fn path(log_root: &Url) -> Result<Url> {
-        Ok(log_root.join(LAST_CHECKPOINT_FILE_NAME)?)
+        log_root
+            .join(LAST_CHECKPOINT_FILE_NAME)
+            .map_err(crate::Error::kernel)
     }
 
     /// Try reading the `_last_checkpoint` file.
@@ -380,11 +386,11 @@ impl LastCheckpointHint {
                 info!(hint = result.as_ref().map(|h| h.summary()));
                 Ok(result)
             }
-            Some(Err(KernelError::FileNotFound(_))) => {
+            Some(Err(crate::Error::Kernel(KernelError::FileNotFound(_)))) => {
                 info!("_last_checkpoint file not found");
                 Ok(None)
             }
-            Some(Err(err)) => Err(err),
+            Some(Err(err)) => Err(crate::KernelError::from(err)),
             None => {
                 warn!("empty _last_checkpoint file");
                 Ok(None)
@@ -1151,7 +1157,7 @@ mod tests {
         created_time: 1739313200623,
         config: &[("delta.checkpointPolicy", "v2")],
     })]
-    fn v2_last_checkpoint_hint_contents(#[case] expected: ExpectedHint) -> Result<()> {
+    fn v2_last_checkpoint_hint_contents(#[case] expected: ExpectedHint) -> crate::KernelResult<()> {
         use crate::unit_test_utils::load_test_table;
 
         let ExpectedHint {

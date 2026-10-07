@@ -22,7 +22,7 @@ use delta_kernel::transaction::Transaction;
 use delta_kernel::LogPath;
 use delta_kernel::{
     Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, FileSize,
-    FileStats, JsonHandler, ParquetFooter, ParquetHandler, PredicateRef, Result,
+    FileStats, JsonHandler, ParquetFooter, ParquetHandler, PredicateRef, Result, ResultExt,
     ResultIteratorStatic, StorageHandler, Version,
 };
 use rstest::rstest;
@@ -719,7 +719,7 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
     )]
     root: WriteRoot,
     #[values(false, true)] ict_enabled: bool,
-) -> Result<()> {
+) -> delta_kernel::KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
     // === Create the table with domain metadata (and optionally ICT) enabled ===
@@ -935,7 +935,7 @@ async fn test_write_checksum_after_checkpoint_with_stale_base_resolves_from_chec
 async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     table_path: &str,
-) -> Result<SnapshotRef> {
+) -> delta_kernel::KernelResult<SnapshotRef> {
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut snap = create_table(table_path, schema, "test_engine")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -986,7 +986,9 @@ async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
 #[tokio::test(flavor = "multi_thread")]
 async fn test_incremental_unlimited_skips_below_checkpoint_base() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let base = setup_incremental_below_checkpoint_base(&engine, &table_path).await?;
+    let base = setup_incremental_below_checkpoint_base(&engine, &table_path)
+        .await
+        .into_public_result()?;
 
     let updated = Snapshot::builder_from(base)
         .with_incremental_crc_replay(IncrementalReplay::Unlimited)
@@ -1003,7 +1005,9 @@ async fn test_incremental_unlimited_skips_below_checkpoint_base() -> Result<()> 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_checksum_incremental_stale_base_below_new_checkpoint_resolves() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let base = setup_incremental_below_checkpoint_base(&engine, &table_path).await?;
+    let base = setup_incremental_below_checkpoint_base(&engine, &table_path)
+        .await
+        .into_public_result()?;
 
     // Disabled update keeps the below-checkpoint base@1 un-advanced on the combined segment.
     let updated = Snapshot::builder_from(base).build(engine.as_ref())?;
@@ -1030,7 +1034,7 @@ async fn test_write_checksum_incremental_stale_base_below_new_checkpoint_resolve
 /// ICT read error propagates instead of being laundered into a generic "CRC unresolved" error.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_propagates_read_error(
-) -> Result<()> {
+) -> delta_kernel::KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
     let schema = schema_ref! { nullable "id": INTEGER };
@@ -1064,14 +1068,15 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
     // The failure is the propagated ICT read error, not a laundered `ChecksumWriteUnsupported`.
     assert!(matches!(
         fresh.write_checksum(engine.as_ref()),
-        Err(e) if !matches!(e, delta_kernel::KernelError::ChecksumWriteUnsupported(_))
+        Err(e) if !matches!(e, delta_kernel::Error::Kernel(delta_kernel::KernelError::ChecksumWriteUnsupported(_)))
     ));
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupported() -> Result<()> {
+async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupported(
+) -> delta_kernel::KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
     let schema = schema_ref! { nullable "id": INTEGER };
@@ -1097,7 +1102,9 @@ async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupporte
     assert!(fresh.crc_at_version().is_none());
     assert!(matches!(
         fresh.write_checksum(engine.as_ref()),
-        Err(delta_kernel::KernelError::ChecksumWriteUnsupported(_))
+        Err(delta_kernel::Error::Kernel(
+            delta_kernel::KernelError::ChecksumWriteUnsupported(_)
+        ))
     ));
 
     Ok(())
@@ -2222,11 +2229,12 @@ async fn commit_with_dm_and_txn<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     v: i64,
 ) -> Result<SnapshotRef> {
-    commit_data(snapshot, engine, v, |txn| {
+    (commit_data(snapshot, engine, v, |txn| {
         txn.with_domain_metadata("domain".to_string(), format!("value_{v}"))
             .with_transaction_id("app".to_string(), v)
     })
-    .await
+    .await)
+        .into_public_result()
 }
 
 /// Commit one data file at version `v`, letting `customize` attach the version-specific actions
@@ -2236,7 +2244,7 @@ async fn commit_data<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     v: i64,
     customize: impl FnOnce(Transaction) -> Transaction,
-) -> Result<SnapshotRef> {
+) -> delta_kernel::KernelResult<SnapshotRef> {
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(
         Arc::new(arrow_schema),
@@ -2416,7 +2424,8 @@ async fn test_stale_crc_fresh_build_advance_matrix(
 }
 
 #[tokio::test]
-async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate() -> Result<()> {
+async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate(
+) -> delta_kernel::KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // ===== GIVEN: a CRC at v0 (made stale by an insert at v1) =====
@@ -2453,7 +2462,9 @@ async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate() -> 
     assert_eq!(fresh.get_file_stats_if_present(), None);
     assert!(matches!(
         fresh.write_checksum(engine.as_ref()),
-        Err(delta_kernel::KernelError::ChecksumWriteUnsupported(_))
+        Err(delta_kernel::Error::Kernel(
+            delta_kernel::KernelError::ChecksumWriteUnsupported(_)
+        ))
     ));
 
     Ok(())
@@ -2575,7 +2586,8 @@ async fn setup_stale_crc_dm_table<E: TaskExecutor>(
             18 => txn.with_domain_metadata("dom_after".to_string(), "cfg_after".to_string()),
             _ => txn,
         })
-        .await?;
+        .await
+        .into_public_result()?;
 
         if v == 10 {
             snap = snap.checkpoint(engine.as_ref(), None)?.1;
@@ -2726,7 +2738,8 @@ async fn setup_stale_crc_txn_table<E: TaskExecutor>(
             18 => txn.with_transaction_id("app_after".to_string(), 18),
             _ => txn,
         })
-        .await?;
+        .await
+        .into_public_result()?;
 
         if v == 10 {
             snap = snap.checkpoint(engine.as_ref(), None)?.1;

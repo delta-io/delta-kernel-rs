@@ -273,7 +273,9 @@ fn table_changes_scan_execute_impl(
 ) -> KernelResult<Handle<SharedScanTableChangesIterator>> {
     let table_changes_iter = table_changes_scan.execute(engine.engine().clone())?;
     let data = ScanTableChangesIterator {
-        data: Mutex::new(Box::new(table_changes_iter)),
+        data: Mutex::new(Box::new(
+            table_changes_iter.map(|item| item.map_err(KernelError::from)),
+        )),
         engine: engine.clone(),
     };
     Ok(Arc::new(data).into())
@@ -415,7 +417,7 @@ mod tests {
         storage: &DynObjectStore,
         version: u64,
         file: String,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let metadata = storage.head(&Path::from(file.as_ref())).await?;
         add_commit(
             table_root,
@@ -437,7 +439,7 @@ mod tests {
         storage: &DynObjectStore,
         version: u64,
         file: String,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let metadata = storage.head(&Path::from(file.as_ref())).await?;
         add_commit(
             table_root,
@@ -458,14 +460,14 @@ mod tests {
         storage: &DynObjectStore,
         file: String,
         batch: &RecordBatch,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         storage
             .put(&Path::from(file), record_batch_to_bytes(batch).into())
             .await?;
         Ok(())
     }
 
-    pub fn generate_batch_with_id(start_i: i32) -> Result<RecordBatch, ArrowError> {
+    pub fn generate_batch_with_id(start_i: i32) -> std::result::Result<RecordBatch, ArrowError> {
         generate_batch(vec![
             (
                 "id",
@@ -530,7 +532,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_changes_getters() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_table_changes_getters() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
 
         let batch = generate_batch_with_id(1)?;
@@ -618,7 +620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_changes_scan() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_table_changes_scan() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
 
         let batch = generate_batch_with_id(1)?;
@@ -675,7 +677,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_changes_scan_iterator() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_table_changes_scan_iterator(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
 
         let batch = generate_batch_with_id(1)?;
@@ -756,7 +759,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_changes_between_commits() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_table_changes_between_commits(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
 
         let batch = generate_batch_with_id(1)?;

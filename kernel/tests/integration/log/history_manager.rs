@@ -38,7 +38,7 @@ async fn test_get_earliest_commit(
     #[case] earliest_ratified_commit_version: Option<Version>,
     #[case] commit_type: HistoryCommitType,
     #[case] expected_version: Version,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(8).with_checkpoint_at([5]))
         .build()?;

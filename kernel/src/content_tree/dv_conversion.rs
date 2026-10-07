@@ -5,7 +5,7 @@ use crate::content_tree::DeletionVectorInfo;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Scalar};
 use crate::schema::{column_name, lazy_schema_ref, ArrayType, ColumnName, DataType, SchemaRef};
-use crate::{EngineData, KernelError, KernelResult, Result};
+use crate::{EngineData, KernelError, KernelResult, Result, ResultExt};
 
 /// Extracts deletion vector content from a DeletionVectorDescriptor.
 ///
@@ -172,7 +172,7 @@ impl DecodedDvVisitor {
     }
 
     fn append_decoded_dv_columns(self, data: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
-        data.append_columns(
+        Ok(data.append_columns(
             DV_DECODED_FLAT_SCHEMA.clone(),
             vec![
                 ArrayData::try_new(ArrayType::new(DataType::STRING, true), self.decoded_paths)?,
@@ -183,7 +183,7 @@ impl DecodedDvVisitor {
                     self.decoded_cardinalities,
                 )?,
             ],
-        )
+        )?)
     }
 }
 
@@ -210,7 +210,7 @@ impl RowVisitor for DecodedDvVisitor {
                         size_in_bytes: getters[3].get(i, "sizeInBytes")?,
                         cardinality: getters[4].get(i, "cardinality")?,
                     };
-                    Some(extract_deletion_vector_content(&dv)?)
+                    Some(extract_deletion_vector_content(&dv).into_public_result()?)
                 }
                 None => None,
             };
@@ -411,7 +411,7 @@ mod tests {
     fn decode(
         shape: DvColumnShape,
         dvs: &[Option<DeletionVectorDescriptor>],
-    ) -> Result<DecodedColumnsVisitor, Box<dyn std::error::Error>> {
+    ) -> std::result::Result<DecodedColumnsVisitor, Box<dyn std::error::Error>> {
         let data = shape.engine_data(dvs);
         let mut decoder = DecodedDvVisitor::new(shape.columns(), dvs.len());
         decoder.visit_rows_of(data.as_ref())?;
@@ -425,7 +425,7 @@ mod tests {
     #[rstest]
     fn test_visitor_decodes_dv_row(
         #[values(DvColumnShape::ScanRow, DvColumnShape::LogBatch)] shape: DvColumnShape,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let columns = decode(shape, &[Some(sample_dv())])?;
         assert_eq!(
             columns.locations,
@@ -442,7 +442,7 @@ mod tests {
     #[rstest]
     fn test_visitor_row_without_dv_is_null(
         #[values(DvColumnShape::ScanRow, DvColumnShape::LogBatch)] shape: DvColumnShape,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         // A null source struct decodes to nulls across all four columns.
         let columns = decode(shape, &[None])?;
         assert_eq!(columns.locations, vec![None]);
@@ -455,7 +455,7 @@ mod tests {
     #[rstest]
     fn test_visitor_mixed_rows(
         #[values(DvColumnShape::ScanRow, DvColumnShape::LogBatch)] shape: DvColumnShape,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         // One batch mixing all three row kinds: a relative DV (z85-decoded), an absolute DV (path
         // verbatim), and a row with no DV at all.
         let columns = decode(shape, &[Some(sample_dv()), Some(absolute_dv()), None])?;
@@ -482,7 +482,7 @@ mod tests {
     fn test_has_any_dv(
         #[case] presence: &[Option<()>],
         #[case] expected: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dvs: Vec<Option<DeletionVectorDescriptor>> =
             presence.iter().map(|p| p.map(|()| sample_dv())).collect();
         let data = DvColumnShape::ScanRow.engine_data(&dvs);
@@ -527,7 +527,7 @@ mod tests {
     #[rstest]
     fn test_visitor_empty_batch_yields_no_rows(
         #[values(DvColumnShape::ScanRow, DvColumnShape::LogBatch)] shape: DvColumnShape,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         // A zero-row batch appends four empty decoded columns without error.
         let columns = decode(shape, &[])?;
         assert!(columns.locations.is_empty());
@@ -581,7 +581,7 @@ mod tests {
     fn test_extract_deletion_vector_content(
         #[case] input: (DeletionVectorStorageType, &str, Option<i32>, i32),
         #[case] expected: (&str, i64, i64),
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let (expected_location, expected_offset, expected_size_in_bytes) = expected;
         let deletion_vector = extract_deletion_vector_content(&dv(input))?;
 

@@ -103,7 +103,7 @@ async fn commit_append_emits_success_metrics(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn commit_reports_added_file_count_not_batch_count() -> Result<()> {
+async fn commit_reports_added_file_count_not_batch_count() -> delta_kernel::KernelResult<()> {
     // num_add_files counts added FILES, not add_files() batches: two batches of two files each
     // must report 4. A regression to add_files_metadata.len() (a batch count) would report 2.
     let (_temp_dir, table_url) = setup_empty_table()?;
@@ -301,7 +301,7 @@ async fn commit_success_carries_table_type(#[case] catalog_managed: bool) -> Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_dv_update_reports_updated_file_count_not_batch_count(
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Three files get a new deletion vector in a single update_deletion_vectors call.
     // num_dv_updates must be the count of updated FILES (3), not the number of scan-metadata
     // batches they arrive in -- a single batch carrying all three would otherwise report 1.
@@ -345,7 +345,7 @@ async fn commit_dv_update_reports_updated_file_count_not_batch_count(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_dv_update_accumulates_file_count_across_calls(
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // num_dv_updates must accumulate (`+=`) across multiple update_deletion_vectors calls on one
     // transaction: two calls updating one file each must report 2, not the last call's 1.
     let schema = schema_ref! {

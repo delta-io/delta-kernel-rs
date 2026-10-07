@@ -4,7 +4,7 @@ use url::Url;
 
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::utils::require;
-use crate::{FileMeta, KernelError, KernelResult, Result, Version};
+use crate::{FileMeta, KernelError, KernelResult, Result, ResultExt, Version};
 
 /// A catalog commit that has been ratified by the catalog but not yet published to the Delta log.
 ///
@@ -99,8 +99,8 @@ impl PublishMetadata {
         publish_to_version: Version,
         commits_to_publish: Vec<CatalogCommit>,
     ) -> Result<Self> {
-        Self::validate_contiguous(&commits_to_publish)?;
-        Self::validate_end_version(&commits_to_publish, publish_to_version)?;
+        Self::validate_contiguous(&commits_to_publish).into_public_result()?;
+        Self::validate_end_version(&commits_to_publish, publish_to_version).into_public_result()?;
         Ok(Self {
             publish_to_version,
             commits_to_publish,

@@ -117,9 +117,11 @@ impl RowVisitor for LogVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         let expected = NAMES_AND_TYPES.as_ref().0.len();
         if getters.len() != expected {
-            return Err(KernelError::InternalError(format!(
-                "Wrong number of LogVisitor getters: {}, expected {expected}",
-                getters.len()
+            return Err(delta_kernel::Error::Kernel(KernelError::InternalError(
+                format!(
+                    "Wrong number of LogVisitor getters: {}, expected {expected}",
+                    getters.len()
+                ),
             )));
         }
         let (add_start, add_end) = self.offsets[ADD_NAME];

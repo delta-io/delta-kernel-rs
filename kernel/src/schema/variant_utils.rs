@@ -5,15 +5,15 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 /// Schema visitor that checks if any column in the schema uses VARIANT type
 pub(crate) struct UsesVariant;
 
 impl<'a> SchemaTransform<'a> for UsesVariant {
-    transform_output_type!(|'a, T| Result<(), ()>);
+    transform_output_type!(|'a, T| std::result::Result<(), ()>);
 
-    fn transform_variant(&mut self, _: &'a StructType) -> Result<(), ()> {
+    fn transform_variant(&mut self, _: &'a StructType) -> std::result::Result<(), ()> {
         Err(())
     }
 }

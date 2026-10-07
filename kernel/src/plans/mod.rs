@@ -143,7 +143,7 @@ impl PlanResult {
     pub fn into_data(self) -> Result<ResultIteratorStatic<Box<dyn EngineData>>> {
         match self {
             Self::Data(iter) => Ok(iter),
-            other => Err(other.type_mismatch("Data")),
+            other => Err(crate::Error::Kernel(other.type_mismatch("Data"))),
         }
     }
 
@@ -153,7 +153,7 @@ impl PlanResult {
     pub fn into_file_meta(self) -> Result<ResultIteratorStatic<FileMeta>> {
         match self {
             Self::FileMeta(iter) => Ok(iter),
-            other => Err(other.type_mismatch("FileMeta")),
+            other => Err(crate::Error::Kernel(other.type_mismatch("FileMeta"))),
         }
     }
 
@@ -163,7 +163,7 @@ impl PlanResult {
     pub fn into_bytes(self) -> Result<ResultIteratorStatic<Bytes>> {
         match self {
             Self::Bytes(iter) => Ok(iter),
-            other => Err(other.type_mismatch("Bytes")),
+            other => Err(crate::Error::Kernel(other.type_mismatch("Bytes"))),
         }
     }
 
@@ -173,7 +173,7 @@ impl PlanResult {
     pub fn into_parquet_footer(self) -> Result<ParquetFooter> {
         match self {
             Self::ParquetFooter(footer) => Ok(footer),
-            other => Err(other.type_mismatch("ParquetFooter")),
+            other => Err(crate::Error::Kernel(other.type_mismatch("ParquetFooter"))),
         }
     }
 
@@ -182,7 +182,7 @@ impl PlanResult {
     pub fn into_unit(self) -> Result<()> {
         match self {
             Self::Unit => Ok(()),
-            other => Err(other.type_mismatch("Unit")),
+            other => Err(crate::Error::Kernel(other.type_mismatch("Unit"))),
         }
     }
 

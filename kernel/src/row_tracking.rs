@@ -51,12 +51,12 @@ pub(crate) fn parse_row_tracking_high_water_mark(configuration: &str) -> KernelR
 }
 
 impl TryFrom<RowTrackingDomainMetadata> for DomainMetadata {
-    type Error = crate::KernelError;
+    type Error = crate::Error;
 
     fn try_from(metadata: RowTrackingDomainMetadata) -> Result<Self> {
         Ok(DomainMetadata::new(
             ROW_TRACKING_DOMAIN_NAME.to_string(),
-            serde_json::to_string(&metadata)?,
+            serde_json::to_string(&metadata).map_err(crate::Error::kernel)?,
         ))
     }
 }
@@ -105,10 +105,10 @@ impl RowVisitor for RowTrackingVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == 1,
-            KernelError::generic(format!(
+            crate::Error::Kernel(KernelError::generic(format!(
                 "Wrong number of RowTrackingVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
 
         // Create a new batch for this visit
@@ -117,9 +117,9 @@ impl RowVisitor for RowTrackingVisitor {
         let mut current_hwm = self.row_id_high_water_mark;
         for i in 0..row_count {
             let num_records: i64 = getters[0].get_opt(i, NUM_RECORDS)?.ok_or_else(|| {
-                KernelError::InternalError(format!(
+                crate::Error::Kernel(KernelError::InternalError(format!(
                     "{NUM_RECORDS} must be present in Add actions when row tracking is enabled."
-                ))
+                )))
             })?;
             batch_base_row_ids.push(current_hwm + 1);
             current_hwm += num_records;
@@ -294,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn test_serialization_roundtrip() -> Result<()> {
+    fn test_serialization_roundtrip() -> crate::KernelResult<()> {
         let original = RowTrackingDomainMetadata::new(-42);
         let json = serde_json::to_string(&original)?;
         let deserialized: RowTrackingDomainMetadata = serde_json::from_str(&json)?;

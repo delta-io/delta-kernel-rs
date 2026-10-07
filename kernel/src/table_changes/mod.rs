@@ -55,7 +55,7 @@ use crate::table_properties::{
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult, Result, Version};
+use crate::{Engine, KernelError, KernelResult, Result, ResultExt, Version};
 
 mod log_replay;
 mod net_changes;
@@ -265,6 +265,7 @@ impl TableChanges {
             end_version,
             CdfMode::ChangeDataFeed,
         )
+        .into_public_result()
     }
 
     /// Creates a listing-only change feed from row-tracking metadata.
@@ -306,6 +307,7 @@ impl TableChanges {
             end_version,
             CdfMode::RowTracking,
         )
+        .into_public_result()
     }
 
     fn try_new_internal(
@@ -433,13 +435,14 @@ impl TableChanges {
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn materialized_row_id_column_name(&self) -> Result<&str> {
-        self.row_tracking_table_properties()?
+        self.row_tracking_table_properties()
+            .into_public_result()?
             .materialized_row_id_column_name
             .as_deref()
             .ok_or_else(|| {
-                KernelError::internal_error(
+                crate::Error::Kernel(KernelError::internal_error(
                     "A row-tracking TableChanges is missing its materialized row ID column name",
-                )
+                ))
             })
     }
 
@@ -452,14 +455,15 @@ impl TableChanges {
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn materialized_row_commit_version_column_name(&self) -> Result<&str> {
-        self.row_tracking_table_properties()?
+        self.row_tracking_table_properties()
+            .into_public_result()?
             .materialized_row_commit_version_column_name
             .as_deref()
             .ok_or_else(|| {
-                KernelError::internal_error(
+                crate::Error::Kernel(KernelError::internal_error(
                     "A row-tracking TableChanges is missing its materialized row commit version \
                      column name",
-                )
+                ))
             })
     }
 
@@ -520,10 +524,10 @@ impl TableChanges {
         mode: TableChangesListingMode,
     ) -> Result<impl Iterator<Item = Result<TableChangesFileAction>>> {
         if self.mode != CdfMode::RowTracking {
-            return Err(KernelError::unsupported(
+            return Err(crate::Error::Kernel(KernelError::unsupported(
                 "scan_file_listing is only supported for row-tracking change feeds; construct \
                  the TableChanges with TableChanges::try_new_row_tracking_cdf_listing",
-            ));
+            )));
         }
 
         let commits = self.log_segment.listed.ascending_commit_files.clone();
@@ -535,14 +539,18 @@ impl TableChanges {
             schema,
             None,
             self.mode,
-        )?;
+        )
+        .into_public_result()?;
         // Any listing error surfaces here rather than mid-iteration.
         let actions = scan_metadata_to_scan_file(scan_metadata)
             .map(|scan_file| TableChangesFileAction::try_from_scan_file(scan_file?))
-            .collect::<KernelResult<Vec<_>>>()?;
+            .collect::<KernelResult<Vec<_>>>()
+            .into_public_result()?;
         let actions = match mode {
             TableChangesListingMode::AllChanges => actions,
-            TableChangesListingMode::NetChanges => net_changes::collapse_net_changes(actions)?,
+            TableChangesListingMode::NetChanges => {
+                net_changes::collapse_net_changes(actions).into_public_result()?
+            }
         };
         Ok(actions.into_iter().map(Ok))
     }
@@ -614,7 +622,9 @@ mod tests {
             );
             assert!(matches!(
                 res,
-                Err(KernelError::ChangeDataFeedUnsupported(_))
+                Err(crate::Error::Kernel(
+                    KernelError::ChangeDataFeedUnsupported(_)
+                ))
             ))
         }
     }
@@ -627,7 +637,9 @@ mod tests {
 
         // A field in the schema goes from being nullable to non-nullable
         let table_changes_res = TableChanges::try_new(url, engine.as_ref(), 3, Some(4));
-        assert!(matches!(table_changes_res, Err(KernelError::Generic(msg)) if msg == expected_msg));
+        assert!(
+            matches!(table_changes_res, Err(crate::Error::Kernel(KernelError::Generic(msg))) if msg == expected_msg)
+        );
     }
 
     #[test]
@@ -666,7 +678,7 @@ mod tests {
         );
         let res = table_changes.scan_file_listing(engine, TableChangesListingMode::AllChanges);
         assert!(
-            matches!(res, Err(KernelError::Unsupported(_))),
+            matches!(res, Err(crate::Error::Kernel(KernelError::Unsupported(_)))),
             "scan_file_listing on a cdc-file TableChanges must return an unsupported error"
         );
     }
@@ -707,7 +719,12 @@ mod tests {
         let url = delta_kernel::try_parse_uri(path).unwrap();
         let res = TableChanges::try_new_row_tracking_cdf_listing(url, engine.as_ref(), 0, Some(1));
         assert!(
-            matches!(&res, Err(KernelError::RowTrackingChangeFeedUnsupported(_))),
+            matches!(
+                &res,
+                Err(crate::Error::Kernel(
+                    KernelError::RowTrackingChangeFeedUnsupported(_)
+                ))
+            ),
             "expected a row-tracking-disabled error, got {res:?}"
         );
     }
@@ -758,7 +775,9 @@ mod tests {
         assert!(
             matches!(
                 &res,
-                Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+                Err(crate::Error::Kernel(
+                    KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+                ))
             ),
             "expected an incompatible start schema to be rejected, got {res:?}"
         );

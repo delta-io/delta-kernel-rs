@@ -28,7 +28,7 @@ use crate::schema::{
 use crate::struct_patch::{project_struct_preserving_nulls, ProjectionStructPatchBuilder};
 use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::utils::FoldWithOption as _;
-use crate::{KernelError, KernelResult, PlanBuilder};
+use crate::{KernelError, KernelResult, PlanBuilder, ResultExt};
 
 // === Internal column names ===
 
@@ -117,7 +117,7 @@ impl Scan {
             .filter(col!("add").is_not_null())?
             .project(output_expr, output_schema)?;
 
-        PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])?.build_opt()
+        Ok(PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])?.build_opt()?)
     }
 
     /// Build normalized checkpoint adds. Returns an empty relation when no checkpoint exists.
@@ -167,7 +167,8 @@ impl Scan {
                 match log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
                     Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
                     // Without a complete hint, load the sidecars referenced by the manifest.
-                    None => sidecar_actions(file_type, parts, schema, &log_segment.log_root),
+                    None => sidecar_actions(file_type, parts, schema, &log_segment.log_root)
+                        .into_public_result(),
                 }
             }
             (CheckpointType::None, _) | (_, None) => {
@@ -175,7 +176,7 @@ impl Scan {
             }
         }?;
 
-        actions
+        Ok(actions
             .filter(col!("add.path").is_not_null())?
             .project_patch(|patch| {
                 patch
@@ -189,7 +190,7 @@ impl Scan {
                         FILE_ACTION_KEY_FIELD.clone(),
                         file_action_key_expr(|col| joined_column_expr!("add", col)),
                     )
-            })
+            })?)
     }
 
     /// Build the normalized commit JSON arm.
@@ -210,33 +211,35 @@ impl Scan {
     fn commit_arm(&self) -> KernelResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
         let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
-        PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
-            .filter(Predicate::or(
-                col!("add.path").is_not_null(),
-                col!("remove.path").is_not_null(),
-            ))?
-            .project_patch(|patch| {
-                // Commits never carry source-native parsed columns, so normalize from the raw
-                // encodings.
-                patch
-                    .with_parsed_add_stats(self.state_info.physical_stats_read_schema())
-                    .with_parsed_add_partition_values(
-                        self.state_info.physical_partition_schema.as_ref(),
-                    )
-                    .append(
-                        StructField::not_null(IS_ADD, DataType::BOOLEAN),
-                        Expr::from(col!("add.path").is_not_null()),
-                    )
-                    .append(
-                        FILE_ACTION_KEY_FIELD.clone(),
-                        file_action_key_expr(|col| {
-                            Expr::coalesce([
-                                joined_column_expr!("add", col),
-                                joined_column_expr!("remove", col),
-                            ])
-                        }),
-                    )
-            })
+        Ok(
+            PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
+                .filter(Predicate::or(
+                    col!("add.path").is_not_null(),
+                    col!("remove.path").is_not_null(),
+                ))?
+                .project_patch(|patch| {
+                    // Commits never carry source-native parsed columns, so normalize from the raw
+                    // encodings.
+                    patch
+                        .with_parsed_add_stats(self.state_info.physical_stats_read_schema())
+                        .with_parsed_add_partition_values(
+                            self.state_info.physical_partition_schema.as_ref(),
+                        )
+                        .append(
+                            StructField::not_null(IS_ADD, DataType::BOOLEAN),
+                            Expr::from(col!("add.path").is_not_null()),
+                        )
+                        .append(
+                            FILE_ACTION_KEY_FIELD.clone(),
+                            file_action_key_expr(|col| {
+                                Expr::coalesce([
+                                    joined_column_expr!("add", col),
+                                    joined_column_expr!("remove", col),
+                                ])
+                            }),
+                        )
+                })?,
+        )
     }
 
     fn normalized_add_field(&self) -> KernelResult<StructField> {
@@ -396,7 +399,7 @@ fn sidecar_actions(
         None,
     )?;
 
-    sidecar_files.dynamic_scan(dynamic_scan)
+    Ok(sidecar_files.dynamic_scan(dynamic_scan)?)
 }
 
 // === Helpers ===
@@ -579,7 +582,7 @@ mod tests {
     };
     use crate::{Engine as _, Result};
 
-    fn mock_snapshot(log_segment: LogSegment) -> Result<Arc<Snapshot>> {
+    fn mock_snapshot(log_segment: LogSegment) -> crate::KernelResult<Arc<Snapshot>> {
         let table_configuration = MockTableConfigurationBuilder::new()
             .with_schema(partitioned_schema())
             .with_partition_columns(["p"])
@@ -666,7 +669,7 @@ mod tests {
     }
 
     // One add with JSON stats and no `stats_parsed`.
-    fn write_parquet_checkpoint(store: &Arc<InMemory>, path: &str) -> Result<()> {
+    fn write_parquet_checkpoint(store: &Arc<InMemory>, path: &str) -> crate::KernelResult<()> {
         use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
         use crate::arrow::array::{
             Array, BooleanArray, Int64Array, RecordBatch, StringArray as SA,
@@ -769,7 +772,7 @@ mod tests {
         #[case] shape: CheckpointShape,
         #[case] file_type: FileType,
         #[case] checkpoint_arm_tags: Vec<&'static str>,
-    ) -> Result<()> {
+    ) -> crate::KernelResult<()> {
         let segment = log_segment(
             log_root(),
             &["file:///_delta_log/00000000000000000001.json"],
@@ -795,7 +798,7 @@ mod tests {
         #[case] expect_native_partitions: bool,
         #[values(None, Some(struct_stats_schema()))] parsed_stats: Option<SchemaRef>,
         #[values(CheckpointType::Leaf, CheckpointType::Manifest)] checkpoint_type: CheckpointType,
-    ) -> Result<()> {
+    ) -> crate::KernelResult<()> {
         let stats = StatsOptions::all();
         let partition_values = PartitionValuesOptions::with_struct();
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
@@ -858,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_plan_commits_only() -> Result<()> {
+    fn metadata_plan_commits_only() -> crate::KernelResult<()> {
         let segment = log_segment(
             log_root(),
             &["file:///_delta_log/00000000000000000001.json"],
@@ -881,7 +884,7 @@ mod tests {
         #[case] shape: CheckpointShape,
         #[case] file_type: FileType,
         #[case] checkpoint_arm_tags: Vec<&'static str>,
-    ) -> Result<()> {
+    ) -> crate::KernelResult<()> {
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(file_type)));
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
         let plan = scan.build_metadata_scan_plan(&shape)?.expect("non-empty");
@@ -890,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_plan_empty_is_none() -> Result<()> {
+    fn metadata_plan_empty_is_none() -> crate::KernelResult<()> {
         let segment = log_segment(log_root(), &[], None);
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
         assert!(scan.build_metadata_scan_plan(&no_checkpoint())?.is_none());
@@ -898,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_plan_static_skip_all_is_none() -> Result<()> {
+    fn metadata_plan_static_skip_all_is_none() -> crate::KernelResult<()> {
         let segment = log_segment(log_root(), &[], None);
         let scan = mock_snapshot(segment)?
             .scan_builder()
@@ -915,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_plan_executes_commit_dedup_with_sync_executor() -> Result<()> {
+    fn metadata_plan_executes_commit_dedup_with_sync_executor() -> crate::KernelResult<()> {
         let store = Arc::new(InMemory::new());
         futures::executor::block_on(async {
             store
@@ -926,7 +929,7 @@ mod tests {
 "#
                     .into(),
                 )
-                .await?;
+                .await.map_err(crate::Error::kernel)?;
             store
                 .put(
                     &Path::from("_delta_log/00000000000000000001.json"),
@@ -934,7 +937,8 @@ mod tests {
 "#
                     .into(),
                 )
-                .await?;
+                .await
+                .map_err(crate::Error::kernel)?;
             Result::<()>::Ok(())
         })?;
 
@@ -986,7 +990,7 @@ mod tests {
     fn metadata_plan_executes_leaf_without_stats_parsed(
         #[case] lower_bound: i64,
         #[case] expected_rows: usize,
-    ) -> Result<()> {
+    ) -> crate::KernelResult<()> {
         let store = Arc::new(InMemory::new());
         // A single-row parquet checkpoint carrying an `add` with a JSON `stats` string but no
         // `stats_parsed` column.

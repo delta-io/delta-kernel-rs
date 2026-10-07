@@ -24,7 +24,9 @@ use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{format_features, Operation, TableFeature};
 use crate::utils::require;
-use crate::{Engine, EngineData, KernelError, KernelResult, PredicateRef, Result, RowVisitor};
+use crate::{
+    Engine, EngineData, KernelError, KernelResult, PredicateRef, Result, ResultExt, RowVisitor,
+};
 
 #[cfg(test)]
 mod tests;
@@ -281,7 +283,12 @@ impl LogReplayScanner {
             if has_protocol_update {
                 table_configuration
                     .ensure_operation_supported(Operation::Cdf)
-                    .map_err(|e| mode.protocol_support_error(e, commit_file.version))?;
+                    .map_err(|e| {
+                        mode.protocol_support_error(
+                            crate::KernelError::from(e),
+                            commit_file.version,
+                        )
+                    })?;
             }
         }
         // We resolve the remove deletion vector map after visiting the entire commit.
@@ -436,10 +443,10 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> Result<()> {
         require!(
             getters.len() == 11,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of PreparePhaseVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         for i in 0..row_count {
             if let Some(path) = getters[0].get_str(i, "add.path")? {
@@ -450,7 +457,8 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
             } else if let Some(path) = getters[2].get_str(i, "remove.path")? {
                 // If no data was changed, we must ignore that action
                 if !*self.has_cdc_action && getters[3].get(i, "remove.dataChange")? {
-                    let deletion_vector = visit_deletion_vector_at(i, &getters[4..=8])?;
+                    let deletion_vector =
+                        visit_deletion_vector_at(i, &getters[4..=8]).into_public_result()?;
                     self.remove_dvs
                         .insert(path.to_string(), DvInfo { deletion_vector });
                 }
@@ -515,10 +523,10 @@ impl RowVisitor for FileActionSelectionVisitor<'_> {
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> Result<()> {
         require!(
             getters.len() == 5,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of FileActionSelectionVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
 
         for i in 0..row_count {

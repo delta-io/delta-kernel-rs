@@ -16,7 +16,7 @@ use delta_kernel_derive::internal_api;
 
 use super::file_stats::FileStats;
 use crate::actions::{DomainMetadata, SetTransaction};
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult, Result, ResultExt};
 
 /// The state of file statistics for a CRC.
 ///
@@ -102,13 +102,17 @@ impl DomainMetadataState {
     /// Builds complete state, rejecting tombstones and duplicate domains.
     #[internal_api]
     pub(crate) fn try_complete(values: impl IntoIterator<Item = DomainMetadata>) -> Result<Self> {
-        Ok(Self::Complete(domain_metadata_map(values, true)?))
+        Ok(Self::Complete(
+            domain_metadata_map(values, true).into_public_result()?,
+        ))
     }
 
     /// Builds partial state, rejecting duplicate domains.
     #[internal_api]
     pub(crate) fn try_partial(values: impl IntoIterator<Item = DomainMetadata>) -> Result<Self> {
-        Ok(Self::Partial(domain_metadata_map(values, false)?))
+        Ok(Self::Partial(
+            domain_metadata_map(values, false).into_public_result()?,
+        ))
     }
 }
 
@@ -190,13 +194,15 @@ impl SetTransactionState {
     /// Builds complete state, rejecting duplicate application IDs.
     #[internal_api]
     pub(crate) fn try_complete(values: impl IntoIterator<Item = SetTransaction>) -> Result<Self> {
-        Ok(Self::Complete(transaction_map(values)?))
+        Ok(Self::Complete(
+            transaction_map(values).into_public_result()?,
+        ))
     }
 
     /// Builds partial state, rejecting duplicate application IDs.
     #[internal_api]
     pub(crate) fn try_partial(values: impl IntoIterator<Item = SetTransaction>) -> Result<Self> {
-        Ok(Self::Partial(transaction_map(values)?))
+        Ok(Self::Partial(transaction_map(values).into_public_result()?))
     }
 }
 

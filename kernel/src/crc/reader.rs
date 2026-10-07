@@ -30,7 +30,7 @@ pub(crate) fn try_read_crc_file(
         .next()
         .ok_or_else(|| KernelError::generic("CRC file read returned no data"))??;
     tracing::Span::current().record("bytes_read", data.len() as u64);
-    Crc::try_from_json_bytes(&data, crc_path.version)
+    Ok(Crc::try_from_json_bytes(&data, crc_path.version)?)
 }
 
 /// Read a CRC file, returning `None` if it cannot be read.

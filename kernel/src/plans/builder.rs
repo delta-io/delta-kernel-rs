@@ -50,7 +50,7 @@ use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, Struct
 use crate::schema::{SchemaRef, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::CollectInto;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult, Result, ResultExt};
 
 /// One node of a plan DAG: an operator, its inputs, and its output schema. Node identity is the
 /// `Arc`'s address ([`PlanBuilder::build`] dedups shared subgraphs by pointer). Inputs are always
@@ -121,6 +121,7 @@ impl PlanBuilder {
         schema: impl Into<SchemaRef>,
     ) -> Result<Self> {
         Self::scan_source(FileType::Parquet, files, file_constant_columns, schema)
+            .into_public_result()
     }
 
     /// A newline-delimited JSON scan source over `files` producing rows matching `schema`. See
@@ -130,7 +131,7 @@ impl PlanBuilder {
         file_constant_columns: &[&str],
         schema: impl Into<SchemaRef>,
     ) -> Result<Self> {
-        Self::scan_source(FileType::Json, files, file_constant_columns, schema)
+        Self::scan_source(FileType::Json, files, file_constant_columns, schema).into_public_result()
     }
 
     /// Shared body of [`Self::scan_parquet`] / [`Self::scan_json`]. Normalizes and validates the
@@ -195,11 +196,11 @@ impl PlanBuilder {
         let width = schema.fields().count();
         for (i, row) in rows.iter().enumerate() {
             if row.len() != width {
-                return Err(KernelError::generic(format!(
+                return Err(crate::Error::Kernel(KernelError::generic(format!(
                     "values: row {i} has {} value(s) {row:?} but schema has {width} field(s) {:?}",
                     row.len(),
                     Vec::from_iter(schema.fields().map(|f| f.name())),
-                )));
+                ))));
             }
         }
         Ok(Values::new(schema, rows).into())
@@ -293,7 +294,8 @@ impl PlanBuilder {
     /// ```
     pub fn filter(self, predicate: impl Into<PredicateRef>) -> Result<Self> {
         let predicate = predicate.into();
-        check_columns_resolve(self.schema(), predicate.references(), "filter")?;
+        check_columns_resolve(self.schema(), predicate.references(), "filter")
+            .into_public_result()?;
         let schema = Arc::clone(self.schema());
         Ok(self.unary_op_or_absent(schema, Filter { predicate }))
     }
@@ -330,7 +332,7 @@ impl PlanBuilder {
     ) -> Result<Self> {
         let schema = schema.into();
         let expr = expr.into();
-        check_columns_resolve(self.schema(), expr.references(), "project")?;
+        check_columns_resolve(self.schema(), expr.references(), "project").into_public_result()?;
         Ok(self.unary_op_or_absent(Arc::clone(&schema), Project { expr, schema }))
     }
 
@@ -369,7 +371,7 @@ impl PlanBuilder {
     /// column is absent from its input schema, or two output columns would share a name.
     pub fn aggregate(
         self,
-        aggregate: impl TryInto<Aggregate, Error = KernelError>,
+        aggregate: impl TryInto<Aggregate, Error = crate::Error>,
     ) -> Result<Self> {
         let aggregate = aggregate.try_into()?;
         let schema = Arc::clone(&aggregate.schema);
@@ -485,6 +487,7 @@ impl PlanBuilder {
         build_keys: impl IntoIterator<Item = ColumnName>,
     ) -> Result<Self> {
         self.semi_join_impl(build, false, probe_keys, build_keys)
+            .into_public_result()
     }
 
     /// Anti join: emit the `self` (probe) rows that have *no* match in `build` on the join keys.
@@ -496,6 +499,7 @@ impl PlanBuilder {
         build_keys: impl IntoIterator<Item = ColumnName>,
     ) -> Result<Self> {
         self.semi_join_impl(build, true, probe_keys, build_keys)
+            .into_public_result()
     }
 
     fn semi_join_impl(
@@ -558,16 +562,16 @@ impl PlanBuilder {
     pub fn union_all(inputs: impl IntoIterator<Item = PlanBuilder>) -> Result<Self> {
         let inputs = Vec::from_iter(inputs);
         let Some(schema) = inputs.first().map(|b| Arc::clone(b.schema())) else {
-            return Err(KernelError::generic(
+            return Err(crate::Error::Kernel(KernelError::generic(
                 "union_all: requires at least one input",
-            ));
+            )));
         };
         if let Some(i) = inputs.iter().position(|b| b.schema() != &schema) {
-            return Err(KernelError::generic(format!(
+            return Err(crate::Error::Kernel(KernelError::generic(format!(
                 "union_all: input {i} has a schema differing from input 0: {:?} vs {:?}",
                 inputs[i].schema(),
                 schema,
-            )));
+            ))));
         }
         let mut present = Vec::from_iter(inputs.into_iter().filter_map(|b| match b.0 {
             PlanBuilderRoot::Present(node) => Some(node),
@@ -959,7 +963,7 @@ mod tests {
     #[case::anti_join_absent_probe(
         absent_src().anti_join(vals(x_schema()), [column_name!("id")], [column_name!("x")]))]
     #[case::union_all_of_absent(PlanBuilder::union_all([absent_src(), absent_src()]))]
-    fn collapses_to_absent(#[case] builder: Result<PlanBuilder>) -> Result<()> {
+    fn collapses_to_absent(#[case] builder: Result<PlanBuilder>) -> crate::KernelResult<()> {
         assert!(builder?.build_opt()?.is_none()); // absent has no plan to run
         Ok(())
     }
@@ -1162,10 +1166,7 @@ mod tests {
         Ok(())
     }
 
-    fn dynamic_scan_node(
-        input_schema: &SchemaRef,
-        out_schema: SchemaRef,
-    ) -> KernelResult<DynamicScan> {
+    fn dynamic_scan_node(input_schema: &SchemaRef, out_schema: SchemaRef) -> Result<DynamicScan> {
         DynamicScan::try_new(
             input_schema,
             out_schema,
@@ -1197,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_scan_sets_output_schema_and_records_input() -> Result<()> {
+    fn dynamic_scan_sets_output_schema_and_records_input() -> crate::KernelResult<()> {
         let input = dynamic_scan_input_schema();
         let out = dynamic_scan_output_schema();
         let node = dynamic_scan_node(&input, out.clone())?;
@@ -1231,14 +1232,11 @@ mod tests {
         schema_with_field(dynamic_scan_input_schema(), field)
     }
 
-    fn construct_dynamic_scan(input: SchemaRef) -> KernelResult<DynamicScan> {
+    fn construct_dynamic_scan(input: SchemaRef) -> Result<DynamicScan> {
         dynamic_scan_node(&input, dynamic_scan_output_schema())
     }
 
-    fn build_dynamic_scan_with_schemas(
-        input: SchemaRef,
-        output: SchemaRef,
-    ) -> KernelResult<PlanBuilder> {
+    fn build_dynamic_scan_with_schemas(input: SchemaRef, output: SchemaRef) -> Result<PlanBuilder> {
         let dynamic_scan = dynamic_scan_node(&input, output)?;
         vals(input).dynamic_scan(dynamic_scan)
     }

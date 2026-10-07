@@ -611,8 +611,10 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         create_add_files_metadata(&add_schema, vec![("file.parquet", 100, 1000, Some(1))])
             .expect("metadata creation should succeed");
     txn.add_files(metadata);
-    txn.commit(engine.as_ref())
-        .expect_err("commit should fail for invalid void schema")
+    delta_kernel::KernelError::from(
+        txn.commit(engine.as_ref())
+            .expect_err("commit should fail for invalid void schema"),
+    )
 }
 
 #[rstest]

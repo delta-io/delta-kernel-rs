@@ -437,7 +437,7 @@ impl<'a> TryFromStringSlice<'a> for &'a str {
     /// valid utf8 bytes.
     unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> Result<Self> {
         let slice = unsafe { std::slice::from_raw_parts(slice.ptr.cast(), slice.len) };
-        Ok(std::str::from_utf8(slice)?)
+        std::str::from_utf8(slice).map_err(delta_kernel::Error::kernel)
     }
 }
 
@@ -798,7 +798,7 @@ impl ExternEngine for ExternEngineVtable {
 /// Caller is responsible for passing a valid path pointer.
 unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> KernelResult<Url> {
     let path: &str = unsafe { TryFromStringSlice::try_from_slice(&path) }?;
-    delta_kernel::try_parse_uri(path)
+    Ok(delta_kernel::try_parse_uri(path)?)
 }
 
 /// How [`FfiEngineBuilder`] resolves an [`ObjectStore`](delta_kernel::object_store::ObjectStore) at
@@ -1344,7 +1344,7 @@ pub unsafe extern "C" fn get_snapshot_builder(
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let source = match url {
         Ok(url) => FfiSnapshotBuilderSource::TableRoot(url),
-        Err(e) => return Result::Err(e).into_extern_result(&engine_ref),
+        Err(e) => return KernelResult::Err(e).into_extern_result(&engine_ref),
     };
     make_snapshot_builder(source, engine_arc).into_extern_result(&engine_ref)
 }
@@ -1498,7 +1498,7 @@ fn snapshot_builder_build_impl(
         if let Some(snapshot_hint) = snapshot_hint {
             builder = apply_snapshot_hint(builder, snapshot_hint)?;
         }
-        builder.build(engine)
+        Ok(builder.build(engine)?)
     }
 
     let snapshot = match source {
@@ -1798,12 +1798,12 @@ fn get_earliest_commit_impl(
     earliest_ratified_commit_version: OptionalValue<Version>,
     commit_type: FfiHistoryCommitType,
 ) -> KernelResult<Version> {
-    kernel_get_earliest_commit(
+    Ok(kernel_get_earliest_commit(
         extern_engine.engine().as_ref(),
         &log_root?,
         earliest_ratified_commit_version.into(),
         commit_type.into(),
-    )
+    )?)
 }
 
 /// A commit located by a timestamp query: a commit version paired with its timestamp. FFI-safe
@@ -2421,7 +2421,7 @@ mod tests {
     /// engine and snapshot handles.
     async fn make_engine_and_v0_snapshot(
         path: &str,
-    ) -> Result<
+    ) -> std::result::Result<
         (
             Arc<InMemory>,
             Handle<SharedExternEngine>,
@@ -2449,7 +2449,7 @@ mod tests {
     /// snapshot is built with `max_catalog_version = 0`.
     async fn make_catalog_managed_engine_and_v0_snapshot(
         path: &str,
-    ) -> Result<
+    ) -> std::result::Result<
         (
             Arc<InMemory>,
             Handle<SharedExternEngine>,
@@ -2590,7 +2590,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_snapshot() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let table_root = "memory:///test_table/";
         let (_, engine, snapshot1) = make_engine_and_v0_snapshot(table_root).await?;
 
@@ -2638,7 +2638,7 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_file_stats_present() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_snapshot_file_stats_present() -> std::result::Result<(), Box<dyn std::error::Error>> {
         // The crc-full fixture has a CRC at version 0 with complete file stats.
         let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")?;
         let table_root = Url::from_directory_path(&table_path)
@@ -2683,8 +2683,8 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_row_tracking_high_water_mark_present() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn test_snapshot_row_tracking_high_water_mark_present(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")?;
         let table_root = Url::from_directory_path(&table_path)
             .map_err(|()| delta_kernel::KernelError::generic("invalid table path"))?
@@ -2711,7 +2711,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_row_tracking_high_water_mark_absent(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let table_root = "memory:///test_row_tracking_high_water_mark_absent/";
         let (_storage, engine, snapshot) = make_engine_and_v0_snapshot(table_root).await?;
 
@@ -2731,8 +2731,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_file_stats_absent_without_crc() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn test_snapshot_file_stats_absent_without_crc(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         // A metadata-only table has no CRC, so file stats are absent.
         let table_root = "memory:///test_file_stats_no_crc/";
         let (_storage, engine, snapshot) = make_engine_and_v0_snapshot(table_root).await?;
@@ -2865,8 +2865,8 @@ mod tests {
         #[case] setup: EarliestCommitTableSetupScenario,
         #[case] earliest_ratified: OptionalValue<Version>,
         #[case] commit_type: FfiHistoryCommitType,
-        #[case] expected: Result<Version, FFIKernelError>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[case] expected: std::result::Result<Version, FFIKernelError>,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let table_root = "memory:///earliest_commit/";
         let log_root = "memory:///earliest_commit/_delta_log/";
         let engine = setup_earliest_commit_table(&setup, table_root).await;
@@ -2892,7 +2892,8 @@ mod tests {
     // TODO: (PR #2307) will introduce a helper function for setting up storage, engine.
     // The test will need to refactor to use the helper function.
     #[tokio::test]
-    async fn test_snapshot_timestamp_no_ict() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_snapshot_timestamp_no_ict() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
         add_commit(
@@ -2933,7 +2934,8 @@ mod tests {
     // TODO: (PR #2307) will introduce a helper function for setting up storage, engine.
     // The test will need to refactor to use the helper function.
     #[tokio::test]
-    async fn test_snapshot_timestamp_ict_enabled() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_snapshot_timestamp_ict_enabled(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
 
@@ -2986,10 +2988,10 @@ mod tests {
     async fn test_snapshot_version_at_timestamp_cases(
         #[case] query: HistoryQueryFn,
         #[case] timestamp: i64,
-        #[case] expected: Result<(Version, i64), FFIKernelError>,
+        #[case] expected: std::result::Result<(Version, i64), FFIKernelError>,
         #[values(FfiHistoryCommitType::Published, FfiHistoryCommitType::Recreatable)]
         commit_type: FfiHistoryCommitType,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
 
@@ -3045,7 +3047,7 @@ mod tests {
     async fn test_visit_metadata_configuration(
         #[case] metadata: &str,
         #[case] expected: HashMap<String, String>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let table_root = "memory:///";
         let storage = Arc::new(InMemory::new());
         add_commit(
@@ -3098,7 +3100,7 @@ mod tests {
     async fn test_visit_metadata_format_options(
         #[case] metadata: &str,
         #[case] expected: HashMap<String, String>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let (engine, snap) = setup_snapshot(metadata.to_string()).await?;
 
         assert_eq!(collect_metadata_format_options(&snap), expected);
@@ -3125,7 +3127,7 @@ mod tests {
         storage: &DynObjectStore,
         table_root: &str,
         num_add_actions: usize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         add_commit(
             table_root,
             storage,
@@ -3151,7 +3153,7 @@ mod tests {
         storage: &InMemory,
         table_root: &str,
         num_add_actions: usize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         add_commit(
             table_root,
             storage,
@@ -3209,7 +3211,7 @@ mod tests {
     async fn setup_checkpoint_test(
         is_v2: bool,
         num_add_actions: usize,
-    ) -> Result<
+    ) -> std::result::Result<
         (
             Arc<InMemory>,
             Handle<SharedExternEngine>,
@@ -3286,7 +3288,7 @@ mod tests {
         #[case] num_add_actions: usize,
         #[case] spec: Option<FfiCheckpointSpec>,
         #[case] expected_sidecars: usize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let (storage, engine, snapshot) = setup_checkpoint_test(is_v2, num_add_actions).await?;
 
         let result = unsafe {
@@ -3312,7 +3314,7 @@ mod tests {
     // surfaced through the FFI as `CheckpointWriteError`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_v2_with_sidecars_zero_hint_returns_error(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let (_storage, engine, snapshot) = setup_checkpoint_test(true, 3).await?;
 
         let spec = FfiCheckpointSpec::V2WithSidecar {
@@ -3335,7 +3337,7 @@ mod tests {
     // Checkpoint on V1 table with V2 spec => `FFIKernelError::CheckpointWriteError`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_v2_on_non_v2_table_returns_checkpoint_write_error(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let (_storage, engine, snapshot) = setup_checkpoint_test(false, 1).await?;
 
         let spec = FfiCheckpointSpec::V2NoSidecar;
@@ -3374,7 +3376,7 @@ mod tests {
     )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_second_call_returns_consistent_snapshot(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let (_storage, engine, snapshot) = setup_checkpoint_test(false, 2).await?;
         let input_version = unsafe { version(snapshot.shallow_copy()) };
 
@@ -3423,7 +3425,7 @@ mod tests {
     )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_written_snapshot_is_usable(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let (storage, engine, snapshot) = setup_checkpoint_test(false, 2).await?;
         let input_version = unsafe { version(snapshot.shallow_copy()) };
 
@@ -3485,7 +3487,7 @@ mod tests {
     // coverage under Miri.
     #[cfg(feature = "default-engine-base")]
     #[test]
-    fn test_setting_multithread_executor() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_setting_multithread_executor() -> std::result::Result<(), Box<dyn std::error::Error>> {
         use delta_kernel::object_store::local::LocalFileSystem;
         use tempfile::tempdir;
 
@@ -3548,7 +3550,7 @@ mod tests {
     fn test_setting_io_concurrency(
         #[case] buffer_size: usize,
         #[case] batch_size: usize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         use delta_kernel::object_store::local::LocalFileSystem;
         use tempfile::tempdir;
 
@@ -3603,7 +3605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_partition_cols() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_snapshot_partition_cols() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
 
@@ -3641,7 +3643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allocate_null_err_okay() -> Result<(), Box<dyn std::error::Error>> {
+    async fn allocate_null_err_okay() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///";
 
@@ -3671,7 +3673,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_log_tail() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_snapshot_log_tail() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let table_root = "memory:///test_table/";
         let (storage, engine, snap) =
             make_catalog_managed_engine_and_v0_snapshot(table_root).await?;
@@ -3770,7 +3772,7 @@ mod tests {
         #[case] catalog_managed: bool,
         #[case] max_catalog_version: Option<Version>,
         #[case] expected_message: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
         let actions = if catalog_managed {
@@ -3808,7 +3810,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_builder_from_existing_snapshot_advances_to_latest_and_pinned_version(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let path = "memory:///";
         let (storage, engine, snapshot_at_v0) = make_engine_and_v0_snapshot(path).await?;
         assert_eq!(unsafe { version(snapshot_at_v0.shallow_copy()) }, 0);
@@ -3856,7 +3858,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_builder_from_existing_snapshot_rejects_earlier_version(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let path = "memory:///";
         let (storage, engine, snapshot_at_v0) = make_engine_and_v0_snapshot(path).await?;
 
@@ -3908,7 +3910,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_with_prev_snapshot_and_log_tail(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let path = "memory:///";
         let (storage, engine, snapshot_at_v0) =
             make_catalog_managed_engine_and_v0_snapshot(path).await?;
@@ -3985,7 +3987,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_builder_from_table_path_builds_latest_version(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let path = "memory:///";
         add_commit(
@@ -4022,8 +4024,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_free_snapshot_builder_without_building() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn test_free_snapshot_builder_without_building(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let path = "memory:///";
         let (_, engine, snap) = make_engine_and_v0_snapshot(path).await?;
         unsafe { free_snapshot(snap) };
@@ -4197,7 +4199,7 @@ mod tests {
     // === visit_protocol tests ===
 
     #[tokio::test]
-    async fn test_visit_protocol_legacy() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_visit_protocol_legacy() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let (engine, snap) = setup_snapshot(METADATA.to_string()).await?;
         let state = collect_protocol_state(&snap);
 
@@ -4213,7 +4215,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_builder_with_nonexistent_path_returns_error(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
@@ -4236,7 +4238,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_builder_at_nonexistent_version_returns_error(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let path = "memory:///";
         let (_, engine, snap) = make_engine_and_v0_snapshot(path).await?;
         unsafe { free_snapshot(snap) };
@@ -4260,7 +4262,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_visit_protocol_with_features() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_visit_protocol_with_features(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let (engine, snap) = setup_snapshot(METADATA_WITH_FEATURES.to_string()).await?;
         let state = collect_protocol_state(&snap);
 
@@ -4277,7 +4280,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_visit_metadata_default() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_visit_metadata_default() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let (engine, snap) = setup_snapshot(METADATA.to_string()).await?;
         let state = collect_metadata_state(&snap);
 
@@ -4303,7 +4306,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_visit_metadata_with_name() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_visit_metadata_with_name() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
         let (engine, snap) = setup_snapshot(METADATA_WITH_FEATURES.to_string()).await?;
         let state = collect_metadata_state(&snap);
 
@@ -4323,7 +4327,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_visit_metadata_with_description() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_visit_metadata_with_description(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let (engine, snap) = setup_snapshot(METADATA_WITH_FORMAT_OPTIONS.to_string()).await?;
         let state = collect_metadata_state(&snap);
 
@@ -4338,7 +4343,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_visit_metadata_without_created_time() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_visit_metadata_without_created_time(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let metadata_no_time = concat!(
             r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{},"isBlindAppend":true}}"#,
             "\n",

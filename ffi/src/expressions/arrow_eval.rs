@@ -26,7 +26,7 @@ use delta_kernel::kernel_predicates::{
     IndirectDataSkippingPredicateEvaluator, KernelPredicateEvaluator,
 };
 use delta_kernel::schema::DataType;
-use delta_kernel::{KernelError, KernelResult, Predicate, Result};
+use delta_kernel::{KernelError, KernelResult, Predicate, Result, ResultExt};
 
 use super::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
 use crate::engine_data::ArrowFFIData;
@@ -139,7 +139,7 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> KernelResult<Recor
         .iter()
         .map(|arg| match arg {
             Expression::Struct(fields, _nullability) => evaluate_struct_arg(fields, batch),
-            _ => evaluate_expression(arg, batch, None),
+            _ => evaluate_expression(arg, batch, None).map_err(delta_kernel::KernelError::from),
         })
         .collect::<KernelResult<_>>()?;
 
@@ -208,7 +208,7 @@ fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> KernelR
     let arrays: Vec<ArrayRef> = fields
         .iter()
         .map(|f| evaluate_expression(f, batch, None))
-        .collect::<KernelResult<_>>()?;
+        .collect::<delta_kernel::Result<_>>()?;
     let arrow_fields: Fields = arrays
         .iter()
         .enumerate()
@@ -323,7 +323,7 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
                 );
                 return Ok(BooleanArray::from(vec![true; batch.num_rows()]));
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(delta_kernel::Error::Kernel(e)),
         };
         // The StatsMode rewrite records inversion on the op (the stats predicate is then evaluated
         // non-inverted by kernel); RowMode carries it via the eval-time flag. XOR composes both.
@@ -335,6 +335,7 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
             self.mode,
             inverted,
         )
+        .into_public_result()
     }
 
     fn eval_pred_scalar(

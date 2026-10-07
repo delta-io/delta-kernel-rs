@@ -6,6 +6,7 @@ use delta_kernel::plans::proto::schema as proto_schema;
 use delta_kernel::schema::StructType;
 use delta_kernel::{
     KernelError, KernelResult, Operation, ParquetFooter, PlanExecutor, PlanResult, Result,
+    ResultExt,
 };
 use delta_kernel_ffi_macros::handle_descriptor;
 use prost::Message as _;
@@ -65,24 +66,29 @@ impl PlanExecutor for FfiPlanExecutor {
 
         let mut out = EngineExecResult::Uninit;
         (self.callback)(self.context, plan_proto_slice, &mut out);
-        let plan_result =
-            match out {
-                EngineExecResult::Success(plan) => plan,
-                EngineExecResult::Failure(err) => return Err(err.into()),
-                EngineExecResult::Uninit => return Err(KernelError::internal_error(
+        let plan_result = match out {
+            EngineExecResult::Success(plan) => plan,
+            EngineExecResult::Failure(err) => return Err(delta_kernel::Error::Kernel(err.into())),
+            EngineExecResult::Uninit => {
+                return Err(delta_kernel::Error::Kernel(KernelError::internal_error(
                     "FFI engine returned from execute_op upcall without writing the plan result",
-                )),
-            };
+                )))
+            }
+        };
         match plan_result {
             CPlanResult::Unit => Ok(PlanResult::Unit),
-            CPlanResult::Data(it) => Ok(PlanResult::Data(Box::new(FfiEngineDataIter::new(it)))),
-            CPlanResult::FileMeta(it) => {
-                Ok(PlanResult::FileMeta(Box::new(FfiFileMetaIter::new(it))))
-            }
-            CPlanResult::Bytes(it) => Ok(PlanResult::Bytes(Box::new(FfiBytesIter::new(it)))),
-            CPlanResult::ParquetFooter(footer) => {
-                Ok(PlanResult::ParquetFooter(decode_parquet_footer(footer)?))
-            }
+            CPlanResult::Data(it) => Ok(PlanResult::Data(Box::new(
+                FfiEngineDataIter::new(it).map(ResultExt::into_public_result),
+            ))),
+            CPlanResult::FileMeta(it) => Ok(PlanResult::FileMeta(Box::new(
+                FfiFileMetaIter::new(it).map(ResultExt::into_public_result),
+            ))),
+            CPlanResult::Bytes(it) => Ok(PlanResult::Bytes(Box::new(
+                FfiBytesIter::new(it).map(ResultExt::into_public_result),
+            ))),
+            CPlanResult::ParquetFooter(footer) => Ok(PlanResult::ParquetFooter(
+                decode_parquet_footer(footer).into_public_result()?,
+            )),
         }
     }
 }
@@ -200,7 +206,7 @@ mod tests {
             panic!("execute_op should surface the engine failure");
         };
         assert!(
-            matches!(err, KernelError::Unsupported(ref msg) if msg == "kaboom"),
+            matches!(err, delta_kernel::Error::Kernel(KernelError::Unsupported(ref msg)) if msg == "kaboom"),
             "expected KernelError::Unsupported(\"kaboom\"), got {err:?}"
         );
     }
@@ -318,7 +324,10 @@ mod tests {
             panic!("invalid schema proto bytes should fail to decode");
         };
         assert!(
-            matches!(err, KernelError::GenericError { .. }),
+            matches!(
+                err,
+                delta_kernel::Error::Kernel(KernelError::GenericError { .. })
+            ),
             "expected a proto decode error, got {err:?}"
         );
     }

@@ -20,7 +20,7 @@ use crate::plans::ir::nodes::Operator;
 use crate::plans::Operation as PlanOperation;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
 use crate::unit_test_utils::load_test_table;
-use crate::{Engine, KernelResult, PredicateRef, Result, Snapshot};
+use crate::{Engine, KernelResult, PredicateRef, Result, ResultExt, Snapshot};
 
 // Normalizes metadata for comparison: the imperative path splits fields between the data batch
 // and fileConstantValues, while the declarative path returns them in an add struct.
@@ -216,7 +216,7 @@ fn declarative_metadata_matches_imperative_scan(
         Some(col!("id").is_not_null())
     )]
     predicate: Option<Pred>,
-) -> Result<()> {
+) -> crate::KernelResult<()> {
     let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
     let predicate = predicate.map(Arc::new);
 
@@ -256,7 +256,9 @@ fn declarative_metadata_matches_imperative_scan(
 #[rstest]
 #[case::parquet_manifest("v2-checkpoints-parquet-with-sidecars")]
 #[case::json_manifest("v2-checkpoints-json-with-sidecars")]
-fn declarative_metadata_scans_sidecars_from_checkpoint_hint(#[case] table: &str) -> Result<()> {
+fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
+    #[case] table: &str,
+) -> crate::KernelResult<()> {
     let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
     let plan = snapshot
         .scan_builder()
@@ -295,7 +297,7 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(#[case] table: &str)
 fn declarative_metadata_matches_imperative_across_stats_options(
     #[case] stats: StatsOptions,
     #[case] expected_stats_field_groups: &[&[&str]],
-) -> Result<()> {
+) -> crate::KernelResult<()> {
     let (engine, snapshot, _tempdir) = load_test_table("parsed-stats")?;
     let struct_stats = stats.struct_stats.clone();
     let no_stats = !stats.synthesize_json && matches!(&struct_stats, StructStats::None);
@@ -502,7 +504,7 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
     (|| -> Result<()> {
         let json_requested = stats.synthesize_json;
         let (engine, snapshot, _tempdir) =
-            load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+            load_test_table("v1-multi-part-partitioned-struct-stats-only").into_public_result()?;
         let scan = snapshot
             .scan_builder()
             .with_stats(stats)
@@ -561,7 +563,7 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
 }
 
 #[test]
-fn declarative_metadata_projects_nested_column_mapped_stats() -> Result<()> {
+fn declarative_metadata_projects_nested_column_mapped_stats() -> crate::KernelResult<()> {
     let (engine, snapshot, _tempdir) = load_test_table("stats-writing-all-types/delta")?;
     let scan = snapshot
         .scan_builder()
@@ -642,7 +644,7 @@ fn declarative_metadata_output_options_across_log_shapes(
         PartitionValuesOptions::with_struct()
     )]
     partitions: PartitionValuesOptions,
-) -> Result<()> {
+) -> crate::KernelResult<()> {
     assert_metadata_output_options(log_state, features, table_config, stats, partitions)
 }
 
@@ -771,7 +773,7 @@ fn declarative_metadata_data_skipping(
     table: &str,
     #[case] predicate: Pred,
     #[case] expected_count: usize,
-) -> Result<()> {
+) -> crate::KernelResult<()> {
     let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
     let predicate = Arc::new(predicate);
     let expected = imperative_metadata(
@@ -808,7 +810,7 @@ fn declarative_metadata_data_skipping(
 fn declarative_metadata_partition_values_prune_without_struct_stats(
     #[case] predicate: Pred,
     #[case] expected_count: usize,
-) -> Result<()> {
+) -> crate::KernelResult<()> {
     let (engine, snapshot, _tempdir) =
         crate::unit_test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
     let predicate = Arc::new(predicate);
@@ -835,7 +837,7 @@ fn declarative_metadata_partition_values_prune_without_struct_stats(
 }
 
 #[test]
-fn declarative_metadata_partition_is_null_keeps_null_partition() -> Result<()> {
+fn declarative_metadata_partition_is_null_keeps_null_partition() -> crate::KernelResult<()> {
     let (engine, snapshot, _tempdir) = load_test_table("data-reader-timestamp_ntz")?;
     let scan = snapshot
         .scan_builder()
@@ -876,7 +878,7 @@ fn declarative_metadata_partition_is_null_keeps_null_partition() -> Result<()> {
 }
 
 #[test]
-fn declarative_metadata_reconstructs_well_formed_stats_and_partitions() -> Result<()> {
+fn declarative_metadata_reconstructs_well_formed_stats_and_partitions() -> crate::KernelResult<()> {
     let (engine, snapshot, _tempdir) =
         crate::unit_test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
     let scan = snapshot
@@ -946,7 +948,7 @@ fn expected_stats_row(id: i64, partition: i32) -> String {
 }
 
 #[test]
-fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> Result<()> {
+fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> crate::KernelResult<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(4).with_checkpoint_at([2]))
         .build()
@@ -976,7 +978,8 @@ fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> Result<()>
 }
 
 #[test]
-fn declarative_metadata_pruning_keeps_remove_for_checkpoint_reconciliation() -> Result<()> {
+fn declarative_metadata_pruning_keeps_remove_for_checkpoint_reconciliation(
+) -> crate::KernelResult<()> {
     let (engine, snapshot, _tempdir) = load_test_table("with_checkpoint_no_last_checkpoint")?;
     let scan = snapshot
         .scan_builder()
@@ -1016,7 +1019,7 @@ fn declarative_metadata_prunes_across_v1_log_states(
         )
     )]
     pruning: (Pred, usize),
-) -> Result<()> {
+) -> crate::KernelResult<()> {
     assert_declarative_metadata_matches_imperative(
         log_state,
         FeatureSet::new(),
@@ -1028,7 +1031,7 @@ fn declarative_metadata_prunes_across_v1_log_states(
 #[rstest]
 fn declarative_metadata_partition_prunes_v2_checkpoints(
     #[values(2, 4)] checkpoint_version: u64,
-) -> Result<()> {
+) -> crate::KernelResult<()> {
     let log_state = LogState::with_latest_version(4)
         .with_checkpoint_at([checkpoint_version])
         .with_sidecars_if_enabled(None);
@@ -1084,7 +1087,8 @@ fn assert_declarative_metadata_matches_imperative(
 }
 
 #[test]
-fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Result<()> {
+fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> crate::KernelResult<()>
+{
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(4).with_checkpoint_at([2]))
         .build()
@@ -1098,6 +1102,9 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
         .declarative_metadata_scan_plan(&no_plan_engine)
         .unwrap_err();
 
-    assert!(matches!(err, crate::KernelError::Unsupported(_)));
+    assert!(matches!(
+        err,
+        crate::Error::Kernel(crate::KernelError::Unsupported(_))
+    ));
     Ok(())
 }

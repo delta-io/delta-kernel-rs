@@ -68,6 +68,11 @@ run: |
     echo "Comment: $COMMENT_BODY"
 ```
 
+## Error-contract checks
+
+Public error-contract checks include compile-fail doctests for explicit `KernelError` wrapping.
+Run doctests in addition to nextest; nextest does not execute them.
+
 ## Release tooling checks
 
 The `release-tooling` job in `build.yml` fetches full history and tags because release branches

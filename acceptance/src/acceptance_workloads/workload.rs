@@ -10,7 +10,7 @@ use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predic
 use delta_kernel::expressions::Predicate;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{Engine, KernelError, KernelResult, Result, Version};
+use delta_kernel::{Engine, KernelError, KernelResult, Result, ResultExt, Version};
 use delta_kernel_workloads::models::{ReadSpec, SnapshotConstructionSpec, Spec, TimeTravel};
 use delta_kernel_workloads::predicate_parser::parse_predicate;
 use itertools::Itertools;
@@ -55,7 +55,7 @@ fn build_snapshot(
     if let Some(v) = version {
         builder = builder.at_version(v);
     }
-    builder.build(engine)
+    Ok(builder.build(engine)?)
 }
 
 /// Execute a read workload.
@@ -64,7 +64,8 @@ pub fn execute_read_workload(
     table_root: &Url,
     read_spec: &ReadSpec,
 ) -> Result<ReadResult> {
-    let snapshot = build_snapshot(engine.as_ref(), table_root, read_spec.time_travel.as_ref())?;
+    let snapshot = build_snapshot(engine.as_ref(), table_root, read_spec.time_travel.as_ref())
+        .into_public_result()?;
 
     let table_schema = snapshot.schema();
 
@@ -73,8 +74,8 @@ pub fn execute_read_workload(
 
     // Extract and parse the predicate if one is present
     let predicate = if let Some(ref predicate_string) = read_spec.predicate {
-        let predicate =
-            parse_predicate(predicate_string, &table_schema).map_err(KernelError::generic)?;
+        let predicate = parse_predicate(predicate_string, &table_schema)
+            .map_err(|error| delta_kernel::Error::Kernel(KernelError::generic(error)))?;
         let predicate = Arc::new(predicate);
         scan_builder = scan_builder.with_predicate(predicate.clone());
         Some(predicate)
@@ -95,7 +96,8 @@ pub fn execute_read_workload(
         .execute(engine)?
         .map(|data| data?.try_into_record_batch())
         .try_collect()?;
-    let batches = filter_batches_with_predicate(batches, predicate.as_deref())?;
+    let batches =
+        filter_batches_with_predicate(batches, predicate.as_deref()).into_public_result()?;
 
     // Compute row count from filtered batches
     let row_count: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
@@ -138,7 +140,8 @@ pub fn execute_snapshot_workload(
         engine.as_ref(),
         table_root,
         snapshot_spec.time_travel.as_ref(),
-    )?;
+    )
+    .into_public_result()?;
 
     let config = snapshot.table_configuration();
 
@@ -155,7 +158,7 @@ pub fn execute_and_validate_workload(
     table_root: &Url,
     spec: &Spec,
     expected_dir: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     match spec {
         Spec::Read(read_spec) => {
             let expected = read_spec

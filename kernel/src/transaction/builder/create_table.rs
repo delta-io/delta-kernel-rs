@@ -46,7 +46,7 @@ use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
 use crate::transaction::Transaction;
 use crate::utils::{current_time_ms, try_parse_uri};
-use crate::{Engine, KernelError, KernelResult, Result, StorageHandler};
+use crate::{Engine, KernelError, KernelResult, Result, ResultExt, StorageHandler};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
 ///
@@ -164,17 +164,17 @@ fn ensure_table_does_not_exist(
                 Some(Ok(_)) => Err(KernelError::generic(format!(
                     "Table already exists at path: {table_path}"
                 ))),
-                Some(Err(KernelError::FileNotFound(_))) | None => {
+                Some(Err(crate::Error::Kernel(KernelError::FileNotFound(_)))) | None => {
                     // Path doesn't exist or empty - OK for new table
                     Ok(())
                 }
                 Some(Err(e)) => {
                     // Real error (permissions, network, etc.) - propagate
-                    Err(e)
+                    Err(crate::KernelError::from(e))
                 }
             }
         }
-        Err(KernelError::FileNotFound(_)) => {
+        Err(crate::Error::Kernel(KernelError::FileNotFound(_))) => {
             // Directory doesn't exist - this is expected for a new table.
             // The storage layer will create the full path (including _delta_log/)
             // when the commit writes the first log file via write_json_file().
@@ -182,7 +182,7 @@ fn ensure_table_does_not_exist(
         }
         Err(e) => {
             // Real error - propagate
-            Err(e)
+            Err(crate::KernelError::from(e))
         }
     }
 }
@@ -955,32 +955,37 @@ impl CreateTableTransactionBuilder {
         let table_url = try_parse_uri(&self.path)?;
 
         // Check if table already exists by looking for _delta_log directory
-        let delta_log_url = table_url.join("_delta_log/")?;
+        let delta_log_url = table_url
+            .join("_delta_log/")
+            .map_err(crate::Error::kernel)?;
         let storage = engine.storage_handler();
-        ensure_table_does_not_exist(storage.as_ref(), &delta_log_url, &self.path)?;
+        ensure_table_does_not_exist(storage.as_ref(), &delta_log_url, &self.path)
+            .into_public_result()?;
 
         // Validate and transform table properties
         // - Extracts and validates feature signals
         // - Removes feature signals from properties (they shouldn't be stored in metadata)
         // - Returns reader/writer features to add to protocol
-        let mut validated = validate_extract_table_features_and_properties(self.table_properties)?;
+        let mut validated = validate_extract_table_features_and_properties(self.table_properties)
+            .into_public_result()?;
 
         // When IcebergCompatV2 is enabled, fill in / validate required dependencies before column
         // mapping is applied so the CM mode is in place. This must run before
         // `maybe_apply_column_mapping_for_table_create`,
         // `maybe_auto_enable_property_driven_features`, and
         // `maybe_set_materialized_row_tracking_column_name_properties`.
-        maybe_enable_iceberg_compat_v2_dependencies(&mut validated)?;
+        maybe_enable_iceberg_compat_v2_dependencies(&mut validated).into_public_result()?;
 
         // When IcebergCompatV3 is enabled, fill in and validate its column-mapping and row-tracking
         // dependencies. This must run before `maybe_apply_column_mapping_for_table_create`,
         // `maybe_auto_enable_property_driven_features`, and
         // `maybe_set_materialized_row_tracking_column_name_properties`.
-        maybe_enable_iceberg_compat_v3_dependencies(&mut validated)?;
+        maybe_enable_iceberg_compat_v3_dependencies(&mut validated).into_public_result()?;
 
         // Apply column mapping if mode is name or id (must happen BEFORE data layout)
         let (mut effective_schema, column_mapping_mode) =
-            maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated)?;
+            maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated)
+                .into_public_result()?;
 
         // Validate schema (column names, duplicates, no `delta.invariants` metadata).
         // Empty schemas are intentionally allowed.
@@ -988,7 +993,8 @@ impl CreateTableTransactionBuilder {
             &effective_schema,
             column_mapping_mode,
             validated.is_property_true(ENABLE_CHANGE_DATA_FEED),
-        )?;
+        )
+        .into_public_result()?;
 
         // Strip CM metadata in `None` mode: a new table has no prior schema (passed as `None`), so
         // any annotation the caller supplied is newly introduced (see
@@ -1008,7 +1014,8 @@ impl CreateTableTransactionBuilder {
             &effective_schema,
             column_mapping_mode,
             &mut validated,
-        )?;
+        )
+        .into_public_result()?;
 
         // Schema-driven auto-enablement: detect types or annotations that require a feature
         maybe_enable_variant_type(&effective_schema, &mut validated);
@@ -1019,7 +1026,7 @@ impl CreateTableTransactionBuilder {
         maybe_auto_enable_property_driven_features(&mut validated);
 
         // Auto-enable inCommitTimestamp for catalogManaged tables
-        maybe_enable_ict_for_catalog_managed(&mut validated)?;
+        maybe_enable_ict_for_catalog_managed(&mut validated).into_public_result()?;
 
         // Auto-enable v2Checkpoint when checkpointPolicy=v2
         maybe_enable_v2_checkpoint_for_policy(&mut validated);
@@ -1029,7 +1036,8 @@ impl CreateTableTransactionBuilder {
 
         // Create Protocol action with table features support
         let protocol =
-            Protocol::try_new_modern(validated.reader_features, validated.writer_features)?;
+            Protocol::try_new_modern(validated.reader_features, validated.writer_features)
+                .into_public_result()?;
 
         // Create Metadata action with filtered properties (feature signals removed)
         // Use effective_schema which includes column mapping annotations if enabled
@@ -1044,7 +1052,7 @@ impl CreateTableTransactionBuilder {
             None, // description
             effective_schema.clone(),
             partition_columns,
-            current_time_ms()?,
+            current_time_ms().into_public_result()?,
             validated.properties,
         )?;
 
@@ -1060,6 +1068,7 @@ impl CreateTableTransactionBuilder {
             data_layout_result.clustering_columns,
             self.correlation_id,
         )
+        .into_public_result()
     }
 }
 

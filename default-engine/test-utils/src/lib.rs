@@ -42,21 +42,29 @@ pub fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineD
 
 /// Returns the current time as a `Duration` since Unix epoch.
 pub fn current_time_duration() -> Result<Duration> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| KernelError::generic(format!("System time before Unix epoch: {e}")))
+    SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| {
+        delta_kernel::Error::Kernel(KernelError::generic(format!(
+            "System time before Unix epoch: {e}"
+        )))
+    })
 }
 
 /// Returns the current time in milliseconds since Unix epoch.
 pub fn current_time_ms() -> Result<i64> {
     let duration = current_time_duration()?;
-    i64::try_from(duration.as_millis())
-        .map_err(|_| KernelError::generic("Current timestamp exceeds i64 millisecond range"))
+    i64::try_from(duration.as_millis()).map_err(|_| {
+        delta_kernel::Error::Kernel(KernelError::generic(
+            "Current timestamp exceeds i64 millisecond range",
+        ))
+    })
 }
 
 /// Assert that `res` is an `Err` whose `Display` contains `message`.
 #[track_caller]
-pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {
+pub fn assert_result_error_with_message<T, E: ToString>(
+    res: std::result::Result<T, E>,
+    message: &str,
+) {
     match res {
         Ok(_) => panic!("Expected error containing '{message}', but got Ok result"),
         Err(e) => {

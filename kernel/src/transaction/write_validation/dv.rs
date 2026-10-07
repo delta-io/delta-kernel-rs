@@ -37,7 +37,7 @@ static DV_MATCHED_FILE_COLUMNS: LazyLock<KernelResult<ColumnNamesAndTypes>> = La
                 .field_at(name)
                 .map(|field| field.data_type().clone())
         })
-        .collect::<KernelResult<Vec<_>>>()?;
+        .collect::<crate::Result<Vec<_>>>()?;
     Ok((names, types).into())
 });
 

@@ -126,7 +126,7 @@ use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
     version_as_i64, Engine, EngineData, FileMeta, KernelError, KernelResult,
-    KernelResultIteratorStatic, Result, Version,
+    KernelResultIteratorStatic, Result, ResultExt, Version,
 };
 
 #[cfg(feature = "declarative-plans")]
@@ -196,25 +196,29 @@ impl LastCheckpointHintStats {
         num_sidecars: u64,
     ) -> Result<Self> {
         if !state.is_exhausted() {
-            return Err(KernelError::checkpoint_write(
+            return Err(crate::Error::Kernel(KernelError::checkpoint_write(
                 "Cannot build LastCheckpointHintStats: the reconciliation iterator must be fully \
                  consumed and all data written to storage before finalizing",
-            ));
+            )));
         }
         let size_in_bytes = i64::try_from(size_in_bytes).map_err(|e| {
-            KernelError::checkpoint_write(format!("size_in_bytes {size_in_bytes} exceeds i64: {e}"))
+            crate::Error::Kernel(KernelError::checkpoint_write(format!(
+                "size_in_bytes {size_in_bytes} exceeds i64: {e}"
+            )))
         })?;
         let num_sidecars_i64 = i64::try_from(num_sidecars).map_err(|e| {
-            KernelError::checkpoint_write(format!("num_sidecars {num_sidecars} exceeds i64: {e}"))
+            crate::Error::Kernel(KernelError::checkpoint_write(format!(
+                "num_sidecars {num_sidecars} exceeds i64: {e}"
+            )))
         })?;
         let num_actions = state
             .actions_count()
             .checked_add(num_sidecars_i64)
             .ok_or_else(|| {
-                KernelError::checkpoint_write(format!(
+                crate::Error::Kernel(KernelError::checkpoint_write(format!(
                     "checkpoint action count overflowed i64: {} + {num_sidecars}",
                     state.actions_count()
-                ))
+                )))
             })?;
         Ok(Self {
             num_actions,
@@ -417,6 +421,7 @@ impl CheckpointWriter {
             self.snapshot.version(),
         )
         .map(|parsed| parsed.location)
+        .into_public_result()
     }
 
     /// Returns the checkpoint data to be written to the checkpoint file.
@@ -461,8 +466,10 @@ impl CheckpointWriter {
 
         // Process actions through reconciliation
         let checkpoint_data = ActionReconciliationProcessor::new(
-            self.deleted_file_retention_timestamp()?,
-            self.get_transaction_expiration_timestamp()?,
+            self.deleted_file_retention_timestamp()
+                .into_public_result()?,
+            self.get_transaction_expiration_timestamp()
+                .into_public_result()?,
         )
         .process_actions_iter(actions);
 
@@ -544,7 +551,7 @@ impl CheckpointWriter {
         let last_checkpoint_path = LastCheckpointHint::path(&self.snapshot.log_segment().log_root)?;
 
         // Write the `_last_checkpoint` file to `table/_delta_log/_last_checkpoint`
-        let filtered_data = FilteredEngineData::with_all_rows_selected(data?);
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data.into_public_result()?);
         engine.json_handler().write_json_file(
             &last_checkpoint_path,
             Box::new(std::iter::once(Ok(filtered_data))),
@@ -613,9 +620,10 @@ impl CheckpointWriter {
         let checkpoint_path = self.checkpoint_path()?;
         let main_data: KernelResultIteratorStatic<Box<dyn EngineData>> =
             Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
-        let main_size = engine
-            .parquet_handler()
-            .write_parquet_file(checkpoint_path.clone(), main_data)?;
+        let main_size = engine.parquet_handler().write_parquet_file(
+            checkpoint_path.clone(),
+            Box::new(main_data.map(ResultExt::into_public_result)),
+        )?;
 
         // size_in_bytes covers the main checkpoint file plus all sidecar files.
         let sidecar_sizes_sum = sidecar_metas
@@ -781,7 +789,7 @@ pub(crate) fn create_last_checkpoint_data(
     add_actions_counter: i64,
     size_in_bytes: i64,
 ) -> KernelResult<Box<dyn EngineData>> {
-    engine.evaluation_handler().create_many(
+    Ok(engine.evaluation_handler().create_many(
         LAST_CHECKPOINT_SCHEMA.clone(),
         vec![vec![
             version.into(),
@@ -790,7 +798,7 @@ pub(crate) fn create_last_checkpoint_data(
             size_in_bytes.into(),
             add_actions_counter.into(),
         ]],
-    )
+    )?)
 }
 
 /// Writes one sidecar file. Returns `None` if the splitter yielded no rows for this sidecar.
@@ -807,9 +815,10 @@ fn write_single_sidecar(
         return Ok(None);
     }
     let (filename, sidecar_url) = path::new_sidecar(table_root, version)?;
-    let written_size = engine
-        .parquet_handler()
-        .write_parquet_file(sidecar_url.clone(), Box::new(iter))?;
+    let written_size = engine.parquet_handler().write_parquet_file(
+        sidecar_url.clone(),
+        Box::new(iter.map(ResultExt::into_public_result)),
+    )?;
     let meta = engine.storage_handler().head(&sidecar_url)?;
     verify_written_size(&sidecar_url, written_size, meta.size)?;
     Ok(Some((filename, meta)))

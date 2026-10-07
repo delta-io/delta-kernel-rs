@@ -20,6 +20,12 @@ pub enum AssertionError {
     KernelError(#[from] KernelError),
 }
 
+impl From<delta_kernel::Error> for AssertionError {
+    fn from(error: delta_kernel::Error) -> Self {
+        Self::KernelError(error.into())
+    }
+}
+
 pub type TestResult<T, E = AssertionError> = std::result::Result<T, E>;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]

@@ -5,7 +5,7 @@ use datafusion::functions::core::expr_fn::get_field_path;
 use datafusion::logical_expr::{lit, Expr as DFExpr};
 use delta_kernel::expressions::ColumnName as KernelColumnName;
 use delta_kernel::schema::StructType;
-use delta_kernel::{KernelError, Result};
+use delta_kernel::KernelError;
 
 /// A schema that can resolve the root of a kernel column path to a DataFusion column.
 pub(crate) trait ColumnResolver {
@@ -38,7 +38,7 @@ pub(crate) fn column_to_df_expr<E>(
 impl ColumnResolver for StructType {
     type Error = KernelError;
 
-    fn resolve_column(&self, name: &KernelColumnName) -> Result<DFColumn> {
+    fn resolve_column(&self, name: &KernelColumnName) -> Result<DFColumn, Self::Error> {
         let Some(root) = name.first() else {
             return Err(KernelError::generic(
                 "cannot convert an empty column reference",

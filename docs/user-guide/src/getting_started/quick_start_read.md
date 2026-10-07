@@ -45,7 +45,7 @@ use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::DefaultEngine;
-use delta_kernel::{Result, Snapshot};
+use delta_kernel::{Error, Result, Snapshot};
 
 fn main() -> Result<()> {
     // 1. Parse the table location
@@ -71,7 +71,7 @@ fn main() -> Result<()> {
     }
 
     // 5. Print the results
-    print_batches(&batches)?;
+    print_batches(&batches).map_err(Error::kernel)?;
     Ok(())
 }
 ```

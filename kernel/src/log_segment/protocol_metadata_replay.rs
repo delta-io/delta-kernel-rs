@@ -194,33 +194,35 @@ impl LogSegment {
         let relevant_action =
             Predicate::or(relevant_action, col!(CHECKPOINT_ACTION_NAME).is_not_null());
 
-        PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
-            .filter(relevant_action)?
-            .aggregate_ungrouped(|a| {
-                let protocol = || column_name!(PROTOCOL_NAME);
-                let metadata = || column_name!(METADATA_NAME);
-                let version = || column_name!("version");
-                // The version aggregates are aliased; unaliased both would be named `version`.
-                let a = a
-                    .max_non_null_by(protocol(), protocol(), version())
-                    .max_non_null_by(metadata(), metadata(), version())
-                    .aggregate_as(
-                        Agg::max_non_null_by(version(), protocol(), version()),
-                        "protocol_version",
-                    )
-                    .aggregate_as(
-                        Agg::max_non_null_by(version(), metadata(), version()),
-                        "metadata_version",
+        Ok(
+            PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
+                .filter(relevant_action)?
+                .aggregate_ungrouped(|a| {
+                    let protocol = || column_name!(PROTOCOL_NAME);
+                    let metadata = || column_name!(METADATA_NAME);
+                    let version = || column_name!("version");
+                    // The version aggregates are aliased; unaliased both would be named `version`.
+                    let a = a
+                        .max_non_null_by(protocol(), protocol(), version())
+                        .max_non_null_by(metadata(), metadata(), version())
+                        .aggregate_as(
+                            Agg::max_non_null_by(version(), protocol(), version()),
+                            "protocol_version",
+                        )
+                        .aggregate_as(
+                            Agg::max_non_null_by(version(), metadata(), version()),
+                            "metadata_version",
+                        );
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    let a = a.max_non_null_by(
+                        column_name!(CHECKPOINT_ACTION_NAME),
+                        column_name!(CHECKPOINT_ACTION_NAME),
+                        version(),
                     );
-                #[cfg(feature = "adaptive-metadata-in-dev")]
-                let a = a.max_non_null_by(
-                    column_name!(CHECKPOINT_ACTION_NAME),
-                    column_name!(CHECKPOINT_ACTION_NAME),
-                    version(),
-                );
-                a
-            })?
-            .build()
+                    a
+                })?
+                .build()?,
+        )
     }
 
     /// Reads the P&M commit cover and checkpoint via the declarative plan, tagging each batch with
@@ -513,7 +515,9 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     impl PlanExecutor for FailingPlanExecutor {
         fn execute_op(&self, _op: Operation) -> Result<PlanResult> {
-            Err(KernelError::generic("plan executor deliberately failed"))
+            Err(crate::Error::Kernel(KernelError::generic(
+                "plan executor deliberately failed",
+            )))
         }
     }
 

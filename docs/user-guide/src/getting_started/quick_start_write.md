@@ -42,7 +42,7 @@ use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{Result, Snapshot};
+use delta_kernel::{Error, Result, Snapshot};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -76,14 +76,14 @@ async fn main() -> Result<()> {
 
     // Build an Arrow RecordBatch
     let arrow_schema: delta_kernel::arrow::datatypes::Schema =
-        schema.as_ref().try_into_arrow()?;
+        schema.as_ref().try_into_arrow().map_err(Error::kernel)?;
     let batch = RecordBatch::try_new(
         Arc::new(arrow_schema),
         vec![
             Arc::new(Int32Array::from(vec![1, 2, 3])),
             Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
         ],
-    )?;
+    ).map_err(Error::kernel)?;
 
     // Write Parquet and add file metadata to the transaction
     let write_state = txn.write_state()?;
@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
             Ok(data?.try_into_record_batch()?)
         })
         .collect::<Result<Vec<_>>>()?;
-    print_batches(&batches)?;
+    print_batches(&batches).map_err(Error::kernel)?;
 
     Ok(())
 }

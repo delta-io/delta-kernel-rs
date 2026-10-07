@@ -56,7 +56,7 @@ fn align_batch_to_schema(batch: RecordBatch, schema: SchemaRef) -> Result<Record
                 .unwrap_or_else(|| missing_void_array(field, batch.num_rows()))
         })
         .try_collect()?;
-    Ok(RecordBatch::try_new(schema, columns)?)
+    RecordBatch::try_new(schema, columns).map_err(delta_kernel::Error::kernel)
 }
 
 fn align_array(array: &ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
@@ -76,32 +76,38 @@ fn align_array(array: &ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
                     .unwrap_or_else(|| missing_void_array(field, source.len()))
             })
             .try_collect()?;
-        return Ok(Arc::new(StructArray::try_new(
-            fields.clone(),
-            columns,
-            source.nulls().cloned(),
-        )?));
+        return Ok(Arc::new(
+            StructArray::try_new(fields.clone(), columns, source.nulls().cloned())
+                .map_err(delta_kernel::Error::kernel)?,
+        ));
     }
     if let (Some(source), DataType::List(field)) =
         (array.as_any().downcast_ref::<ListArray>(), data_type)
     {
         let DataType::List(source_field) = source.data_type() else {
-            return Err(Error::internal_error("ListArray has a non-list data type"));
+            return Err(delta_kernel::Error::Kernel(Error::internal_error(
+                "ListArray has a non-list data type",
+            )));
         };
         require_same_nullability("list element", source_field, field)?;
         let values = align_array(source.values(), field.data_type())?;
-        return Ok(Arc::new(ListArray::try_new(
-            field.clone(),
-            source.offsets().clone(),
-            values,
-            source.nulls().cloned(),
-        )?));
+        return Ok(Arc::new(
+            ListArray::try_new(
+                field.clone(),
+                source.offsets().clone(),
+                values,
+                source.nulls().cloned(),
+            )
+            .map_err(delta_kernel::Error::kernel)?,
+        ));
     }
     if let (Some(source), DataType::Map(field, ordered)) =
         (array.as_any().downcast_ref::<MapArray>(), data_type)
     {
         let DataType::Map(source_field, source_ordered) = source.data_type() else {
-            return Err(Error::internal_error("MapArray has a non-map data type"));
+            return Err(delta_kernel::Error::Kernel(Error::internal_error(
+                "MapArray has a non-map data type",
+            )));
         };
         require_map_compatibility(*source_ordered, *ordered, source_field, field)?;
         let entries = align_array(
@@ -111,15 +117,20 @@ fn align_array(array: &ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
         let entries = entries
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| Error::generic("Aligned map entries are not a struct"))?
+            .ok_or_else(|| {
+                delta_kernel::Error::Kernel(Error::generic("Aligned map entries are not a struct"))
+            })?
             .clone();
-        return Ok(Arc::new(MapArray::try_new(
-            field.clone(),
-            source.offsets().clone(),
-            entries,
-            source.nulls().cloned(),
-            *ordered,
-        )?));
+        return Ok(Arc::new(
+            MapArray::try_new(
+                field.clone(),
+                source.offsets().clone(),
+                entries,
+                source.nulls().cloned(),
+                *ordered,
+            )
+            .map_err(delta_kernel::Error::kernel)?,
+        ));
     }
     if let (
         DataType::Timestamp(delta_kernel::arrow::datatypes::TimeUnit::Nanosecond, None),
@@ -132,19 +143,23 @@ fn align_array(array: &ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
             let source = array
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
-                .ok_or_else(|| Error::internal_error("Timestamp array has an unexpected type"))?;
+                .ok_or_else(|| {
+                    delta_kernel::Error::Kernel(Error::internal_error(
+                        "Timestamp array has an unexpected type",
+                    ))
+                })?;
             if source.iter().flatten().any(|value| value % 1_000 != 0) {
-                return Err(Error::generic(
+                return Err(delta_kernel::Error::Kernel(Error::generic(
                     "Expected Spark timestamp has sub-microsecond precision",
-                ));
+                )));
             }
-            return Ok(cast(array, data_type)?);
+            return cast(array, data_type).map_err(delta_kernel::Error::kernel);
         }
     }
-    Err(Error::generic(format!(
+    Err(delta_kernel::Error::Kernel(Error::generic(format!(
         "Expected data type {:?} does not match result type {data_type:?}",
         array.data_type()
-    )))
+    ))))
 }
 
 fn require_matching_field_order(source: &Fields, target: &Fields) -> Result<()> {
@@ -158,18 +173,18 @@ fn require_matching_field_order(source: &Fields, target: &Fields) -> Result<()> 
         .map(|field| field.name().clone())
         .collect_vec();
     if source_names != target_names {
-        return Err(Error::generic(format!(
+        return Err(delta_kernel::Error::Kernel(Error::generic(format!(
             "Expected field order {:?} does not match result field order {:?}",
             source_names, target_names
-        )));
+        ))));
     }
     for target_field in target {
         if let Some((_, source_field)) = source.find(target_field.name()) {
             if source_field.is_nullable() != target_field.is_nullable() {
-                return Err(Error::generic(format!(
+                return Err(delta_kernel::Error::Kernel(Error::generic(format!(
                     "Expected nullability for field '{}' does not match the result",
                     target_field.name()
-                )));
+                ))));
             }
         }
     }
@@ -180,18 +195,18 @@ fn missing_void_array(field: &Field, len: usize) -> Result<ArrayRef> {
     if field.data_type() == &DataType::Null {
         Ok(new_null_array(field.data_type(), len))
     } else {
-        Err(Error::generic(format!(
+        Err(delta_kernel::Error::Kernel(Error::generic(format!(
             "Expected data is missing non-void field '{}'",
             field.name()
-        )))
+        ))))
     }
 }
 
 fn require_same_nullability(context: &str, source: &Field, target: &Field) -> Result<()> {
     if source.is_nullable() != target.is_nullable() {
-        return Err(Error::generic(format!(
+        return Err(delta_kernel::Error::Kernel(Error::generic(format!(
             "Expected {context} nullability does not match the result"
-        )));
+        ))));
     }
     Ok(())
 }
@@ -203,9 +218,9 @@ fn require_map_compatibility(
     target_field: &Field,
 ) -> Result<()> {
     if source_ordered != target_ordered {
-        return Err(Error::generic(
+        return Err(delta_kernel::Error::Kernel(Error::generic(
             "Expected map ordering does not match the result",
-        ));
+        )));
     }
     require_same_nullability("map entry", source_field, target_field)
 }
@@ -213,8 +228,10 @@ fn require_map_compatibility(
 fn protocols_equal(
     actual: &delta_kernel::actions::Protocol,
     expected: &delta_kernel::actions::Protocol,
-) -> Result<bool, String> {
-    fn normalized(protocol: &delta_kernel::actions::Protocol) -> Result<Value, String> {
+) -> std::result::Result<bool, String> {
+    fn normalized(
+        protocol: &delta_kernel::actions::Protocol,
+    ) -> std::result::Result<Value, String> {
         let mut value = serde_json::to_value(protocol).map_err(|error| error.to_string())?;
         for name in ["readerFeatures", "writerFeatures"] {
             if let Some(features) = value.get_mut(name).and_then(Value::as_array_mut) {
@@ -330,7 +347,10 @@ fn expected_error_matches(expected: &ExpectedError, actual: &Error) -> bool {
     }
 }
 
-fn validate_expected_error(actual: &Error, expected: &ExpectedError) -> Result<(), String> {
+fn validate_expected_error(
+    actual: &Error,
+    expected: &ExpectedError,
+) -> std::result::Result<(), String> {
     if expected_error_matches(expected, actual) {
         debug!(
             "Got expected error '{}' with message: {:?}\nKernel error: {}",
@@ -346,7 +366,7 @@ fn validate_expected_error(actual: &Error, expected: &ExpectedError) -> Result<(
 }
 
 /// Read expected data from parquet files in expected_dir/expected_data/.
-fn read_expected_data(expected_dir: &Path) -> Result<RecordBatch, String> {
+fn read_expected_data(expected_dir: &Path) -> std::result::Result<RecordBatch, String> {
     let expected_data_dir = expected_dir.join("expected_data");
     if !expected_data_dir.exists() {
         return Err(format!(
@@ -408,7 +428,7 @@ pub fn validate_read_result(
     result: Result<ReadResult>,
     expected_dir: &Path,
     expected: &ReadExpected,
-) -> Result<(), String> {
+) -> std::result::Result<(), String> {
     match (result, expected) {
         (Ok(read_result), ReadExpected::Success { expected: exp }) => {
             // TODO: Check file_count and files_skipped against scan metrics once available.
@@ -435,7 +455,7 @@ pub fn validate_read_result(
             Ok(())
         }
         (Err(kernel_err), ReadExpected::Error { error }) => {
-            validate_expected_error(&kernel_err, error)
+            validate_expected_error(&delta_kernel::KernelError::from(kernel_err), error)
         }
         (Ok(_), ReadExpected::Error { error }) => Err(format!(
             "Expected error '{}' but succeeded",
@@ -452,7 +472,7 @@ pub fn validate_snapshot(
     result: Result<SnapshotResult>,
     time_travel: Option<&TimeTravel>,
     expected: &SnapshotExpected,
-) -> Result<(), String> {
+) -> std::result::Result<(), String> {
     match (result, expected) {
         (Ok(snapshot_result), SnapshotExpected::Success { expected }) => {
             if let Some(TimeTravel::Version { version }) = time_travel {
@@ -480,7 +500,7 @@ pub fn validate_snapshot(
             Ok(())
         }
         (Err(kernel_err), SnapshotExpected::Error { error }) => {
-            validate_expected_error(&kernel_err, error)
+            validate_expected_error(&delta_kernel::KernelError::from(kernel_err), error)
         }
         (Ok(_), SnapshotExpected::Error { error }) => Err(format!(
             "Expected error '{}' but succeeded",

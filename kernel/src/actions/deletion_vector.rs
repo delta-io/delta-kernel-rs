@@ -14,7 +14,7 @@ use url::Url;
 
 use crate::schema::DataType;
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result, Scalar, StorageHandler};
+use crate::{KernelError, KernelResult, Result, ResultExt, Scalar, StorageHandler};
 
 /// Magic number for portable RoaringBitmap serialization format.
 /// This is the standard format defined in the RoaringBitmap Specification
@@ -40,16 +40,16 @@ pub enum DeletionVectorStorageType {
 }
 
 impl FromStr for DeletionVectorStorageType {
-    type Err = KernelError;
+    type Err = crate::Error;
 
     fn from_str(s: &str) -> Result<Self> {
         match s {
             "u" => Ok(Self::PersistedRelative),
             "i" => Ok(Self::Inline),
             "p" => Ok(Self::PersistedAbsolute),
-            _ => Err(KernelError::internal_error(format!(
+            _ => Err(crate::Error::Kernel(KernelError::internal_error(format!(
                 "Unsupported deletion vector format option: {s}"
-            ))),
+            )))),
         }
     }
 }
@@ -122,9 +122,11 @@ impl DeletionVectorPath {
     /// Returns the absolute path to the deletion vector file.
     pub fn absolute_path(&self) -> Result<Url> {
         let dv_suffix = Self::relative_path(&self.prefix, &self.uuid);
-        self.table_path
-            .join(&dv_suffix)
-            .map_err(|_| KernelError::DeletionVector(format!("invalid path: {dv_suffix}")))
+        self.table_path.join(&dv_suffix).map_err(|_| {
+            crate::Error::Kernel(KernelError::DeletionVector(format!(
+                "invalid path: {dv_suffix}"
+            )))
+        })
     }
 
     /// Returns the compressed encoded path for use in descriptor (prefix + z85 encoded UUID).
@@ -180,14 +182,14 @@ struct DeletionVectorRaw {
 impl TryFrom<DeletionVectorRaw> for DeletionVectorDescriptor {
     type Error = KernelError;
 
-    fn try_from(raw: DeletionVectorRaw) -> Result<Self> {
-        Self::try_new(
+    fn try_from(raw: DeletionVectorRaw) -> KernelResult<Self> {
+        Ok(Self::try_new(
             raw.storage_type.parse()?,
             raw.path_or_inline_dv,
             raw.offset,
             raw.size_in_bytes,
             raw.cardinality,
-        )
+        )?)
     }
 }
 
@@ -214,21 +216,27 @@ impl DeletionVectorDescriptor {
     ) -> Result<Self> {
         require!(
             size_in_bytes >= 0,
-            KernelError::deletion_vector("size_in_bytes must be non-negative")
+            crate::Error::Kernel(KernelError::deletion_vector(
+                "size_in_bytes must be non-negative"
+            ))
         );
         require!(
             cardinality >= 0,
-            KernelError::deletion_vector("cardinality must be non-negative")
+            crate::Error::Kernel(KernelError::deletion_vector(
+                "cardinality must be non-negative"
+            ))
         );
         require!(
             offset.is_none_or(|o| o >= 0),
-            KernelError::deletion_vector("offset must be non-negative")
+            crate::Error::Kernel(KernelError::deletion_vector("offset must be non-negative"))
         );
         let path_or_inline_dv = path_or_inline_dv.into();
         match storage_type {
             DeletionVectorStorageType::Inline => require!(
                 offset.is_none(),
-                KernelError::deletion_vector("inline deletion vectors must not carry an offset")
+                crate::Error::Kernel(KernelError::deletion_vector(
+                    "inline deletion vectors must not carry an offset"
+                ))
             ),
             DeletionVectorStorageType::PersistedRelative => {
                 // Byte-slice rather than char-slice: z85 is ASCII-only, and string slicing
@@ -237,23 +245,23 @@ impl DeletionVectorDescriptor {
                 let bytes = path_or_inline_dv.as_bytes();
                 require!(
                     bytes.len() >= 20,
-                    KernelError::deletion_vector(format!(
+                    crate::Error::Kernel(KernelError::deletion_vector(format!(
                         "persisted-relative DV path must be at least 20 bytes, got {}",
                         bytes.len()
-                    ))
+                    )))
                 );
                 let suffix = &bytes[bytes.len() - 20..];
                 z85::decode(suffix).map_err(|_| {
-                    KernelError::deletion_vector(
+                    crate::Error::Kernel(KernelError::deletion_vector(
                         "persisted-relative DV path must end with a z85-encoded UUID",
-                    )
+                    ))
                 })?;
             }
             DeletionVectorStorageType::PersistedAbsolute => {
                 Url::parse(&path_or_inline_dv).map_err(|e| {
-                    KernelError::deletion_vector(format!(
+                    crate::Error::Kernel(KernelError::deletion_vector(format!(
                         "persisted-absolute DV path must parse as a URL: {e}"
-                    ))
+                    )))
                 })?;
             }
         }
@@ -325,15 +333,20 @@ impl DeletionVectorDescriptor {
     pub fn absolute_path(&self, parent: &Url) -> Result<Option<Url>> {
         match self.storage_type {
             DeletionVectorStorageType::PersistedRelative => {
-                let dv_suffix = self.relative_path()?;
+                let dv_suffix = self.relative_path().into_public_result()?;
                 let dv_path = parent.join(&dv_suffix).map_err(|_| {
-                    KernelError::DeletionVector(format!("invalid path: {dv_suffix}"))
+                    crate::Error::Kernel(KernelError::DeletionVector(format!(
+                        "invalid path: {dv_suffix}"
+                    )))
                 })?;
                 Ok(Some(dv_path))
             }
             DeletionVectorStorageType::PersistedAbsolute => {
                 Ok(Some(Url::parse(&self.path_or_inline_dv).map_err(|_| {
-                    KernelError::DeletionVector(format!("invalid path: {}", self.path_or_inline_dv))
+                    crate::Error::Kernel(KernelError::DeletionVector(format!(
+                        "invalid path: {}",
+                        self.path_or_inline_dv
+                    )))
                 })?))
             }
             DeletionVectorStorageType::Inline => Ok(None),
@@ -349,58 +362,66 @@ impl DeletionVectorDescriptor {
     pub fn read(&self, storage: Arc<dyn StorageHandler>, parent: &Url) -> Result<RoaringTreemap> {
         match self.absolute_path(parent)? {
             None => {
-                let byte_slice = z85::decode(&self.path_or_inline_dv)
-                    .map_err(|_| KernelError::deletion_vector("Failed to decode DV"))?;
+                let byte_slice = z85::decode(&self.path_or_inline_dv).map_err(|_| {
+                    crate::Error::Kernel(KernelError::deletion_vector("Failed to decode DV"))
+                })?;
                 require!(
                     byte_slice.len() >= INLINE_DELETION_VECTOR_MAGIC_SIZE,
-                    KernelError::deletion_vector(
+                    crate::Error::Kernel(KernelError::deletion_vector(
                         "Inline deletion vector payload must contain at least 4 bytes"
-                    )
+                    ))
                 );
                 let magic = slice_to_u32(
                     &byte_slice[..INLINE_DELETION_VECTOR_MAGIC_SIZE],
                     Endian::Little,
-                )?;
+                )
+                .into_public_result()?;
                 match magic {
                     ROARING_BITMAP_PORTABLE_MAGIC => {
-                        RoaringTreemap::deserialize_from(&byte_slice[4..])
-                            .map_err(|err| KernelError::DeletionVector(err.to_string()))
+                        RoaringTreemap::deserialize_from(&byte_slice[4..]).map_err(|err| {
+                            crate::Error::Kernel(KernelError::DeletionVector(err.to_string()))
+                        })
                     }
-                    ROARING_BITMAP_NATIVE_MAGIC => Err(KernelError::deletion_vector(
-                        "Native serialization in inline bitmaps is not yet supported",
-                    )),
-                    _ => Err(KernelError::DeletionVector(format!(
+                    ROARING_BITMAP_NATIVE_MAGIC => {
+                        Err(crate::Error::Kernel(KernelError::deletion_vector(
+                            "Native serialization in inline bitmaps is not yet supported",
+                        )))
+                    }
+                    _ => Err(crate::Error::Kernel(KernelError::DeletionVector(format!(
                         "Invalid magic {magic}"
-                    ))),
+                    )))),
                 }
             }
             Some(path) => {
-                let size_in_bytes: u32 =
-                    self.size_in_bytes
-                        .try_into()
-                        .or(Err(KernelError::DeletionVector(format!(
-                            "size_in_bytes doesn't fit in usize for {path}"
-                        ))))?;
+                let size_in_bytes: u32 = self
+                    .size_in_bytes
+                    .try_into()
+                    .or(Err(KernelError::DeletionVector(format!(
+                        "size_in_bytes doesn't fit in usize for {path}"
+                    ))))
+                    .into_public_result()?;
 
                 let dv_data = storage
                     .read_files(vec![(path.clone(), None)])?
                     .next()
-                    .ok_or(KernelError::missing_data(format!(
+                    .ok_or(crate::Error::Kernel(KernelError::missing_data(format!(
                         "No deletion vector data for {path}"
-                    )))??;
+                    ))))??;
                 let dv_data_len = dv_data.len();
 
                 let mut cursor = Cursor::new(dv_data);
                 let mut version_buf = [0; 1];
                 cursor.read(&mut version_buf).map_err(|err| {
-                    KernelError::DeletionVector(format!(
+                    crate::Error::Kernel(KernelError::DeletionVector(format!(
                         "Failed to read version from {path}: {err}"
-                    ))
+                    )))
                 })?;
                 let version = u8::from_be_bytes(version_buf);
                 require!(
                     version == 1,
-                    KernelError::DeletionVector(format!("Invalid version {version} for {path}"))
+                    crate::Error::Kernel(KernelError::DeletionVector(format!(
+                        "Invalid version {version} for {path}"
+                    )))
                 );
 
                 // Deletion vector file format:
@@ -420,14 +441,15 @@ impl DeletionVectorDescriptor {
                 // | 4 bytes       |  CRC            |
                 // +---------------+-----------------+
 
-                let this_dv_start: usize =
-                    self.offset
-                        .unwrap_or(1)
-                        .try_into()
-                        .or(Err(KernelError::DeletionVector(format!(
-                            "Offset {:?} doesn't fit in usize for {path}",
-                            self.offset
-                        ))))?;
+                let this_dv_start: usize = self
+                    .offset
+                    .unwrap_or(1)
+                    .try_into()
+                    .or(Err(KernelError::DeletionVector(format!(
+                        "Offset {:?} doesn't fit in usize for {path}",
+                        self.offset
+                    ))))
+                    .into_public_result()?;
                 let magic_start = this_dv_start + 4;
                 // bitmap_start = this_dv_start + 4 (dv_size field) + 4 (magic field)
                 let bitmap_start = this_dv_start + 8;
@@ -437,23 +459,25 @@ impl DeletionVectorDescriptor {
                 let crc_start = this_dv_start + 4 + (size_in_bytes as usize);
                 require!(
                     this_dv_start < dv_data_len,
-                    KernelError::DeletionVector(format!(
+                    crate::Error::Kernel(KernelError::DeletionVector(format!(
                         "This DV start is out of bounds for {path} (Offset: {this_dv_start} >= Size: {dv_data_len})"
-                    ))
+                    )))
                 );
 
                 cursor.set_position(this_dv_start as u64);
-                let dv_size = read_u32(&mut cursor, Endian::Big)?;
+                let dv_size = read_u32(&mut cursor, Endian::Big).into_public_result()?;
                 require!(
                     dv_size == size_in_bytes,
-                    KernelError::DeletionVector(format!(
+                    crate::Error::Kernel(KernelError::DeletionVector(format!(
                         "DV size mismatch for {path}. Log indicates {size_in_bytes}, file says: {dv_size}"
-                    ))
+                    )))
                 );
-                let magic = read_u32(&mut cursor, Endian::Little)?;
+                let magic = read_u32(&mut cursor, Endian::Little).into_public_result()?;
                 require!(
                     magic == ROARING_BITMAP_PORTABLE_MAGIC,
-                    KernelError::DeletionVector(format!("Invalid magic {magic} for {path}"))
+                    crate::Error::Kernel(KernelError::DeletionVector(format!(
+                        "Invalid magic {magic} for {path}"
+                    )))
                 );
 
                 let bytes = cursor.into_inner();
@@ -461,33 +485,33 @@ impl DeletionVectorDescriptor {
                 // +4 to account for CRC value
                 require!(
                     bytes.len() >= crc_start + 4,
-                    KernelError::DeletionVector(format!(
+                    crate::Error::Kernel(KernelError::DeletionVector(format!(
                         "Can't read deletion vector for {path} as there are not enough bytes. Expected {}, but got {}",
                         crc_start + 4,
                         bytes.len()
-                    ))
+                    )))
                 );
 
                 let mut crc_cursor: Cursor<Bytes> =
                     Cursor::new(bytes.slice(crc_start..crc_start + 4));
-                let crc = read_u32(&mut crc_cursor, Endian::Big)?;
+                let crc = read_u32(&mut crc_cursor, Endian::Big).into_public_result()?;
                 let crc32 = create_dv_crc32();
                 // CRC is calculated from magic field through end of bitmap
                 // Safety: verified bytes is larger than crc_start + 4, above.
                 let expected_crc = crc32.checksum(&bytes.slice(magic_start..crc_start));
                 require!(
                     crc == expected_crc,
-                    KernelError::DeletionVector(format!(
+                    crate::Error::Kernel(KernelError::DeletionVector(format!(
                         "CRC32 checksum mismatch for {path}. Got: {crc}, expected: {expected_crc}"
-                    ))
+                    )))
                 );
                 // Safety: verified bytes is larger than crc_start + 4, above.
                 let dv_bytes = bytes.slice(bitmap_start..crc_start);
                 let cursor = Cursor::new(dv_bytes);
                 RoaringTreemap::deserialize_from(cursor).map_err(|err| {
-                    KernelError::DeletionVector(format!(
+                    crate::Error::Kernel(KernelError::DeletionVector(format!(
                         "Failed to deserialize deletion vector for {path}: {err}"
-                    ))
+                    )))
                 })
             }
         }
@@ -823,7 +847,10 @@ mod tests {
         let parent = Url::parse("http://not.used").unwrap();
 
         let error = inline.read(storage, &parent).unwrap_err();
-        assert!(matches!(&error, KernelError::DeletionVector(_)));
+        assert!(matches!(
+            &error,
+            crate::Error::Kernel(KernelError::DeletionVector(_))
+        ));
         assert!(
             error.to_string().contains(expected_error),
             "expected error containing {expected_error:?}, got {error}"

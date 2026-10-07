@@ -105,7 +105,7 @@ async fn setup_multi_version_table<E: TaskExecutor>(
 
 #[tokio::test]
 async fn deeply_nested_schema_snapshot_load_returns_schema_error(
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let deeply_nested_schema = (0..42).fold(
         schema! { nullable "leaf": INTEGER },
         |nested, depth| schema! { nullable (format!("level_{depth}")): (nested) },
@@ -138,8 +138,8 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error(
         ),
     );
     let error = match result.unwrap_err() {
-        KernelError::Backtraced { source, .. } => *source,
-        error => error,
+        delta_kernel::Error::Kernel(KernelError::Backtraced { source, .. }) => *source,
+        error => delta_kernel::KernelError::from(error),
     };
     assert!(matches!(error, KernelError::Schema(_)));
     Ok(())
@@ -196,7 +196,7 @@ async fn snapshot_load_validates_reader_protocol(
     #[case] case: SnapshotLoadProtocolCase,
     #[values(false, true)] incremental: bool,
     #[values(false, true)] time_travel: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (store, engine, table_url) = engine_store_setup("snapshot_feature_validation", None);
     create_table(
         table_url.as_str(),
@@ -259,7 +259,7 @@ async fn row_tracking_configuration_rejects_only_enabled_and_suspended(
     #[case] suspended: Option<bool>,
     #[case] expect_error: bool,
     #[values(false, true)] incremental: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let configuration: HashMap<_, _> = [
         ("delta.enableRowTracking", enabled),
         ("delta.rowTrackingSuspended", suspended),

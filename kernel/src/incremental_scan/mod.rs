@@ -16,7 +16,7 @@ use crate::table_features::Operation;
 use crate::utils::require;
 use crate::{
     Engine, EngineData, FileDataReadResultIterator, FileMeta, KernelError, KernelResult,
-    PredicateRef, Result, Version,
+    PredicateRef, Result, ResultExt, Version,
 };
 
 /// Builder for an incremental scan over `(base_version, target_version]`. Construct via
@@ -90,19 +90,21 @@ impl IncrementalScanBuilder {
         let target_version = self.target_snapshot.version();
         require!(
             self.base_version < target_version,
-            KernelError::generic(format!(
+            crate::Error::Kernel(KernelError::generic(format!(
                 "IncrementalScanBuilder: base_version ({}) must be less than target_version ({})",
                 self.base_version, target_version
-            ))
+            )))
         );
         // Resolve the predicate into an Add-side skipping strategy up front so `build` can
         // fail fast on a malformed predicate (e.g. references to unknown columns), rather
         // than surfacing the error lazily from the stream.
-        let add_skipping = self.resolve_add_skipping(engine)?;
+        let add_skipping = self.resolve_add_skipping(engine).into_public_result()?;
         // `base_version < target_version` above guarantees `base_version < u64::MAX`, but use
         // `checked_add` to make the dependency explicit and panic-free.
         let start_version = self.base_version.checked_add(1).ok_or_else(|| {
-            KernelError::generic("IncrementalScanBuilder: base_version + 1 overflowed u64")
+            crate::Error::Kernel(KernelError::generic(
+                "IncrementalScanBuilder: base_version + 1 overflowed u64",
+            ))
         })?;
 
         // TODO(#2552): surface in-range protocol/metadata changes to the consumer.
@@ -259,7 +261,7 @@ impl Iterator for IncrementalScanStream {
                     Ok(None) => continue,
                     Err(e) => {
                         self.errored = true;
-                        return Some(Err(e));
+                        return Some(Err(crate::Error::Kernel(e)));
                     }
                 },
             }
@@ -286,9 +288,9 @@ impl IncrementalScanStream {
     ///   corruption.
     pub fn into_summary(mut self) -> Result<IncrementalScanSummary> {
         if self.errored {
-            return Err(KernelError::generic(
+            return Err(crate::Error::Kernel(KernelError::generic(
                 "IncrementalScanStream: cannot finish a stream that previously errored",
-            ));
+            )));
         }
         // Drain anything the consumer didn't pull. `self.next()` propagates errors via
         // `Some(Err(_))` and sets `errored`; the `?` below surfaces them.
@@ -659,15 +661,17 @@ impl RowVisitor for IncrementalDedupVisitor<'_, '_> {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == NUM_GETTERS,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "IncrementalDedupVisitor expected {NUM_GETTERS} getters, got {}",
                 getters.len()
-            ))
+            )))
         );
 
         for i in 0..row_count {
-            let Some(FileActionInfo { key, is_add, .. }) =
-                self.deduplicator.extract_file_action(i, getters, false)?
+            let Some(FileActionInfo { key, is_add, .. }) = self
+                .deduplicator
+                .extract_file_action(i, getters, false)
+                .into_public_result()?
             else {
                 continue;
             };

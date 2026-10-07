@@ -14,7 +14,7 @@ use delta_kernel::expressions::{
     UnaryPredicateOp as KernelUnaryPredicateOp,
 };
 use delta_kernel::schema::{DataType, StructType};
-use delta_kernel::{KernelError, KernelResult, Result};
+use delta_kernel::{KernelError, KernelResult, Result, ResultExt};
 
 use crate::expression::to_df_expr;
 use crate::scalar::to_df_scalar;
@@ -34,17 +34,21 @@ pub fn to_df_predicate_expr(pred: &KernelPredicate, input_schema: &StructType) -
             let df_inner = to_df_predicate_expr(inner, input_schema)?;
             Ok(DFExpr::Not(Box::new(df_inner)))
         }
-        KernelPredicate::Unary(unary) => unary_to_df_predicate_expr(unary, input_schema),
-        KernelPredicate::Binary(binary) => binary_to_df_predicate_expr(binary, input_schema),
-        KernelPredicate::Junction(junction) => {
-            junction_to_df_predicate_expr(junction, input_schema)
+        KernelPredicate::Unary(unary) => {
+            unary_to_df_predicate_expr(unary, input_schema).into_public_result()
         }
-        KernelPredicate::Opaque(_) => Err(KernelError::unsupported(
+        KernelPredicate::Binary(binary) => {
+            binary_to_df_predicate_expr(binary, input_schema).into_public_result()
+        }
+        KernelPredicate::Junction(junction) => {
+            junction_to_df_predicate_expr(junction, input_schema).into_public_result()
+        }
+        KernelPredicate::Opaque(_) => Err(delta_kernel::Error::Kernel(KernelError::unsupported(
             "cannot convert an engine-defined Opaque predicate",
-        )),
-        KernelPredicate::Unknown(name) => Err(KernelError::unsupported(format!(
-            "cannot convert Unknown predicate {name:?}"
         ))),
+        KernelPredicate::Unknown(name) => Err(delta_kernel::Error::Kernel(
+            KernelError::unsupported(format!("cannot convert Unknown predicate {name:?}")),
+        )),
     }
 }
 
@@ -167,7 +171,7 @@ fn junction_to_df_predicate_expr(
     junction: &KernelJunctionPredicate,
     input_schema: &StructType,
 ) -> KernelResult<DFExpr> {
-    let preds: KernelResult<Vec<DFExpr>> = junction
+    let preds: Result<Vec<DFExpr>> = junction
         .preds
         .iter()
         .map(|pred| to_df_predicate_expr(pred, input_schema))

@@ -20,7 +20,7 @@ use crate::log_segment::LogSegment;
 use crate::scan::COMMIT_READ_SCHEMA;
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, KernelResultIteratorStatic, Result};
+use crate::{Engine, FileMeta, KernelError, KernelResultIteratorStatic, Result, ResultExt};
 
 /// Sequential log replay processor for parallel execution.
 ///
@@ -106,18 +106,23 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         checkpoint_read_schema: SchemaRef,
     ) -> Result<Self> {
         let commit_phase: Option<KernelResultIteratorStatic<ActionsBatch>> = Some(Box::new(
-            log_segment.read_commit_actions(engine.as_ref(), COMMIT_READ_SCHEMA.clone(), None)?,
+            log_segment
+                .read_commit_actions(engine.as_ref(), COMMIT_READ_SCHEMA.clone(), None)?
+                .map(|result| result.map_err(KernelError::from)),
         ));
 
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
         // reader if the checkpoint is single-part.
         let checkpoint_manifest_phase = match log_segment.listed.checkpoint_parts.as_slice() {
-            [single_part] => Some(CheckpointManifestReader::try_new(
-                engine,
-                single_part,
-                log_segment.log_root.clone(),
-                checkpoint_read_schema,
-            )?),
+            [single_part] => Some(
+                CheckpointManifestReader::try_new(
+                    engine,
+                    single_part,
+                    log_segment.log_root.clone(),
+                    checkpoint_read_schema,
+                )
+                .into_public_result()?,
+            ),
             _ => None,
         };
 
@@ -150,21 +155,21 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     #[internal_api]
     pub(crate) fn finish(self) -> Result<AfterSequential<P>> {
         if !self.is_finished {
-            return Err(KernelError::generic(
+            return Err(crate::Error::Kernel(KernelError::generic(
                 "Must exhaust iterator before calling finish()",
-            ));
+            )));
         }
 
         let parallel_files = match self.checkpoint_manifest_phase {
-            Some(manifest_reader) => manifest_reader.extract_sidecars()?,
+            Some(manifest_reader) => manifest_reader.extract_sidecars().into_public_result()?,
             None => {
                 let parts = self.checkpoint_parts;
                 require!(
                     parts.len() != 1,
-                    KernelError::generic(
+                    crate::Error::Kernel(KernelError::generic(
                         "Invariant violation: If there is exactly one checkpoint part,
                         there must be a manifest reader"
-                    )
+                    ))
                 );
                 // If this is a multi-part checkpoint, use the checkpoint parts for parallel phase
                 parts
@@ -200,7 +205,15 @@ impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
             return None;
         };
 
-        Some(result.and_then(|batch| self.processor.process_actions_batch(batch)))
+        Some(
+            result
+                .and_then(|batch| {
+                    self.processor
+                        .process_actions_batch(batch)
+                        .map_err(crate::KernelError::from)
+                })
+                .into_public_result(),
+        )
     }
 }
 
@@ -216,7 +229,7 @@ mod tests {
         stats: StatsOptions,
         expected_adds: &[&str],
         expected_sidecars: &[&str],
-    ) -> Result<()> {
+    ) -> crate::KernelResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
         let scan = snapshot.scan_builder().with_stats(stats).build()?;
@@ -284,6 +297,7 @@ mod tests {
             &["part-00000-517f5d32-9c95-48e8-82b4-0229cc194867-c000.snappy.parquet"],
             &[], // No sidecars
         )
+        .into_public_result()
     }
 
     #[test]
@@ -296,11 +310,11 @@ mod tests {
                 "00000000000000000006.checkpoint.0000000001.0000000002.19af1366-a425-47f4-8fa6-8d6865625573.parquet",
                 "00000000000000000006.checkpoint.0000000002.0000000002.5008b69f-aa8a-4a66-9299-0733a56a7e63.parquet",
             ],
-        )
+        ).into_public_result()
     }
 
     #[test]
-    fn test_sequential_finish_before_exhaustion_error() -> Result<()> {
+    fn test_sequential_finish_before_exhaustion_error() -> crate::KernelResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
 
         let scan = snapshot.scan_builder().build()?;
@@ -325,7 +339,7 @@ mod tests {
                 "test%25file%25prefix-part-00001-a5c41be1-ded0-4b18-a638-a927d233876e-c000.snappy.parquet",
             ],
             &[], // No sidecars
-        )
+        ).into_public_result()
     }
 
     #[rstest::rstest]
@@ -341,7 +355,7 @@ mod tests {
                 "00000000000000000006.checkpoint.0000000001.0000000002.76931b15-ead3-480d-b86c-afe55a577fc3.parquet",
                 "00000000000000000006.checkpoint.0000000002.0000000002.4367b29c-0e87-447f-8e81-9814cc01ad1f.parquet",
             ],
-        )
+        ).into_public_result()
     }
 
     #[test]
@@ -351,6 +365,6 @@ mod tests {
             StatsOptions::default(),
             &["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"], /* Add from commit 3 */
             &[], // No sidecars
-        )
+        ).into_public_result()
     }
 }

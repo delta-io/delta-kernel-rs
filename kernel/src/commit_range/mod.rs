@@ -64,7 +64,7 @@ use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{Engine, KernelError, KernelResult, Result, Version};
+use crate::{Engine, KernelError, KernelResult, Result, ResultExt, Version};
 
 /// A contiguous range of Delta commits, holding resolved `[start_version, end_version]` bounds
 /// plus the materialized commit-file pointers in `commit_files`.
@@ -135,29 +135,29 @@ impl CommitRange {
         actions: &[DeltaAction],
     ) -> Result<impl Iterator<Item = Result<CommitAction>> + Send> {
         if actions.is_empty() {
-            return Err(KernelError::generic(
+            return Err(crate::Error::Kernel(KernelError::generic(
                 "at least one DeltaAction must be requested",
-            ));
+            )));
         }
 
         let (latest_protocol, latest_metadata) = match &start_snapshot {
             Some(snapshot) => {
                 if snapshot.table_root() != &self.table_root {
-                    return Err(KernelError::generic(format!(
+                    return Err(crate::Error::Kernel(KernelError::generic(format!(
                         "snapshot table root ({}) does not match commit range table root ({})",
                         snapshot.table_root(),
                         self.table_root,
-                    )));
+                    ))));
                 }
                 let (anchor_version, anchor_name) = match self.commit_ordering {
                     CommitOrdering::AscendingOrder => (self.start_version, "start_version"),
                     CommitOrdering::DescendingOrder => (self.end_version, "end_version"),
                 };
                 if snapshot.version() != anchor_version {
-                    return Err(KernelError::generic(format!(
+                    return Err(crate::Error::Kernel(KernelError::generic(format!(
                         "snapshot version {} does not match {anchor_name} ({anchor_version})",
                         snapshot.version(),
-                    )));
+                    ))));
                 }
                 let table_config = snapshot.table_configuration();
                 table_config.ensure_operation_supported(Operation::Scan)?;
@@ -252,7 +252,7 @@ impl Iterator for CommitActionsIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         let log_path = self.log_path_iter.next()?;
-        Some(self.try_advance(log_path))
+        Some(self.try_advance(log_path).into_public_result())
     }
 }
 
@@ -724,6 +724,7 @@ mod tests {
         let actions = [DeltaAction::Add, DeltaAction::Remove];
         let err = drain_commits(&range, engine, Some(anchor_snapshot), &actions)
             .expect_err("v=1 reader version must be rejected");
+        let err = KernelError::from(err);
         assert!(is_expected_err(&err), "unexpected error variant: {err:?}");
     }
 
@@ -960,7 +961,7 @@ mod tests {
         if expects_unsupported {
             let err = result.expect_err("commit-driven validation must reject");
             assert!(
-                matches!(err, KernelError::Unsupported(_)),
+                matches!(err, crate::Error::Kernel(KernelError::Unsupported(_))),
                 "expected KernelError::Unsupported, got: {err:?}",
             );
         } else {
@@ -989,7 +990,7 @@ mod tests {
         let v0_result = iter.next().expect("v=0 commit yield slot");
         match v0_result {
             Ok(_) => panic!("v=0 must reject during iter.next()"),
-            Err(KernelError::Unsupported(msg)) => {
+            Err(crate::Error::Kernel(KernelError::Unsupported(msg))) => {
                 assert!(msg.contains("futureFeature"), "got: {msg}")
             }
             Err(other) => panic!("expected KernelError::Unsupported, got: {other:?}"),

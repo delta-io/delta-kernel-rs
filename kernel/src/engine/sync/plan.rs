@@ -44,7 +44,7 @@ use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, ScopedPlanE
 use crate::schema::{ArrayType, DataType, SchemaRef, StructType};
 use crate::{
     EvaluationHandler as _, FileMeta, KernelError, KernelResult, KernelResultIteratorStatic,
-    Result, StorageHandler as _,
+    Result, ResultExt, StorageHandler as _,
 };
 
 /// A synchronous, test-only [`PlanExecutor`].
@@ -124,6 +124,7 @@ impl Default for SyncPlanExecutor {
 impl PlanExecutor for SyncPlanExecutor {
     fn execute_op(&self, op: Operation) -> Result<PlanResult> {
         self.execute_op_with_relation_store(op, None)
+            .into_public_result()
     }
 }
 
@@ -131,14 +132,18 @@ impl PlanExecutor for ScopedSyncPlanExecutor {
     fn execute_op(&self, op: Operation) -> Result<PlanResult> {
         self.executor
             .execute_op_with_relation_store(op, Some(&self.relation_store))
+            .into_public_result()
     }
 }
 
 impl ScopedPlanExecutor for ScopedSyncPlanExecutor {
     fn execute_and_retain(&self, name: &str, plan: Plan) -> Result<RelationRef> {
         let schema = Arc::clone(&plan.schema);
-        let batches = self.executor.eval_plan(plan, Some(&self.relation_store))?;
-        retain_relation(&self.relation_store, name, schema, batches)
+        let batches = self
+            .executor
+            .eval_plan(plan, Some(&self.relation_store))
+            .into_public_result()?;
+        retain_relation(&self.relation_store, name, schema, batches).into_public_result()
     }
 }
 
@@ -160,14 +165,14 @@ impl SyncPlanExecutor {
                 // `StorageHandler::list_from` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
-                let metas: Vec<KernelResult<FileMeta>> = self.storage.list_from(&url)?.collect();
+                let metas: Vec<Result<FileMeta>> = self.storage.list_from(&url)?.collect();
                 Ok(PlanResult::FileMeta(Box::new(metas.into_iter())))
             }
             IoOperation::ReadBytes { files } => {
                 // `StorageHandler::read_files` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
-                let bytes: Vec<KernelResult<Bytes>> = self.storage.read_files(files)?.collect();
+                let bytes: Vec<Result<Bytes>> = self.storage.read_files(files)?.collect();
                 Ok(PlanResult::Bytes(Box::new(bytes.into_iter())))
             }
             IoOperation::WriteBytes {
@@ -514,6 +519,7 @@ fn eval_project(project: Project, input: &[RecordBatch]) -> KernelResult<Vec<Rec
             evaluator
                 .evaluate(&ArrowEngineData::new(batch.clone()))?
                 .try_into_record_batch()
+                .map_err(KernelError::from)
         })
         .collect()
 }
@@ -578,7 +584,7 @@ fn splice_file_constants(
         .fields()
         .map(
             |field| match file_constant_columns.iter().position(|c| c == field.name()) {
-                Some(slot) => constants[slot].to_array(rows),
+                Some(slot) => constants[slot].to_array(rows).map_err(KernelError::from),
                 None => read_columns.next().ok_or_else(|| {
                     KernelError::generic("scan output has fewer columns than schema")
                 }),
@@ -669,7 +675,7 @@ mod tests {
     use crate::schema::{schema, schema_ref, ToSchema as _};
 
     #[test]
-    fn scoped_executor_creates_ref_from_arrow_batch() -> Result<()> {
+    fn scoped_executor_creates_ref_from_arrow_batch() -> crate::KernelResult<()> {
         let executor = SyncPlanExecutor::default();
         let scoped = executor.get_scoped();
         let schema = schema_ref! { nullable "id": LONG };
@@ -853,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_keys_as_rows_synthesizes_empty_keys_when_ungrouped() -> Result<()> {
+    fn encode_keys_as_rows_synthesizes_empty_keys_when_ungrouped() -> crate::KernelResult<()> {
         let batch = RecordBatch::try_from_iter([(
             "x",
             Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
@@ -892,7 +898,7 @@ mod tests {
         size: Scalar,
         last_modified: Scalar,
         dv: Scalar,
-    ) -> Result<Vec<ScanFile>> {
+    ) -> crate::KernelResult<Vec<ScanFile>> {
         let input_schema = schema_ref! {
             nullable "path": STRING,
             nullable "size": LONG,

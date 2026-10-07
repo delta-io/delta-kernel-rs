@@ -347,7 +347,10 @@ fn resolve_physical_columns_strict(
     let column_mapping_mode = table_configuration.column_mapping_mode();
     logical
         .iter()
-        .map(|col| get_any_level_column_physical_name(&logical_schema, col, column_mapping_mode))
+        .map(|col| {
+            get_any_level_column_physical_name(&logical_schema, col, column_mapping_mode)
+                .map_err(KernelError::from)
+        })
         .collect()
 }
 
@@ -684,7 +687,7 @@ pub(crate) mod tests {
     use crate::unit_test_utils::{
         assert_result_error_with_message, MockProtocolBuilder, MockTableConfigurationBuilder,
     };
-    use crate::Result;
+    use crate::{Result, ResultExt};
 
     #[test]
     fn stats_schemas_can_both_be_absent() {
@@ -803,6 +806,7 @@ pub(crate) mod tests {
             stats,
             PartitionValuesOptions::default(),
         )
+        .into_public_result()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -815,7 +819,7 @@ pub(crate) mod tests {
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
         stats: StatsOptions,
         partition_values: PartitionValuesOptions,
-    ) -> Result<StateInfo> {
+    ) -> crate::KernelResult<StateInfo> {
         let builder = MockTableConfigurationBuilder::new()
             .with_schema(schema.clone())
             .with_partition_columns(partition_columns)

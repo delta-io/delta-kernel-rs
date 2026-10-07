@@ -248,9 +248,11 @@ async fn load_error(
     )
     .await
     .unwrap();
-    Snapshot::builder_for(table_url)
-        .build(&engine)
-        .expect_err(&format!("{scenario}: expected snapshot load to fail"))
+    delta_kernel::KernelError::from(
+        Snapshot::builder_for(table_url)
+            .build(&engine)
+            .expect_err(&format!("{scenario}: expected snapshot load to fail")),
+    )
 }
 
 /// Shapes that must still be rejected at load. The orphaned-feature exemption is scoped to legacy
@@ -300,7 +302,10 @@ async fn reader_v3_without_reader_features_is_rejected() {
         .build(&engine)
         .expect_err("expected snapshot load to fail");
     assert!(
-        matches!(err, delta_kernel::KernelError::InvalidProtocol(_)),
+        matches!(
+            err,
+            delta_kernel::Error::Kernel(delta_kernel::KernelError::InvalidProtocol(_))
+        ),
         "{err}"
     );
 }

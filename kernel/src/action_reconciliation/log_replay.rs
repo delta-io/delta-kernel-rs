@@ -41,7 +41,7 @@ use crate::log_replay::{
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, KernelResultIteratorStatic, Result};
+use crate::{KernelError, KernelResult, KernelResultIteratorStatic, Result, ResultExt};
 
 /// The [`ActionReconciliationProcessor`] is an implementation of the [`LogReplayProcessor`]
 /// trait that filters log segment actions.
@@ -182,6 +182,7 @@ impl Iterator for ActionReconciliationIterator {
     fn next(&mut self) -> Option<Self::Item> {
         let batch = self.inner.next();
         self.transform_batch(batch)
+            .map(ResultExt::into_public_result)
     }
 }
 
@@ -677,14 +678,14 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == 16,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of visitor getters for ActionReconciliationVisitor: {}",
                 getters.len()
-            ))
+            )))
         );
 
         for i in 0..row_count {
-            self.selection_vector[i] = self.is_valid_action(i, getters)?;
+            self.selection_vector[i] = self.is_valid_action(i, getters).into_public_result()?;
         }
         Ok(())
     }
@@ -1233,10 +1234,12 @@ mod tests {
         impl<'a> GetData<'a> for MockErrorGetData {
             fn get_str(&'a self, _: usize, field_name: &str) -> Result<Option<&'a str>> {
                 if field_name == self.error_on_field && self.error_type == "str" {
-                    Err(KernelError::UnexpectedColumnType(format!(
-                        "{field_name} is not of type str"
+                    Err(crate::Error::Kernel(
+                        KernelError::UnexpectedColumnType(format!(
+                            "{field_name} is not of type str"
+                        ))
+                        .with_backtrace(),
                     ))
-                    .with_backtrace())
                 } else {
                     Ok(None)
                 }
@@ -1244,10 +1247,12 @@ mod tests {
 
             fn get_int(&'a self, _: usize, field_name: &str) -> Result<Option<i32>> {
                 if field_name == self.error_on_field && self.error_type == "int" {
-                    Err(KernelError::UnexpectedColumnType(format!(
-                        "{field_name} is not of type i32"
+                    Err(crate::Error::Kernel(
+                        KernelError::UnexpectedColumnType(format!(
+                            "{field_name} is not of type i32"
+                        ))
+                        .with_backtrace(),
                     ))
-                    .with_backtrace())
                 } else {
                     Ok(None)
                 }
@@ -1272,10 +1277,12 @@ mod tests {
 
             fn get_long(&'a self, _: usize, field_name: &str) -> Result<Option<i64>> {
                 if field_name.contains(self.error_field) {
-                    Err(KernelError::UnexpectedColumnType(format!(
-                        "{field_name} is not of type i64"
+                    Err(crate::Error::Kernel(
+                        KernelError::UnexpectedColumnType(format!(
+                            "{field_name} is not of type i64"
+                        ))
+                        .with_backtrace(),
                     ))
-                    .with_backtrace())
                 } else {
                     Ok(None)
                 }

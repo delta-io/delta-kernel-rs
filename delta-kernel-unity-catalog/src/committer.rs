@@ -6,7 +6,7 @@ use delta_kernel::committer::{
 };
 use delta_kernel::{
     Engine, FileMeta, FilteredEngineData, KernelError as DeltaError, KernelResult, Result,
-    ResultIterator,
+    ResultExt, ResultIterator,
 };
 use tracing::{debug, info};
 use unity_catalog_delta_client_api::{
@@ -160,11 +160,11 @@ impl<C: UpdateTableClient> UCCommitter<C> {
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }
-            Err(DeltaError::FileAlreadyExists(_)) => {
+            Err(delta_kernel::Error::Kernel(DeltaError::FileAlreadyExists(_))) => {
                 info!("version 0 commit conflict: commit file already exists");
                 Ok(CommitResponse::Conflict { version: 0 })
             }
-            Err(e) => Err(e),
+            Err(e) => Err(delta_kernel::KernelError::from(e)),
         }
     }
 
@@ -267,9 +267,12 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
         commit_metadata: CommitMetadata,
     ) -> Result<CommitResponse> {
         if commit_metadata.version() == 0 {
-            return self.commit_version_0(engine, actions, &commit_metadata);
+            return self
+                .commit_version_0(engine, actions, &commit_metadata)
+                .into_public_result();
         }
         self.commit_version_non_zero(engine, actions, commit_metadata)
+            .into_public_result()
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -286,7 +289,7 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
             let dest = catalog_commit.published_location();
             match engine.storage_handler().copy_atomic(src, dest) {
                 Ok(_) => (),
-                Err(DeltaError::FileAlreadyExists(_)) => (),
+                Err(delta_kernel::Error::Kernel(DeltaError::FileAlreadyExists(_))) => (),
                 Err(e) => return Err(e),
             }
         }

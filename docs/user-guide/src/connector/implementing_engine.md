@@ -25,6 +25,24 @@ the default handlers for everything else.
 Many of the `Engine` handlers take or return `EngineData`. See [EngineData](engine_data.md) for more
 information about this type.
 
+## Returning errors
+
+Handler methods and their fallible iterator items use `Result<T>`, which returns the top-level
+`Error`. Wrap kernel failures explicitly in `Error::Kernel`, or import `ResultExt` to convert a
+`KernelResult<T>`:
+
+```rust
+# extern crate delta_kernel;
+use delta_kernel::{KernelResult, Result, ResultExt};
+
+fn expose_result(result: KernelResult<()>) -> Result<()> {
+    result.into_public_result()
+}
+```
+
+The `KernelError` variants in the contracts below are carried inside `Error::Kernel`. To classify
+a returned error, match its outer variant before inspecting the contained `KernelError`.
+
 ## StorageHandler
 
 `StorageHandler` provides file system operations. The kernel calls this to list and read
@@ -210,7 +228,7 @@ fn read_parquet_files_with_cancellation(
 ) -> Result<FileDataReadResultIterator> {
     // Kick off the async read as usual, then poll the read future and the token's
     // `cancelled_future()` together. If cancellation wins the race, drop the in-flight
-    // work and yield `Err(KernelError::Cancelled)` as the iterator's terminal item.
+    // work and yield `Err(Error::Kernel(KernelError::Cancelled))` as the terminal item.
 }
 ```
 

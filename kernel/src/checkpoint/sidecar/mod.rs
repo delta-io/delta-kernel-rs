@@ -274,7 +274,7 @@ impl SidecarSplitter {
             })?;
             let batch = match result.and_then(|f| f.apply_selection_vector()) {
                 Ok(b) => b,
-                Err(e) => return Some(Err(e)),
+                Err(e) => return Some(Err(crate::KernelError::from(e))),
             };
             let non_file_actions_batch = match self.non_file_actions_picker.pick(batch.as_ref()) {
                 Ok(b) => b,

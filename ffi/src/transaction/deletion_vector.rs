@@ -8,7 +8,7 @@ use std::os::raw::c_int;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::transaction::Transaction;
-use delta_kernel::{KernelError, KernelResult, Result};
+use delta_kernel::{KernelError, KernelResult, Result, ResultExt};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use super::ExclusiveTransaction;
@@ -100,16 +100,16 @@ impl From<KernelDvStorageType> for DeletionVectorStorageType {
 }
 
 impl TryFrom<c_int> for KernelDvStorageType {
-    type Error = KernelError;
+    type Error = delta_kernel::Error;
 
     fn try_from(value: c_int) -> Result<Self> {
         match value {
             0 => Ok(Self::PersistedRelative),
             1 => Ok(Self::Inline),
             2 => Ok(Self::PersistedAbsolute),
-            _ => Err(KernelError::generic(format!(
+            _ => Err(delta_kernel::Error::Kernel(KernelError::generic(format!(
                 "invalid deletion vector storage type: {value}"
-            ))),
+            )))),
         }
     }
 }
@@ -141,16 +141,18 @@ pub unsafe extern "C" fn dv_descriptor_new(
 ) -> ExternResult<Handle<ExclusiveDvDescriptor>> {
     let engine = unsafe { engine.as_ref() };
     let path = unsafe { TryFromStringSlice::try_from_slice(&path_or_inline_dv) };
-    let result = KernelDvStorageType::try_from(storage_type).and_then(|storage_type| {
-        dv_descriptor_new_impl(
-            storage_type,
-            path,
-            has_offset,
-            offset,
-            size_in_bytes,
-            cardinality,
-        )
-    });
+    let result = KernelDvStorageType::try_from(storage_type)
+        .map_err(KernelError::from)
+        .and_then(|storage_type| {
+            dv_descriptor_new_impl(
+                storage_type,
+                path.map_err(delta_kernel::KernelError::from),
+                has_offset,
+                offset,
+                size_in_bytes,
+                cardinality,
+            )
+        });
     result.into_extern_result(&engine)
 }
 
@@ -197,9 +199,13 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
     let engine_ref = unsafe { engine.as_ref() };
     let descriptor = unsafe { descriptor.into_inner() };
     let path_result = unsafe { TryFromStringSlice::try_from_slice(&data_file_path) };
-    dv_descriptor_map_insert_impl(map_ref, path_result, *descriptor)
-        .map(|_| true)
-        .into_extern_result(&engine_ref)
+    dv_descriptor_map_insert_impl(
+        map_ref,
+        path_result.map_err(delta_kernel::KernelError::from),
+        *descriptor,
+    )
+    .map(|_| true)
+    .into_extern_result(&engine_ref)
 }
 
 fn dv_descriptor_map_insert_impl(
@@ -261,8 +267,10 @@ fn transaction_update_deletion_vectors_impl(
     scan_iter: &crate::scan::ScanMetadataIterator,
 ) -> KernelResult<()> {
     let mut guard = scan_iter.lock_iter()?;
-    let files_iter = Transaction::scan_metadata_to_engine_data(&mut **guard);
-    txn.update_deletion_vectors(dv_map.inner, files_iter)
+    let files_iter = Transaction::scan_metadata_to_engine_data(
+        guard.by_ref().map(ResultExt::into_public_result),
+    );
+    Ok(txn.update_deletion_vectors(dv_map.inner, files_iter)?)
 }
 
 #[cfg(test)]

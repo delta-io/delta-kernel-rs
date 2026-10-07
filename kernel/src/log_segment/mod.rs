@@ -35,8 +35,8 @@ use crate::utils::require;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
 use crate::{
-    Engine, FileMeta, KernelError, KernelResult, Predicate, PredicateRef, Result, RowVisitor,
-    StorageHandler, Version,
+    Engine, FileMeta, KernelError, KernelResult, Predicate, PredicateRef, Result, ResultExt,
+    RowVisitor, StorageHandler, Version,
 };
 
 mod crc_replay;
@@ -91,7 +91,7 @@ impl CheckpointReadInfo {
 ///
 /// This struct provides named access to the return values instead of tuple indexing.
 #[internal_api]
-pub(crate) struct ActionsWithCheckpointInfo<A: Iterator<Item = Result<ActionsBatch>>> {
+pub(crate) struct ActionsWithCheckpointInfo<A> {
     /// Iterator over action batches read from the log segment.
     pub actions: A,
     /// Metadata about checkpoint reading, including the schema used.
@@ -292,11 +292,11 @@ impl LogSegment {
         end_version: Option<Version>,
         last_checkpoint_metadata: Option<LastCheckpointHint>,
     ) -> Result<Self> {
-        validate_log_path_fields(&listed_files)?;
-        validate_compaction_files(&listed_files.ascending_compaction_files)?;
-        validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
-        validate_commit_file_types(&listed_files.ascending_commit_files)?;
-        validate_commit_files_sorted(&listed_files.ascending_commit_files)?;
+        validate_log_path_fields(&listed_files).into_public_result()?;
+        validate_compaction_files(&listed_files.ascending_compaction_files).into_public_result()?;
+        validate_checkpoint_parts(&listed_files.checkpoint_parts).into_public_result()?;
+        validate_commit_file_types(&listed_files.ascending_commit_files).into_public_result()?;
+        validate_commit_files_sorted(&listed_files.ascending_commit_files).into_public_result()?;
 
         // Filter commits before/at checkpoint version
         let checkpoint_version =
@@ -310,19 +310,23 @@ impl LogSegment {
                 None
             };
 
-        validate_checkpoint_commit_gap(checkpoint_version, &listed_files.ascending_commit_files)?;
-        validate_commit_files_contiguous(&listed_files.ascending_commit_files)?;
+        validate_checkpoint_commit_gap(checkpoint_version, &listed_files.ascending_commit_files)
+            .into_public_result()?;
+        validate_commit_files_contiguous(&listed_files.ascending_commit_files)
+            .into_public_result()?;
         let effective_version = validate_end_version(
             &listed_files.ascending_commit_files,
             &listed_files.checkpoint_parts,
             end_version,
-        )?;
-        validate_latest_commit_file(&listed_files, effective_version)?;
+        )
+        .into_public_result()?;
+        validate_latest_commit_file(&listed_files, effective_version).into_public_result()?;
         validate_crc(
             listed_files.latest_crc_file.as_ref(),
             checkpoint_version,
             effective_version,
-        )?;
+        )
+        .into_public_result()?;
 
         let log_segment = LogSegment {
             end_version: effective_version,
@@ -459,8 +463,9 @@ impl LogSegment {
                 cancellation_token,
             )
         };
-        let log_segment =
-            build().inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
+        let log_segment = build()
+            .inspect_err(|_| emit_log_segment_load_failure(&metric_context))
+            .into_public_result()?;
 
         emit_log_segment_load(&metric_context, &log_segment, start.elapsed());
         Ok(log_segment)
@@ -532,7 +537,12 @@ impl LogSegment {
             }
         };
 
-        LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
+        Ok(LogSegment::try_new(
+            listed_files,
+            log_root,
+            time_travel_version,
+            checkpoint_hint,
+        )?)
     }
 
     /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between
@@ -548,6 +558,7 @@ impl LogSegment {
         end_version: impl Into<Option<Version>>,
     ) -> Result<Self> {
         Self::for_table_changes_with_log_tail(storage, log_root, start_version, end_version, vec![])
+            .into_public_result()
     }
 
     /// Constructs a table-changes log segment with a caller-provided authoritative commit tail.
@@ -584,7 +595,12 @@ impl LogSegment {
             start_version,
             listed_files.ascending_commit_files().first(),
         )?;
-        LogSegment::try_new(listed_files, log_root, end_version, None)
+        Ok(LogSegment::try_new(
+            listed_files,
+            log_root,
+            end_version,
+            None,
+        )?)
     }
 
     #[allow(unused)]
@@ -635,7 +651,12 @@ impl LogSegment {
         }
         commits.drain(..start_idx);
 
-        LogSegment::try_new(listed_commits, log_root, Some(end_version), None)
+        Ok(LogSegment::try_new(
+            listed_commits,
+            log_root,
+            Some(end_version),
+            None,
+        )?)
     }
 
     /// Creates a new LogSegment with the given commit file added to the end.
@@ -839,17 +860,20 @@ impl LogSegment {
         let commit_stream =
             self.read_commit_actions(engine, commit_read_schema, cancellation_token)?;
 
-        let checkpoint_result = self.create_checkpoint_stream(
-            engine,
-            checkpoint_read_schema,
-            checkpoint_predicate,
-            stats_schema,
-            partition_schema,
-            cancellation_token,
-        )?;
+        let checkpoint_result = self
+            .create_checkpoint_stream(
+                engine,
+                checkpoint_read_schema,
+                checkpoint_predicate,
+                stats_schema,
+                partition_schema,
+                cancellation_token,
+            )
+            .into_public_result()?;
 
         Ok(ActionsWithCheckpointInfo {
-            actions: commit_stream.chain(checkpoint_result.actions),
+            actions: commit_stream
+                .chain(checkpoint_result.actions.map(ResultExt::into_public_result)),
             checkpoint_info: checkpoint_result.checkpoint_info,
         })
     }
@@ -1332,7 +1356,7 @@ impl LogSegment {
             checkpoint_read_schema: augmented_checkpoint_read_schema,
         };
         Ok(ActionsWithCheckpointInfo {
-            actions: actions_iter,
+            actions: actions_iter.map(|result| result.map_err(KernelError::from)),
             checkpoint_info,
         })
     }

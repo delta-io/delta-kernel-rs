@@ -85,8 +85,8 @@ impl ManifestCommitState {
     #[internal_api]
     pub(crate) fn add_leaf(&mut self, _result: LeafNodeWriterResult) -> Result<()> {
         // TODO(#3352): fold the finished leaf's result into the commit.
-        Err(KernelError::unsupported(
+        Err(crate::Error::Kernel(KernelError::unsupported(
             "manifest commit add_leaf is not yet supported",
-        ))
+        )))
     }
 }

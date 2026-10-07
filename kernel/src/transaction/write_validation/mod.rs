@@ -18,7 +18,7 @@ use crate::engine_data::{
 };
 use crate::expressions::ColumnName;
 use crate::schema::{ColumnNamesAndTypes, DataType};
-use crate::{EngineData, KernelResult, Result};
+use crate::{EngineData, KernelResult, Result, ResultExt};
 
 /// A single row-level validation.
 pub(crate) trait Validation {
@@ -74,6 +74,7 @@ impl RowVisitor for StagedDataValidator {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         self.validate_rows(0..row_count, getters)
+            .into_public_result()
     }
 }
 
@@ -87,6 +88,6 @@ impl FilteredRowVisitor for StagedDataValidator {
         getters: &[&'a dyn GetData<'a>],
         rows: RowIndexIterator<'_>,
     ) -> Result<()> {
-        self.validate_rows(rows, getters)
+        self.validate_rows(rows, getters).into_public_result()
     }
 }

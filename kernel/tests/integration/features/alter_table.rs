@@ -158,8 +158,8 @@ async fn add_column_validates_cdf_physical_column_names(
 }
 
 #[tokio::test]
-async fn alter_table_commit_info_includes_operation_maps() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn alter_table_commit_info_includes_operation_maps(
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
@@ -196,7 +196,7 @@ async fn alter_table_commit_info_includes_operation_maps() -> Result<(), Box<dyn
 async fn add_columns_lifecycle(
     #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
     #[values(1, 3)] num_columns: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let properties: Vec<(&str, &str)> = cm_mode
         .map(|m| vec![("delta.columnMapping.mode", m)])
@@ -477,7 +477,8 @@ async fn add_column_failures(
 /// row with values in both new columns (v3) → reload. The reload must rebuild the snapshot
 /// from the checkpoint + alter commits + data commit and return the written values.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error::Error>> {
+async fn back_to_back_alters_with_checkpoint() -> std::result::Result<(), Box<dyn std::error::Error>>
+{
     // Checkpoint writing requires the multi-threaded engine (like `maintenance_ops.rs`).
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
@@ -852,7 +853,7 @@ async fn add_column_at_rejects_non_struct_parent() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_create_then_add_column(
     #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
-) -> Result<()> {
+) -> delta_kernel::KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let properties: Vec<(&str, &str)> = cm_mode
         .map(|m| vec![("delta.columnMapping.mode", m)])
@@ -1022,7 +1023,7 @@ async fn set_nullable_on_layout_column_with_checkpoint(
     #[case] layout: DataLayout,
     #[case] col_value: &str,
     #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     // Partition values live in the directory path; clustering values live in the row batch.
     let is_partitioned = matches!(layout, DataLayout::Partitioned { .. });
@@ -1328,7 +1329,7 @@ async fn add_column_strip_is_none_mode_only(
 async fn alter_blocked_when_iceberg_compat_enabled(
     #[case] enablement_property: &str,
     #[case] feature_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let snapshot = create_table_and_load_snapshot(
         &table_path,
@@ -1389,8 +1390,8 @@ async fn add_column_with_orphan_default_metadata_succeeds() -> Result<()> {
 }
 
 #[tokio::test]
-async fn alter_blocked_when_allow_column_defaults_enabled() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn alter_blocked_when_allow_column_defaults_enabled(
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (store, engine, table_url) = engine_store_setup("alter_column_defaults", None);
     let table_url = create_test_table(
         store,
@@ -1665,7 +1666,7 @@ async fn add_column_with_id_colliding_existing_field_is_rejected() -> Result<()>
 async fn add_column_on_stale_table_leaves_schema_untouched(
     #[case] added_field: StructField,
     #[case] expected_added_cm_id: Option<i64>,
-) -> Result<()> {
+) -> delta_kernel::KernelResult<()> {
     let (store, engine, table_url) = engine_store_setup("alter_stale_cm", None);
 
     // `value` carries a stale id; protocol omits columnMapping and no mode is set (resolves to

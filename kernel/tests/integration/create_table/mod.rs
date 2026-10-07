@@ -202,7 +202,7 @@ async fn create_table_validates_cdf_reserved_physical_column_names(
 }
 
 #[tokio::test]
-async fn test_create_table_with_user_domain_metadata() -> Result<()> {
+async fn test_create_table_with_user_domain_metadata() -> delta_kernel::KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = simple_schema()?;

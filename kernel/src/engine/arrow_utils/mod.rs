@@ -1,6 +1,6 @@
 //! Some utilities for working with arrow data types
 
-use crate::KernelResult;
+use crate::{KernelResult, ResultExt};
 pub(crate) mod apply_schema;
 
 use std::borrow::Cow;
@@ -201,7 +201,8 @@ impl RowIndexBuilder {
                                 ))
                             })
                     })
-                    .try_collect()?
+                    .try_collect()
+                    .into_public_result()?
             }
             None => self.row_group_row_index_ranges,
         };
@@ -245,10 +246,11 @@ pub(crate) fn fixup_parquet_read(
     file_location: Option<&str>,
     target_schema: Option<&SchemaRef>,
 ) -> Result<ArrowEngineData> {
-    let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)?;
+    let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)
+        .into_public_result()?;
     let data = fix_nested_null_masks(data);
     let data = if let Some(schema) = target_schema {
-        apply_schema_to_struct(&data, schema)?
+        apply_schema_to_struct(&data, schema).into_public_result()?
     } else {
         data
     };
@@ -853,7 +855,8 @@ pub(crate) fn parquet_read_plan(
     requested_schema: &SchemaRef,
     file_metadata: &ArrowReaderMetadata,
 ) -> Result<(Vec<ReorderIndex>, Option<ProjectionMask>)> {
-    let (indices, reorder) = get_requested_indices(requested_schema, file_metadata.schema())?;
+    let (indices, reorder) =
+        get_requested_indices(requested_schema, file_metadata.schema()).into_public_result()?;
     let mask = generate_mask(file_metadata.parquet_schema(), &indices);
     Ok((reorder, mask))
 }
@@ -1228,7 +1231,7 @@ pub(crate) fn parse_json(
     schema: SchemaRef,
 ) -> Result<Box<dyn EngineData>> {
     let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
-    let result = parse_json_impl(json_strings.column(0).as_ref(), schema)?;
+    let result = parse_json_impl(json_strings.column(0).as_ref(), schema).into_public_result()?;
     Ok(Box::new(ArrowEngineData::new(result)))
 }
 
@@ -1498,7 +1501,7 @@ impl EncoderFactory for NullValueMapEncoderFactory {
         field: &'a ArrowFieldRef,
         array: &'a dyn ArrowArray,
         _options: &'a EncoderOptions,
-    ) -> Result<Option<NullableEncoder<'a>>, crate::arrow::error::ArrowError> {
+    ) -> std::result::Result<Option<NullableEncoder<'a>>, crate::arrow::error::ArrowError> {
         // `make_encoder` needs a new `EncoderOptions` in order to set `with_explicit_nulls`. The
         // lifetime of the created encoder becomes tied to the lifetime of the `EncoderOptions`,
         // and local options would be freed here. We also can't put the options inside the
@@ -1544,10 +1547,10 @@ pub(crate) fn to_json_bytes(
     let builder = WriterBuilder::new().with_encoder_factory(Arc::new(NullValueMapEncoderFactory));
     let mut writer = builder.build::<_, LineDelimited>(Vec::new());
     for chunk in data {
-        let batch = filter_to_record_batch(chunk?)?;
-        writer.write(&batch)?;
+        let batch = filter_to_record_batch(chunk?).into_public_result()?;
+        writer.write(&batch).map_err(crate::Error::kernel)?;
     }
-    writer.finish()?;
+    writer.finish().map_err(crate::Error::kernel)?;
     Ok(writer.into_inner())
 }
 
@@ -1562,7 +1565,8 @@ pub(crate) fn fixup_json_read(
     reorder_indices: &[ReorderIndex],
     file_location: &str,
 ) -> Result<ArrowEngineData> {
-    let data = reorder_struct_array(batch.into(), reorder_indices, None, Some(file_location))?;
+    let data = reorder_struct_array(batch.into(), reorder_indices, None, Some(file_location))
+        .into_public_result()?;
     Ok(data.into())
 }
 
@@ -1599,7 +1603,7 @@ pub(crate) fn build_json_reorder_indices(schema: &StructType) -> Result<Vec<Reor
     }
 
     for (output_pos, field, spec) in metadata_entries {
-        let field = Arc::new(field.try_into_arrow()?);
+        let field = Arc::new(field.try_into_arrow().map_err(crate::Error::kernel)?);
         let rindex = match spec {
             MetadataColumnSpec::FilePath => ReorderIndex::file_path(output_pos, field),
             _ => ReorderIndex::missing(output_pos, field),
@@ -1619,7 +1623,7 @@ pub(crate) fn build_json_reorder_indices(schema: &StructType) -> Result<Vec<Reor
 #[internal_api]
 pub(crate) fn json_arrow_schema(schema: &StructType) -> Result<ArrowSchema> {
     let json_fields = schema.with_fields_filtered(|f| f.get_metadata_column_spec().is_none())?;
-    Ok(ArrowSchema::try_from_kernel(&json_fields)?)
+    ArrowSchema::try_from_kernel(&json_fields).map_err(crate::Error::kernel)
 }
 
 #[cfg(test)]
@@ -3832,7 +3836,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_json() -> Result<()> {
+    fn test_write_json() -> crate::KernelResult<()> {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "string",
             ArrowDataType::Utf8,
@@ -3853,7 +3857,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_json_bytes_filters_data() -> Result<()> {
+    fn test_to_json_bytes_filters_data() -> crate::KernelResult<()> {
         // Create test data with 4 rows
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "value",

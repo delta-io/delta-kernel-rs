@@ -8,7 +8,9 @@ use url::Url;
 use super::{put_bytes, resolve_scope};
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-use crate::{FileMeta, FileSlice, KernelError, Result, ResultIteratorStatic, StorageHandler};
+use crate::{
+    FileMeta, FileSlice, KernelError, Result, ResultExt, ResultIteratorStatic, StorageHandler,
+};
 
 #[derive(Constructor)]
 pub(crate) struct SyncStorageHandler {
@@ -30,7 +32,8 @@ impl SyncStorageHandler {
 // pulling the resulting in-memory iterator.
 impl StorageHandler for SyncStorageHandler {
     fn list_from(&self, url_path: &Url) -> Result<ResultIteratorStatic<FileMeta>> {
-        let (store, base_url, offset) = resolve_scope(self.store.as_ref(), url_path)?;
+        let (store, base_url, offset) =
+            resolve_scope(self.store.as_ref(), url_path).into_public_result()?;
 
         // For directory URLs, prefix == offset and the offset acts as a lower bound that still
         // includes everything underneath (since `dir/a` > `dir` lexicographically). For file
@@ -51,13 +54,16 @@ impl StorageHandler for SyncStorageHandler {
                 .collect::<Vec<_>>(),
         )
         .into_iter()
-        .collect::<Result<_, _>>()?;
+        .collect::<std::result::Result<_, _>>()
+        .map_err(crate::Error::kernel)?;
         metas.sort_unstable_by(|a, b| a.location.cmp(&b.location));
 
         let iter = metas.into_iter().map(move |meta| {
-            let location = base_url
-                .join(meta.location.as_ref())
-                .map_err(|e| KernelError::generic(format!("Failed to construct URL: {e}")))?;
+            let location = base_url.join(meta.location.as_ref()).map_err(|e| {
+                crate::Error::Kernel(KernelError::generic(format!(
+                    "Failed to construct URL: {e}"
+                )))
+            })?;
             Ok(FileMeta {
                 location,
                 last_modified: meta.last_modified.timestamp_millis(),
@@ -72,16 +78,17 @@ impl StorageHandler for SyncStorageHandler {
         let results: Vec<Result<Bytes>> = files
             .into_iter()
             .map(|(url, _range_opt)| {
-                let (s, _, path) = resolve_scope(store.as_ref(), &url)?;
-                let get_result = futures::executor::block_on(s.get(&path))?;
-                Ok(futures::executor::block_on(get_result.bytes())?)
+                let (s, _, path) = resolve_scope(store.as_ref(), &url).into_public_result()?;
+                let get_result =
+                    futures::executor::block_on(s.get(&path)).map_err(crate::Error::kernel)?;
+                futures::executor::block_on(get_result.bytes()).map_err(crate::Error::kernel)
             })
             .collect();
         Ok(Box::new(results.into_iter()))
     }
 
     fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> Result<()> {
-        put_bytes(self.store.as_ref(), path, data, overwrite)
+        put_bytes(self.store.as_ref(), path, data, overwrite).into_public_result()
     }
 
     fn copy_atomic(&self, _src: &Url, _dest: &Url) -> Result<()> {
@@ -89,8 +96,8 @@ impl StorageHandler for SyncStorageHandler {
     }
 
     fn head(&self, url: &Url) -> Result<FileMeta> {
-        let (store, _, path) = resolve_scope(self.store.as_ref(), url)?;
-        let meta = futures::executor::block_on(store.head(&path))?;
+        let (store, _, path) = resolve_scope(self.store.as_ref(), url).into_public_result()?;
+        let meta = futures::executor::block_on(store.head(&path)).map_err(crate::Error::kernel)?;
         Ok(FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp_millis(),
@@ -99,11 +106,11 @@ impl StorageHandler for SyncStorageHandler {
     }
 
     fn delete(&self, url: &Url) -> Result<()> {
-        let (store, _, path) = resolve_scope(self.store.as_ref(), url)?;
+        let (store, _, path) = resolve_scope(self.store.as_ref(), url).into_public_result()?;
         match futures::executor::block_on(store.delete(&path)) {
             Ok(()) => Ok(()),
             Err(crate::object_store::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(crate::Error::Kernel(e.into())),
         }
     }
 }
@@ -271,7 +278,7 @@ mod tests {
         let url = Url::from_file_path(tmp_dir.path().join("missing.json")).unwrap();
         assert!(matches!(
             storage.head(&url).unwrap_err(),
-            KernelError::FileNotFound(_)
+            crate::Error::Kernel(KernelError::FileNotFound(_))
         ));
     }
 
@@ -310,7 +317,10 @@ mod tests {
         let err = storage
             .put(&url, bytes::Bytes::from("second"), false)
             .unwrap_err();
-        assert!(matches!(err, KernelError::FileAlreadyExists(_)));
+        assert!(matches!(
+            err,
+            crate::Error::Kernel(KernelError::FileAlreadyExists(_))
+        ));
 
         // With overwrite, it should succeed.
         storage
@@ -336,7 +346,7 @@ mod tests {
 
         assert!(matches!(
             storage.head(&url).unwrap_err(),
-            KernelError::FileNotFound(_)
+            crate::Error::Kernel(KernelError::FileNotFound(_))
         ));
     }
 
@@ -348,7 +358,7 @@ mod tests {
 
         assert!(matches!(
             storage.head(&url).unwrap_err(),
-            KernelError::FileNotFound(_)
+            crate::Error::Kernel(KernelError::FileNotFound(_))
         ));
         storage.delete(&url).unwrap();
     }

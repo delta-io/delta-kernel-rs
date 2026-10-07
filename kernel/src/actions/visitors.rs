@@ -15,7 +15,7 @@ use crate::schema::{
     column_name, lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef,
 };
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult, Result, ResultExt};
 
 pub(crate) static METADATA_LEAVES: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| Metadata::to_schema().leaves(METADATA_NAME));
@@ -58,10 +58,10 @@ impl RowVisitor for SelectionVectorVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == 1,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of SelectionVectorVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         for i in 0..row_count {
             let selected: bool = getters[0].get(i, "selectionvector.output")?;
@@ -127,10 +127,10 @@ impl AddVisitor {
         };
         require!(
             getters.len() == expected_getters,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of AddVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         let partition_values: HashMap<_, _> = getters[1].get(row_index, "add.partitionValues")?;
         let size: i64 = getters[2].get(row_index, "add.size")?;
@@ -140,7 +140,8 @@ impl AddVisitor {
 
         // TODO(nick) extract tags if we ever need them at getters[6]
 
-        let deletion_vector = visit_deletion_vector_at(row_index, &getters[7..])?;
+        let deletion_vector =
+            visit_deletion_vector_at(row_index, &getters[7..]).into_public_result()?;
 
         let base_row_id: Option<i64> = getters[12].get_opt(row_index, "add.base_row_id")?;
         let default_row_commit_version: Option<i64> =
@@ -149,7 +150,8 @@ impl AddVisitor {
             getters[14].get_opt(row_index, "add.clustering_provider")?;
 
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let back_reference = visit_back_reference_at(row_index, &getters[15..])?;
+        let back_reference =
+            visit_back_reference_at(row_index, &getters[15..]).into_public_result()?;
 
         Ok(Add {
             path,
@@ -211,10 +213,10 @@ impl RemoveVisitor {
         };
         require!(
             getters.len() == expected_getters,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of RemoveVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         let deletion_timestamp: Option<i64> =
             getters[1].get_opt(row_index, "remove.deletionTimestamp")?;
@@ -229,14 +231,16 @@ impl RemoveVisitor {
         let stats: Option<String> = getters[6].get_opt(row_index, "remove.stats")?;
         // TODO(nick) tags are skipped in getters[7]
 
-        let deletion_vector = visit_deletion_vector_at(row_index, &getters[8..])?;
+        let deletion_vector =
+            visit_deletion_vector_at(row_index, &getters[8..]).into_public_result()?;
 
         let base_row_id: Option<i64> = getters[13].get_opt(row_index, "remove.baseRowId")?;
         let default_row_commit_version: Option<i64> =
             getters[14].get_opt(row_index, "remove.defaultRowCommitVersion")?;
 
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let back_reference = visit_back_reference_at(row_index, &getters[15..])?;
+        let back_reference =
+            visit_back_reference_at(row_index, &getters[15..]).into_public_result()?;
 
         Ok(Remove {
             path,
@@ -310,10 +314,10 @@ impl RowVisitor for CdcVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == 5,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of CdcVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of a Cdc action
@@ -358,10 +362,10 @@ impl SetTransactionVisitor {
     ) -> Result<SetTransaction> {
         require!(
             getters.len() == 3,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of SetTransactionVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         let version: i64 = getters[1].get(row_index, "txn.version")?;
         let last_updated: Option<i64> = getters[2].get_opt(row_index, "txn.lastUpdated")?;
@@ -432,10 +436,10 @@ impl RowVisitor for SidecarVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == 4,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of SidecarVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of a Sidecar action
@@ -537,7 +541,8 @@ impl RowVisitor for DomainMetadataVisitor {
                     // slot is actually empty, avoiding unnecessary field access.
                     if let Entry::Vacant(entry) = self.domain_metadatas.entry(domain.clone()) {
                         let domain_metadata =
-                            DomainMetadataVisitor::visit_domain_metadata(i, domain, getters)?;
+                            DomainMetadataVisitor::visit_domain_metadata(i, domain, getters)
+                                .into_public_result()?;
                         entry.insert(domain_metadata);
                     }
                 }
@@ -615,10 +620,10 @@ pub(crate) fn visit_metadata_at<'a>(
 ) -> Result<Option<Metadata>> {
     require!(
         getters.len() == 9,
-        KernelError::InternalError(format!(
+        crate::Error::Kernel(KernelError::InternalError(format!(
             "Wrong number of MetadataVisitor getters: {}",
             getters.len()
-        ))
+        )))
     );
 
     // Since id column is required, use it to detect presence of a metadata action
@@ -663,10 +668,10 @@ pub(crate) fn visit_protocol_at<'a>(
 ) -> Result<Option<Protocol>> {
     require!(
         getters.len() == 4,
-        KernelError::InternalError(format!(
+        crate::Error::Kernel(KernelError::InternalError(format!(
             "Wrong number of ProtocolVisitor getters: {}",
             getters.len()
-        ))
+        )))
     );
     // Since minReaderVersion column is required, use it to detect presence of a Protocol action
     let Some(min_reader_version) = getters[0].get_opt(row_index, "protocol.min_reader_version")?
@@ -732,10 +737,10 @@ impl RowVisitor for InCommitTimestampVisitor {
     ) -> Result<()> {
         require!(
             getters.len() == 1,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of InCommitTimestampVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
 
         // If the batch is empty, return
@@ -778,16 +783,20 @@ impl RowVisitor for CheckpointVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
         require!(
             getters.len() == 1,
-            KernelError::InternalError(format!(
+            crate::Error::Kernel(KernelError::InternalError(format!(
                 "Wrong number of CheckpointVisitor getters: {}",
                 getters.len()
-            ))
+            )))
         );
         for i in 0..row_count {
             if let Some(elements) = getters[0].get_struct_list(i, CHECKPOINT_ACTION_NAME)? {
                 let mut element_visitor = CheckpointElementVisitor::default();
                 elements.visit_with(&mut element_visitor)?;
-                self.checkpoint = Some(element_visitor.into_checkpoint_action()?);
+                self.checkpoint = Some(
+                    element_visitor
+                        .into_checkpoint_action()
+                        .into_public_result()?,
+                );
                 // Keep the first checkpoint row found; this only extracts one action, it is not
                 // the RFC's checkpoint selection rule (MAX checkpointMetadata.version across
                 // commits, standalone checkpoints, and _last_checkpoint).
@@ -923,24 +932,27 @@ impl RowVisitor for CheckpointElementVisitor {
             if let Some(version) =
                 getters[r.checkpoint_metadata.start].get_opt(i, "checkpointMetadata.version")?
             {
-                set_once(&mut self.version, version, "checkpointMetadata")?;
+                set_once(&mut self.version, version, "checkpointMetadata").into_public_result()?;
             } else if let Some(content_root) =
-                visit_content_root_at(i, &getters[r.content_root.clone()])?
+                visit_content_root_at(i, &getters[r.content_root.clone()]).into_public_result()?
             {
-                set_once(&mut self.content_root, content_root, "contentRoot")?;
+                set_once(&mut self.content_root, content_root, "contentRoot")
+                    .into_public_result()?;
             } else if let Some(protocol) = visit_protocol_at(i, &getters[r.protocol.clone()])? {
-                set_once(&mut self.protocol, protocol, "protocol")?;
+                set_once(&mut self.protocol, protocol, "protocol").into_public_result()?;
             } else if let Some(metadata) = visit_metadata_at(i, &getters[r.metadata.clone()])? {
-                set_once(&mut self.metadata, metadata, "metaData")?;
+                set_once(&mut self.metadata, metadata, "metaData").into_public_result()?;
             } else if let Some(domain) =
                 getters[r.domain_metadata.start].get_opt(i, "domainMetadata.domain")?
             {
-                self.domain_metadata
-                    .push(DomainMetadataVisitor::visit_domain_metadata(
+                self.domain_metadata.push(
+                    DomainMetadataVisitor::visit_domain_metadata(
                         i,
                         domain,
                         &getters[r.domain_metadata.clone()],
-                    )?);
+                    )
+                    .into_public_result()?,
+                );
             } else if let Some(app_id) = getters[r.txn.start].get_opt(i, "txn.appId")? {
                 self.transactions.push(SetTransactionVisitor::visit_txn(
                     i,
@@ -954,9 +966,9 @@ impl RowVisitor for CheckpointElementVisitor {
                     SET_TRANSACTION_NAME => self.txn_sidecars.push(sidecar),
                     DOMAIN_METADATA_NAME => self.domain_metadata_sidecars.push(sidecar),
                     other => {
-                        return Err(KernelError::generic(format!(
+                        return Err(crate::Error::Kernel(KernelError::generic(format!(
                             "checkpoint sidecar has unsupported type `{other}`"
-                        )))
+                        ))))
                     }
                 }
             }
@@ -1033,7 +1045,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_protocol() -> Result<()> {
+    fn test_parse_protocol() -> crate::KernelResult<()> {
         let data = action_batch();
         let parsed = Protocol::try_new_from_data(data.as_ref())?.unwrap();
         let expected = Protocol {
@@ -1156,7 +1168,7 @@ mod tests {
     #[case::with_tags(Some(HashMap::from([("k".to_string(), "v".to_string())])))]
     fn test_checkpoint_action_write_then_read_round_trip(
         #[case] sidecar_tags: Option<HashMap<String, String>>,
-    ) -> Result<()> {
+    ) -> crate::KernelResult<()> {
         let action = CheckpointAction {
             version: 7,
             content_root: ContentRoot {

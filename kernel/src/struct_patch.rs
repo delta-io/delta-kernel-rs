@@ -67,7 +67,7 @@ use serde::{Deserialize, Serialize};
 use crate::expressions::{ColumnName, Expression, ExpressionRef};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::utils::{CollectInto, FoldWithOption as _};
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult, Result, ResultExt};
 
 /// Projects a nested struct to `schema` while preserving a null source struct.
 ///
@@ -537,13 +537,13 @@ impl StructPatchBuilder<ExpressionRef> {
     /// same field, or when a destructive operation on one field overlapped with an operation on a
     /// nested child field.
     pub fn build(self) -> Result<ExpressionStructPatch> {
-        self.error?;
+        self.error.into_public_result()?;
         Ok(self.root.to_expr_patch(self.input_path))
     }
 }
 
 impl TryFrom<StructPatchBuilder<ExpressionRef>> for ExpressionStructPatch {
-    type Error = KernelError;
+    type Error = crate::Error;
 
     fn try_from(builder: StructPatchBuilder<ExpressionRef>) -> Result<Self> {
         builder.build()
@@ -633,8 +633,9 @@ impl StructPatchBuilder<StructField> {
     /// be resolved to a struct, a required field patch references a missing input field, a nested
     /// field patch targets a non-struct field, or the resulting output schema is invalid.
     pub fn build(self, input_schema: &StructType) -> Result<StructType> {
-        let (root, _input_path, source_schema) = self.begin_build(input_schema)?;
-        StructType::try_new(schema_walk(root, source_schema)?)
+        let (root, _input_path, source_schema) =
+            self.begin_build(input_schema).into_public_result()?;
+        StructType::try_new(schema_walk(root, source_schema).into_public_result()?)
     }
 }
 
@@ -935,9 +936,12 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
     /// be resolved to a struct, a required field patch references a missing input field, a nested
     /// field patch targets a non-struct field, or the resulting output schema is invalid.
     pub fn build(self) -> Result<(SchemaRef, ExpressionRef)> {
-        let (root, input_path, source_schema) = self.inner.begin_build(self.input_schema)?;
+        let (root, input_path, source_schema) = self
+            .inner
+            .begin_build(self.input_schema)
+            .into_public_result()?;
         let patch = root.to_expr_patch(input_path);
-        let schema = StructType::try_new(schema_walk(root, source_schema)?)?;
+        let schema = StructType::try_new(schema_walk(root, source_schema).into_public_result()?)?;
         Ok((Arc::new(schema), Arc::new(Expression::StructPatch(patch))))
     }
 }
