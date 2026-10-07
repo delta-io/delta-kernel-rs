@@ -17,7 +17,7 @@ use crate::log_segment::{
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::metrics::{MetricId, SnapshotLoadMetricContext, SnapshotLoadType};
-use crate::path::{LogPathFileType, ParsedLogPath};
+use crate::path::{LogPathFileType, ParsedLogPath, DELTA_LOG_DIR_WITH_SLASH};
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri, PhantomType};
@@ -110,7 +110,7 @@ impl SnapshotHint {
         crc: Option<Arc<Crc>>,
         freshness: SnapshotHintFreshness,
     ) -> Result<Self> {
-        let log_root = try_parse_uri(table_root)?.join("_delta_log/")?;
+        let log_root = try_parse_uri(table_root)?.join(DELTA_LOG_DIR_WITH_SLASH)?;
         let mut parsed_paths: Vec<ParsedLogPath> = log_paths.into_iter().map(Into::into).collect();
         require!(
             !parsed_paths
@@ -512,7 +512,7 @@ impl<Mode> SnapshotBuilder<Mode> {
                 let table_url = try_parse_uri(table_root)?;
                 let log_segment = LogSegment::for_snapshot(
                     engine.storage_handler().as_ref(),
-                    table_url.join("_delta_log/")?,
+                    table_url.join(DELTA_LOG_DIR_WITH_SLASH)?,
                     log_tail,
                     effective_version,
                     metric_context.clone(),
@@ -596,7 +596,7 @@ impl<Mode> SnapshotBuilder<Mode> {
             )
         })?;
         let table_url = try_parse_uri(table_root)?;
-        let log_root = table_url.join("_delta_log/")?;
+        let log_root = table_url.join(DELTA_LOG_DIR_WITH_SLASH)?;
         let SnapshotHint {
             version,
             log_segment_files,

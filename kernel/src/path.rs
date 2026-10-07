@@ -12,6 +12,9 @@ use crate::engine_data::RowVisitor;
 use crate::utils::require;
 use crate::{Engine, FileMeta, KernelError, KernelResult, Result, Version};
 
+/// The delta log subdirectory with a trailing slash for directory URL joins.
+pub(crate) const DELTA_LOG_DIR_WITH_SLASH: &str = "_delta_log/";
+
 /// How many characters a version tag has
 const VERSION_LEN: usize = 20;
 
@@ -23,7 +26,6 @@ const UUID_PART_LEN: usize = 36;
 
 /// The subdirectory name within the table root where the delta log resides
 const DELTA_LOG_DIR: &str = "_delta_log";
-const DELTA_LOG_DIR_WITH_SLASH: &str = "_delta_log/";
 /// The subdirectory name within the delta log where staged commits reside
 const STAGED_COMMITS_DIR: &str = "_staged_commits/";
 /// The subdirectory name within the delta log where checkpoint sidecars reside
