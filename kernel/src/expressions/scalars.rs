@@ -1165,8 +1165,8 @@ fn parse_year_month_interval(raw: &str, target: IntervalYearToMonthType) -> Resu
     use IntervalYearToMonthType::*;
 
     let parse_error = || PrimitiveType::interval_year_month(target).parse_error(raw);
-    let (body, field_range) = extract_interval_literal(raw).ok_or_else(&parse_error)?;
-    let (negative, magnitude) = interval_magnitude(body).ok_or_else(&parse_error)?;
+    let (body, field_range) = extract_interval_literal(raw).ok_or_else(parse_error)?;
+    let (negative, magnitude) = interval_magnitude(body).ok_or_else(parse_error)?;
     let (parsed_type, total) = match (field_range.start, field_range.end) {
         (Year, Year) => (
             IntervalYear,
@@ -1174,11 +1174,11 @@ fn parse_year_month_interval(raw: &str, target: IntervalYearToMonthType) -> Resu
                 .parse::<u32>()
                 .ok()
                 .and_then(|years| years.checked_mul(MONTHS_PER_YEAR as u32))
-                .ok_or_else(&parse_error)?,
+                .ok_or_else(parse_error)?,
         ),
         (Month, Month) => (IntervalMonth, magnitude.parse().map_err(|_| parse_error())?),
         (Year, Month) => {
-            let (years, months) = magnitude.split_once('-').ok_or_else(&parse_error)?;
+            let (years, months) = magnitude.split_once('-').ok_or_else(parse_error)?;
             let months = months.parse::<u32>().map_err(|_| parse_error())?;
             if months >= MONTHS_PER_YEAR as u32 {
                 return Err(parse_error());
@@ -1190,7 +1190,7 @@ fn parse_year_month_interval(raw: &str, target: IntervalYearToMonthType) -> Resu
                     .ok()
                     .and_then(|years| years.checked_mul(MONTHS_PER_YEAR as u32))
                     .and_then(|years| years.checked_add(months))
-                    .ok_or_else(&parse_error)?,
+                    .ok_or_else(parse_error)?,
             )
         }
         _ => return Err(parse_error()),
@@ -1198,7 +1198,7 @@ fn parse_year_month_interval(raw: &str, target: IntervalYearToMonthType) -> Resu
     if parsed_type != target {
         return Err(parse_error());
     }
-    let months = signed_i32(total, negative).ok_or_else(&parse_error)?;
+    let months = signed_i32(total, negative).ok_or_else(parse_error)?;
     Scalar::interval_year_month(months, target).map_err(|_| parse_error())
 }
 
