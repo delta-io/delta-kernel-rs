@@ -452,6 +452,10 @@ pub enum KernelError {
     #[error("File already exists: {0}")]
     FileAlreadyExists(String),
 
+    /// A Delta table already exists at the requested table path.
+    #[error("Table already exists at path: {0}")]
+    TableAlreadyExistsAtPath(String),
+
     /// Some functionality is currently unsupported
     #[error("Unsupported: {0}")]
     Unsupported(String),

@@ -3457,6 +3457,7 @@ mod tests {
             ExternResult::Err(e) => {
                 // Clean up the error to prevent leaks
                 let error = unsafe { recover_error(e) };
+                assert_eq!(error.etype, FFIKernelError::TableAlreadyExistsAtPath);
                 assert!(
                     error.message.contains("already exists"),
                     "Expected 'already exists' error, got: {}",

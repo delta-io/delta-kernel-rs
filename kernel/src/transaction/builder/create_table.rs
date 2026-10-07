@@ -161,9 +161,9 @@ fn ensure_table_does_not_exist(
             // - Some(Err(other)) means real error -> propagate
             // - None means empty iterator -> OK for new table
             match files.next() {
-                Some(Ok(_)) => Err(KernelError::generic(format!(
-                    "Table already exists at path: {table_path}"
-                ))),
+                Some(Ok(_)) => Err(KernelError::TableAlreadyExistsAtPath(
+                    table_path.to_string(),
+                )),
                 Some(Err(KernelError::FileNotFound(_))) | None => {
                     // Path doesn't exist or empty - OK for new table
                     Ok(())
