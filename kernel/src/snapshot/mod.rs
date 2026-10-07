@@ -42,6 +42,7 @@ use crate::utils::require;
 use crate::{Engine, KernelError, KernelResult, LogCompactionWriter, Result, Version};
 
 mod builder;
+mod hint;
 mod incremental;
 mod snapshot_crc;
 #[cfg(test)]
@@ -51,7 +52,7 @@ pub use builder::{FromSnapshot, FromTableRoot};
 pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder};
 #[allow(unused_imports)]
 #[internal_api]
-pub(crate) use builder::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
+pub(crate) use hint::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
 use snapshot_crc::SnapshotCrc;
 
 pub use crate::error::SnapshotHintError;
