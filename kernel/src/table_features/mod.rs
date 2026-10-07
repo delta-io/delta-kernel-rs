@@ -28,6 +28,7 @@ pub(crate) use timestamp_ntz::{
 };
 
 use crate::actions::Protocol;
+use crate::error::ProtocolVersionType;
 use crate::expressions::Scalar;
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
@@ -940,7 +941,8 @@ pub(crate) fn auto_enable_property_driven_features(
 
 /// Enforce that `protocol.min_reader_version()` lies within
 /// [`MIN_VALID_RW_VERSION`]..=[`MAX_VALID_READER_VERSION`]. Below the minimum yields
-/// [`KernelError::InvalidProtocol`]; above the maximum yields [`KernelError::Unsupported`].
+/// [`KernelError::InvalidProtocol`]; above the maximum yields
+/// [`KernelError::UnsupportedProtocolVersion`].
 pub(crate) fn check_reader_version_range(protocol: &Protocol) -> KernelResult<()> {
     require!(
         protocol.min_reader_version() >= MIN_VALID_RW_VERSION,
@@ -950,10 +952,11 @@ pub(crate) fn check_reader_version_range(protocol: &Protocol) -> KernelResult<()
         ))
     );
     if protocol.min_reader_version() > MAX_VALID_READER_VERSION {
-        return Err(KernelError::unsupported(format!(
-            "Unsupported minimum reader version {}",
-            protocol.min_reader_version()
-        )));
+        return Err(KernelError::UnsupportedProtocolVersion {
+            version_type: ProtocolVersionType::Reader,
+            min_reader_version: protocol.min_reader_version(),
+            min_writer_version: protocol.min_writer_version(),
+        });
     }
     Ok(())
 }
@@ -1026,6 +1029,7 @@ mod tests {
         Ok,
         InvalidProtocol,
         Unsupported,
+        UnsupportedProtocol,
     }
 
     #[rstest]
@@ -1035,7 +1039,7 @@ mod tests {
     )]
     #[case::reader_version_above_maximum(
         Protocol::new_unchecked(99, 1, None, None),
-        ExpectRead::Unsupported
+        ExpectRead::UnsupportedProtocol
     )]
     #[case::legacy_reader_v1(Protocol::try_new_legacy(1, 1).unwrap(), ExpectRead::Ok)]
     #[case::legacy_reader_v2(Protocol::try_new_legacy(2, 5).unwrap(), ExpectRead::Ok)]
@@ -1102,6 +1106,10 @@ mod tests {
             ExpectRead::Unsupported => assert!(
                 matches!(result, Err(KernelError::Unsupported(_))),
                 "expected Unsupported, got: {result:?}"
+            ),
+            ExpectRead::UnsupportedProtocol => assert!(
+                matches!(result, Err(KernelError::UnsupportedProtocolVersion { .. })),
+                "expected UnsupportedProtocolVersion, got: {result:?}"
             ),
         }
     }

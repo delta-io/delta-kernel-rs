@@ -16,6 +16,7 @@ use delta_kernel::arrow::array::{
 use delta_kernel::arrow::compute::{cast, concat_batches};
 use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef};
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
+use delta_kernel::error::ProtocolVersionType;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::{KernelError as Error, Result};
 use delta_kernel_workloads::models::{ExpectedError, ReadExpected, SnapshotExpected, TimeTravel};
@@ -296,6 +297,13 @@ fn expected_error_matches(expected: &ExpectedError, actual: &Error) -> bool {
             message.starts_with("Cannot determine types for: CompoundIdentifier(")
         }
         ("DELTA_VERSION_NOT_FOUND", Error::MissingVersion(_) | Error::EmptyLog) => true,
+        (
+            "DELTA_INVALID_PROTOCOL_VERSION",
+            Error::UnsupportedProtocolVersion {
+                version_type: ProtocolVersionType::Reader,
+                ..
+            },
+        ) => true,
         ("DELTA_INVALID_PROTOCOL_VERSION", Error::Unsupported(message)) => {
             message.starts_with("Unsupported minimum reader version ")
         }
@@ -543,7 +551,11 @@ mod tests {
 
     #[test]
     fn protocol_error_categories_do_not_overlap() {
-        let invalid_version = Error::unsupported("Unsupported minimum reader version 4");
+        let invalid_version = Error::UnsupportedProtocolVersion {
+            version_type: ProtocolVersionType::Reader,
+            min_reader_version: 4,
+            min_writer_version: 7,
+        };
         assert!(expected_error_matches(
             &expected_error("DELTA_INVALID_PROTOCOL_VERSION"),
             &invalid_version
