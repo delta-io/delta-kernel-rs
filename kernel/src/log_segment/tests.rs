@@ -49,6 +49,8 @@ use crate::unit_test_utils::{
     assert_batch_matches, assert_result_error_with_message, create_log_path,
     create_log_path_with_size, load_test_table, string_array_to_engine_data, Action,
 };
+#[cfg(feature = "geo-type-in-dev")]
+use crate::unit_test_utils::{geography_type, geometry_type};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::Snapshot;
 use crate::{
@@ -4242,6 +4244,77 @@ fn test_schema_has_compatible_stats_parsed_variant_against_struct(
         LogSegment::schema_has_compatible_stats_parsed(&checkpoint_schema, &stats_schema),
         expected
     );
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+#[rstest]
+#[case::binary(Some(DataType::BINARY), true)]
+#[case::geometry(Some(geometry_type("EPSG:4326")), true)]
+#[case::different_crs(Some(geometry_type("EPSG:3857")), false)]
+#[case::geography(
+    Some(geography_type("EPSG:4326", crate::schema::EdgeInterpolationAlgorithm::Spherical)),
+    false
+)]
+#[case::string(Some(DataType::STRING), false)]
+#[case::missing(None, true)]
+fn geometry_stats_checkpoint_compatibility(
+    #[case] available: Option<DataType>,
+    #[case] expected: bool,
+    #[values(false, true)] nested: bool,
+) {
+    let fields = |data_type: Option<DataType>| {
+        let fields: Vec<_> = data_type
+            .map(|dt| StructField::nullable("g", dt))
+            .into_iter()
+            .collect();
+        if nested {
+            vec![StructField::nullable("location", schema! { ..(fields) })]
+        } else {
+            fields
+        }
+    };
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(fields(available));
+    let stats_schema = create_stats_schema(fields(Some(geometry_type("EPSG:4326"))));
+    assert_eq!(
+        LogSegment::schema_has_compatible_stats_parsed(&checkpoint_schema, &stats_schema),
+        expected,
+    );
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+#[rstest]
+#[case::binary_to_geography(
+    DataType::BINARY,
+    geography_type("EPSG:4326", crate::schema::EdgeInterpolationAlgorithm::Spherical)
+)]
+#[case::geometry_to_binary(geometry_type("EPSG:4326"), DataType::BINARY)]
+fn geometry_stats_compatibility_does_not_admit_other_conversions(
+    #[case] available: DataType,
+    #[case] needed: DataType,
+) {
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable("g", available)]);
+    let stats_schema = create_stats_schema(vec![StructField::nullable("g", needed)]);
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema,
+    ));
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+#[test]
+fn binary_geometry_stats_compatibility_does_not_change_partitions_or_schema_casts() {
+    let geometry = geometry_type("EPSG:4326");
+    let checkpoint = create_checkpoint_schema_with_partition_parsed(vec![StructField::nullable(
+        "g",
+        DataType::BINARY,
+    )]);
+    let partitions = schema! { nullable "g": (geometry.clone()) };
+    assert!(!LogSegment::schema_has_compatible_partition_values_parsed(
+        &checkpoint,
+        &partitions,
+    ));
+    assert!(DataType::BINARY.can_read_as(&geometry).is_err());
 }
 
 #[test]

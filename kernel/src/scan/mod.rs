@@ -138,6 +138,11 @@ pub struct StatsOptions {
     /// Whether a VARIANT column's min/max statistic is requested. See
     /// [`Self::with_variant_min_max_stats`].
     pub(crate) variant_min_max: bool,
+
+    /// Whether Geometry bounding-box statistics are requested. See
+    /// [`Self::with_geometry_min_max_stats`].
+    #[cfg(feature = "geo-type-in-dev")]
+    pub(crate) geometry_min_max: bool,
 }
 
 /// Controls which struct stats columns appear in `stats_parsed`.
@@ -177,6 +182,8 @@ impl Default for StatsOptions {
             synthesize_json: true,
             struct_stats: StructStats::None,
             variant_min_max: false,
+            #[cfg(feature = "geo-type-in-dev")]
+            geometry_min_max: false,
         }
     }
 }
@@ -272,26 +279,56 @@ impl StatsOptions {
         self
     }
 
+    /// Requests Geometry bounding-box corner points in `stats_parsed.minValues` and
+    /// `stats_parsed.maxValues`, retaining each column's logical Geometry type and CRS. Off by
+    /// default; Geography bounds are not included.
+    ///
+    /// Kernel does not use these bounds for spatial pruning. This option requires struct stats
+    /// without JSON synthesis, such as [`Self::all_struct`]; [`ScanBuilder::build`] rejects any
+    /// other combination.
+    ///
+    /// The caller must supply an engine that supports Geometry statistics. For commits and
+    /// checkpoints without compatible `stats_parsed`, the engine's [`ParseJson`] must decode WKT
+    /// points. For compatible checkpoints, its Parquet handler must read WKB points into the same
+    /// logical type. Missing bounds in compatible `stats_parsed` read as null. Kernel does not
+    /// check engine capability or prescribe an in-memory representation; unsupported handlers,
+    /// including the default engine, may return an error.
+    ///
+    /// [`ParseJson`]: crate::expressions::ParseJsonExpression
+    #[cfg(feature = "geo-type-in-dev")]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[internal_api]
+    pub(crate) fn with_geometry_min_max_stats(mut self, include: bool) -> Self {
+        self.geometry_min_max = include;
+        self
+    }
+
     /// Checks that the options form a supported combination.
     ///
     /// # Errors
     ///
-    /// Returns [`KernelError::Unsupported`] if VARIANT min/max stats are requested without struct
-    /// stats output or with JSON stats synthesis.
+    /// Returns [`KernelError::Unsupported`] if VARIANT or Geometry min/max stats are requested
+    /// without struct stats output or with JSON stats synthesis.
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.variant_min_max {
+        for (include, option) in [
+            (self.variant_min_max, "with_variant_min_max_stats"),
+            #[cfg(feature = "geo-type-in-dev")]
+            (self.geometry_min_max, "with_geometry_min_max_stats"),
+        ] {
+            if !include {
+                continue;
+            }
             require!(
                 !matches!(self.struct_stats, StructStats::None),
-                KernelError::unsupported(
-                    "StatsOptions::with_variant_min_max_stats requires struct stats output"
-                )
+                KernelError::unsupported(format!(
+                    "StatsOptions::{option} requires struct stats output"
+                ))
             );
             require!(
                 !self.synthesize_json,
-                KernelError::unsupported(
-                    "StatsOptions::with_variant_min_max_stats cannot be combined with JSON stats \
-                     synthesis"
-                )
+                KernelError::unsupported(format!(
+                    "StatsOptions::{option} cannot be combined with JSON stats synthesis"
+                ))
             );
         }
         Ok(())
@@ -822,9 +859,19 @@ fn build_stats_output_schemas(
     match &stats.struct_stats {
         StructStats::None => Ok(None),
         StructStats::AllIndexed { extra_indexed } => table_configuration
-            .build_indexed_stats_output_schemas(extra_indexed, stats.variant_min_max),
+            .build_indexed_stats_output_schemas(
+                extra_indexed,
+                stats.variant_min_max,
+                #[cfg(feature = "geo-type-in-dev")]
+                stats.geometry_min_max,
+            ),
         StructStats::Columns { requested } => table_configuration
-            .build_selected_stats_output_schemas(requested, stats.variant_min_max),
+            .build_selected_stats_output_schemas(
+                requested,
+                stats.variant_min_max,
+                #[cfg(feature = "geo-type-in-dev")]
+                stats.geometry_min_max,
+            ),
     }
 }
 

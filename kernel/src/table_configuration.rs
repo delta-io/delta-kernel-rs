@@ -123,6 +123,9 @@ pub(crate) struct StatsSchemaBuilder<'a> {
     /// Whether VARIANT columns appear in `minValues`/`maxValues`, typed as the variant's physical
     /// struct.
     variant_min_max: bool,
+    /// Whether Geometry bounding-box statistics appear with the column's logical type.
+    #[cfg(feature = "geo-type-in-dev")]
+    geometry_min_max: bool,
 }
 
 impl<'a> StatsSchemaBuilder<'a> {
@@ -153,6 +156,14 @@ impl<'a> StatsSchemaBuilder<'a> {
         self
     }
 
+    /// Sets whether Geometry bounding-box statistics appear in `minValues`/`maxValues`,
+    /// retaining the column's CRS. Off by default.
+    #[cfg(feature = "geo-type-in-dev")]
+    pub(crate) fn with_geometry_min_max(mut self, include: bool) -> Self {
+        self.geometry_min_max = include;
+        self
+    }
+
     /// Builds the stats schema, using physical column names.
     ///
     /// Engines can provide statistics for files written to the delta table, enabling data skipping
@@ -172,7 +183,8 @@ impl<'a> StatsSchemaBuilder<'a> {
     /// - **`delta.dataSkippingStatsColumns`**: If set, only specified columns are included.
     /// - **`delta.dataSkippingNumIndexedCols`**: Otherwise, includes the first N leaf columns
     ///   (default 32).
-    /// - **Builder options**: required and requested columns, and VARIANT min/max statistics.
+    /// - **Builder options**: required and requested columns, and VARIANT/Geometry min/max
+    ///   statistics.
     ///
     /// See the Delta protocol for more details on per-file statistics:
     /// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics>
@@ -188,6 +200,8 @@ impl<'a> StatsSchemaBuilder<'a> {
             data_skipping_stats_columns: required_physical_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: tc.table_properties().data_skipping_num_indexed_cols,
             variant_min_max: self.variant_min_max,
+            #[cfg(feature = "geo-type-in-dev")]
+            geometry_min_max: self.geometry_min_max,
         };
         let physical_stats_schema = Arc::new(expected_stats_schema(
             &physical_data_schema,
@@ -230,11 +244,14 @@ fn build_stats_schema_for_columns(
     data_schema: &StructType,
     selected_columns: &[ColumnName],
     variant_min_max: bool,
+    #[cfg(feature = "geo-type-in-dev")] geometry_min_max: bool,
 ) -> KernelResult<SchemaRef> {
     let config = StatsConfig {
         data_skipping_stats_columns: Some(selected_columns),
         data_skipping_num_indexed_cols: None,
         variant_min_max,
+        #[cfg(feature = "geo-type-in-dev")]
+        geometry_min_max,
     };
     let required_columns = None;
     let requested_columns = None;
@@ -492,6 +509,7 @@ impl TableConfiguration {
         &self,
         extra_indexed_columns: &[ColumnName],
         variant_min_max: bool,
+        #[cfg(feature = "geo-type-in-dev")] geometry_min_max: bool,
     ) -> KernelResult<Option<StatsOutputSchemas>> {
         let logical_data_schema = self.logical_schema_without_partition_columns();
         let logical_schema = self.logical_schema();
@@ -560,6 +578,8 @@ impl TableConfiguration {
             &logical_columns,
             &physical_columns,
             variant_min_max,
+            #[cfg(feature = "geo-type-in-dev")]
+            geometry_min_max,
         )
     }
 
@@ -573,6 +593,7 @@ impl TableConfiguration {
         &self,
         logical_columns: &[ColumnName],
         variant_min_max: bool,
+        #[cfg(feature = "geo-type-in-dev")] geometry_min_max: bool,
     ) -> KernelResult<Option<StatsOutputSchemas>> {
         if logical_columns.is_empty() {
             return Ok(None);
@@ -596,6 +617,8 @@ impl TableConfiguration {
             logical_columns,
             &physical_columns,
             variant_min_max,
+            #[cfg(feature = "geo-type-in-dev")]
+            geometry_min_max,
         )
     }
 
@@ -604,11 +627,14 @@ impl TableConfiguration {
         logical_columns: &[ColumnName],
         physical_columns: &[ColumnName],
         variant_min_max: bool,
+        #[cfg(feature = "geo-type-in-dev")] geometry_min_max: bool,
     ) -> KernelResult<Option<StatsOutputSchemas>> {
         let logical = build_stats_schema_for_columns(
             &self.logical_schema_without_partition_columns(),
             logical_columns,
             variant_min_max,
+            #[cfg(feature = "geo-type-in-dev")]
+            geometry_min_max,
         )?;
         // `expected_stats_schema` emits `nullCount` only when a data column is selected.
         if logical.field(NULL_COUNT).is_none() {
@@ -619,6 +645,8 @@ impl TableConfiguration {
             &self.physical_data_schema_without_partition_columns(),
             physical_columns,
             variant_min_max,
+            #[cfg(feature = "geo-type-in-dev")]
+            geometry_min_max,
         )?;
 
         Ok(Some(StatsOutputSchemas::try_new(logical, physical)?))
@@ -632,6 +660,8 @@ impl TableConfiguration {
             required_physical_columns: None,
             requested_physical_columns: None,
             variant_min_max: false,
+            #[cfg(feature = "geo-type-in-dev")]
+            geometry_min_max: false,
         }
     }
 

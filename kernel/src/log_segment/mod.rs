@@ -30,6 +30,8 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::{FileType, ScanFile};
 use crate::schema::compare::SchemaComparison;
+#[cfg(feature = "geo-type-in-dev")]
+use crate::schema::PrimitiveType;
 use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 #[cfg(feature = "declarative-plans")]
@@ -1537,7 +1539,13 @@ impl LogSegment {
             return false;
         };
 
-        if !Self::structs_have_compatible_types(stats_struct, stats_schema, "stats_parsed") {
+        if !Self::structs_have_compatible_types(
+            stats_struct,
+            stats_schema,
+            "stats_parsed",
+            #[cfg(feature = "geo-type-in-dev")]
+            true,
+        ) {
             return false;
         }
 
@@ -1555,12 +1563,16 @@ impl LogSegment {
     /// - A needed VARIANT against an available struct: the struct must have exactly the variant's
     ///   physical fields, with compatible types. A shredded struct is not compatible with an
     ///   unshredded VARIANT.
+    /// - For statistics only, Binary can back requested Geometry bounds. The engine must read the
+    ///   WKB using the requested logical Geometry type; this does not establish CRS compatibility
+    ///   when the available schema omits it.
     /// - Missing fields in checkpoint: OK (will return null when accessed)
     /// - Extra fields in checkpoint: OK (ignored)
     fn structs_have_compatible_types(
         available: &StructType,
         needed: &StructType,
         context: &str,
+        #[cfg(feature = "geo-type-in-dev")] allow_geometry_bounds: bool,
     ) -> bool {
         for needed_field in needed.fields() {
             let Some(available_field) = available.field(needed_field.name()) else {
@@ -1575,6 +1587,8 @@ impl LogSegment {
                         avail_struct,
                         need_struct,
                         &nested_context(),
+                        #[cfg(feature = "geo-type-in-dev")]
+                        allow_geometry_bounds,
                     ) {
                         return false;
                     }
@@ -1583,13 +1597,24 @@ impl LogSegment {
                 // schema rules otherwise.
                 (avail_type, need_type) => {
                     let compatible = match (avail_type, need_type) {
+                        #[cfg(feature = "geo-type-in-dev")]
+                        (
+                            DataType::Primitive(PrimitiveType::Binary),
+                            DataType::Primitive(PrimitiveType::Geometry(_)),
+                        ) if allow_geometry_bounds => true,
                         (DataType::Primitive(a), DataType::Primitive(b)) => {
                             a.is_stats_type_compatible_with(b)
                         }
                         (DataType::Struct(a), DataType::Variant(b)) => {
                             a.num_fields() == b.num_fields()
                                 && b.fields().all(|f| a.field(f.name()).is_some())
-                                && Self::structs_have_compatible_types(a, b, &nested_context())
+                                && Self::structs_have_compatible_types(
+                                    a,
+                                    b,
+                                    &nested_context(),
+                                    #[cfg(feature = "geo-type-in-dev")]
+                                    allow_geometry_bounds,
+                                )
                         }
                         (a, b) => a.can_read_as(b).is_ok(),
                     };
@@ -1643,6 +1668,8 @@ impl LogSegment {
             partition_struct,
             partition_schema,
             "partitionValues_parsed",
+            #[cfg(feature = "geo-type-in-dev")]
+            false,
         ) {
             return false;
         }

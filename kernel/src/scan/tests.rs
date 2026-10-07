@@ -39,6 +39,8 @@ use crate::{
     KernelResult, ParquetFooter, ParquetHandler, PredicateRef, ResultIteratorStatic, Snapshot,
 };
 
+#[cfg(feature = "geo-type-in-dev")]
+mod geometry_stats;
 mod variant_stats;
 
 fn field_names(s: &StructArray) -> Vec<String> {
