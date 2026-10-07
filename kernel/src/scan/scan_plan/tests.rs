@@ -193,7 +193,6 @@ fn leaf_paths(batches: &[RecordBatch]) -> Vec<String> {
     for field in schema.fields() {
         append(field, "", &mut paths);
     }
-    paths.sort_unstable();
     paths
 }
 
@@ -332,7 +331,7 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         unexpected_fields.is_empty(),
         "declarative metadata fields missing from imperative output: {unexpected_fields:?}"
     );
-    let actual_stats_fields: Vec<_> = actual_fields
+    let mut actual_stats_fields: Vec<_> = actual_fields
         .into_iter()
         .filter(|field| field == STATS || field.starts_with("stats_parsed."))
         .collect();
@@ -346,6 +345,7 @@ fn declarative_metadata_matches_imperative_across_stats_options(
                 .to_string()
         })
         .collect();
+    actual_stats_fields.sort_unstable();
     expected_stats_fields.sort_unstable();
     assert_eq!(actual_stats_fields, expected_stats_fields);
     let parsed_stats_requested = match &struct_stats {
@@ -372,12 +372,10 @@ fn declarative_metadata_matches_imperative_across_stats_options(
     )
 }
 
-const ADD_FIELDS: &[&str] = &[
-    "add.path",
-    "add.size",
-    "add.modificationTime",
-    "add.dataChange",
-    "add.partitionValues",
+const ADD_PREFIX_FIELDS: &[&str] = &["add.path", "add.partitionValues"];
+const ADD_FILE_FIELDS: &[&str] = &["add.size", "add.modificationTime", "add.dataChange"];
+const ADD_SUFFIX_FIELDS: &[&str] = &[
+    "add.tags",
     "add.deletionVector.storageType",
     "add.deletionVector.pathOrInlineDv",
     "add.deletionVector.offset",
@@ -385,8 +383,11 @@ const ADD_FIELDS: &[&str] = &[
     "add.deletionVector.cardinality",
     "add.baseRowId",
     "add.defaultRowCommitVersion",
-    "add.tags",
     "add.clusteringProvider",
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    "add.backReference.manifest",
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    "add.backReference.pos",
 ];
 const ALL_STATS_PARSED_FIELDS: &[&str] = &[
     "add.stats_parsed.numRecords",
@@ -431,72 +432,89 @@ const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
 #[case::json_only_string_map(
     StatsOptions::json_only(),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_FIELDS, JSON_STATS_FIELDS]
+    &[ADD_PREFIX_FIELDS, ADD_FILE_FIELDS, JSON_STATS_FIELDS, ADD_SUFFIX_FIELDS]
 )]
 #[case::json_only_with_struct(
     StatsOptions::json_only(),
     PartitionValuesOptions::with_struct(),
-    &[ADD_FIELDS, JSON_STATS_FIELDS, PARTITION_PARSED_FIELDS]
+    &[
+        ADD_PREFIX_FIELDS, PARTITION_PARSED_FIELDS, ADD_FILE_FIELDS,
+        JSON_STATS_FIELDS, ADD_SUFFIX_FIELDS
+    ]
 )]
 #[case::all_struct_string_map(
     StatsOptions::all_struct(),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS]
+    &[ADD_PREFIX_FIELDS, ADD_FILE_FIELDS, ALL_STATS_PARSED_FIELDS, ADD_SUFFIX_FIELDS]
 )]
 #[case::all_struct_with_struct(
     StatsOptions::all_struct(),
     PartitionValuesOptions::with_struct(),
-    &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS, PARTITION_PARSED_FIELDS]
+    &[
+        ADD_PREFIX_FIELDS, PARTITION_PARSED_FIELDS, ADD_FILE_FIELDS,
+        ALL_STATS_PARSED_FIELDS, ADD_SUFFIX_FIELDS
+    ]
 )]
 #[case::struct_columns_string_map(
     StatsOptions::struct_columns(vec![column_name!("id")]),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_FIELDS, ID_STATS_PARSED_FIELDS]
+    &[ADD_PREFIX_FIELDS, ADD_FILE_FIELDS, ID_STATS_PARSED_FIELDS, ADD_SUFFIX_FIELDS]
 )]
 #[case::struct_columns_with_struct(
     StatsOptions::struct_columns(vec![column_name!("id")]),
     PartitionValuesOptions::with_struct(),
-    &[ADD_FIELDS, ID_STATS_PARSED_FIELDS, PARTITION_PARSED_FIELDS]
+    &[
+        ADD_PREFIX_FIELDS, PARTITION_PARSED_FIELDS, ADD_FILE_FIELDS,
+        ID_STATS_PARSED_FIELDS, ADD_SUFFIX_FIELDS
+    ]
 )]
 #[case::empty_struct_columns_string_map(
     StatsOptions::struct_columns(vec![]),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_FIELDS]
+    &[ADD_PREFIX_FIELDS, ADD_FILE_FIELDS, ADD_SUFFIX_FIELDS]
 )]
 #[case::empty_struct_columns_with_struct(
     StatsOptions::struct_columns(vec![]),
     PartitionValuesOptions::with_struct(),
-    &[ADD_FIELDS, PARTITION_PARSED_FIELDS]
+    &[ADD_PREFIX_FIELDS, PARTITION_PARSED_FIELDS, ADD_FILE_FIELDS, ADD_SUFFIX_FIELDS]
 )]
 #[case::all_string_map(
     StatsOptions::all(),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS, JSON_STATS_FIELDS]
+    &[
+        ADD_PREFIX_FIELDS, ADD_FILE_FIELDS, JSON_STATS_FIELDS,
+        ALL_STATS_PARSED_FIELDS, ADD_SUFFIX_FIELDS
+    ]
 )]
 #[case::all_with_struct(
     StatsOptions::all(),
     PartitionValuesOptions::with_struct(),
     &[
-        ADD_FIELDS,
-        ALL_STATS_PARSED_FIELDS,
-        JSON_STATS_FIELDS,
+        ADD_PREFIX_FIELDS,
         PARTITION_PARSED_FIELDS,
+        ADD_FILE_FIELDS,
+        JSON_STATS_FIELDS,
+        ALL_STATS_PARSED_FIELDS,
+        ADD_SUFFIX_FIELDS,
     ]
 )]
 #[case::both_columns(
     StatsOptions { synthesize_json: true, ..StatsOptions::struct_columns(vec![column_name!("id")]) },
     PartitionValuesOptions::with_struct(),
-    &[ADD_FIELDS, ID_STATS_PARSED_FIELDS, JSON_STATS_FIELDS, PARTITION_PARSED_FIELDS]
+    &[
+        ADD_PREFIX_FIELDS, PARTITION_PARSED_FIELDS, ADD_FILE_FIELDS,
+        JSON_STATS_FIELDS, ID_STATS_PARSED_FIELDS, ADD_SUFFIX_FIELDS
+    ]
 )]
 #[case::none_string_map(
     StatsOptions::none(),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_FIELDS]
+    &[ADD_PREFIX_FIELDS, ADD_FILE_FIELDS, ADD_SUFFIX_FIELDS]
 )]
 #[case::none_with_struct(
     StatsOptions::none(),
     PartitionValuesOptions::with_struct(),
-    &[ADD_FIELDS, PARTITION_PARSED_FIELDS]
+    &[ADD_PREFIX_FIELDS, PARTITION_PARSED_FIELDS, ADD_FILE_FIELDS, ADD_SUFFIX_FIELDS]
 )]
 fn declarative_metadata_has_exact_leaf_schema_across_output_options(
     #[case] stats: StatsOptions,
@@ -549,19 +567,11 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
             }
         }
 
-        let mut expected: Vec<_> = expected_field_groups
+        let expected: Vec<_> = expected_field_groups
             .iter()
             .flat_map(|fields| fields.iter())
             .map(|field| field.to_string())
             .collect();
-        // Back references are part of the adaptive-metadata-tree schema; they appear as `add`
-        // leaves only when that feature is enabled.
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        {
-            expected.push("add.backReference.manifest".to_string());
-            expected.push("add.backReference.pos".to_string());
-        }
-        expected.sort_unstable();
         assert_eq!(leaf_paths(&actual), expected);
         Ok(())
     })()
@@ -601,10 +611,11 @@ fn declarative_metadata_projects_nested_column_mapped_stats(
     }
     let parent = "col-481c7590-d3b8-4e9c-b40e-7b7128a972f4";
     let child = "col-7f2f94cf-7082-430c-bba7-852bc6c5215e";
-    let stats_paths: Vec<_> = leaf_paths(&actual)
+    let mut stats_paths: Vec<_> = leaf_paths(&actual)
         .into_iter()
         .filter(|path| path.starts_with(STATS_PARSED))
         .collect();
+    stats_paths.sort_unstable();
     assert_eq!(
         stats_paths,
         [

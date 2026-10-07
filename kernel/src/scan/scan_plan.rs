@@ -114,6 +114,19 @@ impl<'a> MetadataPlanner<'a> {
     /// checkpoint or a commit file.
     /// `read_removes` controls whether the read schema includes remove actions; other replay
     /// columns pass through unchanged.
+    ///
+    /// The schema evolves as follows (schematic); `add_base` is [`ADD_SCHEMA`] without `stats`:
+    /// ```text
+    /// read:       { add: { add_base, (stats OR stats_parsed)?, native partitionValues_parsed? },
+    ///               remove?, version }
+    /// pre-filter: { add: { add_base, (working stats_parsed OR stats)?,
+    ///                      required partitionValues_parsed? }, remove?, version, is_add? }
+    /// filter:     same schema; remove actions pass through for newest-action-wins replay
+    /// output:     { add: { add_base, requested stats?, requested stats_parsed?,
+    ///                      requested partitionValues_parsed? }, remove?, version }
+    /// ```
+    /// Working structured stats include filter and output columns. JSON output disables filtering;
+    /// both stats representations can coexist only at the output boundary.
     fn build_metadata_arm(
         &self,
         available_file_schema: &StructType,
@@ -132,7 +145,10 @@ impl<'a> MetadataPlanner<'a> {
         self.project_post_stats_filter(post_stats_filter, stats)
     }
 
-    /// Builds the action read schema and reports its stats kind and partition struct presence.
+    /// Builds `{ add, remove?, version }` and reports its stats kind and partition struct presence.
+    /// `add` follows [`ADD_SCHEMA`] with at most one stats representation and only compatible
+    /// requested native structs. As in checkpoint writing, parsed fields follow their string/map
+    /// counterparts regardless of source order. Dropping `stats` leaves `stats_parsed` in its slot.
     fn read_schema(
         &self,
         file_schema: &StructType,
@@ -153,19 +169,20 @@ impl<'a> MetadataPlanner<'a> {
             (Some(required), Some(DataType::Struct(native)))
                 if LogSegment::structs_have_compatible_types(native, required, STATS_PARSED) =>
             {
-                let patch = patch.drop(STATS).append(StructField::nullable(
-                    STATS_PARSED,
-                    required.as_ref().clone(),
-                ));
+                let patch = patch.drop(STATS).insert_after(
+                    STATS,
+                    StructField::nullable(STATS_PARSED, required.as_ref().clone()),
+                );
                 (patch, StatsKind::Struct)
             }
             // JSON synthesis needs the source's full stats, not the requested subset.
             (None, Some(DataType::Struct(native)))
                 if self.scan.stats.synthesize_json && !add.contains(STATS) =>
             {
-                let patch = patch
-                    .drop(STATS)
-                    .append(StructField::nullable(STATS_PARSED, native.as_ref().clone()));
+                let patch = patch.drop(STATS).insert_after(
+                    STATS,
+                    StructField::nullable(STATS_PARSED, native.as_ref().clone()),
+                );
 
                 (patch, StatsKind::Struct)
             }
@@ -182,10 +199,10 @@ impl<'a> MetadataPlanner<'a> {
             _ => None,
         };
         let add_patch = add_patch.fold_with(read_partitions, |patch, schema| {
-            patch.append(StructField::nullable(
-                PARTITION_VALUES_PARSED,
-                schema.as_ref().clone(),
-            ))
+            patch.insert_after(
+                PARTITION_VALUES,
+                StructField::nullable(PARTITION_VALUES_PARSED, schema.as_ref().clone()),
+            )
         });
         let read_schema = schema_ref! {
             nullable ADD_NAME: (add_patch.build(&ADD_SCHEMA)?),
@@ -197,6 +214,11 @@ impl<'a> MetadataPlanner<'a> {
 
     /// Adds structured metadata needed by the stats filter or requested output when the source
     /// could not provide compatible native fields.
+    ///
+    /// `add.stats` is replaced by `add.stats_parsed` with the pre-filter stats schema when parsing
+    /// is needed. `add.partitionValues_parsed` is inserted when needed but unavailable natively;
+    /// the string map remains. `remove?` and `version` pass through unchanged. Metadata filtering
+    /// adds top-level `is_add`, including for partition-only filters.
     fn project_pre_stats_filter(
         &self,
         plan: PlanBuilder,
@@ -213,15 +235,17 @@ impl<'a> MetadataPlanner<'a> {
             patch
                 .fold_with(pre_filter_stats_schema, |patch, schema| {
                     stats = StatsKind::Struct;
-                    patch.drop_at([ADD_NAME], STATS).append_at(
+                    patch.drop_at([ADD_NAME], STATS).insert_after_at(
                         [ADD_NAME],
+                        STATS,
                         StructField::nullable(STATS_PARSED, schema.as_ref().clone()),
                         Expr::parse_json(col!(ADD_NAME, STATS), Arc::clone(schema)),
                     )
                 })
                 .fold_with(parsed_partition_schema, |patch, schema| {
-                    patch.append_at(
+                    patch.insert_after_at(
                         [ADD_NAME],
+                        PARTITION_VALUES,
                         StructField::nullable(PARTITION_VALUES_PARSED, schema.as_ref().clone()),
                         Expr::map_to_struct(
                             col!(ADD_NAME, PARTITION_VALUES),
@@ -248,22 +272,24 @@ impl<'a> MetadataPlanner<'a> {
     /// add: struct<
     ///   path: string,
     ///   partitionValues: map<string, string>,
+    ///   partitionValues_parsed: struct<...>,   // when parsed partition values are requested
     ///   size: long,
     ///   modificationTime: long,
     ///   dataChange: boolean,
     ///   stats: string,                         // when JSON stats are requested
+    ///   stats_parsed: struct<...>,             // when parsed stats are requested
     ///   tags: map<string, string>,
     ///   deletionVector: struct<...>,
     ///   baseRowId: long,
     ///   defaultRowCommitVersion: long,
     ///   clusteringProvider: string,
-    ///   stats_parsed: struct<...>,             // when parsed stats are requested
-    ///   partitionValues_parsed: struct<...>,   // when parsed partition values are requested
+    ///   backReference: struct<...>,            // with adaptive metadata support
     /// >
     /// ```
     /// Stats output may contain neither representation, JSON only, parsed only, or both. Parsed
     /// partition values are selected independently and omitted for unpartitioned tables. Fields
-    /// needed only for pruning are omitted. Source-specific top-level columns remain for replay.
+    /// needed only for pruning and top-level `is_add` are omitted. `remove?` and `version` remain
+    /// for replay.
     fn project_post_stats_filter(
         &self,
         plan: PlanBuilder,
@@ -292,8 +318,9 @@ impl<'a> MetadataPlanner<'a> {
             // Parse only at the output boundary, preserving full JSON even for a structured subset.
             if stats == StatsKind::Json {
                 patch = patch.fold_with(output_stats_schema, |patch, schema| {
-                    patch.append_at(
+                    patch.insert_after_at(
                         [ADD_NAME],
+                        STATS,
                         StructField::nullable(STATS_PARSED, schema.as_ref().clone()),
                         Expr::parse_json(col!(ADD_NAME, STATS), Arc::clone(schema)),
                     )
@@ -656,7 +683,13 @@ mod execution_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::{StringArray, StructArray};
+    use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
+    use crate::arrow::array::{
+        Array, ArrayRef, AsArray as _, BooleanArray, Int64Array, RecordBatch, StringArray,
+        StructArray,
+    };
+    use crate::arrow::datatypes::{DataType as ADT, Field, Fields, Schema as ArrowSchema};
+    use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
@@ -664,6 +697,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
+    use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::plans::ir::nodes::Operator;
     use crate::plans::Operation as PlanOperation;
     use crate::scan::{build_stats_output_schemas, PartitionValuesOptions, StatsOptions};
@@ -761,23 +795,21 @@ mod tests {
     }
 
     // One add with JSON stats and no `stats_parsed`.
-    fn write_parquet_checkpoint(store: &Arc<InMemory>, path: &str) -> Result<()> {
-        use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-        use crate::arrow::array::{
-            Array, BooleanArray, Int64Array, RecordBatch, StringArray as SA,
-        };
-        use crate::arrow::datatypes::{DataType as ADT, Field, Fields, Schema};
-        use crate::parquet::arrow::arrow_writer::ArrowWriter;
-
-        // An empty (non-null) `partitionValues` map for the single row; the canonical add schema
-        // requires the field, so the checkpoint file must physically carry it. The inner field
-        // names must match kernel's map convention (`key_value` / `key` / `value`).
+    fn write_parquet_checkpoint(
+        store: &Arc<InMemory>,
+        path: &str,
+        native_partitions: bool,
+    ) -> Result<()> {
+        // The canonical add schema requires a non-null partition map. Its inner field names must
+        // match kernel's map convention (`key_value` / `key` / `value`).
         let map_names = MapFieldNames {
             entry: "key_value".to_string(),
             key: "key".to_string(),
             value: "value".to_string(),
         };
         let mut map = MapBuilder::new(Some(map_names), StringBuilder::new(), StringBuilder::new());
+        map.keys().append_value("p");
+        map.values().append_value("p0");
         map.append(true).unwrap();
         let partition_values = map.finish();
 
@@ -785,7 +817,7 @@ mod tests {
         // non-null scalars (`path`, `size`, `modificationTime`, `dataChange`) and `partitionValues`
         // must be present in the file. `stats` carries the JSON string parsed in the
         // no-parsed-stats path; there is deliberately no `stats_parsed` column.
-        let add_fields = Fields::from(vec![
+        let mut add_fields = vec![
             Field::new("path", ADT::Utf8, true),
             Field::new("stats", ADT::Utf8, true),
             Field::new(
@@ -796,25 +828,35 @@ mod tests {
             Field::new("size", ADT::Int64, true),
             Field::new("modificationTime", ADT::Int64, true),
             Field::new("dataChange", ADT::Boolean, true),
-        ]);
-        let schema = Arc::new(Schema::new(vec![
+        ];
+        let mut add_columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["c.parquet"])),
+            Arc::new(StringArray::from(vec![
+                r#"{"numRecords":1,"minValues":{"x":10},"maxValues":{"x":10}}"#,
+            ])),
+            Arc::new(partition_values),
+            Arc::new(Int64Array::from(vec![1i64])),
+            Arc::new(Int64Array::from(vec![1i64])),
+            Arc::new(BooleanArray::from(vec![true])),
+        ];
+        if native_partitions {
+            let partitions = StructArray::from(vec![(
+                Arc::new(Field::new("p", ADT::Utf8, true)),
+                Arc::new(StringArray::from(vec!["p0"])) as ArrayRef,
+            )]);
+            add_fields.push(Field::new(
+                PARTITION_VALUES_PARSED,
+                partitions.data_type().clone(),
+                true,
+            ));
+            add_columns.push(Arc::new(partitions));
+        }
+        let add_fields = Fields::from(add_fields);
+        let schema = Arc::new(ArrowSchema::new(vec![
             Field::new(ADD_NAME, ADT::Struct(add_fields.clone()), true),
             Field::new(VERSION, ADT::Int64, true),
         ]));
-        let add = StructArray::new(
-            add_fields,
-            vec![
-                Arc::new(SA::from(vec!["c.parquet"])),
-                Arc::new(SA::from(vec![
-                    r#"{"numRecords":1,"minValues":{"x":10},"maxValues":{"x":10}}"#,
-                ])),
-                Arc::new(partition_values),
-                Arc::new(Int64Array::from(vec![1i64])),
-                Arc::new(Int64Array::from(vec![1i64])),
-                Arc::new(BooleanArray::from(vec![true])),
-            ],
-            None,
-        );
+        let add = StructArray::new(add_fields, add_columns, None);
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(add), Arc::new(Int64Array::from(vec![0i64]))],
@@ -876,7 +918,12 @@ mod tests {
         #[case] expect_native_partitions: bool,
         #[values(false, true)] native_stats: bool,
         #[values(CheckpointType::Leaf, CheckpointType::Manifest)] checkpoint_type: CheckpointType,
-        #[values(StatsOptions::all_struct(), StatsOptions::json_only())] stats: StatsOptions,
+        #[values(
+            StatsOptions::all_struct(),
+            StatsOptions::json_only(),
+            StatsOptions::all()
+        )]
+        stats: StatsOptions,
         #[values(true, false)] source_json_stats: bool,
         #[values(1, 32)] width: usize,
     ) -> Result<()> {
@@ -916,6 +963,12 @@ mod tests {
             checkpoint_type,
             leaf_checkpoint_schema: Some(Arc::new(file_schema)),
         };
+        let metadata = MetadataPlanner::try_new(&scan)?;
+        let commit = scan.commit_arm(&metadata)?.build()?;
+        let checkpoint = scan.checkpoint_arm(&shape, &metadata)?.build()?;
+        let commit_add: ArrowSchema = add_struct(&commit.schema).try_into_arrow()?;
+        let checkpoint_add: ArrowSchema = add_struct(&checkpoint.schema).try_into_arrow()?;
+        assert_eq!(commit_add, checkpoint_add, "ordered add schemas must match");
         let plan = scan.build_metadata_scan_plan(&shape)?.expect("non-empty");
 
         let checkpoint_schema = plan
@@ -1116,25 +1169,48 @@ mod tests {
         #[case] stats: StatsOptions,
         #[case] predicate: Predicate,
         #[case] expected_rows: usize,
+        #[values(false, true)] mixed: bool,
     ) -> Result<()> {
         let store = Arc::new(InMemory::new());
         // A single-row parquet checkpoint carrying an `add` with a JSON `stats` string but no
         // `stats_parsed` column.
-        write_parquet_checkpoint(&store, "_delta_log/00000000000000000000.checkpoint.parquet")?;
+        write_parquet_checkpoint(
+            &store,
+            "_delta_log/00000000000000000000.checkpoint.parquet",
+            mixed,
+        )?;
+        let commits = if mixed {
+            futures::executor::block_on(store.put(
+                &Path::from("_delta_log/00000000000000000001.json"),
+                r#"{"add":{"path":"d.parquet","size":1,"modificationTime":1,"dataChange":true,"partitionValues":{"p":"p0"},"stats":"{\"numRecords\":1,\"minValues\":{\"x\":10},\"maxValues\":{\"x\":10}}"}}
+"#
+                .into(),
+            ))?;
+            vec!["memory:///_delta_log/00000000000000000001.json"]
+        } else {
+            vec![]
+        };
 
         let segment = log_segment(
             Url::parse("memory:///_delta_log/").unwrap(),
-            &[],
+            &commits,
             Some("memory:///_delta_log/00000000000000000000.checkpoint.parquet"),
         );
         let scan = mock_snapshot(segment)?
             .scan_builder()
             .with_stats(stats)
+            .with_partition_values(PartitionValuesOptions::with_struct())
             .with_predicate(Arc::new(predicate))
             .build()?;
+        let shape = CheckpointShape {
+            checkpoint_type: CheckpointType::Leaf,
+            leaf_checkpoint_schema: mixed
+                .then(|| checkpoint_file_schema(None, Some(&schema_ref! { nullable "p": STRING })))
+                .transpose()?,
+        };
         let plan = scan
             // Leaf with no compatible parsed stats -> parse add.stats instead.
-            .build_metadata_scan_plan(&shape(CheckpointType::Leaf, None))?
+            .build_metadata_scan_plan(&shape)?
             .expect("non-empty");
 
         for node in &plan.nodes {
@@ -1149,16 +1225,30 @@ mod tests {
             scan.stats.synthesize_json
         );
 
+        let output_schema: ArrowSchema = plan.schema.as_ref().try_into_arrow()?;
         let engine = SyncEngine::new_with_store(store);
-        let mut batches = engine
+        let batches = engine
             .plan_executor()
             .unwrap()
             .execute_op(PlanOperation::QueryPlan(plan))?
             .into_data()?;
-        let actual_rows = batches.try_fold(0, |rows, batch| {
-            Ok::<_, KernelError>(rows + batch?.try_into_record_batch()?.num_rows())
-        })?;
-        assert_eq!(actual_rows, expected_rows);
+        let mut paths = vec![];
+        for batch in batches {
+            let batch = batch?.try_into_record_batch()?;
+            assert_eq!(batch.schema().as_ref(), &output_schema);
+            let add = batch.column_by_name(ADD_NAME).unwrap().as_struct();
+            let path = add.column_by_name("path").unwrap().as_string::<i32>();
+            paths.extend(path.iter().map(|path| path.unwrap().to_owned()));
+        }
+        paths.sort();
+        let expected = if expected_rows == 0 {
+            vec![]
+        } else if mixed {
+            vec!["c.parquet", "d.parquet"]
+        } else {
+            vec!["c.parquet"]
+        };
+        assert_eq!(paths, expected);
         Ok(())
     }
 }
