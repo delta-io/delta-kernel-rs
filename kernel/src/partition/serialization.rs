@@ -14,7 +14,7 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 
-use crate::expressions::{DecimalData, Scalar};
+use crate::expressions::{DecimalData, IntervalYearMonthData, Scalar, MONTHS_PER_YEAR};
 use crate::schema::IntervalYearToMonthType;
 use crate::{KernelError, Result};
 
@@ -94,9 +94,7 @@ pub fn serialize_partition_value(value: &Scalar) -> Result<Option<String>> {
         Scalar::Date(days) => Ok(Some(format_date(*days)?)),
         Scalar::Timestamp(us) => Ok(Some(format_timestamp(*us)?)),
         Scalar::TimestampNtz(us) => Ok(Some(format_timestamp_ntz(*us)?)),
-        Scalar::IntervalYearMonth(data) => {
-            Ok(Some(format_year_month_interval(data.months(), *data.ty())?))
-        }
+        Scalar::IntervalYearMonth(data) => Ok(Some(format_year_month_interval(data)?)),
         Scalar::IntervalDayTime(micros) => Ok(Some(format_day_time_interval(*micros))),
         Scalar::Decimal(d) => Ok(Some(format_decimal(d))),
         Scalar::Binary(b) if b.is_empty() => Ok(None),
@@ -201,23 +199,25 @@ fn format_timestamp_ntz(micros: i64) -> Result<String> {
         .map(|dt| dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string())
 }
 
-fn format_year_month_interval(months: i32, ty: IntervalYearToMonthType) -> Result<String> {
+fn format_year_month_interval(data: &IntervalYearMonthData) -> Result<String> {
+    let months = data.months();
     let sign = if months < 0 { "-" } else { "" };
     let abs = months.unsigned_abs();
-    match ty {
+    let months_per_year = MONTHS_PER_YEAR as u32;
+    match data.ty() {
         IntervalYearToMonthType::IntervalYear => {
-            if months % 12 != 0 {
+            if months % MONTHS_PER_YEAR != 0 {
                 return Err(KernelError::invalid_partition_values(format!(
-                    "interval year partition value {months} months is not divisible by 12"
+                    "interval year partition value {months} months is not divisible by {MONTHS_PER_YEAR}"
                 )));
             }
-            Ok(format!("INTERVAL '{sign}{}' YEAR", abs / 12))
+            Ok(format!("INTERVAL '{sign}{}' YEAR", abs / months_per_year))
         }
         IntervalYearToMonthType::IntervalMonth => Ok(format!("INTERVAL '{months}' MONTH")),
         IntervalYearToMonthType::IntervalYearToMonth => Ok(format!(
             "INTERVAL '{sign}{}-{}' YEAR TO MONTH",
-            abs / 12,
-            abs % 12
+            abs / months_per_year,
+            abs % months_per_year
         )),
     }
 }

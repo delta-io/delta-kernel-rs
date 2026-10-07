@@ -19,7 +19,7 @@ use crate::schema::{
 use crate::utils::require;
 use crate::{KernelError, Result};
 
-const MONTHS_PER_YEAR: i32 = 12;
+pub(crate) const MONTHS_PER_YEAR: i32 = 12;
 
 /// Pairs [`Into<Scalar>`] with [`ToDataType`] for infallible container conversions.
 ///
