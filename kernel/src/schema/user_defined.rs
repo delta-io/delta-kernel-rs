@@ -1,6 +1,6 @@
 //! User-defined schema annotations and their physical representation.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use serde::de::Error as _;
 use serde::ser::SerializeMap;
@@ -46,7 +46,7 @@ use crate::{KernelError, Result};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserDefinedType {
     sql_type: Box<DataType>,
-    annotation: BTreeMap<String, Option<String>>,
+    annotation: HashMap<String, Option<String>>,
 }
 
 impl UserDefinedType {
@@ -58,7 +58,7 @@ impl UserDefinedType {
     /// contains the reserved key `type` or `sqlType`.
     pub fn try_new(
         sql_type: impl Into<DataType>,
-        annotation: BTreeMap<String, Option<String>>,
+        annotation: HashMap<String, Option<String>>,
     ) -> Result<Self> {
         let sql_type = sql_type.into();
         if contains_udt(&sql_type) {
@@ -90,7 +90,7 @@ impl UserDefinedType {
     /// Returns the engine-defined annotation.
     ///
     /// A value of `None` represents an explicit JSON `null`; an absent key is not serialized.
-    pub fn annotation(&self) -> &BTreeMap<String, Option<String>> {
+    pub fn annotation(&self) -> &HashMap<String, Option<String>> {
         &self.annotation
     }
 }
@@ -120,7 +120,7 @@ impl<'de> Deserialize<'de> for UserDefinedType {
             #[serde(rename = "sqlType")]
             sql_type: Box<DataType>,
             #[serde(flatten)]
-            annotation: BTreeMap<String, Option<String>>,
+            annotation: HashMap<String, Option<String>>,
         }
         let repr = Repr::deserialize(deserializer)?;
         if repr.type_name != "udt" {
@@ -379,7 +379,7 @@ mod tests {
         physical_type: DataType,
     ) {
         let udt = DataType::from(
-            UserDefinedType::try_new(physical_type.clone(), BTreeMap::new()).unwrap(),
+            UserDefinedType::try_new(physical_type.clone(), HashMap::new()).unwrap(),
         );
         assert_ne!(udt, physical_type);
         for (source, target) in [(&udt, &physical_type), (&physical_type, &udt)] {
@@ -472,9 +472,9 @@ mod tests {
 
     #[test]
     fn construction_rejects_nested_udt() {
-        let inner = UserDefinedType::try_new(DataType::LONG, BTreeMap::new()).unwrap();
+        let inner = UserDefinedType::try_new(DataType::LONG, HashMap::new()).unwrap();
         assert!(
-            UserDefinedType::try_new(DataType::from(inner), BTreeMap::new())
+            UserDefinedType::try_new(DataType::from(inner), HashMap::new())
                 .unwrap_err()
                 .to_string()
                 .contains("another UDT")
@@ -493,7 +493,7 @@ mod tests {
                 Err(())
             }
         }
-        let udt = UserDefinedType::try_new(DataType::LONG, BTreeMap::new()).unwrap();
+        let udt = UserDefinedType::try_new(DataType::LONG, HashMap::new()).unwrap();
         assert!(RejectPrimitives.transform(&DataType::from(udt)).is_ok());
         assert!(RejectPrimitives.transform(&DataType::LONG).is_err());
     }
