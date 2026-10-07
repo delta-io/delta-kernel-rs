@@ -16,6 +16,7 @@ pub use self::column_names::{
 };
 #[doc(inline)]
 pub use self::macros::expr;
+pub(crate) use self::scalars::MONTHS_PER_YEAR;
 pub use self::scalars::{
     ArrayData, DecimalData, IntervalYearMonthData, MapData, Scalar, StructData,
 };

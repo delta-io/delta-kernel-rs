@@ -408,7 +408,7 @@ pub extern "C" fn visit_expression_literal_interval_year_month(
 fn visit_expression_literal_interval_year_month_impl(
     state: &mut KernelExpressionVisitorState,
     value: i32,
-) -> Result<usize> {
+) -> KernelResult<usize> {
     let scalar = Scalar::interval_year_month(value, IntervalYearToMonthType::IntervalYearToMonth)?;
     Ok(wrap_expression(state, lit(scalar)))
 }
