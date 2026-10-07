@@ -252,18 +252,21 @@ async fn create_fixture(
         .unwrap_post_commit_snapshot();
     for (batch, bounds) in &fixture.files {
         snapshot = write_batch_to_table(&snapshot, engine, batch.clone(), HashMap::new()).await?;
-        if bounds.is_null() {
-            continue;
-        }
-        let bounds = mapped_bounds(bounds, &snapshot.schema());
-        // Simulate a writer supplying collation stats; Kernel itself computes only binary stats.
+        let bounds = (!bounds.is_null()).then(|| mapped_bounds(bounds, &snapshot.schema()));
         let mut adds = 0;
         rewrite_commit(table_path, snapshot.version(), |action| {
+            if let Some(commit_info) = action.get_mut("commitInfo") {
+                // CRC replay requires a known operation for file-changing commits.
+                commit_info["operation"] = json!("WRITE");
+            }
             if let Some(add) = action.get_mut("add") {
-                let mut stats: Value = serde_json::from_str(add["stats"].as_str().unwrap())?;
-                assert!(stats.get("statsWithCollation").is_none());
-                stats["statsWithCollation"] = json!({ fixture.collation_id: bounds });
-                add["stats"] = Value::String(stats.to_string());
+                if let Some(bounds) = &bounds {
+                    // Simulate writer-supplied collation stats; Kernel computes only binary stats.
+                    let mut stats: Value = serde_json::from_str(add["stats"].as_str().unwrap())?;
+                    assert!(stats.get("statsWithCollation").is_none());
+                    stats["statsWithCollation"] = json!({ fixture.collation_id: bounds });
+                    add["stats"] = Value::String(stats.to_string());
+                }
                 adds += 1;
             }
             Ok(())
