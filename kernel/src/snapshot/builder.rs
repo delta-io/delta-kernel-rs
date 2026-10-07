@@ -638,9 +638,10 @@ impl<Mode> SnapshotBuilder<Mode> {
             SnapshotHintError::LogCompaction.into()
         );
 
-        // Construction checks every path before grouping can discard it. Recheck retained paths
-        // because a hint can be attached to a builder for a different table.
-        validate_snapshot_hint_paths(log_segment_files.iter_all_paths(), &log_root)?;
+        // Construction validates every path against one root, and grouping preserves locations.
+        // One retained path suffices to reject a hint attached to a different table's builder.
+        // LogSegment::try_new below rejects empty replay history.
+        validate_snapshot_hint_paths(log_segment_files.iter_all_paths().take(1), &log_root)?;
         let log_segment = LogSegment::try_new(
             log_segment_files,
             log_root,
@@ -1045,13 +1046,33 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn snapshot_hint_build_rejects_a_hint_constructed_for_another_table() {
-        let supplied = "memory:///target/_delta_log/00000000000000000010.checkpoint.parquet";
+    #[rstest::rstest]
+    #[case::commit_only(0, &["00000000000000000000.json"])]
+    #[case::checkpoint_only(10, &["00000000000000000010.checkpoint.parquet"])]
+    #[case::checkpoint_and_commit(
+        11,
+        &[
+            "00000000000000000010.checkpoint.parquet",
+            "00000000000000000011.json",
+        ]
+    )]
+    fn snapshot_hint_build_validates_the_hint_table_root(
+        #[case] version: Version,
+        #[case] filenames: &[&str],
+        #[values("memory:///target/", "memory:///other/")] builder_table_root: &str,
+    ) {
+        const TABLE_ROOT: &str = "memory:///target/";
+        let log_paths = filenames
+            .iter()
+            .map(|filename| {
+                let supplied = format!("{TABLE_ROOT}_delta_log/{filename}");
+                LogPath::try_new(create_log_path_with_size(&supplied, 1).location).unwrap()
+            })
+            .collect_vec();
         let hint = SnapshotHint::try_new(
-            "memory:///target/",
-            10,
-            vec![LogPath::try_new(create_log_path_with_size(supplied, 1).location).unwrap()],
+            TABLE_ROOT,
+            version,
+            log_paths,
             Protocol::try_new_legacy(1, 2).unwrap(),
             Metadata::default()
                 .with_schema(schema_ref! { nullable "id": INTEGER })
@@ -1061,20 +1082,58 @@ mod tests {
             SnapshotHintFreshness::Unverified,
         )
         .unwrap();
+        let first_retained_path = hint
+            .log_segment_files
+            .iter_all_paths()
+            .next()
+            .unwrap()
+            .location
+            .location
+            .to_string();
         let (engine, _store, _table_root) = setup_test();
-        let error = SnapshotBuilder::new_for("memory:///other/")
+        let result = SnapshotBuilder::new_for(builder_table_root)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref())
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            KernelError::SnapshotHint(source)
-                if matches!(
-                    &*source,
-                    SnapshotHintError::LogPathOutsideRoot { path, log_root }
-                        if path == supplied && log_root == "memory:///other/_delta_log/"
-                )
-        ));
+            .build(engine.as_ref());
+        if builder_table_root == TABLE_ROOT {
+            let snapshot = result.unwrap();
+            assert_eq!(snapshot.version(), version);
+            assert_eq!(snapshot.table_root().as_str(), TABLE_ROOT);
+        } else {
+            assert!(matches!(
+                result.unwrap_err(),
+                KernelError::SnapshotHint(source)
+                    if matches!(
+                        &*source,
+                        SnapshotHintError::LogPathOutsideRoot { path, log_root }
+                            if path == &first_retained_path
+                                && log_root == "memory:///other/_delta_log/"
+                    )
+            ));
+        }
+    }
+
+    #[rstest::rstest]
+    fn snapshot_hint_build_rejects_empty_replay_history(
+        #[values("memory:///target/", "memory:///other/")] builder_table_root: &str,
+    ) {
+        let hint = SnapshotHint::try_new(
+            "memory:///target/",
+            0,
+            Vec::new(),
+            Protocol::default(),
+            Metadata::default(),
+            None,
+            None,
+            SnapshotHintFreshness::Unverified,
+        )
+        .unwrap();
+        let (engine, _store, _table_root) = setup_test();
+        assert_log_segment_hint_error(
+            SnapshotBuilder::new_for(builder_table_root)
+                .with_snapshot_hint(hint)
+                .build(engine.as_ref()),
+            "No table version found",
+        );
     }
 
     #[derive(Clone, Copy)]

@@ -37,9 +37,9 @@ listing.
 Under `internal-api`, `.with_snapshot_hint(hint)` constructs a snapshot without engine log I/O.
 `SnapshotHint::try_new(table_root, ...)` validates every supplied log path beneath the table's
 `_delta_log` root before grouping and checkpoint selection. Kernel preserves the supplied locations;
-the connector must canonicalize them into the same URL form as the table root. Build rechecks the
-retained paths against the builder's root and validates structural consistency. The connector owns
-protocol/metadata provenance and freshness.
+the connector must canonicalize them into the same URL form as the table root. Build checks the
+hint's table membership against the builder's root and validates structural consistency. The
+connector owns protocol/metadata provenance and freshness.
 
 **Snapshot loading internals:**
 1. Ordinary builds discover commits and checkpoints through **LogSegment**
