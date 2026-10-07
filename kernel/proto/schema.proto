@@ -85,7 +85,6 @@ message StructType {
 
 message VariantType {}
 
-message FileType {}
 // Preserves string-or-null annotation members during schema transport.
 // A present annotation key without a string value represents an explicit JSON null.
 message UserDefinedAnnotationValue {
@@ -100,6 +99,8 @@ message UserDefinedType {
   DataType sql_type = 1;
   map<string, UserDefinedAnnotationValue> annotation = 2;
 }
+
+message FileType {}
 
 message MetadataValue {
   oneof value {
@@ -124,7 +125,7 @@ message DataType {
     StructType struct = 3;
     MapType map = 4;
     VariantType variant = 5;
-    FileType file = 7;
     UserDefinedType user_defined = 6;
+    FileType file = 7;
   }
 }

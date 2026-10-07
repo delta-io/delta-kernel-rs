@@ -638,9 +638,6 @@ impl From<&DataType> for proto_schema::DataType {
             DataType::Map(map) => DataTypeKind::Map(Box::new(map.as_ref().into())),
             // The proto `VariantType` is intentionally empty: variants are opaque on the wire.
             DataType::Variant(_) => DataTypeKind::Variant(proto_schema::VariantType {}),
-            // The proto `FileType` is empty: a `file` has a fixed, canonical set of sub-fields, so
-            // the type identity alone is enough to reconstruct it.
-            DataType::File(_) => DataTypeKind::File(proto_schema::FileType {}),
             #[cfg(feature = "udt-in-dev")]
             DataType::UserDefined(udt) => {
                 DataTypeKind::UserDefined(Box::new(proto_schema::UserDefinedType {
@@ -659,6 +656,9 @@ impl From<&DataType> for proto_schema::DataType {
                         .collect(),
                 }))
             }
+            // The proto `FileType` is empty: a `file` has a fixed, canonical set of sub-fields, so
+            // the type identity alone is enough to reconstruct it.
+            DataType::File(_) => DataTypeKind::File(proto_schema::FileType {}),
         };
         proto_schema::DataType { kind: Some(kind) }
     }
@@ -844,7 +844,6 @@ impl TryFrom<proto_schema::DataType> for DataType {
             DataTypeKind::Map(map) => DataType::from(MapType::try_from(*map)?),
             // Kernel does not support shredded variants, so always decode as unshredded.
             DataTypeKind::Variant(_) => DataType::unshredded_variant(),
-            DataTypeKind::File(_) => DataType::file_type(),
             DataTypeKind::UserDefined(udt) => {
                 #[cfg(feature = "udt-in-dev")]
                 {
@@ -866,6 +865,7 @@ impl TryFrom<proto_schema::DataType> for DataType {
                     return Err(KernelError::unsupported("UDT requires udt-in-dev"));
                 }
             }
+            DataTypeKind::File(_) => DataType::file_type(),
         };
         Ok(data_type)
     }
@@ -2219,8 +2219,8 @@ mod tests {
             Kind::Struct(_) => "struct",
             Kind::Map(_) => "map",
             Kind::Variant(_) => "variant",
-            Kind::File(_) => "file",
             Kind::UserDefined(_) => "udt",
+            Kind::File(_) => "file",
         };
         assert_eq!(kind, expected);
     }

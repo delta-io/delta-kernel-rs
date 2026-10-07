@@ -2269,18 +2269,18 @@ pub enum DataType {
     /// reads. The unshredded schema is `Variant(StructType<metadata: BINARY, value: BINARY>)`.
     #[serde(serialize_with = "serialize_variant")]
     Variant(Box<StructType>),
-    /// The File data type. A reference to a range of bytes located inline or in an external file.
-    /// Physically a group of six optional fields: `uri`, `offset`, `size`, `content_type`,
-    /// `checksum`, and `inline`. Like Variant, the type identity is carried in the Delta schema;
-    /// the physical representation is a plain struct.
-    #[serde(serialize_with = "serialize_file")]
-    File(Box<StructType>),
     /// An engine annotation over a physical Delta type.
     /// Retains logical type information in schemas; physical operations use the enclosed
     /// `sql_type`. See [`UserDefinedType`] for a schema example.
     #[cfg(feature = "udt-in-dev")]
     #[from(UserDefinedType)]
     UserDefined(UserDefinedType),
+    /// The File data type. A reference to a range of bytes located inline or in an external file.
+    /// Physically a group of six optional fields: `uri`, `offset`, `size`, `content_type`,
+    /// `checksum`, and `inline`. Like Variant, the type identity is carried in the Delta schema;
+    /// the physical representation is a plain struct.
+    #[serde(serialize_with = "serialize_file")]
+    File(Box<StructType>),
 }
 
 #[cfg(feature = "geo-type-in-dev")]
@@ -2427,9 +2427,9 @@ impl DataType {
             Self::Struct(_) => "struct".to_string(),
             Self::Map(_) => "map".to_string(),
             Self::Variant(_) => "variant".to_string(),
-            Self::File(_) => "file".to_string(),
             #[cfg(feature = "udt-in-dev")]
             Self::UserDefined(_) => "udt".to_string(),
+            Self::File(_) => "file".to_string(),
         }
     }
 
@@ -2558,9 +2558,9 @@ impl Display for DataType {
             }
             DataType::Map(m) => write!(f, "map<{}, {}>", m.key_type, m.value_type),
             DataType::Variant(_) => write!(f, "variant"),
-            DataType::File(_) => write!(f, "file"),
             #[cfg(feature = "udt-in-dev")]
             DataType::UserDefined(udt) => write!(f, "udt({})", udt.sql_type()),
+            DataType::File(_) => write!(f, "file"),
         }
     }
 }

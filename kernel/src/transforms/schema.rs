@@ -127,12 +127,6 @@ pub trait SchemaTransform<'a> {
         self.recurse_into_struct(stype)
     }
 
-    /// Called for each file value encountered. The provided implementation just
-    /// forwards to [`Self::recurse_into_struct`].
-    fn transform_file(&mut self, stype: &'a StructType) -> Self::Output<StructType> {
-        self.recurse_into_struct(stype)
-    }
-
     /// Visits a user-defined type as a leaf, preserving its physical type and annotation.
     #[cfg(feature = "udt-in-dev")]
     fn transform_user_defined(
@@ -140,6 +134,12 @@ pub trait SchemaTransform<'a> {
         udt: &'a UserDefinedType,
     ) -> Self::Output<UserDefinedType> {
         Carrier::from_inner(Cow::Borrowed(udt))
+    }
+
+    /// Called for each file value encountered. The provided implementation just
+    /// forwards to [`Self::recurse_into_struct`].
+    fn transform_file(&mut self, stype: &'a StructType) -> Self::Output<StructType> {
+        self.recurse_into_struct(stype)
     }
 
     /// General entry point for a recursive traversal over any data type. Also invoked internally to
@@ -166,14 +166,14 @@ pub trait SchemaTransform<'a> {
                 let child = self.transform_variant(stype);
                 map_owned_or_else(data_type, child, |s| DataType::Variant(Box::new(s)))
             }
-            DataType::File(stype) => {
-                let child = self.transform_file(stype);
-                map_owned_or_else(data_type, child, |s| DataType::File(Box::new(s)))
-            }
             #[cfg(feature = "udt-in-dev")]
             DataType::UserDefined(udt) => {
                 let child = self.transform_user_defined(udt);
                 map_owned_or_else(data_type, child, DataType::UserDefined)
+            }
+            DataType::File(stype) => {
+                let child = self.transform_file(stype);
+                map_owned_or_else(data_type, child, |s| DataType::File(Box::new(s)))
             }
         }
     }
