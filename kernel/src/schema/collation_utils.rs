@@ -3,6 +3,8 @@
 use crate::schema::{
     ColumnMetadataKey, DataType, FieldMetadataKeyChecker, MetadataValue, Schema, StructField,
 };
+use crate::table_configuration::TableConfiguration;
+use crate::table_features::TableFeature;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
@@ -22,6 +24,31 @@ pub(crate) fn validate_collation_annotations(schema: &Schema) -> KernelResult<()
         return Ok(());
     }
     CollationAnnotationValidator.transform_struct(schema)
+}
+
+/// Validates annotations and requires a declared stable or preview feature on annotated schemas.
+///
+/// This schema/protocol consistency check also applies to reads of this writer-only feature.
+/// Returns a schema error for malformed annotations or an unsupported error for a missing feature.
+pub(crate) fn validate_collations_feature_support(
+    table_config: &TableConfiguration,
+) -> KernelResult<()> {
+    let schema = table_config.logical_schema_ref();
+    validate_collation_annotations(schema)?;
+    require!(
+        !schema_has_collations(schema)
+            || table_config
+                .protocol()
+                .has_table_feature(&TableFeature::Collations)
+            || table_config
+                .protocol()
+                .has_table_feature(&TableFeature::CollationsPreview),
+        KernelError::unsupported(
+            "Table contains collation metadata but requires the 'collations' or \
+             'collations-preview' table feature"
+        )
+    );
+    Ok(())
 }
 
 struct CollationAnnotationValidator;
