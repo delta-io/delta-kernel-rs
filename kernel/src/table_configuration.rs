@@ -3164,6 +3164,37 @@ mod test {
         deps
     }
 
+    #[rstest]
+    #[case::all_satisfied(
+        vec![TableFeature::AdaptiveMetadataPreview, TableFeature::IcebergNativeV4Preview],
+        None
+    )]
+    #[case::missing_adaptive_metadata(
+        vec![TableFeature::IcebergNativeV4Preview],
+        Some("requires 'adaptiveMetadata-preview' to be enabled")
+    )]
+    #[case::invariants_enabled(
+        vec![
+            TableFeature::AdaptiveMetadataPreview,
+            TableFeature::IcebergNativeV4Preview,
+            TableFeature::Invariants,
+        ],
+        Some("requires 'invariants' to not be enabled")
+    )]
+    fn test_iceberg_native_v4_feature_requirements(
+        #[case] features: Vec<TableFeature>,
+        #[case] expected_error_substring: Option<&str>,
+    ) {
+        let config = MockTableConfigurationBuilder::new()
+            .with_protocol(MockProtocolBuilder::new().with_features(features).build())
+            .build();
+        let result = config.validate_feature_requirements(&TableFeature::IcebergNativeV4Preview);
+        match expected_error_substring {
+            Some(msg) => assert_result_error_with_message(result, msg),
+            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
+        }
+    }
+
     // IcebergCompatV1/V2/V3 are pairwise mutually exclusive.
     #[rstest]
     #[case::v1_rejects_v2(

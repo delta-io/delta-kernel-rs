@@ -28,9 +28,9 @@ const WRITER_FEATURES: &[&str] = &[
     "adaptiveMetadata-preview",
 ];
 
-/// Creates a file-backed table supporting `adaptiveMetadata-preview` (and its full dependency
-/// chain) at version 0, and loads a snapshot at that version. The returned [`TempDir`] must be kept
-/// alive for the table's lifetime.
+/// Creates a file-backed table supporting `adaptiveMetadata-preview` (and its dependencies) at
+/// version 0, and loads a snapshot at that version. The returned [`TempDir`] must be kept alive
+/// for the table's lifetime.
 async fn setup_adaptive_metadata_table(
     table_name: &str,
 ) -> Result<(impl Engine, TempDir, Url, SnapshotRef), Box<dyn std::error::Error>> {
