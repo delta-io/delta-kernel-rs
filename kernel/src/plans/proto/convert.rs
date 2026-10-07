@@ -687,6 +687,7 @@ impl From<&PrimitiveType> for proto_schema::PrimitiveType {
             }
             PrimitiveType::Void => PrimitiveTypeKind::Simple(Simple::Void as i32),
             PrimitiveType::IntervalYearMonth(_) => {
+                // The proto tag carries no qualifier; decoding reconstructs the full-range type.
                 PrimitiveTypeKind::Simple(Simple::IntervalYearMonth as i32)
             }
             PrimitiveType::IntervalDayTime => {

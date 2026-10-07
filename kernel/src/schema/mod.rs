@@ -2071,13 +2071,6 @@ pub enum IntervalYearToMonthType {
     IntervalYearToMonth,
 }
 
-impl IntervalYearToMonthType {
-    /// Returns true for the broad `INTERVAL YEAR TO MONTH` qualifier.
-    pub fn is_full_range(&self) -> bool {
-        matches!(self, Self::IntervalYearToMonth)
-    }
-}
-
 impl Display for IntervalYearToMonthType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {

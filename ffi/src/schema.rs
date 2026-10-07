@@ -455,6 +455,7 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             &DataType::TIMESTAMP => call!(visit_timestamp),
             &DataType::TIMESTAMP_NTZ => call!(visit_timestamp_ntz),
             DataType::Primitive(PrimitiveType::IntervalYearMonth(_)) => {
+                // The callback carries no qualifier, so narrowed types lose it here.
                 call!(visit_interval_year_month)
             }
             &DataType::INTERVAL_DAY_TIME => call!(visit_interval_day_time),

@@ -386,7 +386,8 @@ pub enum Scalar {
     Timestamp(i64),
     /// Microsecond precision timestamp, with no timezone.
     TimestampNtz(i64),
-    /// Year-month interval, stored as a signed 32bit count of months (matches Spark Catalyst).
+    /// Year-month interval, stored as a signed month count and an ANSI qualifier.
+    /// `YEAR` values must contain whole years.
     #[from]
     IntervalYearMonth(IntervalYearMonthData),
     /// Day-time interval, stored as a signed 64bit count of microseconds (matches Spark Catalyst).

@@ -225,6 +225,43 @@ async fn write_partitioned_interval_roundtrip(
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_rejects_qualifier_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = schema_ref! {
+        nullable "value": INTEGER,
+        nullable "period": (DataType::interval_year_month(IntervalYearToMonthType::IntervalYear)),
+    };
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot = create_interval_partitioned_table(
+        &table_path,
+        engine.as_ref(),
+        schema,
+        ColumnMappingMode::None,
+        false,
+    )?;
+    let data_schema = schema! { nullable "value": INTEGER };
+    let batch = RecordBatch::try_new(
+        Arc::new((&data_schema).try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![7]))],
+    )?;
+    let partition_value = Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalMonth)?;
+    let error = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        batch,
+        HashMap::from([("period".to_string(), partition_value)]),
+    )
+    .await
+    .expect_err("mismatched partition qualifier should fail");
+    assert!(error
+        .to_string()
+        .contains("partition column 'period' has type"));
+
+    let latest = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(latest.version(), snapshot.version());
+    Ok(())
+}
+
 /// Checks partitionValues spelling before validating materialized Parquet columns and scans.
 #[rstest]
 #[case::year_month(
