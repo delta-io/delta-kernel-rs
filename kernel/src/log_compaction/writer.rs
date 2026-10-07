@@ -1,12 +1,13 @@
 // TODO(#2337): remove dead_code allows when log compaction is re-enabled
 #![allow(dead_code, unused_imports)]
 
+use itertools::Itertools;
 use url::Url;
 
 use super::COMPACTION_ACTIONS_SCHEMA;
 use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
 use crate::action_reconciliation::{ActionReconciliationIterator, RetentionCalculator};
-use crate::log_replay::LogReplayProcessor;
+use crate::log_replay::HasSelectionVector;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::table_properties::TableProperties;
@@ -122,14 +123,16 @@ impl LogCompactionWriter {
 
         // Create action reconciliation processor for compaction
         // This reuses the same reconciliation logic as checkpoints
-        let processor = ActionReconciliationProcessor::new(
+        let mut processor = ActionReconciliationProcessor::new(
             min_file_retention_timestamp_millis,
             self.get_transaction_expiration_timestamp()?,
         );
 
         // Process actions using the same iterator pattern as checkpoints
         // The processor handles reverse chronological processing internally
-        let result_iter = processor.process_actions_iter(actions_iter);
+        let result_iter = actions_iter
+            .map(move |batch| processor.process_actions_batch(batch?))
+            .filter_ok(HasSelectionVector::has_selected_rows);
 
         // Wrap the iterator to track action counts lazily
         Ok(ActionReconciliationIterator::new(Box::new(result_iter)))

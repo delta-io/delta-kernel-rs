@@ -115,7 +115,7 @@ impl<P: ParallelLogReplayProcessor> Iterator for ParallelPhase<P> {
     fn next(&mut self) -> Option<Self::Item> {
         self.leaf_checkpoint_reader
             .next()
-            .map(|batch| self.processor.process_actions_batch(batch?))
+            .map(|batch| self.processor.process_actions_batch_parallel(batch?))
     }
 }
 

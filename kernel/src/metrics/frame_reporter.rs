@@ -354,7 +354,10 @@ mod tests {
         let callstacks = entered_callstacks(&events);
 
         assert_contains_callstack(&callstacks, &["scan_builder.build"]);
-        assert_contains_callstack(&callstacks, &["scan_log_replay.process_actions_batch"]);
+        assert_contains_callstack(
+            &callstacks,
+            &["scan_log_replay.process_actions_batch_sequential"],
+        );
     }
 
     #[cfg(feature = "declarative-plans")]
