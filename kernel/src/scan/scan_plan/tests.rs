@@ -11,6 +11,8 @@ use super::*;
 use crate::arrow::array::{Array, ArrayRef, BooleanArray, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
+use crate::arrow::json::writer::LineDelimited;
+use crate::arrow::json::WriterBuilder;
 use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::pretty::pretty_format_batches;
 use crate::engine::arrow_conversion::TryIntoArrow as _;
@@ -141,18 +143,25 @@ fn assert_metadata_eq(
     expected: &[RecordBatch],
     context: &str,
 ) -> KernelResult<()> {
-    fn sorted_pretty_lines(batches: &[RecordBatch]) -> KernelResult<Vec<String>> {
-        let formatted = pretty_format_batches(batches)?.to_string();
-        let mut lines: Vec<_> = formatted.lines().map(str::to_string).collect();
-        let len = lines.len();
-        if len > 3 {
-            lines[2..len - 1].sort_unstable();
+    fn sorted_json_rows(batches: &[RecordBatch]) -> KernelResult<Vec<String>> {
+        let mut writer = WriterBuilder::new()
+            .with_explicit_nulls(true)
+            .build::<_, LineDelimited>(Vec::new());
+        writer.write_batches(&batches.iter().collect::<Vec<_>>())?;
+        writer.finish()?;
+        let mut rows = vec![];
+        for row in serde_json::Deserializer::from_slice(&writer.into_inner()).into_iter::<Value>() {
+            let mut row = row?;
+            // Map entry order is immaterial; retain nulls, values, and duplicate rows.
+            row.sort_all_objects();
+            rows.push(row.to_string());
         }
-        Ok(lines)
+        rows.sort_unstable();
+        Ok(rows)
     }
 
-    let actual = sorted_pretty_lines(actual)?;
-    let expected = sorted_pretty_lines(expected)?;
+    let actual = sorted_json_rows(actual)?;
+    let expected = sorted_json_rows(expected)?;
     assert_eq!(actual, expected, "{context}");
     Ok(())
 }
