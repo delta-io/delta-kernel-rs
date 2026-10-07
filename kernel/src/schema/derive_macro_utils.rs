@@ -7,7 +7,7 @@ use bytes::Bytes;
 use delta_kernel_derive::internal_api;
 
 use crate::error::add_scalar_path_context;
-use crate::expressions::{Scalar, StructData};
+use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{ArrayType, DataType, MapType, StructField, StructType, ToSchema};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
@@ -129,6 +129,38 @@ pub(crate) trait ToNullableContainerType {
 impl<K: ToDataType, V: ToDataType> ToNullableContainerType for HashMap<K, V> {
     fn to_nullable_container_type() -> DataType {
         MapType::new(K::to_data_type(), V::to_data_type(), true).into()
+    }
+}
+
+/// Converts a container into a scalar whose type permits null container values.
+///
+/// This supports `IntoStructData` fields annotated with `#[allow_null_container_values]`.
+#[internal_api]
+pub(crate) trait IntoNullableContainerScalar {
+    /// Consumes the container while retaining nullable values in the scalar's data type.
+    fn into_nullable_container_scalar(self) -> Scalar;
+}
+
+impl<K, V> IntoNullableContainerScalar for HashMap<K, V>
+where
+    K: Into<Scalar> + ToDataType,
+    V: Into<Scalar> + ToDataType,
+{
+    fn into_nullable_container_scalar(self) -> Scalar {
+        Scalar::Map(MapData::from_pairs::<K, V>(self, true))
+    }
+}
+
+impl<K, V> IntoNullableContainerScalar for Option<HashMap<K, V>>
+where
+    K: Into<Scalar> + ToDataType,
+    V: Into<Scalar> + ToDataType,
+{
+    fn into_nullable_container_scalar(self) -> Scalar {
+        match self {
+            Some(map) => map.into_nullable_container_scalar(),
+            None => Scalar::Null(MapType::new(K::to_data_type(), V::to_data_type(), true).into()),
+        }
     }
 }
 

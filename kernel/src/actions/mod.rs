@@ -983,7 +983,7 @@ impl CommitInfo {
 ///
 /// [Iceberg V4 metadata RFC]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-v4-metadata.md#backreferences
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize)]
 #[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BackReference {
@@ -995,7 +995,7 @@ pub(crate) struct BackReference {
     pub(crate) pos: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize)]
 #[cfg_attr(test, derive(Serialize, Default))]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
@@ -1544,17 +1544,8 @@ fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> KernelResult<Sca
     let values = std::iter::once(Scalar::from(type_str))
         .chain(sidecar.values().iter().cloned())
         .collect();
-    // `from_values_unchecked`, not `try_new`: `Sidecar::tags` carries
-    // `#[allow_null_container_values]` so its schema field declares value-nullable maps, while
-    // the derived `.into()` value is a non-nullable map -- a leaf-level mismatch `try_new`
-    // would reject. This is inert because the enclosing `checkpoint_action_union_element` still
-    // validates the composite against `CONTENT_SIDECAR_FIELD`, and materialization derives map
-    // nullability from the schema, not the scalar. Tracked by delta-io/delta-kernel-rs#3136,
-    // which will let this use `try_new`.
-    Ok(Scalar::Struct(StructData::from_values_unchecked(
-        StructType::try_new(fields)?,
-        values,
-    )))
+    let fields = StructType::try_new(fields)?.into_fields().collect();
+    Ok(Scalar::Struct(StructData::try_new(fields, values)?))
 }
 
 /// Wrap a single element `value` into a full union struct matching the checkpoint array's element
@@ -1979,7 +1970,7 @@ mod tests {
     use crate::engine::to_json_bytes;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine_data::FilteredEngineData;
-    use crate::expressions::Scalar;
+    use crate::expressions::{Scalar, StructData};
     use crate::schema::{schema, schema_ref, DataType, MapType, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
     use crate::{
@@ -2993,6 +2984,9 @@ mod tests {
         }"#;
 
         let add: Add = serde_json::from_str(json).unwrap();
+        let data: StructData = add.clone().into();
+        StructData::try_new(data.fields().to_vec(), data.values().to_vec())
+            .expect("complete add must match its derived schema");
         assert_eq!(
             add.partition_values,
             HashMap::from([("present".to_string(), "value".to_string())])
@@ -3153,7 +3147,7 @@ mod tests {
             path: path.to_string(),
             size_in_bytes: 100,
             modification_time: 1,
-            tags: None,
+            tags: Some(HashMap::from([("tag".to_string(), "value".to_string())])),
         };
         CheckpointAction {
             version: 42,
@@ -3239,8 +3233,8 @@ mod tests {
                 } },
                 { "txn": { "appId": "myApp", "version": 3 } },
                 { "domainMetadata": { "domain": "myDomain", "configuration": "cfg", "removed": false } },
-                { "sidecar": { "type": "txn", "path": "txn-sidecar.parquet", "sizeInBytes": 100, "modificationTime": 1 } },
-                { "sidecar": { "type": "domainMetadata", "path": "dm-sidecar.parquet", "sizeInBytes": 100, "modificationTime": 1 } },
+                { "sidecar": { "type": "txn", "path": "txn-sidecar.parquet", "sizeInBytes": 100, "modificationTime": 1, "tags": { "tag": "value" } } },
+                { "sidecar": { "type": "domainMetadata", "path": "dm-sidecar.parquet", "sizeInBytes": 100, "modificationTime": 1, "tags": { "tag": "value" } } },
             ] })
         );
         Ok(())
