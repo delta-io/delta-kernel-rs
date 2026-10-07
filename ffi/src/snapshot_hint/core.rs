@@ -149,6 +149,22 @@ pub unsafe extern "C" fn snapshot_externalize_validated_core(
     snapshot: Handle<SharedSnapshot>,
     generation: u64,
 ) -> Handle<SharedSnapshotCore> {
+    unsafe { core_from_snapshot(&snapshot, generation, false) }.into()
+}
+
+/// Externalize a core that can plan from configuration validated by the source snapshot.
+///
+/// Unlike [`snapshot_externalize_validated_core`], this retains the parsed table configuration
+/// after the source snapshot is released. Use it only when trusted planning is enabled.
+///
+/// # Safety
+///
+/// `snapshot` is borrowed and must reference a valid snapshot for this call.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_externalize_trusted_core(
+    snapshot: Handle<SharedSnapshot>,
+    generation: u64,
+) -> Handle<SharedSnapshotCore> {
     unsafe { core_from_snapshot(&snapshot, generation, true) }.into()
 }
 
@@ -308,8 +324,9 @@ fn metadata_plan(
 ///
 /// Unlike the ordinary planning entry point, this does not read, parse, or validate the
 /// connector's metadata, protocol, or schema. Only a core created by
-/// [`snapshot_externalize_validated_core`] has the retained configuration required here.
-/// Generation, version, freshness, externalized log state, and scan-operation checks still run.
+/// [`snapshot_externalize_trusted_core`] has the retained configuration required here.
+/// Generation, version, freshness, FFI bounds, and scan-operation checks still run. Log paths are
+/// transferred and decoded, but their source-snapshot structural validation is not repeated.
 ///
 /// # Safety
 ///
@@ -336,9 +353,10 @@ fn trusted_metadata_plan(
     engine: &dyn delta_kernel::Engine,
 ) -> DeltaResult<crate::OptionalValue<crate::KernelOwnedBytes>> {
     validate_scan_identity(core, value, generation)?;
-    let configuration = core.validated_configuration.as_deref().ok_or_else(|| {
-        invalid("trusted planning requires a validated externalized snapshot core")
-    })?;
+    let configuration = core
+        .validated_configuration
+        .as_deref()
+        .ok_or_else(|| invalid("trusted planning requires a trusted externalized snapshot core"))?;
     let state = BorrowedSnapshotScanState {
         value,
         table_root: &core.table_root,

@@ -13,8 +13,27 @@ impl LogSegment {
         state: &dyn SnapshotScanState,
         paths: SnapshotLogPathIterator<'_>,
     ) -> DeltaResult<(Self, Vec<ScanFile>)> {
+        Self::stream_scan_inputs_impl(state, paths, true)
+    }
+
+    /// Rebuild scan inputs from the exact immutable paths validated by a source snapshot.
+    ///
+    /// This preserves the connector-to-kernel path transfer while avoiding repeated structural
+    /// validation. Decoding and bounds checks still run at the connector boundary.
+    pub(crate) fn stream_trusted_scan_inputs(
+        state: &dyn SnapshotScanState,
+        paths: SnapshotLogPathIterator<'_>,
+    ) -> DeltaResult<(Self, Vec<ScanFile>)> {
+        Self::stream_scan_inputs_impl(state, paths, false)
+    }
+
+    fn stream_scan_inputs_impl(
+        state: &dyn SnapshotScanState,
+        paths: SnapshotLogPathIterator<'_>,
+        validate: bool,
+    ) -> DeltaResult<(Self, Vec<ScanFile>)> {
         let result = (|| {
-            let paths = checked_paths(paths).filter_map(|result| match result {
+            let paths = scan_paths(paths, validate).filter_map(|result| match result {
                 Ok(path) if path.is_commit() => None,
                 other => Some(other),
             });
@@ -25,16 +44,18 @@ impl LogSegment {
                 None,
                 CheckpointHandling::Adopt,
             )?;
-            validate_log_path_fields(&listed)?;
-            validate_compaction_files(&listed.ascending_compaction_files)?;
-            validate_checkpoint_parts(&listed.checkpoint_parts)?;
+            if validate {
+                validate_log_path_fields(&listed)?;
+                validate_compaction_files(&listed.ascending_compaction_files)?;
+                validate_checkpoint_parts(&listed.checkpoint_parts)?;
+            }
             let checkpoint_version = listed.checkpoint_parts.first().map(|p| p.version);
             let paths = state.ordered_log_paths()?.ok_or_else(|| {
                 Error::generic("Connector removed its ordered log path source during planning")
             })?;
             let mut previous: Option<ParsedLogPath> = None;
             let mut files = Vec::new();
-            for path in checked_paths(paths) {
+            for path in scan_paths(paths, validate) {
                 let path = path?;
                 if path.file_type == LogPathFileType::Commit {
                     listed.max_published_version =
@@ -50,16 +71,18 @@ impl LogSegment {
                 if checkpoint_version == Some(path.version) {
                     continue;
                 }
-                validate_commit_file_types(std::slice::from_ref(&path))?;
-                if let Some(previous) = previous.take() {
-                    let pair = [previous, path.clone()];
-                    validate_commit_files_sorted(&pair)?;
-                    validate_commit_files_contiguous(&pair)?;
-                } else {
-                    validate_checkpoint_commit_gap(
-                        checkpoint_version,
-                        std::slice::from_ref(&path),
-                    )?;
+                if validate {
+                    validate_commit_file_types(std::slice::from_ref(&path))?;
+                    if let Some(previous) = previous.take() {
+                        let pair = [previous, path.clone()];
+                        validate_commit_files_sorted(&pair)?;
+                        validate_commit_files_contiguous(&pair)?;
+                    } else {
+                        validate_checkpoint_commit_gap(
+                            checkpoint_version,
+                            std::slice::from_ref(&path),
+                        )?;
+                    }
                 }
                 let version = path.version_as_i64()?;
                 previous = Some(path.clone());
@@ -68,17 +91,18 @@ impl LogSegment {
                     file_constants: vec![Scalar::Long(version)],
                 });
             }
-            let effective_version = validate_end_version(
-                previous.as_slice(),
-                &listed.checkpoint_parts,
-                Some(state.version()),
-            )?;
-            validate_latest_commit_file(&listed, effective_version)?;
-            validate_crc(
-                listed.latest_crc_file.as_ref(),
-                checkpoint_version,
-                effective_version,
-            )?;
+            let effective_version = if validate {
+                let version = validate_end_version(
+                    previous.as_slice(),
+                    &listed.checkpoint_parts,
+                    Some(state.version()),
+                )?;
+                validate_latest_commit_file(&listed, version)?;
+                validate_crc(listed.latest_crc_file.as_ref(), checkpoint_version, version)?;
+                version
+            } else {
+                state.version()
+            };
             // Commit-cover planning reads newest first. No second copy of the input list is needed.
             files.reverse();
             Ok((
@@ -101,12 +125,16 @@ impl LogSegment {
     }
 }
 
-fn checked_paths(
+fn scan_paths(
     paths: SnapshotLogPathIterator<'_>,
+    validate: bool,
 ) -> impl Iterator<Item = DeltaResult<ParsedLogPath>> + '_ {
     let mut previous = None;
     paths.map(move |path| {
         let path: ParsedLogPath = path?.into();
+        if !validate {
+            return Ok(path);
+        }
         require!(
             !matches!(path.file_type, LogPathFileType::CompactedCommit { .. }),
             SnapshotHintError::LogCompaction.into()
@@ -203,8 +231,12 @@ mod tests {
         let baseline = log_segment_from_state(state);
         let streamed =
             LogSegment::stream_scan_inputs(state, state.ordered_log_paths().unwrap().unwrap());
-        match (baseline, streamed) {
-            (Ok(baseline), Ok((checkpoint, files))) => {
+        let trusted = LogSegment::stream_trusted_scan_inputs(
+            state,
+            state.ordered_log_paths().unwrap().unwrap(),
+        );
+        let assert_matches =
+            |baseline: &LogSegment, (checkpoint, files): &(LogSegment, Vec<ScanFile>)| {
                 assert!(checkpoint.listed.ascending_commit_files.is_empty());
                 assert_eq!(checkpoint.end_version, baseline.end_version);
                 assert_eq!(checkpoint.checkpoint_version, baseline.checkpoint_version);
@@ -222,11 +254,18 @@ mod tests {
                 );
                 assert_eq!(
                     files,
-                    baseline.commit_cover_version_tagged_scan_files().unwrap()
+                    &baseline.commit_cover_version_tagged_scan_files().unwrap()
                 );
+            };
+        match (baseline, streamed, trusted) {
+            (Ok(baseline), Ok(streamed), Ok(trusted)) => {
+                assert_matches(&baseline, &streamed);
+                assert_matches(&baseline, &trusted);
             }
-            (Err(_), Err(_)) => {}
-            (baseline, streamed) => panic!("baseline={baseline:?}, streamed={streamed:?}"),
+            (Err(_), Err(_), _) => {}
+            (baseline, streamed, trusted) => {
+                panic!("baseline={baseline:?}, streamed={streamed:?}, trusted={trusted:?}")
+            }
         }
     }
 

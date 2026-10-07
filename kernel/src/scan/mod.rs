@@ -91,8 +91,8 @@ pub(crate) fn declarative_metadata_scan_plan_from_state_with_metadata(
 /// Build the default metadata plan from a configuration validated by the source snapshot.
 ///
 /// This is only for a trusted externalization of that snapshot. The connector-owned log state is
-/// still reconstructed for this call, but metadata, protocol, and schema are not reparsed or
-/// revalidated.
+/// still reconstructed for this call, but its validated structure and the metadata, protocol, and
+/// schema are not revalidated.
 #[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
 #[internal_api]
 pub(crate) fn declarative_metadata_scan_plan_from_validated_state(
@@ -100,7 +100,7 @@ pub(crate) fn declarative_metadata_scan_plan_from_validated_state(
     table_configuration: &TableConfiguration,
     engine: &dyn Engine,
 ) -> DeltaResult<Option<Plan>> {
-    let (log_segment, commit_files) = metadata_plan_log_inputs(state)?;
+    let (log_segment, commit_files) = metadata_plan_log_inputs(state, true)?;
     metadata_plan_with_configuration(engine, log_segment, commit_files, table_configuration)
 }
 
@@ -110,7 +110,7 @@ fn metadata_plan_with_components(
     engine: &dyn Engine,
     components: impl FnOnce() -> DeltaResult<(crate::actions::Metadata, crate::actions::Protocol)>,
 ) -> DeltaResult<Option<Plan>> {
-    let (log_segment, commit_files) = metadata_plan_log_inputs(state)?;
+    let (log_segment, commit_files) = metadata_plan_log_inputs(state, false)?;
     let (metadata, protocol) = components()?;
     let table_configuration = TableConfiguration::try_new(
         metadata,
@@ -124,11 +124,15 @@ fn metadata_plan_with_components(
 #[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
 fn metadata_plan_log_inputs(
     state: &dyn SnapshotScanState,
+    trusted: bool,
 ) -> DeltaResult<(LogSegment, Option<Vec<crate::plans::ir::nodes::ScanFile>>)> {
     match state.ordered_log_paths()? {
         Some(paths) => {
-            let (segment, files) =
-                crate::log_segment::LogSegment::stream_scan_inputs(state, paths)?;
+            let (segment, files) = if trusted {
+                crate::log_segment::LogSegment::stream_trusted_scan_inputs(state, paths)?
+            } else {
+                crate::log_segment::LogSegment::stream_scan_inputs(state, paths)?
+            };
             Ok((segment, Some(files)))
         }
         None => Ok((log_segment_from_state(state)?, None)),
@@ -177,14 +181,14 @@ fn metadata_plan_with_configuration(
     let state_info = StateInfo::try_new(
         table_schema.clone(),
         table_schema,
-        &table_configuration,
+        table_configuration,
         None,
         &stats,
         &partition_values,
         (),
     )?;
     let physical_stats_output_schema =
-        build_physical_stats_output_schema(&table_configuration, &state_info, &stats)?;
+        build_physical_stats_output_schema(table_configuration, &state_info, &stats)?;
 
     let executor = engine.require_plan_executor()?;
     let shape = CheckpointShape::try_new_for_segment(

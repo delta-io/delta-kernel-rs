@@ -26,6 +26,10 @@ pub struct ExclusiveSnapshotHint;
 ///
 /// The snapshot and engine are borrowed. The caller owns the returned hint and must eventually
 /// release it with [`free_snapshot_hint`].
+///
+/// # Safety
+///
+/// `snapshot` and `engine` must be valid borrowed handles for this call.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_to_snapshot_hint(
     snapshot: Handle<SharedSnapshot>,
@@ -42,6 +46,10 @@ pub unsafe extern "C" fn snapshot_to_snapshot_hint(
 /// Releases an exported snapshot hint.
 ///
 /// The handle is consumed and must not be used again.
+///
+/// # Safety
+///
+/// `hint` must be a valid owned handle and must not be used after this call.
 #[no_mangle]
 pub unsafe extern "C" fn free_snapshot_hint(hint: Handle<ExclusiveSnapshotHint>) {
     unsafe { hint.into_inner() };
@@ -53,6 +61,11 @@ pub type SnapshotHintVisitor = extern "C" fn(context: NullableCvoid, hint: *cons
 /// Visits retained hint state without engine I/O or transferring ownership.
 ///
 /// The callback must copy retained values and must not reenter or consume the hint.
+///
+/// # Safety
+///
+/// `hint` and `engine` must be valid borrowed handles. `visitor` must be safe to call with
+/// `context` and must not retain any pointer reachable from the visited hint.
 #[no_mangle]
 pub unsafe extern "C" fn visit_snapshot_hint(
     hint: Handle<ExclusiveSnapshotHint>,

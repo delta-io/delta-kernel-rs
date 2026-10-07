@@ -518,6 +518,7 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
     };
     let validated_core =
         unsafe { snapshot_externalize_validated_core(snapshot.shallow_copy(), 42) };
+    let trusted_core = unsafe { snapshot_externalize_trusted_core(snapshot.shallow_copy(), 42) };
     let plan_engine = unsafe { plan_based_engine(&engine) };
     let inner_engine = unsafe { plan_engine.as_ref() }.engine();
     let native_snapshot = unsafe { snapshot.into_inner() };
@@ -579,7 +580,7 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
 
     let rejected = unsafe {
         snapshot_core_declarative_metadata_plan_trusted(
-            core.shallow_copy(),
+            validated_core.shallow_copy(),
             &scan_state,
             42,
             plan_engine.shallow_copy(),
@@ -588,12 +589,12 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
     assert_extern_result_error_contains(
         rejected,
         KernelError::InvalidSnapshotHint,
-        "validated externalized snapshot core",
+        "trusted externalized snapshot core",
     );
 
     let rejected = unsafe {
         snapshot_core_declarative_metadata_plan_trusted(
-            validated_core.shallow_copy(),
+            trusted_core.shallow_copy(),
             &scan_state,
             43,
             plan_engine.shallow_copy(),
@@ -609,7 +610,7 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
     let trusted = unsafe {
         if uploaded {
             snapshot_core_declarative_metadata_plan_trusted_with_schema(
-                validated_core.shallow_copy(),
+                trusted_core.shallow_copy(),
                 &scan_state,
                 42,
                 schema_upload("transferred but intentionally not parsed"),
@@ -617,7 +618,7 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
             )
         } else {
             snapshot_core_declarative_metadata_plan_trusted(
-                validated_core.shallow_copy(),
+                trusted_core.shallow_copy(),
                 &scan_state,
                 42,
                 plan_engine.shallow_copy(),
@@ -631,6 +632,7 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
     assert_eq!(trusted_bytes, native_bytes);
 
     unsafe {
+        free_snapshot_core(trusted_core);
         free_snapshot_core(validated_core);
         free_snapshot_core(core);
         free_engine(plan_engine);
