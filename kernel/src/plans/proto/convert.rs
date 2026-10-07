@@ -919,7 +919,7 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
                     Simple::Timestamp => PrimitiveType::Timestamp,
                     Simple::TimestampNtz => PrimitiveType::TimestampNtz,
                     Simple::Void => PrimitiveType::Void,
-                    Simple::IntervalYearMonth => PrimitiveType::IntervalYearMonth(
+                    Simple::IntervalYearMonth => PrimitiveType::interval_year_month(
                         IntervalYearToMonthType::IntervalYearToMonth,
                     ),
                     Simple::IntervalDayTime => PrimitiveType::IntervalDayTime,
@@ -1068,10 +1068,10 @@ mod tests {
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{
         col, column_name, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
-        DecimalData, Expression, ExpressionStructPatchBuilder, IntervalYearMonthData,
-        JunctionPredicateOp, MapData, MapToStructOptions, OpaqueExpressionOp, OpaquePredicateOp,
-        Predicate, Scalar, ScalarExpressionEvaluator, StructData, UnaryExpressionOp,
-        UnaryPredicateOp, VariadicExpressionOp,
+        DecimalData, Expression, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
+        MapToStructOptions, OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar,
+        ScalarExpressionEvaluator, StructData, UnaryExpressionOp, UnaryPredicateOp,
+        VariadicExpressionOp,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -2122,18 +2122,19 @@ mod tests {
 
     #[rstest]
     #[case(
-        Scalar::IntervalYearMonth(IntervalYearMonthData::from(30)),
+        Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
         proto_expr::scalar::Value::IntervalYearMonth(30)
     )]
     #[case(
-        Scalar::IntervalYearMonth(IntervalYearMonthData::new(
-            30,
-            IntervalYearToMonthType::IntervalYear
-        )),
+        Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
+        proto_expr::scalar::Value::IntervalYearMonth(24)
+    )]
+    #[case(
+        Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
         proto_expr::scalar::Value::IntervalYearMonth(30)
     )]
     #[case(
-        Scalar::IntervalYearMonth(IntervalYearMonthData::from(i32::MIN)),
+        Scalar::interval_year_month(i32::MIN, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
         proto_expr::scalar::Value::IntervalYearMonth(i32::MIN)
     )]
     #[case(
@@ -2154,8 +2155,9 @@ mod tests {
     #[rstest]
     #[case(IntervalYearToMonthType::IntervalYear)]
     #[case(IntervalYearToMonthType::IntervalMonth)]
+    #[case(IntervalYearToMonthType::IntervalYearToMonth)]
     fn from_interval_year_month_null_encodes_generic_type(#[case] dtype: IntervalYearToMonthType) {
-        let scalar = Scalar::Null(DataType::Primitive(PrimitiveType::IntervalYearMonth(dtype)));
+        let scalar = Scalar::Null(DataType::interval_year_month(dtype));
         let proto_expr::scalar::Value::Null(data_type) = scalar_value_of(scalar) else {
             panic!("expected a null scalar");
         };
@@ -2333,11 +2335,15 @@ mod tests {
     )]
     #[case(PrimitiveType::Void, proto_schema::SimplePrimitiveType::Void)]
     #[case(
-        PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYearToMonth),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
         proto_schema::SimplePrimitiveType::IntervalYearMonth
     )]
     #[case(
-        PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYear),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYear),
+        proto_schema::SimplePrimitiveType::IntervalYearMonth
+    )]
+    #[case(
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
         proto_schema::SimplePrimitiveType::IntervalYearMonth
     )]
     #[case(
@@ -2474,7 +2480,7 @@ mod tests {
             PrimitiveType::Timestamp,
             PrimitiveType::TimestampNtz,
             PrimitiveType::Void,
-            PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYearToMonth),
+            PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
             PrimitiveType::IntervalDayTime
         )]
         primitive: PrimitiveType,
