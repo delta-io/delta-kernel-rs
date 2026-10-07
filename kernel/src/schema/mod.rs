@@ -234,7 +234,7 @@ pub enum ColumnMetadataKey {
     ///
     /// Kernel preserves these identifiers; string predicates use UTF-8 binary semantics.
     /// See [`ScanBuilder::with_predicate`](crate::scan::ScanBuilder::with_predicate) and the
-    /// [collation RFC](https://github.com/delta-io/delta/pull/3068).
+    /// [collation RFC](https://github.com/delta-io/delta/blob/master/protocol_rfcs/collated-string-type.md).
     Collations,
     ColumnMappingId,
     ColumnMappingPhysicalName,

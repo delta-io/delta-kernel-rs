@@ -69,7 +69,7 @@ pub(crate) struct CheckpointReadInfo {
     #[serde(default)]
     #[allow(unused)]
     pub has_partition_values_parsed: bool,
-    /// The schema used to read checkpoint files, potentially including stats_parsed.
+    /// The schema of normalized checkpoint batches, potentially including stats_parsed.
     #[allow(unused)]
     pub checkpoint_read_schema: SchemaRef,
 }

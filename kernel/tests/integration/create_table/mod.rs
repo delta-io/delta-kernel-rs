@@ -647,6 +647,14 @@ async fn test_create_table_txn_debug() -> Result<()> {
 #[case("changeDataFeed", TableFeature::ChangeDataFeed, false, false, false)]
 #[case("rowTracking", TableFeature::RowTracking, false, false, true)]
 #[case("domainMetadata", TableFeature::DomainMetadata, false, true, true)]
+#[case("collations", TableFeature::Collations, false, true, true)]
+#[case(
+    "collations-preview",
+    TableFeature::CollationsPreview,
+    false,
+    true,
+    true
+)]
 // WriterOnly features (AlwaysIfSupported)
 #[case(
     "materializePartitionColumns",

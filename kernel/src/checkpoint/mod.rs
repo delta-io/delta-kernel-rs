@@ -740,14 +740,7 @@ impl CheckpointWriter {
             .stats_schema_builder()
             .with_required_physical_columns(physical_clustering_columns.as_deref())
             .build()?;
-        let has_collations =
-            crate::schema::collation_utils::schema_has_collations(snapshot.schema().as_ref())
-                || tc.protocol().writer_features().is_some_and(|features| {
-                    features.iter().any(|feature| {
-                        matches!(feature.as_ref(), "collations" | "collations-preview")
-                    })
-                });
-        if config.write_stats_as_struct && has_collations {
+        if config.write_stats_as_struct && collation_stats::snapshot_has_collations(snapshot) {
             stats_schema =
                 collation_stats::checkpoint_stats_schema(snapshot, engine, stats_schema)?;
         }

@@ -19,6 +19,20 @@ use crate::{Engine, KernelError, KernelResult, Result, Snapshot};
 
 const COLLATION_STATS: &str = "statsWithCollation";
 
+/// Returns whether the snapshot declares collation support or carries collation annotations.
+pub(crate) fn snapshot_has_collations(snapshot: &Snapshot) -> bool {
+    snapshot
+        .table_configuration()
+        .protocol()
+        .writer_features()
+        .is_some_and(|features| {
+            features
+                .iter()
+                .any(|feature| matches!(feature.as_ref(), "collations" | "collations-preview"))
+        })
+        || crate::schema::collation_utils::schema_has_collations(&snapshot.schema())
+}
+
 /// Returns the complete source parsed-stats schema when it contains collation bounds.
 pub(crate) fn source_collation_stats(schema: &StructType) -> Option<&StructType> {
     let DataType::Struct(stats) = schema
