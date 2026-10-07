@@ -111,6 +111,10 @@ pub use crate::parallel::parallel_scan_metadata::{
 /// Existing JSON passes through for commits and checkpoints without compatible structured stats
 /// unless stats are disabled.
 ///
+/// Declarative metadata plans disable stats and partition pruning when JSON output is requested,
+/// including both-output requests. The data-row predicate and imperative metadata path are
+/// unchanged.
+///
 /// Most consumers should pick one of the named constructors:
 /// - [`Self::json_only`] (default) -- JSON stats only.
 /// - [`Self::all_struct`] -- all struct stats without JSON synthesis. Compatible checkpoints omit
