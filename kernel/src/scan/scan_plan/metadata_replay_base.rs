@@ -21,6 +21,7 @@ impl MetadataReplayBase {
         planner: &MetadataPlanner<'_>,
     ) -> KernelResult<Self> {
         let checkpoint_version = snapshot.log_segment().checkpoint_version;
+        // Keep replay eligibility independent of SnapshotCrc's validation.
         if let Some((version, _)) = snapshot.base_crc_all_files().filter(|(version, _)| {
             checkpoint_version.is_none_or(|checkpoint| *version >= checkpoint)
         }) {

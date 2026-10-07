@@ -428,37 +428,29 @@ impl Scan {
         version: Version,
         planner: &MetadataPlanner<'_>,
     ) -> KernelResult<PlanBuilder> {
-        let files = self
+        let Some((_, files)) = self
             .snapshot
             .base_crc_all_files()
             .filter(|(crc_version, _)| *crc_version == version)
-            .map(|(_, files)| files)
-            .ok_or_else(|| {
-                KernelError::internal_error(format!(
-                    "Selected CRC version {version} has no allFiles"
-                ))
-            })?;
+        else {
+            return Err(KernelError::internal_error(format!(
+                "Selected CRC version {version} has no allFiles"
+            )));
+        };
 
         planner
             .build_metadata_arm(&LOG_ADD_SCHEMA, false, |schema| {
-                let DataType::Struct(read_add) =
-                    schema.field_at(&column_name!(ADD_NAME))?.data_type()
-                else {
-                    return Err(KernelError::schema(
-                        "metadata source add field must be a struct",
-                    ));
-                };
                 PlanBuilder::values(
                     LOG_ADD_SCHEMA.clone(),
                     files.iter().cloned().map(|add| vec![add.into()]).collect(),
                 )?
                 .project_patch(|patch| {
-                    ADD_SCHEMA
-                        .fields()
-                        .filter(|field| read_add.field(field.name()).is_none())
-                        .fold(patch, |patch, field| {
-                            patch.drop_at([ADD_NAME], field.name())
-                        })
+                    // Canonical CRC adds can only omit JSON stats from the read schema.
+                    if schema.field_at(&column_name!(ADD_NAME, STATS)).is_ok() {
+                        patch
+                    } else {
+                        patch.drop_at([ADD_NAME], STATS)
+                    }
                 })
             })?
             .project_patch(|patch| {

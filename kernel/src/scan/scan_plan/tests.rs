@@ -11,7 +11,7 @@ use super::*;
 use crate::arrow::array::{Array, ArrayRef, BooleanArray, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
-use crate::arrow::json::writer::LineDelimited;
+use crate::arrow::json::writer::JsonArray;
 use crate::arrow::json::WriterBuilder;
 use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::pretty::pretty_format_batches;
@@ -143,20 +143,16 @@ fn assert_metadata_eq(
     expected: &[RecordBatch],
     context: &str,
 ) -> KernelResult<()> {
-    fn sorted_json_rows(batches: &[RecordBatch]) -> KernelResult<Vec<String>> {
+    fn sorted_json_rows(batches: &[RecordBatch]) -> KernelResult<Vec<Value>> {
         let mut writer = WriterBuilder::new()
             .with_explicit_nulls(true)
-            .build::<_, LineDelimited>(Vec::new());
+            .build::<_, JsonArray>(Vec::new());
         writer.write_batches(&batches.iter().collect::<Vec<_>>())?;
         writer.finish()?;
-        let mut rows = vec![];
-        for row in serde_json::Deserializer::from_slice(&writer.into_inner()).into_iter::<Value>() {
-            let mut row = row?;
-            // Map entry order is immaterial; retain nulls, values, and duplicate rows.
-            row.sort_all_objects();
-            rows.push(row.to_string());
-        }
-        rows.sort_unstable();
+        let mut rows: Vec<Value> = serde_json::from_slice(&writer.into_inner())?;
+        // Map entry order is immaterial; retain nulls, values, and duplicate rows.
+        rows.iter_mut().for_each(Value::sort_all_objects);
+        rows.sort_by_cached_key(Value::to_string);
         Ok(rows)
     }
 
@@ -724,8 +720,10 @@ fn declarative_metadata_synthesizes_json_for_struct_only_checkpoints(
     .unwrap();
 }
 
-#[test]
-fn declarative_metadata_crc_source_plan_is_sparse() -> Result<()> {
+#[rstest]
+fn declarative_metadata_crc_plan_is_sparse_and_prunes(
+    #[values(None, Some(col!("id").gt(lit(3i64))))] predicate: Option<Pred>,
+) -> Result<()> {
     let (engine, latest, _tempdir) =
         load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
     let snapshot = Snapshot::builder_for(latest.table_root().clone())
@@ -737,9 +735,13 @@ fn declarative_metadata_crc_source_plan_is_sparse() -> Result<()> {
         Some(4)
     );
 
-    let plan = snapshot
+    let expected_count = if predicate.is_some() { 1 } else { 4 };
+    let scan = snapshot
         .scan_builder()
-        .build()?
+        .with_stats(StatsOptions::all_struct())
+        .with_predicate(predicate.map(Arc::new))
+        .build()?;
+    let plan = scan
         .declarative_metadata_scan_plan(engine.as_ref())?
         .expect("CRC metadata plan");
     assert!(plan.schema.field(IS_ADD).is_none());
@@ -757,24 +759,8 @@ fn declarative_metadata_crc_source_plan_is_sparse() -> Result<()> {
         Operator::Project(project) => matches!(project.expr.as_ref(), Expr::StructPatch(_)),
         _ => true,
     }));
-    Ok(())
-}
-
-#[test]
-fn declarative_metadata_crc_structured_stats_prune_with_predicate() -> Result<()> {
-    let (engine, latest, _tempdir) =
-        load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
-    let snapshot = Snapshot::builder_for(latest.table_root().clone())
-        .at_version(4)
-        .build(engine.as_ref())?;
-    let scan = snapshot
-        .scan_builder()
-        .with_stats(StatsOptions::all_struct())
-        .with_predicate(Arc::new(col!("id").gt(lit(3i64))))
-        .build()?;
-
     let actual = declarative_metadata(&scan, engine.as_ref())?;
-    assert_eq!(metadata_row_count(&actual), 1);
+    assert_eq!(metadata_row_count(&actual), expected_count);
     assert!(actual
         .iter()
         .all(|batch| batch.column_by_name(STATS).is_none()));
