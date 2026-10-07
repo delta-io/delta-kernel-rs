@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -48,7 +48,7 @@ async fn read_udt_as_sql_type_preserves_logical_schema(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let udt = UserDefinedType::try_new(
         sql_type,
-        BTreeMap::from([
+        HashMap::from([
             ("class".into(), Some("example.Value".into())),
             ("pyClass".into(), None),
         ]),
