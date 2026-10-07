@@ -370,14 +370,14 @@ impl Scan {
     pub(super) fn build_metadata_scan_plan_with(
         &self,
         shape: &CheckpointShape,
-        metadata: &MetadataPlanner<'_>,
+        planner: &MetadataPlanner<'_>,
     ) -> KernelResult<Option<Plan>> {
         // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
-        if metadata.statically_skips_all() {
+        if planner.statically_skips_all() {
             return Ok(None);
         }
 
-        let commit_actions = self.commit_arm(metadata)?;
+        let commit_actions = self.commit_arm(planner)?;
 
         let deduped_commit = commit_actions.aggregate_by([column_name!(FILE_ACTION_KEY)], |a| {
             // Each group with a non-null FILE_ACTION_KEY contains the adds and removes for a given
@@ -390,7 +390,7 @@ impl Scan {
             )
         })?;
 
-        let checkpoint_adds = self.checkpoint_arm(shape, metadata)?;
+        let checkpoint_adds = self.checkpoint_arm(shape, planner)?;
 
         let checkpoint_live_adds = checkpoint_adds
             .anti_join(
@@ -428,14 +428,14 @@ impl Scan {
     fn checkpoint_arm(
         &self,
         shape: &CheckpointShape,
-        metadata: &MetadataPlanner<'_>,
+        planner: &MetadataPlanner<'_>,
     ) -> KernelResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
         let available_file_schema = shape
             .leaf_checkpoint_schema
             .as_deref()
             .unwrap_or(get_all_actions_schema());
-        metadata
+        planner
             .build_metadata_arm(available_file_schema, false, |schema| {
                 let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
                 let actions = match (&shape.checkpoint_type, checkpoint) {
@@ -481,10 +481,10 @@ impl Scan {
     /// WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
     ///
     /// A parsed field is omitted when its schema is absent.
-    fn commit_arm(&self, metadata: &MetadataPlanner<'_>) -> KernelResult<PlanBuilder> {
+    fn commit_arm(&self, planner: &MetadataPlanner<'_>) -> KernelResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
         let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
-        metadata
+        planner
             .build_metadata_arm(get_all_actions_schema(), true, |schema| {
                 PlanBuilder::scan_json(commit_files, &[VERSION], schema)?.filter(Predicate::or(
                     col!("add.path").is_not_null(),
@@ -920,9 +920,9 @@ mod tests {
             checkpoint_type,
             leaf_checkpoint_schema: Some(Arc::new(file_schema)),
         };
-        let metadata = MetadataPlanner::try_new(&scan)?;
-        let commit = scan.commit_arm(&metadata)?.build()?;
-        let checkpoint = scan.checkpoint_arm(&shape, &metadata)?.build()?;
+        let planner = MetadataPlanner::try_new(&scan)?;
+        let commit = scan.commit_arm(&planner)?.build()?;
+        let checkpoint = scan.checkpoint_arm(&shape, &planner)?.build()?;
         let commit_add: ArrowSchema = add_struct(&commit.schema).try_into_arrow()?;
         let checkpoint_add: ArrowSchema = add_struct(&checkpoint.schema).try_into_arrow()?;
         assert_eq!(commit_add, checkpoint_add, "ordered add schemas must match");

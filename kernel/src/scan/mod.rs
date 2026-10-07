@@ -1200,16 +1200,16 @@ impl Scan {
         err
     )]
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> Result<Option<Plan>> {
-        let metadata = scan_plan::MetadataPlanner::try_new(self)?;
+        let planner = scan_plan::MetadataPlanner::try_new(self)?;
         // Resolve the checkpoint shape once. The planner owns the decision to retain the file-
         // action schema; checkpoint discovery owns how that schema is obtained.
         let plan_executor = engine.require_plan_executor()?;
-        let shape = if metadata.requires_checkpoint_add_schema() {
+        let shape = if planner.requires_checkpoint_add_schema() {
             CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
         } else {
             CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?
         };
-        self.build_metadata_scan_plan_with(&shape, &metadata)
+        self.build_metadata_scan_plan_with(&shape, &planner)
     }
 
     // Factored out to facilitate testing
