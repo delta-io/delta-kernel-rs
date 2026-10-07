@@ -19,7 +19,7 @@ use crate::schema::{
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
-const MONTHS_PER_YEAR: i32 = 12;
+pub(crate) const MONTHS_PER_YEAR: i32 = 12;
 
 /// Pairs [`Into<Scalar>`] with [`ToDataType`] for infallible container conversions.
 ///
@@ -49,7 +49,7 @@ impl IntervalYearMonthData {
     /// Creates a year-month interval payload from total months and its qualifier.
     ///
     /// Returns an error when a `YEAR` value contains a fractional year.
-    pub fn try_new(months: i32, ty: IntervalYearToMonthType) -> Result<Self> {
+    pub fn try_new(months: i32, ty: IntervalYearToMonthType) -> KernelResult<Self> {
         require!(
             ty != IntervalYearToMonthType::IntervalYear || months % MONTHS_PER_YEAR == 0,
             KernelError::generic(format!(
@@ -463,7 +463,7 @@ impl Scalar {
     /// Constructs a year-month interval from a signed total-month count and its ANSI qualifier.
     ///
     /// Returns an error when a `YEAR` value contains a fractional year.
-    pub fn interval_year_month(months: i32, ty: IntervalYearToMonthType) -> Result<Self> {
+    pub fn interval_year_month(months: i32, ty: IntervalYearToMonthType) -> KernelResult<Self> {
         Ok(Self::IntervalYearMonth(IntervalYearMonthData::try_new(
             months, ty,
         )?))
