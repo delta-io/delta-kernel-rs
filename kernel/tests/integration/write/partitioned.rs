@@ -131,20 +131,18 @@ async fn test_write_partitioned_normal_values_roundtrip(
     Ok(())
 }
 
-/// Checks interval partition serialization before scanning values whose spelling matches.
+/// Checks interval partition serialization and scanned values.
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
     Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
     "INTERVAL '2-6' YEAR TO MONTH"
 )]
-#[should_panic(expected = "interval partition value should serialize to the ANSI literal")]
 #[case::year(
     DataType::interval_year_month(IntervalYearToMonthType::IntervalYear),
     Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
     "INTERVAL '2' YEAR"
 )]
-#[should_panic(expected = "interval partition value should serialize to the ANSI literal")]
 #[case::month(
     DataType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
     Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
@@ -234,13 +232,11 @@ async fn write_partitioned_interval_roundtrip(
     Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
     "INTERVAL '2-6' YEAR TO MONTH"
 )]
-#[should_panic(expected = "interval partition value should serialize to the ANSI literal")]
 #[case::year(
     DataType::interval_year_month(IntervalYearToMonthType::IntervalYear),
     Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
     "INTERVAL '2' YEAR"
 )]
-#[should_panic(expected = "interval partition value should serialize to the ANSI literal")]
 #[case::month(
     DataType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
     Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),

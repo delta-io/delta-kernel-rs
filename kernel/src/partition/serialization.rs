@@ -15,6 +15,7 @@
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::expressions::{DecimalData, Scalar};
+use crate::schema::IntervalYearToMonthType;
 use crate::{KernelError, Result};
 
 /// The UNIX epoch (1970-01-01) expressed as a CE day number for chrono's
@@ -72,7 +73,8 @@ pub(crate) fn would_serialize_to_null(value: &Scalar) -> bool {
 /// `Scalar::Null`, empty `Scalar::String`, and empty `Scalar::Binary`. Non-null partition
 /// values are serialized according to protocol rules; readers interpret the stored value
 /// against the table schema. Returns `Err` for non-null values of types that cannot be
-/// partition columns (Struct, Array, Map) or for binary values that are not valid UTF-8.
+/// partition columns (Struct, Array, Map), binary values that are not valid UTF-8, or
+/// `interval year` values whose total months are not divisible by 12.
 ///
 /// The inverse of [`PrimitiveType::parse_scalar`].
 ///
@@ -92,7 +94,9 @@ pub fn serialize_partition_value(value: &Scalar) -> Result<Option<String>> {
         Scalar::Date(days) => Ok(Some(format_date(*days)?)),
         Scalar::Timestamp(us) => Ok(Some(format_timestamp(*us)?)),
         Scalar::TimestampNtz(us) => Ok(Some(format_timestamp_ntz(*us)?)),
-        Scalar::IntervalYearMonth(data) => Ok(Some(format_year_month_interval(data.months()))),
+        Scalar::IntervalYearMonth(data) => {
+            Ok(Some(format_year_month_interval(data.months(), *data.ty())?))
+        }
         Scalar::IntervalDayTime(micros) => Ok(Some(format_day_time_interval(*micros))),
         Scalar::Decimal(d) => Ok(Some(format_decimal(d))),
         Scalar::Binary(b) if b.is_empty() => Ok(None),
@@ -197,10 +201,25 @@ fn format_timestamp_ntz(micros: i64) -> Result<String> {
         .map(|dt| dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string())
 }
 
-fn format_year_month_interval(months: i32) -> String {
+fn format_year_month_interval(months: i32, ty: IntervalYearToMonthType) -> Result<String> {
     let sign = if months < 0 { "-" } else { "" };
     let abs = months.unsigned_abs();
-    format!("INTERVAL '{sign}{}-{}' YEAR TO MONTH", abs / 12, abs % 12)
+    match ty {
+        IntervalYearToMonthType::IntervalYear => {
+            if months % 12 != 0 {
+                return Err(KernelError::invalid_partition_values(format!(
+                    "interval year partition value {months} months is not divisible by 12"
+                )));
+            }
+            Ok(format!("INTERVAL '{sign}{}' YEAR", abs / 12))
+        }
+        IntervalYearToMonthType::IntervalMonth => Ok(format!("INTERVAL '{months}' MONTH")),
+        IntervalYearToMonthType::IntervalYearToMonth => Ok(format!(
+            "INTERVAL '{sign}{}-{}' YEAR TO MONTH",
+            abs / 12,
+            abs % 12
+        )),
+    }
 }
 
 fn format_day_time_interval(micros: i64) -> String {
@@ -614,29 +633,80 @@ mod tests {
     }
 
     #[rstest]
-    #[case::year(
-        24,
+    #[case::year_zero(0, IntervalYearToMonthType::IntervalYear, "INTERVAL '0' YEAR")]
+    #[case::year_positive(24, IntervalYearToMonthType::IntervalYear, "INTERVAL '2' YEAR")]
+    #[case::year_negative(-24, IntervalYearToMonthType::IntervalYear, "INTERVAL '-2' YEAR")]
+    #[case::year_max_aligned(
+        2_147_483_640,
         IntervalYearToMonthType::IntervalYear,
-        "INTERVAL '2-0' YEAR TO MONTH",
-        "INTERVAL '2' YEAR"
+        "INTERVAL '178956970' YEAR"
     )]
-    #[case::month(
-        30,
+    #[case::year_min_aligned(
+        -2_147_483_640,
+        IntervalYearToMonthType::IntervalYear,
+        "INTERVAL '-178956970' YEAR"
+    )]
+    #[case::month_zero(0, IntervalYearToMonthType::IntervalMonth, "INTERVAL '0' MONTH")]
+    #[case::month_positive(30, IntervalYearToMonthType::IntervalMonth, "INTERVAL '30' MONTH")]
+    #[case::month_min(
+        i32::MIN,
         IntervalYearToMonthType::IntervalMonth,
-        "INTERVAL '2-6' YEAR TO MONTH",
-        "INTERVAL '30' MONTH"
+        "INTERVAL '-2147483648' MONTH"
     )]
-    fn test_narrowed_year_month_partition_serialization_uses_full_range_literal(
+    #[case::month_max(
+        i32::MAX,
+        IntervalYearToMonthType::IntervalMonth,
+        "INTERVAL '2147483647' MONTH"
+    )]
+    #[case::full_zero(
+        0,
+        IntervalYearToMonthType::IntervalYearToMonth,
+        "INTERVAL '0-0' YEAR TO MONTH"
+    )]
+    #[case::full_positive(
+        30,
+        IntervalYearToMonthType::IntervalYearToMonth,
+        "INTERVAL '2-6' YEAR TO MONTH"
+    )]
+    #[case::full_negative_one(
+        -1,
+        IntervalYearToMonthType::IntervalYearToMonth,
+        "INTERVAL '-0-1' YEAR TO MONTH"
+    )]
+    #[case::full_min(
+        i32::MIN,
+        IntervalYearToMonthType::IntervalYearToMonth,
+        "INTERVAL '-178956970-8' YEAR TO MONTH"
+    )]
+    #[case::full_max(
+        i32::MAX,
+        IntervalYearToMonthType::IntervalYearToMonth,
+        "INTERVAL '178956970-7' YEAR TO MONTH"
+    )]
+    fn test_year_month_interval_formats_by_qualifier(
         #[case] months: i32,
         #[case] qualifier: IntervalYearToMonthType,
-        #[case] emitted: &str,
-        #[case] qualified: &str,
+        #[case] expected: &str,
     ) {
-        let actual =
-            serialize_partition_value(&Scalar::interval_year_month(months, qualifier).unwrap())
-                .unwrap();
-        assert_eq!(actual.as_deref(), Some(emitted));
-        assert_ne!(actual.as_deref(), Some(qualified));
+        let input = Scalar::interval_year_month(months, qualifier).unwrap();
+        assert_eq!(
+            serialize_partition_value(&input).unwrap().as_deref(),
+            Some(expected)
+        );
+    }
+
+    #[rstest]
+    #[case(-13)]
+    #[case(i32::MIN)]
+    #[case(i32::MAX)]
+    fn test_year_interval_partition_serialization_rejects_unaligned_months(#[case] months: i32) {
+        let payload = serde_json::from_value(serde_json::json!({
+            "months": months,
+            "ty": "interval year"
+        }))
+        .unwrap();
+        let err = serialize_partition_value(&Scalar::IntervalYearMonth(payload)).unwrap_err();
+        assert!(matches!(err, KernelError::InvalidPartitionValues(_)));
     }
 
     /// Kernel formats the smallest subnormal double as "5.0E-324" while Delta-Spark
