@@ -39,7 +39,7 @@ pub struct DecimalData {
 /// A year-month interval value stored as a signed month count and an ANSI qualifier.
 ///
 /// For example, `INTERVAL '2' YEAR` is stored as 24 months with the `YEAR` qualifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IntervalYearMonthData {
     months: i32,
     ty: IntervalYearToMonthType,
@@ -52,7 +52,7 @@ impl IntervalYearMonthData {
     pub fn try_new(months: i32, ty: IntervalYearToMonthType) -> Result<Self> {
         require!(
             ty != IntervalYearToMonthType::IntervalYear || months % MONTHS_PER_YEAR == 0,
-            KernelError::generic(format!(
+            KernelError::invalid_interval(format!(
                 "interval year value {months} months is not divisible by {MONTHS_PER_YEAR}"
             ))
         );
@@ -897,6 +897,8 @@ impl PrimitiveType {
     /// is normalized to UTC. The spec stores timestamp partition values either without a zone
     /// (interpreted in the writer's local time zone) or adjusted to UTC with a `Z` suffix.
     ///
+    /// Year-month interval literals must have the same qualifier as this primitive type.
+    ///
     /// # Errors
     ///
     /// Returns [`KernelError::ParseError`] if `raw` is not a valid encoding of this type.
@@ -963,10 +965,7 @@ impl PrimitiveType {
                     _ => unreachable!(),
                 }
             }
-            IntervalYearMonth(dtype) => {
-                let months = parse_year_month_interval(raw).ok_or_else(|| self.parse_error(raw))?;
-                Scalar::interval_year_month(months, *dtype).map_err(|_| self.parse_error(raw))
-            }
+            IntervalYearMonth(dtype) => parse_year_month_interval(raw, *dtype),
             IntervalDayTime => parse_day_time_interval(raw)
                 .map(Scalar::IntervalDayTime)
                 .ok_or_else(|| self.parse_error(raw)),
@@ -1067,9 +1066,8 @@ impl PrimitiveType {
 //
 // Spark serializes interval partition values as ANSI interval literal strings, e.g.
 // `INTERVAL '1-0' YEAR TO MONTH` (= 12 months) and
-// `INTERVAL '1 12:30:45.000000' DAY TO SECOND`. Kernel represents intervals as their
-// physical integer (i32 months / i64 microseconds), so these parsers convert literals to
-// their physical representation.
+// `INTERVAL '1 12:30:45.000000' DAY TO SECOND`. Kernel stores year-month intervals as a
+// month count and qualifier, and day-time intervals as microseconds.
 //
 // Currently, there's no DAT test for DAY TO SECOND partition values.
 // TODO: Unify SQL literal parsing with `expressions/sql.rs`.
@@ -1161,30 +1159,47 @@ fn checked_day_time_micros(
         .checked_add(micros)
 }
 
-/// Parses a year-month interval literal into a signed total month count.
-fn parse_year_month_interval(raw: &str) -> Option<i32> {
+/// Parses a year-month interval literal into a scalar with the target qualifier.
+fn parse_year_month_interval(raw: &str, target: IntervalYearToMonthType) -> Result<Scalar> {
     use IntervalField::*;
+    use IntervalYearToMonthType::*;
 
-    let (body, field_range) = extract_interval_literal(raw)?;
-    let (negative, magnitude) = interval_magnitude(body)?;
-    let total = match (field_range.start, field_range.end) {
-        (Year, Year) => magnitude.parse::<u32>().ok()?.checked_mul(12)?,
-        (Month, Month) => magnitude.parse().ok()?,
-        (Year, Month) => {
-            let (years, months) = magnitude.split_once('-')?;
-            let months = months.parse::<u32>().ok()?;
-            if months >= 12 {
-                return None;
-            }
-            years
+    let parse_error = || PrimitiveType::interval_year_month(target).parse_error(raw);
+    let (body, field_range) = extract_interval_literal(raw).ok_or_else(&parse_error)?;
+    let (negative, magnitude) = interval_magnitude(body).ok_or_else(&parse_error)?;
+    let (parsed_type, total) = match (field_range.start, field_range.end) {
+        (Year, Year) => (
+            IntervalYear,
+            magnitude
                 .parse::<u32>()
-                .ok()?
-                .checked_mul(12)?
-                .checked_add(months)?
+                .ok()
+                .and_then(|years| years.checked_mul(MONTHS_PER_YEAR as u32))
+                .ok_or_else(&parse_error)?,
+        ),
+        (Month, Month) => (IntervalMonth, magnitude.parse().map_err(|_| parse_error())?),
+        (Year, Month) => {
+            let (years, months) = magnitude.split_once('-').ok_or_else(&parse_error)?;
+            let months = months.parse::<u32>().map_err(|_| parse_error())?;
+            if months >= MONTHS_PER_YEAR as u32 {
+                return Err(parse_error());
+            }
+            (
+                IntervalYearToMonth,
+                years
+                    .parse::<u32>()
+                    .ok()
+                    .and_then(|years| years.checked_mul(MONTHS_PER_YEAR as u32))
+                    .and_then(|years| years.checked_add(months))
+                    .ok_or_else(&parse_error)?,
+            )
         }
-        _ => return None,
+        _ => return Err(parse_error()),
     };
-    signed_i32(total, negative)
+    if parsed_type != target {
+        return Err(parse_error());
+    }
+    let months = signed_i32(total, negative).ok_or_else(&parse_error)?;
+    Scalar::interval_year_month(months, target).map_err(|_| parse_error())
 }
 
 /// Parses a day-time interval literal into a signed total microsecond count.
@@ -1923,8 +1938,14 @@ mod tests {
         let payload = IntervalYearMonthData::try_new(months, dtype);
         let scalar = Scalar::interval_year_month(months, dtype);
         if dtype == IntervalYearToMonthType::IntervalYear && months % MONTHS_PER_YEAR != 0 {
-            assert!(payload.is_err());
-            assert!(scalar.is_err());
+            assert!(matches!(
+                payload.unwrap_err(),
+                KernelError::InvalidInterval(_)
+            ));
+            assert!(matches!(
+                scalar.unwrap_err(),
+                KernelError::InvalidInterval(_)
+            ));
             return;
         }
         let data = payload.unwrap();
@@ -1940,34 +1961,22 @@ mod tests {
     #[case(26)]
     #[case(-13)]
     fn interval_year_month_constructor_rejects_unaligned_years(#[case] months: i32) {
-        assert_result_error_with_message(
-            Scalar::interval_year_month(months, IntervalYearToMonthType::IntervalYear),
-            "not divisible by 12",
+        let err =
+            Scalar::interval_year_month(months, IntervalYearToMonthType::IntervalYear).unwrap_err();
+        assert!(
+            matches!(err, KernelError::InvalidInterval(message) if message.contains("not divisible by 12"))
         );
     }
 
     #[rstest]
-    #[case::target_year_accepts_year_literal(
-        IntervalYearToMonthType::IntervalYear,
-        "INTERVAL '2' YEAR",
-        24
-    )]
-    #[case::target_year_attaches_type_to_aligned_full_literal(
-        IntervalYearToMonthType::IntervalYear,
-        "INTERVAL '2-0' YEAR TO MONTH",
-        24
-    )]
-    #[case::target_month_attaches_type_to_year_literal(
-        IntervalYearToMonthType::IntervalMonth,
-        "INTERVAL '2' YEAR",
-        24
-    )]
-    #[case::target_full_accepts_full_literal(
+    #[case::year(IntervalYearToMonthType::IntervalYear, "INTERVAL '2' YEAR", 24)]
+    #[case::month(IntervalYearToMonthType::IntervalMonth, "INTERVAL '24' MONTH", 24)]
+    #[case::year_to_month(
         IntervalYearToMonthType::IntervalYearToMonth,
         "INTERVAL '2-6' YEAR TO MONTH",
         30
     )]
-    fn interval_year_month_parser_attaches_target_type(
+    fn interval_year_month_parser_requires_matching_qualifier(
         #[case] dtype: IntervalYearToMonthType,
         #[case] literal: &str,
         #[case] months: i32,
@@ -1979,12 +1988,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn interval_year_month_parser_rejects_unaligned_year_value() {
-        let year = PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYear);
-        assert_result_error_with_message(
-            year.parse_scalar("INTERVAL '2-6' YEAR TO MONTH"),
-            "Failed to parse value",
+    #[rstest]
+    #[case::year_as_month(IntervalYearToMonthType::IntervalMonth, "INTERVAL '2' YEAR")]
+    #[case::year_as_full(IntervalYearToMonthType::IntervalYearToMonth, "INTERVAL '2' YEAR")]
+    #[case::month_as_year(IntervalYearToMonthType::IntervalYear, "INTERVAL '24' MONTH")]
+    #[case::month_as_full(IntervalYearToMonthType::IntervalYearToMonth, "INTERVAL '24' MONTH")]
+    #[case::full_as_year(IntervalYearToMonthType::IntervalYear, "INTERVAL '2-0' YEAR TO MONTH")]
+    #[case::full_as_month(IntervalYearToMonthType::IntervalMonth, "INTERVAL '2-0' YEAR TO MONTH")]
+    fn interval_year_month_parser_rejects_cross_qualifier_literal(
+        #[case] dtype: IntervalYearToMonthType,
+        #[case] literal: &str,
+    ) {
+        let primitive = PrimitiveType::interval_year_month(dtype);
+        let err = primitive.parse_scalar(literal).unwrap_err();
+        assert!(
+            matches!(err, KernelError::ParseError(raw, ty) if raw == literal && ty == DataType::interval_year_month(dtype))
         );
     }
 
@@ -2086,11 +2104,11 @@ mod tests {
     #[rstest]
     #[case(
         "INTERVAL '1' YEAR",
-        Scalar::interval_year_month(12, IntervalYearToMonthType::IntervalYearToMonth).unwrap()
+        Scalar::interval_year_month(12, IntervalYearToMonthType::IntervalYear).unwrap()
     )]
     #[case(
         "INTERVAL '-6' MONTH",
-        Scalar::interval_year_month(-6, IntervalYearToMonthType::IntervalYearToMonth).unwrap()
+        Scalar::interval_year_month(-6, IntervalYearToMonthType::IntervalMonth).unwrap()
     )]
     #[case(
         "INTERVAL '2-6' YEAR TO MONTH",
@@ -2135,14 +2153,16 @@ mod tests {
 
     #[test]
     fn test_interval_literal_overflow_rejected() {
-        assert_eq!(
-            parse_year_month_interval("INTERVAL '178956970-8' YEAR TO MONTH"),
-            None
-        );
-        assert_eq!(
-            parse_year_month_interval("INTERVAL '-178956970-9' YEAR TO MONTH"),
-            None
-        );
+        let year_month = IntervalYearToMonthType::IntervalYearToMonth;
+        for literal in [
+            "INTERVAL '178956970-8' YEAR TO MONTH",
+            "INTERVAL '-178956970-9' YEAR TO MONTH",
+        ] {
+            let err = parse_year_month_interval(literal, year_month).unwrap_err();
+            assert!(
+                matches!(err, KernelError::ParseError(raw, ty) if raw == literal && ty == DataType::interval_year_month(year_month))
+            );
+        }
         assert_eq!(
             parse_day_time_interval("INTERVAL '9223372036854.775808' SECOND"),
             None
@@ -2156,8 +2176,12 @@ mod tests {
     #[test]
     fn test_interval_literal_case_whitespace_and_fraction_truncation() {
         assert_eq!(
-            parse_year_month_interval("  interval   '1-0'   year   to   month  "),
-            Some(12)
+            parse_year_month_interval(
+                "  interval   '1-0'   year   to   month  ",
+                IntervalYearToMonthType::IntervalYearToMonth,
+            )
+            .unwrap(),
+            Scalar::interval_year_month(12, IntervalYearToMonthType::IntervalYearToMonth).unwrap()
         );
         assert_eq!(
             parse_day_time_interval("INTERVAL '0.1234567' SECOND"),
