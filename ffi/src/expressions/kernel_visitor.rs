@@ -6,9 +6,9 @@ use std::sync::Arc;
 use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
 use delta_kernel::expressions::{
     lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
-    IntervalYearMonthData, JunctionPredicateOp, Predicate, Scalar, UnaryPredicateOp,
+    JunctionPredicateOp, Predicate, Scalar, UnaryPredicateOp,
 };
-use delta_kernel::schema::{DataType, PrimitiveType};
+use delta_kernel::schema::{DataType, IntervalYearToMonthType, PrimitiveType};
 use delta_kernel::Result;
 
 #[cfg(feature = "default-engine-base")]
@@ -388,17 +388,27 @@ pub extern "C" fn visit_expression_literal_timestamp_ntz(
 }
 
 /// Visit an interval year-month literal (signed month count).
+///
+/// Returns an allocated error if scalar construction fails.
 #[no_mangle]
 pub extern "C" fn visit_expression_literal_interval_year_month(
     state: &mut KernelExpressionVisitorState,
     value: i32,
-) -> usize {
-    wrap_expression(
-        state,
-        lit(Scalar::IntervalYearMonth(IntervalYearMonthData::from(
-            value,
-        ))),
-    )
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
+    unsafe {
+        visit_expression_literal_interval_year_month_impl(state, value)
+            .into_extern_result(&allocate_error)
+    }
+}
+
+fn visit_expression_literal_interval_year_month_impl(
+    state: &mut KernelExpressionVisitorState,
+    value: i32,
+) -> Result<usize> {
+    let scalar = Scalar::interval_year_month(value, IntervalYearToMonthType::IntervalYearToMonth)?;
+    Ok(wrap_expression(state, lit(scalar)))
 }
 
 /// Visit an interval day-time literal (signed microsecond count).
@@ -883,7 +893,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use delta_kernel::expressions::{col, lit, MapToStructOptions, Scalar};
-    use delta_kernel::schema::{schema, ArrayType, DataType, MapType};
+    use delta_kernel::schema::{schema, ArrayType, DataType, IntervalYearToMonthType, MapType};
     use rstest::rstest;
 
     use super::*;
@@ -1157,11 +1167,11 @@ mod tests {
     }
 
     #[rstest]
-    #[case(Scalar::IntervalYearMonth(IntervalYearMonthData::from(17)))]
+    #[case(Scalar::interval_year_month(17, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
     #[case(Scalar::IntervalDayTime(1_234_567))]
-    #[case(Scalar::IntervalYearMonth(IntervalYearMonthData::from(-13)))]
-    #[case(Scalar::IntervalYearMonth(IntervalYearMonthData::from(i32::MIN)))]
-    #[case(Scalar::IntervalYearMonth(IntervalYearMonthData::from(i32::MAX)))]
+    #[case(Scalar::interval_year_month(-13, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
+    #[case(Scalar::interval_year_month(i32::MIN, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
+    #[case(Scalar::interval_year_month(i32::MAX, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
     #[case(Scalar::IntervalDayTime(-86_400_000_000))]
     #[case(Scalar::IntervalDayTime(i64::MIN))]
     #[case(Scalar::IntervalDayTime(i64::MAX))]
@@ -1169,7 +1179,11 @@ mod tests {
         let mut state = KernelExpressionVisitorState::default();
         let id = match expected {
             Scalar::IntervalYearMonth(ref value) => {
-                visit_expression_literal_interval_year_month(&mut state, value.months())
+                ok_or_panic(visit_expression_literal_interval_year_month(
+                    &mut state,
+                    value.months(),
+                    allocate_err,
+                ))
             }
             Scalar::IntervalDayTime(value) => {
                 visit_expression_literal_interval_day_time(&mut state, value)

@@ -470,7 +470,7 @@ pub unsafe extern "C" fn visit_field_interval_year_month(
     visit_field_primitive_impl(
         state,
         name_str,
-        PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYearToMonth),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
         nullable,
         metadata,
     )
@@ -1957,7 +1957,7 @@ mod tests {
             ("col_timestamp_ntz", PrimitiveType::TimestampNtz),
             (
                 "col_interval_year_month",
-                PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYearToMonth),
+                PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
             ),
             ("col_interval_day_time", PrimitiveType::IntervalDayTime),
             ("col_void", PrimitiveType::Void),

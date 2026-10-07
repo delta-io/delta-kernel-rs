@@ -1973,6 +1973,11 @@ impl PrimitiveType {
         Ok(DecimalType::try_new(precision, scale)?.into())
     }
 
+    /// Constructs a year-month interval primitive with the given ANSI qualifier.
+    pub fn interval_year_month(ty: IntervalYearToMonthType) -> Self {
+        Self::IntervalYearMonth(ty)
+    }
+
     /// Returns whether this is one of the ANSI interval primitive types.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
@@ -2453,6 +2458,11 @@ impl DataType {
     /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> Result<Self> {
         Ok(PrimitiveType::decimal(precision, scale)?.into())
+    }
+
+    /// Constructs a year-month interval data type with the given ANSI qualifier.
+    pub fn interval_year_month(ty: IntervalYearToMonthType) -> Self {
+        PrimitiveType::interval_year_month(ty).into()
     }
 
     /// Create a new struct type with the given fields.
@@ -3121,15 +3131,11 @@ mod tests {
     #[case("timestamp_ntz", DataType::TIMESTAMP_NTZ)]
     #[case(
         "interval year",
-        DataType::Primitive(PrimitiveType::IntervalYearMonth(
-            IntervalYearToMonthType::IntervalYear
-        ))
+        DataType::interval_year_month(IntervalYearToMonthType::IntervalYear)
     )]
     #[case(
         "interval month",
-        DataType::Primitive(PrimitiveType::IntervalYearMonth(
-            IntervalYearToMonthType::IntervalMonth
-        ))
+        DataType::interval_year_month(IntervalYearToMonthType::IntervalMonth)
     )]
     #[case("interval year to month", DataType::INTERVAL_YEAR_MONTH)]
     #[case("interval day", DataType::INTERVAL_DAY_TIME)]
@@ -3229,6 +3235,14 @@ mod tests {
     #[case("\"date\"", DataType::DATE)]
     #[case("\"timestamp\"", DataType::TIMESTAMP)]
     #[case("\"timestamp_ntz\"", DataType::TIMESTAMP_NTZ)]
+    #[case(
+        "\"interval year\"",
+        DataType::interval_year_month(IntervalYearToMonthType::IntervalYear)
+    )]
+    #[case(
+        "\"interval month\"",
+        DataType::interval_year_month(IntervalYearToMonthType::IntervalMonth)
+    )]
     #[case("\"interval year to month\"", DataType::INTERVAL_YEAR_MONTH)]
     #[case("\"interval day to second\"", DataType::INTERVAL_DAY_TIME)]
     #[case("\"variant\"", DataType::unshredded_variant())]
@@ -3239,15 +3253,15 @@ mod tests {
 
     #[rstest]
     #[case(
-        PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYear),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYear),
         "interval year"
     )]
     #[case(
-        PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalMonth),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
         "interval month"
     )]
     #[case(
-        PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYearToMonth),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
         "interval year to month"
     )]
     #[case(PrimitiveType::IntervalDayTime, "interval day to second")]
@@ -3268,12 +3282,12 @@ mod tests {
         let schema = StructType::try_new([
             StructField::nullable(
                 "year",
-                PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYear),
+                PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYear),
             ),
             StructField::nullable(
                 "month_array",
                 ArrayType::new(
-                    PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalMonth),
+                    PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
                     true,
                 ),
             ),
@@ -3281,7 +3295,9 @@ mod tests {
                 "full_map",
                 MapType::new(
                     DataType::STRING,
-                    PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYearToMonth),
+                    PrimitiveType::interval_year_month(
+                        IntervalYearToMonthType::IntervalYearToMonth,
+                    ),
                     true,
                 ),
             ),

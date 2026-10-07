@@ -643,14 +643,16 @@ mod tests {
     }
 
     #[test]
-    fn visit_schema_preserves_interval_fields() {
+    fn visit_schema_encodes_interval_fields_with_generic_tags() {
         let schema = schema! {
             nullable "ym": INTERVAL_YEAR_MONTH,
             (StructField::nullable(
                 "narrow_year",
-                DataType::Primitive(PrimitiveType::IntervalYearMonth(
-                    IntervalYearToMonthType::IntervalYear
-                ))
+                DataType::interval_year_month(IntervalYearToMonthType::IntervalYear)
+            )),
+            (StructField::nullable(
+                "narrow_month",
+                DataType::interval_year_month(IntervalYearToMonthType::IntervalMonth)
             )),
             not_null "dt": INTERVAL_DAY_TIME,
             nullable "nested": {
@@ -664,7 +666,7 @@ mod tests {
         let top_level_id = visit_schema_impl(&schema, &mut visitor);
 
         assert_eq!(top_level_id, 0);
-        assert_eq!(builder.lists[0].len(), 5);
+        assert_eq!(builder.lists[0].len(), 6);
         assert_eq!(
             builder.lists[0][0],
             VisitedField::new("ym", "interval year to month", true, None)
@@ -675,16 +677,20 @@ mod tests {
         );
         assert_eq!(
             builder.lists[0][2],
+            VisitedField::new("narrow_month", "interval year to month", true, None)
+        );
+        assert_eq!(
+            builder.lists[0][3],
             VisitedField::new("dt", "interval day to second", false, None)
         );
 
-        let nested_child_list_id = builder.lists[0][3].children.unwrap();
+        let nested_child_list_id = builder.lists[0][4].children.unwrap();
         assert_eq!(
             builder.lists[nested_child_list_id][0],
             VisitedField::new("inner_ym", "interval year to month", true, None)
         );
 
-        let array_child_list_id = builder.lists[0][4].children.unwrap();
+        let array_child_list_id = builder.lists[0][5].children.unwrap();
         assert_eq!(
             builder.lists[array_child_list_id][0],
             VisitedField::new("array_element", "interval day to second", false, None)

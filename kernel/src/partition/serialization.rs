@@ -253,7 +253,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::{ArrayData, IntervalYearMonthData, MapData, Scalar, StructData};
+    use crate::expressions::{ArrayData, MapData, Scalar, StructData};
     use crate::schema::{
         ArrayType, DataType, IntervalYearToMonthType, MapType, PrimitiveType, StructField,
     };
@@ -551,24 +551,32 @@ mod tests {
         PrimitiveType::decimal(38, 18).unwrap()
     )]
     #[case::interval_ym(
-        Scalar::IntervalYearMonth(IntervalYearMonthData::from(30)),
-        PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYearToMonth)
+        Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth)
+    )]
+    #[case::interval_year(
+        Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYear)
+    )]
+    #[case::interval_month(
+        Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalMonth)
     )]
     #[case::interval_ym_neg(
-        Scalar::IntervalYearMonth(IntervalYearMonthData::from(-18)),
-        PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYearToMonth)
+        Scalar::interval_year_month(-18, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth)
     )]
     #[case::interval_ym_zero(
-        Scalar::IntervalYearMonth(IntervalYearMonthData::from(0)),
-        PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYearToMonth)
+        Scalar::interval_year_month(0, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth)
     )]
     #[case::interval_ym_min(
-        Scalar::IntervalYearMonth(IntervalYearMonthData::from(i32::MIN)),
-        PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYearToMonth)
+        Scalar::interval_year_month(i32::MIN, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth)
     )]
     #[case::interval_ym_max(
-        Scalar::IntervalYearMonth(IntervalYearMonthData::from(i32::MAX)),
-        PrimitiveType::IntervalYearMonth(IntervalYearToMonthType::IntervalYearToMonth)
+        Scalar::interval_year_month(i32::MAX, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth)
     )]
     #[case::interval_dt(
         Scalar::IntervalDayTime(131_445_000_000),
@@ -587,11 +595,11 @@ mod tests {
     /// year-month spelling is verified against the DAT `intv_003` workload.
     #[rstest]
     #[case(
-        Scalar::IntervalYearMonth(IntervalYearMonthData::from(12)),
+        Scalar::interval_year_month(12, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
         "INTERVAL '1-0' YEAR TO MONTH"
     )]
     #[case(
-        Scalar::IntervalYearMonth(IntervalYearMonthData::from(30)),
+        Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
         "INTERVAL '2-6' YEAR TO MONTH"
     )]
     #[case(
@@ -603,6 +611,32 @@ mod tests {
             serialize_partition_value(&input).unwrap(),
             Some(expected.to_string())
         );
+    }
+
+    #[rstest]
+    #[case::year(
+        24,
+        IntervalYearToMonthType::IntervalYear,
+        "INTERVAL '2-0' YEAR TO MONTH",
+        "INTERVAL '2' YEAR"
+    )]
+    #[case::month(
+        30,
+        IntervalYearToMonthType::IntervalMonth,
+        "INTERVAL '2-6' YEAR TO MONTH",
+        "INTERVAL '30' MONTH"
+    )]
+    fn test_narrowed_year_month_partition_serialization_uses_full_range_literal(
+        #[case] months: i32,
+        #[case] qualifier: IntervalYearToMonthType,
+        #[case] emitted: &str,
+        #[case] qualified: &str,
+    ) {
+        let actual =
+            serialize_partition_value(&Scalar::interval_year_month(months, qualifier).unwrap())
+                .unwrap();
+        assert_eq!(actual.as_deref(), Some(emitted));
+        assert_ne!(actual.as_deref(), Some(qualified));
     }
 
     /// Kernel formats the smallest subnormal double as "5.0E-324" while Delta-Spark

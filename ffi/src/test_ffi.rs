@@ -6,15 +6,17 @@ use std::sync::Arc;
 
 use delta_kernel::expressions::{
     col, column_name, column_pred, lit, null_lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
-    Expression as Expr, ExpressionStructPatchBuilder, IntervalYearMonthData, MapData,
-    MapToStructOptions, OpaqueExpressionOp, OpaquePredicateOp, Predicate as Pred, Scalar,
-    ScalarExpressionEvaluator, StructData,
+    Expression as Expr, ExpressionStructPatchBuilder, MapData, MapToStructOptions,
+    OpaqueExpressionOp, OpaquePredicateOp, Predicate as Pred, Scalar, ScalarExpressionEvaluator,
+    StructData,
 };
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
-use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
+use delta_kernel::schema::{
+    ArrayType, DataType, IntervalYearToMonthType, MapType, StructField, StructType,
+};
 use delta_kernel::Result;
 
 use crate::expressions::{SharedExpression, SharedPredicate};
@@ -250,7 +252,9 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
         lit(Scalar::Date(19000)),
         lit(Scalar::Timestamp(1234567890)),
         lit(Scalar::TimestampNtz(9876543210)),
-        lit(Scalar::IntervalYearMonth(IntervalYearMonthData::from(-13))),
+        lit(
+            Scalar::interval_year_month(-13, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+        ),
         lit(Scalar::IntervalDayTime(9_876_543_210)),
         null_lit(DataType::INTEGER),
         null_lit(DataType::decimal(10, 5).unwrap()),

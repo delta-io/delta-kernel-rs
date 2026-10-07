@@ -21,13 +21,14 @@ use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{
-    col, column_name, lit, Expression as Expr, IntervalYearMonthData, Predicate as Pred,
-    PredicateRef, Scalar,
+    col, column_name, lit, Expression as Expr, Predicate as Pred, PredicateRef, Scalar,
 };
 use delta_kernel::metrics::{MetricEvent, ScanType};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, Scan, StatsOptions};
-use delta_kernel::schema::{schema, schema_ref, DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{
+    schema, schema_ref, DataType, IntervalYearToMonthType, SchemaRef, StructField, StructType,
+};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{KernelError, Snapshot, SnapshotRef};
@@ -1275,9 +1276,21 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
-    Scalar::IntervalYearMonth(IntervalYearMonthData::from(12)),
-    Scalar::IntervalYearMonth(IntervalYearMonthData::from(12)),
-    Scalar::IntervalYearMonth(IntervalYearMonthData::from(24))
+    Scalar::interval_year_month(12, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+    Scalar::interval_year_month(12, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
+    Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYearToMonth).unwrap()
+)]
+#[case::year(
+    DataType::interval_year_month(IntervalYearToMonthType::IntervalYear),
+    Scalar::interval_year_month(12, IntervalYearToMonthType::IntervalYear).unwrap(),
+    Scalar::interval_year_month(12, IntervalYearToMonthType::IntervalYear).unwrap(),
+    Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap()
+)]
+#[case::month(
+    DataType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
+    Scalar::interval_year_month(13, IntervalYearToMonthType::IntervalMonth).unwrap(),
+    Scalar::interval_year_month(13, IntervalYearToMonthType::IntervalMonth).unwrap(),
+    Scalar::interval_year_month(25, IntervalYearToMonthType::IntervalMonth).unwrap()
 )]
 #[case::day_time(
     DataType::INTERVAL_DAY_TIME,

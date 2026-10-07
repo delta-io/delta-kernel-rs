@@ -349,7 +349,7 @@ Most engines need only one of the two surfaces.
 | `visit_engine_expression` / `visit_engine_predicate` | Build a Kernel `SharedExpression` / `SharedPredicate` from an engine-side AST (Build surface) |
 | `visit_expression` / `visit_predicate` | Walk a Kernel expression or predicate with an `EngineExpressionVisitor` (Walk surface) |
 | `visit_expression_ref` / `visit_predicate_ref` | Walk a pre-interned expression or predicate reference (Walk surface) |
-| `visit_expression_column` / `visit_expression_struct` / `visit_expression_plus` / `visit_expression_literal_*` / ... | Builder functions the engine calls from inside `visit_engine_expression` to construct Kernel expression nodes; see `delta_kernel_ffi.h` for the full list |
+| `visit_expression_column` / `visit_expression_struct` / `visit_expression_plus` / `visit_expression_literal_*` / ... | Builder functions the engine calls from inside `visit_engine_expression` to construct Kernel expression nodes. Fallible literal builders take `allocate_error` and return `ExternResultusize`; see `delta_kernel_ffi.h` for the full list |
 | `visit_predicate_eq` / `visit_predicate_and` / `visit_predicate_or` / ... | Builder functions the engine calls from inside `visit_engine_predicate` to construct Kernel predicate nodes |
 | `visit_expression_unknown` / `visit_predicate_unknown` | Builder helpers that bridge an opaque engine operator through Kernel unchanged |
 | `visit_kernel_opaque_expression_op_name` / `visit_kernel_opaque_predicate_op_name` | Inspect the name of an opaque op carried through by the above |
