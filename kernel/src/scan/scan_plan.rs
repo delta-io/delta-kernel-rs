@@ -7,14 +7,13 @@
 use std::borrow::Cow;
 use std::sync::{Arc, LazyLock};
 
-use delta_kernel_derive::{IntoStructData, ToSchema};
 use url::Url;
 
 use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, Scan};
 use crate::actions::{
-    get_all_actions_schema, Add, ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME,
+    get_all_actions_schema, ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME,
     SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
@@ -49,11 +48,6 @@ const PARTITION_VALUES: &str = "partitionValues";
 const PARTITION_VALUES_PARSED: &str = "partitionValues_parsed";
 const IS_ADD: &str = "is_add";
 const VERSION: &str = "version";
-
-#[derive(IntoStructData, ToSchema)]
-struct CrcAdd {
-    add: Option<Add>,
-}
 
 /// This planner centralizes schema and projection decisions shared by commits and checkpoints.
 /// For each source, it constructs a plan that:
@@ -454,15 +448,18 @@ impl Scan {
                         "metadata source add field must be a struct",
                     ));
                 };
-                PlanBuilder::values_from(files.iter().cloned().map(|add| CrcAdd { add: Some(add) }))
-                    .project_patch(|patch| {
-                        ADD_SCHEMA
-                            .fields()
-                            .filter(|field| read_add.field(field.name()).is_none())
-                            .fold(patch, |patch, field| {
-                                patch.drop_at([ADD_NAME], field.name())
-                            })
-                    })
+                PlanBuilder::values(
+                    LOG_ADD_SCHEMA.clone(),
+                    files.iter().cloned().map(|add| vec![add.into()]).collect(),
+                )?
+                .project_patch(|patch| {
+                    ADD_SCHEMA
+                        .fields()
+                        .filter(|field| read_add.field(field.name()).is_none())
+                        .fold(patch, |patch, field| {
+                            patch.drop_at([ADD_NAME], field.name())
+                        })
+                })
             })?
             .project_patch(|patch| {
                 patch.append(
@@ -728,12 +725,16 @@ mod execution_tests;
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+    use crate::actions::Add;
     use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
     use crate::arrow::array::{
         Array, BooleanArray, Int64Array, RecordBatch, StringArray, StructArray,
     };
     use crate::arrow::datatypes::{DataType as ADT, Field, Fields, Schema as ArrowSchema};
+    use crate::crc::Crc;
     use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
@@ -748,6 +749,7 @@ mod tests {
     use crate::scan::{build_stats_output_schemas, PartitionValuesOptions, StatsOptions};
     use crate::schema::StructType;
     use crate::snapshot::Snapshot;
+    use crate::table_features::TableFeature;
     use crate::unit_test_utils::{
         create_log_path, MockProtocolBuilder, MockTableConfigurationBuilder,
     };
@@ -1115,24 +1117,51 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn metadata_plan_executes_commit_dedup_with_sync_executor() -> Result<()> {
+    #[rstest::rstest]
+    #[case::no_dv(None, None, &["b.parquet"])]
+    #[case::matching_dv(Some(0), Some(0), &["b.parquet"])]
+    #[case::different_dv(Some(0), Some(1), &["a.parquet", "b.parquet"])]
+    fn metadata_plan_executes_commit_dedup_with_sync_executor(
+        #[case] add_offset: Option<i32>,
+        #[case] remove_offset: Option<i32>,
+        #[case] expected_paths: &[&str],
+        #[values(false, true)] crc_base: bool,
+    ) -> Result<()> {
         let store = Arc::new(InMemory::new());
+        let dv = |offset: Option<i32>| {
+            offset.map(|offset| {
+                json!({
+                    "storageType": "p", "pathOrInlineDv": "memory:///dv.bin", "offset": offset,
+                    "sizeInBytes": 1, "cardinality": 1
+                })
+            })
+        };
+        let add = |path, offset| {
+            json!({
+                "path": path, "size": 1, "modificationTime": 1, "dataChange": true,
+                "partitionValues": {}, "deletionVector": dv(offset)
+            })
+        };
+        let adds = [add("a.parquet", add_offset), add("b.parquet", None)];
         futures::executor::block_on(async {
             store
                 .put(
                     &Path::from("_delta_log/00000000000000000000.json"),
-                    r#"{"add":{"path":"a.parquet","size":1,"modificationTime":1,"dataChange":true,"partitionValues":{}}}
-{"add":{"path":"b.parquet","size":1,"modificationTime":1,"dataChange":true,"partitionValues":{}}}
-"#
-                    .into(),
+                    adds.iter()
+                        .map(|add| json!({"add": add}).to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        .into(),
                 )
                 .await?;
             store
                 .put(
                     &Path::from("_delta_log/00000000000000000001.json"),
-                    r#"{"remove":{"path":"a.parquet","deletionTimestamp":2,"dataChange":true}}
-"#
+                    json!({"remove": {
+                        "path": "a.parquet", "deletionTimestamp": 2, "dataChange": true,
+                        "deletionVector": dv(remove_offset)
+                    }})
+                    .to_string()
                     .into(),
                 )
                 .await?;
@@ -1147,37 +1176,71 @@ mod tests {
             ],
             None,
         );
-        let scan = mock_snapshot(segment)?.scan_builder().build()?;
-        let plan = scan
-            .build_metadata_scan_plan(&no_checkpoint())?
-            .expect("non-empty");
-
         let engine = SyncEngine::new_with_store(store);
-        let mut batches = engine
+        let table_configuration = MockTableConfigurationBuilder::new()
+            .with_schema(partitioned_schema())
+            .with_partition_columns(["p"])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::DeletionVectors])
+                    .build(),
+            )
+            .with_table_root("memory:///")
+            .with_version(1)
+            .try_build()?;
+        let all_files = adds
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<serde_json::Result<Vec<Add>>>()?;
+        let crc = crc_base.then(|| {
+            Arc::new(Crc {
+                version: 0,
+                all_files: Some(all_files),
+                ..Default::default()
+            })
+        });
+        let scan = Arc::new(Snapshot::new_with_crc(
+            segment,
+            table_configuration,
+            crc,
+            false,
+            false,
+        )?)
+        .scan_builder()
+        .build()?;
+        let plan = scan
+            .declarative_metadata_scan_plan(&engine)?
+            .expect("non-empty");
+        assert_eq!(
+            plan.nodes
+                .iter()
+                .any(|node| matches!(node.op, Operator::Values(_))),
+            crc_base
+        );
+        let batches = engine
             .plan_executor()
             .unwrap()
             .execute_op(PlanOperation::QueryPlan(plan))?
             .into_data()?;
-        let batch = batches
-            .next()
-            .expect("one batch")?
-            .try_into_record_batch()?;
-        assert!(batches.next().is_none());
-        assert_eq!(batch.num_rows(), 1);
-
-        let add = batch
-            .column_by_name(ADD_NAME)
-            .expect("add column")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("add struct");
-        let paths = add
-            .column_by_name("path")
-            .expect("add.path")
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("path string");
-        assert_eq!(paths.value(0), "b.parquet");
+        let mut actual_paths = vec![];
+        for batch in batches {
+            let batch = batch?.try_into_record_batch()?;
+            let add = batch
+                .column_by_name(ADD_NAME)
+                .expect("add column")
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("add struct");
+            let paths = add
+                .column_by_name("path")
+                .expect("add.path")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("path string");
+            actual_paths.extend(paths.iter().map(|path| path.unwrap().to_owned()));
+        }
+        actual_paths.sort_unstable();
+        assert_eq!(actual_paths, expected_paths);
         Ok(())
     }
 

@@ -119,38 +119,59 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn crc_bounds_replay_to_newer_commits() -> KernelResult<()> {
+    #[rstest]
+    #[case::base_only(4, false, 4)]
+    #[case::base_plus_commit(5, false, 5)]
+    #[case::empty_base_only(4, true, 0)]
+    #[case::empty_base_plus_commit(5, true, 1)]
+    fn crc_bounds_replay_to_newer_commits(
+        #[case] target_version: Version,
+        #[case] empty_crc: bool,
+        #[case] expected_rows: usize,
+    ) -> KernelResult<()> {
         let (engine, latest, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+        let target = Snapshot::builder_for(latest.table_root().clone())
+            .at_version(target_version)
+            .build(engine.as_ref())?;
         let base = Snapshot::builder_for(latest.table_root().clone())
             .at_version(4)
             .build(engine.as_ref())?;
         let (version, files) = base.base_crc_all_files().expect("version 4 CRC allFiles");
         let crc = Crc {
             version,
-            all_files: Some(files.to_vec()),
+            all_files: Some(if empty_crc { vec![] } else { files.to_vec() }),
             ..Default::default()
         };
         let log_root = latest.log_segment().log_root.clone();
-        let commit = log_root.join("00000000000000000005.json")?.to_string();
+        let commits: Vec<_> = (0..=target_version)
+            .map(|version| {
+                log_root
+                    .join(&format!("{version:020}.json"))
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
         let snapshot = Arc::new(Snapshot::new_with_crc(
-            log_segment(log_root, &[&commit], None),
-            latest.table_configuration().clone(),
+            log_segment(
+                log_root,
+                &commits.iter().map(String::as_str).collect::<Vec<_>>(),
+                None,
+            ),
+            target.table_configuration().clone(),
             Some(Arc::new(crc)),
             false,
             false,
         )?);
         let scan = snapshot.scan_builder().build()?;
-        let planner = MetadataPlanner::try_new(&scan)?;
-        let base = MetadataReplayBase::try_new(
-            &scan.snapshot,
+        let plan = scan.declarative_metadata_scan_plan(
             &DelegatingEngine::new(engine.clone()).without_plan_executor(),
-            &planner,
         )?;
-        let plan = scan
-            .build_metadata_scan_plan_with(&base, &planner)?
-            .expect("non-empty");
+        if expected_rows == 0 {
+            assert!(plan.is_none());
+            return Ok(());
+        }
+        let plan = plan.expect("non-empty");
 
         let json_paths: Vec<_> = plan
             .nodes
@@ -162,8 +183,10 @@ mod tests {
             .flatten()
             .map(|file| file.meta.location.path())
             .collect();
-        assert_eq!(json_paths.len(), 1);
-        assert!(json_paths[0].ends_with("00000000000000000005.json"));
+        assert_eq!(json_paths.len(), (target_version - version) as usize);
+        assert!(json_paths
+            .iter()
+            .all(|path| path.ends_with("00000000000000000005.json")));
 
         let row_count = engine
             .plan_executor()
@@ -173,7 +196,7 @@ mod tests {
             .try_fold(0, |count, batch| {
                 Ok::<_, crate::KernelError>(count + batch?.try_into_record_batch()?.num_rows())
             })?;
-        assert_eq!(row_count, 5);
+        assert_eq!(row_count, expected_rows);
         Ok(())
     }
 }
