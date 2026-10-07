@@ -785,7 +785,7 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
 #[cfg(test)]
 mod tests {
     use delta_kernel::expressions::{lit, Expression, MapToStructOptions, Scalar};
-    use delta_kernel::schema::{DataType, IntervalYearToMonthType};
+    use delta_kernel::schema::IntervalYearToMonthType;
     use rstest::rstest;
 
     use super::*;
@@ -801,12 +801,6 @@ mod tests {
         IntervalDayTime {
             sibling_list_id: usize,
             value: i64,
-        },
-        Null {
-            sibling_list_id: usize,
-            tag: u8,
-            precision: u8,
-            scale: u8,
         },
         Column {
             sibling_list_id: usize,
@@ -931,22 +925,7 @@ mod tests {
     ignore_fn!(ignore_struct_literal, usize, usize);
     ignore_fn!(ignore_child_list, usize);
     ignore_fn!(ignore_map_literal, usize, usize);
-    extern "C" fn visit_literal_null(
-        data: *mut c_void,
-        sibling_list_id: usize,
-        tag: u8,
-        precision: u8,
-        scale: u8,
-    ) {
-        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
-        builder.events.push(LiteralEvent::Null {
-            sibling_list_id,
-            tag,
-            precision,
-            scale,
-        });
-    }
-
+    ignore_fn!(ignore_null, u8, u8, u8);
     ignore_fn!(ignore_parse_json, usize, Handle<SharedSchema>);
     ignore_fn!(ignore_struct_patch, usize, usize, usize, usize);
     ignore_fn!(ignore_field_patch, KernelStringSlice, usize, bool, bool);
@@ -975,7 +954,7 @@ mod tests {
             visit_literal_struct: ignore_struct_literal,
             visit_literal_array: ignore_child_list,
             visit_literal_map: ignore_map_literal,
-            visit_literal_null,
+            visit_literal_null: ignore_null,
             visit_and: ignore_child_list,
             visit_or: ignore_child_list,
             visit_not: ignore_child_list,
@@ -1074,31 +1053,6 @@ mod tests {
 
         assert_eq!(top_level_id, 0);
         assert_eq!(builder.events, vec![expected]);
-    }
-
-    #[rstest]
-    #[case(IntervalYearToMonthType::IntervalYear)]
-    #[case(IntervalYearToMonthType::IntervalMonth)]
-    #[case(IntervalYearToMonthType::IntervalYearToMonth)]
-    fn visit_expression_uses_generic_interval_year_month_null_tag(
-        #[case] dtype: IntervalYearToMonthType,
-    ) {
-        let expression = lit(Scalar::Null(DataType::interval_year_month(dtype)));
-        let mut builder = TestExpressionBuilder::default();
-        let mut visitor = test_visitor(&mut builder);
-
-        let top_level_id = visit_expression_internal(&expression, &mut visitor);
-
-        assert_eq!(top_level_id, 0);
-        assert_eq!(
-            builder.events,
-            vec![LiteralEvent::Null {
-                sibling_list_id: 0,
-                tag: 13,
-                precision: 0,
-                scale: 0,
-            }]
-        );
     }
 
     #[rstest]

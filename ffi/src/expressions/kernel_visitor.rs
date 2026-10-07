@@ -390,17 +390,18 @@ pub extern "C" fn visit_expression_literal_timestamp_ntz(
 /// Visit an interval year-month literal (signed month count).
 ///
 /// Returns an allocated error if scalar construction fails.
+///
+/// # Safety
+///
+/// The caller must provide a valid `allocate_error` callback.
 #[no_mangle]
-pub extern "C" fn visit_expression_literal_interval_year_month(
+pub unsafe extern "C" fn visit_expression_literal_interval_year_month(
     state: &mut KernelExpressionVisitorState,
     value: i32,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
-    unsafe {
-        visit_expression_literal_interval_year_month_impl(state, value)
-            .into_extern_result(&allocate_error)
-    }
+    visit_expression_literal_interval_year_month_impl(state, value)
+        .into_extern_result(&allocate_error)
 }
 
 fn visit_expression_literal_interval_year_month_impl(
@@ -1179,11 +1180,14 @@ mod tests {
         let mut state = KernelExpressionVisitorState::default();
         let id = match expected {
             Scalar::IntervalYearMonth(ref value) => {
-                ok_or_panic(visit_expression_literal_interval_year_month(
-                    &mut state,
-                    value.months(),
-                    allocate_err,
-                ))
+                // SAFETY: allocate_err is a valid test callback.
+                ok_or_panic(unsafe {
+                    visit_expression_literal_interval_year_month(
+                        &mut state,
+                        value.months(),
+                        allocate_err,
+                    )
+                })
             }
             Scalar::IntervalDayTime(value) => {
                 visit_expression_literal_interval_day_time(&mut state, value)
