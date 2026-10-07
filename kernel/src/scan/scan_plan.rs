@@ -174,15 +174,13 @@ impl<'a> MetadataPlanner<'a> {
             }
             _ => (patch.drop(STATS), StatsKind::None),
         };
-        let read_partitions = self.parsed_partition_schema.filter(|required| {
-            matches!(
-                field_type(PARTITION_VALUES_PARSED),
-                Some(DataType::Struct(native))
-                    if LogSegment::structs_have_compatible_types(
-                        native, required, PARTITION_VALUES_PARSED,
-                    )
-            )
-        });
+        let native_partitions = field_type(PARTITION_VALUES_PARSED);
+        let read_partitions = match native_partitions {
+            Some(DataType::Struct(native)) => self.parsed_partition_schema.filter(|required| {
+                LogSegment::structs_have_compatible_types(native, required, PARTITION_VALUES_PARSED)
+            }),
+            _ => None,
+        };
         let add_patch = add_patch.fold_with(read_partitions, |patch, schema| {
             patch.append(StructField::nullable(
                 PARTITION_VALUES_PARSED,
@@ -212,30 +210,31 @@ impl<'a> MetadataPlanner<'a> {
             .parsed_partition_schema
             .filter(|_| !has_struct_partitions);
         let plan = plan.project_patch(|patch| {
-            let patch = patch.fold_with(pre_filter_stats_schema, |patch, schema| {
-                stats = StatsKind::Struct;
-                patch.drop_at([ADD_NAME], STATS).append_at(
-                    [ADD_NAME],
-                    StructField::nullable(STATS_PARSED, schema.as_ref().clone()),
-                    Expr::parse_json(col!(ADD_NAME, STATS), Arc::clone(schema)),
-                )
-            });
-            let patch = patch.fold_with(parsed_partition_schema, |patch, schema| {
-                patch.append_at(
-                    [ADD_NAME],
-                    StructField::nullable(PARTITION_VALUES_PARSED, schema.as_ref().clone()),
-                    Expr::map_to_struct(
-                        col!(ADD_NAME, PARTITION_VALUES),
-                        MapToStructOptions::default(),
-                    ),
-                )
-            });
-            patch.fold_with(self.stats_filter.as_ref(), |patch, _| {
-                patch.append(
-                    StructField::not_null(IS_ADD, DataType::BOOLEAN),
-                    Expr::from(col!("add.path").is_not_null()),
-                )
-            })
+            patch
+                .fold_with(pre_filter_stats_schema, |patch, schema| {
+                    stats = StatsKind::Struct;
+                    patch.drop_at([ADD_NAME], STATS).append_at(
+                        [ADD_NAME],
+                        StructField::nullable(STATS_PARSED, schema.as_ref().clone()),
+                        Expr::parse_json(col!(ADD_NAME, STATS), Arc::clone(schema)),
+                    )
+                })
+                .fold_with(parsed_partition_schema, |patch, schema| {
+                    patch.append_at(
+                        [ADD_NAME],
+                        StructField::nullable(PARTITION_VALUES_PARSED, schema.as_ref().clone()),
+                        Expr::map_to_struct(
+                            col!(ADD_NAME, PARTITION_VALUES),
+                            MapToStructOptions::default(),
+                        ),
+                    )
+                })
+                .fold_with(self.stats_filter.as_ref(), |patch, _| {
+                    patch.append(
+                        StructField::not_null(IS_ADD, DataType::BOOLEAN),
+                        Expr::from(col!("add.path").is_not_null()),
+                    )
+                })
         })?;
         Ok((plan, stats))
     }
