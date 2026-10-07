@@ -56,8 +56,16 @@ uintptr_t convert_engine_to_kernel_literal(
           lit->value.long_data);
     case Date:
       return visit_expression_literal_date(state, lit->value.integer_data);
-    case IntervalYearMonth:
-      return visit_expression_literal_interval_year_month(state, lit->value.integer_data);
+    case IntervalYearMonth: {
+      ExternResultusize result = visit_expression_literal_interval_year_month(
+          state, lit->value.integer_data, allocate_error);
+      if (result.tag == Errusize) {
+        print_error("visit_expression_literal_interval_year_month failed", (Error*)result.err);
+        free_error((Error*)result.err);
+        abort();
+      }
+      return result.ok;
+    }
     case IntervalDayTime:
       return visit_expression_literal_interval_day_time(state, lit->value.long_data);
     case Binary: {
