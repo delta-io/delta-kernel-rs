@@ -10,9 +10,10 @@ use serde_json::Value;
 use super::*;
 use crate::arrow::array::{Array, ArrayRef, BooleanArray, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
-use crate::arrow::datatypes::DataType as ArrowDataType;
+use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::pretty::pretty_format_batches;
+use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
@@ -97,6 +98,7 @@ fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> KernelResult<Vec<Re
     let Some(plan) = scan.declarative_metadata_scan_plan(engine)? else {
         return Ok(vec![]);
     };
+    let output_schema: ArrowSchema = plan.schema.as_ref().try_into_arrow()?;
     let batches = engine
         .plan_executor()
         .unwrap()
@@ -106,6 +108,7 @@ fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> KernelResult<Vec<Re
     let mut projected = vec![];
     for batch in batches {
         let batch = batch?.try_into_record_batch()?;
+        assert_eq!(batch.schema().as_ref(), &output_schema);
         if batch.num_rows() == 0 {
             continue;
         }
@@ -432,89 +435,67 @@ const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
 #[case::json_only_string_map(
     StatsOptions::json_only(),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_PREFIX_FIELDS, ADD_FILE_FIELDS, JSON_STATS_FIELDS, ADD_SUFFIX_FIELDS]
+    &[JSON_STATS_FIELDS]
 )]
 #[case::json_only_with_struct(
     StatsOptions::json_only(),
     PartitionValuesOptions::with_struct(),
-    &[
-        ADD_PREFIX_FIELDS, PARTITION_PARSED_FIELDS, ADD_FILE_FIELDS,
-        JSON_STATS_FIELDS, ADD_SUFFIX_FIELDS
-    ]
+    &[JSON_STATS_FIELDS]
 )]
 #[case::all_struct_string_map(
     StatsOptions::all_struct(),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_PREFIX_FIELDS, ADD_FILE_FIELDS, ALL_STATS_PARSED_FIELDS, ADD_SUFFIX_FIELDS]
+    &[ALL_STATS_PARSED_FIELDS]
 )]
 #[case::all_struct_with_struct(
     StatsOptions::all_struct(),
     PartitionValuesOptions::with_struct(),
-    &[
-        ADD_PREFIX_FIELDS, PARTITION_PARSED_FIELDS, ADD_FILE_FIELDS,
-        ALL_STATS_PARSED_FIELDS, ADD_SUFFIX_FIELDS
-    ]
+    &[ALL_STATS_PARSED_FIELDS]
 )]
 #[case::struct_columns_string_map(
     StatsOptions::struct_columns(vec![column_name!("id")]),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_PREFIX_FIELDS, ADD_FILE_FIELDS, ID_STATS_PARSED_FIELDS, ADD_SUFFIX_FIELDS]
+    &[ID_STATS_PARSED_FIELDS]
 )]
 #[case::struct_columns_with_struct(
     StatsOptions::struct_columns(vec![column_name!("id")]),
     PartitionValuesOptions::with_struct(),
-    &[
-        ADD_PREFIX_FIELDS, PARTITION_PARSED_FIELDS, ADD_FILE_FIELDS,
-        ID_STATS_PARSED_FIELDS, ADD_SUFFIX_FIELDS
-    ]
+    &[ID_STATS_PARSED_FIELDS]
 )]
 #[case::empty_struct_columns_string_map(
     StatsOptions::struct_columns(vec![]),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_PREFIX_FIELDS, ADD_FILE_FIELDS, ADD_SUFFIX_FIELDS]
+    &[]
 )]
 #[case::empty_struct_columns_with_struct(
     StatsOptions::struct_columns(vec![]),
     PartitionValuesOptions::with_struct(),
-    &[ADD_PREFIX_FIELDS, PARTITION_PARSED_FIELDS, ADD_FILE_FIELDS, ADD_SUFFIX_FIELDS]
+    &[]
 )]
 #[case::all_string_map(
     StatsOptions::all(),
     PartitionValuesOptions::string_map_only(),
-    &[
-        ADD_PREFIX_FIELDS, ADD_FILE_FIELDS, JSON_STATS_FIELDS,
-        ALL_STATS_PARSED_FIELDS, ADD_SUFFIX_FIELDS
-    ]
+    &[JSON_STATS_FIELDS, ALL_STATS_PARSED_FIELDS]
 )]
 #[case::all_with_struct(
     StatsOptions::all(),
     PartitionValuesOptions::with_struct(),
-    &[
-        ADD_PREFIX_FIELDS,
-        PARTITION_PARSED_FIELDS,
-        ADD_FILE_FIELDS,
-        JSON_STATS_FIELDS,
-        ALL_STATS_PARSED_FIELDS,
-        ADD_SUFFIX_FIELDS,
-    ]
+    &[JSON_STATS_FIELDS, ALL_STATS_PARSED_FIELDS]
 )]
 #[case::both_columns(
     StatsOptions { synthesize_json: true, ..StatsOptions::struct_columns(vec![column_name!("id")]) },
     PartitionValuesOptions::with_struct(),
-    &[
-        ADD_PREFIX_FIELDS, PARTITION_PARSED_FIELDS, ADD_FILE_FIELDS,
-        JSON_STATS_FIELDS, ID_STATS_PARSED_FIELDS, ADD_SUFFIX_FIELDS
-    ]
+    &[JSON_STATS_FIELDS, ID_STATS_PARSED_FIELDS]
 )]
 #[case::none_string_map(
     StatsOptions::none(),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_PREFIX_FIELDS, ADD_FILE_FIELDS, ADD_SUFFIX_FIELDS]
+    &[]
 )]
 #[case::none_with_struct(
     StatsOptions::none(),
     PartitionValuesOptions::with_struct(),
-    &[ADD_PREFIX_FIELDS, PARTITION_PARSED_FIELDS, ADD_FILE_FIELDS, ADD_SUFFIX_FIELDS]
+    &[]
 )]
 fn declarative_metadata_has_exact_leaf_schema_across_output_options(
     #[case] stats: StatsOptions,
@@ -523,6 +504,7 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
 ) {
     (|| -> Result<()> {
         let json_requested = stats.synthesize_json;
+        let parsed_partitions_requested = partition_values.parsed_struct;
         let (engine, snapshot, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
         let scan = snapshot
@@ -567,9 +549,12 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
             }
         }
 
-        let expected: Vec<_> = expected_field_groups
+        let expected: Vec<_> = ADD_PREFIX_FIELDS
             .iter()
-            .flat_map(|fields| fields.iter())
+            .chain(PARTITION_PARSED_FIELDS.iter().filter(|_| parsed_partitions_requested))
+            .chain(ADD_FILE_FIELDS)
+            .chain(expected_field_groups.iter().flat_map(|fields| fields.iter()))
+            .chain(ADD_SUFFIX_FIELDS)
             .map(|field| field.to_string())
             .collect();
         assert_eq!(leaf_paths(&actual), expected);
@@ -648,6 +633,12 @@ fn declarative_metadata_projects_nested_column_mapped_stats(
     checkpoint_struct_stats(),
     StatsOptions::all_struct()
 )]
+#[case::v1_mixed_both(
+    LogState::with_latest_version(2).with_checkpoint_at([1]),
+    FeatureSet::new(),
+    TableConfig::new().write_stats_as_json(true).write_stats_as_struct(true),
+    StatsOptions::all()
+)]
 #[case::v2_checkpoint_json(
     LogState::with_latest_version(2)
         .with_checkpoint_at([2])
@@ -663,6 +654,14 @@ fn declarative_metadata_projects_nested_column_mapped_stats(
     FeatureSet::new().v2_checkpoint(),
     checkpoint_struct_stats(),
     StatsOptions::all_struct()
+)]
+#[case::v2_mixed_both(
+    LogState::with_latest_version(2)
+        .with_checkpoint_at([1])
+        .with_sidecars_if_enabled(None),
+    FeatureSet::new().v2_checkpoint(),
+    TableConfig::new().write_stats_as_json(true).write_stats_as_struct(true),
+    StatsOptions::all()
 )]
 #[case::v2_checkpoint_without_stats(
     LogState::with_latest_version(2)
