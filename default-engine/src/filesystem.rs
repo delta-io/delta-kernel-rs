@@ -72,7 +72,14 @@ async fn list_from_impl(
         .map(move |meta| {
             let meta = meta?;
             let mut location = path.clone();
-            location.set_path(&format!("/{}", meta.location.as_ref()));
+            // Unlike set_path, this escapes literal '%' characters in object keys.
+            location
+                .path_segments_mut()
+                .map_err(|()| {
+                    KernelError::InvalidTableLocation(format!("Invalid listing URL: {path}"))
+                })?
+                .clear()
+                .extend(meta.location.parts());
             Ok(FileMeta {
                 location,
                 last_modified: meta.last_modified.timestamp_millis(),
