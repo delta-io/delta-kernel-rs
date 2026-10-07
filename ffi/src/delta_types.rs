@@ -8,8 +8,9 @@
 //! `as_ffi()` does not read those fields directly. For example, `CrcBacking::_add_backing` owns
 //! the buffers and deletion-vector descriptors referenced by `adds`. In `CheckpointV2Backing`,
 //! `_sidecar_tags` owns tag arrays referenced by `sidecars`, and `_action_records` owns records
-//! addressed by `actions`. The `_` prefix suppresses unused-field warnings; these fields obey
-//! the same lifetime rules as other backing storage.
+//! addressed by `actions`; `_action_backing` retains the protocol and metadata arrays those
+//! records reference. The `_` prefix suppresses unused-field warnings; these fields obey the
+//! same lifetime rules as other backing storage.
 //!
 //! Build views after inline pointees are in place, and do not move those pointees or reallocate
 //! referenced buffers while the views are in use.
@@ -26,6 +27,7 @@ use delta_kernel::crc::{
 };
 use delta_kernel::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::snapshot::PublicationWatermark;
+use delta_kernel::table_features::TableFeature;
 use delta_kernel::{KernelError, KernelResult, Version};
 
 use crate::{
@@ -124,7 +126,7 @@ pub(crate) struct ProtocolBacking<'a> {
 impl<'a> ProtocolBacking<'a> {
     /// Creates C-layout storage borrowing `source`.
     pub(crate) fn new(source: &'a Protocol) -> Self {
-        let features = |values: Option<&[delta_kernel::table_features::TableFeature]>| {
+        let features = |values: Option<&[TableFeature]>| {
             values.map(|values| {
                 values
                     .iter()

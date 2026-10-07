@@ -31,17 +31,18 @@ pub struct FromTableRoot;
 #[doc(hidden)]
 pub struct FromSnapshot;
 
-/// The connector-provided freshness of the version carried by a [`SnapshotHint`].
+/// The freshness claim for the version carried by a [`SnapshotHint`].
 ///
 /// Kernel trusts this value: [`Latest`](Self::Latest) makes
 /// [`Snapshot::is_built_as_latest`] true, while [`Unverified`](Self::Unverified) makes it false.
+/// Connector inputs supply this claim; exports preserve the snapshot's build-time claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 #[internal_api]
 pub(crate) enum SnapshotHintFreshness {
-    /// The connector supplied the version without establishing that it was the latest version.
+    /// The hinted version was not established as latest.
     Unverified,
-    /// The connector established that the supplied version was the latest version.
+    /// The hinted version was established as latest when the claim was made.
     Latest,
 }
 
@@ -94,12 +95,10 @@ pub(crate) struct SnapshotHint {
     ///
     /// This may have been advanced from an older `latest_crc_file`.
     crc: Option<Arc<Crc>>,
-    /// Whether the connector established that `version` was latest.
+    /// Whether `version` was established as latest when the hint was captured.
     freshness: SnapshotHintFreshness,
 }
 
-// The containing type is exposed only with internal-api.
-#[allow(unreachable_pub)]
 impl SnapshotHint {
     /// Creates a hint for `table_root` at `version` from connector-provided log paths and table
     /// state.
@@ -177,20 +176,23 @@ impl SnapshotHint {
     }
 
     /// Returns the version described by this hint.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn version(&self) -> Version {
+    pub(crate) fn version(&self) -> Version {
         self.version
     }
 
     /// Returns the retained log files, including the observed publication watermark.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn log_segment_files(&self) -> &LogSegmentFiles {
+    pub(crate) fn log_segment_files(&self) -> &LogSegmentFiles {
         &self.log_segment_files
     }
 
     /// Returns the resolved publication observation, never a request for inference.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn publication_watermark(&self) -> PublicationWatermark {
+    pub(crate) fn publication_watermark(&self) -> PublicationWatermark {
         match self.log_segment_files.max_published_version {
             Some(version) => PublicationWatermark::PublishedThrough(version),
             None => PublicationWatermark::NoPublishedCommits,
@@ -198,14 +200,16 @@ impl SnapshotHint {
     }
 
     /// Returns the protocol at the hinted version.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn protocol(&self) -> &Protocol {
+    pub(crate) fn protocol(&self) -> &Protocol {
         &self.protocol
     }
 
     /// Returns the metadata at the hinted version.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn metadata(&self) -> &Metadata {
+    pub(crate) fn metadata(&self) -> &Metadata {
         &self.metadata
     }
 
@@ -213,8 +217,9 @@ impl SnapshotHint {
     ///
     /// Hints exported by [`Snapshot::to_snapshot_hint`] retain only a matching checkpoint hint.
     /// Connector-provided inputs are checked when the snapshot is built.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn last_checkpoint_hint(&self) -> Option<&LastCheckpointHint> {
+    pub(crate) fn last_checkpoint_hint(&self) -> Option<&LastCheckpointHint> {
         self.last_checkpoint_hint.as_ref()
     }
 
@@ -222,14 +227,16 @@ impl SnapshotHint {
     ///
     /// Hints exported by [`Snapshot::to_snapshot_hint`] retain only CRC state at the snapshot
     /// version. Connector-provided inputs are checked when the snapshot is built.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn crc(&self) -> Option<&Crc> {
+    pub(crate) fn crc(&self) -> Option<&Crc> {
         self.crc.as_deref()
     }
 
     /// Returns the freshness established when the hint was captured.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn freshness(&self) -> SnapshotHintFreshness {
+    pub(crate) fn freshness(&self) -> SnapshotHintFreshness {
         self.freshness
     }
 
@@ -1107,6 +1114,45 @@ mod tests {
                 if matches!(*source, SnapshotHintError::LogCompaction)
         ));
         Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::infer_published(PublicationWatermark::InferFromLogPaths, false, Some(1))]
+    #[case::infer_staged_only(PublicationWatermark::InferFromLogPaths, true, None)]
+    #[case::explicit_absence(PublicationWatermark::NoPublishedCommits, false, None)]
+    #[case::explicit_version(PublicationWatermark::PublishedThrough(0), true, Some(0))]
+    fn snapshot_hint_resolves_publication_watermark(
+        #[case] watermark: PublicationWatermark,
+        #[case] staged: bool,
+        #[case] expected: Option<Version>,
+    ) {
+        let path = if staged {
+            "memory:///target/_delta_log/_staged_commits/\
+             00000000000000000001.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json"
+        } else {
+            "memory:///target/_delta_log/00000000000000000001.json"
+        };
+        let hint = SnapshotHint::try_new(
+            "memory:///target/",
+            1,
+            watermark,
+            vec![LogPath::try_new(create_log_path(path).location).unwrap()],
+            Protocol::default(),
+            Metadata::default(),
+            None,
+            None,
+            SnapshotHintFreshness::Unverified,
+        )
+        .unwrap();
+
+        assert_eq!(hint.log_segment_files().max_published_version, expected);
+        assert_eq!(
+            hint.publication_watermark(),
+            expected.map_or(
+                PublicationWatermark::NoPublishedCommits,
+                PublicationWatermark::PublishedThrough,
+            )
+        );
     }
 
     #[rstest::rstest]

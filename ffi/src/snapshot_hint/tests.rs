@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error as _;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -7,11 +8,14 @@ use delta_kernel::actions::{Add, LastManifestCommit};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::crc::Crc;
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
-use delta_kernel::snapshot::PublicationWatermark;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
-use test_utils::TestCatalogCommitter;
+use delta_kernel::log_segment::LogSegment;
+use delta_kernel::path::ParsedLogPath;
+use delta_kernel::snapshot::{IncrementalReplay, PublicationWatermark, Snapshot};
+use delta_kernel::{
+    Engine, EvaluationHandler, FileMeta, JsonHandler, ParquetHandler, StorageHandler,
+};
+use test_utils::table_builder::{LogState, TestTableBuilder};
+use test_utils::{compacted_log_path_for_versions, create_log_path, TestCatalogCommitter};
 
 use super::*;
 use crate::delta_types::*;
@@ -275,6 +279,246 @@ fn snapshot_hint_export_borrows_inputs_and_calls_visitor_once() {
 extern "C" fn count_hint_visits(context: NullableCvoid, _hint: *const FfiSnapshotHint) {
     let visits = unsafe { &mut *context.unwrap().as_ptr().cast::<usize>() };
     *visits += 1;
+}
+
+#[test]
+fn snapshot_hint_export_rejects_compaction_without_calling_visitor() {
+    let engine = test_engine();
+    let paths = [
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+            1,
+            1,
+        ),
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000001.json"),
+            2,
+            2,
+        ),
+    ];
+    let hint = test_snapshot_hint(&paths, 1, FfiSnapshotHintFreshness::Unverified);
+    let builder = unsafe {
+        ok_or_panic(snapshot_builder_with_snapshot_hint(
+            test_builder(&engine),
+            &hint,
+        ))
+    };
+    let source = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let source_ref = unsafe { source.as_ref() };
+    let mut files = source_ref.log_segment().listed.clone();
+    files.ascending_compaction_files.push(
+        create_log_path(
+            source_ref.table_root(),
+            compacted_log_path_for_versions(0, 1, "json"),
+        )
+        .into(),
+    );
+    let snapshot = Snapshot::new(
+        LogSegment::try_new(
+            files,
+            source_ref.log_segment().log_root.clone(),
+            Some(1),
+            None,
+        )
+        .unwrap(),
+        source_ref.table_configuration().clone(),
+    )
+    .unwrap();
+    let snapshot: Handle<SharedSnapshot> = Arc::new(snapshot).into();
+    unsafe { free_snapshot(source) };
+
+    let mut visits = 0usize;
+    let result = unsafe {
+        snapshot_to_snapshot_hint(
+            snapshot.shallow_copy(),
+            engine.shallow_copy(),
+            Some(NonNull::from(&mut visits).cast()),
+            count_hint_visits,
+        )
+    };
+    assert_extern_result_error_contains(
+        result,
+        FFIKernelError::InvalidSnapshotHint,
+        "log compaction",
+    );
+    assert_eq!(visits, 0);
+    assert_eq!(unsafe { snapshot.as_ref() }.version(), 1);
+    unsafe {
+        free_snapshot(snapshot);
+        free_engine(engine);
+    }
+}
+
+struct CopiedHintPaths {
+    files: Vec<FileMeta>,
+    crc_version: Option<Version>,
+    visits: usize,
+}
+
+extern "C" fn copy_hint_paths(context: NullableCvoid, hint: *const FfiSnapshotHint) {
+    let state = unsafe { &mut *context.unwrap().as_ptr().cast::<CopiedHintPaths>() };
+    let hint = unsafe { &*hint };
+    state.visits += 1;
+    state.files = unsafe { hint.log_paths.log_paths() }
+        .unwrap()
+        .into_iter()
+        .map(|path| ParsedLogPath::from(path).location)
+        .collect();
+    state.crc_version = unsafe { hint.crc.as_ref() }.map(|crc| crc.version);
+}
+
+fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
+    let source = unsafe { snapshot.as_ref() };
+    let table_root = source.table_root().as_str().to_owned();
+    let expected_segment = source.log_segment().clone();
+    let expected_crc = source.crc_at_version().cloned();
+    let expected_latest = source.is_built_as_latest();
+    let files = &expected_segment.listed;
+    let expected_files: BTreeMap<_, _> = files
+        .checkpoint_parts
+        .iter()
+        .chain(&files.ascending_commit_files)
+        .chain(files.latest_commit_file.iter())
+        .chain(files.latest_crc_file.iter())
+        .map(|path| {
+            (
+                path.location.location.as_str().to_owned(),
+                path.location.clone(),
+            )
+        })
+        .collect();
+    let engine = test_engine();
+    let mut state = CopiedHintPaths {
+        files: Vec::new(),
+        crc_version: None,
+        visits: 0,
+    };
+    assert!(unsafe {
+        ok_or_panic(snapshot_to_snapshot_hint(
+            snapshot.shallow_copy(),
+            engine.shallow_copy(),
+            Some(NonNull::from(&mut state).cast()),
+            copy_hint_paths,
+        ))
+    });
+    assert_eq!(state.visits, 1);
+    assert!(state
+        .files
+        .windows(2)
+        .all(|pair| pair[0].location.as_str() < pair[1].location.as_str()));
+    assert_eq!(
+        state.files,
+        expected_files.into_values().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        state.crc_version,
+        expected_crc.as_ref().map(|crc| crc.version)
+    );
+
+    let builder = unsafe {
+        ok_or_panic(get_snapshot_builder(
+            KernelStringSlice::new_unsafe(&table_root),
+            engine.shallow_copy(),
+        ))
+    };
+    let builder = ok_or_panic(install_through_visitor(&snapshot, builder, &engine));
+    unsafe { free_snapshot(snapshot) };
+    let rebuilt = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let rebuilt_ref = unsafe { rebuilt.as_ref() };
+    assert_eq!(rebuilt_ref.log_segment(), &expected_segment);
+    assert_eq!(rebuilt_ref.crc_at_version(), expected_crc.as_ref());
+    assert_eq!(rebuilt_ref.is_built_as_latest(), expected_latest);
+    unsafe {
+        free_snapshot(rebuilt);
+        free_engine(engine);
+    }
+}
+
+#[rstest::rstest]
+#[case::checkpoint_with_later_commits(1)]
+#[case::checkpoint_at_end(3)]
+fn exported_hint_sorts_and_deduplicates_supplied_paths(#[case] checkpoint_version: Version) {
+    let engine = test_engine();
+    let checkpoint = if checkpoint_version == 1 {
+        "memory:///hinted-table/_delta_log/00000000000000000001.checkpoint.parquet"
+    } else {
+        "memory:///hinted-table/_delta_log/00000000000000000003.checkpoint.parquet"
+    };
+    let paths = [
+        FfiLogPath::new(slice(checkpoint), 1, 10),
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000003.json"),
+            3,
+            30,
+        ),
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000002.crc"),
+            2,
+            20,
+        ),
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000002.json"),
+            2,
+            20,
+        ),
+    ];
+    let hint = test_snapshot_hint(&paths, 3, FfiSnapshotHintFreshness::Latest);
+    let builder = unsafe {
+        ok_or_panic(snapshot_builder_with_snapshot_hint(
+            test_builder(&engine),
+            &hint,
+        ))
+    };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    assert_exported_paths_and_round_trip(snapshot);
+    unsafe { free_engine(engine) };
+}
+
+#[rstest::rstest]
+#[case::checkpoint_with_later_commits(1, Some(2))]
+#[case::checkpoint_at_end(3, None)]
+#[cfg_attr(
+    miri,
+    ignore = "checkpoint setup is costly; shared FFI coverage is kept in \
+              exported_hint_sorts_and_deduplicates_supplied_paths"
+)]
+fn exported_storage_snapshot_preserves_paths_and_omits_stale_crc(
+    #[case] checkpoint_version: Version,
+    #[case] expected_crc_path: Option<Version>,
+) {
+    let table = TestTableBuilder::new()
+        .with_log_state(
+            LogState::with_latest_version(3)
+                .with_checkpoint_at([checkpoint_version])
+                .with_crc_at([2]),
+        )
+        .with_data(1, 1)
+        .build()
+        .unwrap();
+    let snapshot = Snapshot::builder_for(table.table_root())
+        .with_incremental_crc_replay(IncrementalReplay::Disabled)
+        .build(&table.engine())
+        .unwrap();
+    let segment = snapshot.log_segment();
+    assert_eq!(segment.checkpoint_version, Some(checkpoint_version));
+    assert_eq!(
+        segment
+            .listed
+            .latest_crc_file
+            .as_ref()
+            .map(|path| path.version),
+        expected_crc_path
+    );
+    assert_eq!(
+        segment.listed.latest_commit_file.as_ref().unwrap().version,
+        3
+    );
+    assert_eq!(
+        segment.listed.ascending_commit_files.is_empty(),
+        checkpoint_version == 3
+    );
+    assert!(snapshot.crc_at_version().is_none());
+    assert_exported_paths_and_round_trip(snapshot.into());
 }
 
 struct VisitedHint {

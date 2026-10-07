@@ -753,32 +753,37 @@ descriptor and read it during that call.
 #### Example: snapshot hint input
 
 A snapshot hint is a complete value when its setter call begins, so one borrowed aggregate is the
-appropriate input. The C-facing shape is equivalent to:
+appropriate input. The exported Rust API is:
 
 ```rust
 #[repr(C)]
 pub struct FfiSnapshotHint {
     pub version: Version,
+    pub freshness: FfiSnapshotHintFreshness,
     pub log_paths: LogPathArray,
     pub protocol: FfiProtocol,
     pub metadata: FfiMetadata,
-    pub last_checkpoint: *const FfiSnapshotHintLastCheckpoint,
+    pub last_checkpoint: *const FfiLastCheckpoint,
+    pub crc: *const FfiCrc,
+    pub publication_watermark: FfiPublicationWatermark,
 }
 
-pub unsafe extern "C" fn snapshot_builder_set_snapshot_hint(
-    builder: *mut Handle<MutableFfiSnapshotBuilder>,
-    hint: *const FfiSnapshotHint,
-) -> ExternResult<bool>;
+pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint(
+    builder: Handle<ExclusiveSnapshotBuilder>,
+    value: &FfiSnapshotHint,
+) -> ExternResult<Handle<ExclusiveSnapshotBuilder>>;
 ```
 
 The host keeps `hint` and all reachable memory alive for the call. Rust validates and copies the
 full graph before changing the builder. One call avoids partial state and callback choreography.
+The setter consumes the builder on both success and error, returning its replacement on success.
 
 ## Key Files
 
 - `src/lib.rs` -- main FFI entry points and type definitions
 - `src/delta_types.rs` -- reusable borrowed C representations of Delta state and actions,
   with their backing storage and conversions colocated
+- `src/snapshot_hint/` -- typed snapshot-hint input and callback export
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
@@ -795,7 +800,7 @@ full graph before changing the builder. One call avoids partial state and callba
 get_default_engine() -> get_snapshot_builder() -> snapshot_builder_build() -> scan() -> scan_metadata() -> read + transform
 ```
 
-Snapshot builder API (`ffi/src/lib.rs`):
+Snapshot builder API (`ffi/src/lib.rs` and `ffi/src/snapshot_hint/mod.rs`):
 - `get_snapshot_builder(path, engine)` -- fresh snapshot from a table path
 - `get_snapshot_builder_from(old_snapshot, engine)` -- incremental update reusing an existing snapshot (avoids re-reading the log)
 - `snapshot_builder_with_version(builder, version)` -- optional: pin to a specific version
@@ -833,8 +838,8 @@ preserving absence even when published commits are not represented by the retain
 preserves the observed highest published version independently of the retained paths. Export
 always uses an explicit variant. Neither the snapshot version nor its freshness claim is a
 publication watermark.
-Typed export rejects CRCs containing experimental adaptive-metadata `lastManifestCommit` or Add
-`backReference` state.
+When built with `adaptive-metadata-in-dev`, typed export rejects CRCs containing experimental
+adaptive-metadata `lastManifestCommit` or Add `backReference` state.
 
 Snapshot accessors (`ffi/src/lib.rs`) read a built `SharedSnapshot` without I/O -- e.g. `version`,
 `snapshot_timestamp`, and `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar

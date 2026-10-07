@@ -171,8 +171,9 @@ impl Crc {
 
     /// Returns the typed file-stats state. Useful for callers that want to inspect the
     /// variant directly (via `matches!` or the `is_*` predicates).
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn file_stats_state(&self) -> &FileStatsState {
+    pub(crate) fn file_stats_state(&self) -> &FileStatsState {
         &self.file_stats_state
     }
 
@@ -187,33 +188,38 @@ impl Crc {
     }
 
     /// Returns the transaction identifier, if captured.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn txn_id(&self) -> Option<&str> {
+    pub(crate) fn txn_id(&self) -> Option<&str> {
         self.txn_id.as_deref()
     }
 
     /// Returns the captured number of deleted records.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn num_deleted_records(&self) -> Option<i64> {
+    pub(crate) fn num_deleted_records(&self) -> Option<i64> {
         self.num_deleted_records_opt
     }
 
     /// Returns the captured number of deletion vectors.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn num_deletion_vectors(&self) -> Option<i64> {
+    pub(crate) fn num_deletion_vectors(&self) -> Option<i64> {
         self.num_deletion_vectors_opt
     }
 
     /// Returns the captured deleted-record-count histogram.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn deleted_record_counts_histogram(&self) -> Option<&DeletedRecordCountsHistogram> {
+    pub(crate) fn deleted_record_counts_histogram(&self) -> Option<&DeletedRecordCountsHistogram> {
         self.deleted_record_counts_histogram_opt.as_ref()
     }
 
     /// Returns the latest manifest commit captured by this CRC, if present.
     #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn last_manifest_commit(&self) -> Option<&LastManifestCommit> {
+    pub(crate) fn last_manifest_commit(&self) -> Option<&LastManifestCommit> {
         self.last_manifest_commit_opt.as_ref()
     }
 }
@@ -654,8 +660,9 @@ impl TryFrom<DeletedRecordCountsHistogramRaw> for DeletedRecordCountsHistogram {
 
 impl DeletedRecordCountsHistogram {
     /// Returns the file counts in the deletion-count bins.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn deleted_record_counts(&self) -> &[i64] {
+    pub(crate) fn deleted_record_counts(&self) -> &[i64] {
         &self.deleted_record_counts
     }
 

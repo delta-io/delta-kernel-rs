@@ -27,8 +27,8 @@ mod export;
 ///
 /// Returns `InvalidSnapshotHint` if the retained segment contains unsupported compaction files.
 /// Returns an error if checkpoint schema serialization fails. Returns `UnsupportedError` if the
-/// CRC contains experimental adaptive-metadata `lastManifestCommit` or Add `backReference` state,
-/// which the typed representation cannot preserve.
+/// CRC contains experimental adaptive-metadata `lastManifestCommit` or Add `backReference` state
+/// when built with `adaptive-metadata-in-dev`, which the typed representation cannot preserve.
 ///
 /// # Safety
 ///
@@ -54,19 +54,22 @@ pub unsafe extern "C" fn snapshot_to_snapshot_hint(
 /// Receives one complete borrowed hint. All nested storage expires when the callback returns.
 pub type SnapshotHintVisitor = extern "C" fn(context: NullableCvoid, hint: *const FfiSnapshotHint);
 
-/// Freshness claim attached to a connector-provided snapshot hint.
+/// Freshness claim carried by a snapshot hint.
+///
+/// Connector inputs supply this claim; exports preserve the snapshot's build-time claim.
 ///
 /// cbindgen:prefix-with-name=true
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub enum FfiSnapshotHintFreshness {
-    /// The connector has not established that the hinted version is latest.
+    /// The hinted version was not established as latest.
     Unverified,
-    /// The connector has established that the hinted version is latest.
+    /// The hinted version was established as latest when the claim was made, not necessarily
+    /// still latest.
     Latest,
 }
 
-/// Complete borrowed representation of a connector-provided snapshot hint.
+/// Complete borrowed representation of a hint supplied by a connector or exported from a snapshot.
 ///
 /// Every pointer reachable from this value is borrowed only for the duration of
 /// [`snapshot_builder_with_snapshot_hint`] or a [`SnapshotHintVisitor`] callback.
@@ -75,7 +78,7 @@ pub enum FfiSnapshotHintFreshness {
 pub struct FfiSnapshotHint {
     /// Target table version described by the hint.
     pub version: Version,
-    /// Connector-provided freshness claim for `version`.
+    /// Freshness claim for `version`.
     pub freshness: FfiSnapshotHintFreshness,
     /// Complete set of log paths needed to construct the snapshot.
     pub log_paths: LogPathArray,
@@ -88,6 +91,8 @@ pub struct FfiSnapshotHint {
     /// Optional CRC state. Null means absent.
     pub crc: *const FfiCrc,
     /// Whether to infer publication from paths or preserve an explicit observation.
+    ///
+    /// Export always uses an explicit variant, never `InferFromLogPaths`.
     pub publication_watermark: FfiPublicationWatermark,
 }
 

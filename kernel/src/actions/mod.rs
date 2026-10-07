@@ -1107,43 +1107,47 @@ where
     deserializer.deserialize_map(PartitionValuesVisitor)
 }
 
-// The containing type is exposed only with internal-api.
-#[allow(unreachable_pub)]
 impl Add {
     /// Returns the URI-encoded data-file path.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn path(&self) -> &str {
+    pub(crate) fn path(&self) -> &str {
         &self.path
     }
 
     /// Returns non-null partition values. Missing partition columns represent null values.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn partition_values(&self) -> &HashMap<String, String> {
+    pub(crate) fn partition_values(&self) -> &HashMap<String, String> {
         &self.partition_values
     }
 
     /// Returns the data-file size in bytes.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn size(&self) -> i64 {
+    pub(crate) fn size(&self) -> i64 {
         self.size
     }
 
     /// Returns the file modification time in milliseconds since the Unix epoch.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn modification_time(&self) -> i64 {
+    pub(crate) fn modification_time(&self) -> i64 {
         self.modification_time
     }
 
     /// Returns whether the action changes table data.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn data_change(&self) -> bool {
+    pub(crate) fn data_change(&self) -> bool {
         self.data_change
     }
 
     /// Returns this action's adaptive-metadata back reference, if present.
     #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn back_reference(&self) -> Option<&BackReference> {
+    pub(crate) fn back_reference(&self) -> Option<&BackReference> {
         self.back_reference.as_ref()
     }
 
@@ -1318,24 +1322,25 @@ pub(crate) struct SetTransaction {
     pub(crate) last_updated: Option<i64>,
 }
 
-// The containing type is exposed only with internal-api.
-#[allow(unreachable_pub)]
 impl SetTransaction {
     /// Returns the application identifier.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn app_id(&self) -> &str {
+    pub(crate) fn app_id(&self) -> &str {
         &self.app_id
     }
 
     /// Returns the application-specific transaction version.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn version(&self) -> i64 {
+    pub(crate) fn version(&self) -> i64 {
         self.version
     }
 
     /// Returns the last-updated timestamp, if captured.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn last_updated(&self) -> Option<i64> {
+    pub(crate) fn last_updated(&self) -> Option<i64> {
         self.last_updated
     }
 
@@ -1954,18 +1959,18 @@ pub(crate) struct CheckpointMetadata {
     pub(crate) tags: Option<HashMap<String, String>>,
 }
 
-// The containing type is exposed only with internal-api.
-#[allow(unreachable_pub)]
 impl CheckpointMetadata {
     /// Returns the checkpoint version.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn version(&self) -> i64 {
+    pub(crate) fn version(&self) -> i64 {
         self.version
     }
 
     /// Returns checkpoint tags, preserving absent versus empty maps.
+    #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn tags(&self) -> Option<&HashMap<String, String>> {
+    pub(crate) fn tags(&self) -> Option<&HashMap<String, String>> {
         self.tags.as_ref()
     }
 }
