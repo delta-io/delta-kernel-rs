@@ -1,3 +1,17 @@
+//! Backing structs (e.g. `CrcBacking`) own temporary C-layout arrays and records while borrowing
+//! the Rust-layout source payloads. FFI views must not outlive either their backing storage or
+//! the borrowed source payloads.
+//!
+//! Fields prefixed with `_` keep storage referenced by cached FFI records alive, even though
+//! `as_ffi()` does not read those fields directly. For example, `CrcBacking::_add_backing` owns
+//! the buffers and deletion-vector descriptors referenced by `adds`. In `CheckpointV2Backing`,
+//! `_sidecar_tags` owns tag arrays referenced by `sidecars`, and `_action_records` owns records
+//! addressed by `actions`. The `_` prefix suppresses unused-field warnings; these fields obey
+//! the same lifetime rules as other backing storage.
+//!
+//! Build views after inline pointees are in place, and do not move those pointees or reallocate
+//! referenced buffers while the views are in use.
+
 use delta_kernel::actions::deletion_vector::DeletionVectorStorageType;
 use delta_kernel::actions::{
     Add, CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction,
@@ -26,7 +40,7 @@ pub(super) fn visit(
         crc.last_manifest_commit().is_some()
             || crc
                 .all_files()
-                .is_some_and(|files| files.iter().any(Add::has_back_reference))
+                .is_some_and(|files| files.iter().any(|add| add.back_reference().is_some()))
     }) {
         return Err(KernelError::unsupported(
             "typed snapshot hint export cannot represent CRC lastManifestCommit or Add backReference",
@@ -34,7 +48,6 @@ pub(super) fn visit(
     }
     let files = hint.log_segment_files();
     // Checkpoint adoption can retain the latest commit separately from replay files.
-    // Include it, then remove duplicates when it also appears in ascending_commit_files.
     let mut paths: Vec<_> = files
         .checkpoint_parts
         .iter()
@@ -42,6 +55,7 @@ pub(super) fn visit(
         .chain(files.latest_commit_file.iter())
         .chain(files.latest_crc_file.iter())
         .collect();
+    // Deduplication only removes adjacent entries; sorting groups copies of the same retained path.
     paths.sort_unstable_by_key(|path| path.location.location.as_str());
     paths.dedup_by_key(|path| path.location.location.as_str());
     let paths: Vec<_> = paths
@@ -57,25 +71,28 @@ pub(super) fn visit(
         .collect();
     let protocol = ProtocolBacking::new(hint.protocol());
     let metadata = MetadataBacking::new(hint.metadata());
-    with_checkpoint(hint.last_checkpoint_hint(), |checkpoint| {
-        with_crc(hint.crc(), |crc| {
-            let value = FfiSnapshotHint {
-                version: hint.version(),
-                freshness: match hint.freshness() {
-                    SnapshotHintFreshness::Latest => FfiSnapshotHintFreshness::Latest,
-                    SnapshotHintFreshness::Unverified => FfiSnapshotHintFreshness::Unverified,
-                },
-                // All backing vectors remain live until the visitor returns.
-                log_paths: unsafe { FfiSlice::new_unsafe(&paths) },
-                protocol: protocol.as_ffi(),
-                metadata: metadata.as_ffi(),
-                last_checkpoint: optional_pointer(checkpoint.as_ref()),
-                crc: optional_pointer(crc.as_ref()),
-                publication_watermark: hint.publication_watermark().into(),
-            };
-            visitor(context, &value);
-        });
-    })
+    let checkpoint = hint
+        .last_checkpoint_hint()
+        .map(CheckpointBacking::try_new)
+        .transpose()?;
+    let crc = hint.crc().map(CrcBacking::new);
+    let checkpoint_view = checkpoint.as_ref().map(CheckpointBacking::as_ffi);
+    let crc_view = crc.as_ref().map(CrcBacking::as_ffi);
+    let value = FfiSnapshotHint {
+        version: hint.version(),
+        freshness: match hint.freshness() {
+            SnapshotHintFreshness::Latest => FfiSnapshotHintFreshness::Latest,
+            SnapshotHintFreshness::Unverified => FfiSnapshotHintFreshness::Unverified,
+        },
+        log_paths: unsafe { FfiSlice::new_unsafe(&paths) },
+        protocol: protocol.as_ffi(),
+        metadata: metadata.as_ffi(),
+        last_checkpoint: optional_pointer(checkpoint_view.as_ref()),
+        crc: optional_pointer(crc_view.as_ref()),
+        publication_watermark: hint.publication_watermark().into(),
+    };
+    visitor(context, &value);
+    Ok(())
 }
 
 struct ProtocolBacking<'a> {
@@ -317,195 +334,264 @@ impl CheckpointActionRecord {
     }
 }
 
-fn with_checkpoint<R>(
-    value: Option<&LastCheckpointHint>,
-    f: impl FnOnce(Option<FfiLastCheckpoint>) -> R,
-) -> KernelResult<R> {
-    let Some(value) = value else {
-        return Ok(f(None));
-    };
-    let schema = value
-        .checkpoint_schema()
-        .map(|schema| serde_json::to_string(schema.as_ref()))
-        .transpose()?;
-    let tags = value
-        .tags()
-        .map(|values| unsafe { FfiStringMapEntry::from_map_unsafe(values) });
-    Ok(with_checkpoint_v2(value.v2_checkpoint(), |v2| {
-        f(Some(FfiLastCheckpoint {
-            version: value.version(),
-            size: value.size(),
-            parts: value.parts().map(|parts| parts as u64).into(),
-            size_in_bytes: value.size_in_bytes().into(),
-            num_of_add_files: value.num_of_add_files().into(),
-            checkpoint_schema: schema
+struct CheckpointBacking<'a> {
+    source: &'a LastCheckpointHint,
+    schema: Option<String>,
+    tags: Option<Vec<FfiStringMapEntry>>,
+    _v2_backing: Option<CheckpointV2Backing<'a>>,
+    v2: Option<FfiLastCheckpointV2>,
+}
+
+impl<'a> CheckpointBacking<'a> {
+    fn try_new(source: &'a LastCheckpointHint) -> KernelResult<Self> {
+        let schema = source
+            .checkpoint_schema()
+            .map(|schema| serde_json::to_string(schema.as_ref()))
+            .transpose()?;
+        let tags = source
+            .tags()
+            .map(|values| unsafe { FfiStringMapEntry::from_map_unsafe(values) });
+        let v2_backing = source.v2_checkpoint().map(CheckpointV2Backing::new);
+        // The V2 record points into vector buffers, which remain stable when their owners move.
+        let v2 = v2_backing.as_ref().map(CheckpointV2Backing::as_ffi);
+        Ok(Self {
+            source,
+            schema,
+            tags,
+            _v2_backing: v2_backing,
+            v2,
+        })
+    }
+
+    fn as_ffi(&self) -> FfiLastCheckpoint {
+        FfiLastCheckpoint {
+            version: self.source.version(),
+            size: self.source.size(),
+            parts: self.source.parts().map(|parts| parts as u64).into(),
+            size_in_bytes: self.source.size_in_bytes().into(),
+            num_of_add_files: self.source.num_of_add_files().into(),
+            checkpoint_schema: self
+                .schema
                 .as_deref()
                 .map(|value| kernel_string_slice!(value))
                 .into(),
-            checksum: value
+            checksum: self
+                .source
                 .checksum()
                 .map(|value| kernel_string_slice!(value))
                 .into(),
-            tags: tags
+            tags: self
+                .tags
                 .as_deref()
                 .map(|values| unsafe { FfiSlice::new_unsafe(values) })
                 .into(),
-            v2_checkpoint: optional_pointer(v2.as_ref()),
-        }))
-    }))
+            v2_checkpoint: optional_pointer(self.v2.as_ref()),
+        }
+    }
 }
 
-fn with_checkpoint_v2<R>(
-    value: Option<&LastCheckpointV2>,
-    f: impl FnOnce(Option<FfiLastCheckpointV2>) -> R,
-) -> R {
-    let Some(value) = value else {
-        return f(None);
-    };
-    let sidecar_tags: Option<Vec<_>> = value.sidecar_files().map(|values| {
-        values
-            .iter()
-            .map(|value| {
-                value
-                    .tags
-                    .as_ref()
-                    .map(|values| unsafe { FfiStringMapEntry::from_map_unsafe(values) })
-            })
-            .collect()
-    });
-    let sidecars: Option<Vec<_>> =
-        value
-            .sidecar_files()
-            .zip(sidecar_tags.as_ref())
-            .map(|(values, tags)| {
-                values
-                    .iter()
-                    .zip(tags)
-                    .map(|(value, tags)| {
-                        let path = &value.path;
-                        FfiSidecar {
-                            path: kernel_string_slice!(path),
-                            size_in_bytes: value.size_in_bytes,
-                            modification_time: value.modification_time,
-                            tags: tags
-                                .as_deref()
-                                .map(|values| unsafe { FfiSlice::new_unsafe(values) })
-                                .into(),
-                        }
-                    })
-                    .collect()
-            });
-    let action_backing: Option<Vec<_>> = value
-        .non_file_actions()
-        .map(|values| values.iter().map(CheckpointActionBacking::new).collect());
-    let action_records: Option<Vec<_>> = action_backing
-        .as_ref()
-        .map(|values| values.iter().map(CheckpointActionBacking::record).collect());
-    // Take variant addresses only after every record is in its final vector position.
-    let actions: Option<Vec<_>> = action_records
-        .as_ref()
-        .map(|values| values.iter().map(CheckpointActionRecord::as_ffi).collect());
-    let path = value.path();
-    f(Some(FfiLastCheckpointV2 {
-        path: kernel_string_slice!(path),
-        size_in_bytes: value.size_in_bytes().into(),
-        modification_time: value.modification_time().into(),
-        sidecar_files: sidecars
-            .as_deref()
-            .map(|values| unsafe { FfiSlice::new_unsafe(values) })
-            .into(),
-        non_file_actions: actions
-            .as_deref()
-            .map(|values| unsafe { FfiSlice::new_unsafe(values) })
-            .into(),
-    }))
+struct CheckpointV2Backing<'a> {
+    source: &'a LastCheckpointV2,
+    _sidecar_tags: Option<Vec<Option<Vec<FfiStringMapEntry>>>>,
+    sidecars: Option<Vec<FfiSidecar>>,
+    _action_backing: Option<Vec<CheckpointActionBacking<'a>>>,
+    _action_records: Option<Vec<CheckpointActionRecord>>,
+    actions: Option<Vec<FfiCheckpointNonFileAction>>,
 }
 
-fn with_crc<R>(value: Option<&Crc>, f: impl FnOnce(Option<FfiCrc>) -> R) -> R {
-    let Some(value) = value else {
-        return f(None);
-    };
-    let protocol = ProtocolBacking::new(&value.protocol);
-    let metadata = MetadataBacking::new(&value.metadata);
-    let histogram = value.file_stats().and_then(|stats| {
-        stats
-            .file_size_histogram()
-            .map(|value| FfiFileSizeHistogram {
-                sorted_bin_boundaries: unsafe {
-                    FfiSlice::new_unsafe(value.sorted_bin_boundaries())
+impl<'a> CheckpointV2Backing<'a> {
+    fn new(source: &'a LastCheckpointV2) -> Self {
+        let sidecar_tags: Option<Vec<_>> = source.sidecar_files().map(|values| {
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .tags
+                        .as_ref()
+                        .map(|values| unsafe { FfiStringMapEntry::from_map_unsafe(values) })
+                })
+                .collect()
+        });
+        let sidecars: Option<Vec<_>> =
+            source
+                .sidecar_files()
+                .zip(sidecar_tags.as_ref())
+                .map(|(values, tags)| {
+                    values
+                        .iter()
+                        .zip(tags)
+                        .map(|(value, tags)| {
+                            let path = &value.path;
+                            FfiSidecar {
+                                path: kernel_string_slice!(path),
+                                size_in_bytes: value.size_in_bytes,
+                                modification_time: value.modification_time,
+                                tags: tags
+                                    .as_deref()
+                                    .map(|values| unsafe { FfiSlice::new_unsafe(values) })
+                                    .into(),
+                            }
+                        })
+                        .collect()
+                });
+        let action_backing: Option<Vec<_>> = source
+            .non_file_actions()
+            .map(|values| values.iter().map(CheckpointActionBacking::new).collect());
+        let action_records: Option<Vec<_>> = action_backing
+            .as_ref()
+            .map(|values| values.iter().map(CheckpointActionBacking::record).collect());
+        // Take variant addresses only after every record is in its final vector position.
+        let actions: Option<Vec<_>> = action_records
+            .as_ref()
+            .map(|values| values.iter().map(CheckpointActionRecord::as_ffi).collect());
+        Self {
+            source,
+            _sidecar_tags: sidecar_tags,
+            sidecars,
+            _action_backing: action_backing,
+            _action_records: action_records,
+            actions,
+        }
+    }
+
+    fn as_ffi(&self) -> FfiLastCheckpointV2 {
+        let path = self.source.path();
+        FfiLastCheckpointV2 {
+            path: kernel_string_slice!(path),
+            size_in_bytes: self.source.size_in_bytes().into(),
+            modification_time: self.source.modification_time().into(),
+            sidecar_files: self
+                .sidecars
+                .as_deref()
+                .map(|values| unsafe { FfiSlice::new_unsafe(values) })
+                .into(),
+            non_file_actions: self
+                .actions
+                .as_deref()
+                .map(|values| unsafe { FfiSlice::new_unsafe(values) })
+                .into(),
+        }
+    }
+}
+
+struct CrcBacking<'a> {
+    source: &'a Crc,
+    protocol: ProtocolBacking<'a>,
+    metadata: MetadataBacking<'a>,
+    histogram: Option<FfiFileSizeHistogram>,
+    transactions: Vec<FfiSetTransaction>,
+    domains: Vec<FfiDomainMetadata>,
+    _add_backing: Option<Vec<AddBacking<'a>>>,
+    adds: Option<Vec<FfiAdd>>,
+    deleted_histogram: Option<FfiDeletedRecordCountsHistogram>,
+}
+
+impl<'a> CrcBacking<'a> {
+    fn new(source: &'a Crc) -> Self {
+        let protocol = ProtocolBacking::new(&source.protocol);
+        let metadata = MetadataBacking::new(&source.metadata);
+        let histogram = source.file_stats().and_then(|stats| {
+            stats
+                .file_size_histogram()
+                .map(|value| FfiFileSizeHistogram {
+                    sorted_bin_boundaries: unsafe {
+                        FfiSlice::new_unsafe(value.sorted_bin_boundaries())
+                    },
+                    file_counts: unsafe { FfiSlice::new_unsafe(value.file_counts()) },
+                    total_bytes: unsafe { FfiSlice::new_unsafe(value.total_bytes()) },
+                })
+        });
+        let transactions = match &source.set_transaction_state {
+            SetTransactionState::Complete(values) | SetTransactionState::Partial(values) => values,
+        };
+        let transactions = transactions.values().map(transaction).collect();
+        let domains = match &source.domain_metadata_state {
+            DomainMetadataState::Complete(values) | DomainMetadataState::Partial(values) => values,
+        };
+        let domains = domains.values().map(domain).collect();
+        let add_backing: Option<Vec<_>> = source
+            .all_files()
+            .map(|values| values.iter().map(AddBacking::new).collect());
+        let adds = add_backing
+            .as_ref()
+            .map(|values| values.iter().map(AddBacking::as_ffi).collect());
+        let deleted_histogram =
+            source
+                .deleted_record_counts_histogram()
+                .map(|value| FfiDeletedRecordCountsHistogram {
+                    deleted_record_counts: unsafe {
+                        FfiSlice::new_unsafe(value.deleted_record_counts())
+                    },
+                });
+        Self {
+            source,
+            protocol,
+            metadata,
+            histogram,
+            transactions,
+            domains,
+            _add_backing: add_backing,
+            adds,
+            deleted_histogram,
+        }
+    }
+
+    fn as_ffi(&self) -> FfiCrc {
+        let file_stats_state = match self.source.file_stats_state() {
+            FileStatsState::Indeterminate => FfiFileStatsState {
+                kind: FfiFileStatsStateKind::Indeterminate,
+                file_stats: FfiFileStats {
+                    num_files: 0,
+                    table_size_bytes: 0,
                 },
-                file_counts: unsafe { FfiSlice::new_unsafe(value.file_counts()) },
-                total_bytes: unsafe { FfiSlice::new_unsafe(value.total_bytes()) },
-            })
-    });
-    let file_stats_state = match value.file_stats_state() {
-        FileStatsState::Indeterminate => FfiFileStatsState {
-            kind: FfiFileStatsStateKind::Indeterminate,
-            file_stats: FfiFileStats {
-                num_files: 0,
-                table_size_bytes: 0,
+                file_size_histogram: std::ptr::null(),
             },
-            file_size_histogram: std::ptr::null(),
-        },
-        FileStatsState::Complete(stats) => FfiFileStatsState {
-            kind: FfiFileStatsStateKind::Complete,
-            file_stats: FfiFileStats {
-                num_files: stats.num_files(),
-                table_size_bytes: stats.table_size_bytes(),
-            },
-            file_size_histogram: optional_pointer(histogram.as_ref()),
-        },
-    };
-    let (transaction_kind, transactions) = match &value.set_transaction_state {
-        SetTransactionState::Complete(values) => (FfiSetTransactionStateKind::Complete, values),
-        SetTransactionState::Partial(values) => (FfiSetTransactionStateKind::Partial, values),
-    };
-    let transactions: Vec<_> = transactions.values().map(transaction).collect();
-    let (domain_kind, domains) = match &value.domain_metadata_state {
-        DomainMetadataState::Complete(values) => (FfiDomainMetadataStateKind::Complete, values),
-        DomainMetadataState::Partial(values) => (FfiDomainMetadataStateKind::Partial, values),
-    };
-    let domains: Vec<_> = domains.values().map(domain).collect();
-    let add_backing: Option<Vec<_>> = value
-        .all_files()
-        .map(|values| values.iter().map(AddBacking::new).collect());
-    let adds: Option<Vec<_>> = add_backing
-        .as_ref()
-        .map(|values| values.iter().map(AddBacking::as_ffi).collect());
-    let deleted_histogram =
-        value
-            .deleted_record_counts_histogram()
-            .map(|value| FfiDeletedRecordCountsHistogram {
-                deleted_record_counts: unsafe {
-                    FfiSlice::new_unsafe(value.deleted_record_counts())
+            FileStatsState::Complete(stats) => FfiFileStatsState {
+                kind: FfiFileStatsStateKind::Complete,
+                file_stats: FfiFileStats {
+                    num_files: stats.num_files(),
+                    table_size_bytes: stats.table_size_bytes(),
                 },
-            });
-    f(Some(FfiCrc {
-        version: value.version,
-        metadata: metadata.as_ffi(),
-        protocol: protocol.as_ffi(),
-        file_stats_state,
-        in_commit_timestamp: value.in_commit_timestamp_opt.into(),
-        set_transaction_state: FfiSetTransactionState {
-            kind: transaction_kind,
-            transactions: unsafe { FfiSlice::new_unsafe(&transactions) },
-        },
-        domain_metadata_state: FfiDomainMetadataState {
-            kind: domain_kind,
-            domain_metadata: unsafe { FfiSlice::new_unsafe(&domains) },
-        },
-        txn_id: value
-            .txn_id()
-            .map(|value| kernel_string_slice!(value))
-            .into(),
-        all_files: adds
-            .as_deref()
-            .map(|values| unsafe { FfiSlice::new_unsafe(values) })
-            .into(),
-        num_deleted_records: value.num_deleted_records().into(),
-        num_deletion_vectors: value.num_deletion_vectors().into(),
-        deleted_record_counts_histogram: optional_pointer(deleted_histogram.as_ref()),
-    }))
+                file_size_histogram: optional_pointer(self.histogram.as_ref()),
+            },
+        };
+        let transaction_kind = match &self.source.set_transaction_state {
+            SetTransactionState::Complete(_) => FfiSetTransactionStateKind::Complete,
+            SetTransactionState::Partial(_) => FfiSetTransactionStateKind::Partial,
+        };
+        let domain_kind = match &self.source.domain_metadata_state {
+            DomainMetadataState::Complete(_) => FfiDomainMetadataStateKind::Complete,
+            DomainMetadataState::Partial(_) => FfiDomainMetadataStateKind::Partial,
+        };
+        FfiCrc {
+            version: self.source.version,
+            metadata: self.metadata.as_ffi(),
+            protocol: self.protocol.as_ffi(),
+            file_stats_state,
+            in_commit_timestamp: self.source.in_commit_timestamp_opt.into(),
+            set_transaction_state: FfiSetTransactionState {
+                kind: transaction_kind,
+                transactions: unsafe { FfiSlice::new_unsafe(&self.transactions) },
+            },
+            domain_metadata_state: FfiDomainMetadataState {
+                kind: domain_kind,
+                domain_metadata: unsafe { FfiSlice::new_unsafe(&self.domains) },
+            },
+            txn_id: self
+                .source
+                .txn_id()
+                .map(|value| kernel_string_slice!(value))
+                .into(),
+            all_files: self
+                .adds
+                .as_deref()
+                .map(|values| unsafe { FfiSlice::new_unsafe(values) })
+                .into(),
+            num_deleted_records: self.source.num_deleted_records().into(),
+            num_deletion_vectors: self.source.num_deletion_vectors().into(),
+            deleted_record_counts_histogram: optional_pointer(self.deleted_histogram.as_ref()),
+        }
+    }
 }
 
 fn transaction(value: &SetTransaction) -> FfiSetTransaction {

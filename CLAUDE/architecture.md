@@ -42,8 +42,8 @@ hint's table membership against the builder's root and validates structural cons
 connector owns protocol/metadata provenance, publication state, and freshness.
 `Snapshot::to_snapshot_hint()` exports retained state without engine I/O, preserving build-time
 freshness, the selected log files and publication watermark, a matching checkpoint hint, and any CRC
-resolved at the snapshot version. It rejects log compactions. The FFI exports hints as independently
-owned handles and visits their retained state through a borrowed typed representation.
+resolved at the snapshot version. It rejects log compactions. The FFI exports one complete borrowed
+typed hint through a callback; connectors must copy any state retained after the callback returns.
 
 **Snapshot loading internals:**
 1. Ordinary builds discover commits and checkpoints through **LogSegment**

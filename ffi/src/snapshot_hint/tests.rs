@@ -7,10 +7,10 @@ use delta_kernel::actions::{Add, LastManifestCommit};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::crc::Crc;
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
-use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::snapshot::PublicationWatermark;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel_default_engine::DefaultEngineBuilder;
+use delta_kernel::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
 use test_utils::TestCatalogCommitter;
 
 use super::*;
@@ -134,10 +134,27 @@ fn empty_crc() -> FfiCrc {
 }
 
 fn test_engine() -> Handle<SharedExternEngine> {
-    engine_to_handle(
-        Arc::new(DefaultEngineBuilder::new(Arc::new(InMemory::new())).build()),
-        allocate_err,
-    )
+    engine_to_handle(Arc::new(NoIoEngine), allocate_err)
+}
+
+struct NoIoEngine;
+
+impl Engine for NoIoEngine {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        panic!("snapshot hints must not require evaluation")
+    }
+
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        panic!("snapshot hints must not require storage")
+    }
+
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        panic!("snapshot hints must not require JSON I/O")
+    }
+
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        panic!("snapshot hints must not require Parquet I/O")
+    }
 }
 
 fn test_builder(engine: &Handle<SharedExternEngine>) -> Handle<ExclusiveSnapshotBuilder> {
@@ -188,7 +205,7 @@ unsafe fn with_minimal_hint(
 #[rstest::rstest]
 #[case::latest(FfiSnapshotHintFreshness::Latest, true)]
 #[case::unverified(FfiSnapshotHintFreshness::Unverified, false)]
-fn exported_hint_outlives_snapshot_and_preserves_state(
+fn exported_hint_copy_outlives_snapshot_and_preserves_state(
     #[case] freshness: FfiSnapshotHintFreshness,
     #[case] expected_latest: bool,
     #[values(false, true)] with_crc: bool,
@@ -213,19 +230,12 @@ fn exported_hint_outlives_snapshot_and_preserves_state(
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let expected_segment = unsafe { snapshot.as_ref() }.log_segment().clone();
     let expected_crc = unsafe { snapshot.as_ref() }.crc_at_version().cloned();
-    let exported = unsafe {
-        ok_or_panic(snapshot_to_snapshot_hint(
-            snapshot.shallow_copy(),
-            engine.shallow_copy(),
-        ))
-    };
-    unsafe { free_snapshot(snapshot) };
     let builder = ok_or_panic(install_through_visitor(
-        &exported,
+        &snapshot,
         test_builder(&engine),
         &engine,
     ));
-    unsafe { free_snapshot_hint(exported) };
+    unsafe { free_snapshot(snapshot) };
     let rebuilt = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let rebuilt_ref = unsafe { rebuilt.as_ref() };
     assert_eq!(rebuilt_ref.version(), 0);
@@ -239,39 +249,52 @@ fn exported_hint_outlives_snapshot_and_preserves_state(
 }
 
 #[test]
-fn exported_hint_can_be_freed_without_building() {
+fn snapshot_hint_export_borrows_inputs_and_calls_visitor_once() {
     let engine = test_engine();
     let builder = unsafe { with_minimal_hint(test_builder(&engine)) };
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
-    let hint = unsafe {
-        ok_or_panic(snapshot_to_snapshot_hint(
-            snapshot.shallow_copy(),
-            engine.shallow_copy(),
-        ))
-    };
+    let mut visits = 0usize;
+    for expected_visits in 1..=2 {
+        assert!(unsafe {
+            ok_or_panic(snapshot_to_snapshot_hint(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+                Some(NonNull::from(&mut visits).cast()),
+                count_hint_visits,
+            ))
+        });
+        assert_eq!(visits, expected_visits);
+        assert_eq!(unsafe { snapshot.as_ref() }.version(), 0);
+    }
     unsafe {
         free_snapshot(snapshot);
-        free_snapshot_hint(hint);
         free_engine(engine);
     }
+}
+
+extern "C" fn count_hint_visits(context: NullableCvoid, _hint: *const FfiSnapshotHint) {
+    let visits = unsafe { &mut *context.unwrap().as_ptr().cast::<usize>() };
+    *visits += 1;
 }
 
 struct VisitedHint {
     builder: Option<Handle<ExclusiveSnapshotBuilder>>,
     result: Option<ExternResult<Handle<ExclusiveSnapshotBuilder>>>,
     watermark: Option<PublicationWatermark>,
+    visits: usize,
 }
 
 extern "C" fn install_visited_hint(context: NullableCvoid, hint: *const FfiSnapshotHint) {
     let state = unsafe { &mut *context.unwrap().as_ptr().cast::<VisitedHint>() };
     let hint = unsafe { &*hint };
+    state.visits += 1;
     state.watermark = Some(hint.publication_watermark.into());
     state.result =
         Some(unsafe { snapshot_builder_with_snapshot_hint(state.builder.take().unwrap(), hint) });
 }
 
 fn install_through_visitor(
-    exported: &Handle<ExclusiveSnapshotHint>,
+    snapshot: &Handle<SharedSnapshot>,
     builder: Handle<ExclusiveSnapshotBuilder>,
     engine: &Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
@@ -279,15 +302,17 @@ fn install_through_visitor(
         builder: Some(builder),
         result: None,
         watermark: None,
+        visits: 0,
     };
     assert!(unsafe {
-        ok_or_panic(visit_snapshot_hint(
-            exported.shallow_copy(),
+        ok_or_panic(snapshot_to_snapshot_hint(
+            snapshot.shallow_copy(),
             engine.shallow_copy(),
             Some(NonNull::from(&mut state).cast()),
             install_visited_hint,
         ))
     });
+    assert_eq!(state.visits, 1);
     state.result.take().unwrap()
 }
 
@@ -295,18 +320,11 @@ fn rebuild_through_visitor(
     snapshot: &Handle<SharedSnapshot>,
     engine: &Handle<SharedExternEngine>,
 ) -> Handle<SharedSnapshot> {
-    let exported = unsafe {
-        ok_or_panic(snapshot_to_snapshot_hint(
-            snapshot.shallow_copy(),
-            engine.shallow_copy(),
-        ))
-    };
     let builder = ok_or_panic(install_through_visitor(
-        &exported,
+        snapshot,
         test_builder(engine),
         engine,
     ));
-    unsafe { free_snapshot_hint(exported) };
     unsafe { ok_or_panic(snapshot_builder_build(builder)) }
 }
 
@@ -348,25 +366,21 @@ fn publication_watermark_distinguishes_inference_from_explicit_state(
             .max_published_version,
         expected
     );
-    let exported = unsafe {
-        ok_or_panic(snapshot_to_snapshot_hint(
-            snapshot.shallow_copy(),
-            engine.shallow_copy(),
-        ))
-    };
     let mut state = VisitedHint {
         builder: Some(test_builder(&engine)),
         result: None,
         watermark: None,
+        visits: 0,
     };
     assert!(unsafe {
-        ok_or_panic(visit_snapshot_hint(
-            exported.shallow_copy(),
+        ok_or_panic(snapshot_to_snapshot_hint(
+            snapshot.shallow_copy(),
             engine.shallow_copy(),
             Some(NonNull::from(&mut state).cast()),
             install_visited_hint,
         ))
     });
+    assert_eq!(state.visits, 1);
     assert_eq!(
         state.watermark,
         Some(expected.map_or(
@@ -376,7 +390,6 @@ fn publication_watermark_distinguishes_inference_from_explicit_state(
     );
     unsafe {
         crate::free_snapshot_builder(ok_or_panic(state.result.take().unwrap()));
-        free_snapshot_hint(exported);
         free_snapshot(snapshot);
         free_engine(engine);
     }
@@ -419,27 +432,23 @@ fn visited_hint_round_trips_explicit_watermark_and_outlives_source(
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let expected_segment = unsafe { snapshot.as_ref() }.log_segment().clone();
     let expected_crc = unsafe { snapshot.as_ref() }.crc_at_version().cloned();
-    let exported = unsafe {
-        ok_or_panic(snapshot_to_snapshot_hint(
-            snapshot.shallow_copy(),
-            engine.shallow_copy(),
-        ))
-    };
-    unsafe { free_snapshot(snapshot) };
     let mut state = VisitedHint {
         builder: Some(test_builder(&engine)),
         result: None,
         watermark: None,
+        visits: 0,
     };
     let visited = unsafe {
-        ok_or_panic(visit_snapshot_hint(
-            exported.shallow_copy(),
+        ok_or_panic(snapshot_to_snapshot_hint(
+            snapshot.shallow_copy(),
             engine.shallow_copy(),
             Some(NonNull::from(&mut state).cast()),
             install_visited_hint,
         ))
     };
     assert!(visited);
+    assert_eq!(state.visits, 1);
+    unsafe { free_snapshot(snapshot) };
     assert_eq!(
         state.watermark,
         Some(watermark.map_or(
@@ -447,7 +456,6 @@ fn visited_hint_round_trips_explicit_watermark_and_outlives_source(
             PublicationWatermark::PublishedThrough,
         ))
     );
-    unsafe { free_snapshot_hint(exported) };
     let builder = ok_or_panic(state.result.take().unwrap());
     let rebuilt = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     assert_eq!(unsafe { rebuilt.as_ref() }.log_segment(), &expected_segment);
@@ -621,37 +629,32 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
         source_ref.log_segment().listed.ascending_commit_files
     );
     let published: Handle<SharedSnapshot> = published.into();
-    let exported = unsafe {
-        ok_or_panic(snapshot_to_snapshot_hint(
-            published.shallow_copy(),
-            engine.shallow_copy(),
-        ))
-    };
-    unsafe {
-        free_snapshot(source);
-        free_snapshot(published);
-    }
-    drop(source_ref);
+    let expected_segment = unsafe { published.as_ref() }.log_segment().listed.clone();
     let builder = unsafe { snapshot_builder_with_max_catalog_version(test_builder(&engine), 1) };
     let mut state = VisitedHint {
         builder: Some(builder),
         result: None,
         watermark: None,
+        visits: 0,
     };
     assert!(unsafe {
-        ok_or_panic(visit_snapshot_hint(
-            exported.shallow_copy(),
+        ok_or_panic(snapshot_to_snapshot_hint(
+            published.shallow_copy(),
             engine.shallow_copy(),
             Some(NonNull::from(&mut state).cast()),
             install_visited_hint,
         ))
     });
+    assert_eq!(state.visits, 1);
+    unsafe {
+        free_snapshot(source);
+        free_snapshot(published);
+    }
+    drop(source_ref);
     assert_eq!(
         state.watermark,
         Some(PublicationWatermark::PublishedThrough(1))
     );
-    let expected_segment = unsafe { exported.as_ref() }.log_segment_files().clone();
-    unsafe { free_snapshot_hint(exported) };
     let rebuilt =
         unsafe { ok_or_panic(snapshot_builder_build(ok_or_panic(state.result.unwrap()))) };
     assert_eq!(
@@ -669,7 +672,7 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
 #[case::manifest(true, false)]
 #[case::back_reference(false, true)]
 #[case::both(true, true)]
-fn typed_visit_rejects_adaptive_crc_without_consuming_native_hint(
+fn typed_export_rejects_adaptive_crc_without_visiting_or_consuming_snapshot(
     #[case] with_manifest: bool,
     #[case] with_back_reference: bool,
 ) {
@@ -689,7 +692,7 @@ fn typed_visit_rejects_adaptive_crc_without_consuming_native_hint(
         "backReference": back_reference,
     }))
     .unwrap();
-    assert_eq!(add.has_back_reference(), with_back_reference);
+    assert_eq!(add.back_reference().is_some(), with_back_reference);
     let expected_crc = Crc::try_from_parts(
         0,
         crc.metadata.clone(),
@@ -717,7 +720,7 @@ fn typed_visit_rejects_adaptive_crc_without_consuming_native_hint(
         FfiSnapshotHintFreshness::Unverified,
     );
     let hint = SnapshotHint::try_new(
-        "memory:///",
+        "memory:///hinted-table/",
         0,
         PublicationWatermark::InferFromLogPaths,
         unsafe { input.log_paths.log_paths() }.unwrap(),
@@ -734,21 +737,15 @@ fn typed_visit_rejects_adaptive_crc_without_consuming_native_hint(
         .build(kernel_engine.as_ref())
         .unwrap();
     let source: Handle<SharedSnapshot> = source.into();
-    let exported = unsafe {
-        ok_or_panic(snapshot_to_snapshot_hint(
-            source.shallow_copy(),
-            engine.shallow_copy(),
-        ))
-    };
-    unsafe { free_snapshot(source) };
     let mut state = VisitedHint {
         builder: Some(test_builder(&engine)),
         result: None,
         watermark: None,
+        visits: 0,
     };
     let result = unsafe {
-        visit_snapshot_hint(
-            exported.shallow_copy(),
+        snapshot_to_snapshot_hint(
+            source.shallow_copy(),
             engine.shallow_copy(),
             Some(NonNull::from(&mut state).cast()),
             install_visited_hint,
@@ -765,16 +762,20 @@ fn typed_visit_rejects_adaptive_crc_without_consuming_native_hint(
     );
     assert!(state.result.is_none());
     assert!(state.watermark.is_none());
-    assert_eq!(unsafe { exported.as_ref() }.crc(), Some(&expected_crc));
+    assert_eq!(state.visits, 0);
+    assert_eq!(
+        unsafe { source.as_ref() }.crc_at_version().map(Arc::as_ref),
+        Some(&expected_crc)
+    );
     unsafe {
         crate::free_snapshot_builder(state.builder.take().unwrap());
-        free_snapshot_hint(exported);
+        free_snapshot(source);
         free_engine(engine);
     }
 }
 
 #[test]
-fn visited_hint_rejects_incremental_builder_without_consuming_hint() {
+fn visited_hint_rejects_incremental_builder_without_consuming_snapshot() {
     let engine = test_engine();
     let builder = unsafe { with_minimal_hint(test_builder(&engine)) };
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
@@ -784,21 +785,14 @@ fn visited_hint_rejects_incremental_builder_without_consuming_hint() {
             engine.shallow_copy(),
         ))
     };
-    let hint = unsafe {
-        ok_or_panic(snapshot_to_snapshot_hint(
-            snapshot.shallow_copy(),
-            engine.shallow_copy(),
-        ))
-    };
-    let result = install_through_visitor(&hint, builder, &engine);
+    let result = install_through_visitor(&snapshot, builder, &engine);
     assert_extern_result_error_contains(
         result,
         FFIKernelError::UnsupportedError,
         "snapshot hints cannot be set",
     );
-    assert_eq!(unsafe { hint.as_ref() }.version(), 0);
+    assert_eq!(unsafe { snapshot.as_ref() }.version(), 0);
     unsafe {
-        free_snapshot_hint(hint);
         free_snapshot(snapshot);
         free_engine(engine);
     }
@@ -807,19 +801,13 @@ fn visited_hint_rejects_incremental_builder_without_consuming_hint() {
 #[rstest::rstest]
 #[case::different_table("memory:///other-table/", false)]
 #[case::version_mismatch("memory:///hinted-table/", true)]
-fn exported_hint_build_validates_table_and_version(
+fn exported_hint_rejects_cross_table_paths_at_install_and_version_mismatch_at_build(
     #[case] table_root: &'static str,
     #[case] version_mismatch: bool,
 ) {
     let engine = test_engine();
     let builder = unsafe { with_minimal_hint(test_builder(&engine)) };
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
-    let hint = unsafe {
-        ok_or_panic(snapshot_to_snapshot_hint(
-            snapshot.shallow_copy(),
-            engine.shallow_copy(),
-        ))
-    };
     let builder = unsafe {
         ok_or_panic(get_snapshot_builder(
             slice(table_root),
@@ -831,9 +819,16 @@ fn exported_hint_build_validates_table_and_version(
     } else {
         builder
     };
-    let builder = ok_or_panic(install_through_visitor(&hint, builder, &engine));
-    unsafe { free_snapshot_hint(hint) };
-    let result = unsafe { snapshot_builder_build(builder) };
+    let result = match install_through_visitor(&snapshot, builder, &engine) {
+        ExternResult::Ok(builder) => {
+            assert!(version_mismatch);
+            unsafe { snapshot_builder_build(builder) }
+        }
+        ExternResult::Err(error) => {
+            assert!(!version_mismatch);
+            ExternResult::Err(error)
+        }
+    };
     assert_extern_result_error_with_message(result, FFIKernelError::InvalidSnapshotHint, None);
     unsafe {
         free_snapshot(snapshot);

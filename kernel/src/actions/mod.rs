@@ -986,6 +986,7 @@ impl CommitInfo {
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize)]
 #[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
+#[internal_api]
 pub(crate) struct BackReference {
     /// Path to the leaf manifest containing this file, relative to the table root
     /// (e.g. `metadata/leaf-m1.parquet`). Resolved by joining the table location and this path
@@ -1139,11 +1140,11 @@ impl Add {
         self.data_change
     }
 
-    /// Returns whether this action carries an adaptive-metadata back reference.
+    /// Returns this action's adaptive-metadata back reference, if present.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub fn has_back_reference(&self) -> bool {
-        self.back_reference.is_some()
+    pub fn back_reference(&self) -> Option<&BackReference> {
+        self.back_reference.as_ref()
     }
 
     /// Reconstructs an Add action from its serialized fields.
@@ -3075,7 +3076,7 @@ mod tests {
             ]))
         );
         assert_eq!(
-            add.deletion_vector.unwrap().storage_type,
+            add.deletion_vector.as_ref().unwrap().storage_type,
             deletion_vector::DeletionVectorStorageType::Inline
         );
         assert_eq!(add.base_row_id, Some(10));
@@ -3083,8 +3084,8 @@ mod tests {
         assert_eq!(add.clustering_provider.as_deref(), Some("liquid"));
         #[cfg(feature = "adaptive-metadata-in-dev")]
         assert_eq!(
-            add.back_reference,
-            Some(BackReference {
+            add.back_reference(),
+            Some(&BackReference {
                 manifest: "manifest.parquet".to_string(),
                 pos: 3,
             })
@@ -3103,6 +3104,8 @@ mod tests {
 
         let add: Add = serde_json::from_str(json).unwrap();
         assert!(add.partition_values.is_empty());
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        assert!(add.back_reference().is_none());
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]

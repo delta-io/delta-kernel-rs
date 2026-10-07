@@ -816,16 +816,15 @@ into the builder. Cross-component and table validation occurs when the builder i
 must eventually pass the final returned handle to either `snapshot_builder_build` or
 `free_snapshot_builder`.
 
-`snapshot_to_snapshot_hint(snapshot, engine)` exports retained state into an independently owned
-`ExclusiveSnapshotHint` without engine I/O. It borrows both input handles, and the hint outlives the
-source snapshot. Copy its retained values through `visit_snapshot_hint`, then release it with
-`free_snapshot_hint`. Supply the copied values through `snapshot_builder_with_snapshot_hint`
-when rebuilding a snapshot. The hint preserves build-time freshness, not current freshness, and
-includes only a matching checkpoint hint and an at-version CRC. Compaction files are unsupported.
+`snapshot_to_snapshot_hint(snapshot, engine, context, visitor)` exports retained state without
+engine I/O through one callback with a complete borrowed `FfiSnapshotHint`. Both input handles are
+borrowed. The callback runs once on success and is not invoked on error. All nested pointers expire
+when the callback returns; copy retained values during the callback. No hint handle is returned.
+Supply the copied values through `snapshot_builder_with_snapshot_hint` when rebuilding a snapshot.
+The hint preserves build-time freshness, not current freshness, and includes only a matching
+checkpoint hint and an at-version CRC. Compaction files are unsupported.
 
-`visit_snapshot_hint(hint, engine, context, visitor)` borrows the hint and engine, invoking the
-visitor with a complete `FfiSnapshotHint`. All nested pointers expire when the callback returns;
-copy retained values during the callback. Export includes an explicit publication watermark,
+Export includes an explicit publication watermark,
 preserving absence even when published commits are not represented by the retained paths.
 `FfiSnapshotHint.publication_watermark` is a tagged `FfiPublicationWatermark`:
 `InferFromLogPaths` derives publication from supplied published commit paths,

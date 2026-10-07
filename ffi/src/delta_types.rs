@@ -11,6 +11,7 @@ use delta_kernel::crc::{
     FileStatsState, SetTransactionState,
 };
 use delta_kernel::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
+use delta_kernel::snapshot::PublicationWatermark;
 use delta_kernel::{KernelError, KernelResult, Version};
 
 use crate::{
@@ -53,6 +54,37 @@ pub struct FfiNullableStringMapEntry {
 
 /// Borrowed array of UTF-8 map entries whose values may be null.
 pub type FfiNullableStringMap = FfiSlice<FfiNullableStringMapEntry>;
+
+/// C-layout representation of kernel [`PublicationWatermark`].
+///
+/// Publication and ratification are separate: a staged commit may belong to the snapshot without
+/// having been published to the table's log directory. The snapshot version and freshness claim
+/// do not establish how far publication has advanced.
+///
+/// Connectors that only supply log paths can request inference. Connectors exporting a built
+/// snapshot must preserve its observed publication state, which may not be recoverable from the
+/// retained paths. [`snapshot_to_snapshot_hint`](crate::snapshot_hint::snapshot_to_snapshot_hint)
+/// always reports one of the two explicit variants.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub enum FfiPublicationWatermark {
+    /// Derive the highest published commit version from the supplied log paths.
+    ///
+    /// Staged commit paths do not count as published commits. If no published commit path is
+    /// supplied, the inferred watermark is absent.
+    InferFromLogPaths,
+    /// Explicitly record that no published commits were observed.
+    ///
+    /// This is not a request for inference, even if the supplied paths include published commits.
+    NoPublishedCommits,
+    /// Preserve the highest observed published commit version.
+    ///
+    /// The watermark is retained independently of the supplied paths, which may omit published
+    /// commits or still name their staged locations after publication.
+    PublishedThrough(Version),
+}
 
 /// Borrowed Delta protocol state.
 #[repr(C)]
@@ -372,6 +404,26 @@ pub struct FfiCrc {
     pub num_deletion_vectors: OptionalValue<i64>,
     /// Optional deleted-record-count histogram.
     pub deleted_record_counts_histogram: *const FfiDeletedRecordCountsHistogram,
+}
+
+impl From<FfiPublicationWatermark> for PublicationWatermark {
+    fn from(value: FfiPublicationWatermark) -> Self {
+        match value {
+            FfiPublicationWatermark::InferFromLogPaths => Self::InferFromLogPaths,
+            FfiPublicationWatermark::NoPublishedCommits => Self::NoPublishedCommits,
+            FfiPublicationWatermark::PublishedThrough(version) => Self::PublishedThrough(version),
+        }
+    }
+}
+
+impl From<PublicationWatermark> for FfiPublicationWatermark {
+    fn from(value: PublicationWatermark) -> Self {
+        match value {
+            PublicationWatermark::InferFromLogPaths => Self::InferFromLogPaths,
+            PublicationWatermark::NoPublishedCommits => Self::NoPublishedCommits,
+            PublicationWatermark::PublishedThrough(version) => Self::PublishedThrough(version),
+        }
+    }
 }
 
 pub(crate) fn invalid(message: impl Into<String>) -> KernelError {
