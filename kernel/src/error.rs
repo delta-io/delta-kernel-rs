@@ -452,7 +452,10 @@ pub enum KernelError {
     #[error("File already exists: {0}")]
     FileAlreadyExists(String),
 
-    /// A Delta table already exists at the requested table path.
+    /// A Delta table was found during create-table validation.
+    ///
+    /// The payload is the caller-supplied table path, not the normalized table URL. Concurrent
+    /// create attempts that pass validation surface as a commit conflict instead of this error.
     #[error("Table already exists at path: {0}")]
     TableAlreadyExistsAtPath(String),
 
