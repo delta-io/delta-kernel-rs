@@ -777,7 +777,8 @@ full graph before changing the builder. One call avoids partial state and callba
 ## Key Files
 
 - `src/lib.rs` -- main FFI entry points and type definitions
-- `src/delta_types.rs` -- reusable borrowed C representations of Delta state and actions
+- `src/delta_types.rs` -- reusable borrowed C representations of Delta state and actions,
+  with their backing storage and conversions colocated
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
