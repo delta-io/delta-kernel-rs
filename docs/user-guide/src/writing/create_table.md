@@ -376,6 +376,7 @@ Features enabled when specific column types or annotations appear in the schema.
 |---------|-----------------------|----------------|----------------|
 | `VARIANT` type in schema | `variantType` | — | — |
 | `TIMESTAMP_NTZ` type in schema | `timestampNtz` | — | — |
+| `__COLLATIONS` metadata in schema | - | `collations` (or selected `collations-preview`), `domainMetadata` | - |
 | Any field with `nullable: false` in schema | — | `invariants` | — |
 
 ### Feature-signal only

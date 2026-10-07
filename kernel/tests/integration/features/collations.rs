@@ -543,27 +543,20 @@ async fn alter_requires_existing_feature_without_upgrade(
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
     let protocol = snapshot.table_configuration().protocol().clone();
+    let collated_field = annotated_field("name", DataType::STRING, "name", "test.ASCII_CI");
     let result = snapshot
         .clone()
         .alter_table()
-        .add_column(annotated_field(
-            "name",
-            DataType::STRING,
-            "name",
-            "test.ASCII_CI",
-        ))
+        .add_column(collated_field.clone())
         .build(engine.as_ref(), committer());
     if supported {
         let updated = result?
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
-        assert_eq!(updated.table_configuration().protocol(), &protocol);
-        assert!(updated
-            .schema()
-            .field("name")
-            .unwrap()
-            .get_config_value(&ColumnMetadataKey::Collations)
-            .is_some());
+        let reloaded = Snapshot::builder_for(&path).build(engine.as_ref())?;
+        assert_eq!(reloaded.version(), updated.version());
+        assert_eq!(reloaded.table_configuration().protocol(), &protocol);
+        assert_eq!(reloaded.schema().field("name"), Some(&collated_field));
     } else {
         assert!(result
             .err()
