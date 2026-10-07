@@ -14,6 +14,7 @@ use super::{PhysicalPredicate, Scan};
 use crate::actions::{
     ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
 };
+use crate::checkpoint::collation_stats::{normalize_collation_stats, source_collation_stats};
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
     col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, ExpressionRef,
@@ -147,12 +148,23 @@ impl Scan {
         let source_physical_partitions = physical_partitions
             .and_then(|schema| shape.compatible_partition_values_parsed_schema(schema));
         let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
+        let parquet_schema =
+            parquet_read_schema(source_physical_stats, source_physical_partitions)?;
+        let normalization = normalize_collation_stats(
+            &parquet_schema,
+            shape
+                .leaf_checkpoint_schema
+                .as_deref()
+                .and_then(source_collation_stats)
+                .filter(|_| self.stats.synthesize_json),
+        )?;
+        let read_schema = normalization
+            .as_ref()
+            .map_or(&parquet_schema, |normalization| &normalization.read_schema);
 
         let actions = match (&shape.checkpoint_type, checkpoint) {
             (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
-                let schema =
-                    parquet_read_schema(source_physical_stats, source_physical_partitions)?;
-                PlanBuilder::scan_parquet(parts, &[VERSION], schema)
+                PlanBuilder::scan_parquet(parts, &[VERSION], read_schema.clone())
             }
             (CheckpointType::Leaf, Some((FileType::Json, parts))) => {
                 PlanBuilder::scan_json(
@@ -162,18 +174,29 @@ impl Scan {
                 )
             }
             (CheckpointType::Manifest, Some((file_type, parts))) => {
-                let schema =
-                    parquet_read_schema(source_physical_stats, source_physical_partitions)?;
                 match log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
-                    Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
+                    Some(sidecars) => {
+                        PlanBuilder::scan_parquet(sidecars, &[VERSION], read_schema.clone())
+                    }
                     // Without a complete hint, load the sidecars referenced by the manifest.
-                    None => sidecar_actions(file_type, parts, schema, &log_segment.log_root),
+                    None => sidecar_actions(
+                        file_type,
+                        parts,
+                        read_schema.clone(),
+                        &log_segment.log_root,
+                    ),
                 }
             }
             (CheckpointType::None, _) | (_, None) => {
                 PlanBuilder::values(json_read_schema(/* include_remove */ false), vec![])
             }
         }?;
+        let actions = match normalization {
+            Some(normalization) => {
+                actions.project(normalization.expression, normalization.output_schema)?
+            }
+            None => actions,
+        };
 
         actions
             .filter(col!("add.path").is_not_null())?
