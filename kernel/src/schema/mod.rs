@@ -40,7 +40,11 @@ pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
 pub(crate) mod file_utils;
+#[cfg(feature = "udt-in-dev")]
+mod user_defined;
 pub(crate) mod validation;
+#[cfg(feature = "udt-in-dev")]
+pub use user_defined::UserDefinedType;
 pub(crate) mod variant_utils;
 pub(crate) mod void_utils;
 
@@ -1289,6 +1293,8 @@ impl StructType {
             // Primitive types cannot contain nested metadata columns, and variant and file types
             // are validated at creation
             DataType::Primitive(_) | DataType::Variant(_) | DataType::File(_) => {}
+            #[cfg(feature = "udt-in-dev")]
+            DataType::UserDefined(_) => {}
         };
 
         Ok(())
@@ -2269,6 +2275,12 @@ pub enum DataType {
     /// the physical representation is a plain struct.
     #[serde(serialize_with = "serialize_file")]
     File(Box<StructType>),
+    /// An engine annotation over a physical Delta type.
+    /// Retains logical type information in schemas; physical operations use the enclosed
+    /// `sql_type`. See [`UserDefinedType`] for a schema example.
+    #[cfg(feature = "udt-in-dev")]
+    #[from(UserDefinedType)]
+    UserDefined(UserDefinedType),
 }
 
 #[cfg(feature = "geo-type-in-dev")]
@@ -2334,6 +2346,10 @@ impl<'de> serde::Deserialize<'de> for DataType {
                     "map" => MapType::deserialize(value)
                         .map(DataType::from)
                         .map_err(|e| Error::custom(e.to_string())),
+                    #[cfg(feature = "udt-in-dev")]
+                    "udt" => UserDefinedType::deserialize(value)
+                        .map(DataType::UserDefined)
+                        .map_err(Error::custom),
                     _ => Err(unsupported_delta_type_error(type_str)),
                 };
             }
@@ -2412,6 +2428,8 @@ impl DataType {
             Self::Map(_) => "map".to_string(),
             Self::Variant(_) => "variant".to_string(),
             Self::File(_) => "file".to_string(),
+            #[cfg(feature = "udt-in-dev")]
+            Self::UserDefined(_) => "udt".to_string(),
         }
     }
 
@@ -2541,6 +2559,8 @@ impl Display for DataType {
             DataType::Map(m) => write!(f, "map<{}, {}>", m.key_type, m.value_type),
             DataType::Variant(_) => write!(f, "variant"),
             DataType::File(_) => write!(f, "file"),
+            #[cfg(feature = "udt-in-dev")]
+            DataType::UserDefined(udt) => write!(f, "udt({})", udt.sql_type()),
         }
     }
 }

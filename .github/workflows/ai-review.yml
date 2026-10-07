@@ -14,16 +14,16 @@
 #   vars.OMNIGENT_BOT_APP_ID + secrets.OMNIGENT_BOT_APP_KEY
 #   vars.OMNIGENT_BOT_LOGIN  Exact GitHub App login used for history deduplication.
 #
-# Ready PRs from authors with write-or-higher permission are reviewed
-# automatically and published as an inline review with a non-blocking PR check.
-# Authorized actors can also trigger a review manually with a /review comment or
-# workflow dispatch.
+# Non-draft PRs from authors with write-or-higher permission are reviewed on open,
+# reopen, and ready-for-review transitions. Pushes do not trigger another review;
+# during iteration, an authorized actor can request one with /review inline.
+# Other /review modes and workflow dispatch remain available for experiments.
 # =============================================================================
 name: AI PR Review
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, reopened, ready_for_review]
   issue_comment:
     types: [created]
   workflow_dispatch:
@@ -1030,29 +1030,6 @@ jobs:
             echo "::warning::AI review exited with status ${review_status}."
           fi
           echo "review_status=${review_status}" >> "$GITHUB_OUTPUT"
-
-      - name: Verify reviewed PR head is current
-        if: >-
-          always() &&
-          steps.creds.outputs.available == 'true' &&
-          steps.context.outcome == 'success'
-        env:
-          EXPECTED_BASE_SHA: ${{ steps.context.outputs.base_sha }}
-          EXPECTED_HEAD_SHA: ${{ steps.context.outputs.head_sha }}
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          read -r current_base_sha current_head_sha < <(
-            gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
-              --jq '[.base.sha, .head.sha] | @tsv'
-          )
-          if [ "$current_base_sha" != "$EXPECTED_BASE_SHA" ] || \
-             [ "$current_head_sha" != "$EXPECTED_HEAD_SHA" ]; then
-            echo "::error::PR base or head changed during review; refusing to publish stale output."
-            exit 1
-          fi
 
       - name: Validate review output
         id: review

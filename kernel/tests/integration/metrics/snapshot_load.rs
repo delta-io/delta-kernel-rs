@@ -61,6 +61,7 @@ fn external_snapshot_hint_api_builds_without_storage_io() -> Result<()> {
         .map(|path| LogPath::try_new(path.location.clone()))
         .collect::<Result<Vec<_>>>()?;
     let hint = SnapshotHint::try_new(
+        table.table_root(),
         snapshot.version(),
         log_paths,
         snapshot.table_configuration().protocol().clone(),
@@ -121,6 +122,7 @@ fn external_snapshot_hint_accepts_parsed_advanced_crc() -> Result<()> {
         .map(|path| LogPath::try_new(path.location.clone()))
         .collect::<Result<Vec<_>>>()?;
     let hint = SnapshotHint::try_new(
+        table.table_root(),
         snapshot.version(),
         log_paths,
         snapshot.table_configuration().protocol().clone(),

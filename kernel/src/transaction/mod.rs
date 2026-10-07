@@ -928,6 +928,24 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
+    /// Reject file actions on a commit to an `icebergNativeV4-preview` table.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn validate_iceberg_native_v4_semantics(&self) -> KernelResult<()> {
+        if !self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::IcebergNativeV4Preview)
+        {
+            return Ok(());
+        }
+        require!(
+            !self.has_data_file_actions(),
+            KernelError::invalid_transaction_state(
+                "commits to icebergNativeV4-preview tables cannot include file actions"
+            )
+        );
+        Ok(())
+    }
+
     /// Builds the `checkpoint` action committing the configured root manifest file, or `None` if
     /// this transaction has none.
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1111,6 +1129,8 @@ impl<S> Transaction<S> {
         self.ensure_schema_non_empty_for_data_writes()?;
         #[cfg(feature = "adaptive-metadata-in-dev")]
         self.validate_manifest_write_semantics()?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        self.validate_iceberg_native_v4_semantics()?;
 
         // Validate that the schema supports data writes when files are being added. Reads and
         // metadata-only commits are always allowed.
@@ -2065,6 +2085,10 @@ mod tests {
     use crate::table_properties::APPEND_ONLY;
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::unit_test_utils::{
+        adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
+    };
     use crate::unit_test_utils::{
         assert_result_error_with_message, copy_test_table, create_valid_add_file_batch,
         install_thread_local_metrics_reporter, load_test_table, string_array_to_engine_data,
@@ -3264,6 +3288,23 @@ mod tests {
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
         Ok((engine, txn, tempdir))
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_commit_rejects_file_actions_on_iceberg_native_v4_table() -> KernelResult<()> {
+        let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        txn.replace_effective_table_config(adaptive_metadata_table_configuration(
+            test_schema_flat_with_column_mapping(),
+            &[TableFeature::IcebergNativeV4Preview],
+        ));
+        add_dummy_file(&mut txn);
+        let err = txn.commit(engine.as_ref()).unwrap_err();
+        assert!(
+            err.to_string().contains("icebergNativeV4"),
+            "unexpected error: {err}"
+        );
+        Ok(())
     }
 
     #[test]
