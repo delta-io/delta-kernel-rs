@@ -516,6 +516,8 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
             engine.shallow_copy(),
         ))
     };
+    let validated_core =
+        unsafe { snapshot_externalize_validated_core(snapshot.shallow_copy(), 42) };
     let plan_engine = unsafe { plan_based_engine(&engine) };
     let inner_engine = unsafe { plan_engine.as_ref() }.engine();
     let native_snapshot = unsafe { snapshot.into_inner() };
@@ -528,6 +530,7 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
         .unwrap()
         .expect("expected a native plan for a hinted commit");
     let native_bytes = delta_kernel::Operation::QueryPlan(native_plan).to_proto_bytes();
+    drop(native_snapshot);
     let mut scan_state = test_snapshot_scan_state(&hint);
     let source = crate::log_path::FfiLogPathSource {
         context: std::ptr::from_ref(&hint.log_paths).cast_mut().cast(),
@@ -574,7 +577,61 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
         Some(proto_op::operation::Op::QueryPlan(_))
     ));
 
+    let rejected = unsafe {
+        snapshot_core_declarative_metadata_plan_trusted(
+            core.shallow_copy(),
+            &scan_state,
+            42,
+            plan_engine.shallow_copy(),
+        )
+    };
+    assert_extern_result_error_contains(
+        rejected,
+        KernelError::InvalidSnapshotHint,
+        "validated externalized snapshot core",
+    );
+
+    let rejected = unsafe {
+        snapshot_core_declarative_metadata_plan_trusted(
+            validated_core.shallow_copy(),
+            &scan_state,
+            43,
+            plan_engine.shallow_copy(),
+        )
+    };
+    assert_extern_result_error_contains(rejected, KernelError::InvalidSnapshotHint, "generation");
+
+    scan_state.protocol.min_reader_version = i32::MAX;
+    scan_state.metadata.id = invalid_utf8();
+    if !uploaded {
+        scan_state.metadata.schema_string = invalid_utf8();
+    }
+    let trusted = unsafe {
+        if uploaded {
+            snapshot_core_declarative_metadata_plan_trusted_with_schema(
+                validated_core.shallow_copy(),
+                &scan_state,
+                42,
+                schema_upload("transferred but intentionally not parsed"),
+                plan_engine.shallow_copy(),
+            )
+        } else {
+            snapshot_core_declarative_metadata_plan_trusted(
+                validated_core.shallow_copy(),
+                &scan_state,
+                42,
+                plan_engine.shallow_copy(),
+            )
+        }
+    };
+    let trusted_bytes = match ok_or_panic(trusted) {
+        OptionalValue::Some(bytes) => unsafe { bytes.into_vec() },
+        OptionalValue::None => panic!("expected a trusted plan for a hinted commit"),
+    };
+    assert_eq!(trusted_bytes, native_bytes);
+
     unsafe {
+        free_snapshot_core(validated_core);
         free_snapshot_core(core);
         free_engine(plan_engine);
         free_engine(engine);

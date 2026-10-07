@@ -26,6 +26,7 @@ pub struct SnapshotCore {
     version: Version,
     latest: bool,
     generation: u64,
+    validated_configuration: Option<Arc<delta_kernel::table_configuration::TableConfiguration>>,
 }
 
 /// Shared handle for a snapshot whose component state is held by its connector.
@@ -92,6 +93,7 @@ pub unsafe extern "C" fn snapshot_visit_log_paths(
 unsafe fn core_from_snapshot(
     snapshot: &Handle<SharedSnapshot>,
     generation: u64,
+    retain_validated_configuration: bool,
 ) -> Arc<SnapshotCore> {
     let owned = unsafe { snapshot.as_ref() };
     Arc::new(SnapshotCore {
@@ -99,6 +101,8 @@ unsafe fn core_from_snapshot(
         version: owned.version(),
         latest: owned.is_built_as_latest(),
         generation,
+        validated_configuration: retain_validated_configuration
+            .then(|| Arc::new(owned.table_configuration().clone())),
     })
 }
 
@@ -126,7 +130,7 @@ pub unsafe extern "C" fn snapshot_externalize_core(
     };
     let engine_ref = unsafe { engine.as_ref() };
     let result = validate_handoff(owned, &state)
-        .map(|_| unsafe { core_from_snapshot(&snapshot, generation) }.into());
+        .map(|_| unsafe { core_from_snapshot(&snapshot, generation, false) }.into());
     result.into_extern_result(&engine_ref)
 }
 
@@ -145,7 +149,7 @@ pub unsafe extern "C" fn snapshot_externalize_validated_core(
     snapshot: Handle<SharedSnapshot>,
     generation: u64,
 ) -> Handle<SharedSnapshotCore> {
-    unsafe { core_from_snapshot(&snapshot, generation) }.into()
+    unsafe { core_from_snapshot(&snapshot, generation, true) }.into()
 }
 
 /// Release a connector-backed snapshot core. The connector still owns its host state.
@@ -278,14 +282,7 @@ fn metadata_plan(
     engine: &dyn delta_kernel::Engine,
     metadata: Option<delta_kernel::actions::Metadata>,
 ) -> DeltaResult<crate::OptionalValue<crate::KernelOwnedBytes>> {
-    if generation != core.generation
-        || value.version != core.version
-        || matches!(value.freshness, super::FfiSnapshotHintFreshness::Latest) != core.latest
-    {
-        return Err(invalid(
-            "host snapshot generation, version, or freshness changed",
-        ));
-    }
+    validate_scan_identity(core, value, generation)?;
     let state = BorrowedSnapshotScanState {
         value,
         table_root: &core.table_root,
@@ -305,6 +302,76 @@ fn metadata_plan(
                 .into()
         })
         .into())
+}
+
+/// Build a declarative scan plan using configuration retained from the source snapshot.
+///
+/// Unlike the ordinary planning entry point, this does not read, parse, or validate the
+/// connector's metadata, protocol, or schema. Only a core created by
+/// [`snapshot_externalize_validated_core`] has the retained configuration required here.
+/// Generation, version, freshness, externalized log state, and scan-operation checks still run.
+///
+/// # Safety
+///
+/// Handles are borrowed. `value` and its log-path storage must be valid for this call.
+#[cfg(feature = "declarative-plans")]
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan_trusted(
+    core: Handle<SharedSnapshotCore>,
+    value: &FfiSnapshotScanState,
+    generation: u64,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<crate::OptionalValue<crate::KernelOwnedBytes>> {
+    let core = unsafe { core.as_ref() };
+    let extern_engine = unsafe { engine.as_ref() };
+    let result = trusted_metadata_plan(core, value, generation, extern_engine.engine().as_ref());
+    result.into_extern_result(&extern_engine)
+}
+
+#[cfg(feature = "declarative-plans")]
+fn trusted_metadata_plan(
+    core: &SnapshotCore,
+    value: &FfiSnapshotScanState,
+    generation: u64,
+    engine: &dyn delta_kernel::Engine,
+) -> DeltaResult<crate::OptionalValue<crate::KernelOwnedBytes>> {
+    validate_scan_identity(core, value, generation)?;
+    let configuration = core.validated_configuration.as_deref().ok_or_else(|| {
+        invalid("trusted planning requires a validated externalized snapshot core")
+    })?;
+    let state = BorrowedSnapshotScanState {
+        value,
+        table_root: &core.table_root,
+    };
+    let plan = delta_kernel::scan::declarative_metadata_scan_plan_from_validated_state(
+        &state,
+        configuration,
+        engine,
+    )?;
+    Ok(plan
+        .map(|plan| {
+            delta_kernel::Operation::QueryPlan(plan)
+                .to_proto_bytes()
+                .into()
+        })
+        .into())
+}
+
+#[cfg(feature = "declarative-plans")]
+fn validate_scan_identity(
+    core: &SnapshotCore,
+    value: &FfiSnapshotScanState,
+    generation: u64,
+) -> DeltaResult<()> {
+    if generation != core.generation
+        || value.version != core.version
+        || matches!(value.freshness, super::FfiSnapshotHintFreshness::Latest) != core.latest
+    {
+        return Err(invalid(
+            "host snapshot generation, version, or freshness changed",
+        ));
+    }
+    Ok(())
 }
 
 /// A preallocated schema transfer buffer. It does not retain connector pointers.
@@ -368,12 +435,16 @@ pub unsafe extern "C" fn free_snapshot_schema_upload(
 }
 
 impl SnapshotSchemaUpload {
-    pub(super) fn finish(self) -> DeltaResult<String> {
+    fn finish_bytes(self) -> DeltaResult<Vec<u8>> {
         let bytes = self.bytes?;
         if bytes.len() != self.expected {
             return Err(invalid("Incomplete schema upload"));
         }
-        String::from_utf8(bytes).map_err(|e| invalid(e.to_string()))
+        Ok(bytes)
+    }
+
+    pub(super) fn finish(self) -> DeltaResult<String> {
+        String::from_utf8(self.finish_bytes()?).map_err(|e| invalid(e.to_string()))
     }
 }
 
@@ -410,6 +481,37 @@ pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan_with_schema(
             engine.engine().as_ref(),
             Some(metadata),
         )
+    })();
+    result.into_extern_result(&engine)
+}
+
+/// Trusted planning variant that consumes a transferred schema without reparsing it.
+///
+/// The completed upload preserves the same Java-to-native transfer behavior as the validating
+/// path, but the retained source-snapshot configuration is authoritative. This entry point checks
+/// upload completeness and does not interpret its bytes.
+///
+/// # Safety
+/// Consumes `upload` unconditionally, including on errors. Other handles and `value` are borrowed
+/// and its log-path storage must be valid for this call.
+#[cfg(feature = "declarative-plans")]
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan_trusted_with_schema(
+    core: Handle<SharedSnapshotCore>,
+    value: &FfiSnapshotScanState,
+    generation: u64,
+    upload: Handle<ExclusiveSnapshotSchemaUpload>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<crate::OptionalValue<crate::KernelOwnedBytes>> {
+    let upload = unsafe { upload.into_inner() };
+    let core = unsafe { core.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    let result = (|| {
+        if value.metadata.schema_string.len != 0 {
+            return Err(invalid("Schema supplied both inline and as an upload"));
+        }
+        drop(upload.finish_bytes()?);
+        trusted_metadata_plan(core, value, generation, engine.engine().as_ref())
     })();
     result.into_extern_result(&engine)
 }
