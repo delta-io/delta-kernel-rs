@@ -108,14 +108,13 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP => {
             props.in_commit_timestamp_enablement_timestamp = Some(parse_non_negative(v)?)
         }
-        _ => match strip_check_constraint_prefix(k) {
-            Some(name) => props.check_constraints.push(CheckConstraint {
+        _ => {
+            let name = strip_check_constraint_prefix(k)?;
+            props.check_constraints.push(CheckConstraint {
                 name: name.to_string(),
                 raw_sql: v.to_string(),
-            }),
-            // Not a recognized key, so it stays in `unknown_properties`.
-            None => return None,
-        },
+            });
+        }
     }
     Some(())
 }
