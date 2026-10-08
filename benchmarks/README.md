@@ -27,9 +27,6 @@ After each selected benchmark finishes timing, the harness resets the counters a
 untimed iteration to print its `[io]` summary. The summary excludes runner setup and timed iterations;
 filtered-out benchmarks are not profiled.
 
-Counts describe kernel and engine operations, not physical disk reads or operating-system cache
-misses.
-
 ### Filtering benchmarks
 
 #### By benchmark name
