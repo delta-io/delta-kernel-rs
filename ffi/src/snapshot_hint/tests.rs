@@ -50,6 +50,7 @@ fn slice(value: &'static str) -> KernelStringSlice {
     unsafe { KernelStringSlice::new_unsafe(value) }
 }
 
+#[cfg(feature = "declarative-plans")]
 fn schema_upload(schema: &str) -> Handle<ExclusiveSnapshotSchemaUpload> {
     let upload = snapshot_schema_upload_new(schema.len());
     for chunk in schema.as_bytes().chunks(65536) {
@@ -224,6 +225,7 @@ fn test_snapshot_hint(
     }
 }
 
+#[cfg(feature = "declarative-plans")]
 fn test_snapshot_scan_state(hint: &FfiSnapshotHint) -> FfiSnapshotScanState {
     FfiSnapshotScanState {
         log_path_source: std::ptr::null(),
@@ -2397,6 +2399,7 @@ fn build_rejects_internally_supplied_hint_for_existing_snapshot_builder() {
 }
 
 // Return one entry at a time, including a final empty batch, to exercise callback lifetimes.
+#[cfg(feature = "declarative-plans")]
 unsafe extern "C" fn read_test_log_batch(
     context: *mut std::ffi::c_void,
     offset: usize,
@@ -2416,6 +2419,7 @@ unsafe extern "C" fn read_test_log_batch(
     true
 }
 
+#[cfg(feature = "declarative-plans")]
 #[test]
 fn borrowed_log_batch_errors_are_terminal() {
     unsafe extern "C" fn fail(

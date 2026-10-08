@@ -10,7 +10,9 @@ use delta_kernel::snapshot::{SnapshotLogState, SnapshotScanState, SnapshotState}
 use delta_kernel::{KernelResult, LogPath, Version};
 use url::Url;
 
-use super::{invalid_crc, invalid_with_source, FfiSnapshotHint, FfiSnapshotScanState};
+#[cfg(feature = "declarative-plans")]
+use super::FfiSnapshotScanState;
+use super::{invalid_crc, invalid_with_source, FfiSnapshotHint};
 
 /// The connector owns every pointer reachable from `hint` for this call only.
 pub(super) struct BorrowedSnapshotState<'a> {
@@ -79,11 +81,13 @@ impl SnapshotState for BorrowedSnapshotState<'_> {
 }
 
 /// The connector owns every pointer reachable from `value` for this scan-planning call only.
+#[cfg(feature = "declarative-plans")]
 pub(super) struct BorrowedSnapshotScanState<'a> {
     pub value: &'a FfiSnapshotScanState,
     pub table_root: &'a Url,
 }
 
+#[cfg(feature = "declarative-plans")]
 impl SnapshotLogState for BorrowedSnapshotScanState<'_> {
     fn ordered_log_paths(
         &self,
@@ -173,6 +177,7 @@ impl SnapshotLogState for BorrowedSnapshotScanState<'_> {
     }
 }
 
+#[cfg(feature = "declarative-plans")]
 impl SnapshotScanState for BorrowedSnapshotScanState<'_> {
     fn protocol(&self) -> KernelResult<Protocol> {
         unsafe { self.value.protocol.try_to_kernel() }

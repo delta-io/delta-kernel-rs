@@ -430,7 +430,7 @@ mod tests {
         let shape = if stats_schema.is_some() {
             CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref())
         } else {
-            CheckpointShape::try_new(&exec, snapshot.as_ref())
+            CheckpointShape::try_new_for_segment(&exec, snapshot.as_ref())
         }
         .unwrap();
         let parsed_stats_schema = stats_schema
@@ -551,7 +551,7 @@ mod tests {
         let shape = if needs_leaf_schema {
             CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref())
         } else {
-            CheckpointShape::try_new(&exec, snapshot.as_ref())
+            CheckpointShape::try_new_for_segment(&exec, snapshot.as_ref())
         }
         .unwrap();
 
