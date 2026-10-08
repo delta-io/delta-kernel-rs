@@ -1200,7 +1200,8 @@ impl Scan {
         // needed for output or pruning.
         let plan_executor = engine.require_plan_executor()?;
         let needs_leaf_schema = self.state_info.physical_stats_read_schema().is_some()
-            || self.state_info.physical_partition_schema.is_some();
+            || self.state_info.physical_partition_schema.is_some()
+            || self.stats.synthesize_json;
         let shape = if needs_leaf_schema {
             CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
         } else {
