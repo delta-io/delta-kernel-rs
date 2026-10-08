@@ -983,9 +983,10 @@ impl CommitInfo {
 ///
 /// [Iceberg V4 metadata RFC]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-v4-metadata.md#backreferences
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize)]
 #[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
+#[internal_api]
 pub(crate) struct BackReference {
     /// Path to the leaf manifest containing this file, relative to the table root
     /// (e.g. `metadata/leaf-m1.parquet`). Resolved by joining the table location and this path
@@ -995,7 +996,7 @@ pub(crate) struct BackReference {
     pub(crate) pos: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize)]
 #[cfg_attr(test, derive(Serialize, Default))]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
@@ -1107,6 +1108,49 @@ where
 }
 
 impl Add {
+    /// Returns the URI-encoded data-file path.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns non-null partition values. Missing partition columns represent null values.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn partition_values(&self) -> &HashMap<String, String> {
+        &self.partition_values
+    }
+
+    /// Returns the data-file size in bytes.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn size(&self) -> i64 {
+        self.size
+    }
+
+    /// Returns the file modification time in milliseconds since the Unix epoch.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn modification_time(&self) -> i64 {
+        self.modification_time
+    }
+
+    /// Returns whether the action changes table data.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn data_change(&self) -> bool {
+        self.data_change
+    }
+
+    /// Returns this action's adaptive-metadata back reference, if present.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn back_reference(&self) -> Option<&BackReference> {
+        self.back_reference.as_ref()
+    }
+
     /// Reconstructs an Add action from its serialized fields.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
@@ -1279,6 +1323,27 @@ pub(crate) struct SetTransaction {
 }
 
 impl SetTransaction {
+    /// Returns the application identifier.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn app_id(&self) -> &str {
+        &self.app_id
+    }
+
+    /// Returns the application-specific transaction version.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn version(&self) -> i64 {
+        self.version
+    }
+
+    /// Returns the last-updated timestamp, if captured.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn last_updated(&self) -> Option<i64> {
+        self.last_updated
+    }
+
     /// Whether this transaction is expired: `last_updated <= expiration_timestamp` with both
     /// present. A `None` `last_updated` (no timestamp recorded) or a `None` `expiration_timestamp`
     /// (no retention duration configured) never expires.
@@ -1544,17 +1609,8 @@ fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> KernelResult<Sca
     let values = std::iter::once(Scalar::from(type_str))
         .chain(sidecar.values().iter().cloned())
         .collect();
-    // `from_values_unchecked`, not `try_new`: `Sidecar::tags` carries
-    // `#[allow_null_container_values]` so its schema field declares value-nullable maps, while
-    // the derived `.into()` value is a non-nullable map -- a leaf-level mismatch `try_new`
-    // would reject. This is inert because the enclosing `checkpoint_action_union_element` still
-    // validates the composite against `CONTENT_SIDECAR_FIELD`, and materialization derives map
-    // nullability from the schema, not the scalar. Tracked by delta-io/delta-kernel-rs#3136,
-    // which will let this use `try_new`.
-    Ok(Scalar::Struct(StructData::from_values_unchecked(
-        StructType::try_new(fields)?,
-        values,
-    )))
+    let fields = StructType::try_new(fields)?.into_fields().collect();
+    Ok(Scalar::Struct(StructData::try_new(fields, values)?))
 }
 
 /// Wrap a single element `value` into a full union struct matching the checkpoint array's element
@@ -1903,6 +1959,22 @@ pub(crate) struct CheckpointMetadata {
     pub(crate) tags: Option<HashMap<String, String>>,
 }
 
+impl CheckpointMetadata {
+    /// Returns the checkpoint version.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn version(&self) -> i64 {
+        self.version
+    }
+
+    /// Returns checkpoint tags, preserving absent versus empty maps.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn tags(&self) -> Option<&HashMap<String, String>> {
+        self.tags.as_ref()
+    }
+}
+
 /// The [DomainMetadata] action contains a configuration (string) for a named metadata domain. Two
 /// overlapping transactions conflict if they both contain a domain metadata action for the same
 /// metadata domain.
@@ -1979,7 +2051,7 @@ mod tests {
     use crate::engine::to_json_bytes;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine_data::FilteredEngineData;
-    use crate::expressions::Scalar;
+    use crate::expressions::{Scalar, StructData};
     use crate::schema::{schema, schema_ref, DataType, MapType, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
     use crate::{
@@ -2993,6 +3065,9 @@ mod tests {
         }"#;
 
         let add: Add = serde_json::from_str(json).unwrap();
+        let data: StructData = add.clone().into();
+        StructData::try_new(data.fields().to_vec(), data.values().to_vec())
+            .expect("complete add must match its derived schema");
         assert_eq!(
             add.partition_values,
             HashMap::from([("present".to_string(), "value".to_string())])
@@ -3006,7 +3081,7 @@ mod tests {
             ]))
         );
         assert_eq!(
-            add.deletion_vector.unwrap().storage_type,
+            add.deletion_vector.as_ref().unwrap().storage_type,
             deletion_vector::DeletionVectorStorageType::Inline
         );
         assert_eq!(add.base_row_id, Some(10));
@@ -3014,8 +3089,8 @@ mod tests {
         assert_eq!(add.clustering_provider.as_deref(), Some("liquid"));
         #[cfg(feature = "adaptive-metadata-in-dev")]
         assert_eq!(
-            add.back_reference,
-            Some(BackReference {
+            add.back_reference(),
+            Some(&BackReference {
                 manifest: "manifest.parquet".to_string(),
                 pos: 3,
             })
@@ -3034,6 +3109,8 @@ mod tests {
 
         let add: Add = serde_json::from_str(json).unwrap();
         assert!(add.partition_values.is_empty());
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        assert!(add.back_reference().is_none());
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -3153,7 +3230,7 @@ mod tests {
             path: path.to_string(),
             size_in_bytes: 100,
             modification_time: 1,
-            tags: None,
+            tags: Some(HashMap::from([("tag".to_string(), "value".to_string())])),
         };
         CheckpointAction {
             version: 42,
@@ -3239,8 +3316,8 @@ mod tests {
                 } },
                 { "txn": { "appId": "myApp", "version": 3 } },
                 { "domainMetadata": { "domain": "myDomain", "configuration": "cfg", "removed": false } },
-                { "sidecar": { "type": "txn", "path": "txn-sidecar.parquet", "sizeInBytes": 100, "modificationTime": 1 } },
-                { "sidecar": { "type": "domainMetadata", "path": "dm-sidecar.parquet", "sizeInBytes": 100, "modificationTime": 1 } },
+                { "sidecar": { "type": "txn", "path": "txn-sidecar.parquet", "sizeInBytes": 100, "modificationTime": 1, "tags": { "tag": "value" } } },
+                { "sidecar": { "type": "domainMetadata", "path": "dm-sidecar.parquet", "sizeInBytes": 100, "modificationTime": 1, "tags": { "tag": "value" } } },
             ] })
         );
         Ok(())
