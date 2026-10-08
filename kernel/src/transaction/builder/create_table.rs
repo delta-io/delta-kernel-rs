@@ -34,19 +34,19 @@ use crate::table_features::{
 use crate::table_properties::{
     strip_check_constraint_prefix, CheckpointPolicy, TableProperties, APPEND_ONLY,
     CHECKPOINT_INTERVAL, CHECKPOINT_POLICY, CHECKPOINT_WRITE_STATS_AS_JSON,
-    CHECKPOINT_WRITE_STATS_AS_STRUCT, CHECK_CONSTRAINT_PREFIX, COLUMN_MAPPING_MAX_COLUMN_ID,
-    COLUMN_MAPPING_MODE, DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS,
-    DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED,
-    ENABLE_DELETION_VECTORS, ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1,
-    ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
-    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION,
-    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
-    PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED, SET_TRANSACTION_RETENTION_DURATION,
+    CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE,
+    DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS, DELETED_FILE_RETENTION_DURATION,
+    DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS,
+    ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
+    ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
+    ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+    MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED,
+    SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
 use crate::transaction::Transaction;
-use crate::utils::{current_time_ms, require, try_parse_uri};
+use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{Engine, KernelError, KernelResult, Result, StorageHandler};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
@@ -421,56 +421,6 @@ fn maybe_enable_invariants(schema: &SchemaRef, validated: &mut ValidatedTablePro
     }
 }
 
-/// Validates the CHECK constraint properties of a new table and rewrites each key to
-/// `delta.constraints.<lowercased name>`. Other properties pass through unchanged.
-///
-/// # Errors
-///
-/// Returns an error for a CHECK constraint property without the `check-constraints-in-dev` cargo
-/// feature, and for two constraints whose names differ only in case.
-fn normalize_check_constraint_properties(
-    properties: HashMap<String, String>,
-) -> KernelResult<HashMap<String, String>> {
-    let mut normalized = HashMap::with_capacity(properties.len());
-    for (key, value) in properties {
-        let Some(name) = strip_check_constraint_prefix(&key) else {
-            normalized.insert(key, value);
-            continue;
-        };
-        require!(
-            cfg!(feature = "check-constraints-in-dev"),
-            KernelError::generic(format!(
-                "Setting CHECK constraint property '{key}' is not supported during CREATE TABLE"
-            ))
-        );
-        let name = name.to_lowercase();
-        let stored_key = format!("{CHECK_CONSTRAINT_PREFIX}{name}");
-        require!(
-            !normalized.contains_key(&stored_key),
-            KernelError::generic(format!("Duplicate CHECK constraint '{name}'"))
-        );
-        normalized.insert(stored_key, value);
-    }
-    Ok(normalized)
-}
-
-/// Auto-enables the `checkConstraints` writer feature when the table declares at least one
-/// `delta.constraints.<name>` property.
-#[cfg(feature = "check-constraints-in-dev")]
-fn maybe_enable_check_constraints(validated: &mut ValidatedTableProperties) {
-    if validated
-        .properties
-        .keys()
-        .any(|key| strip_check_constraint_prefix(key).is_some())
-    {
-        add_feature_to_lists(
-            TableFeature::CheckConstraints,
-            &mut validated.reader_features,
-            &mut validated.writer_features,
-        );
-    }
-}
-
 /// Auto-enables allowed property-driven features from the table properties (see
 /// [`auto_enable_property_driven_features`]).
 fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProperties) {
@@ -824,12 +774,14 @@ fn validate_extract_table_features_and_properties(
         add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
     }
 
-    let properties = normalize_check_constraint_properties(properties)?;
-
     // Validate remaining delta.* properties against the allow list
     for key in properties.keys() {
-        if strip_check_constraint_prefix(key).is_none()
-            && key.starts_with(DELTA_PROPERTY_PREFIX)
+        if strip_check_constraint_prefix(key).is_some() {
+            return Err(KernelError::generic(format!(
+                "Setting CHECK constraint property '{key}' is not supported during CREATE TABLE"
+            )));
+        }
+        if key.starts_with(DELTA_PROPERTY_PREFIX)
             && !ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
         {
             return Err(KernelError::generic(format!(
@@ -881,10 +833,7 @@ impl CreateTableTransactionBuilder {
     /// Custom application properties (those not starting with `delta.`) are always allowed.
     /// Delta properties (`delta.*`) are validated against an allow list during [`build()`].
     /// Feature flags (`delta.feature.*=supported`) are supported for the subset of features
-    /// listed in `ALLOWED_DELTA_FEATURES`. CHECK constraints (`delta.constraints.<name>`) are
-    /// stored under `delta.constraints.<lowercased name>` and enable the `checkConstraints` writer
-    /// feature. [`build()`] rejects them without the `check-constraints-in-dev` cargo feature, or
-    /// when two keys differ only in case.
+    /// listed in `ALLOWED_DELTA_FEATURES`.
     ///
     /// This method can be called multiple times. If a property key already exists from a
     /// previous call, the new value will overwrite the old one.
@@ -1075,9 +1024,6 @@ impl CreateTableTransactionBuilder {
         // Property-driven auto-enablement: check enablement properties
         maybe_auto_enable_property_driven_features(&mut validated);
 
-        #[cfg(feature = "check-constraints-in-dev")]
-        maybe_enable_check_constraints(&mut validated);
-
         // Auto-enable inCommitTimestamp for catalogManaged tables
         maybe_enable_ict_for_catalog_managed(&mut validated)?;
 
@@ -1185,73 +1131,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "check-constraints-in-dev")]
-    fn test_property_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
-        entries
-            .iter()
-            .map(|(key, value)| (key.to_string(), value.to_string()))
-            .collect()
-    }
-
-    #[cfg(feature = "check-constraints-in-dev")]
-    #[rstest]
-    // Names a user would expect.
-    #[case::lowercase_key("delta.constraints.positive", "delta.constraints.positive")]
-    #[case::mixed_case_name("delta.constraints.MyCheck", "delta.constraints.mycheck")]
-    // Unusual names, accepted like any other name.
-    #[case::bare_prefix("delta.constraints.", "delta.constraints.")]
-    #[case::whitespace_only_name("delta.constraints.   ", "delta.constraints.   ")]
-    fn create_table_stores_check_constraints_under_lowercased_keys(
-        #[case] key: &str,
-        #[case] expected_key: &str,
-    ) {
-        let properties = test_property_map(&[(key, "amount > 0")]);
-        let validated = validate_extract_table_features_and_properties(properties).unwrap();
-
-        let stored: Vec<_> = validated.properties.keys().map(String::as_str).collect();
-        assert_eq!(stored, [expected_key]);
-    }
-
-    #[cfg(feature = "check-constraints-in-dev")]
-    #[rstest]
-    #[case::check_constraint_key("delta.constraints.MyCheck", "delta.constraints.mycheck", true)]
-    #[case::non_lowercase_prefix("DELTA.CONSTRAINTS.MyCheck", "DELTA.CONSTRAINTS.MyCheck", false)]
-    fn create_table_enables_check_constraints_only_for_check_constraint_keys(
-        #[case] key: &str,
-        #[case] expected_key: &str,
-        #[case] expect_feature: bool,
-    ) {
-        let properties = test_property_map(&[(key, "amount > 0")]);
-        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
-        maybe_enable_check_constraints(&mut validated);
-
-        let stored: Vec<_> = validated.properties.keys().map(String::as_str).collect();
-        assert_eq!(stored, [expected_key]);
-        let enables_feature = validated
-            .writer_features
-            .contains(&TableFeature::CheckConstraints);
-        assert_eq!(enables_feature, expect_feature);
-    }
-
-    #[cfg(feature = "check-constraints-in-dev")]
-    #[test]
-    fn create_table_rejects_check_constraints_feature_signal() {
-        let properties = test_property_map(&[("delta.feature.checkConstraints", "supported")]);
-        let result = validate_extract_table_features_and_properties(properties);
-        assert_result_error_with_message(result, "Enabling feature 'checkConstraints'");
-    }
-
-    #[cfg(feature = "check-constraints-in-dev")]
-    #[test]
-    fn create_table_rejects_check_constraint_keys_differing_only_in_case() {
-        let properties = test_property_map(&[
-            ("delta.constraints.c", "amount > 0"),
-            ("delta.constraints.C", "amount > 1"),
-        ]);
-        let result = validate_extract_table_features_and_properties(properties);
-        assert_result_error_with_message(result, "Duplicate CHECK constraint 'c'");
-    }
-
     #[test]
     fn test_with_multiple_table_properties() {
         let schema = test_schema();
@@ -1270,7 +1149,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "check-constraints-in-dev"))]
     #[rstest]
     // Names a user would expect.
     #[case::lowercase_prefix("delta.constraints.positive")]

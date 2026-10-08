@@ -4,18 +4,12 @@
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField};
-use delta_kernel::transaction::create_table::{
-    create_table as kernel_create_table, CreateTableTransaction,
-};
 use delta_kernel::transaction::Transaction;
 use delta_kernel::write_expressions::TableWriteExpressions;
-use delta_kernel::{Engine, KernelError, Result, Snapshot};
+use delta_kernel::{KernelError, Result, Snapshot};
 use rstest::rstest;
 use serde_json::json;
-use test_utils::{
-    add_commit, create_add_files_metadata, read_actions_from_commit, test_table_setup,
-    test_table_setup_mt,
-};
+use test_utils::{add_commit, create_add_files_metadata, test_table_setup, test_table_setup_mt};
 use url::Url;
 
 use crate::common::write_utils::get_scan_files;
@@ -36,33 +30,6 @@ fn test_schema() -> SchemaRef {
         nullable "amount": LONG,
         nullable "name": STRING,
     }
-}
-
-/// Builds (but does not commit) a create-table transaction declaring `constraints`.
-fn build_create_txn(
-    engine: &dyn Engine,
-    table_path: &str,
-    constraints: &[(&str, &str)],
-) -> Result<CreateTableTransaction> {
-    let properties = constraints
-        .iter()
-        .map(|(name, sql)| (format!("delta.constraints.{name}"), sql.to_string()));
-    kernel_create_table(table_path, test_schema(), "Test/1.0")
-        .with_table_properties(properties)
-        .build(engine, Box::new(FileSystemCommitter::new()))
-}
-
-/// Creates a table with the given constraints (possibly none), acknowledging them on the create
-/// commit, and returns its URL.
-fn create_constrained_table(
-    engine: &dyn Engine,
-    table_path: &str,
-    constraints: &[(&str, &str)],
-) -> Result<Url, Box<dyn std::error::Error>> {
-    let mut txn = build_create_txn(engine, table_path, constraints)?;
-    txn.ack_check_constraints();
-    txn.commit(engine)?.unwrap_committed();
-    Ok(Url::from_directory_path(table_path).expect("table path must be a URL"))
 }
 
 fn stage_one_file(txn: &mut Transaction) -> Result<(), Box<dyn std::error::Error>> {
@@ -156,52 +123,6 @@ async fn discovers_constraints_from_snapshot_and_transaction(
 }
 
 #[rstest]
-#[case::single(
-    &[("positive_amount", "amount > 0")],
-    &[("positive_amount", "amount > 0")]
-)]
-#[case::multiple_with_mixed_case_name(
-    &[("PositiveAmount", "amount > 0"), ("nonempty_name", "name != ''")],
-    &[("nonempty_name", "name != ''"), ("positiveamount", "amount > 0")]
-)]
-#[tokio::test]
-async fn discovers_constraints_and_auto_enables_feature_on_create(
-    #[case] declared: &[(&str, &str)],
-    #[case] expected: &[(&str, &str)],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp, table_path, engine) = test_table_setup()?;
-    let mut create_txn = build_create_txn(engine.as_ref(), &table_path, declared)?;
-
-    // The uncommitted create-table transaction already discovers the declared constraints.
-    let from_create_txn = discovered(&create_txn);
-    assert_eq!(from_create_txn, expected);
-
-    create_txn.ack_check_constraints();
-    create_txn.commit(engine.as_ref())?.unwrap_committed();
-    let table_url = Url::from_directory_path(&table_path).expect("table path must be a URL");
-
-    // CREATE TABLE auto-enabled the writer feature from the declared constraints.
-    let protocol = read_actions_from_commit(&table_url, 0, "protocol")?;
-    let writer_features = protocol[0]["writerFeatures"]
-        .as_array()
-        .expect("writer v7 protocol must list writer features");
-    let lists_check_constraints = writer_features
-        .iter()
-        .any(|f| f.as_str() == Some("checkConstraints"));
-    assert!(lists_check_constraints);
-
-    // Discovery works from both a snapshot and a transaction, with no ack.
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let from_snapshot = discovered(snapshot.as_ref());
-    assert_eq!(from_snapshot, expected);
-
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-    let from_txn = discovered(&txn);
-    assert_eq!(from_txn, expected);
-    Ok(())
-}
-
-#[rstest]
 #[tokio::test]
 async fn constrained_table_write_requires_acknowledgement(
     #[values(
@@ -240,37 +161,6 @@ async fn constrained_table_write_requires_acknowledgement(
                 let _committed = committed.unwrap_committed();
             }),
         GatedOp::WriteState => txn.write_state().map(|_write_state| ()),
-    };
-    if acknowledge {
-        result?;
-    } else {
-        assert_gate_error(result);
-    }
-    Ok(())
-}
-
-#[rstest]
-#[tokio::test]
-async fn creating_a_constrained_table_requires_acknowledgement(
-    #[values(GatedOp::MetadataOnlyCommit, GatedOp::WriteState)] op: GatedOp,
-    #[values(true, false)] acknowledge: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp, table_path, engine) = test_table_setup()?;
-    let mut txn = build_create_txn(
-        engine.as_ref(),
-        &table_path,
-        &[("positive_amount", "amount > 0")],
-    )?;
-    if acknowledge {
-        txn.ack_check_constraints();
-    }
-
-    let result = match op {
-        GatedOp::MetadataOnlyCommit => txn.commit(engine.as_ref()).map(|committed| {
-            let _committed = committed.unwrap_committed();
-        }),
-        GatedOp::WriteState => txn.write_state().map(|_write_state| ()),
-        GatedOp::CommitWithData => unreachable!("not a case of this test"),
     };
     if acknowledge {
         result?;
