@@ -1,6 +1,7 @@
 //! This module holds functionality for managing transactions.
 use delta_kernel::KernelResult;
 mod deletion_vector;
+mod deletion_vector_writer;
 mod partition_value;
 mod transaction_id;
 mod write_context;
@@ -12,6 +13,7 @@ pub use deletion_vector::{
     free_dv_descriptor_map, transaction_update_deletion_vectors, ExclusiveDvDescriptor,
     ExclusiveDvDescriptorMap, KernelDvStorageType,
 };
+pub use deletion_vector_writer::{write_deletion_vectors, FfiDeletionVectorUpdate};
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::{
@@ -44,8 +46,9 @@ use crate::{
 
 /// A handle for an existing-table transaction (`Transaction<ExistingTable>`).
 ///
-/// Returned by [`transaction`] and [`transaction_with_committer`]. Supports all transaction
-/// operations including existing-table-only operations like blind append and file removal.
+/// Returned by [`transaction`], [`transaction_from_snapshot`], and [`transaction_with_committer`].
+/// Supports all transaction operations including existing-table-only operations like blind append
+/// and file removal.
 #[handle_descriptor(target=Transaction, mutable=true, sized=true)]
 pub struct ExclusiveTransaction;
 
@@ -94,6 +97,32 @@ fn transaction_impl(
     let committer = Box::new(FileSystemCommitter::new());
     let transaction = snapshot.transaction(committer, engine.as_ref());
     Ok(Box::new(transaction?).into())
+}
+
+/// Start a filesystem transaction from the supplied immutable snapshot.
+///
+/// `snapshot` determines the transaction's read version, even when a newer commit exists.
+/// `engine` supplies the handlers and error allocator. Both input handles remain caller-owned.
+/// Returns an owned transaction that retains its snapshot and must be committed or released with
+/// `free_transaction`.
+///
+/// # Errors
+///
+/// Returns an error when Kernel does not support writes to this table or transaction initialization
+/// fails. No commit is attempted.
+///
+/// # Safety
+///
+/// The borrowed snapshot and engine handles must be valid for this call.
+#[no_mangle]
+pub unsafe extern "C" fn transaction_from_snapshot(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let snapshot = unsafe { snapshot.clone_as_arc() };
+    let engine = unsafe { engine.as_ref() };
+    transaction_with_committer_impl(snapshot, engine, Box::new(FileSystemCommitter::new()))
+        .into_extern_result(&engine)
 }
 
 /// Start a transaction with a custom committer
