@@ -1273,6 +1273,7 @@ impl StructType {
     ///
     /// Uses a single transformer so duplicate column mapping IDs are detected across all
     /// fields in this struct, not just within each field's subtree.
+    #[allow(unused)]
     #[internal_api]
     pub(crate) fn make_physical(
         &self,
