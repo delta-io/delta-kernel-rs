@@ -129,6 +129,7 @@ impl Transaction {
             provided_row_tracking_high_water_mark: None,
             user_domain_removals: vec![],
             data_change: true,
+            dedup_validation_enabled: true,
             column_defaults_acknowledged: false,
             row_tracking_preservation_acknowledged: false,
             engine_commit_info: None,
@@ -588,7 +589,7 @@ fn selection_vector_for_matches(num_rows: usize, matched_file_indexes: &[usize])
 /// Column name for temporary column used during deletion vector updates.
 /// This column holds new DV descriptors appended to scan file metadata before transforming to final
 /// add actions.
-static NEW_DELETION_VECTOR_NAME: &str = "newDeletionVector";
+pub(super) static NEW_DELETION_VECTOR_NAME: &str = "newDeletionVector";
 
 /// Column name for the temporary column holding the rewritten `stats` string for a DV update.
 static NEW_STATS_NAME: &str = "newStats";
