@@ -14,6 +14,7 @@ use super::{PhysicalPredicate, Scan};
 use crate::actions::{
     ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
 };
+use crate::checkpoint::collation_stats::{normalize_collation_stats, source_collation_stats};
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
     col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, ExpressionRef,
@@ -147,12 +148,23 @@ impl Scan {
         let source_physical_partitions = physical_partitions
             .and_then(|schema| shape.compatible_partition_values_parsed_schema(schema));
         let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
+        let parquet_schema =
+            parquet_read_schema(source_physical_stats, source_physical_partitions)?;
+        let normalization = normalize_collation_stats(
+            &parquet_schema,
+            shape
+                .leaf_checkpoint_schema
+                .as_deref()
+                .and_then(source_collation_stats)
+                .filter(|_| self.stats.synthesize_json),
+        )?;
+        let read_schema = normalization
+            .as_ref()
+            .map_or(&parquet_schema, |normalization| &normalization.read_schema);
 
         let actions = match (&shape.checkpoint_type, checkpoint) {
             (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
-                let schema =
-                    parquet_read_schema(source_physical_stats, source_physical_partitions)?;
-                PlanBuilder::scan_parquet(parts, &[VERSION], schema)
+                PlanBuilder::scan_parquet(parts, &[VERSION], read_schema.clone())
             }
             (CheckpointType::Leaf, Some((FileType::Json, parts))) => {
                 PlanBuilder::scan_json(
@@ -162,18 +174,29 @@ impl Scan {
                 )
             }
             (CheckpointType::Manifest, Some((file_type, parts))) => {
-                let schema =
-                    parquet_read_schema(source_physical_stats, source_physical_partitions)?;
                 match log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
-                    Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
+                    Some(sidecars) => {
+                        PlanBuilder::scan_parquet(sidecars, &[VERSION], read_schema.clone())
+                    }
                     // Without a complete hint, load the sidecars referenced by the manifest.
-                    None => sidecar_actions(file_type, parts, schema, &log_segment.log_root),
+                    None => sidecar_actions(
+                        file_type,
+                        parts,
+                        read_schema.clone(),
+                        &log_segment.log_root,
+                    ),
                 }
             }
             (CheckpointType::None, _) | (_, None) => {
                 PlanBuilder::values(json_read_schema(/* include_remove */ false), vec![])
             }
         }?;
+        let actions = match normalization {
+            Some(normalization) => {
+                actions.project(normalization.expression, normalization.output_schema)?
+            }
+            None => actions,
+        };
 
         actions
             .filter(col!("add.path").is_not_null())?
@@ -854,6 +877,51 @@ mod tests {
             !expect_native_partitions
         );
         assert!(!normalization.contains("COALESCE"));
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::json(StatsOptions::json_only(), true)]
+    #[case::both(StatsOptions::all(), true)]
+    #[case::struct_only(StatsOptions::all_struct(), false)]
+    #[case::none(StatsOptions::none(), false)]
+    fn metadata_plan_reads_full_collation_source_only_for_json(
+        #[case] stats: StatsOptions,
+        #[case] preserve_json: bool,
+        #[values(CheckpointType::Leaf, CheckpointType::Manifest)] checkpoint_type: CheckpointType,
+    ) -> Result<()> {
+        let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
+        let scan = mock_snapshot(segment)?
+            .scan_builder()
+            .with_stats(stats)
+            .build()?;
+        let source = Arc::new(SchemaStructPatchBuilder::new()
+            .append(StructField::nullable("statsWithCollation", schema! {
+                nullable "test.ASCII_CI.1": { nullable "minValues": { nullable "nested": { nullable "leaf": STRING } } },
+                nullable "test.ASCII_CI.2": { nullable "maxValues": { nullable "nested": { nullable "leaf": STRING } } },
+            }))
+            .build(&struct_stats_schema())?);
+        let shape = shape(checkpoint_type, Some(source));
+        let plan = scan.build_metadata_scan_plan(&shape)?.unwrap();
+        let read_schema = plan
+            .nodes
+            .iter()
+            .find_map(|node| match &node.op {
+                Operator::ScanParquet(scan) if shape.checkpoint_type == CheckpointType::Leaf => {
+                    Some(&scan.schema)
+                }
+                Operator::DynamicScan(scan) => Some(&scan.schema),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(source_collation_stats(read_schema).is_some(), preserve_json);
+        assert_eq!(
+            plan.nodes.iter().any(|node| match &node.op {
+                Operator::Project(project) => project.expr.to_string().contains("TO_JSON"),
+                _ => false,
+            }),
+            preserve_json
+        );
         Ok(())
     }
 

@@ -132,6 +132,7 @@ use crate::{
 #[cfg(feature = "declarative-plans")]
 mod checkpoint_shape;
 mod checkpoint_transform;
+pub(crate) mod collation_stats;
 mod sidecar;
 
 #[cfg(feature = "declarative-plans")]
@@ -735,10 +736,14 @@ impl CheckpointWriter {
 
         // Get stats schema from table configuration.
         // This already excludes partition columns and applies column mapping.
-        let stats_schema = tc
+        let mut stats_schema = tc
             .stats_schema_builder()
             .with_required_physical_columns(physical_clustering_columns.as_deref())
             .build()?;
+        if config.write_stats_as_struct && collation_stats::snapshot_has_collations(snapshot) {
+            stats_schema =
+                collation_stats::checkpoint_stats_schema(snapshot, engine, stats_schema)?;
+        }
 
         // Build partition schema for partitionValues_parsed (None for non-partitioned tables)
         let partition_schema = tc.build_partition_values_parsed_schema();

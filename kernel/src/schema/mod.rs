@@ -35,6 +35,7 @@ pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
 
+pub(crate) mod collation_utils;
 #[cfg(feature = "internal-api")]
 pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
@@ -229,6 +230,12 @@ impl Display for MetadataValue {
 
 #[derive(Debug)]
 pub enum ColumnMetadataKey {
+    /// Collation identifiers keyed by field-relative path, stored as a JSON object.
+    ///
+    /// Kernel preserves these identifiers; string predicates use UTF-8 binary semantics.
+    /// See [`ScanBuilder::with_predicate`](crate::scan::ScanBuilder::with_predicate) and the
+    /// [collation RFC](https://github.com/delta-io/delta/blob/master/protocol_rfcs/collated-string-type.md).
+    Collations,
     ColumnMappingId,
     ColumnMappingPhysicalName,
     /// Parquet field IDs for the synthesized `element` / `key` / `value` fields of an Array or
@@ -267,6 +274,7 @@ pub enum ColumnMetadataKey {
 impl AsRef<str> for ColumnMetadataKey {
     fn as_ref(&self) -> &str {
         match self {
+            Self::Collations => "__COLLATIONS",
             Self::ColumnMappingId => "delta.columnMapping.id",
             Self::ColumnMappingPhysicalName => "delta.columnMapping.physicalName",
             Self::ColumnMappingNestedIds => "delta.columnMapping.nested.ids",
@@ -730,6 +738,12 @@ impl StructField {
     pub(crate) fn has_invariants(&self) -> bool {
         self.metadata
             .contains_key(ColumnMetadataKey::Invariants.as_ref())
+    }
+
+    /// Returns whether this field carries `__COLLATIONS` metadata.
+    pub(crate) fn has_collations(&self) -> bool {
+        self.metadata
+            .contains_key(ColumnMetadataKey::Collations.as_ref())
     }
 
     /// Converts logical schema StructField metadata to physical schema metadata
@@ -1530,13 +1544,13 @@ impl DoubleEndedIterator for StructFieldRefIter<'_> {
     }
 }
 
-struct InvariantChecker;
+struct FieldMetadataKeyChecker(ColumnMetadataKey);
 
-impl<'a> SchemaTransform<'a> for InvariantChecker {
+impl<'a> SchemaTransform<'a> for FieldMetadataKeyChecker {
     transform_output_type!(|'a, T| Result<(), ()>);
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), ()> {
-        if field.has_invariants() {
+        if field.metadata.contains_key(self.0.as_ref()) {
             Err(())
         } else {
             self.recurse_into_struct_field(field)
@@ -1549,7 +1563,9 @@ impl<'a> SchemaTransform<'a> for InvariantChecker {
 /// This traverses the entire schema to check for the presence of the `delta.invariants`
 /// metadata key.
 pub(crate) fn schema_has_invariants(schema: &Schema) -> bool {
-    InvariantChecker.transform_struct(schema).is_err()
+    FieldMetadataKeyChecker(ColumnMetadataKey::Invariants)
+        .transform_struct(schema)
+        .is_err()
 }
 
 /// Visitor that reports whether any non-null (`nullable: false`) field exists in a schema.

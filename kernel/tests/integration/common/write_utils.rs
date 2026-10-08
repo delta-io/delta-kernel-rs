@@ -7,6 +7,8 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -42,6 +44,30 @@ use uuid::Uuid;
 
 /// Deterministic placeholder for test commit JSON comparisons.
 pub const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// Simulates an external writer by rewriting a complete local commit with `edit`.
+///
+/// Keeps action wrappers and unedited actions. Reload the snapshot after calling this helper.
+/// Returns I/O or JSON errors, including errors returned by `edit`.
+pub fn rewrite_commit(
+    table_path: &str,
+    version: Version,
+    mut edit: impl FnMut(&mut serde_json::Value) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::path::Path::new(table_path).join(format!("_delta_log/{version:020}.json"));
+    let mut actions = serde_json::Deserializer::from_reader(File::open(&path)?)
+        .into_iter::<serde_json::Value>()
+        .collect::<Result<Vec<_>, _>>()?;
+    for action in &mut actions {
+        edit(action)?;
+    }
+    let mut file = File::create(path)?;
+    for action in actions {
+        serde_json::to_writer(&mut file, &action)?;
+        file.write_all(b"\n")?;
+    }
+    Ok(())
+}
 
 /// Single-column nullable `id: int` schema.
 pub fn get_simple_schema() -> SchemaRef {

@@ -88,6 +88,32 @@ let schema = Arc::new(StructType::try_new([
 
 For the full list of supported data types, see [Schemas and Data Types](../concepts/schema_and_types.md).
 
+## Collated string columns
+
+To preserve a non-binary collation, attach `ColumnMetadataKey::Collations` to the nearest
+`StructField` with `StructField::with_metadata`. Store its value as `MetadataValue::Other`
+containing a JSON object whose keys identify STRING targets relative to that field:
+
+```json
+{ "name": "ICU.en_US" }
+```
+
+Array elements and map keys/values use `.element`, `.key`, and `.value` path segments.
+Nested struct children own their annotations. Kernel validates the object, STRING targets,
+and `Provider.Name[.Version]` identifier syntax before creating or altering a schema.
+
+An annotated schema automatically selects the stable `collations` writer feature unless
+`collations` or `collations-preview` is already requested. You can request either with
+`delta.feature.collations=supported` or `delta.feature.collations-preview=supported`.
+An explicit preview request stays preview. Both features require `domainMetadata`, which
+Kernel adds after feature selection. ALTER requires the feature to be declared already;
+it doesn't automatically upgrade the protocol.
+
+Kernel preserves the annotations and existing collation statistics without evaluating
+collations or computing collated bounds. For collation-aware queries, follow the
+[predicate-pushdown contract](../reading/filter_pushdown.md#collation-aware-queries) to avoid
+discarding matching files with binary predicates.
+
 ## Table properties
 
 You can set custom application properties on the table:
@@ -350,6 +376,7 @@ Features enabled when specific column types or annotations appear in the schema.
 |---------|-----------------------|----------------|----------------|
 | `VARIANT` type in schema | `variantType` | — | — |
 | `TIMESTAMP_NTZ` type in schema | `timestampNtz` | — | — |
+| `__COLLATIONS` metadata in schema | - | `collations` (or selected `collations-preview`), `domainMetadata` | - |
 | Any field with `nullable: false` in schema | — | `invariants` | — |
 
 ### Feature-signal only

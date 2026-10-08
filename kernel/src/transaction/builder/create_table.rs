@@ -17,6 +17,7 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
+use crate::schema::collation_utils::schema_has_collations;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
@@ -26,10 +27,10 @@ use crate::schema::{
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
-    find_max_column_id_in_schema, get_any_level_column_physical_name,
-    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz,
-    strip_stray_column_mapping_metadata, ColumnMappingMode, TableFeature,
-    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    ensure_domain_metadata_dependency, find_max_column_id_in_schema,
+    get_any_level_column_physical_name, get_column_mapping_mode_from_properties,
+    schema_contains_timestamp_ntz, strip_stray_column_mapping_metadata, ColumnMappingMode,
+    TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     CheckpointPolicy, TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY,
@@ -87,6 +88,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // create time is the explicit feature signal
     // `delta.feature.materializePartitionColumns=supported`.
     TableFeature::MaterializePartitionColumns,
+    TableFeature::Collations,
+    TableFeature::CollationsPreview,
     // IcebergCompatV2 is a writer-only feature that gates Iceberg V2 conversion compatibility.
     // Dependent features (ColumnMapping) are auto-added during create table.
     TableFeature::IcebergCompatV2,
@@ -206,8 +209,8 @@ impl ValidatedTableProperties {
 
 /// Test-only helper for clustering support during table creation.
 ///
-/// Validates clustering columns, adds the `DomainMetadata` and `ClusteredTable` features
-/// directly, and creates the domain metadata action.
+/// Validates clustering columns, selects `ClusteredTable` and its `DomainMetadata` dependency,
+/// and creates the domain metadata action.
 #[cfg(test)]
 fn validate_clustering_and_make_domain_metadata(
     logical_schema: &SchemaRef,
@@ -217,17 +220,12 @@ fn validate_clustering_and_make_domain_metadata(
 ) -> KernelResult<DomainMetadata> {
     validate_clustering_columns(logical_schema, logical_columns)?;
 
-    // Add required features
-    add_feature_to_lists(
-        TableFeature::DomainMetadata,
-        reader_features,
-        writer_features,
-    );
     add_feature_to_lists(
         TableFeature::ClusteredTable,
         reader_features,
         writer_features,
     );
+    ensure_domain_metadata_dependency(reader_features, writer_features);
 
     Ok(create_clustering_domain_metadata(logical_columns))
 }
@@ -312,7 +310,7 @@ fn validate_partition_columns(
 ///
 /// - **None**: Returns defaults (no domain metadata, no clustering/partition columns).
 /// - **Clustered**: Validates clustering columns, resolves to physical names, adds the
-///   `DomainMetadata` and `ClusteredTable` features, creates clustering domain metadata.
+///   `ClusteredTable` feature, creates clustering domain metadata.
 /// - **Partitioned**: Validates partition columns and stores logical names. No domain metadata or
 ///   special features are needed (partitioning is a core Delta feature).
 fn apply_data_layout(
@@ -338,11 +336,6 @@ fn apply_data_layout(
                 })
                 .try_collect()?;
 
-            add_feature_to_lists(
-                TableFeature::DomainMetadata,
-                &mut validated.reader_features,
-                &mut validated.writer_features,
-            );
             add_feature_to_lists(
                 TableFeature::ClusteredTable,
                 &mut validated.reader_features,
@@ -389,6 +382,24 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
     if schema_contains_timestamp_ntz(schema) {
         add_feature_to_lists(
             TableFeature::TimestampWithoutTimezone,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
+/// Adds stable collations for an annotated schema if neither collation feature is declared.
+fn maybe_enable_collations(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    if schema_has_collations(schema)
+        && !validated
+            .writer_features
+            .contains(&TableFeature::Collations)
+        && !validated
+            .writer_features
+            .contains(&TableFeature::CollationsPreview)
+    {
+        add_feature_to_lists(
+            TableFeature::Collations,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
@@ -752,14 +763,6 @@ fn validate_extract_table_features_and_properties(
             )));
         }
 
-        // RowTracking requires DomainMetadata as a dependency
-        if feature == TableFeature::RowTracking {
-            add_feature_to_lists(
-                TableFeature::DomainMetadata,
-                &mut reader_features,
-                &mut writer_features,
-            );
-        }
         // VariantShredding requires VariantType as a dependency
         if feature == TableFeature::VariantShredding {
             add_feature_to_lists(
@@ -1013,6 +1016,7 @@ impl CreateTableTransactionBuilder {
         // Schema-driven auto-enablement: detect types or annotations that require a feature
         maybe_enable_variant_type(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
+        maybe_enable_collations(&effective_schema, &mut validated);
         maybe_enable_invariants(&effective_schema, &mut validated);
 
         // Property-driven auto-enablement: check enablement properties
@@ -1027,6 +1031,10 @@ impl CreateTableTransactionBuilder {
         // Set materialized row tracking column names when row tracking is enabled.
         maybe_set_materialized_row_tracking_column_name_properties(&mut validated);
 
+        ensure_domain_metadata_dependency(
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
         // Create Protocol action with table features support
         let protocol =
             Protocol::try_new_modern(validated.reader_features, validated.writer_features)?;
@@ -1590,6 +1598,8 @@ mod tests {
     #[case::append_only(TableFeature::AppendOnly, "appendOnly")]
     #[case::change_data_feed(TableFeature::ChangeDataFeed, "changeDataFeed")]
     #[case::type_widening(TableFeature::TypeWidening, "typeWidening")]
+    #[case::collations(TableFeature::Collations, "collations")]
+    #[case::collations_preview(TableFeature::CollationsPreview, "collations-preview")]
     #[case::variant_type(TableFeature::VariantType, "variantType")]
     #[case::variant_shredding(TableFeature::VariantShredding, "variantShredding")]
     #[case::catalog_managed(TableFeature::CatalogManaged, "catalogManaged")]
@@ -1670,7 +1680,7 @@ mod tests {
         has_domain_metadata: true,
         has_clustering_columns: true,
         expected_partition_columns: None,
-        expected_writer_features: vec![TableFeature::DomainMetadata, TableFeature::ClusteredTable],
+        expected_writer_features: vec![TableFeature::ClusteredTable],
     })]
     #[case::partitioned_single(DataLayoutExpectation {
         layout: DataLayout::partitioned(["date"]),
@@ -1875,9 +1885,6 @@ mod tests {
         );
     }
 
-    /// Verifies that both activation paths add `RowTracking` and `DomainMetadata` to
-    /// `writer_features`. For the feature-signal path, `delta.enableRowTracking` must NOT
-    /// be present in the properties (signal grants support, not enablement).
     #[rstest::rstest]
     #[case::enablement_property(
         HashMap::from([(ENABLE_ROW_TRACKING.to_string(), "true".to_string())]),
@@ -1887,7 +1894,7 @@ mod tests {
         HashMap::from([("delta.feature.rowTracking".to_string(), "supported".to_string())]),
         false, // enablement property is NOT set
     )]
-    fn test_row_tracking_activation_adds_required_features(
+    fn test_row_tracking_activation_selects_feature(
         #[case] properties: HashMap<String, String>,
         #[case] expect_enablement_property: bool,
     ) {
@@ -1901,10 +1908,10 @@ mod tests {
             "Expected RowTracking in writer_features"
         );
         assert!(
-            validated
+            !validated
                 .writer_features
                 .contains(&TableFeature::DomainMetadata),
-            "Expected DomainMetadata in writer_features"
+            "Feature selection must leave domain dependency resolution to build"
         );
         assert_eq!(
             validated.properties.contains_key(ENABLE_ROW_TRACKING),
@@ -1972,7 +1979,7 @@ mod tests {
     }
 
     /// V3 create-table flow with the same schema for minimum and maximum feature sets.
-    /// Validates final features, CM id assignments, and nested-id JSON contents.
+    /// Validates selected features, CM id assignments, and nested-id JSON contents.
     #[rstest]
     #[case::v3_only(
         /* extra_props */ &[],
@@ -1980,7 +1987,6 @@ mod tests {
             TableFeature::IcebergCompatV3,
             TableFeature::ColumnMapping,
             TableFeature::RowTracking,
-            TableFeature::DomainMetadata,
         ],
     )]
     #[case::v3_with_cross_features(
@@ -1995,7 +2001,6 @@ mod tests {
             TableFeature::IcebergCompatV3,
             TableFeature::ColumnMapping,
             TableFeature::RowTracking,
-            TableFeature::DomainMetadata,
             TableFeature::DeletionVectors,
             TableFeature::InCommitTimestamp,
             TableFeature::TypeWidening,

@@ -138,6 +138,15 @@ pub(crate) enum TableFeature {
     MaterializePartitionColumns,
     /// Column Default Values.
     AllowColumnDefaults,
+    /// Collation annotations and statistics for STRING columns.
+    ///
+    /// Kernel string predicates remain binary. See
+    /// [`ScanBuilder::with_predicate`](crate::scan::ScanBuilder::with_predicate).
+    Collations,
+    /// Preview form of [`Self::Collations`], with the same binary-predicate contract.
+    #[strum(serialize = "collations-preview")]
+    #[serde(rename = "collations-preview")]
+    CollationsPreview,
 
     ///////////////////////////
     // ReaderWriter features //
@@ -544,6 +553,14 @@ static ALLOW_COLUMN_DEFAULTS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+static COLLATIONS_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
@@ -772,7 +789,9 @@ impl TableFeature {
             | TableFeature::IcebergNativeV4Preview
             | TableFeature::ClusteredTable
             | TableFeature::MaterializePartitionColumns => FeatureType::WriterOnly,
-            TableFeature::AllowColumnDefaults => FeatureType::WriterOnly,
+            TableFeature::AllowColumnDefaults
+            | TableFeature::Collations
+            | TableFeature::CollationsPreview => FeatureType::WriterOnly,
             TableFeature::Unknown(_) => FeatureType::Unknown,
         }
     }
@@ -810,6 +829,7 @@ impl TableFeature {
             TableFeature::ClusteredTable => &CLUSTERED_TABLE_INFO,
             TableFeature::MaterializePartitionColumns => &MATERIALIZE_PARTITION_COLUMNS_INFO,
             TableFeature::AllowColumnDefaults => &ALLOW_COLUMN_DEFAULTS_INFO,
+            TableFeature::Collations | TableFeature::CollationsPreview => &COLLATIONS_INFO,
 
             // ReaderWriter features
             TableFeature::CatalogManaged => &CATALOG_MANAGED_INFO,
@@ -914,8 +934,7 @@ pub(crate) fn add_feature_to_lists(
 /// Enable each `allowed_table_features` entry whose [`EnablementCheck::EnabledIf`] check is
 /// satisfied by `table_properties`, appending it to `reader_features`/`writer_features`
 /// (deduplicated). Features with [`EnablementCheck::AlwaysIfSupported`] are skipped since they need
-/// no property-driven enablement. `RowTracking` additionally pulls in its `DomainMetadata`
-/// dependency.
+/// no property-driven enablement. Dependency resolution is separate from feature selection.
 pub(crate) fn auto_enable_property_driven_features(
     allowed_table_features: &[TableFeature],
     table_properties: &TableProperties,
@@ -926,15 +945,37 @@ pub(crate) fn auto_enable_property_driven_features(
         if let EnablementCheck::EnabledIf(check) = table_feature.info().enablement_check {
             if check(table_properties) {
                 add_feature_to_lists(table_feature.clone(), reader_features, writer_features);
-                if *table_feature == TableFeature::RowTracking {
-                    add_feature_to_lists(
-                        TableFeature::DomainMetadata,
-                        reader_features,
-                        writer_features,
-                    );
-                }
             }
         }
+    }
+}
+
+/// Adds `domainMetadata` when a selected feature requires `Supported(DomainMetadata)`.
+pub(crate) fn ensure_domain_metadata_dependency(
+    reader_features: &mut Vec<TableFeature>,
+    writer_features: &mut Vec<TableFeature>,
+) {
+    let required = reader_features
+        .iter()
+        .chain(writer_features.iter())
+        .any(|feature| {
+            feature
+                .info()
+                .feature_requirements
+                .iter()
+                .any(|requirement| {
+                    matches!(
+                        requirement,
+                        FeatureRequirement::Supported(TableFeature::DomainMetadata)
+                    )
+                })
+        });
+    if required {
+        add_feature_to_lists(
+            TableFeature::DomainMetadata,
+            reader_features,
+            writer_features,
+        );
     }
 }
 
@@ -1176,6 +1217,8 @@ mod tests {
                 TableFeature::VariantShreddingPreview => "variantShredding-preview",
                 TableFeature::AdaptiveMetadataPreview => "adaptiveMetadata-preview",
                 TableFeature::AllowColumnDefaults => "allowColumnDefaults",
+                TableFeature::Collations => "collations",
+                TableFeature::CollationsPreview => "collations-preview",
                 TableFeature::GeospatialType => "geospatial",
                 TableFeature::Unknown(_) => continue, // tested in test_unknown_features
             };
