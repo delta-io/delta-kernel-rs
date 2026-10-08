@@ -93,10 +93,12 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   `KernelSupport::Supported` for the `checkConstraints` writer feature (without it, writes to
   tables that support the feature, including legacy writer version 3 and above, are blocked and
   CREATE TABLE rejects `delta.constraints.*` properties). With it, kernel discovers constraints and
-  exposes their raw SQL through `check_constraints()` on `Snapshot` and `Transaction`, and on a
-  constrained table `write_state` and every commit require `Transaction::ack_check_constraints`.
-  Kernel does not evaluate constraint SQL, so enforcement is the connector's responsibility. Also
-  gates the internal SQL tokenizer and parser.
+  exposes their raw SQL through `check_constraints()` on `Snapshot` and `Transaction`, ALTER TABLE
+  adds and drops them (`add_check_constraint`, `drop_check_constraint`,
+  `drop_check_constraint_if_exists`, adding enables the feature), and on a constrained table
+  `write_state` and every commit require `Transaction::ack_check_constraints`. Kernel does not
+  evaluate constraint SQL, so enforcement is the connector's responsibility. Also gates the
+  internal SQL tokenizer and parser.
 - `adaptive-metadata-in-dev`: adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature. Without it, reads and writes to tables listing

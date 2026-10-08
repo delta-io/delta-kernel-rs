@@ -77,6 +77,8 @@ use builder::TransactionBuilderState;
 pub use builder::{TransactionBuilder, TransactionType};
 use commit_info::collect_operation_metadata;
 mod bound_write_context;
+#[cfg(feature = "check-constraints-in-dev")]
+mod check_constraints;
 mod commit_info;
 #[cfg(feature = "declarative-plans")]
 mod declarative;

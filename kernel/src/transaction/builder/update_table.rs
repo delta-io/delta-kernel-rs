@@ -15,6 +15,10 @@ use crate::table_features::{
     validate_iceberg_compat_if_needed, IcebergCompatValidationContext, Operation, TableFeature,
     V2_VALIDATOR, V3_VALIDATOR,
 };
+#[cfg(feature = "check-constraints-in-dev")]
+use crate::transaction::check_constraints::{
+    apply_check_constraint_operations, CheckConstraintOperation,
+};
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
 use crate::transaction::{
@@ -59,6 +63,8 @@ pub struct UpdateTableBuilderState {
     snapshot: SnapshotRef,
     operation: UpdateTableOperation,
     schema_changes: Option<Vec<SchemaOperation>>,
+    #[cfg(feature = "check-constraints-in-dev")]
+    check_constraint_changes: Vec<CheckConstraintOperation>,
     domain_metadata_removals: Vec<String>,
     is_blind_append: bool,
 }
@@ -89,6 +95,8 @@ impl TransactionBuilder<UpdateTable> {
                 snapshot,
                 operation,
                 schema_changes: None,
+                #[cfg(feature = "check-constraints-in-dev")]
+                check_constraint_changes: Vec::new(),
                 domain_metadata_removals: Vec::new(),
                 is_blind_append: false,
             },
@@ -177,6 +185,65 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         self
     }
 
+    /// Adds a CHECK constraint, stored under `delta.constraints.<name>` with `raw_sql` as its
+    /// expression. The name is stored lowercased. Kernel does not parse or evaluate `raw_sql`.
+    ///
+    /// The name must not match an existing constraint case-insensitively, and the expression must
+    /// not be empty or whitespace-only. Adding the first constraint enables the `checkConstraints`
+    /// writer feature. Committing requires
+    /// [`ack_check_constraints`](crate::transaction::Transaction::ack_check_constraints), which
+    /// lists what the connector must verify for the new constraint.
+    ///
+    /// CHECK constraint changes require [`UpdateTableOperation::AlterTable`], apply in call order
+    /// after all schema changes, and are validated by [`build`](Self::build).
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn add_check_constraint(
+        mut self,
+        name: impl Into<String>,
+        raw_sql: impl Into<String>,
+    ) -> Self {
+        self.local_state
+            .check_constraint_changes
+            .push(CheckConstraintOperation::Add {
+                name: name.into(),
+                raw_sql: raw_sql.into(),
+            });
+        self
+    }
+
+    /// Drops every CHECK constraint whose name matches `name` case-insensitively. The
+    /// `checkConstraints` feature stays in the protocol. Committing requires
+    /// [`ack_check_constraints`](crate::transaction::Transaction::ack_check_constraints) only when
+    /// the table still declares other constraints afterwards.
+    ///
+    /// The constraint must exist. CHECK constraint changes require
+    /// [`UpdateTableOperation::AlterTable`] and are validated by [`build`](Self::build).
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn drop_check_constraint(mut self, name: impl Into<String>) -> Self {
+        self.local_state
+            .check_constraint_changes
+            .push(CheckConstraintOperation::Drop {
+                name: name.into(),
+                if_exists: false,
+            });
+        self
+    }
+
+    /// Drops every CHECK constraint whose name matches `name` case-insensitively, if any exists.
+    /// Behaves like [`drop_check_constraint`](Self::drop_check_constraint), except that a missing
+    /// constraint is not an error. If the constraint is missing, the change is a no-op but still
+    /// generates a commit.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn drop_check_constraint_if_exists(mut self, name: impl Into<String>) -> Self {
+        self.local_state
+            .check_constraint_changes
+            .push(CheckConstraintOperation::Drop {
+                name: name.into(),
+                if_exists: true,
+            });
+        self
+    }
+
     /// Adds a user-controlled domain metadata removal to the transaction.
     ///
     /// If the domain exists, commit emits a tombstone that preserves its previous configuration.
@@ -209,8 +276,12 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// # Errors
     ///
     /// Returns an error for:
-    /// - Invalid operation intent, including incompatible blind-append or schema intent.
+    /// - Invalid operation intent, including incompatible blind-append or schema intent, or CHECK
+    ///   constraint changes outside `ALTER TABLE`.
     /// - Unsupported table writes, schema evolution, or CDF validation failures.
+    /// - Invalid CHECK constraint changes: an empty or whitespace-only expression, an added name
+    ///   that matches an existing constraint case-insensitively, or a dropped name that matches no
+    ///   constraint.
     /// - Conflicting application ids or domain metadata, or reserved or unsupported domains.
     /// - Connector commit information that does not contain exactly one row.
     ///
@@ -233,8 +304,17 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         operation
             .validate()
             .map_err(KernelError::invalid_transaction_state)?;
+        #[cfg(feature = "check-constraints-in-dev")]
+        let has_check_constraint_changes = !self.local_state.check_constraint_changes.is_empty();
+        #[cfg(not(feature = "check-constraints-in-dev"))]
+        let has_check_constraint_changes = false;
+        if operation != &UpdateTableOperation::AlterTable && has_check_constraint_changes {
+            return Err(KernelError::invalid_transaction_state(
+                "CHECK constraint changes require ALTER TABLE",
+            ));
+        }
         if operation == &UpdateTableOperation::AlterTable {
-            if self.local_state.schema_changes.is_none() {
+            if self.local_state.schema_changes.is_none() && !has_check_constraint_changes {
                 return Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE requires at least one schema change",
                 ));
@@ -300,6 +380,8 @@ fn try_new_update_table<MODE: ExecutionMode>(
         snapshot: read_snapshot,
         operation,
         schema_changes,
+        #[cfg(feature = "check-constraints-in-dev")]
+        check_constraint_changes,
         domain_metadata_removals,
         is_blind_append,
     } = local_state;
@@ -343,9 +425,22 @@ fn try_new_update_table<MODE: ExecutionMode>(
         Some(changes) => apply_schema_changes(effective_table_config, changes)?,
         None => effective_table_config,
     };
+    #[cfg(feature = "check-constraints-in-dev")]
+    let (effective_table_config, should_emit_metadata) = if check_constraint_changes.is_empty() {
+        (effective_table_config, should_emit_metadata)
+    } else {
+        let altered_table_config =
+            apply_check_constraint_operations(&effective_table_config, check_constraint_changes)?;
+        // Adding a constraint can enable `checkConstraints` and so change the protocol.
+        altered_table_config.ensure_operation_supported(Operation::Write)?;
+        (altered_table_config, true)
+    };
+    let should_emit_protocol =
+        effective_table_config.protocol() != read_snapshot.table_configuration().protocol();
 
     Ok(Transaction {
         read_snapshot_opt: Some(read_snapshot),
+        should_emit_protocol,
         should_emit_metadata,
         user_domain_removals: domain_metadata_removals,
         is_blind_append,
