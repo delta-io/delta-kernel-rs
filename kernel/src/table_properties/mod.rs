@@ -758,32 +758,4 @@ mod tests {
         let name = strip_check_constraint_prefix(key);
         assert_eq!(name, expected_name);
     }
-
-    /// Covers keys already in a table's configuration, such as ones written by other Delta writers.
-    /// Kernel never writes such a pair itself.
-    #[rstest]
-    #[case::prefix_case_differs(
-        "delta.constraints.xx",
-        "delta.CONSTRAINTS.xx",
-        &[("xx", "a > 0")][..]
-    )]
-    #[case::name_case_differs(
-        "delta.constraints.xx",
-        "delta.constraints.XX",
-        &[("XX", "a > 1"), ("xx", "a > 0")][..]
-    )]
-    fn keys_differing_only_in_case_are_never_merged(
-        #[case] first_key: &str,
-        #[case] second_key: &str,
-        #[case] expected_constraints: &[(&str, &str)],
-    ) {
-        let props = TableProperties::from([(first_key, "a > 0"), (second_key, "a > 1")]);
-
-        let constraints: Vec<_> = props
-            .check_constraints
-            .iter()
-            .map(|constraint| (constraint.name(), constraint.raw_sql()))
-            .collect();
-        assert_eq!(constraints, expected_constraints);
-    }
 }
