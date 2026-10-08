@@ -24,6 +24,9 @@ members = [
 # - write-table
 resolver = "3"
 
+[profile.bench]
+lto = "fat"
+
 [workspace.package]
 edition = "2021"
 homepage = "https://delta.io"
