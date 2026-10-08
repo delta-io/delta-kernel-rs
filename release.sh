@@ -9,7 +9,7 @@
 # Prepare one independently-versioned crate (the Unity Catalog crates):
 #   1. prepare on a release branch: ./release.sh crate <crate> <version>
 #      (example: ./release.sh crate unity-catalog-delta-client-api 0.2.0)
-#   2. create and push its tag after merging: ./release.sh tag <crate>
+#   2. create and push its tag after merging: ./release.sh tag <crate> [commit]
 #      The tag command does not publish the crate to crates.io.
 #
 # Refresh a kernel release PR: ./release.sh changelog <version>
@@ -21,9 +21,7 @@
 #   DELTA_KERNEL_RELEASE_REGISTRY=<registry-name> ./release.sh release 0.29.0
 ###################################################################################################
 
-# This is a script to automate a large portion of the release process for the crates we publish to
-# crates.io. Currently `delta_kernel` (in the kernel/ dir), `delta_kernel_derive` (in the
-# derive-macros/ dir), and `delta_kernel_default_engine` (in the default-engine/ dir) are released.
+# This script prepares Kernel and UC releases, publishes the Kernel crates, and creates release tags.
 #
 # The Unity Catalog crates carry their own versions rather than the workspace version. Both their
 # literal `version` and their `[package.metadata.release] release = false` are needed to keep a
@@ -37,7 +35,8 @@
 # Exit on error, undefined variables, and pipe failures
 set -euo pipefail
 
-REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+UC_RELEASE_CRATES='["unity-catalog-delta-client-api", "unity-catalog-delta-rest-client", "delta-kernel-unity-catalog"]'
 
 # print commands before executing them for debugging
 # set -x
@@ -51,7 +50,7 @@ NC='\033[0m' # no color
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; exit 1; }
 
 check_requirements() {
     log_info "Checking required tools..."
@@ -111,8 +110,12 @@ is_version_published() {
 # get current version from Cargo.toml
 get_current_version() {
     local crate_name="$1"
-    cargo metadata --locked --no-deps --format-version 1 | \
+    workspace_metadata | \
         jq -r --arg name "$crate_name" '.packages[] | select(.name == $name) | .version'
+}
+
+workspace_metadata() {
+    cargo metadata --locked --no-deps --format-version 1 --manifest-path "$REPO_ROOT/Cargo.toml"
 }
 
 # Run cargo-release with an optional registry selection.
@@ -331,15 +334,11 @@ warn_dependents() {
     done <<< "$dependents"
 }
 
-# Independent release candidates must be publishable and differ from the Kernel version.
-# Non-publishable examples can also carry literal versions, so version alone is insufficient.
+# The per-crate flow supports the UC crates; Kernel packages use the shared release flow.
 independent_release_packages() {
-    cargo metadata --no-deps --format-version 1 | \
-        jq -c '. as $metadata
-         | (.packages[] | select(.name == "delta_kernel") | .version) as $wv
-         | .packages[]
-         | select(.id as $id | $metadata.workspace_members | index($id))
-         | select(.version != $wv and .publish == null)'
+    workspace_metadata | jq -c --argjson names "$UC_RELEASE_CRATES" \
+        '.packages[] | select(.name as $name | $names | index($name))
+         | select(.publish == null)'
 }
 
 independent_dependents_of() {
@@ -352,7 +351,7 @@ independent_dependents_of() {
 
 crate_directory() {
     local crate_name="$1" manifest_path
-    manifest_path=$(cargo metadata --no-deps --format-version 1 | \
+    manifest_path=$(workspace_metadata | \
         jq -r --arg name "$crate_name" \
         '.packages[] | select(.name == $name) | .manifest_path')
     if [[ "$manifest_path" != "$REPO_ROOT/"* ]]; then
@@ -372,15 +371,15 @@ handle_crate_release() {
         log_error "Create a release branch before bumping a crate"
     fi
 
+    if ! is_working_tree_clean; then
+        log_error "Working tree must be clean before releasing"
+    fi
+
     if [[ -z "$(independent_release_packages | \
         jq -r --arg name "$crate_name" 'select(.name == $name) | .name')" ]]; then
         log_error "'$crate_name' must be a publishable crate on an independent version line"
     fi
     crate_path=$(crate_directory "$crate_name")
-
-    if ! is_working_tree_clean; then
-        log_error "Working tree must be clean before releasing"
-    fi
 
     log_info "Bumping $crate_name to $version..."
     if ! cargo release version -p "$crate_name" "$version" --isolated --execute --no-confirm; then
@@ -389,10 +388,9 @@ handle_crate_release() {
 
     update_crate_changelog "$crate_name" "$version" "$crate_path"
 
+    warn_dependents "$crate_name" "$version"
     git add -A
     git commit -q -m "release $crate_name $version"
-
-    warn_dependents "$crate_name" "$version"
     review_and_open_pr "release $crate_name $version"
 }
 
@@ -403,7 +401,7 @@ update_crate_changelog() {
     local crate_name="$1" version="$2"
     local crate_path="${3:-}"
     [[ -n "$crate_path" ]] || crate_path=$(crate_directory "$crate_name")
-    local changelog="$crate_path/CHANGELOG.md"
+    local changelog="$REPO_ROOT/$crate_path/CHANGELOG.md"
 
     log_info "Updating $changelog..."
     # --prepend needs the file to exist, and a crate's first release has no changelog yet.
@@ -544,6 +542,7 @@ usage() {
 }
 
 main() {
+    cd "$REPO_ROOT"
     case "${1:-}" in
         crate)
             if [[ $# -ne 3 ]]; then

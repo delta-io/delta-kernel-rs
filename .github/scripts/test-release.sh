@@ -180,29 +180,24 @@ resolver = "2"
 [workspace.package]
 version = "0.29.0"
 EOF
-    local directory package
-    for directory in kernel ffi api rest integration example; do
-        case "$directory" in
-            kernel) package=delta_kernel ;;
-            ffi) package=delta_kernel_ffi ;;
-            api) package=unity-catalog-delta-client-api ;;
-            rest) package=unity-catalog-delta-rest-client ;;
-            integration) package=delta-kernel-unity-catalog ;;
-            example) package=release_example ;;
-        esac
+    local spec directory package
+    for spec in kernel:delta_kernel ffi:delta_kernel_ffi api:unity-catalog-delta-client-api \
+        rest:unity-catalog-delta-rest-client integration:delta-kernel-unity-catalog \
+        example:release_example; do
+        directory=${spec%%:*} package=${spec#*:}
         mkdir -p "$directory"
         printf '[package]\nname = "%s"\nedition = "2021"\n' "$package" \
             > "$directory/Cargo.toml"
         if [[ "$directory" == kernel || "$directory" == ffi ]]; then
             printf 'version.workspace = true\n' >> "$directory/Cargo.toml"
         else
-            printf 'version = "0.1.0"\n' >> "$directory/Cargo.toml"
+            printf 'version = "0.29.0"\n' >> "$directory/Cargo.toml"
         fi
         if [[ "$directory" == example ]]; then
             printf 'publish = false\n' >> "$directory/Cargo.toml"
         fi
         if [[ "$directory" == rest || "$directory" == integration ]]; then
-            printf '[dependencies]\nunity-catalog-delta-client-api = { path = "../api", version = "0.1.0" }\n' \
+            printf '[dependencies]\nunity-catalog-delta-client-api = { path = "../api", version = "0.29.0" }\n' \
                 >> "$directory/Cargo.toml"
         fi
         printf '[lib]\npath = "lib.rs"\n' >> "$directory/Cargo.toml"
@@ -245,6 +240,7 @@ test_tag_commit_validation() {
 
     # shellcheck source=release.sh
     source "$REPOSITORY_ROOT/release.sh"
+    REPO_ROOT="$TEST_ROOT/tag-repository"
     confirm() {
         printf '%s\n' "$1" > "$prompt"
         return 1
@@ -266,7 +262,7 @@ test_tag_commit_validation() {
 
     tag_release unity-catalog-delta-client-api HEAD
     assert_contains "$prompt" "at $(git rev-parse --short HEAD)?"
-    if git rev-parse -q --verify refs/tags/v0.1.0_unity-catalog-delta-client-api >/dev/null; then
+    if git rev-parse -q --verify refs/tags/v0.29.0_unity-catalog-delta-client-api >/dev/null; then
         fail "declining confirmation unexpectedly created a tag"
     fi
 }
@@ -283,12 +279,13 @@ test_tag_publication() {
 
     # shellcheck source=release.sh
     source "$REPOSITORY_ROOT/release.sh"
+    REPO_ROOT="$repository"
     confirm() { return 0; }
     for crate in delta_kernel unity-catalog-delta-client-api; do
         if [[ "$crate" == delta_kernel ]]; then
             tag=v0.29.0
         else
-            tag=v0.1.0_unity-catalog-delta-client-api
+            tag=v0.29.0_unity-catalog-delta-client-api
         fi
         tag_release "$crate" "$target"
         [[ "$(git cat-file -t "refs/tags/$tag")" == tag ]] || fail "$tag is not annotated"
@@ -372,7 +369,9 @@ test_crate_changelog_ranges() {
         if [[ "$previous_version" == 0.2.0-rc.1 ]]; then
             next_version=0.2.0-rc.2
         fi
+        cd "$crate_path"
         update_crate_changelog "$crate" "$next_version"
+        cd ..
         changelog="$crate_path/CHANGELOG.md"
         assert_contains "$changelog" "## [v${next_version}_${crate}]"
         assert_contains "$changelog" "([#101])"

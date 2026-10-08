@@ -10,10 +10,9 @@ header = """
 body = """
 ## [v{{ version }}](https://github.com/delta-io/delta-kernel-rs/tree/v{{ version }}/) ({{ timestamp | date(format="%Y-%m-%d") }})
 
-{% if previous.version %}
-[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/{{ previous.version }}...v{{ version }})
-{% endif %}
+{% if previous.version %}[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/{{ previous.version }}...v{{ version }})
 
+{% endif %}\
 {% for group, commits in commits | group_by(attribute="group") %}
     ### {{ group | striptags | trim | upper_first }}
     {% for commit in commits %}

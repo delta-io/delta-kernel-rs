@@ -14,6 +14,7 @@ The Unity Catalog (UC) crates have independent versions and `v<version>_<crate>`
 
 Use `release` for the Kernel crates and `crate` for an individual UC crate. The `tag` command
 creates and pushes an annotated tag; it does not publish to crates.io.
+`tag delta_kernel` creates the shared Kernel tag when publishing is handled separately.
 
 ## Prerequisites
 
@@ -124,7 +125,7 @@ do not truncate its history. `changelog` and `verify-changelog` apply to the Ker
 
 UC crates evolve independently. A Kernel version bump updates their Kernel dependency requirements
 without changing their own versions. When a dependency makes a breaking change, also bump each
-affected dependent's breaking version in the same release. Before `1.0`, this means a minor bump,
+affected dependent's breaking version before tagging. Before `1.0`, this means a minor bump,
 such as `0.1.0` to `0.2.0`. A compatible patch does not require a dependent version bump.
 
 `delta-kernel-unity-catalog` depends on `delta_kernel` and `unity-catalog-delta-client-api`.
@@ -155,6 +156,8 @@ For version `0.2.0`, this creates and pushes the annotated tag
 The version in the tag comes from the current checkout's manifest. The command validates the target
 commit before asking for confirmation. Tagging does not publish the crate, and `release` on `main`
 publishes only the Kernel crates.
+UC publication is handled separately from this script. If a tag push fails, retry with
+`git push upstream tag <tag>`; the annotated tag remains local.
 
 ## Patch releases
 
