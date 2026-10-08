@@ -1425,6 +1425,20 @@ impl LastManifestCommit {
         Ok(last_manifest_commit)
     }
 
+    /// Builds a reference to the manifest commit at `commit_version` that emitted `action`. The
+    /// commit version is that of the log file carrying the action, which can be newer than the
+    /// action's own `checkpointMetadata.version`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the action's content root version exceeds `commit_version`.
+    pub(crate) fn try_from_checkpoint_action(
+        commit_version: i64,
+        action: &CheckpointAction,
+    ) -> Result<Self> {
+        Self::new(commit_version, action.content_root.version)
+    }
+
     /// Enforce the adaptiveMetadata invariant that `contentRootVersion` never exceeds the manifest
     /// commit `version`. Because [`LastManifestCommit`] derives [`Deserialize`], values parsed from
     /// JSON bypass [`Self::new`], so callers that deserialize must invoke this explicitly.

@@ -15,7 +15,7 @@ use crate::actions::set_transaction::SetTransactionScanner;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::SetTransactionMap;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::CheckpointAction;
+use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
@@ -284,7 +284,7 @@ impl Snapshot {
     ) -> Result<Option<Arc<CheckpointAction>>> {
         match &self.checkpoint_action_resolution {
             // Captured during replay: serve it directly (cheap `Arc` clone).
-            CheckpointActionResolution::Captured(action) => Ok(Some(action.clone())),
+            CheckpointActionResolution::Captured { action, .. } => Ok(Some(action.clone())),
             // TODO(#3495): when a `Hint` is present, resolve the action from the single manifest
             // commit it names instead of scanning the whole log. For now both scan, memoizing the
             // result. A concurrent caller may win the race to fill the cell; both compute the same
@@ -300,6 +300,37 @@ impl Snapshot {
                 let _ = self.checkpoint_action.set(found.clone());
                 Ok(found)
             }
+        }
+    }
+
+    /// The latest manifest commit this snapshot covers, or `None` if it has none. Served from
+    /// build-time state without I/O when available; otherwise found with the same memoized log scan
+    /// as [`Self::latest_checkpoint_action`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the log scan fails.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn last_manifest_commit(
+        &self,
+        engine: &dyn Engine,
+    ) -> Result<Option<LastManifestCommit>> {
+        match &self.checkpoint_action_resolution {
+            CheckpointActionResolution::Captured {
+                last_manifest_commit,
+                ..
+            }
+            | CheckpointActionResolution::Hint(last_manifest_commit) => {
+                Ok(Some(last_manifest_commit.clone()))
+            }
+            // The fallback situation that we want to avoid as this triggers IO.
+            // We should get this information from hint/CRC/Checkpoint or catalog in the future
+            CheckpointActionResolution::Unresolved => self
+                .latest_checkpoint_action(engine)?
+                .map(|action| {
+                    LastManifestCommit::try_from_checkpoint_action(action.version(), &action)
+                })
+                .transpose(),
         }
     }
 

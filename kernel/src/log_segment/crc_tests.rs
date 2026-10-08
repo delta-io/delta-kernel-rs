@@ -822,7 +822,7 @@ async fn test_crc_seeded_replay_captures_checkpoint_action_after_crc() {
         .await
         .checkpoint_action_resolution();
     assert!(
-        matches!(resolution, CheckpointActionResolution::Captured(a) if a.version == 1),
+        matches!(resolution, CheckpointActionResolution::Captured { action, .. } if action.version == 1),
         "a checkpoint action after the CRC is the latest and must be captured, not deferred"
     );
 }

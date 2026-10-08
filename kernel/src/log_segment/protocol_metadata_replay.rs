@@ -94,8 +94,7 @@ impl LogSegment {
             // the latest action: any action at or below the CRC is older. A miss stays `Unresolved`
             // because the latest action may sit at or below the CRC, which this replay never reads.
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            let checkpoint_action =
-                CheckpointActionResolution::from_replay(candidate.checkpoint.map(|(_, c)| c));
+            let checkpoint_action = CheckpointActionResolution::from_replay(candidate.checkpoint)?;
 
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 info!("Found P&M from pruned log replay");
@@ -128,9 +127,7 @@ impl LogSegment {
             protocol: candidate.protocol.map(|(_, p)| p),
             source: ProtocolMetadataSource::FullReplay,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            checkpoint_action: CheckpointActionResolution::from_replay(
-                candidate.checkpoint.map(|(_, c)| c),
-            ),
+            checkpoint_action: CheckpointActionResolution::from_replay(candidate.checkpoint)?,
         })
     }
 
@@ -204,11 +201,14 @@ impl LogSegment {
                         "metadata_version",
                     );
                 #[cfg(feature = "adaptive-metadata-in-dev")]
-                let a = a.max_non_null_by(
-                    column_name!(CHECKPOINT_ACTION_NAME),
-                    column_name!(CHECKPOINT_ACTION_NAME),
-                    version(),
-                );
+                let a = {
+                    let checkpoint = || column_name!(CHECKPOINT_ACTION_NAME);
+                    a.max_non_null_by(checkpoint(), checkpoint(), version())
+                        .aggregate_as(
+                            Agg::max_non_null_by(version(), checkpoint(), version()),
+                            CHECKPOINT_COMMIT_VERSION,
+                        )
+                };
                 a
             })?
             .build()
@@ -229,13 +229,7 @@ impl LogSegment {
             .map(|batch| {
                 // Mark as a log batch so the checkpoint action is read from it.
                 let batch = ActionsBatch::new(batch?, true);
-                let (protocol_version, metadata_version) =
-                    pm_versions_from_plan_output(batch.actions.as_ref())?;
-                Ok(VersionedBatch {
-                    protocol_version,
-                    metadata_version,
-                    batch,
-                })
+                versioned_batch_from_plan_output(batch)
             });
         Ok(batches)
     }
@@ -277,6 +271,8 @@ impl LogSegment {
             Ok(VersionedBatch {
                 protocol_version: Some(version),
                 metadata_version: Some(version),
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                checkpoint_commit_version: Some(version),
                 batch,
             })
         }))
@@ -289,15 +285,18 @@ impl LogSegment {
 #[derive(Debug)]
 pub(crate) enum CheckpointActionResolution {
     /// The latest `checkpoint` action, captured during replay.
-    Captured(Arc<CheckpointAction>),
+    Captured {
+        action: Arc<CheckpointAction>,
+        /// Pointer to the commit the action was read from.
+        last_manifest_commit: LastManifestCommit,
+    },
     /// Not captured, but the CRC carries a [`LastManifestCommit`] pointer to the commit that
     /// emitted the latest checkpoint action, letting a consumer resolve it from that one commit
     /// instead of a full log scan.
     //
-    // TODO(#3495): the pointer is carried but not yet read -- `Snapshot::latest_checkpoint_action`
-    // still falls back to a full scan on `Hint`. Resolving the action from the pointed commit will
-    // consume it; `#[allow(dead_code)]` holds the field until then.
-    Hint(#[allow(dead_code)] LastManifestCommit),
+    // TODO(#3495): `Snapshot::latest_checkpoint_action` still falls back to a full scan on
+    // `Hint` instead of resolving the action from the pointed commit.
+    Hint(LastManifestCommit),
     /// Replay did not settle it and no pointer is available -- a miss, which does not prove
     /// absence since replay can stop early. Consumers fall back to a log scan.
     Unresolved,
@@ -305,17 +304,27 @@ pub(crate) enum CheckpointActionResolution {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl CheckpointActionResolution {
-    /// Resolves a replay's checkpoint-action find. A hit is the latest action: replay keeps the
-    /// highest `checkpointMetadata.version` across the batches it reaches, and checkpoint versions
-    /// strictly increase, so an earlier-stopping replay can only skip older actions. A miss does
-    /// not prove absence (the action may sit in a batch the replay stopped before, or at/below a
-    /// seeding CRC version), so it stays [`Unresolved`](Self::Unresolved) for the accessor to
-    /// settle by scanning.
-    fn from_replay(checkpoint: Option<CheckpointAction>) -> Self {
-        match checkpoint {
-            Some(action) => Self::Captured(Arc::new(action)),
+    /// Resolves a replay's checkpoint-action find, given as the action paired with the version
+    /// of the commit it was read from. A hit is the latest action: replay keeps the one from the
+    /// newest commit it reaches, so an earlier-stopping replay can only skip older actions. A miss
+    /// does not prove absence (the action may sit in a batch the replay stopped before, or
+    /// at/below a seeding CRC version), so it stays [`Unresolved`](Self::Unresolved) for the
+    /// accessor to settle by scanning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the action's content root is newer than the commit carrying it.
+    fn from_replay(checkpoint: Option<(i64, CheckpointAction)>) -> KernelResult<Self> {
+        Ok(match checkpoint {
+            Some((commit_version, action)) => Self::Captured {
+                last_manifest_commit: LastManifestCommit::try_from_checkpoint_action(
+                    commit_version,
+                    &action,
+                )?,
+                action: Arc::new(action),
+            },
             None => Self::Unresolved,
-        }
+        })
     }
 }
 
@@ -355,7 +364,7 @@ struct PmCandidate {
     protocol: Option<(i64, Protocol)>,
     metadata: Option<(i64, Metadata)>,
     /// The AMT checkpoint action found in this batch, or the latest one across batches, tagged
-    /// with its `checkpointMetadata.version` so it ranks the same way as Protocol and Metadata.
+    /// with the version of the commit it was read from.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     checkpoint: Option<(i64, CheckpointAction)>,
 }
@@ -364,6 +373,9 @@ struct PmCandidate {
 struct VersionedBatch {
     protocol_version: Option<i64>,
     metadata_version: Option<i64>,
+    /// Version of the log file carrying the batch's checkpoint action, if any.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    checkpoint_commit_version: Option<i64>,
     batch: ActionsBatch,
 }
 
@@ -379,13 +391,21 @@ fn resolve_pm_batches(
         let VersionedBatch {
             protocol_version,
             metadata_version,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_commit_version,
             batch,
         } = batch?;
         let batch_version = protocol_version.max(metadata_version);
-        let candidate = pm_candidate(&batch, protocol_version, metadata_version)?;
+        let candidate = pm_candidate(
+            &batch,
+            protocol_version,
+            metadata_version,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_commit_version,
+        )?;
         metadata = newer(metadata, candidate.metadata);
         protocol = newer(protocol, candidate.protocol);
-        // Keep the highest-versioned checkpoint action, ranked by version like P&M (not by
+        // Keep the checkpoint action from the newest commit, ranked by commit version (not by
         // iteration order). Best-effort: if the loop breaks below before reaching one, it stays
         // `None`.
         #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -482,6 +502,7 @@ fn pm_candidate(
     batch: &ActionsBatch,
     protocol_version: Option<i64>,
     metadata_version: Option<i64>,
+    #[cfg(feature = "adaptive-metadata-in-dev")] checkpoint_commit_version: Option<i64>,
 ) -> KernelResult<PmCandidate> {
     let actions = batch.actions.as_ref();
     let protocol = protocol_version.zip(Protocol::try_new_from_data(actions)?);
@@ -512,7 +533,7 @@ fn pm_candidate(
         Ok(PmCandidate {
             protocol: newer(protocol, checkpoint_protocol),
             metadata: newer(metadata, checkpoint_metadata),
-            checkpoint: checkpoint.map(|c| (c.version(), c)),
+            checkpoint: checkpoint_commit_version.zip(checkpoint),
         })
     }
 
@@ -520,27 +541,32 @@ fn pm_candidate(
     Ok(PmCandidate { protocol, metadata })
 }
 
-/// Reads the `protocol_version` and `metadata_version` columns the plan aggregate emits.
+/// Plan aggregate column holding the version of the file the latest checkpoint action came from.
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+const CHECKPOINT_COMMIT_VERSION: &str = "checkpoint_commit_version";
+
+/// Tags the plan aggregate's single batch with the version columns it emits.
 #[cfg(feature = "declarative-plans")]
-fn pm_versions_from_plan_output(
-    actions: &dyn EngineData,
-) -> KernelResult<(Option<i64>, Option<i64>)> {
+fn versioned_batch_from_plan_output(batch: ActionsBatch) -> KernelResult<VersionedBatch> {
     #[derive(Default)]
-    struct PmVersionsVisitor {
+    struct PlanVersionsVisitor {
         protocol: Option<i64>,
         metadata: Option<i64>,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        checkpoint_commit: Option<i64>,
     }
-    impl RowVisitor for PmVersionsVisitor {
+    impl RowVisitor for PlanVersionsVisitor {
         fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
             static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-                (
-                    vec![
-                        column_name!("protocol_version"),
-                        column_name!("metadata_version"),
-                    ],
-                    vec![DataType::LONG, DataType::LONG],
-                )
-                    .into()
+                #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_mut))]
+                let mut names = vec![
+                    column_name!("protocol_version"),
+                    column_name!("metadata_version"),
+                ];
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                names.push(ColumnName::new([CHECKPOINT_COMMIT_VERSION]));
+                let types = vec![DataType::LONG; names.len()];
+                (names, types).into()
             });
             NAMES_AND_TYPES.as_ref()
         }
@@ -548,13 +574,23 @@ fn pm_versions_from_plan_output(
             if row_count > 0 {
                 self.protocol = getters[0].get_opt(0, "protocol_version")?;
                 self.metadata = getters[1].get_opt(0, "metadata_version")?;
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                {
+                    self.checkpoint_commit = getters[2].get_opt(0, CHECKPOINT_COMMIT_VERSION)?;
+                }
             }
             Ok(())
         }
     }
-    let mut visitor = PmVersionsVisitor::default();
-    visitor.visit_rows_of(actions)?;
-    Ok((visitor.protocol, visitor.metadata))
+    let mut visitor = PlanVersionsVisitor::default();
+    visitor.visit_rows_of(batch.actions.as_ref())?;
+    Ok(VersionedBatch {
+        protocol_version: visitor.protocol,
+        metadata_version: visitor.metadata,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        checkpoint_commit_version: visitor.checkpoint_commit,
+        batch,
+    })
 }
 
 #[cfg(test)]

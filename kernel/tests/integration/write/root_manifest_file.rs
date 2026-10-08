@@ -181,3 +181,48 @@ async fn test_with_root_manifest_file_requires_the_feature(
     );
     Ok(())
 }
+
+// A log commit before any manifest commit records no `lastManifestCommit`; a root manifest commit
+// points at itself; later log commits carry that pointer forward, both from a freshly loaded
+// snapshot and from a post-commit snapshot (which falls back to scanning the log).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_commit_info_last_manifest_commit_is_set_and_carried_forward(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (engine, _temp_dir, table_url, snapshot) =
+        setup_adaptive_metadata_table("root_manifest_file_last_manifest_commit").await?;
+    let last_manifest_commit = |version| -> Result<_, Box<dyn std::error::Error>> {
+        let commit_infos = read_actions_from_commit(&table_url, version, "commitInfo")?;
+        assert_eq!(commit_infos.len(), 1);
+        Ok(commit_infos[0].get("lastManifestCommit").cloned())
+    };
+    let load = || Snapshot::builder_for(table_url.clone()).build(&engine);
+
+    begin_transaction(snapshot, &engine)?
+        .commit(&engine)?
+        .unwrap_committed();
+    assert_eq!(last_manifest_commit(1)?, None);
+
+    let file = FileMeta {
+        location: table_url.join("metadata/root-v2.parquet")?,
+        last_modified: 0,
+        size: 1024,
+    };
+    begin_transaction(load()?, &engine)?
+        .with_root_manifest_file(file)?
+        .commit(&engine)?
+        .unwrap_committed();
+    let expected = Some(json!({ "version": 2, "contentRootVersion": 2 }));
+    assert_eq!(last_manifest_commit(2)?, expected);
+
+    let post_commit_snapshot = begin_transaction(load()?, &engine)?
+        .commit(&engine)?
+        .unwrap_post_commit_snapshot();
+    assert_eq!(last_manifest_commit(3)?, expected);
+
+    begin_transaction(post_commit_snapshot, &engine)?
+        .commit(&engine)?
+        .unwrap_committed();
+    assert_eq!(last_manifest_commit(4)?, expected);
+
+    Ok(())
+}

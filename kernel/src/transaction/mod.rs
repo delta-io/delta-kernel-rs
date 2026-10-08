@@ -13,7 +13,7 @@ use crate::actions::{
     LOG_TXN_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{BackReference, CheckpointAction};
+use crate::actions::{BackReference, CheckpointAction, LastManifestCommit};
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
 };
@@ -1091,6 +1091,24 @@ impl<S> Transaction<S> {
             .map(|prev_ict| self.commit_timestamp.max(prev_ict + 1)))
     }
 
+    /// The `lastManifestCommit` to record in this transaction's commitInfo: this commit when it
+    /// writes a manifest, otherwise the read snapshot's latest manifest commit carried forward.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn last_manifest_commit(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<LastManifestCommit>> {
+        if self.manifest_write.is_some() {
+            let version = version_as_i64(self.get_commit_version())?;
+            return LastManifestCommit::new(version, version).map(Some);
+        }
+        match &self.read_snapshot_opt {
+            Some(snapshot) => snapshot.last_manifest_commit(engine),
+            // When there hasn't been a manifest commit been produced
+            None => Ok(None),
+        }
+    }
+
     /// Returns the commit version for this transaction.
     /// For existing table transactions, this is snapshot.version() + 1.
     /// For create-table transactions, this is 0.
@@ -1199,6 +1217,10 @@ impl<S> Transaction<S> {
                 .is_feature_enabled(&TableFeature::RowTracking)
         {
             kernel_commit_info.set_row_tracking_preserved();
+        }
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            kernel_commit_info.last_manifest_commit = self.last_manifest_commit(engine)?;
         }
         Ok(NonfileCommitActions {
             commit_version: self.get_commit_version(),

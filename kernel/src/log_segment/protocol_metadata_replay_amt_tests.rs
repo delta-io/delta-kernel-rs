@@ -6,10 +6,13 @@ use std::sync::Arc;
 use rstest::rstest;
 use test_utils::add_commit;
 
-use super::{CheckpointActionResolution, LogSegment};
+use super::{CheckpointActionResolution, LogSegment, PmResolution};
+use crate::actions::LastManifestCommit;
+use crate::crc::Crc;
 use crate::engine::sync::SyncEngine;
 #[cfg(feature = "declarative-plans")]
 use crate::engine::test_delegating::DelegatingEngine;
+use crate::metrics::ProtocolMetadataSource;
 use crate::object_store::memory::InMemory;
 use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
@@ -292,6 +295,50 @@ async fn assert_latest_checkpoint_action<E: Engine>(
     assert_eq!(action.map(|action| action.version), expected_version);
 }
 
+// The snapshot's last manifest commit points at the commit (v1) that carries the checkpoint
+// action, on both replay paths. Its version comes from the commit file, not from the action's
+// `checkpointMetadata.version`, which lags behind it in the second case.
+#[rstest]
+#[case::current_checkpoint(1)]
+#[case::lagging_checkpoint(0)]
+#[tokio::test]
+async fn snapshot_last_manifest_commit_points_at_the_commit_carrying_the_action(
+    #[case] checkpoint_version: i64,
+) {
+    let expected = LastManifestCommit::new(1, checkpoint_version).unwrap();
+    assert_last_manifest_commit(checkpoint_version, &expected, non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    assert_last_manifest_commit(checkpoint_version, &expected, |store| {
+        SyncEngine::new_with_store(store)
+    })
+    .await;
+}
+
+async fn assert_last_manifest_commit<E: Engine>(
+    checkpoint_version: i64,
+    expected: &LastManifestCommit,
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    let commits = [
+        standalone_pm_commit(one_column_schema()),
+        checkpoint_commit(checkpoint_version, &[], one_column_schema()),
+    ];
+    for (version, commit) in commits.into_iter().enumerate() {
+        add_commit(table_root.as_str(), store.as_ref(), version as u64, commit)
+            .await
+            .unwrap();
+    }
+
+    let engine = make_engine(store);
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    assert_eq!(
+        snapshot.last_manifest_commit(&engine).unwrap().as_ref(),
+        Some(expected)
+    );
+}
+
 // A snapshot built without P&M replay (`Snapshot::new`) leaves its checkpoint-action resolution
 // unset, so `latest_checkpoint_action` resolves lazily by scanning the log.
 #[tokio::test]
@@ -389,7 +436,7 @@ async fn assert_replay_resolution<E: Engine>(
         .unwrap();
     // No CRC is passed, so replay never produces a `Hint`: only `Captured` or `Unresolved`.
     let version = match resolution.checkpoint_action {
-        CheckpointActionResolution::Captured(action) => Some(action.version),
+        CheckpointActionResolution::Captured { action, .. } => Some(action.version),
         CheckpointActionResolution::Hint(_) | CheckpointActionResolution::Unresolved => None,
     };
     assert_eq!(version, expected_version);
@@ -443,4 +490,19 @@ async fn incremental_update_resolves_latest_checkpoint_action(
             .map(|a| a.version),
         Some(expected_version)
     );
+}
+
+// A CRC that short-circuits replay hands its manifest-commit pointer to the snapshot as a `Hint`.
+#[test]
+fn crc_manifest_commit_pointer_becomes_hint() {
+    let pointer = LastManifestCommit::new(5, 3).unwrap();
+    let crc = Crc {
+        last_manifest_commit_opt: Some(pointer.clone()),
+        ..Default::default()
+    };
+    let resolution = PmResolution::from_crc(&crc, ProtocolMetadataSource::CrcAtTarget);
+    assert!(matches!(
+        resolution.checkpoint_action,
+        CheckpointActionResolution::Hint(hint) if hint == pointer
+    ));
 }
