@@ -73,7 +73,7 @@ enum StatsKind {
 impl<'a> MetadataPlanner<'a> {
     pub(super) fn try_new(scan: &'a Scan) -> KernelResult<Self> {
         let (pre_filter_stats_schema, stats_filter) = if scan.stats.synthesize_json {
-            // JSON output disables metadata filtering, not the data-row predicate.
+            // JSON output disables metadata filtering
             (None, None)
         } else {
             (
@@ -81,10 +81,12 @@ impl<'a> MetadataPlanner<'a> {
                 stats_skipping_predicate(&scan.state_info),
             )
         };
-        let parsed_partition_schema = (stats_filter.is_some()
-            || scan.partition_values.parsed_struct)
-            .then(|| scan.state_info.physical_partition_schema.as_ref())
-            .flatten();
+        let parsed_partition_schema =
+            if stats_filter.is_some() || scan.partition_values.parsed_struct {
+                scan.state_info.physical_partition_schema.as_ref()
+            } else {
+                None
+            };
 
         Ok(Self {
             scan,
@@ -100,11 +102,6 @@ impl<'a> MetadataPlanner<'a> {
         self.pre_filter_stats_schema.is_some()
             || self.parsed_partition_schema.is_some()
             || self.scan.stats.synthesize_json
-    }
-
-    fn statically_skips_all(&self) -> bool {
-        !self.scan.stats.synthesize_json
-            && self.scan.state_info.physical_predicate == PhysicalPredicate::StaticSkipAll
     }
 
     /// Plans a metadata source using its physical schema. `source` must honor the supplied read
@@ -283,7 +280,7 @@ impl<'a> MetadataPlanner<'a> {
     ///   backReference: struct<...>,            // with adaptive metadata support
     /// >
     /// ```
-    /// Stats output may contain neither representation, JSON only, parsed only, or both. Parsed
+    /// Stats output may contain JSON only, parsed only, both, or neither. Parsed
     /// partition values are selected independently and omitted for unpartitioned tables. Fields
     /// needed only for pruning and top-level `is_add` are omitted. `remove?` and `version` remain
     /// for replay.
@@ -373,23 +370,18 @@ impl<'a> MetadataPlanner<'a> {
 impl Scan {
     /// Build the live-add metadata plan from checkpoint and commit actions.
     ///
-    /// Returns `None` for an empty result or a statically false predicate.
+    /// Returns `None` for an empty result.
     #[tracing::instrument(
         name = "scan_plan.build_metadata_scan_plan",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub(super) fn build_metadata_scan_plan_with(
+    pub(super) fn build_metadata_scan_plan(
         &self,
         shape: &CheckpointShape,
         planner: &MetadataPlanner<'_>,
     ) -> KernelResult<Option<Plan>> {
-        // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
-        if planner.statically_skips_all() {
-            return Ok(None);
-        }
-
         let commit_actions = self.commit_arm(planner)?;
 
         let deduped_commit = commit_actions.aggregate_by([column_name!(FILE_ACTION_KEY)], |a| {
@@ -418,11 +410,6 @@ impl Scan {
             .project_patch(|patch| patch.drop(FILE_ACTION_KEY))?;
 
         PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])?.build_opt()
-    }
-
-    #[cfg(test)]
-    fn build_metadata_scan_plan(&self, shape: &CheckpointShape) -> KernelResult<Option<Plan>> {
-        self.build_metadata_scan_plan_with(shape, &MetadataPlanner::try_new(self)?)
     }
 
     /// Build checkpoint adds in the requested output shape. Returns an empty relation when no
@@ -873,7 +860,9 @@ mod tests {
             Some(checkpoint_path(file_type)),
         );
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
-        let plan = scan.build_metadata_scan_plan(&shape)?.expect("non-empty");
+        let plan = scan
+            .build_metadata_scan_plan(&shape, &MetadataPlanner::try_new(&scan)?)?
+            .expect("non-empty");
 
         let mut expected: Vec<&str> = COMMIT_ARM_TAGS.to_vec();
         expected.extend(checkpoint_arm_tags);
@@ -939,7 +928,9 @@ mod tests {
         let commit_add: ArrowSchema = add_struct(&commit.schema).try_into_arrow()?;
         let checkpoint_add: ArrowSchema = add_struct(&checkpoint.schema).try_into_arrow()?;
         assert_eq!(commit_add, checkpoint_add, "ordered add schemas must match");
-        let plan = scan.build_metadata_scan_plan(&shape)?.expect("non-empty");
+        let plan = scan
+            .build_metadata_scan_plan(&shape, &planner)?
+            .expect("non-empty");
 
         let checkpoint_schema = plan
             .nodes
@@ -1005,7 +996,7 @@ mod tests {
         );
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
         let plan = scan
-            .build_metadata_scan_plan(&no_checkpoint())?
+            .build_metadata_scan_plan(&no_checkpoint(), &MetadataPlanner::try_new(&scan)?)?
             .expect("non-empty");
         assert_eq!(tags(&plan), COMMIT_ARM_TAGS.to_vec());
         Ok(())
@@ -1024,7 +1015,9 @@ mod tests {
     ) -> Result<()> {
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(file_type)));
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
-        let plan = scan.build_metadata_scan_plan(&shape)?.expect("non-empty");
+        let plan = scan
+            .build_metadata_scan_plan(&shape, &MetadataPlanner::try_new(&scan)?)?
+            .expect("non-empty");
         assert_eq!(tags(&plan), checkpoint_arm_tags);
         Ok(())
     }
@@ -1033,7 +1026,9 @@ mod tests {
     fn metadata_plan_empty_is_none() -> Result<()> {
         let segment = log_segment(log_root(), &[], None);
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
-        assert!(scan.build_metadata_scan_plan(&no_checkpoint())?.is_none());
+        assert!(scan
+            .build_metadata_scan_plan(&no_checkpoint(), &MetadataPlanner::try_new(&scan)?)?
+            .is_none());
         Ok(())
     }
 
@@ -1050,7 +1045,7 @@ mod tests {
             PhysicalPredicate::StaticSkipAll
         );
         assert!(scan
-            .build_metadata_scan_plan(&shape(CheckpointType::Leaf, None))?
+            .declarative_metadata_scan_plan(&SyncEngine::new_with_store(Arc::new(InMemory::new())))?
             .is_none());
         Ok(())
     }
@@ -1089,7 +1084,7 @@ mod tests {
         );
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
         let plan = scan
-            .build_metadata_scan_plan(&no_checkpoint())?
+            .build_metadata_scan_plan(&no_checkpoint(), &MetadataPlanner::try_new(&scan)?)?
             .expect("non-empty");
 
         let engine = SyncEngine::new_with_store(store);
@@ -1125,9 +1120,9 @@ mod tests {
     #[case::keeps_matching_file(StatsOptions::all_struct(), col!("x").gt(lit(5i64)), 1)]
     #[case::prunes_non_matching_file(StatsOptions::all_struct(), col!("x").gt(lit(20i64)), 0)]
     #[case::json_ignores_predicate(StatsOptions::json_only(), col!("x").gt(lit(20i64)), 1)]
-    #[case::json_ignores_false(StatsOptions::json_only(), Predicate::FALSE, 1)]
+    #[case::json_skips_false(StatsOptions::json_only(), Predicate::FALSE, 0)]
     #[case::both_ignores_predicate(StatsOptions::all(), col!("x").gt(lit(20i64)), 1)]
-    #[case::both_ignores_false(StatsOptions::all(), Predicate::FALSE, 1)]
+    #[case::both_skips_false(StatsOptions::all(), Predicate::FALSE, 0)]
     fn metadata_plan_executes_leaf_without_stats_parsed(
         #[case] stats: StatsOptions,
         #[case] predicate: Predicate,
@@ -1148,13 +1143,13 @@ mod tests {
             .with_stats(stats)
             .with_predicate(Arc::new(predicate))
             .build()?;
-        let plan = scan
-            // Leaf with no compatible parsed stats -> parse add.stats instead.
-            .build_metadata_scan_plan(&shape(CheckpointType::Leaf, None))?
-            .expect("non-empty");
+        let engine = SyncEngine::new_with_store(store);
+        let Some(plan) = scan.declarative_metadata_scan_plan(&engine)? else {
+            assert_eq!(expected_rows, 0);
+            return Ok(());
+        };
 
         let output_schema: ArrowSchema = plan.schema.as_ref().try_into_arrow()?;
-        let engine = SyncEngine::new_with_store(store);
         let mut batches = engine
             .plan_executor()
             .unwrap()

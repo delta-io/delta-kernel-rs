@@ -1191,8 +1191,9 @@ impl Scan {
     ///
     /// # Errors
     ///
-    /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
-    /// or if log discovery, checkpoint inspection, or plan construction fails.
+    /// Returns an error if planning requires a [`PlanExecutor`](crate::plans::PlanExecutor) that
+    /// the engine does not provide, or if log discovery, checkpoint inspection, or plan
+    /// construction fails.
     #[tracing::instrument(
         name = "scan.declarative_metadata_scan_plan",
         skip_all,
@@ -1200,6 +1201,11 @@ impl Scan {
         err
     )]
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> Result<Option<Plan>> {
+        // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
+        if self.state_info.physical_predicate == PhysicalPredicate::StaticSkipAll {
+            return Ok(None);
+        }
+
         let planner = scan_plan::MetadataPlanner::try_new(self)?;
         // Resolve the checkpoint shape once. The planner owns the decision to retain the file-
         // action schema; checkpoint discovery owns how that schema is obtained.
@@ -1209,7 +1215,7 @@ impl Scan {
         } else {
             CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?
         };
-        self.build_metadata_scan_plan_with(&shape, &planner)
+        self.build_metadata_scan_plan(&shape, &planner)
     }
 
     // Factored out to facilitate testing
