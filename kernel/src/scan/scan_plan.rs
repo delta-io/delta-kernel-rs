@@ -13,7 +13,7 @@ use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, Scan};
 use crate::actions::{
-    get_all_actions_schema, ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME,
+    get_all_actions_schema, Add, ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME,
     SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
@@ -373,7 +373,7 @@ impl Scan {
     )]
     pub(super) fn build_metadata_scan_plan_with(
         &self,
-        base: &MetadataReplayBase,
+        base: MetadataReplayBase,
         planner: &MetadataPlanner<'_>,
     ) -> KernelResult<Option<Plan>> {
         // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
@@ -395,8 +395,8 @@ impl Scan {
         })?;
 
         let base_adds = match base {
-            MetadataReplayBase::Crc { version } => self.crc_arm(*version, planner),
-            MetadataReplayBase::Checkpoint { shape, .. } => self.checkpoint_arm(shape, planner),
+            MetadataReplayBase::Crc { files, .. } => self.crc_arm(files, planner),
+            MetadataReplayBase::Checkpoint { shape, .. } => self.checkpoint_arm(&shape, planner),
         }?;
 
         let base_live_adds = base_adds
@@ -420,29 +420,15 @@ impl Scan {
             version: self.snapshot.log_segment().checkpoint_version,
             shape: shape.clone(),
         };
-        self.build_metadata_scan_plan_with(&base, &MetadataPlanner::try_new(self)?)
+        self.build_metadata_scan_plan_with(base, &MetadataPlanner::try_new(self)?)
     }
 
-    fn crc_arm(
-        &self,
-        version: Version,
-        planner: &MetadataPlanner<'_>,
-    ) -> KernelResult<PlanBuilder> {
-        let Some((_, files)) = self
-            .snapshot
-            .base_crc_all_files()
-            .filter(|(crc_version, _)| *crc_version == version)
-        else {
-            return Err(KernelError::internal_error(format!(
-                "Selected CRC version {version} has no allFiles"
-            )));
-        };
-
+    fn crc_arm(&self, files: Vec<Add>, planner: &MetadataPlanner<'_>) -> KernelResult<PlanBuilder> {
         planner
             .build_metadata_arm(&LOG_ADD_SCHEMA, false, |schema| {
                 PlanBuilder::values(
                     LOG_ADD_SCHEMA.clone(),
-                    files.iter().cloned().map(|add| vec![add.into()]).collect(),
+                    files.into_iter().map(|add| vec![add.into()]).collect(),
                 )?
                 .project_patch(|patch| {
                     // Canonical CRC adds can only omit JSON stats from the read schema.
@@ -521,6 +507,7 @@ impl Scan {
     }
 
     /// Build commit JSON actions in the requested output shape.
+    /// When `base_version` is set, only commits newer than that base are read.
     ///
     /// ## SQL equivalent:
     ///
@@ -720,10 +707,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::actions::Add;
     use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
     use crate::arrow::array::{
-        Array, BooleanArray, Int64Array, RecordBatch, StringArray, StructArray,
+        Array, AsArray, BooleanArray, Int64Array, RecordBatch, StringArray, StructArray,
     };
     use crate::arrow::datatypes::{DataType as ADT, Field, Fields, Schema as ArrowSchema};
     use crate::crc::Crc;
@@ -1217,18 +1203,13 @@ mod tests {
         let mut actual_paths = vec![];
         for batch in batches {
             let batch = batch?.try_into_record_batch()?;
-            let add = batch
+            let paths = batch
                 .column_by_name(ADD_NAME)
                 .expect("add column")
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .expect("add struct");
-            let paths = add
+                .as_struct()
                 .column_by_name("path")
                 .expect("add.path")
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("path string");
+                .as_string::<i32>();
             actual_paths.extend(paths.iter().map(|path| path.unwrap().to_owned()));
         }
         actual_paths.sort_unstable();

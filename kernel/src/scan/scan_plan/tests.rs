@@ -730,10 +730,9 @@ fn declarative_metadata_crc_plan_is_sparse_and_prunes(
         .at_version(4)
         .build(engine.as_ref())?;
     assert_eq!(snapshot.log_segment().checkpoint_version, None);
-    assert_eq!(
-        snapshot.base_crc_all_files().map(|(version, _)| version),
-        Some(4)
-    );
+    let crc = snapshot.base_crc().expect("fixture CRC");
+    assert_eq!(crc.version, 4);
+    assert!(crc.all_files().is_some());
 
     let expected_count = if predicate.is_some() { 1 } else { 4 };
     let scan = snapshot

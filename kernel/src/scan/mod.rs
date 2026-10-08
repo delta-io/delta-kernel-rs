@@ -1190,9 +1190,9 @@ impl Scan {
     ///
     /// # Errors
     ///
-    /// Returns an error if checkpoint inspection is required and the engine provides no
-    /// [`PlanExecutor`](crate::plans::PlanExecutor), or if log discovery, checkpoint inspection,
-    /// or plan construction fails.
+    /// Returns an error if no eligible CRC provides `allFiles` and the engine provides no
+    /// [`PlanExecutor`](crate::plans::PlanExecutor), even when there is no checkpoint, or if
+    /// log discovery, checkpoint inspection, or plan construction fails.
     #[tracing::instrument(
         name = "scan.declarative_metadata_scan_plan",
         skip_all,
@@ -1202,7 +1202,7 @@ impl Scan {
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> Result<Option<Plan>> {
         let planner = scan_plan::MetadataPlanner::try_new(self)?;
         let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine, &planner)?;
-        self.build_metadata_scan_plan_with(&base, &planner)
+        self.build_metadata_scan_plan_with(base, &planner)
     }
 
     // Factored out to facilitate testing

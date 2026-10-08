@@ -12,8 +12,6 @@ use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::SetTransactionMap;
-#[cfg(feature = "declarative-plans")]
-use crate::actions::Add;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
@@ -419,15 +417,9 @@ impl Snapshot {
 
     /// The held CRC regardless of version, for reuse that does not require an at-version CRC
     /// (e.g. checksum writes). Prefer [`Self::crc_at_version`] for authoritative queries.
-    fn base_crc(&self) -> Option<&Arc<Crc>> {
+    /// Replaying `allFiles` from this CRC requires applying commits newer than its version.
+    pub(crate) fn base_crc(&self) -> Option<&Arc<Crc>> {
         self.crc.base()
-    }
-
-    /// Returns the held CRC's version and complete live file set when `allFiles` is present.
-    #[cfg(feature = "declarative-plans")]
-    pub(crate) fn base_crc_all_files(&self) -> Option<(Version, &[Add])> {
-        let crc = self.base_crc()?;
-        Some((crc.version, crc.all_files()?))
     }
 
     pub fn table_root(&self) -> &Url {

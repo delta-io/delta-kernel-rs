@@ -1,11 +1,12 @@
 use super::MetadataPlanner;
+use crate::actions::Add;
 use crate::checkpoint::CheckpointShape;
 use crate::{Engine, KernelResult, Snapshot, Version};
 
 /// Reconciled table state from which metadata replay starts.
 pub(in crate::scan) enum MetadataReplayBase {
     /// Complete live file state from a CRC at least as new as the checkpoint.
-    Crc { version: Version },
+    Crc { version: Version, files: Vec<Add> },
     /// Checkpoint replay base, or an empty base when no checkpoint exists.
     Checkpoint {
         version: Option<Version>,
@@ -22,10 +23,17 @@ impl MetadataReplayBase {
     ) -> KernelResult<Self> {
         let checkpoint_version = snapshot.log_segment().checkpoint_version;
         // Keep replay eligibility independent of SnapshotCrc's validation.
-        if let Some((version, _)) = snapshot.base_crc_all_files().filter(|(version, _)| {
-            checkpoint_version.is_none_or(|checkpoint| *version >= checkpoint)
-        }) {
-            return Ok(Self::Crc { version });
+        if let Some((version, files)) = snapshot
+            .base_crc()
+            .and_then(|crc| Some((crc.version, crc.all_files()?)))
+            .filter(|(version, _)| {
+                checkpoint_version.is_none_or(|checkpoint| *version >= checkpoint)
+            })
+        {
+            return Ok(Self::Crc {
+                version,
+                files: files.to_vec(),
+            });
         }
 
         let plan_executor = engine.require_plan_executor()?;
@@ -40,9 +48,10 @@ impl MetadataReplayBase {
         })
     }
 
+    /// Exclusive lower bound for commit replay; `None` replays all available commits.
     pub(super) fn version(&self) -> Option<Version> {
         match self {
-            Self::Crc { version } => Some(*version),
+            Self::Crc { version, .. } => Some(*version),
             Self::Checkpoint { version, .. } => *version,
         }
     }
@@ -62,6 +71,7 @@ mod tests {
     use crate::plans::Operation as PlanOperation;
     use crate::scan::scan_plan::tests::log_segment;
     use crate::unit_test_utils::load_test_table;
+    use crate::KernelError;
 
     #[rstest]
     #[case::without_checkpoint(4, None)]
@@ -85,7 +95,7 @@ mod tests {
 
         assert!(matches!(
             MetadataReplayBase::try_new(&scan.snapshot, &no_plan_engine, &planner)?,
-            MetadataReplayBase::Crc { version: selected } if selected == version
+            MetadataReplayBase::Crc { version: selected, .. } if selected == version
         ));
         Ok(())
     }
@@ -94,15 +104,12 @@ mod tests {
     fn crc_without_all_files_falls_back_to_checkpoint() -> KernelResult<()> {
         let (engine, latest, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
-        let crc = Crc {
-            version: 5,
-            all_files: None,
-            ..Default::default()
-        };
+        let mut crc = latest.crc_at_version().expect("fixture CRC").clone();
+        Arc::make_mut(&mut crc).all_files = None;
         let snapshot = Arc::new(Snapshot::new_with_crc(
             latest.log_segment().clone(),
             latest.table_configuration().clone(),
-            Some(Arc::new(crc)),
+            Some(crc),
             false,
             false,
         )?);
@@ -138,7 +145,9 @@ mod tests {
         let base = Snapshot::builder_for(latest.table_root().clone())
             .at_version(4)
             .build(engine.as_ref())?;
-        let (version, files) = base.base_crc_all_files().expect("version 4 CRC allFiles");
+        let base_crc = base.base_crc().expect("version 4 CRC");
+        let version = base_crc.version;
+        let files = base_crc.all_files().expect("CRC allFiles");
         let crc = Crc {
             version,
             all_files: Some(if empty_crc { vec![] } else { files.to_vec() }),
@@ -182,12 +191,9 @@ mod tests {
                 _ => None,
             })
             .flatten()
-            .map(|file| file.meta.location.path())
+            .map(|file| file.meta.location.to_string())
             .collect();
-        assert_eq!(json_paths.len(), (target_version - version) as usize);
-        assert!(json_paths
-            .iter()
-            .all(|path| path.ends_with("00000000000000000005.json")));
+        assert_eq!(json_paths, commits[(version + 1) as usize..]);
 
         let row_count = engine
             .plan_executor()
@@ -195,7 +201,7 @@ mod tests {
             .execute_op(PlanOperation::QueryPlan(plan))?
             .into_data()?
             .try_fold(0, |count, batch| {
-                Ok::<_, crate::KernelError>(count + batch?.try_into_record_batch()?.num_rows())
+                Ok::<_, KernelError>(count + batch?.try_into_record_batch()?.num_rows())
             })?;
         assert_eq!(row_count, expected_rows);
         Ok(())
