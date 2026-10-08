@@ -4,6 +4,7 @@
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField};
+use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::{
     create_table as kernel_create_table, CreateTableTransaction,
 };
@@ -13,8 +14,8 @@ use delta_kernel::{Engine, KernelError, Result, Snapshot};
 use rstest::rstest;
 use serde_json::json;
 use test_utils::{
-    add_commit, create_add_files_metadata, read_actions_from_commit, test_table_setup,
-    test_table_setup_mt,
+    add_commit, create_add_files_metadata, create_table as create_test_table, engine_store_setup,
+    read_actions_from_commit, test_table_setup, test_table_setup_mt,
 };
 use url::Url;
 
@@ -399,11 +400,9 @@ async fn alter_table_on_constrained_table_requires_acknowledgement(
 }
 
 #[rstest]
-#[case::acknowledged(true)]
-#[case::not_acknowledged(false)]
 #[tokio::test]
 async fn alter_table_add_constraint_requires_acknowledgement(
-    #[case] acknowledge: bool,
+    #[values(true, false)] acknowledge: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = create_constrained_table(engine.as_ref(), &table_path, &[])?;
@@ -423,13 +422,9 @@ async fn alter_table_add_constraint_requires_acknowledgement(
     }
 
     let altered = result?.unwrap_post_commit_snapshot();
-    let discovered: Vec<_> = altered
-        .check_constraints()
-        .iter()
-        .map(|c| (c.name().to_string(), c.raw_sql().to_string()))
-        .collect();
-    let expected = [("positive_amount".to_string(), "amount > 0".to_string())];
-    assert_eq!(discovered, expected);
+    let from_altered = discovered(altered.as_ref());
+    let expected = [("positive_amount", "amount > 0")];
+    assert_eq!(from_altered, expected);
 
     let protocol = read_actions_from_commit(&table_url, 1, "protocol")?;
     let writer_features = protocol[0]["writerFeatures"]
@@ -459,12 +454,62 @@ async fn alter_table_adds_column_and_constraint_in_one_commit(
 
     let has_column = altered.schema().contains("discount");
     assert!(has_column);
-    let discovered: Vec<_> = altered
-        .check_constraints()
-        .iter()
-        .map(|c| c.raw_sql().to_string())
-        .collect();
-    assert_eq!(discovered, ["discount >= 0".to_string()]);
+    let from_altered = discovered(altered.as_ref());
+    let expected = [("nonnegative_discount", "discount >= 0")];
+    assert_eq!(from_altered, expected);
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_applies_constraint_operations_in_order(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp, table_path, engine) = test_table_setup()?;
+    let table_url = create_constrained_table(engine.as_ref(), &table_path, &[])?;
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .alter_table()
+        .add_check_constraint("positive_amount", "amount > 0")
+        .add_check_constraint("named", "name IS NOT NULL")
+        .drop_check_constraint("POSITIVE_AMOUNT")
+        .add_check_constraint("positive_amount", "amount > 1")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    txn.ack_check_constraints();
+    let altered = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+
+    let from_altered = discovered(altered.as_ref());
+    let expected = [
+        ("named", "name IS NOT NULL"),
+        ("positive_amount", "amount > 1"),
+    ];
+    assert_eq!(from_altered, expected);
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_add_constraint_upgrades_legacy_protocol(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (store, engine, table_url) = engine_store_setup("legacy_protocol", None);
+    let table_url =
+        create_test_table(store, table_url, test_schema(), &[], false, vec![], vec![]).await?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let mut txn = snapshot
+        .alter_table()
+        .add_check_constraint("positive_amount", "amount > 0")
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    txn.ack_check_constraints();
+    txn.commit(&engine)?.unwrap_committed();
+
+    let altered = Snapshot::builder_for(table_url).build(&engine)?;
+    let protocol = altered.table_configuration().protocol();
+    let versions = (protocol.min_reader_version(), protocol.min_writer_version());
+    assert_eq!(versions, (1, 3));
+    let writer_features = protocol.writer_features();
+    assert_eq!(writer_features, None);
+    let from_altered = discovered(altered.as_ref());
+    let expected = [("positive_amount", "amount > 0")];
+    assert_eq!(from_altered, expected);
     Ok(())
 }
 
@@ -494,11 +539,9 @@ async fn alter_table_rejects_invalid_constraint_addition(
 }
 
 #[rstest]
-#[case::same_case("positive_amount")]
-#[case::other_case("POSITIVE_AMOUNT")]
 #[tokio::test]
-async fn alter_table_drops_constraint_without_acknowledgement(
-    #[case] name: &str,
+async fn alter_table_drops_last_constraint_without_acknowledgement_and_keeps_feature(
+    #[values("positive_amount", "POSITIVE_AMOUNT")] name: &str,
     #[values(false, true)] if_exists: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp, table_path, engine) = test_table_setup()?;
@@ -522,15 +565,17 @@ async fn alter_table_drops_constraint_without_acknowledgement(
 
     let remaining = altered.check_constraints();
     assert!(remaining.is_empty());
+    let keeps_feature = altered
+        .table_configuration()
+        .is_feature_supported(&TableFeature::CheckConstraints);
+    assert!(keeps_feature);
     Ok(())
 }
 
 #[rstest]
-#[case::rejected_without_if_exists(false)]
-#[case::skipped_with_if_exists(true)]
 #[tokio::test]
 async fn alter_table_drop_of_missing_constraint(
-    #[case] if_exists: bool,
+    #[values(false, true)] if_exists: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = create_constrained_table(
@@ -556,11 +601,8 @@ async fn alter_table_drop_of_missing_constraint(
     let mut txn = result?;
     txn.ack_check_constraints();
     let altered = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
-    let discovered: Vec<_> = altered
-        .check_constraints()
-        .iter()
-        .map(|c| c.raw_sql().to_string())
-        .collect();
-    assert_eq!(discovered, ["amount > 0".to_string()]);
+    let from_altered = discovered(altered.as_ref());
+    let expected = [("positive_amount", "amount > 0")];
+    assert_eq!(from_altered, expected);
     Ok(())
 }

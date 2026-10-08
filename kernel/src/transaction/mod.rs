@@ -187,7 +187,7 @@ pub struct ExistingTable;
 #[derive(Debug)]
 pub struct CreateTable;
 
-/// Marker type for alter-table (schema evolution) transactions.
+/// Marker type for alter-table transactions.
 ///
 /// Transactions in this state perform metadata-only commits. Data file operations are not
 /// available at compile time because `AlterTable` does not implement [`SupportsDataFiles`].
@@ -236,7 +236,8 @@ pub struct Transaction<S = ExistingTable> {
     // config, this is cloned from the read snapshot; when the config changes (e.g. schema
     // evolution), it is constructed separately with the new schema/protocol.
     effective_table_config: TableConfiguration,
-    // Whether to emit a Protocol action. True for CREATE TABLE and ALTER TABLE, false otherwise.
+    // Whether to emit a Protocol action. True for CREATE TABLE and for an ALTER TABLE that changes
+    // the protocol, false otherwise.
     should_emit_protocol: bool,
     // Whether to emit a Metadata action. True for CREATE TABLE and ALTER TABLE, false otherwise.
     should_emit_metadata: bool,

@@ -149,10 +149,10 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     /// expression. The name is stored lowercased. Kernel does not parse or evaluate `raw_sql`.
     ///
     /// The name must not match an existing constraint case-insensitively, and the expression must
-    /// be non-empty. Adding the first constraint enables the `checkConstraints` writer feature.
-    /// Committing requires
-    /// [`ack_check_constraints`](crate::transaction::Transaction::ack_check_constraints): the
-    /// connector must verify that every existing row satisfies the new constraint.
+    /// not be empty or whitespace-only. Adding the first constraint enables the `checkConstraints`
+    /// writer feature. Committing requires
+    /// [`ack_check_constraints`](crate::transaction::Transaction::ack_check_constraints), which
+    /// lists what the connector must verify for the new constraint.
     ///
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     #[cfg(feature = "check-constraints-in-dev")]

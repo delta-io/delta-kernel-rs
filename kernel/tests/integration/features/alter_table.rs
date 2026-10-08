@@ -187,6 +187,28 @@ async fn alter_table_commit_info_includes_operation_maps() -> Result<(), Box<dyn
     Ok(())
 }
 
+#[tokio::test]
+async fn alter_table_without_protocol_change_writes_no_protocol_action(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+    let table_url = snapshot.table_root().clone();
+
+    snapshot
+        .alter_table()
+        .add_column(StructField::nullable("added", DataType::STRING))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let metadata_actions = read_actions_from_commit(&table_url, 1, "metaData")?;
+    assert_eq!(metadata_actions.len(), 1);
+    let protocol_actions = read_actions_from_commit(&table_url, 1, "protocol")?;
+    assert!(protocol_actions.is_empty());
+    Ok(())
+}
+
 /// End-to-end lifecycle: write, ALTER to add columns, scan, write populated rows, scan again.
 /// Each column is added in its own alter commit with a checkpoint after, exercising
 /// "do some ops -> checkpoint -> do more ops -> checkpoint". Under CM, also verifies fresh

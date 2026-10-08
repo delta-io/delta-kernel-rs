@@ -56,9 +56,9 @@ pub(crate) enum CheckConstraintOperation {
 ///
 /// # Errors
 ///
-/// Returns an error if an added constraint has an empty expression, if an added name matches an
-/// existing constraint case-insensitively, if a dropped name matches no constraint, or if the
-/// resulting metadata and protocol are invalid.
+/// Returns an error if an added constraint's expression is empty or whitespace-only, if an added
+/// name matches an existing constraint case-insensitively, if a dropped name matches no
+/// constraint, or if the resulting metadata and protocol are invalid.
 pub(crate) fn apply_check_constraint_operations(
     table_config: &TableConfiguration,
     operations: Vec<CheckConstraintOperation>,
@@ -226,6 +226,7 @@ mod tests {
                 ("delta.constraints.positive", "value > 0"),
                 ("delta.constraints.POSITIVE", "value > 2"),
                 ("delta.constraints.other", "value < 10"),
+                ("DELTA.CONSTRAINTS.positive", "value > 3"),
             ])
             .with_protocol(
                 MockProtocolBuilder::new()
@@ -247,6 +248,11 @@ mod tests {
             .map(|constraint| constraint.name())
             .collect();
         assert_eq!(remaining, ["other"]);
+        let keeps_non_constraint_key = dropped
+            .metadata()
+            .configuration()
+            .contains_key("DELTA.CONSTRAINTS.positive");
+        assert!(keeps_non_constraint_key);
     }
 
     #[test]
