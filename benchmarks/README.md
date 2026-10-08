@@ -19,6 +19,17 @@ cargo install samply
 samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "some_name"
 ```
 
+### I/O profiles
+
+Metrics collection is enabled during the timed iterations, including on worker threads, so the
+benchmarks measure metrics-enabled execution and can detect performance regressions in reporting.
+After each selected benchmark finishes timing, the harness resets the counters and runs one extra,
+untimed iteration to print its `[io]` summary. The summary excludes runner setup and timed iterations;
+filtered-out benchmarks are not profiled.
+
+Counts describe kernel and engine operations, not physical disk reads or operating-system cache
+misses.
+
 ### Filtering benchmarks
 
 #### By benchmark name
