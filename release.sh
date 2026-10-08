@@ -393,7 +393,8 @@ update_crate_changelog() {
     # --prepend needs the file to exist, and a crate's first release has no changelog yet.
     [[ -f "$changelog" ]] || : > "$changelog"
     if ! git cliff --repository "$REPO_ROOT" --config "$REPO_ROOT/cliff.toml" \
-        --use-branch-tags --tag-pattern "^v[0-9]+\.[0-9]+\.[0-9]+_${crate_name}$" \
+        --use-branch-tags \
+        --tag-pattern "^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?_${crate_name}$" \
         --unreleased --prepend "$changelog" --include-path "$crate_name/*" \
         --tag "${version}_${crate_name}"; then
         log_error "Failed to update $changelog"

@@ -10,7 +10,9 @@ header = """
 body = """
 ## [v{{ version }}](https://github.com/delta-io/delta-kernel-rs/tree/v{{ version }}/) ({{ timestamp | date(format="%Y-%m-%d") }})
 
+{% if previous.version %}
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/{{ previous.version }}...v{{ version }})
+{% endif %}
 
 {% for group, commits in commits | group_by(attribute="group") %}
     ### {{ group | striptags | trim | upper_first }}
@@ -56,7 +58,7 @@ commit_preprocessors = []
 # regex for parsing and grouping commits. note that e.g. both doc and docs are matched since we have
 # trim = true above.
 commit_parsers = [
-  { message = "^release [0-9]", skip = true },
+  { message = "^release ([a-z0-9_-]+ )?[0-9]", skip = true },
   { message = "^chore: refresh release changelog", skip = true },
   { field = "github.pr_labels", pattern = "breaking-change", group = "<!-- 0 --> 🏗️ Breaking changes" },
   { message = "^feat", group = "<!-- 1 -->🚀 Features / new APIs" },

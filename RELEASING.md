@@ -105,7 +105,7 @@ Create a release branch from the latest `upstream/main` and run the per-crate co
 
 ```bash
 git fetch upstream main --tags
-git switch -c release/unity-catalog-delta-client-api-0.2.0 upstream/main
+git switch -c crate-release/unity-catalog-delta-client-api-0.2.0 upstream/main
 ./release.sh crate unity-catalog-delta-client-api 0.2.0
 ```
 
@@ -113,6 +113,9 @@ The command refuses to run on `main` and requires a clean working tree, includin
 It bumps the selected crate, updates its dependents' version requirements, and prepends release
 notes to `<crate>/CHANGELOG.md`. It creates a release commit and can push the branch and open a PR.
 Review the manifest changes and generated changelog before merging.
+
+Use the `crate-release/` prefix for UC release branches. CI reserves `release/` for Kernel releases
+and runs Kernel changelog verification on those branches.
 
 Each crate's changelog uses its own release tags as boundaries. Kernel tags and other crates' tags
 do not truncate its history. `changelog` and `verify-changelog` apply to the Kernel changelog only.

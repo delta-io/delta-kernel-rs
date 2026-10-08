@@ -25,6 +25,13 @@ assert_count() {
         fail "$path contains '$value' $actual times; expected $expected"
 }
 
+assert_not_contains() {
+    local path="$1" unexpected="$2"
+    if grep -Fq -- "$unexpected" "$path"; then
+        fail "$path unexpectedly contains: $unexpected"
+    fi
+}
+
 test_registry_override() {
     local capture="$TEST_ROOT/cargo-args"
 
@@ -149,20 +156,24 @@ test_release_command_dispatch() {
 }
 
 commit_file() {
-    local message="$1" contents="$2"
-    printf '%s\n' "$contents" > tracked.txt
-    git add tracked.txt
+    local message="$1" contents="$2" path="${3:-tracked.txt}"
+    printf '%s\n' "$contents" > "$path"
+    git add "$path"
     git commit -q -m "$message"
 }
 
-test_working_tree_cleanliness() {
-    local repository="$TEST_ROOT/cleanliness-repository"
-    mkdir -p "$repository"
-    cd "$repository"
+init_test_repository() {
+    mkdir -p "$1"
+    cd "$1"
     git init -q -b main
     git config user.email release-test@example.com
     git config user.name "Release Test"
     git config core.hooksPath /dev/null
+}
+
+test_working_tree_cleanliness() {
+    local repository="$TEST_ROOT/cleanliness-repository"
+    init_test_repository "$repository"
     commit_file "chore: initial file" "initial"
 
     # shellcheck source=release.sh
@@ -187,7 +198,8 @@ test_working_tree_cleanliness() {
 test_tag_commit_validation() {
     local failure_log="$TEST_ROOT/tag-commit-failure"
     local prompt="$TEST_ROOT/tag-prompt"
-    cd "$TEST_ROOT/cleanliness-repository"
+    init_test_repository "$TEST_ROOT/tag-repository"
+    commit_file "chore: initial file" "initial"
 
     # shellcheck source=release.sh
     source "$REPOSITORY_ROOT/release.sh"
@@ -218,20 +230,58 @@ test_tag_commit_validation() {
     fi
 }
 
+test_crate_changelog_ranges() {
+    local crate="unity-catalog-delta-client-api"
+    local previous_version next_version changelog
+
+    for previous_version in "" 0.1.0 0.2.0-rc.1; do
+        init_test_repository "$TEST_ROOT/crate-${previous_version:-first}"
+        cp "$REPOSITORY_ROOT/release.sh" "$REPOSITORY_ROOT/cliff.toml" .
+        mkdir -p "$crate"
+        commit_file "feat: initial API (#100)" "initial" "$crate/lib.rs"
+        git tag v0.28.0
+        if [[ -n "$previous_version" ]]; then
+            git tag "v${previous_version}_${crate}"
+        fi
+
+        commit_file "feat: API change before Kernel release (#101)" "before" "$crate/lib.rs"
+        git tag v0.29.0
+        commit_file "fix: unrelated change (#102)" "unrelated"
+        git tag v9.0.0_unity-catalog-delta-rest-client
+        commit_file "fix: API change after Kernel release (#103)" "after" "$crate/lib.rs"
+        commit_file "release $crate 0.2.0 (#104)" "release" "$crate/lib.rs"
+
+        # shellcheck source=release.sh
+        source ./release.sh
+        next_version=0.2.0
+        if [[ "$previous_version" == 0.2.0-rc.1 ]]; then
+            next_version=0.2.0-rc.2
+        fi
+        update_crate_changelog "$crate" "$next_version"
+        changelog="$crate/CHANGELOG.md"
+        assert_contains "$changelog" "## [v${next_version}_${crate}]"
+        assert_contains "$changelog" "([#101])"
+        assert_contains "$changelog" "([#103])"
+        assert_not_contains "$changelog" "([#102])"
+        assert_not_contains "$changelog" "([#104])"
+        if [[ -n "$previous_version" ]]; then
+            assert_not_contains "$changelog" "([#100])"
+            assert_contains "$changelog" "v${previous_version}_${crate}...v${next_version}_${crate}"
+        else
+            assert_contains "$changelog" "([#100])"
+            assert_not_contains "$changelog" "[Full Changelog]"
+        fi
+    done
+}
+
 test_changelog_refresh_and_verification() {
     local repository="$TEST_ROOT/repository"
     local failing_bin="$TEST_ROOT/failing-bin"
     local section_backup="$TEST_ROOT/changelog-before-section-edit"
     local saved_changelog="$TEST_ROOT/changelog-before-failure"
     local backup refresh_log failure_backup
-    mkdir -p "$repository"
+    init_test_repository "$repository"
     cp "$REPOSITORY_ROOT/release.sh" "$REPOSITORY_ROOT/cliff.toml" "$repository/"
-
-    cd "$repository"
-    git init -q -b main
-    git config user.email release-test@example.com
-    git config user.name "Release Test"
-    git config core.hooksPath /dev/null
 
     printf '%s\n' \
         '# Changelog' \
@@ -251,6 +301,7 @@ test_changelog_refresh_and_verification() {
     commit_file "chore: publish DAT artifact" "dat"
     git tag v999.0.0_dat
     commit_file "fix: include first change (#101)" "first"
+    commit_file "release unity-catalog-delta-client-api 0.2.0 (#997)" "UC release"
 
     # The artifact tag sorts above the real release numerically, but cliff.toml still defines
     # v0.28.0 as the latest Kernel release boundary.
@@ -279,6 +330,7 @@ test_changelog_refresh_and_verification() {
     assert_contains CHANGELOG.md "v0.28.0...v0.29.0"
     assert_count CHANGELOG.md 1 "## [v0.28.0]"
     assert_contains CHANGELOG.md "Previous release notes"
+    assert_not_contains CHANGELOG.md "([#997])"
     git add CHANGELOG.md
     git commit -q -m "release 0.29.0 (#999)"
 
@@ -371,8 +423,9 @@ test_changelog_refresh_and_verification() {
         fail "failed changelog refresh retained the wrong backup contents"
 }
 
-test_registry_override
-test_release_command_dispatch
-test_working_tree_cleanliness
-test_tag_commit_validation
-test_changelog_refresh_and_verification
+(test_registry_override)
+(test_release_command_dispatch)
+(test_working_tree_cleanliness)
+(test_tag_commit_validation)
+(test_crate_changelog_ranges)
+(test_changelog_refresh_and_verification)
