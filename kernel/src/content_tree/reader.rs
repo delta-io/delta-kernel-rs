@@ -39,10 +39,8 @@ pub(crate) struct ReadContext {
     pub(crate) data_change: bool,
 }
 
-/// Caller-supplied expressions for the two `Add` fields the read path derives from an entry's
-/// `tracking` sub-struct. The root path ([`AddFieldSources::root`]) reads the entry columns
-/// directly; other callers (e.g. a leaf manifest applying inheritance) can substitute their own
-/// expressions without the root path having to know about them.
+/// Caller-supplied expressions for columns that translation changes between Root and Leaf
+/// nodes in the AMT.
 struct AddFieldSources {
     /// Expression producing `Add.baseRowId`.
     base_row_id: Expression,
