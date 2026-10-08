@@ -629,29 +629,38 @@ async fn test_create_table_txn_debug() -> Result<()> {
 
 #[rstest]
 // ReaderWriter features (AlwaysIfSupported)
-#[case("vacuumProtocolCheck", TableFeature::VacuumProtocolCheck, true, true)]
-#[case("v2Checkpoint", TableFeature::V2Checkpoint, true, true)]
-#[case("variantType", TableFeature::VariantType, true, true)]
-#[case("variantShredding", TableFeature::VariantShredding, true, true)]
+#[case(
+    "vacuumProtocolCheck",
+    TableFeature::VacuumProtocolCheck,
+    true,
+    true,
+    false
+)]
+#[case("v2Checkpoint", TableFeature::V2Checkpoint, true, true, false)]
+#[case("variantType", TableFeature::VariantType, true, true, false)]
+#[case("variantShredding", TableFeature::VariantShredding, true, true, false)]
 // ReaderWriter features (EnabledIf -- feature signal alone does not enable)
-#[case("deletionVectors", TableFeature::DeletionVectors, true, false)]
-#[case("typeWidening", TableFeature::TypeWidening, true, false)]
+#[case("deletionVectors", TableFeature::DeletionVectors, true, false, false)]
+#[case("typeWidening", TableFeature::TypeWidening, true, false, false)]
 // WriterOnly features (EnabledIf -- feature signal alone does not enable)
-#[case("appendOnly", TableFeature::AppendOnly, false, false)]
-#[case("changeDataFeed", TableFeature::ChangeDataFeed, false, false)]
-#[case("rowTracking", TableFeature::RowTracking, false, false)]
+#[case("appendOnly", TableFeature::AppendOnly, false, false, false)]
+#[case("changeDataFeed", TableFeature::ChangeDataFeed, false, false, false)]
+#[case("rowTracking", TableFeature::RowTracking, false, false, true)]
+#[case("domainMetadata", TableFeature::DomainMetadata, false, true, true)]
 // WriterOnly features (AlwaysIfSupported)
 #[case(
     "materializePartitionColumns",
     TableFeature::MaterializePartitionColumns,
     false,
-    true
+    true,
+    false
 )]
 fn test_create_table_with_feature_signal(
     #[case] feature_name: &str,
     #[case] feature: TableFeature,
     #[case] is_reader_writer: bool,
     #[case] enabled_when_supported: bool,
+    #[case] expects_domain_metadata: bool,
 ) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
@@ -663,6 +672,10 @@ fn test_create_table_with_feature_signal(
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let table_config = snapshot.table_configuration();
+    assert_eq!(
+        table_config.is_feature_supported(&TableFeature::DomainMetadata),
+        expects_domain_metadata,
+    );
 
     assert!(
         table_config.is_feature_supported(&feature),
@@ -689,6 +702,43 @@ fn test_create_table_with_feature_signal(
         );
     }
 
+    Ok(())
+}
+
+#[rstest]
+#[case::plain(&[], DataLayout::None, false)]
+#[case::row_tracking_property(&[("delta.enableRowTracking", "true")], DataLayout::None, true)]
+#[case::row_tracking_dependency(&[("delta.enableIcebergCompatV3", "true")], DataLayout::None, true)]
+#[case::clustered(&[], DataLayout::clustered(["id"]), true)]
+#[case::deduplicated(
+    &[("delta.feature.domainMetadata", "supported"), ("delta.enableRowTracking", "true")],
+    DataLayout::clustered(["id"]),
+    true
+)]
+fn create_resolves_domain_metadata_after_all_feature_selection(
+    #[case] properties: &[(&str, &str)],
+    #[case] layout: DataLayout,
+    #[case] expects_domain_metadata: bool,
+) -> Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table(&table_path, simple_schema()?, "test")
+        .with_table_properties(properties.iter().copied())
+        .with_data_layout(layout)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let features = snapshot
+        .table_configuration()
+        .protocol()
+        .writer_features()
+        .unwrap();
+    assert_eq!(
+        features
+            .iter()
+            .filter(|feature| **feature == TableFeature::DomainMetadata)
+            .count(),
+        usize::from(expects_domain_metadata),
+    );
     Ok(())
 }
 
