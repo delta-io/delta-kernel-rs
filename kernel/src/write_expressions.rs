@@ -16,7 +16,8 @@ use crate::table_properties::CheckConstraint;
 /// [`Transaction`] so a connector can discover from either.
 ///
 /// A [`Snapshot`] returns the constraints at its version. A [`Transaction`] returns the
-/// constraints the table has once the transaction commits.
+/// constraints the table has once the transaction commits. For a create-table transaction these
+/// are the declared ones, with names lowercased.
 ///
 /// Discovery has no side effect: it does not acknowledge anything. See
 /// [`Transaction::ack_check_constraints`] for which operations require the acknowledgement.
