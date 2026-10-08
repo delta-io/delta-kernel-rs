@@ -216,6 +216,8 @@ pub(crate) enum HintAction {
     CheckpointMetadata(CheckpointMetadata),
 }
 
+// The containing type is exposed only with internal-api.
+#[allow(unreachable_pub)]
 impl LastCheckpointHint {
     /// Returns the checkpoint version.
     #[internal_api]
@@ -470,6 +472,8 @@ impl LastCheckpointHint {
     }
 }
 
+// The containing type is exposed only with internal-api.
+#[allow(unreachable_pub)]
 impl LastCheckpointV2 {
     /// Returns the checkpoint file name.
     #[internal_api]

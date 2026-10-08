@@ -1051,6 +1051,20 @@ impl FfiProtocol {
 
 impl FfiMetadata {
     pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<Metadata> {
+        unsafe { self.try_to_kernel_schema_source(|| self.schema_string.try_to_string()) }
+    }
+
+    pub(crate) unsafe fn try_to_kernel_with_schema(
+        &self,
+        schema: String,
+    ) -> KernelResult<Metadata> {
+        unsafe { self.try_to_kernel_schema_source(|| Ok(schema)) }
+    }
+
+    unsafe fn try_to_kernel_schema_source(
+        &self,
+        schema: impl FnOnce() -> KernelResult<String>,
+    ) -> KernelResult<Metadata> {
         let name = Option::<&KernelStringSlice>::from(&self.name)
             .map(|value| unsafe { value.try_to_string() })
             .transpose()?;
@@ -1063,7 +1077,7 @@ impl FfiMetadata {
             description,
             unsafe { self.format_provider.try_to_string() }?,
             unsafe { self.format_options.try_to_hash_map() }?,
-            unsafe { self.schema_string.try_to_string() }?,
+            schema()?,
             unsafe { self.partition_columns.try_to_strings() }?,
             Option::<&i64>::from(&self.created_time).copied(),
             unsafe { self.configuration.try_to_hash_map() }?,

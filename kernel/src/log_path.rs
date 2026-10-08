@@ -1,5 +1,6 @@
 //! Public-facing [`LogPath`] type for representing paths to delta log files.
 
+use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::path::ParsedLogPath;
@@ -20,7 +21,22 @@ impl From<LogPath> for ParsedLogPath {
     }
 }
 
+impl From<ParsedLogPath> for LogPath {
+    fn from(path: ParsedLogPath) -> Self {
+        Self(path)
+    }
+}
+
 impl LogPath {
+    /// Return the storage metadata carried by this parsed log path.
+    ///
+    /// FFI backends use this to move an immutable snapshot's log-segment identity into
+    /// connector-owned memory without retaining the snapshot itself.
+    #[internal_api]
+    pub(crate) fn file_meta(&self) -> &FileMeta {
+        &self.0.location
+    }
+
     /// Attempt to create a `LogPath` from `FileMeta`. This returns an error if the path isn't a
     /// valid log path.
     pub fn try_new(file_meta: FileMeta) -> Result<Self> {

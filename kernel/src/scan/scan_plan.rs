@@ -10,7 +10,7 @@ use url::Url;
 
 use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
-use super::{PhysicalPredicate, Scan};
+use super::{PartitionValuesOptions, PhysicalPredicate, Scan, StatsOptions};
 use crate::actions::{
     ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
 };
@@ -19,6 +19,7 @@ use crate::expressions::{
     col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, ExpressionRef,
     MapToStructOptions, Predicate,
 };
+use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME};
@@ -44,6 +45,40 @@ const IS_ADD: &str = "is_add";
 const VERSION: &str = "version";
 
 impl Scan {
+    pub(super) fn build_metadata_scan_plan(
+        &self,
+        shape: &CheckpointShape,
+    ) -> KernelResult<Option<Plan>> {
+        MetadataScanPlan::from_scan(self).build_metadata_scan_plan(shape)
+    }
+}
+
+/// Inputs the metadata plan needs after scan-state construction has finished.
+pub(super) struct MetadataScanPlan<'a> {
+    pub(super) log_segment: &'a LogSegment,
+    pub(super) skip_all: bool,
+    pub(super) pruning_predicate: Option<Predicate>,
+    pub(super) physical_stats_schema: Option<&'a SchemaRef>,
+    pub(super) physical_partition_schema: Option<&'a SchemaRef>,
+    pub(super) stats: &'a StatsOptions,
+    pub(super) physical_stats_output_schema: Option<&'a SchemaRef>,
+    pub(super) partition_values: &'a PartitionValuesOptions,
+}
+
+impl<'a> MetadataScanPlan<'a> {
+    fn from_scan(scan: &'a Scan) -> Self {
+        Self {
+            log_segment: scan.snapshot.log_segment(),
+            skip_all: scan.state_info.physical_predicate == PhysicalPredicate::StaticSkipAll,
+            pruning_predicate: stats_skipping_predicate(&scan.state_info),
+            physical_stats_schema: scan.state_info.physical_stats_read_schema(),
+            physical_partition_schema: scan.state_info.physical_partition_schema.as_ref(),
+            stats: &scan.stats,
+            physical_stats_output_schema: scan.state_info.physical_stats_output_schema(),
+            partition_values: &scan.partition_values,
+        }
+    }
+
     /// Build the live-add metadata plan from checkpoint and commit actions.
     ///
     /// Returns `None` for an empty result or a statically false predicate.
@@ -57,14 +92,21 @@ impl Scan {
         &self,
         shape: &CheckpointShape,
     ) -> KernelResult<Option<Plan>> {
-        let state = &self.state_info;
+        self.build_metadata_scan_plan_with_commits(shape, None)
+    }
+
+    /// Consume already validated commit files without reconstructing a native log segment.
+    pub(super) fn build_metadata_scan_plan_with_commits(
+        &self,
+        shape: &CheckpointShape,
+        commit_files: Option<Vec<ScanFile>>,
+    ) -> KernelResult<Option<Plan>> {
         // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
-        if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
+        if self.skip_all {
             return Ok(None);
         }
 
-        let prune = stats_skipping_predicate(state);
-        let prune = prune.as_ref();
+        let prune = self.pruning_predicate.as_ref();
 
         // The output `add` after reparsing `stats`/`partitionValues`: shared by the commit arm's
         // dedup carrier and both terminal `{ add }` projections, so every arm agrees on the
@@ -72,23 +114,26 @@ impl Scan {
         let add_field = self.normalized_add_field()?;
         let (output_expr, output_schema) = self.metadata_output_projection(&add_field)?;
 
-        let commit_actions = self.commit_arm()?.try_fold_with(prune, |p, prune| {
-            // We filter so that:
-            // * All remove actions are kept
-            // * Add actions that do not match the partition pruning or stats predicate are removed.
-            //
-            // NOTE: It is important that add actions are filtered by the partition predicate
-            // because partition filtering may not be applied on data rows. On the other
-            // hand, failing to skip based on data columns is safe because the data
-            // predicate will also be evaluated on data rows. Thus it is crucial that we partition
-            // prune adds here.
-            //
-            // NOTE: It is not safe to prune remove actions using the partition filter. This is
-            // because a NULL result for `remove.partitionValues.partCol` may be due to
-            // `remove.partitionValues` being NULL, or it may be from `partCol` being
-            // NULL. Thus, we simply do not prune removes.
-            p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
-        })?;
+        let commit_actions = self
+            .commit_arm(commit_files)?
+            .try_fold_with(prune, |p, prune| {
+                // We filter so that:
+                // * All remove actions are kept
+                // * Add actions that do not match the partition pruning or stats predicate are
+                //   removed.
+                //
+                // NOTE: It is important that add actions are filtered by the partition predicate
+                // because partition filtering may not be applied on data rows. On the other
+                // hand, failing to skip based on data columns is safe because the data
+                // predicate will also be evaluated on data rows. Thus it is crucial that we
+                // partition prune adds here.
+                //
+                // NOTE: It is not safe to prune remove actions using the partition filter. This is
+                // because a NULL result for `remove.partitionValues.partCol` may be due to
+                // `remove.partitionValues` being NULL, or it may be from `partCol` being
+                // NULL. Thus, we simply do not prune removes.
+                p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
+            })?;
 
         let deduped_commit = commit_actions.aggregate_by([column_name!(FILE_ACTION_KEY)], |a| {
             // Each group with a non-null FILE_ACTION_KEY contains the adds and removes for a given
@@ -139,9 +184,9 @@ impl Scan {
     /// and `MAP_TO_STRUCT(add.partitionValues, physical_partitions)` replace the corresponding
     /// fields above. A parsed field is omitted when its schema is absent.
     fn checkpoint_arm(&self, shape: &CheckpointShape) -> KernelResult<PlanBuilder> {
-        let log_segment = self.snapshot.log_segment();
-        let physical_stats = self.state_info.physical_stats_read_schema();
-        let physical_partitions = self.state_info.physical_partition_schema.as_ref();
+        let log_segment = self.log_segment;
+        let physical_stats = self.physical_stats_schema;
+        let physical_partitions = self.physical_partition_schema;
         let source_physical_stats =
             physical_stats.and_then(|schema| shape.compatible_stats_parsed_schema(schema));
         let source_physical_partitions = physical_partitions
@@ -207,9 +252,11 @@ impl Scan {
     /// WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
     ///
     /// A parsed field is omitted when its schema is absent.
-    fn commit_arm(&self) -> KernelResult<PlanBuilder> {
-        let log_segment = self.snapshot.log_segment();
-        let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
+    fn commit_arm(&self, files: Option<Vec<ScanFile>>) -> KernelResult<PlanBuilder> {
+        let commit_files = match files {
+            Some(files) => files,
+            None => self.log_segment.commit_cover_version_tagged_scan_files()?,
+        };
         PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
             .filter(Predicate::or(
                 col!("add.path").is_not_null(),
@@ -219,10 +266,8 @@ impl Scan {
                 // Commits never carry source-native parsed columns, so normalize from the raw
                 // encodings.
                 patch
-                    .with_parsed_add_stats(self.state_info.physical_stats_read_schema())
-                    .with_parsed_add_partition_values(
-                        self.state_info.physical_partition_schema.as_ref(),
-                    )
+                    .with_parsed_add_stats(self.physical_stats_schema)
+                    .with_parsed_add_partition_values(self.physical_partition_schema)
                     .append(
                         StructField::not_null(IS_ADD, DataType::BOOLEAN),
                         Expr::from(col!("add.path").is_not_null()),
@@ -240,8 +285,8 @@ impl Scan {
     }
 
     fn normalized_add_field(&self) -> KernelResult<StructField> {
-        let physical_stats_read_schema = self.state_info.physical_stats_read_schema();
-        let physical_partition_schema = self.state_info.physical_partition_schema.as_ref();
+        let physical_stats_read_schema = self.physical_stats_schema;
+        let physical_partition_schema = self.physical_partition_schema;
         let patch = SchemaStructPatchBuilder::new()
             .fold_with(physical_stats_read_schema, |patch, schema| {
                 patch.append(StructField::nullable(STATS_PARSED, schema.as_ref().clone()))
@@ -300,10 +345,7 @@ impl Scan {
         };
 
         // Parsed stats output.
-        let projection = match (
-            self.state_info.physical_stats_output_schema(),
-            has_stats_parsed,
-        ) {
+        let projection = match (self.physical_stats_output_schema, has_stats_parsed) {
             (Some(physical_stats), _) => projection.replace(
                 STATS_PARSED,
                 StructField::nullable(STATS_PARSED, physical_stats.as_ref().clone()),
@@ -319,7 +361,7 @@ impl Scan {
         let physical_partitions = self
             .partition_values
             .parsed_struct
-            .then_some(self.state_info.physical_partition_schema.as_ref())
+            .then_some(self.physical_partition_schema)
             .flatten();
         let projection = match (physical_partitions, has_partition_values_parsed) {
             (Some(schema), true) => projection.replace(
@@ -512,7 +554,7 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
 }
 
 /// Build the metadata pruning predicate, or `None` when no pruning is possible.
-fn stats_skipping_predicate(state: &StateInfo) -> Option<Predicate> {
+pub(super) fn stats_skipping_predicate(state: &StateInfo) -> Option<Predicate> {
     /// Re-roots metadata columns under `add`.
     struct MetadataSkippingColumnPrefixer;
 
