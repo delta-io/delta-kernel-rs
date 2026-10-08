@@ -470,7 +470,6 @@ async fn alter_table_adds_column_and_constraint_in_one_commit(
 
 #[rstest]
 #[case::duplicate_name_in_other_case("POSITIVE_AMOUNT", "amount > 1")]
-#[case::empty_name("", "amount > 0")]
 #[case::empty_expression("nonempty_name", "  ")]
 #[tokio::test]
 async fn alter_table_rejects_invalid_constraint_addition(

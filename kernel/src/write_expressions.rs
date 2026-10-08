@@ -56,9 +56,9 @@ pub(crate) enum CheckConstraintOperation {
 ///
 /// # Errors
 ///
-/// Returns an error if an added constraint has an empty name or an empty expression, if an added
-/// name matches an existing constraint case-insensitively, if a dropped name matches no constraint,
-/// or if the resulting metadata and protocol are invalid.
+/// Returns an error if an added constraint has an empty expression, if an added name matches an
+/// existing constraint case-insensitively, if a dropped name matches no constraint, or if the
+/// resulting metadata and protocol are invalid.
 pub(crate) fn apply_check_constraint_operations(
     table_config: &TableConfiguration,
     operations: Vec<CheckConstraintOperation>,
@@ -69,10 +69,6 @@ pub(crate) fn apply_check_constraint_operations(
             CheckConstraintOperation::Add { name, raw_sql } => {
                 // Other writers look a constraint up by its lowercased key, so store it that way.
                 let name = name.to_lowercase();
-                require!(
-                    !name.is_empty(),
-                    KernelError::generic("CHECK constraint name must not be empty")
-                );
                 require!(
                     !raw_sql.trim().is_empty(),
                     KernelError::generic(format!(
@@ -228,7 +224,6 @@ mod tests {
         let table_config = MockTableConfigurationBuilder::new()
             .with_properties([
                 ("delta.constraints.positive", "value > 0"),
-                ("DELTA.CONSTRAINTS.positive", "value > 1"),
                 ("delta.constraints.POSITIVE", "value > 2"),
                 ("delta.constraints.other", "value < 10"),
             ])

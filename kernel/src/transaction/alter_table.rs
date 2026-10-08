@@ -25,14 +25,12 @@ pub type AlterTableTransaction = Transaction<AlterTable>;
 
 impl AlterTableTransaction {
     /// Create a new transaction for altering a table. Produces a commit that emits an updated
-    /// Metadata action, plus a Protocol action when the protocol differs from the read snapshot's
-    /// (for example after adding a CHECK constraint enables `checkConstraints`).
+    /// Metadata action, plus a Protocol action when the protocol differs from the read snapshot's.
     ///
-    /// The `effective_table_config` is the evolved table configuration. It must be fully validated
-    /// before calling this constructor (e.g. schema operations applied, protocol feature checks
-    /// passed). The `read_snapshot` provides the
-    /// pre-commit table state (version, previous protocol/metadata, ICT timestamps) used for
-    /// commit versioning and post-commit snapshots.
+    /// The `effective_table_config` is the altered table configuration. It must be fully
+    /// validated before calling this constructor. The `read_snapshot` provides the pre-commit
+    /// table state (version, previous protocol/metadata, ICT timestamps) used for commit
+    /// versioning and post-commit snapshots.
     ///
     /// This is typically called via `AlterTableTransactionBuilder::build()` rather than directly.
     pub(crate) fn try_new_alter_table(

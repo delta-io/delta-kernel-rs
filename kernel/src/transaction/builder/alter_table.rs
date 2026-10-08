@@ -1,4 +1,4 @@
-//! Builder for ALTER TABLE transactions: schema evolution and CHECK-constraint changes.
+//! Builder for ALTER TABLE transactions.
 //!
 //! This module contains [`AlterTableTransactionBuilder`], which uses a type-state pattern to
 //! enforce valid operation chaining at compile time.
@@ -7,13 +7,13 @@
 //!
 //! - [`Ready`]: Initial state. Operations are available, but `build()` is not (at least one
 //!   operation is required).
-//! - [`Modifying`]: After any chainable schema operation. More ops can be chained, and `build()` is
+//! - [`Modifying`]: After any chainable operation. More ops can be chained, and `build()` is
 //!   available. See [`AlterTableTransactionBuilder<Modifying>`] for ops.
 //!
 //! # Transitions
 //!
 //! Each `impl` block below is gated by a state bound and documents which operations that
-//! state enables. Chainable schema operations live on `impl<S: Chainable>` and transition
+//! state enables. Chainable operations live on `impl<S: Chainable>` and transition
 //! the builder to a chainable state; `build()` lives on states that are buildable.
 //!
 //! ```ignore
@@ -48,7 +48,7 @@ pub struct Ready;
 /// See [`Chainable`] for the operations available on this state.
 pub struct Modifying;
 
-/// Marker trait for builder states that accept chainable schema operations. Grouping states
+/// Marker trait for builder states that accept chainable operations. Grouping states
 /// under one bound lets each op (like `add_column`) live on a single `impl<S: Chainable>`
 /// block -- chainable states share the body rather than duplicating it per state.
 ///
@@ -63,10 +63,10 @@ mod sealed {
     impl Sealed for super::Modifying {}
 }
 
-/// Builder for constructing an [`AlterTableTransaction`] with schema evolution operations.
+/// Builder for constructing an [`AlterTableTransaction`].
 ///
 /// Uses a type-state pattern (`S`) to enforce at compile time:
-/// - At least one schema operation must be queued before `build()` is callable.
+/// - At least one operation must be added before `build()` is callable.
 /// - Only operations valid for the current state can be chained. This will disallow incompatible
 ///   chaining.
 pub struct AlterTableTransactionBuilder<S = Ready> {
@@ -148,9 +148,9 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     /// Add a CHECK constraint, stored under `delta.constraints.<name>` with `raw_sql` as its
     /// expression. The name is stored lowercased. Kernel does not parse or evaluate `raw_sql`.
     ///
-    /// The name must be non-empty and must not match an existing constraint case-insensitively,
-    /// and the expression must be non-empty. Adding the first constraint enables the
-    /// `checkConstraints` writer feature. Committing requires
+    /// The name must not match an existing constraint case-insensitively, and the expression must
+    /// be non-empty. Adding the first constraint enables the `checkConstraints` writer feature.
+    /// Committing requires
     /// [`ack_check_constraints`](crate::transaction::Transaction::ack_check_constraints): the
     /// connector must verify that every existing row satisfies the new constraint.
     ///
@@ -233,7 +233,7 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
 }
 
 impl AlterTableTransactionBuilder<Modifying> {
-    /// Validate and apply the queued operations, then build the [`AlterTableTransaction`].
+    /// Validate and apply the operations, then build the [`AlterTableTransaction`].
     ///
     /// This method:
     /// 1. Validates the table supports writes
@@ -276,8 +276,8 @@ impl AlterTableTransactionBuilder<Modifying> {
         }
         // Rejects writes to tables kernel can't safely commit to: writer version out of
         // kernel's supported range, unsupported writer features, or schemas with SQL-expression
-        // invariants. Runs on the pre-alter snapshot; future ALTER variants that change the
-        // protocol must also re-check this on the evolved `TableConfiguration`.
+        // invariants. Runs on the pre-alter snapshot. Operations that change the protocol re-check
+        // this on the altered configuration below.
         table_config.ensure_operation_supported(Operation::Write)?;
 
         let evolved_table_config = evolve_table_config(table_config, self.operations)?;
