@@ -323,46 +323,60 @@ warn_dependents() {
     [[ -n "$dependents" ]] || return 0
 
     log_warning "These crates depend on $crate_name and keep their own versions. If $version breaks"
-    log_warning "their API, bump each one before tagging:"
+    log_warning "their API, prepare each dependent release on a separate crate-release/ branch"
+    log_warning "before tagging:"
     while read -r dependent; do
         [[ -n "$dependent" ]] || continue
         log_warning "  ./release.sh crate $dependent <version>"
     done <<< "$dependents"
 }
 
-# Publishable workspace crates that depend on the named crate and do not track the workspace
-# version. Derived rather than hardcoded so a new crate on its own version line is picked up
-# automatically. The examples also carry literal versions but set `publish = false`, which is what
-# distinguishes them.
-independent_dependents_of() {
-    local crate_name="$1" workspace_version
-    workspace_version=$(get_current_version "delta_kernel")
+# Independent release candidates must be publishable and differ from the Kernel version.
+# Non-publishable examples can also carry literal versions, so version alone is insufficient.
+independent_release_packages() {
     cargo metadata --no-deps --format-version 1 | \
-        jq -r --arg wv "$workspace_version" --arg dep "$crate_name" \
-        '.packages[]
-         | select(.version != $wv and .publish == null)
-         | select(any(.dependencies[]; .kind == null and .name == $dep))
+        jq -c '. as $metadata
+         | (.packages[] | select(.name == "delta_kernel") | .version) as $wv
+         | .packages[]
+         | select(.id as $id | $metadata.workspace_members | index($id))
+         | select(.version != $wv and .publish == null)'
+}
+
+independent_dependents_of() {
+    local crate_name="$1"
+    independent_release_packages | \
+        jq -r --arg dep "$crate_name" '
+         select(any(.dependencies[]; .kind == null and .name == $dep))
          | .name' | sort
+}
+
+crate_directory() {
+    local crate_name="$1" manifest_path
+    manifest_path=$(cargo metadata --no-deps --format-version 1 | \
+        jq -r --arg name "$crate_name" \
+        '.packages[] | select(.name == $name) | .manifest_path')
+    if [[ "$manifest_path" != "$REPO_ROOT/"* ]]; then
+        log_error "Could not find crate '$crate_name' inside the repository"
+    fi
+    manifest_path="${manifest_path#"$REPO_ROOT/"}"
+    dirname "$manifest_path"
 }
 
 # Bump one independently-versioned crate and the requirements its dependents place on it.
 # `--isolated` is what lets `-p` select a crate that sets `release = false`; it discards
 # release.toml, which costs nothing for a version bump (no tag, publish, or commit happens).
 handle_crate_release() {
-    local crate_name="$1" version="$2"
+    local crate_name="$1" version="$2" crate_path
 
     if is_main_branch; then
         log_error "Create a release branch before bumping a crate"
     fi
 
-    case "$crate_name" in
-        delta_kernel | delta_kernel_derive | delta_kernel_default_engine)
-            log_error "$crate_name uses the workspace version\nUsage: $0 release <version>"
-            ;;
-    esac
-    if [[ -z "$(get_current_version "$crate_name")" ]]; then
-        log_error "Could not find crate '$crate_name' in workspace"
+    if [[ -z "$(independent_release_packages | \
+        jq -r --arg name "$crate_name" 'select(.name == $name) | .name')" ]]; then
+        log_error "'$crate_name' must be a publishable crate on an independent version line"
     fi
+    crate_path=$(crate_directory "$crate_name")
 
     if ! is_working_tree_clean; then
         log_error "Working tree must be clean before releasing"
@@ -373,7 +387,7 @@ handle_crate_release() {
         log_error "Failed to bump $crate_name"
     fi
 
-    update_crate_changelog "$crate_name" "$version"
+    update_crate_changelog "$crate_name" "$version" "$crate_path"
 
     git add -A
     git commit -q -m "release $crate_name $version"
@@ -387,7 +401,9 @@ handle_crate_release() {
 # tag name without it.
 update_crate_changelog() {
     local crate_name="$1" version="$2"
-    local changelog="$crate_name/CHANGELOG.md"
+    local crate_path="${3:-}"
+    [[ -n "$crate_path" ]] || crate_path=$(crate_directory "$crate_name")
+    local changelog="$crate_path/CHANGELOG.md"
 
     log_info "Updating $changelog..."
     # --prepend needs the file to exist, and a crate's first release has no changelog yet.
@@ -395,7 +411,7 @@ update_crate_changelog() {
     if ! git cliff --repository "$REPO_ROOT" --config "$REPO_ROOT/cliff.toml" \
         --use-branch-tags \
         --tag-pattern "^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?_${crate_name}$" \
-        --unreleased --prepend "$changelog" --include-path "$crate_name/*" \
+        --unreleased --prepend "$changelog" --include-path "$crate_path/*" \
         --tag "${version}_${crate_name}"; then
         log_error "Failed to update $changelog"
     fi
@@ -405,7 +421,7 @@ update_crate_changelog() {
 review_and_open_pr() {
     local title="$1"
 
-    if confirm "Print diff of CHANGELOG/README changes?"; then
+    if confirm "Print diff of the release commit?"; then
         git diff --stat HEAD^
         git diff HEAD^
     fi
@@ -456,12 +472,10 @@ tag_release() {
     local crate_name="$1" commit="${2:-HEAD}"
     local version tag commit_hash
 
-    # These are published from the kernel's workspace version, so they carry no tag of their own.
-    case "$crate_name" in
-        delta_kernel_derive | delta_kernel_default_engine)
-            log_error "$crate_name shares the kernel release tag; tag 'delta_kernel' instead"
-            ;;
-    esac
+    if [[ "$crate_name" != delta_kernel && -z "$(independent_release_packages | \
+        jq -r --arg name "$crate_name" 'select(.name == $name) | .name')" ]]; then
+        log_error "'$crate_name' must be an independent publishable crate;\nTag 'delta_kernel' for Kernel releases"
+    fi
 
     version=$(get_current_version "$crate_name")
     if [[ -z "$version" ]]; then

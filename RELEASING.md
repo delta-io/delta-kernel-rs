@@ -131,6 +131,10 @@ such as `0.1.0` to `0.2.0`. A compatible patch does not require a dependent vers
 `unity-catalog-delta-rest-client` depends on `unity-catalog-delta-client-api`. The script warns about
 independently versioned dependents; review their APIs to decide which versions need to change.
 
+Prepare each dependent release on a separate `crate-release/` branch and PR. Merge the dependency's
+release PR first, then create the dependent's branch from updated `upstream/main` so it includes the
+new dependency requirement. Prepare affected dependent releases before tagging.
+
 ### Tag the release
 
 After merging, update `main` and verify that the checkout's manifests match the intended release:

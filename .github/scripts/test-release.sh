@@ -171,6 +171,48 @@ init_test_repository() {
     git config core.hooksPath /dev/null
 }
 
+init_release_workspace() {
+    init_test_repository "$1"
+    cat > Cargo.toml <<'EOF'
+[workspace]
+members = ["kernel", "ffi", "api", "rest", "integration", "example"]
+resolver = "2"
+[workspace.package]
+version = "0.29.0"
+EOF
+    local directory package
+    for directory in kernel ffi api rest integration example; do
+        case "$directory" in
+            kernel) package=delta_kernel ;;
+            ffi) package=delta_kernel_ffi ;;
+            api) package=unity-catalog-delta-client-api ;;
+            rest) package=unity-catalog-delta-rest-client ;;
+            integration) package=delta-kernel-unity-catalog ;;
+            example) package=release_example ;;
+        esac
+        mkdir -p "$directory"
+        printf '[package]\nname = "%s"\nedition = "2021"\n' "$package" \
+            > "$directory/Cargo.toml"
+        if [[ "$directory" == kernel || "$directory" == ffi ]]; then
+            printf 'version.workspace = true\n' >> "$directory/Cargo.toml"
+        else
+            printf 'version = "0.1.0"\n' >> "$directory/Cargo.toml"
+        fi
+        if [[ "$directory" == example ]]; then
+            printf 'publish = false\n' >> "$directory/Cargo.toml"
+        fi
+        if [[ "$directory" == rest || "$directory" == integration ]]; then
+            printf '[dependencies]\nunity-catalog-delta-client-api = { path = "../api", version = "0.1.0" }\n' \
+                >> "$directory/Cargo.toml"
+        fi
+        printf '[lib]\npath = "lib.rs"\n' >> "$directory/Cargo.toml"
+        : > "$directory/lib.rs"
+    done
+    cargo generate-lockfile --offline
+    git add .
+    git commit -q -m "chore: initialize release workspace"
+}
+
 test_working_tree_cleanliness() {
     local repository="$TEST_ROOT/cleanliness-repository"
     init_test_repository "$repository"
@@ -198,12 +240,11 @@ test_working_tree_cleanliness() {
 test_tag_commit_validation() {
     local failure_log="$TEST_ROOT/tag-commit-failure"
     local prompt="$TEST_ROOT/tag-prompt"
-    init_test_repository "$TEST_ROOT/tag-repository"
+    init_release_workspace "$TEST_ROOT/tag-repository"
     commit_file "chore: initial file" "initial"
 
     # shellcheck source=release.sh
     source "$REPOSITORY_ROOT/release.sh"
-    get_current_version() { echo 0.1.0; }
     confirm() {
         printf '%s\n' "$1" > "$prompt"
         return 1
@@ -230,26 +271,100 @@ test_tag_commit_validation() {
     fi
 }
 
+test_tag_publication() {
+    local repository="$TEST_ROOT/tag-publication"
+    local upstream="$TEST_ROOT/tag-upstream.git"
+    local target crate tag failure_log="$TEST_ROOT/tag-refusal"
+    init_release_workspace "$repository"
+    target=$(git rev-parse HEAD)
+    commit_file "fix: later change" "later"
+    git init -q --bare "$upstream"
+    git remote add upstream "$upstream"
+
+    # shellcheck source=release.sh
+    source "$REPOSITORY_ROOT/release.sh"
+    confirm() { return 0; }
+    for crate in delta_kernel unity-catalog-delta-client-api; do
+        if [[ "$crate" == delta_kernel ]]; then
+            tag=v0.29.0
+        else
+            tag=v0.1.0_unity-catalog-delta-client-api
+        fi
+        tag_release "$crate" "$target"
+        [[ "$(git cat-file -t "refs/tags/$tag")" == tag ]] || fail "$tag is not annotated"
+        [[ "$(git rev-parse "$tag^{commit}")" == "$target" ]] || fail "$tag has wrong target"
+        [[ "$(git --git-dir="$upstream" rev-parse "$tag^{commit}")" == "$target" ]] || \
+            fail "$tag was not pushed with the intended target"
+        if (tag_release "$crate" HEAD) > "$failure_log" 2>&1; then
+            fail "existing tag $tag was accepted"
+        fi
+        assert_contains "$failure_log" "tag $tag already exists"
+    done
+    if (tag_release delta_kernel_ffi) > "$failure_log" 2>&1; then
+        fail "workspace-versioned FFI crate was allowed its own tag"
+    fi
+    assert_contains "$failure_log" "Tag 'delta_kernel' for Kernel releases"
+}
+
+test_crate_release_guards() {
+    local repository="$TEST_ROOT/crate-guards"
+    local failure_log="$TEST_ROOT/crate-guard-failure" crate dependents
+    init_release_workspace "$repository"
+    git switch -q -c crate-release/api
+
+    # shellcheck source=release.sh
+    source "$REPOSITORY_ROOT/release.sh"
+    REPO_ROOT="$repository"
+    cargo() {
+        if [[ "$1" == release ]]; then
+            fail "invalid crate reached cargo release"
+        fi
+        command cargo "$@"
+    }
+    for crate in delta_kernel delta_kernel_ffi release_example missing-crate; do
+        if (handle_crate_release "$crate" 0.30.0) > "$failure_log" 2>&1; then
+            fail "ineligible crate $crate was accepted"
+        fi
+        assert_contains "$failure_log" "must be a publishable crate on an independent version line"
+        is_working_tree_clean || fail "refusing $crate changed the workspace"
+    done
+    [[ "$(crate_directory unity-catalog-delta-client-api)" == api ]] || \
+        fail "crate directory was inferred from the package name"
+    dependents=$(independent_dependents_of unity-catalog-delta-client-api)
+    [[ "$dependents" == $'delta-kernel-unity-catalog\nunity-catalog-delta-rest-client' ]] || \
+        fail "incorrect independent dependents: $dependents"
+    printf 'untracked\n' > unrelated.txt
+    if (handle_crate_release unity-catalog-delta-client-api 0.2.0) \
+        > "$failure_log" 2>&1; then
+        fail "crate preparation accepted a dirty working tree"
+    fi
+    assert_contains "$failure_log" "Working tree must be clean before releasing"
+}
+
 test_crate_changelog_ranges() {
     local crate="unity-catalog-delta-client-api"
-    local previous_version next_version changelog
+    local previous_version next_version changelog crate_path=client-api
 
     for previous_version in "" 0.1.0 0.2.0-rc.1; do
         init_test_repository "$TEST_ROOT/crate-${previous_version:-first}"
         cp "$REPOSITORY_ROOT/release.sh" "$REPOSITORY_ROOT/cliff.toml" .
-        mkdir -p "$crate"
-        commit_file "feat: initial API (#100)" "initial" "$crate/lib.rs"
+        mkdir -p "$crate_path"
+        printf '[package]\nname = "%s"\nversion = "0.1.0"\n[lib]\npath = "lib.rs"\n' \
+            "$crate" > "$crate_path/Cargo.toml"
+        printf '[workspace]\nmembers = ["%s"]\nresolver = "2"\n' "$crate_path" > Cargo.toml
+        git add Cargo.toml "$crate_path/Cargo.toml"
+        commit_file "feat: initial API (#100)" "initial" "$crate_path/lib.rs"
         git tag v0.28.0
         if [[ -n "$previous_version" ]]; then
             git tag "v${previous_version}_${crate}"
         fi
 
-        commit_file "feat: API change before Kernel release (#101)" "before" "$crate/lib.rs"
+        commit_file "feat: API change before Kernel release (#101)" "before" "$crate_path/lib.rs"
         git tag v0.29.0
         commit_file "fix: unrelated change (#102)" "unrelated"
         git tag v9.0.0_unity-catalog-delta-rest-client
-        commit_file "fix: API change after Kernel release (#103)" "after" "$crate/lib.rs"
-        commit_file "release $crate 0.2.0 (#104)" "release" "$crate/lib.rs"
+        commit_file "fix: API change after Kernel release (#103)" "after" "$crate_path/lib.rs"
+        commit_file "release $crate 0.2.0 (#104)" "release" "$crate_path/lib.rs"
 
         # shellcheck source=release.sh
         source ./release.sh
@@ -258,7 +373,7 @@ test_crate_changelog_ranges() {
             next_version=0.2.0-rc.2
         fi
         update_crate_changelog "$crate" "$next_version"
-        changelog="$crate/CHANGELOG.md"
+        changelog="$crate_path/CHANGELOG.md"
         assert_contains "$changelog" "## [v${next_version}_${crate}]"
         assert_contains "$changelog" "([#101])"
         assert_contains "$changelog" "([#103])"
@@ -427,5 +542,7 @@ test_changelog_refresh_and_verification() {
 (test_release_command_dispatch)
 (test_working_tree_cleanliness)
 (test_tag_commit_validation)
+(test_tag_publication)
+(test_crate_release_guards)
 (test_crate_changelog_ranges)
 (test_changelog_refresh_and_verification)
