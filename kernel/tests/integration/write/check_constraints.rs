@@ -80,6 +80,15 @@ fn assert_gate_error<T: std::fmt::Debug>(result: Result<T>) {
     );
 }
 
+/// The `(name, raw_sql)` pairs `source` discovers, in the order it returns them.
+fn discovered(source: &impl TableWriteExpressions) -> Vec<(&str, &str)> {
+    source
+        .check_constraints()
+        .iter()
+        .map(|constraint| (constraint.name(), constraint.raw_sql()))
+        .collect()
+}
+
 /// Writes version 0 of an in-memory table by hand, listing `writer_features` in the protocol and
 /// declaring `constraints`, for combinations CREATE TABLE cannot produce.
 async fn write_table_with_protocol(
@@ -117,14 +126,29 @@ async fn write_table_with_protocol(
 }
 
 #[rstest]
-#[case::single(&[("positive_amount", "amount > 0")])]
-#[case::multiple(&[("positive_amount", "amount > 0"), ("nonempty_name", "name != ''")])]
+#[case::single(
+    &[("positive_amount", "amount > 0")],
+    &[("positive_amount", "amount > 0")]
+)]
+#[case::multiple_with_mixed_case_name(
+    &[("PositiveAmount", "amount > 0"), ("nonempty_name", "name != ''")],
+    &[("nonempty_name", "name != ''"), ("positiveamount", "amount > 0")]
+)]
 #[tokio::test]
 async fn discovers_constraints_and_auto_enables_feature_on_create(
-    #[case] constraints: &[(&str, &str)],
+    #[case] declared: &[(&str, &str)],
+    #[case] expected: &[(&str, &str)],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp, table_path, engine) = test_table_setup()?;
-    let table_url = create_constrained_table(engine.as_ref(), &table_path, constraints)?;
+    let mut create_txn = build_create_txn(engine.as_ref(), &table_path, declared)?;
+
+    // The uncommitted create-table transaction already discovers the declared constraints.
+    let from_create_txn = discovered(&create_txn);
+    assert_eq!(from_create_txn, expected);
+
+    create_txn.ack_check_constraints();
+    create_txn.commit(engine.as_ref())?.unwrap_committed();
+    let table_url = Url::from_directory_path(&table_path).expect("table path must be a URL");
 
     // CREATE TABLE auto-enabled the writer feature from the declared constraints.
     let protocol = read_actions_from_commit(&table_url, 0, "protocol")?;
@@ -136,46 +160,28 @@ async fn discovers_constraints_and_auto_enables_feature_on_create(
         .any(|f| f.as_str() == Some("checkConstraints"));
     assert!(lists_check_constraints);
 
-    let mut expected: Vec<_> = constraints
-        .iter()
-        .map(|(name, sql)| (name.to_string(), sql.to_string()))
-        .collect();
-    expected.sort();
-
     // Discovery works from both a snapshot and a transaction, with no ack.
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let mut from_snapshot: Vec<_> = snapshot
-        .check_constraints()
-        .iter()
-        .map(|c| (c.name().to_string(), c.raw_sql().to_string()))
-        .collect();
-    from_snapshot.sort();
+    let from_snapshot = discovered(snapshot.as_ref());
     assert_eq!(from_snapshot, expected);
 
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-    let mut from_txn: Vec<_> = txn
-        .check_constraints()
-        .iter()
-        .map(|c| (c.name().to_string(), c.raw_sql().to_string()))
-        .collect();
-    from_txn.sort();
+    let from_txn = discovered(&txn);
     assert_eq!(from_txn, expected);
     Ok(())
 }
 
 #[rstest]
-#[case::commit_acknowledged(GatedOp::CommitWithData, true, false)]
-#[case::commit_not_acknowledged(GatedOp::CommitWithData, false, false)]
-#[case::commit_discovery_is_not_acknowledgement(GatedOp::CommitWithData, false, true)]
-#[case::metadata_only_commit_acknowledged(GatedOp::MetadataOnlyCommit, true, false)]
-#[case::metadata_only_commit_not_acknowledged(GatedOp::MetadataOnlyCommit, false, false)]
-#[case::write_state_acknowledged(GatedOp::WriteState, true, false)]
-#[case::write_state_not_acknowledged(GatedOp::WriteState, false, false)]
 #[tokio::test]
 async fn constrained_table_write_requires_acknowledgement(
-    #[case] op: GatedOp,
-    #[case] acknowledge: bool,
-    #[case] discover_first: bool,
+    #[values(
+        GatedOp::CommitWithData,
+        GatedOp::MetadataOnlyCommit,
+        GatedOp::WriteState
+    )]
+    op: GatedOp,
+    #[values(true, false)] acknowledge: bool,
+    #[values(true, false)] discover_first: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = create_constrained_table(
@@ -186,51 +192,42 @@ async fn constrained_table_write_requires_acknowledgement(
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    // Discovery alone must not count as an acknowledgement.
     if discover_first {
-        txn.check_constraints();
+        let _discovered = txn.check_constraints();
     }
     if acknowledge {
         txn.ack_check_constraints();
     }
 
-    match op {
+    let result = match op {
         GatedOp::CommitWithData => {
             stage_one_file(&mut txn)?;
-            let result = txn.commit(engine.as_ref());
-            if acknowledge {
-                result?.unwrap_committed();
-            } else {
-                assert_gate_error(result);
-            }
+            txn.commit(engine.as_ref()).map(|committed| {
+                let _committed = committed.unwrap_committed();
+            })
         }
-        GatedOp::MetadataOnlyCommit => {
-            let result = txn
-                .with_transaction_id("app_id".to_string(), 1)
-                .commit(engine.as_ref());
-            if acknowledge {
-                result?.unwrap_committed();
-            } else {
-                assert_gate_error(result);
-            }
-        }
-        GatedOp::WriteState => {
-            let result = txn.write_state();
-            if acknowledge {
-                result?;
-            } else {
-                assert_gate_error(result);
-            }
-        }
+        GatedOp::MetadataOnlyCommit => txn
+            .with_transaction_id("app_id".to_string(), 1)
+            .commit(engine.as_ref())
+            .map(|committed| {
+                let _committed = committed.unwrap_committed();
+            }),
+        GatedOp::WriteState => txn.write_state().map(|_write_state| ()),
+    };
+    if acknowledge {
+        result?;
+    } else {
+        assert_gate_error(result);
     }
     Ok(())
 }
 
 #[rstest]
-#[case::acknowledged(true)]
-#[case::not_acknowledged(false)]
 #[tokio::test]
 async fn creating_a_constrained_table_requires_acknowledgement(
-    #[case] acknowledge: bool,
+    #[values(GatedOp::MetadataOnlyCommit, GatedOp::WriteState)] op: GatedOp,
+    #[values(true, false)] acknowledge: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let mut txn = build_create_txn(
@@ -242,9 +239,15 @@ async fn creating_a_constrained_table_requires_acknowledgement(
         txn.ack_check_constraints();
     }
 
-    let result = txn.commit(engine.as_ref());
+    let result = match op {
+        GatedOp::MetadataOnlyCommit => txn.commit(engine.as_ref()).map(|committed| {
+            let _committed = committed.unwrap_committed();
+        }),
+        GatedOp::WriteState => txn.write_state().map(|_write_state| ()),
+        GatedOp::CommitWithData => unreachable!("not a case of this test"),
+    };
     if acknowledge {
-        result?.unwrap_committed();
+        result?;
     } else {
         assert_gate_error(result);
     }
@@ -319,13 +322,9 @@ async fn discovers_constraints_after_checkpoint() -> Result<(), Box<dyn std::err
     // A fresh snapshot reads Metadata from the checkpoint (via the `_last_checkpoint` hint), so
     // discovery and the ack gate must still see the constraint.
     let reloaded = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let discovered: Vec<_> = reloaded
-        .check_constraints()
-        .iter()
-        .map(|c| (c.name().to_string(), c.raw_sql().to_string()))
-        .collect();
-    let expected = [("positive_amount".to_string(), "amount > 0".to_string())];
-    assert_eq!(discovered, expected);
+    let from_reloaded = discovered(reloaded.as_ref());
+    let expected = [("positive_amount", "amount > 0")];
+    assert_eq!(from_reloaded, expected);
 
     let mut txn = reloaded.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
     stage_one_file(&mut txn)?;
@@ -361,8 +360,8 @@ async fn data_commit_needs_no_acknowledgement_when_feature_listed_without_constr
             .await?;
 
     let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
-    let discovered = snapshot.check_constraints();
-    assert!(discovered.is_empty());
+    let from_snapshot = discovered(snapshot.as_ref());
+    assert!(from_snapshot.is_empty());
 
     let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
     stage_one_file(&mut txn)?;
@@ -381,12 +380,9 @@ async fn table_with_constraints_but_without_feature_is_readable_but_not_writable
     .await?;
 
     let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
-    let discovered: Vec<_> = snapshot
-        .check_constraints()
-        .iter()
-        .map(|c| c.raw_sql().to_string())
-        .collect();
-    assert_eq!(discovered, ["amount > 0".to_string()]);
+    let from_snapshot = discovered(snapshot.as_ref());
+    let expected = [("positive_amount", "amount > 0")];
+    assert_eq!(from_snapshot, expected);
 
     let result = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine);
     let rejected_as_malformed = matches!(result, Err(KernelError::InvalidProtocol(_)));
@@ -418,11 +414,8 @@ async fn alter_table_on_constrained_table_requires_acknowledgement(
 
     txn.ack_check_constraints();
     let altered = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
-    let discovered: Vec<_> = altered
-        .check_constraints()
-        .iter()
-        .map(|c| c.raw_sql().to_string())
-        .collect();
-    assert_eq!(discovered, ["amount > 0".to_string()]);
+    let from_altered = discovered(altered.as_ref());
+    let expected = [("positive_amount", "amount > 0")];
+    assert_eq!(from_altered, expected);
     Ok(())
 }

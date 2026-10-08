@@ -1363,6 +1363,20 @@ mod test {
         MockProtocolBuilder::new().with_versions(1, 2).build(),
         WriteSupport::InvalidProtocol
     )]
+    #[case::names_differing_only_in_case_with_feature(
+        &[
+            ("delta.constraints.positive", "amount > 0"),
+            ("delta.constraints.POSITIVE", "amount > 1"),
+        ],
+        MockProtocolBuilder::new()
+            .with_writer_features([TableFeature::CheckConstraints])
+            .build(),
+        if cfg!(feature = "check-constraints-in-dev") {
+            WriteSupport::Supported
+        } else {
+            WriteSupport::Unsupported
+        }
+    )]
     // No CHECK constraint keys.
     #[case::no_properties(
         &[],
@@ -1429,37 +1443,6 @@ mod test {
 
         let has_check_constraints = table_config.has_check_constraints();
         assert_eq!(has_check_constraints, expected);
-    }
-
-    #[cfg(feature = "check-constraints-in-dev")]
-    #[rstest]
-    #[case::names_differ_in_case("delta.constraints.positive", "delta.constraints.POSITIVE")]
-    fn constraint_keys_differing_only_in_case_are_writable_and_all_discovered(
-        #[case] first_key: &str,
-        #[case] second_key: &str,
-    ) {
-        let table_config = MockTableConfigurationBuilder::new()
-            .with_properties([(first_key, "amount > 0"), (second_key, "amount > 1")])
-            .with_protocol(
-                MockProtocolBuilder::new()
-                    .with_writer_features([TableFeature::CheckConstraints])
-                    .build(),
-            )
-            .build();
-
-        let write_supported = table_config
-            .ensure_operation_supported(Operation::Write)
-            .is_ok();
-        assert!(write_supported);
-
-        let mut discovered: Vec<_> = table_config
-            .table_properties()
-            .check_constraints
-            .iter()
-            .map(|c| c.raw_sql())
-            .collect();
-        discovered.sort();
-        assert_eq!(discovered, ["amount > 0", "amount > 1"]);
     }
 
     #[test]
