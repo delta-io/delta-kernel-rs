@@ -7,9 +7,12 @@ use delta_kernel::{KernelResult, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
+#[cfg(feature = "declarative-plans")]
 use super::state::BorrowedSnapshotScanState;
+#[cfg(feature = "declarative-plans")]
+use super::FfiSnapshotScanState;
 use super::{
-    BorrowedSnapshotState, FfiSnapshotHint, FfiSnapshotScanState, invalid, validate_handoff,
+    BorrowedSnapshotState, FfiSnapshotHint, invalid, validate_handoff,
 };
 use crate::delta_types::{FfiMetadata, MetadataBacking};
 use crate::error::{AllocateErrorFn, ExternResult, IntoExternResult};
@@ -27,6 +30,7 @@ pub struct SnapshotCore {
     version: Version,
     latest: bool,
     generation: u64,
+    #[cfg_attr(not(feature = "declarative-plans"), allow(dead_code))]
     trusted_externalization: bool,
 }
 

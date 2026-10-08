@@ -2198,6 +2198,7 @@ fn build_rejects_internally_supplied_hint_for_existing_snapshot_builder() {
     }
 }
 
+#[cfg(feature = "declarative-plans")]
 fn schema_upload(schema: &str) -> Handle<ExclusiveSnapshotSchemaUpload> {
     let upload = snapshot_schema_upload_new(schema.len());
     for chunk in schema.as_bytes().chunks(65536) {
