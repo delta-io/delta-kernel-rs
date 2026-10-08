@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use tracing::{error, instrument};
 
-use super::{IncrementalReplay, Snapshot};
+use super::{IncrementalReplay, PreparedSnapshot, Snapshot};
 use crate::cancellation::CancellationTokenRef;
-use crate::log_segment::LogSegment;
+use crate::log_segment::{LogSegment, PmResolution};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
     emit_log_segment_load, emit_log_segment_load_failure, emit_protocol_metadata_load,
@@ -205,7 +205,12 @@ impl Snapshot {
                 // The nested constructor reports the rebuild failure; this span also reports the
                 // failed incremental operation.
                 let segment = current_segment.insert(new_log_segment);
-                let (table_configuration, crc) = Self::prepare_new_from_log_segment(
+                let PreparedSnapshot {
+                    table_configuration,
+                    crc,
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    checkpoint_action,
+                } = Self::prepare_new_from_log_segment(
                     existing_snapshot.table_root(),
                     segment,
                     engine,
@@ -213,15 +218,19 @@ impl Snapshot {
                     incremental_replay,
                     built_as_latest,
                 )?;
-                return Ok(Arc::new(Self::new_with_validated_crc(
-                    current_segment.take().ok_or_else(|| {
-                        KernelError::internal_error("Missing prepared log segment")
-                    })?,
+                let log_segment = current_segment
+                    .take()
+                    .ok_or_else(|| KernelError::internal_error("Missing prepared log segment"))?;
+                let snapshot = Self::new_with_validated_crc(
+                    log_segment,
                     table_configuration,
                     crc,
                     built_as_latest,
                     false, /* skipped_new_checkpoints */
-                )));
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    checkpoint_action,
+                );
+                return Ok(Arc::new(snapshot));
             }
             NewSegment::Combined(combined_log_segment) => {
                 emit_log_segment_load(
@@ -247,15 +256,18 @@ impl Snapshot {
             .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
 
         let existing_table_config = existing_snapshot.table_configuration();
-        let (new_metadata, new_protocol, source) = match &crc_at_version {
+        let resolution = match &crc_at_version {
             Some((crc, source)) => {
                 // If we were able to build a new CRC, then re-use it for TableConfiguration
-                // creation.
-                let new_metadata = (crc.metadata != *existing_table_config.metadata())
-                    .then(|| crc.metadata.clone());
-                let new_protocol = (crc.protocol != *existing_table_config.protocol())
-                    .then(|| crc.protocol.clone());
-                (new_metadata, new_protocol, *source)
+                // creation, keeping only the P&M that changed.
+                let mut resolution = PmResolution::from_crc(crc, *source);
+                resolution
+                    .metadata
+                    .take_if(|m| m == existing_table_config.metadata());
+                resolution
+                    .protocol
+                    .take_if(|p| p == existing_table_config.protocol());
+                resolution
             }
             None => {
                 // No incremental CRC to reuse: there was no base CRC, or advancing it was out of
@@ -271,12 +283,12 @@ impl Snapshot {
                     .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?
             }
         };
-        emit_protocol_metadata_load(metric_context, source, pm_start.elapsed());
+        emit_protocol_metadata_load(metric_context, resolution.source, pm_start.elapsed());
 
         let table_configuration = TableConfiguration::try_new_from(
             existing_table_config,
-            new_metadata,
-            new_protocol,
+            resolution.metadata,
+            resolution.protocol,
             new_end_version,
         )?;
 
@@ -286,15 +298,19 @@ impl Snapshot {
             &table_configuration,
             crc_at_version.map(|(crc, _)| crc).or(base_crc),
         )?;
-        Ok(Arc::new(Self::new_with_validated_crc(
-            current_segment
-                .take()
-                .ok_or_else(|| KernelError::internal_error("Missing prepared log segment"))?,
+        let log_segment = current_segment
+            .take()
+            .ok_or_else(|| KernelError::internal_error("Missing prepared log segment"))?;
+        let snapshot = Self::new_with_validated_crc(
+            log_segment,
             table_configuration,
             crc,
             built_as_latest,
             skipped_new_checkpoints,
-        )))
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            resolution.checkpoint_action,
+        );
+        Ok(Arc::new(snapshot))
     }
 
     // ============================================================================

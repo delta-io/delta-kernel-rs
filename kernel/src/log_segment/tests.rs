@@ -5407,20 +5407,17 @@ fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn find_last_checkpoint_action_returns_none_without_checkpoint() -> Result<()> {
+fn latest_checkpoint_action_returns_none_without_checkpoint() -> Result<()> {
     let (engine, table_root) = setup_table()?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    assert!(snapshot
-        .log_segment()
-        .find_last_checkpoint_action(&engine)?
-        .is_none());
+    assert!(snapshot.latest_checkpoint_action(&engine)?.is_none());
     Ok(())
 }
 
 // The log is replayed newest-first, so the most recent `checkpoint` action wins.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn find_last_checkpoint_action_returns_the_latest_of_multiple() -> Result<()> {
+fn latest_checkpoint_action_returns_the_latest_of_multiple() -> Result<()> {
     let (engine, table_root) = setup_table()?;
     write_commit(
         &engine,
@@ -5438,10 +5435,57 @@ fn find_last_checkpoint_action_returns_the_latest_of_multiple() -> Result<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert_eq!(snapshot.version(), 2);
     let checkpoint = snapshot
-        .log_segment()
-        .find_last_checkpoint_action(&engine)?
+        .latest_checkpoint_action(&engine)?
         .expect("checkpoint present");
     assert_eq!(checkpoint.version(), 2);
     assert_eq!(checkpoint.path(), "metadata/root-v2.parquet");
+    Ok(())
+}
+
+// A snapshot's frozen log segment makes `latest_checkpoint_action` stable: a newer checkpoint
+// action written to storage after the snapshot is built does not change the snapshot's result.
+// A fresh snapshot does observe it.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[test]
+fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> Result<()> {
+    let (engine, table_root) = setup_table()?;
+    write_commit(
+        &engine,
+        &table_root,
+        1,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?.into_engine_data(&engine)?,
+    )?;
+
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+    assert_eq!(snapshot.version(), 1);
+    let first = snapshot
+        .latest_checkpoint_action(&engine)?
+        .expect("checkpoint present");
+    assert_eq!(first.version(), 1);
+
+    // Write a newer checkpoint action AFTER the snapshot's log segment was frozen.
+    write_commit(
+        &engine,
+        &table_root,
+        2,
+        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?.into_engine_data(&engine)?,
+    )?;
+
+    // The frozen snapshot still reports version 1.
+    let second = snapshot
+        .latest_checkpoint_action(&engine)?
+        .expect("checkpoint present");
+    assert_eq!(second.version(), 1);
+    assert_eq!(second.path(), "metadata/root-v1.parquet");
+
+    // A fresh snapshot observes the newer checkpoint action.
+    let updated = Snapshot::builder_for(table_root).build(&engine)?;
+    assert_eq!(
+        updated
+            .latest_checkpoint_action(&engine)?
+            .expect("checkpoint present")
+            .version(),
+        2
+    );
     Ok(())
 }

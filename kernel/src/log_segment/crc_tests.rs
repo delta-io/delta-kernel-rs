@@ -11,6 +11,8 @@ use serde_json::{json, Value};
 use test_utils::delta_path_for_version;
 use url::Url;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use super::CheckpointActionResolution;
 use super::LogSegment;
 use crate::actions::{DomainMetadata, Format, Metadata, Protocol, SetTransaction};
 use crate::crc::{
@@ -509,6 +511,22 @@ impl BuiltCrcTest {
         let ict = snapshot.get_in_commit_timestamp(&self.engine).unwrap();
         assert_eq!(ict, expected_ict, "ICT mismatch at {label}");
     }
+
+    /// Lists the log, reads the latest on-disk CRC, and runs the unchecked P&M replay, returning
+    /// how it resolved the latest AMT `checkpoint` action.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn checkpoint_action_resolution(&self) -> CheckpointActionResolution {
+        let storage = self.engine.storage_handler();
+        let log_root = self.url.join("_delta_log/").unwrap();
+        let log_segment =
+            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
+                .unwrap();
+        let crc = log_segment.read_latest_crc(&self.engine);
+        log_segment
+            .read_protocol_metadata_opt(&self.engine, crc.as_ref())
+            .unwrap()
+            .checkpoint_action
+    }
 }
 
 async fn put(store: &InMemory, version: u64, suffix: &str, content: &str) {
@@ -763,6 +781,117 @@ async fn test_lagging_checkpoint_action_defers_to_crc_pm() {
         .build()
         .await
         .assert_p_m(None, crc_config.protocol(), crc_config.metadata());
+}
+
+// A CRC-seeded pruned replay (CRC below target) that finds a checkpoint action in the commits
+// after the CRC captures it: those commits include the newest, and checkpoint versions strictly
+// increase, so a hit is the latest action.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[tokio::test]
+async fn test_crc_seeded_replay_captures_checkpoint_action_after_crc() {
+    let crc_config =
+        adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
+    let checkpoint_config = adaptive_metadata_table_configuration(
+        test_schema_flat_with_column_mapping(),
+        &[TableFeature::TimestampWithoutTimezone],
+    );
+    let resolution = CrcReadTest::new()
+        .commit(
+            0,
+            [
+                commit_info(DEFAULT_OPERATION, None),
+                protocol(crc_config.protocol().clone()),
+                metadata(crc_config.metadata().clone()),
+            ],
+        )
+        .crc(
+            0,
+            crc_config.protocol().clone(),
+            crc_config.metadata().clone(),
+            1000, // AMT config enables ICT, so the CRC must carry an inCommitTimestampOpt.
+        )
+        .commit(
+            1,
+            [amt_checkpoint_action(
+                1,
+                checkpoint_config.protocol().clone(),
+                checkpoint_config.metadata().clone(),
+            )],
+        )
+        .build()
+        .await
+        .checkpoint_action_resolution();
+    assert!(
+        matches!(resolution, CheckpointActionResolution::Captured(a) if a.version == 1),
+        "a checkpoint action after the CRC is the latest and must be captured, not deferred"
+    );
+}
+
+// A CRC at the target version short-circuits before any replay, so the checkpoint action is left
+// `Unresolved` for the accessor to settle by scanning.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[tokio::test]
+async fn test_crc_at_target_leaves_checkpoint_action_unresolved() {
+    let config = adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
+    let resolution = CrcReadTest::new()
+        .commit(
+            0,
+            [amt_checkpoint_action(
+                0,
+                config.protocol().clone(),
+                config.metadata().clone(),
+            )],
+        )
+        .crc(
+            0,
+            config.protocol().clone(),
+            config.metadata().clone(),
+            1000, // AMT config enables ICT, so the CRC must carry an inCommitTimestampOpt.
+        )
+        .build()
+        .await
+        .checkpoint_action_resolution();
+    assert!(matches!(resolution, CheckpointActionResolution::Unresolved));
+}
+
+// A CRC-seeded pruned replay that resolves P&M from standalone actions but finds no checkpoint
+// action after the CRC leaves the resolution `Unresolved`: the latest action may sit at or below
+// the CRC version, which the pruned replay never reads.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[tokio::test]
+async fn test_crc_seeded_replay_without_checkpoint_action_is_unresolved() {
+    let crc_config =
+        adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
+    let newer_config = adaptive_metadata_table_configuration(
+        test_schema_flat_with_column_mapping(),
+        &[TableFeature::TimestampWithoutTimezone],
+    );
+    let resolution = CrcReadTest::new()
+        .commit(
+            0,
+            [
+                commit_info(DEFAULT_OPERATION, None),
+                protocol(crc_config.protocol().clone()),
+                metadata(crc_config.metadata().clone()),
+            ],
+        )
+        .crc(
+            0,
+            crc_config.protocol().clone(),
+            crc_config.metadata().clone(),
+            1000, // AMT config enables ICT, so the CRC must carry an inCommitTimestampOpt.
+        )
+        .commit(
+            1,
+            [
+                protocol(newer_config.protocol().clone()),
+                metadata(newer_config.metadata().clone()),
+            ],
+        )
+        .build()
+        .await
+        .checkpoint_action_resolution();
+    assert!(matches!(resolution, CheckpointActionResolution::Unresolved));
 }
 
 #[tokio::test]
