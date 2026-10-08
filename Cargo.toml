@@ -26,6 +26,8 @@ resolver = "3"
 
 [profile.bench]
 lto = "fat"
+codegen-units = 1
+opt-level = 3
 
 [workspace.package]
 edition = "2021"
