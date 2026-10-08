@@ -43,6 +43,8 @@ use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
     ToSchema as _, lazy_schema_ref, schema_ref,
 };
+#[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+use crate::snapshot::{SnapshotScanState, log_segment_from_state};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{ExpressionTransform, SchemaTransform, transform_output_type};
@@ -61,6 +63,169 @@ pub(crate) mod scan_plan;
 pub mod state;
 pub(crate) mod state_info;
 pub(crate) mod transform_spec;
+
+/// Plan a default full-table scan from connector-owned snapshot components for one call.
+///
+/// The table configuration and scan state live only until plan construction finishes. The
+/// returned plan owns the file paths and schemas it needs; no native Snapshot or Scan is retained.
+#[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+#[internal_api]
+pub(crate) fn declarative_metadata_scan_plan_from_state(
+    state: &dyn SnapshotScanState,
+    engine: &dyn Engine,
+) -> KernelResult<Option<Plan>> {
+    metadata_plan_with_components(state, engine, || Ok((state.metadata()?, state.protocol()?)))
+}
+
+/// Build the default metadata plan, consuming transferred metadata at the validation phase.
+/// Protocol and scan validation remain identical to planning directly from `state`.
+#[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+#[internal_api]
+pub(crate) fn declarative_metadata_scan_plan_from_state_with_metadata(
+    state: &dyn SnapshotScanState,
+    metadata: crate::actions::Metadata,
+    engine: &dyn Engine,
+) -> KernelResult<Option<Plan>> {
+    metadata_plan_with_components(state, engine, || Ok((metadata, state.protocol()?)))
+}
+
+/// Build a default metadata plan from portable state validated by a source snapshot.
+///
+/// The configuration is materialized only for this call. Source-proven schema, protocol, and log
+/// compatibility checks are not repeated, and no native configuration survives the call.
+#[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+#[internal_api]
+pub(crate) fn declarative_metadata_scan_plan_from_trusted_state(
+    state: &dyn SnapshotScanState,
+    metadata: crate::actions::Metadata,
+    engine: &dyn Engine,
+) -> KernelResult<Option<Plan>> {
+    let (log_segment, commit_files) = metadata_plan_log_inputs(state, true)?;
+    let table_configuration = TableConfiguration::try_new_for_scan_from_validated_state(
+        metadata,
+        state.protocol()?,
+        state.table_root().clone(),
+        state.version(),
+    )?;
+    metadata_plan_with_validated_configuration(
+        engine,
+        log_segment,
+        commit_files,
+        &table_configuration,
+    )
+}
+
+#[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+fn metadata_plan_with_components(
+    state: &dyn SnapshotScanState,
+    engine: &dyn Engine,
+    components: impl FnOnce() -> KernelResult<(crate::actions::Metadata, crate::actions::Protocol)>,
+) -> KernelResult<Option<Plan>> {
+    let (log_segment, commit_files) = metadata_plan_log_inputs(state, false)?;
+    let (metadata, protocol) = components()?;
+    let table_configuration = TableConfiguration::try_new(
+        metadata,
+        protocol,
+        state.table_root().clone(),
+        state.version(),
+    )?;
+    metadata_plan_with_configuration(engine, log_segment, commit_files, &table_configuration)
+}
+
+#[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+fn metadata_plan_log_inputs(
+    state: &dyn SnapshotScanState,
+    trusted: bool,
+) -> KernelResult<(LogSegment, Option<Vec<crate::plans::ir::nodes::ScanFile>>)> {
+    match state.ordered_log_paths()? {
+        Some(paths) => {
+            let (segment, files) = if trusted {
+                crate::log_segment::LogSegment::stream_trusted_scan_inputs(state, paths)?
+            } else {
+                crate::log_segment::LogSegment::stream_scan_inputs(state, paths)?
+            };
+            Ok((segment, Some(files)))
+        }
+        None => Ok((log_segment_from_state(state)?, None)),
+    }
+}
+
+#[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+fn metadata_plan_with_configuration(
+    engine: &dyn Engine,
+    log_segment: LogSegment,
+    commit_files: Option<Vec<crate::plans::ir::nodes::ScanFile>>,
+    table_configuration: &TableConfiguration,
+) -> KernelResult<Option<Plan>> {
+    table_configuration.ensure_operation_supported(Operation::Scan)?;
+    metadata_plan_with_validated_configuration(
+        engine,
+        log_segment,
+        commit_files,
+        table_configuration,
+    )
+}
+
+#[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+fn metadata_plan_with_validated_configuration(
+    engine: &dyn Engine,
+    log_segment: LogSegment,
+    commit_files: Option<Vec<crate::plans::ir::nodes::ScanFile>>,
+    table_configuration: &TableConfiguration,
+) -> KernelResult<Option<Plan>> {
+    let table_schema = table_configuration.logical_schema();
+    if table_schema.num_fields() == 0 {
+        return Err(KernelError::generic(
+            "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
+             to add at least one column before scanning",
+        ));
+    }
+
+    let stats = StatsOptions::default();
+    let partition_values = PartitionValuesOptions::default();
+    require!(
+        !table_requires_timestamp_timezone_support(table_configuration, &partition_values),
+        KernelError::unsupported(
+            "Kernel does not yet support with_timestamp_timezone in declarative metadata scans"
+        )
+    );
+    // Metadata columns require the scan-specific rules in StateInfo.
+    let state_info = if table_schema.metadata_columns().next().is_some() {
+        Some(StateInfo::try_new(
+            table_schema.clone(),
+            table_schema,
+            table_configuration,
+            None,
+            &stats,
+            &partition_values,
+            (),
+        )?)
+    } else {
+        None
+    };
+    let planner = scan_plan::MetadataPlanner::try_new_from_state(
+        table_configuration,
+        state_info.as_ref(),
+        &stats,
+        &partition_values,
+    )?;
+    let executor = engine.require_plan_executor()?;
+    let shape = CheckpointShape::try_new_for_log_segment(
+        executor.as_ref(),
+        &log_segment,
+        planner.requires_checkpoint_add_schema(),
+    )?;
+    let base = scan_plan::MetadataReplayBase::Checkpoint {
+        version: log_segment.checkpoint_version,
+        shape,
+    };
+    scan_plan::MetadataScanPlan {
+        log_segment: &log_segment,
+        skip_all: state_info
+            .is_some_and(|state| state.physical_predicate == PhysicalPredicate::StaticSkipAll),
+    }
+    .build_metadata_scan_plan_with_commits(base, &planner, commit_files)
+}
 
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -1391,12 +1556,6 @@ impl Scan {
         let planner = scan_plan::MetadataPlanner::try_new(self)?;
         let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine, &planner)?;
         self.build_metadata_scan_plan_with(base, &planner)
-    }
-
-    #[cfg(feature = "declarative-plans")]
-    /// Whether JSON stats synthesis requires the checkpoint's collation stats schema.
-    fn needs_collation_stats_schema(&self) -> bool {
-        self.stats.synthesize_json && self.snapshot.table_configuration().has_collations_feature()
     }
 
     // Factored out to facilitate testing

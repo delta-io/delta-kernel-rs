@@ -11,7 +11,7 @@ use url::Url;
 
 use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
-use super::{PhysicalPredicate, Scan};
+use super::{PartitionValuesOptions, PhysicalPredicate, Scan, StatsOptions};
 use crate::actions::{
     ADD_FIELD, ADD_NAME, ADD_SCHEMA, Add, LOG_ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME, SIDECAR_FIELD,
     SIDECAR_NAME, STATS_PARSED, get_all_actions_schema,
@@ -30,6 +30,7 @@ use crate::schema::{
     lazy_schema_ref, schema, schema_ref,
 };
 use crate::struct_patch::ProjectionStructPatchBuilder;
+use crate::table_configuration::TableConfiguration;
 use crate::transforms::{ExpressionTransform, transform_output_type};
 use crate::utils::FoldWithOption as _;
 use crate::{KernelError, KernelResult, PlanBuilder, Version};
@@ -60,7 +61,10 @@ const VERSION: &str = "version";
 /// 3. Applies data skipping unless the user requests JSON stats without structured output.
 /// 4. Projects metadata after filtering into the stats and partition shape requested by the user.
 pub(super) struct MetadataPlanner<'a> {
-    scan: &'a Scan,
+    stats: &'a StatsOptions,
+    partition_values_options: &'a PartitionValuesOptions,
+    output_stats_schema: Option<&'a SchemaRef>,
+    needs_collation_stats_schema: bool,
     stats_schema: Option<SchemaRef>,
     parsed_partition_schema: Option<&'a SchemaRef>,
     stats_filter: Option<Predicate>,
@@ -77,8 +81,22 @@ enum StatsKind {
 
 impl<'a> MetadataPlanner<'a> {
     pub(super) fn try_new(scan: &'a Scan) -> KernelResult<Self> {
-        let stats_schema = if scan.stats.synthesize_json {
-            let config = scan.snapshot.table_configuration();
+        Self::try_new_from_state(
+            scan.snapshot.table_configuration(),
+            Some(&scan.state_info),
+            &scan.stats,
+            &scan.partition_values_options,
+        )
+    }
+
+    pub(super) fn try_new_from_state(
+        config: &TableConfiguration,
+        state: Option<&'a StateInfo>,
+        stats: &'a StatsOptions,
+        partition_values_options: &'a PartitionValuesOptions,
+    ) -> KernelResult<Self> {
+        let output_stats_schema = state.and_then(StateInfo::physical_stats_output_schema);
+        let stats_schema = if stats.synthesize_json {
             let columns = config
                 .physical_data_schema_without_partition_columns()
                 .leaves(None);
@@ -86,26 +104,30 @@ impl<'a> MetadataPlanner<'a> {
             let builder = config
                 .stats_schema_builder()
                 .with_required_physical_columns(Some(columns.as_ref().0))
-                .with_variant_min_max(scan.stats.variant_min_max);
+                .with_variant_min_max(stats.variant_min_max);
             #[cfg(feature = "geo-type-in-dev")]
-            let builder = builder.with_geometry_min_max(scan.stats.geometry_min_max);
+            let builder = builder.with_geometry_min_max(stats.geometry_min_max);
             Some(builder.build()?)
         } else {
-            scan.state_info.physical_stats_read_schema().cloned()
+            state
+                .and_then(StateInfo::physical_stats_read_schema)
+                .cloned()
         };
-        let enable_metadata_filter =
-            !scan.stats.synthesize_json || scan.state_info.physical_stats_output_schema().is_some();
+        let enable_metadata_filter = !stats.synthesize_json || output_stats_schema.is_some();
         let stats_filter = enable_metadata_filter
-            .then(|| stats_skipping_predicate(&scan.state_info))
+            .then(|| state.and_then(stats_skipping_predicate))
             .flatten();
         let need_partition_schema =
-            stats_filter.is_some() || scan.partition_values_options.parsed_struct;
+            stats_filter.is_some() || partition_values_options.parsed_struct;
         let parsed_partition_schema = need_partition_schema
-            .then(|| scan.state_info.physical_partition_schema.as_ref())
+            .then(|| state.and_then(|state| state.physical_partition_schema.as_ref()))
             .flatten();
 
         Ok(Self {
-            scan,
+            stats,
+            partition_values_options,
+            output_stats_schema,
+            needs_collation_stats_schema: stats.synthesize_json && config.has_collations_feature(),
             stats_schema,
             parsed_partition_schema,
             stats_filter,
@@ -165,7 +187,7 @@ impl<'a> MetadataPlanner<'a> {
 
         // Decide what kind of stats to read from the file by transforming `ADD_SCHEMA` based on the
         // `file_schema` and table-derived stats schema.
-        let prefer_json_stats = self.scan.stats.synthesize_json && file_add_schema.contains(STATS);
+        let prefer_json_stats = self.stats.synthesize_json && file_add_schema.contains(STATS);
         let (patch, stats_kind) = match (self.stats_schema.as_ref(), get_type_of(STATS_PARSED)) {
             // Parsed statistics are requested and present in the file
             (Some(required_stats), Some(DataType::Struct(file_parsed_stats)))
@@ -179,7 +201,7 @@ impl<'a> MetadataPlanner<'a> {
             {
                 let stats_schema = required_stats.clone().try_fold_with(
                     source_collation_stats(file_schema)
-                        .filter(|_| self.scan.needs_collation_stats_schema()),
+                        .filter(|_| self.needs_collation_stats_schema),
                     |stats, field| {
                         SchemaStructPatchBuilder::new()
                             .append(field.clone())
@@ -239,7 +261,7 @@ impl<'a> MetadataPlanner<'a> {
         has_struct_partitions: bool,
     ) -> KernelResult<(PlanBuilder, StatsKind)> {
         let should_parse_stats = stats == StatsKind::Json
-            && (!self.scan.stats.synthesize_json || self.stats_filter.is_some());
+            && (!self.stats.synthesize_json || self.stats_filter.is_some());
         let stats_schema_to_parse = self.stats_schema.as_ref().filter(|_| should_parse_stats);
         let partition_schema_to_parse = self
             .parsed_partition_schema
@@ -249,7 +271,7 @@ impl<'a> MetadataPlanner<'a> {
                 .fold_with(stats_schema_to_parse, |patch, schema| {
                     let field = StructField::nullable(STATS_PARSED, schema.clone());
                     let expr = Expr::parse_json(col!(ADD_NAME, STATS), Arc::clone(schema));
-                    let patch = if self.scan.stats.synthesize_json {
+                    let patch = if self.stats.synthesize_json {
                         stats = StatsKind::Both;
                         patch
                     } else {
@@ -277,7 +299,7 @@ impl<'a> MetadataPlanner<'a> {
     /// unpartitioned tables. Removes filter-only fields and `is_add`, retaining `remove` and
     /// `version` for replay.
     fn project_output(&self, plan: PlanBuilder, stats: StatsKind) -> KernelResult<PlanBuilder> {
-        let output_stats_schema = self.scan.state_info.physical_stats_output_schema();
+        let output_stats_schema = self.output_stats_schema;
 
         plan.project_patch(|mut patch| {
             let read_stats = patch
@@ -293,7 +315,7 @@ impl<'a> MetadataPlanner<'a> {
                     patch.insert_after_at([ADD_NAME], STATS, field, expr)
                 }),
                 StatsKind::Struct | StatsKind::Both => {
-                    if stats == StatsKind::Struct && self.scan.stats.synthesize_json {
+                    if stats == StatsKind::Struct && self.stats.synthesize_json {
                         let field = StructField::nullable(STATS, DataType::STRING);
                         let expr =
                             Expr::unary(UnaryExpressionOp::ToJson, col!(ADD_NAME, STATS_PARSED));
@@ -316,7 +338,7 @@ impl<'a> MetadataPlanner<'a> {
 
             // If parsed partitions is present but was not requested, drop it.
             if self.parsed_partition_schema.is_some()
-                && !self.scan.partition_values_options.parsed_struct
+                && !self.partition_values_options.parsed_struct
             {
                 patch = patch.drop_at([ADD_NAME], PARTITION_VALUES_PARSED);
             }
@@ -359,6 +381,39 @@ impl<'a> MetadataPlanner<'a> {
 }
 
 impl Scan {
+    pub(super) fn build_metadata_scan_plan_with(
+        &self,
+        base: MetadataReplayBase,
+        planner: &MetadataPlanner<'_>,
+    ) -> KernelResult<Option<Plan>> {
+        MetadataScanPlan {
+            log_segment: self.snapshot.log_segment(),
+            skip_all: self.state_info.physical_predicate == PhysicalPredicate::StaticSkipAll,
+        }
+        .build_metadata_scan_plan_with_commits(base, planner, None)
+    }
+
+    #[cfg(test)]
+    fn build_metadata_scan_plan(
+        &self,
+        shape: &CheckpointShape,
+        planner: &MetadataPlanner<'_>,
+    ) -> KernelResult<Option<Plan>> {
+        let base = MetadataReplayBase::Checkpoint {
+            version: self.snapshot.log_segment().checkpoint_version,
+            shape: shape.clone(),
+        };
+        self.build_metadata_scan_plan_with(base, planner)
+    }
+}
+
+/// Inputs shared by owned-snapshot and borrowed-state metadata replay.
+pub(super) struct MetadataScanPlan<'a> {
+    pub(super) log_segment: &'a LogSegment,
+    pub(super) skip_all: bool,
+}
+
+impl MetadataScanPlan<'_> {
     /// Build the live-add metadata plan from checkpoint and commit actions.
     ///
     /// Returns `None` for an empty result.
@@ -368,17 +423,17 @@ impl Scan {
         fields(enable_call_frame),
         err
     )]
-    pub(super) fn build_metadata_scan_plan_with(
+    pub(super) fn build_metadata_scan_plan_with_commits(
         &self,
         base: MetadataReplayBase,
         planner: &MetadataPlanner<'_>,
+        commit_files: Option<Vec<ScanFile>>,
     ) -> KernelResult<Option<Plan>> {
-        let state = &self.state_info;
-        if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
+        if self.skip_all {
             return Ok(None);
         }
 
-        let commit_actions = self.commit_arm(base.version(), planner)?;
+        let commit_actions = self.commit_arm(base.version(), planner, commit_files)?;
 
         let deduped_commit = commit_actions.aggregate_by([column_name!(FILE_ACTION_KEY)], |a| {
             // Each group with a non-null FILE_ACTION_KEY contains the adds and removes for a given
@@ -409,19 +464,6 @@ impl Scan {
             .project_patch(|patch| patch.drop(FILE_ACTION_KEY))?;
 
         PlanBuilder::union_all([commit_live_adds, base_live_adds])?.build_opt()
-    }
-
-    #[cfg(test)]
-    fn build_metadata_scan_plan(
-        &self,
-        shape: &CheckpointShape,
-        planner: &MetadataPlanner<'_>,
-    ) -> KernelResult<Option<Plan>> {
-        let base = MetadataReplayBase::Checkpoint {
-            version: self.snapshot.log_segment().checkpoint_version,
-            shape: shape.clone(),
-        };
-        self.build_metadata_scan_plan_with(base, planner)
     }
 
     fn crc_arm(&self, files: Vec<Add>, planner: &MetadataPlanner<'_>) -> KernelResult<PlanBuilder> {
@@ -471,7 +513,7 @@ impl Scan {
         shape: &CheckpointShape,
         planner: &MetadataPlanner<'_>,
     ) -> KernelResult<PlanBuilder> {
-        let log_segment = self.snapshot.log_segment();
+        let log_segment = self.log_segment;
         let available_file_schema = shape
             .leaf_checkpoint_schema
             .as_deref()
@@ -528,13 +570,17 @@ impl Scan {
         &self,
         base_version: Option<Version>,
         planner: &MetadataPlanner<'_>,
+        files: Option<Vec<ScanFile>>,
     ) -> KernelResult<PlanBuilder> {
-        let log_segment = self.snapshot.log_segment();
-        let commit_files = match base_version {
-            Some(version) => log_segment
-                .segment_after_version(version)
-                .commit_cover_version_tagged_scan_files()?,
-            None => log_segment.commit_cover_version_tagged_scan_files()?,
+        let log_segment = self.log_segment;
+        let commit_files = match files {
+            Some(files) => files,
+            None => match base_version {
+                Some(version) => log_segment
+                    .segment_after_version(version)
+                    .commit_cover_version_tagged_scan_files()?,
+                None => log_segment.commit_cover_version_tagged_scan_files()?,
+            },
         };
         planner
             .build_metadata_scan(get_all_actions_schema(), true, |schema| {
