@@ -603,7 +603,7 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
     assert_extern_result_error_contains(rejected, KernelError::InvalidSnapshotHint, "generation");
 
     if uploaded {
-        for transferred in ["", "wrong length"] {
+        for transferred in ["", "not a schema"] {
             let rejected = unsafe {
                 snapshot_core_declarative_metadata_plan_trusted_with_schema(
                     trusted_core.shallow_copy(),
@@ -613,26 +613,21 @@ fn externalized_core_builds_declarative_plan_from_scoped_host_state(
                     plan_engine.shallow_copy(),
                 )
             };
-            assert_extern_result_error_contains(
+            assert_extern_result_error_with_message(
                 rejected,
-                KernelError::InvalidSnapshotHint,
-                "schema length",
+                KernelError::MalformedJsonError,
+                None,
             );
         }
     }
 
-    scan_state.protocol.min_reader_version = i32::MAX;
-    scan_state.metadata.id = invalid_utf8();
-    if !uploaded {
-        scan_state.metadata.schema_string = invalid_utf8();
-    }
     let trusted = unsafe {
         if uploaded {
             snapshot_core_declarative_metadata_plan_trusted_with_schema(
                 trusted_core.shallow_copy(),
                 &scan_state,
                 42,
-                schema_upload(&"x".repeat(schema_text.len())),
+                schema_upload(&schema_text),
                 plan_engine.shallow_copy(),
             )
         } else {

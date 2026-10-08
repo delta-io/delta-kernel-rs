@@ -168,6 +168,37 @@ impl TableConfiguration {
         Self::try_new_inner(metadata, protocol, table_root, version, logical_schema)
     }
 
+    /// Materializes configuration from state validated by a source snapshot.
+    ///
+    /// The schema still has to be parsed because the caller supplies portable metadata rather
+    /// than a native [`SchemaRef`]. Compatibility checks already performed while building the
+    /// source snapshot are not repeated.
+    #[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+    pub(crate) fn try_new_for_scan_from_validated_state(
+        metadata: Metadata,
+        protocol: Protocol,
+        table_root: Url,
+        version: Version,
+    ) -> DeltaResult<Self> {
+        let logical_schema = Arc::new(metadata.parse_schema()?);
+        let table_properties = metadata.parse_table_properties();
+        let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
+        Ok(Self {
+            metadata,
+            protocol,
+            logical_schema,
+            // Read planning never inspects transaction-only column-default state. The source
+            // snapshot already validated the metadata, so do not traverse the schema again.
+            has_column_with_default: false,
+            physical_schema: OnceLock::new(),
+            filtered_data_schemas: OnceLock::new(),
+            table_properties,
+            column_mapping_mode,
+            table_root,
+            version,
+        })
+    }
+
     /// Like [`try_new`](Self::try_new), but reuses `base`'s protocol, table root, and version
     /// and takes a pre-parsed `logical_schema`.
     pub(crate) fn try_new_with_schema(

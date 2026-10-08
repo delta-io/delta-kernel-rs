@@ -88,20 +88,30 @@ pub(crate) fn declarative_metadata_scan_plan_from_state_with_metadata(
     metadata_plan_with_components(state, engine, || Ok((metadata, state.protocol()?)))
 }
 
-/// Build the default metadata plan from a configuration validated by the source snapshot.
+/// Build a default metadata plan from portable state validated by a source snapshot.
 ///
-/// This is only for a trusted externalization of that snapshot. The connector-owned log state is
-/// still reconstructed for this call, but its validated structure and the metadata, protocol, and
-/// schema are not revalidated.
+/// The configuration is materialized only for this call. Source-proven schema, protocol, and log
+/// compatibility checks are not repeated, and no native configuration survives the call.
 #[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
 #[internal_api]
-pub(crate) fn declarative_metadata_scan_plan_from_validated_state(
+pub(crate) fn declarative_metadata_scan_plan_from_trusted_state(
     state: &dyn SnapshotScanState,
-    table_configuration: &TableConfiguration,
+    metadata: crate::actions::Metadata,
     engine: &dyn Engine,
 ) -> DeltaResult<Option<Plan>> {
     let (log_segment, commit_files) = metadata_plan_log_inputs(state, true)?;
-    metadata_plan_with_configuration(engine, log_segment, commit_files, table_configuration)
+    let table_configuration = TableConfiguration::try_new_for_scan_from_validated_state(
+        metadata,
+        state.protocol()?,
+        state.table_root().clone(),
+        state.version(),
+    )?;
+    metadata_plan_with_validated_configuration(
+        engine,
+        log_segment,
+        commit_files,
+        &table_configuration,
+    )
 }
 
 #[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
@@ -147,6 +157,21 @@ fn metadata_plan_with_configuration(
     table_configuration: &TableConfiguration,
 ) -> DeltaResult<Option<Plan>> {
     table_configuration.ensure_operation_supported(Operation::Scan)?;
+    metadata_plan_with_validated_configuration(
+        engine,
+        log_segment,
+        commit_files,
+        table_configuration,
+    )
+}
+
+#[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+fn metadata_plan_with_validated_configuration(
+    engine: &dyn Engine,
+    log_segment: LogSegment,
+    commit_files: Option<Vec<crate::plans::ir::nodes::ScanFile>>,
+    table_configuration: &TableConfiguration,
+) -> DeltaResult<Option<Plan>> {
     let table_schema = table_configuration.logical_schema();
     if table_schema.num_fields() == 0 {
         return Err(Error::generic(

@@ -26,7 +26,7 @@ pub struct SnapshotCore {
     version: Version,
     latest: bool,
     generation: u64,
-    validated_configuration: Option<Arc<delta_kernel::table_configuration::TableConfiguration>>,
+    trusted_externalization: bool,
 }
 
 /// Shared handle for a snapshot whose component state is held by its connector.
@@ -93,7 +93,7 @@ pub unsafe extern "C" fn snapshot_visit_log_paths(
 unsafe fn core_from_snapshot(
     snapshot: &Handle<SharedSnapshot>,
     generation: u64,
-    retain_validated_configuration: bool,
+    trusted_externalization: bool,
 ) -> Arc<SnapshotCore> {
     let owned = unsafe { snapshot.as_ref() };
     Arc::new(SnapshotCore {
@@ -101,8 +101,7 @@ unsafe fn core_from_snapshot(
         version: owned.version(),
         latest: owned.is_built_as_latest(),
         generation,
-        validated_configuration: retain_validated_configuration
-            .then(|| Arc::new(owned.table_configuration().clone())),
+        trusted_externalization,
     })
 }
 
@@ -152,10 +151,10 @@ pub unsafe extern "C" fn snapshot_externalize_validated_core(
     unsafe { core_from_snapshot(&snapshot, generation, false) }.into()
 }
 
-/// Externalize a core that can plan from configuration validated by the source snapshot.
+/// Externalize a core that can plan from portable state validated by the source snapshot.
 ///
-/// Unlike [`snapshot_externalize_validated_core`], this retains the parsed table configuration
-/// after the source snapshot is released. Use it only when trusted planning is enabled.
+/// Unlike [`snapshot_externalize_validated_core`], this grants access to trusted planning. It does
+/// not retain the parsed table configuration after the source snapshot is released.
 ///
 /// # Safety
 ///
@@ -323,13 +322,13 @@ fn metadata_plan(
         .into())
 }
 
-/// Build a declarative scan plan using configuration retained from the source snapshot.
+/// Build a declarative scan plan from portable state validated by the source snapshot.
 ///
-/// Unlike the ordinary planning entry point, this does not read, parse, or validate the
-/// connector's metadata, protocol, or schema. Only a core created by
-/// [`snapshot_externalize_trusted_core`] has the retained configuration required here.
-/// Generation, version, freshness, FFI bounds, and scan-operation checks still run. Log paths are
-/// transferred and decoded, but their source-snapshot structural validation is not repeated.
+/// Unlike the ordinary planning entry point, this reconstructs ephemeral native configuration
+/// without repeating source-proven compatibility checks. Only a core created by
+/// [`snapshot_externalize_trusted_core`] grants access to this path. Generation, version,
+/// freshness, FFI bounds, and scan-operation checks still run. Portable metadata and log paths
+/// are parsed, but no substantial native snapshot state survives the call.
 ///
 /// # Safety
 ///
@@ -346,7 +345,13 @@ pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan_trusted(
 ) -> ExternResult<crate::OptionalValue<crate::KernelOwnedBytes>> {
     let core = unsafe { core.as_ref() };
     let extern_engine = unsafe { engine.as_ref() };
-    let result = trusted_metadata_plan(core, value, generation, extern_engine.engine().as_ref());
+    let result = trusted_metadata_plan(
+        core,
+        value,
+        generation,
+        None,
+        extern_engine.engine().as_ref(),
+    );
     result.into_extern_result(&extern_engine)
 }
 
@@ -355,21 +360,22 @@ fn trusted_metadata_plan(
     core: &SnapshotCore,
     value: &FfiSnapshotScanState,
     generation: u64,
+    metadata: Option<delta_kernel::actions::Metadata>,
     engine: &dyn delta_kernel::Engine,
 ) -> DeltaResult<crate::OptionalValue<crate::KernelOwnedBytes>> {
     validate_scan_identity(core, value, generation)?;
-    let configuration = core
-        .validated_configuration
-        .as_deref()
-        .ok_or_else(|| invalid("trusted planning requires a trusted externalized snapshot core"))?;
+    if !core.trusted_externalization {
+        return Err(invalid(
+            "trusted planning requires a trusted externalized snapshot core",
+        ));
+    }
     let state = BorrowedSnapshotScanState {
         value,
         table_root: &core.table_root,
     };
-    let plan = delta_kernel::scan::declarative_metadata_scan_plan_from_validated_state(
-        &state,
-        configuration,
-        engine,
+    let metadata = metadata.map_or_else(|| state.metadata(), Ok)?;
+    let plan = delta_kernel::scan::declarative_metadata_scan_plan_from_trusted_state(
+        &state, metadata, engine,
     )?;
     Ok(plan
         .map(|plan| {
@@ -508,11 +514,10 @@ pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan_with_schema(
     result.into_extern_result(&engine)
 }
 
-/// Trusted planning variant that consumes a transferred schema without reparsing it.
+/// Trusted planning variant that consumes a transferred schema.
 ///
-/// The completed upload preserves the same Java-to-native transfer behavior as the validating
-/// path, but the retained source-snapshot configuration is authoritative. This entry point checks
-/// upload completeness and does not interpret its bytes.
+/// The completed upload is parsed to materialize an ephemeral table configuration. Compatibility
+/// checks already performed by the source snapshot are not repeated.
 ///
 /// # Safety
 /// Consumes `upload` unconditionally, including on errors. Other handles and `value` are borrowed
@@ -535,22 +540,15 @@ pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan_trusted_with_sc
         if value.metadata.schema_string.len != 0 {
             return Err(invalid("Schema supplied both inline and as an upload"));
         }
-        let uploaded_schema = upload.finish_bytes()?;
-        let expected_schema_len = core
-            .validated_configuration
-            .as_deref()
-            .ok_or_else(|| {
-                invalid("trusted planning requires a trusted externalized snapshot core")
-            })?
-            .metadata()
-            .schema_string()
-            .len();
-        if uploaded_schema.len() != expected_schema_len {
-            return Err(invalid(
-                "Uploaded schema length differs from the trusted source snapshot",
-            ));
-        }
-        trusted_metadata_plan(core, value, generation, engine.engine().as_ref())
+        let schema = upload.finish()?;
+        let metadata = unsafe { value.metadata.try_to_kernel_with_schema(schema) }?;
+        trusted_metadata_plan(
+            core,
+            value,
+            generation,
+            Some(metadata),
+            engine.engine().as_ref(),
+        )
     })();
     result.into_extern_result(&engine)
 }
