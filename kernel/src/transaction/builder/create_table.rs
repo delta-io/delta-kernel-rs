@@ -1185,6 +1185,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "check-constraints-in-dev")]
     fn test_property_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
         entries
             .iter()
@@ -1194,8 +1195,12 @@ mod tests {
 
     #[cfg(feature = "check-constraints-in-dev")]
     #[rstest]
+    // Names a user would expect.
     #[case::lowercase_key("delta.constraints.positive", "delta.constraints.positive")]
     #[case::mixed_case_name("delta.constraints.MyCheck", "delta.constraints.mycheck")]
+    // Unusual names, accepted like any other name.
+    #[case::bare_prefix("delta.constraints.", "delta.constraints.")]
+    #[case::whitespace_only_name("delta.constraints.   ", "delta.constraints.   ")]
     fn create_table_stores_check_constraints_under_lowercased_keys(
         #[case] key: &str,
         #[case] expected_key: &str,
@@ -1205,6 +1210,35 @@ mod tests {
 
         let stored: Vec<_> = validated.properties.keys().map(String::as_str).collect();
         assert_eq!(stored, [expected_key]);
+    }
+
+    #[cfg(feature = "check-constraints-in-dev")]
+    #[rstest]
+    #[case::check_constraint_key("delta.constraints.MyCheck", "delta.constraints.mycheck", true)]
+    #[case::non_lowercase_prefix("DELTA.CONSTRAINTS.MyCheck", "DELTA.CONSTRAINTS.MyCheck", false)]
+    fn create_table_enables_check_constraints_only_for_check_constraint_keys(
+        #[case] key: &str,
+        #[case] expected_key: &str,
+        #[case] expect_feature: bool,
+    ) {
+        let properties = test_property_map(&[(key, "amount > 0")]);
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        maybe_enable_check_constraints(&mut validated);
+
+        let stored: Vec<_> = validated.properties.keys().map(String::as_str).collect();
+        assert_eq!(stored, [expected_key]);
+        let enables_feature = validated
+            .writer_features
+            .contains(&TableFeature::CheckConstraints);
+        assert_eq!(enables_feature, expect_feature);
+    }
+
+    #[cfg(feature = "check-constraints-in-dev")]
+    #[test]
+    fn create_table_rejects_check_constraints_feature_signal() {
+        let properties = test_property_map(&[("delta.feature.checkConstraints", "supported")]);
+        let result = validate_extract_table_features_and_properties(properties);
+        assert_result_error_with_message(result, "Enabling feature 'checkConstraints'");
     }
 
     #[cfg(feature = "check-constraints-in-dev")]

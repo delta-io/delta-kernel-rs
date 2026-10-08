@@ -511,6 +511,9 @@ impl<S> Transaction<S> {
     /// - Reject every written row, including its partition values, for which a constraint evaluates
     ///   to `false` or `NULL`. This includes files written for an earlier commit attempt, such as
     ///   one that conflicted, and validated against an older table version.
+    /// - When the commit introduces a constraint, verify that its SQL is a Boolean expression that
+    ///   only references existing logical columns, as the Delta protocol requires. Kernel checks
+    ///   neither, so this also applies to a table that holds no data.
     /// - When the commit introduces a constraint on a table that already holds data, verify that
     ///   every existing row satisfies it.
     ///
