@@ -128,6 +128,17 @@ test_release_command_dispatch() {
     if (
         # shellcheck source=release.sh
         source "$REPOSITORY_ROOT/release.sh"
+        check_requirements() { :; }
+        is_main_branch() { return 0; }
+        main crate unity-catalog-delta-client-api 0.2.0
+    ) > "$failure_log" 2>&1; then
+        fail "crate release unexpectedly succeeded on main"
+    fi
+    assert_contains "$failure_log" "Create a release branch before bumping a crate"
+
+    if (
+        # shellcheck source=release.sh
+        source "$REPOSITORY_ROOT/release.sh"
         run_cargo_release() { :; }
         verify_release_changelog() { return 1; }
         handle_release_branch 0.29.0
@@ -142,6 +153,69 @@ commit_file() {
     printf '%s\n' "$contents" > tracked.txt
     git add tracked.txt
     git commit -q -m "$message"
+}
+
+test_working_tree_cleanliness() {
+    local repository="$TEST_ROOT/cleanliness-repository"
+    mkdir -p "$repository"
+    cd "$repository"
+    git init -q -b main
+    git config user.email release-test@example.com
+    git config user.name "Release Test"
+    git config core.hooksPath /dev/null
+    commit_file "chore: initial file" "initial"
+
+    # shellcheck source=release.sh
+    source "$REPOSITORY_ROOT/release.sh"
+    is_working_tree_clean || fail "clean working tree was rejected"
+
+    printf 'untracked\n' > unrelated.txt
+    if is_working_tree_clean; then
+        fail "untracked file was accepted by the release cleanliness check"
+    fi
+    git add unrelated.txt
+    if is_working_tree_clean; then
+        fail "staged file was accepted by the release cleanliness check"
+    fi
+    git commit -q -m "chore: add file"
+    printf 'modified\n' > tracked.txt
+    if is_working_tree_clean; then
+        fail "modified file was accepted by the release cleanliness check"
+    fi
+}
+
+test_tag_commit_validation() {
+    local failure_log="$TEST_ROOT/tag-commit-failure"
+    local prompt="$TEST_ROOT/tag-prompt"
+    cd "$TEST_ROOT/cleanliness-repository"
+
+    # shellcheck source=release.sh
+    source "$REPOSITORY_ROOT/release.sh"
+    get_current_version() { echo 0.1.0; }
+    confirm() {
+        printf '%s\n' "$1" > "$prompt"
+        return 1
+    }
+
+    if (tag_release unity-catalog-delta-client-api missing-commit) \
+        > "$failure_log" 2>&1; then
+        fail "tagging unexpectedly accepted an invalid commit"
+    fi
+    assert_contains "$failure_log" "Not a valid commit: missing-commit"
+    [[ ! -f "$prompt" ]] || fail "invalid commit reached the confirmation prompt"
+
+    if (tag_release unity-catalog-delta-client-api HEAD:tracked.txt) \
+        > "$failure_log" 2>&1; then
+        fail "tagging unexpectedly accepted a file object as a commit"
+    fi
+    assert_contains "$failure_log" "Not a valid commit: HEAD:tracked.txt"
+    [[ ! -f "$prompt" ]] || fail "file object reached the confirmation prompt"
+
+    tag_release unity-catalog-delta-client-api HEAD
+    assert_contains "$prompt" "at $(git rev-parse --short HEAD)?"
+    if git rev-parse -q --verify refs/tags/v0.1.0_unity-catalog-delta-client-api >/dev/null; then
+        fail "declining confirmation unexpectedly created a tag"
+    fi
 }
 
 test_changelog_refresh_and_verification() {
@@ -299,4 +373,6 @@ test_changelog_refresh_and_verification() {
 
 test_registry_override
 test_release_command_dispatch
+test_working_tree_cleanliness
+test_tag_commit_validation
 test_changelog_refresh_and_verification

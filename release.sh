@@ -3,19 +3,19 @@
 ###################################################################################################
 # USAGE:
 # Release the kernel crates (they share the workspace version):
-#   1. on a release branch: ./release.sh release <version>
-#   2. after merging to main: ./release.sh tag delta_kernel
+#   1. prepare on a release branch: ./release.sh release <version>
+#   2. publish and tag on main after merging: ./release.sh release
 #
-# Release one independently-versioned crate (the Unity Catalog crates):
-#   1. on a release branch: ./release.sh crate <crate> <version>
+# Prepare one independently-versioned crate (the Unity Catalog crates):
+#   1. prepare on a release branch: ./release.sh crate <crate> <version>
 #      (example: ./release.sh crate unity-catalog-delta-client-api 0.2.0)
-#   2. after merging to main: ./release.sh tag <crate>
+#   2. create and push its tag after merging: ./release.sh tag <crate>
+#      The tag command does not publish the crate to crates.io.
 #
 # Refresh a kernel release PR: ./release.sh changelog <version>
 # Verify its changelog covers every merged PR: ./release.sh verify-changelog [version]
 #
-# Releasing both means running the kernel steps and then the per-crate steps; a kernel bump
-# rewrites what the UC crates require of the kernel, but never their own versions.
+# A kernel bump rewrites what the UC crates require of the kernel, but never their own versions.
 #
 # Set DELTA_KERNEL_RELEASE_REGISTRY when cargo-release must use an alternate registry:
 #   DELTA_KERNEL_RELEASE_REGISTRY=<registry-name> ./release.sh release 0.29.0
@@ -86,7 +86,9 @@ is_main_branch() {
 }
 
 is_working_tree_clean() {
-    git diff --quiet && git diff --cached --quiet
+    local status
+    status=$(git status --porcelain --untracked-files=all) || return 1
+    [[ -z "$status" ]]
 }
 
 # check if the version is already published on crates.io
@@ -349,6 +351,10 @@ independent_dependents_of() {
 handle_crate_release() {
     local crate_name="$1" version="$2"
 
+    if is_main_branch; then
+        log_error "Create a release branch before bumping a crate"
+    fi
+
     case "$crate_name" in
         delta_kernel | delta_kernel_derive | delta_kernel_default_engine)
             log_error "$crate_name uses the workspace version\nUsage: $0 release <version>"
@@ -447,7 +453,7 @@ tag_name_for() {
 # Tag a release and push the tag to upstream. Pass the commit to tag if it is not HEAD.
 tag_release() {
     local crate_name="$1" commit="${2:-HEAD}"
-    local version tag
+    local version tag commit_hash
 
     # These are published from the kernel's workspace version, so they carry no tag of their own.
     case "$crate_name" in
@@ -466,8 +472,12 @@ tag_release() {
         log_error "tag $tag already exists"
     fi
 
-    if confirm "Tag $crate_name $version as $tag at $(git rev-parse --short "$commit")?"; then
-        git tag -a "$tag" "$commit" -m "Release $tag"
+    if ! commit_hash=$(git rev-parse --verify --end-of-options "${commit}^{commit}" 2>/dev/null); then
+        log_error "Not a valid commit: $commit"
+    fi
+
+    if confirm "Tag $crate_name $version as $tag at $(git rev-parse --short "$commit_hash")?"; then
+        git tag -a "$tag" "$commit_hash" -m "Release $tag"
         git push upstream tag "$tag"
         log_success "Tagged and pushed $tag"
     fi
@@ -511,7 +521,11 @@ usage() {
         "  $0 crate <crate> <version>" \
         "  $0 tag <crate> [commit]" \
         "  $0 changelog <version>" \
-        "  $0 verify-changelog [version]"
+        "  $0 verify-changelog [version]" \
+        "" \
+        "release <version> prepares a kernel release; release on main publishes and tags it." \
+        "crate <crate> <version> prepares a crate release." \
+        "tag <crate> [commit] creates and pushes a tag without publishing."
 }
 
 main() {
