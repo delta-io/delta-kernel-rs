@@ -774,8 +774,7 @@ fn validate_extract_table_features_and_properties(
         add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
     }
 
-    // Validate remaining delta.* properties against the allow list. CHECK constraint keys get a
-    // dedicated error.
+    // Validate remaining delta.* properties against the allow list
     for key in properties.keys() {
         if strip_check_constraint_prefix(key).is_some() {
             return Err(KernelError::generic(format!(
