@@ -32,6 +32,7 @@ impl LogPath {
     ///
     /// FFI backends use this to move an immutable snapshot's log-segment identity into
     /// connector-owned memory without retaining the snapshot itself.
+    #[allow(unused)]
     #[internal_api]
     pub(crate) fn file_meta(&self) -> &FileMeta {
         &self.0.location
