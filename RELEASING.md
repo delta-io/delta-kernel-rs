@@ -113,7 +113,7 @@ git switch -c crate-release/unity-catalog-delta-client-api-0.2.0 upstream/main
 The command refuses to run on `main` and requires a clean working tree, including untracked files.
 It bumps the selected crate, updates its dependents' version requirements, and prepends release
 notes to `<crate>/CHANGELOG.md`. It creates a release commit and can push the branch and open a PR.
-Review the manifest changes and generated changelog before merging.
+Review the manifests and changelog before merging; add dependency-upgrade notes when relevant.
 
 Use the `crate-release/` prefix for UC release branches. CI reserves `release/` for Kernel releases
 and runs Kernel changelog verification on those branches.
@@ -153,8 +153,8 @@ For version `0.2.0`, this creates and pushes the annotated tag
 ./release.sh tag unity-catalog-delta-client-api <release-commit>
 ```
 
-The version in the tag comes from the current checkout's manifest. The command validates the target
-commit before asking for confirmation. Tagging does not publish the crate, and `release` on `main`
+The version in the tag comes from the current checkout's manifest, which must match the target
+commit's manifest. Tagging does not publish the crate, and `release` on `main`
 publishes only the Kernel crates.
 UC publication is handled separately from this script. If a tag push fails, retry with
 `git push upstream tag <tag>`; the annotated tag remains local.

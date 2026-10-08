@@ -234,7 +234,7 @@ test_working_tree_cleanliness() {
 
 test_tag_commit_validation() {
     local failure_log="$TEST_ROOT/tag-commit-failure"
-    local prompt="$TEST_ROOT/tag-prompt"
+    local prompt="$TEST_ROOT/tag-prompt" release_commit
     init_release_workspace "$TEST_ROOT/tag-repository"
     commit_file "chore: initial file" "initial"
 
@@ -265,6 +265,19 @@ test_tag_commit_validation() {
     if git rev-parse -q --verify refs/tags/v0.29.0_unity-catalog-delta-client-api >/dev/null; then
         fail "declining confirmation unexpectedly created a tag"
     fi
+    release_commit=$(git rev-parse HEAD)
+    sed -i 's/version = "0.29.0"/version = "0.30.0"/' api/Cargo.toml
+    for state in dirty committed; do
+        if [[ "$state" == committed ]]; then
+            git add api/Cargo.toml
+            git commit -q -m "chore: bump API version"
+        fi
+        if (tag_release unity-catalog-delta-client-api "$release_commit") \
+            > "$failure_log" 2>&1; then
+            fail "$state manifest mismatch was accepted"
+        fi
+        assert_contains "$failure_log" "release manifest must match the commit being tagged"
+    done
 }
 
 test_tag_publication() {

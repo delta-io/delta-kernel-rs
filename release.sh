@@ -23,14 +23,8 @@
 
 # This script prepares Kernel and UC releases, publishes the Kernel crates, and creates release tags.
 #
-# The Unity Catalog crates carry their own versions rather than the workspace version. Both their
-# literal `version` and their `[package.metadata.release] release = false` are needed to keep a
-# `cargo release --workspace <version>` bump from sweeping them to the kernel's version. Their
-# dependency requirements on the kernel still get rewritten by that bump.
-#
-# `release = false` also hides them from package selection, so bump them with
-# `cargo release version -p <crate> <version> --isolated`, which rewrites their dependents'
-# version requirements too.
+# UC crates have literal versions and `release = false` to exclude them from Kernel version bumps.
+# `--isolated` allows selecting them for per-crate bumps and updates dependent requirements.
 
 # Exit on error, undefined variables, and pipe failures
 set -euo pipefail
@@ -315,9 +309,7 @@ handle_release_branch() {
     review_and_open_pr "release $version"
 }
 
-# A release rewrites what its dependents require of it, but cannot know whether their own APIs broke
-# along with it. List the crates that depend on this one and keep their own versions, with the
-# command to bump each, so a breaking release does not leave a dependent claiming the old version.
+# Dependency requirement updates do not determine whether dependents need their own version bumps.
 warn_dependents() {
     local crate_name="$1" version="$2" dependent
     local dependents
@@ -361,9 +353,7 @@ crate_directory() {
     dirname "$manifest_path"
 }
 
-# Bump one independently-versioned crate and the requirements its dependents place on it.
-# `--isolated` is what lets `-p` select a crate that sets `release = false`; it discards
-# release.toml, which costs nothing for a version bump (no tag, publish, or commit happens).
+# `--isolated` lets `-p` select crates marked `release = false` for a version-only bump.
 handle_crate_release() {
     local crate_name="$1" version="$2" crate_path
 
@@ -394,9 +384,7 @@ handle_crate_release() {
     review_and_open_pr "release $crate_name $version"
 }
 
-# Prepend this crate's commits to its own CHANGELOG. Scoped by path so the changelog only collects
-# commits that touched this crate. cliff.toml's template renders the leading `v`, so --tag takes the
-# tag name without it.
+# cliff.toml renders the leading `v`, so --tag takes the tag name without it.
 update_crate_changelog() {
     local crate_name="$1" version="$2"
     local crate_path="${3:-}"
@@ -442,10 +430,8 @@ review_and_open_pr() {
     fi
 }
 
-# Handle main branch workflow (publish and tag)
 handle_main_branch() {
-    # could potentially just use full 'cargo release' command here
-    # publish order matters: each crate depends on the previous at the same workspace version
+    # Publish dependencies before their dependents.
     publish "delta_kernel_derive"
     publish "delta_kernel"
     publish "delta_kernel_default_engine"
@@ -453,10 +439,7 @@ handle_main_branch() {
     tag_release "delta_kernel"
 }
 
-# Tag name for a crate's release. The kernel crates share the workspace version, so one bare
-# `v<version>` covers all of them and `delta_kernel` stands in for the set. Crates on their own
-# version line take a `_<crate>` suffix, so a low version number cannot be mistaken for an old
-# kernel tag (the kernel really was at 0.1.0 once).
+# The UC suffix separates independent versions from Kernel release tags.
 tag_name_for() {
     local crate_name="$1" version="$2"
     case "$crate_name" in
@@ -488,6 +471,10 @@ tag_release() {
     if ! commit_hash=$(git rev-parse --verify --end-of-options "${commit}^{commit}" 2>/dev/null); then
         log_error "Not a valid commit: $commit"
     fi
+    local manifest="Cargo.toml"
+    [[ "$crate_name" == delta_kernel ]] || manifest="$(crate_directory "$crate_name")/Cargo.toml"
+    git -C "$REPO_ROOT" diff --quiet "$commit_hash" -- "$manifest" || \
+        log_error "Checkout's release manifest must match the commit being tagged"
 
     if confirm "Tag $crate_name $version as $tag at $(git rev-parse --short "$commit_hash")?"; then
         git tag -a "$tag" "$commit_hash" -m "Release $tag"
