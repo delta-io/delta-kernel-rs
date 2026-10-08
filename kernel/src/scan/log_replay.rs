@@ -795,21 +795,22 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
     }
 }
 
-pub(crate) const FILE_CONSTANT_VALUES_NAME: &str = "fileConstantValues";
-pub(crate) const PATH_NAME: &str = "path";
-pub(crate) const BASE_ROW_ID_NAME: &str = "baseRowId";
-pub(crate) const DEFAULT_ROW_COMMIT_VERSION_NAME: &str = "defaultRowCommitVersion";
-pub(crate) const CLUSTERING_PROVIDER_NAME: &str = "clusteringProvider";
-pub(crate) const PARTITION_VALUES_NAME: &str = "partitionValues";
-pub(crate) const SIZE_NAME: &str = "size";
-pub(crate) const MODIFICATION_TIME_NAME: &str = "modificationTime";
+pub(crate) static FILE_CONSTANT_VALUES_NAME: &str = "fileConstantValues";
+pub(crate) static PATH_NAME: &str = "path";
+pub(crate) static BASE_ROW_ID_NAME: &str = "baseRowId";
+pub(crate) static DEFAULT_ROW_COMMIT_VERSION_NAME: &str = "defaultRowCommitVersion";
+pub(crate) static CLUSTERING_PROVIDER_NAME: &str = "clusteringProvider";
+pub(crate) static PARTITION_VALUES_NAME: &str = "partitionValues";
+pub(crate) static SIZE_NAME: &str = "size";
 #[cfg(feature = "adaptive-metadata-in-dev")]
-pub(crate) const DATA_CHANGE_NAME: &str = "dataChange";
-pub(crate) const TAGS_NAME: &str = "tags";
-pub(crate) const STATS_NAME: &str = "stats";
-pub(crate) const STATS_PARSED_NAME: &str = "stats_parsed";
+pub(crate) static MODIFICATION_TIME_NAME: &str = "modificationTime";
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) static DATA_CHANGE_NAME: &str = "dataChange";
+pub(crate) static TAGS_NAME: &str = "tags";
+pub(crate) static STATS_NAME: &str = "stats";
+pub(crate) static STATS_PARSED_NAME: &str = "stats_parsed";
 #[internal_api]
-pub(crate) const PARTITION_VALUES_PARSED_NAME: &str = "partitionValues_parsed";
+pub(crate) static PARTITION_VALUES_PARSED_NAME: &str = "partitionValues_parsed";
 
 // NB: If you update this schema, ensure you update the comment describing it in the doc comment
 // for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
@@ -818,7 +819,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     // Note that fields projected out of a nullable struct must be nullable
     nullable PATH_NAME: STRING,
     nullable SIZE_NAME: LONG,
-    nullable MODIFICATION_TIME_NAME: LONG,
+    nullable "modificationTime": LONG,
     nullable STATS_NAME: STRING,
     nullable "deletionVector": (DeletionVectorDescriptor::to_schema()),
     nullable FILE_CONSTANT_VALUES_NAME: {

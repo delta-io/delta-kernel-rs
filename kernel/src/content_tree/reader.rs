@@ -54,8 +54,7 @@ pub(crate) struct ReadContext {
 /// # Returns
 /// A [`FilteredEngineData`] over an `Add`-action batch (one row per input entry, schema
 /// [`crate::actions::LOG_ADD_SCHEMA`]), whose selection vector keeps only the entries that read as
-/// live data files. The selection is returned rather than applied so the caller can fold it into
-/// its own selection vector.
+/// live data files.
 ///
 /// # Errors
 /// Returns an error if an entry carries an unknown content-type or tracking-status value, if a
@@ -110,16 +109,18 @@ fn build_entry_to_add_expression(ctx: &ReadContext) -> KernelResult<Expression> 
             // table-relative `Add.path` (percent-decoding, and relativizing against a manifest
             // location for non-root entries) is not yet done -- it flows through verbatim, which
             // round-trips only the minimal-root case that stored the raw path.
-            PATH_NAME => Expression::column([LOCATION]),
+            n if n == PATH_NAME => Expression::column([LOCATION]),
             // TODO(#3320): read partition values from the entry's `partition` tuple once the read
             // path carries a partition spec.
-            PARTITION_VALUES_NAME => empty_partition_values.clone(),
-            SIZE_NAME => Expression::column([FILE_SIZE_IN_BYTES]),
+            n if n == PARTITION_VALUES_NAME => empty_partition_values.clone(),
+            n if n == SIZE_NAME => Expression::column([FILE_SIZE_IN_BYTES]),
             // The AMT entry carries neither of these; both come from the caller's `ReadContext`.
-            MODIFICATION_TIME_NAME => lit(ctx.modification_time),
-            DATA_CHANGE_NAME => lit(ctx.data_change),
-            BASE_ROW_ID_NAME => Expression::column([TRACKING, FIRST_ROW_ID]),
-            DEFAULT_ROW_COMMIT_VERSION_NAME => Expression::column([TRACKING, SEQUENCE_NUMBER]),
+            n if n == MODIFICATION_TIME_NAME => lit(ctx.modification_time),
+            n if n == DATA_CHANGE_NAME => lit(ctx.data_change),
+            n if n == BASE_ROW_ID_NAME => Expression::column([TRACKING, FIRST_ROW_ID]),
+            n if n == DEFAULT_ROW_COMMIT_VERSION_NAME => {
+                Expression::column([TRACKING, SEQUENCE_NUMBER])
+            }
             _ => return None,
         })
     })?;
@@ -263,10 +264,11 @@ mod tests {
 
     use super::*;
     use crate::content_tree::{DeletionVectorInfo, ManifestInfo, TrackingInfo};
-    use crate::engine::arrow_conversion::TryIntoArrow as _;
+    use crate::engine::arrow_conversion::TryFromArrow as _;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::StructData;
+    use crate::schema::StructType;
     use crate::unit_test_utils::assert_result_error_with_message;
 
     /// AMT/Iceberg format version stamped on entries; irrelevant to the `Add` output but required
@@ -480,8 +482,8 @@ mod tests {
         )
         .try_into_record_batch()
         .unwrap();
-        let expected = LOG_ADD_SCHEMA.as_ref().try_into_arrow().unwrap();
-        assert_eq!(out.schema().as_ref(), &expected);
+        let schema = StructType::try_from_arrow(out.schema().as_ref()).unwrap();
+        assert_eq!(&schema, LOG_ADD_SCHEMA.as_ref());
     }
 
     #[test]
