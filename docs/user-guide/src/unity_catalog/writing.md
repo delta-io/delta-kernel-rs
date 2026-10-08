@@ -69,6 +69,7 @@ Catalog to ratify. Construct it with the commit client and the table's
 three-part name plus its table ID.
 
 ```rust,ignore
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel_unity_catalog::UCCommitter;
 use unity_catalog_delta_client_api::TableIdentifier;
 
@@ -252,7 +253,7 @@ checkpointing fails because it can only operate on published versions.
 
 ```rust,ignore
 use std::sync::Arc;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel_unity_catalog::{snapshot_builder_from_load_table, UCCommitter};
 use unity_catalog_delta_client_api::{Operation, TableIdentifier};
 use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};

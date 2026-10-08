@@ -316,7 +316,8 @@ unpartitioned writes.
 | `free_create_table_txn_builder` | Release a create-table builder handle (before it is consumed by `create_table_txn_builder_build*`) |
 | `free_create_table_txn` | Release a create-table transaction handle (after build, before commit) |
 
-Initial Add actions in a create-table transaction always use `dataChange = true`.
+Initial Add actions default to `dataChange = true`. To override it, call
+`create_table_txn_builder_with_data_change` before building the transaction.
 
 **Change data feed (table changes)**
 

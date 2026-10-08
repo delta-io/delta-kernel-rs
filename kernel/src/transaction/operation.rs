@@ -2,6 +2,8 @@ use std::fmt;
 
 use strum::{EnumIter, IntoEnumIterator};
 
+use crate::crc::is_incremental_safe_operation;
+
 /// Identifies an operation supported by [`UpdateTableTransactionBuilder`].
 ///
 /// Typed variants provide compiler-checked names. [`Custom`](Self::Custom) preserves the protocol's
@@ -54,13 +56,8 @@ impl UpdateTableOperation {
 
     pub(crate) fn is_incremental_safe(&self) -> bool {
         match self {
-            Self::Write
-            | Self::StreamingUpdate
-            | Self::Delete
-            | Self::Update
-            | Self::Merge
-            | Self::Optimize => true,
-            Self::AlterTable | Self::Custom(_) => false,
+            Self::Custom(_) => false,
+            _ => is_incremental_safe_operation(self.as_str()),
         }
     }
 
@@ -101,7 +98,7 @@ impl CommitOperation {
 
     pub(crate) fn is_incremental_safe(&self) -> bool {
         match self {
-            Self::CreateTable => true,
+            Self::CreateTable => is_incremental_safe_operation(self.as_str()),
             Self::UpdateTable(operation) => operation.is_incremental_safe(),
         }
     }
@@ -233,5 +230,10 @@ mod tests {
         for name in ["vendor.custom/write-v2", "CREATE TABLE AS SELECT", "WRITE"] {
             assert!(!UpdateTableOperation::Custom(name.to_string()).is_incremental_safe());
         }
+    }
+
+    #[test]
+    fn create_table_operations_are_incremental_safe() {
+        assert!(CommitOperation::CreateTable.is_incremental_safe());
     }
 }

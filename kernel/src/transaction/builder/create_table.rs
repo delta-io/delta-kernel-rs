@@ -921,6 +921,27 @@ impl CreateTableTransactionBuilder {
         self
     }
 
+    /// Adds an application transaction identifier to emit as a `txn` action.
+    ///
+    /// The action's `lastUpdated` value uses the transaction's commit timestamp.
+    /// An application id may occur only once; duplicate ids are rejected by [`build`](Self::build).
+    pub fn with_transaction_id(mut self, app_id: impl Into<String>, version: i64) -> Self {
+        self.state = self.state.with_transaction_id(app_id, version);
+        self
+    }
+
+    /// Adds user-controlled domain metadata.
+    ///
+    /// Each domain may occur only once; duplicates are rejected by [`build`](Self::build).
+    pub fn with_domain_metadata(
+        mut self,
+        domain: impl Into<String>,
+        configuration: impl Into<String>,
+    ) -> Self {
+        self.state = self.state.with_domain_metadata(domain, configuration);
+        self
+    }
+
     /// Attach an opaque, caller-supplied correlation id for joining the create-table commit's
     /// metric events to the caller's own request or operation id. An empty id is treated as unset.
     pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
@@ -971,27 +992,6 @@ impl CreateTableTransactionBuilder {
         commit_info_schema: SchemaRef,
     ) -> Self {
         self.state = self.state.with_commit_info(commit_info, commit_info_schema);
-        self
-    }
-
-    /// Adds an application transaction identifier to emit as a `txn` action.
-    ///
-    /// The action's `lastUpdated` value uses the transaction's commit timestamp.
-    /// An application id may occur only once; duplicate ids are rejected by [`build`](Self::build).
-    pub fn with_transaction_id(mut self, app_id: impl Into<String>, version: i64) -> Self {
-        self.state = self.state.with_transaction_id(app_id, version);
-        self
-    }
-
-    /// Adds user-controlled domain metadata.
-    ///
-    /// Each domain may occur only once; duplicates are rejected by [`build`](Self::build).
-    pub fn with_domain_metadata(
-        mut self,
-        domain: impl Into<String>,
-        configuration: impl Into<String>,
-    ) -> Self {
-        self.state = self.state.with_domain_metadata(domain, configuration);
         self
     }
 
@@ -1138,15 +1138,13 @@ impl CreateTableTransactionBuilder {
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
 
         // Create Transaction<CreateTable> with the effective table configuration
-        let transaction = Transaction::try_new_create_table(
+        Transaction::try_new_create_table(
             table_configuration,
             committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
             self.state,
-        )?;
-        transaction.validate_domain_metadata_operations()?;
-        Ok(transaction)
+        )
     }
 }
 

@@ -44,11 +44,28 @@ fn committer() -> Box<FileSystemCommitter> {
 #[tokio::test]
 async fn schema_evolution_while_writing_round_trips_new_column(
     #[case] operation: UpdateTableOperation,
-) -> Result<()> {
+    #[values("none", "name", "id")] cm_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let snapshot =
-        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
-    let mut transaction = snapshot
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", cm_mode)],
+    )?;
+    let old_batch = RecordBatch::try_new(
+        Arc::new(snapshot.schema().as_ref().try_into_arrow()?),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["old-a", "old-b"])),
+        ],
+    )?;
+    let before =
+        write_batch_to_table(&snapshot, engine.as_ref(), old_batch, HashMap::new()).await?;
+    let old_max_id = max_column_id(&before);
+    assert_eq!(old_max_id.is_some(), cm_mode != "none");
+    let mut transaction = before
+        .clone()
         .transaction_builder()
         .with_operation(operation)
         .add_column(StructField::nullable("country", DataType::STRING))
@@ -64,8 +81,8 @@ async fn schema_evolution_while_writing_round_trips_new_column(
                 .try_into_arrow()?,
         ),
         vec![
-            Arc::new(Int32Array::from(vec![1, 2])),
-            Arc::new(StringArray::from(vec!["alice", "bob"])),
+            Arc::new(Int32Array::from(vec![3, 4])),
+            Arc::new(StringArray::from(vec!["new-a", "new-b"])),
             Arc::new(StringArray::from(vec!["US", "CA"])),
         ],
     )?;
@@ -74,26 +91,81 @@ async fn schema_evolution_while_writing_round_trips_new_column(
         .await?;
     transaction.add_files(add_metadata);
 
-    let committed = transaction.commit(engine.as_ref())?.unwrap_committed();
-    let snapshot = committed
-        .post_commit_snapshot()
-        .expect("post-commit snapshot");
-    let adds = read_actions_from_commit(snapshot.table_root(), 1, "add")
-        .map_err(|error| delta_kernel::KernelError::generic(error.to_string()))?;
+    let post = transaction
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let adds = read_actions_from_commit(post.table_root(), 2, "add")?;
     assert_eq!(adds.len(), 1);
     assert_eq!(adds[0]["dataChange"], true);
-    assert!(snapshot.schema().contains("country"));
-    let scan = snapshot.clone().scan_builder().build()?;
-    let batches = test_utils::read_scan(&scan, engine)?;
-    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
-    let countries = batches[0]
-        .column_by_name("country")
-        .expect("country column")
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("country must be a string array");
-    assert_eq!(countries.value(0), "US");
-    assert_eq!(countries.value(1), "CA");
+    assert!(!before.schema().contains("country"));
+    for snapshot in [post, fresh] {
+        assert_eq!(snapshot.version(), 2);
+        let schema = snapshot.schema();
+        for name in ["id", "name"] {
+            assert_eq!(schema.field(name), before.schema().field(name));
+        }
+        let country = schema.field("country").expect("added column");
+        if let Some(old_max_id) = old_max_id {
+            let new_id = country.column_mapping_id().expect("new column ID");
+            assert!(new_id > old_max_id);
+            assert_eq!(max_column_id(&snapshot), Some(new_id));
+            let physical_name = country
+                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+                .expect("new physical name");
+            assert!(
+                matches!(physical_name, MetadataValue::String(name) if name.starts_with("col-"))
+            );
+            for old_field in before.schema().fields() {
+                assert_ne!(
+                    Some(physical_name),
+                    old_field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
+                );
+            }
+        } else {
+            assert_eq!(country.column_mapping_id(), None);
+            assert_eq!(max_column_id(&snapshot), None);
+        }
+        let scan = snapshot.clone().scan_builder().build()?;
+        let batches = test_utils::read_scan(&scan, engine.clone())?;
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 4);
+        let mut rows = HashMap::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let countries = batch
+                .column_by_name("country")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                let country = (!countries.is_null(row)).then(|| countries.value(row).to_string());
+                assert!(rows
+                    .insert(ids.value(row), (names.value(row).to_string(), country))
+                    .is_none());
+            }
+        }
+        assert_eq!(
+            rows,
+            HashMap::from([
+                (1, ("old-a".to_string(), None)),
+                (2, ("old-b".to_string(), None)),
+                (3, ("new-a".to_string(), Some("US".to_string()))),
+                (4, ("new-b".to_string(), Some("CA".to_string()))),
+            ]),
+        );
+    }
     Ok(())
 }
 

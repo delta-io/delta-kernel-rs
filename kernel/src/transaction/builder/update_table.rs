@@ -47,51 +47,123 @@ impl UpdateTableTransactionBuilder {
         }
     }
 
-    /// Validates the accumulated intent and builds a transaction.
+    /// Sets the operation recorded in `commitInfo`.
     ///
-    /// # Parameters
-    ///
-    /// - `engine`: Provides table-state reads needed during validation.
-    /// - `committer`: Executes the eventual atomic commit.
-    ///
-    /// For clustered tables, building performs log replay to load clustering columns from domain
-    /// metadata and may therefore incur additional I/O.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the table is not writable; operation or schema intent is invalid;
-    /// schema evolution or CDF validation fails; application ids or domain metadata conflict;
-    /// a domain is reserved or unsupported; connector commit information does not contain exactly
-    /// one row; or blind append is incompatible with the configured transaction intent.
-    pub fn build(self, engine: &dyn Engine, committer: Box<dyn Committer>) -> Result<Transaction> {
-        self.validate()?;
-        let Self {
-            snapshot,
-            state,
-            operation,
-            schema_changes,
-            domain_metadata_removals,
-            is_blind_append,
-        } = self;
+    /// Consecutive calls replace the previous operation. Invalid custom names and incompatible
+    /// operation/schema-change combinations are rejected by [`build`](Self::build).
+    pub fn with_operation(mut self, operation: UpdateTableOperation) -> Self {
+        self.operation = Some(operation);
+        self
+    }
 
-        let mut transaction =
-            Transaction::try_new_existing_table(snapshot, committer, engine, state)?;
+    /// Sets whether file actions represent a logical data change.
+    ///
+    /// `true` indicates that the commit changes the table's logical contents. Use `false` for
+    /// metadata-only commits or rewrites that reorganize data without changing its contents.
+    /// Connector-supplied values are preserved through commit; Kernel does not compare file
+    /// contents to verify them.
+    ///
+    /// If not set, transactions with schema changes infer the value at commit, after file staging:
+    /// `false` when no Add, Remove, or DV-update batches are staged and `true` otherwise, including
+    /// empty or unselected batches. Transactions without schema changes default to `true`. Set
+    /// this explicitly to `false` for a protocol-valid logical-preserving rewrite such as OPTIMIZE.
+    pub fn with_data_change(mut self, data_change: bool) -> Self {
+        self.state.data_change = Some(data_change);
+        self
+    }
 
-        // TODO(#3149): Construct the transaction from complete validated builder intent.
-        if let Some(operation) = operation {
-            transaction = transaction.with_update_table_operation(operation);
-        }
-        if is_blind_append {
-            transaction = transaction.with_blind_append();
-        }
-        if !schema_changes.is_empty() {
-            transaction = transaction.with_schema_changes(schema_changes)?;
-        }
-        for domain in domain_metadata_removals {
-            transaction = transaction.with_domain_metadata_removed(domain);
-        }
-        transaction.validate_domain_metadata_operations()?;
-        Ok(transaction)
+    /// Marks the transaction as a blind append assertion.
+    ///
+    /// Blind appends add new files without depending on existing table state. Commit validation
+    /// requires staged Add metadata and rejects staged Remove metadata or deletion-vector batches.
+    /// Blind append is also invalid for `ALTER TABLE`, schema changes, or `dataChange = false`.
+    pub fn with_blind_append(mut self) -> Self {
+        self.is_blind_append = true;
+        self
+    }
+
+    /// Adds schema changes to validate and apply during [`build`](Self::build).
+    ///
+    /// Changes are applied in order, and each change observes the result of prior changes.
+    #[internal_api]
+    pub(crate) fn with_schema_changes(
+        mut self,
+        changes: impl IntoIterator<Item = SchemaOperation>,
+    ) -> Self {
+        self.schema_changes.extend(changes);
+        self
+    }
+
+    /// Adds a nullable top-level column to the table schema.
+    ///
+    /// The field must not already exist in the schema, using a case-insensitive comparison, and
+    /// must be nullable because existing data files do not contain it. On column-mapping tables,
+    /// Kernel assigns or preserves column-mapping IDs and physical names.
+    ///
+    /// Schema changes are applied in call order and validated by [`build`](Self::build).
+    pub fn add_column(mut self, field: StructField) -> Self {
+        self.schema_changes
+            .push(SchemaOperation::add_column(None, field));
+        self
+    }
+
+    /// Adds a nullable field under `parent` in the table schema.
+    ///
+    /// An empty `parent` targets the root schema. Path segments may traverse nested structs, array
+    /// elements, map keys, and map values, but the resolved parent must be a struct. The field must
+    /// be nullable, must not be a metadata column, and must not collide case-insensitively with a
+    /// sibling. On column-mapping tables, Kernel assigns or preserves column-mapping IDs and
+    /// physical names.
+    ///
+    /// Schema changes are applied in call order and validated by [`build`](Self::build).
+    pub fn add_column_at(mut self, parent: ColumnName, field: StructField) -> Self {
+        self.schema_changes
+            .push(SchemaOperation::add_column(parent, field));
+        self
+    }
+
+    /// Changes a possibly nested column from non-nullable to nullable.
+    ///
+    /// The column path is resolved after all preceding schema changes. An already-nullable column
+    /// is unchanged, but the transaction still emits its metadata action.
+    pub fn set_nullable(mut self, column: ColumnName) -> Self {
+        self.schema_changes
+            .push(SchemaOperation::SetNullable { column });
+        self
+    }
+
+    /// Adds an application transaction identifier to emit as a `txn` action.
+    ///
+    /// The action's `lastUpdated` value uses the transaction's commit timestamp.
+    /// An application id may occur only once; duplicate ids are rejected by [`build`](Self::build).
+    pub fn with_transaction_id(mut self, app_id: impl Into<String>, version: i64) -> Self {
+        self.state = self.state.with_transaction_id(app_id, version);
+        self
+    }
+
+    /// Adds user-controlled domain metadata.
+    ///
+    /// Each domain may occur only once across additions and removals. Conflicts are rejected by
+    /// [`build`](Self::build).
+    pub fn with_domain_metadata(
+        mut self,
+        domain: impl Into<String>,
+        configuration: impl Into<String>,
+    ) -> Self {
+        self.state = self.state.with_domain_metadata(domain, configuration);
+        self
+    }
+
+    /// Adds a user-controlled domain metadata removal to the transaction.
+    ///
+    /// If the domain exists, commit emits a tombstone that preserves its previous configuration.
+    /// Removing a domain that does not exist is a no-op.
+    ///
+    /// Each domain may occur only once across additions and removals. Conflicts are rejected by
+    /// [`build`](Self::build).
+    pub fn with_domain_metadata_removed(mut self, domain: impl Into<String>) -> Self {
+        self.domain_metadata_removals.push(domain.into());
+        self
     }
 
     /// Sets the connector name and version recorded in `commitInfo`.
@@ -162,121 +234,51 @@ impl UpdateTableTransactionBuilder {
         self
     }
 
-    /// Adds an application transaction identifier to emit as a `txn` action.
+    /// Validates the accumulated intent and builds a transaction.
     ///
-    /// The action's `lastUpdated` value uses the transaction's commit timestamp.
-    /// An application id may occur only once; duplicate ids are rejected by [`build`](Self::build).
-    pub fn with_transaction_id(mut self, app_id: impl Into<String>, version: i64) -> Self {
-        self.state = self.state.with_transaction_id(app_id, version);
-        self
-    }
+    /// # Parameters
+    ///
+    /// - `engine`: Provides table-state reads needed during validation.
+    /// - `committer`: Executes the eventual atomic commit.
+    ///
+    /// For clustered tables, building performs log replay to load clustering columns from domain
+    /// metadata and may therefore incur additional I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table is not writable; operation or schema intent is invalid;
+    /// schema evolution or CDF validation fails; application ids or domain metadata conflict;
+    /// a domain is reserved or unsupported; connector commit information does not contain exactly
+    /// one row; or blind append is incompatible with the configured transaction intent.
+    pub fn build(self, engine: &dyn Engine, committer: Box<dyn Committer>) -> Result<Transaction> {
+        self.validate()?;
+        let Self {
+            snapshot,
+            state,
+            operation,
+            schema_changes,
+            domain_metadata_removals,
+            is_blind_append,
+        } = self;
 
-    /// Adds user-controlled domain metadata.
-    ///
-    /// Each domain may occur only once across additions and removals. Conflicts are rejected by
-    /// [`build`](Self::build).
-    pub fn with_domain_metadata(
-        mut self,
-        domain: impl Into<String>,
-        configuration: impl Into<String>,
-    ) -> Self {
-        self.state = self.state.with_domain_metadata(domain, configuration);
-        self
-    }
+        let mut transaction =
+            Transaction::try_new_existing_table(snapshot, committer, engine, state)?;
 
-    /// Adds a user-controlled domain metadata removal to the transaction.
-    ///
-    /// If the domain exists, commit emits a tombstone that preserves its previous configuration.
-    /// Removing a domain that does not exist is a no-op.
-    ///
-    /// Each domain may occur only once across additions and removals. Conflicts are rejected by
-    /// [`build`](Self::build).
-    pub fn with_domain_metadata_removed(mut self, domain: impl Into<String>) -> Self {
-        self.domain_metadata_removals.push(domain.into());
-        self
-    }
-
-    /// Sets whether file actions represent a logical data change.
-    ///
-    /// `true` indicates that the commit changes the table's logical contents. Use `false` for
-    /// metadata-only commits or rewrites that reorganize data without changing its contents.
-    ///
-    /// If not set, transactions with schema changes infer the value from staged file batches:
-    /// `false` when no batches are staged and `true` otherwise, including empty or unselected
-    /// batches. Transactions without schema changes default to `true`. Set this explicitly to
-    /// `false` for a protocol-valid logical-preserving rewrite.
-    pub fn with_data_change(mut self, data_change: bool) -> Self {
-        self.state.data_change = Some(data_change);
-        self
-    }
-
-    /// Marks the transaction as a blind append assertion.
-    ///
-    /// Blind appends add new files without depending on existing table state. Commit validation
-    /// requires staged Add metadata and rejects staged Remove metadata or deletion-vector batches.
-    /// Blind append is also invalid for `ALTER TABLE`, schema changes, or `dataChange = false`.
-    pub fn with_blind_append(mut self) -> Self {
-        self.is_blind_append = true;
-        self
-    }
-
-    /// Sets the operation recorded in `commitInfo`.
-    ///
-    /// Consecutive calls replace the previous operation. Invalid custom names and incompatible
-    /// operation/schema-change combinations are rejected by [`build`](Self::build).
-    pub fn with_operation(mut self, operation: UpdateTableOperation) -> Self {
-        self.operation = Some(operation);
-        self
-    }
-
-    /// Adds schema changes to validate and apply during [`build`](Self::build).
-    ///
-    /// Changes are applied in order, and each change observes the result of prior changes.
-    #[internal_api]
-    pub(crate) fn with_schema_changes(
-        mut self,
-        changes: impl IntoIterator<Item = SchemaOperation>,
-    ) -> Self {
-        self.schema_changes.extend(changes);
-        self
-    }
-
-    /// Adds a nullable top-level column to the table schema.
-    ///
-    /// The field must not already exist in the schema, using a case-insensitive comparison, and
-    /// must be nullable because existing data files do not contain it. On column-mapping tables,
-    /// Kernel assigns or preserves column-mapping IDs and physical names.
-    ///
-    /// Schema changes are applied in call order and validated by [`build`](Self::build).
-    pub fn add_column(mut self, field: StructField) -> Self {
-        self.schema_changes
-            .push(SchemaOperation::add_column(None, field));
-        self
-    }
-
-    /// Adds a nullable field under `parent` in the table schema.
-    ///
-    /// An empty `parent` targets the root schema. Path segments may traverse nested structs, array
-    /// elements, map keys, and map values, but the resolved parent must be a struct. The field must
-    /// be nullable, must not be a metadata column, and must not collide case-insensitively with a
-    /// sibling. On column-mapping tables, Kernel assigns or preserves column-mapping IDs and
-    /// physical names.
-    ///
-    /// Schema changes are applied in call order and validated by [`build`](Self::build).
-    pub fn add_column_at(mut self, parent: ColumnName, field: StructField) -> Self {
-        self.schema_changes
-            .push(SchemaOperation::add_column(parent, field));
-        self
-    }
-
-    /// Changes a possibly nested column from non-nullable to nullable.
-    ///
-    /// The column path is resolved after all preceding schema changes. An already-nullable column
-    /// is unchanged, but the transaction still emits its metadata action.
-    pub fn set_nullable(mut self, column: ColumnName) -> Self {
-        self.schema_changes
-            .push(SchemaOperation::SetNullable { column });
-        self
+        // TODO(#3149): Construct the transaction from complete validated builder intent.
+        if let Some(operation) = operation {
+            transaction = transaction.with_update_table_operation(operation);
+        }
+        if is_blind_append {
+            transaction = transaction.with_blind_append();
+        }
+        if !schema_changes.is_empty() {
+            transaction = transaction.with_schema_changes(schema_changes)?;
+        }
+        for domain in domain_metadata_removals {
+            transaction = transaction.with_domain_metadata_removed(domain);
+        }
+        transaction.validate_domain_metadata_operations()?;
+        Ok(transaction)
     }
 
     fn validate(&self) -> Result<()> {

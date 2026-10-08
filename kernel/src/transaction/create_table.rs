@@ -156,7 +156,7 @@ impl CreateTableTransaction {
             path = %effective_table_config.table_root(),
             operation = "CREATE",
         );
-        Ok(Transaction {
+        let transaction = Transaction {
             span,
             operation_id: MetricId::new(),
             correlation_id: None,
@@ -190,6 +190,8 @@ impl CreateTableTransaction {
             physical_clustering_columns: clustering_columns,
             _state: PhantomType::default(),
         }
-        .with_builder_state(state))
+        .with_builder_state(state);
+        transaction.validate_domain_metadata_operations()?;
+        Ok(transaction)
     }
 }

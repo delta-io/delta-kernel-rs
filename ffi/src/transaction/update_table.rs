@@ -291,27 +291,17 @@ pub unsafe extern "C" fn update_table_txn_builder_set_nullable(
 }
 
 unsafe fn decode_column_name(column: &FfiColumnName) -> Result<ColumnName> {
-    let parts = unsafe { column.path.try_as_slice() }?
-        .iter()
-        .map(|part| unsafe { part.try_to_string() })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(ColumnName::new(parts))
+    Ok(ColumnName::new(unsafe { column.path.try_to_strings() }?))
 }
 
 fn decode_single_field(schema: &EngineSchema) -> Result<delta_kernel::schema::StructField> {
-    let schema = decode_engine_schema(schema)?;
-    let mut fields = schema.into_fields();
-    let field = fields.next().ok_or_else(|| {
-        delta_kernel::KernelError::invalid_transaction_state(
+    let mut fields = decode_engine_schema(schema)?.into_fields();
+    match (fields.next(), fields.next()) {
+        (Some(field), None) => Ok(field),
+        _ => Err(delta_kernel::KernelError::invalid_transaction_state(
             "add-column schema must contain exactly one field",
-        )
-    })?;
-    if fields.next().is_some() {
-        return Err(delta_kernel::KernelError::invalid_transaction_state(
-            "add-column schema must contain exactly one field",
-        ));
+        )),
     }
-    Ok(field)
 }
 
 // ============================================================================
@@ -614,8 +604,12 @@ pub unsafe extern "C" fn update_table_txn_add_files(
 
 /// Remove selected files from an existing-table transaction.
 ///
-/// A null or empty selection vector selects every row. The engine-data handle is consumed, while
-/// the transaction and engine handles remain owned by the caller.
+/// `data` must use the scan-row schema and be derived from scan metadata. The removal selection
+/// must select only rows active in the original scan selection vector.
+///
+/// A null or empty selection vector selects every row; use it only when every row is active and
+/// intended for removal. The engine-data handle is consumed even on error, while the transaction
+/// and engine handles remain owned by the caller.
 ///
 /// # Safety
 ///

@@ -261,9 +261,9 @@ pub struct Transaction<S = ExistingTable> {
     // Domain names to remove in this transaction. The configuration values are fetched during
     // commit from the log to preserve the pre-image in tombstones.
     user_domain_removals: Vec<String>,
-    // Whether this transaction contains any logical data changes.
+    // Data-change value used by commit validation, file actions, and transaction metrics.
     data_change: bool,
-    // Whether data_change must be resolved after all file actions have been staged.
+    // Set when the builder leaves data_change unspecified; explicit values disable inference.
     infer_data_change: bool,
     // TODO(#2499): Replace this state when Conntector responsibilities encode column-default
     // handling. Whether the connector acknowledged responsibility for applying column
@@ -516,6 +516,7 @@ impl<S> Transaction<S> {
         self
     }
 
+    // TODO(#3149): Replace this helper with direct initialization of immutable transaction state.
     pub(super) fn with_builder_state(mut self, state: TransactionBuilderState) -> Self {
         let TransactionBuilderState {
             correlation_id,
@@ -1000,6 +1001,15 @@ impl<S> Transaction<S> {
         self.read_snapshot_opt.is_none()
     }
 
+    /// Finalizes the data-change default before commit validation and action generation.
+    ///
+    /// The update builder initially defaults to `true`. For existing-table transactions with
+    /// schema changes and no connector-supplied value, commit infers `false` without staged file
+    /// batches and `true` otherwise. Add, Remove, and DV-update batches count even when empty or
+    /// fully unselected. Other transactions retain their configured value or `true` default.
+    ///
+    /// Explicit connector values are preserved. Batch presence does not establish logical changes,
+    /// so logical-preserving rewrites such as OPTIMIZE must explicitly request `false`.
     pub(super) fn resolve_data_change(&mut self) {
         if self.infer_data_change && self.should_emit_metadata {
             self.data_change = self.has_data_file_actions();

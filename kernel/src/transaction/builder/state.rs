@@ -1,3 +1,5 @@
+//! Shared configuration for create-table and update-table transaction builders.
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -7,6 +9,7 @@ use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::utils::require;
 use crate::{EngineData, KernelError, Result};
 
+/// Transaction intent collected before building a transaction.
 #[derive(Default)]
 pub(crate) struct TransactionBuilderState {
     pub(in crate::transaction) correlation_id: Option<Arc<str>>,
