@@ -1144,7 +1144,7 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Kern
         .expect("build checkpoint-plus-commits table");
     let sync_engine = Arc::new(SyncEngine::new_with_store(table.store().clone()));
     let snapshot = Snapshot::builder_for(table.table_root()).build(sync_engine.as_ref())?;
-    let scan = snapshot.scan_builder().build()?;
+    let scan = snapshot.clone().scan_builder().build()?;
 
     let no_plan_engine = DelegatingEngine::new(sync_engine).without_plan_executor();
     let err = scan
@@ -1152,5 +1152,13 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Kern
         .unwrap_err();
 
     assert!(matches!(err, crate::KernelError::Unsupported(_)));
+
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(Pred::FALSE))
+        .build()?;
+    assert!(scan
+        .declarative_metadata_scan_plan(&no_plan_engine)?
+        .is_none());
     Ok(())
 }
