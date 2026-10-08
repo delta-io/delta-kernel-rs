@@ -1329,7 +1329,11 @@ mod test {
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::CheckConstraints])
             .build(),
-        WriteSupport::Unsupported
+        if cfg!(feature = "check-constraints-in-dev") {
+            WriteSupport::Supported
+        } else {
+            WriteSupport::Unsupported
+        }
     )]
     #[case::legacy_writer_below_min_version(
         &[("delta.constraints.positive", "amount > 0")],
@@ -1339,7 +1343,11 @@ mod test {
     #[case::legacy_writer_at_min_version(
         &[("delta.constraints.positive", "amount > 0")],
         MockProtocolBuilder::new().with_versions(1, 3).build(),
-        WriteSupport::Unsupported
+        if cfg!(feature = "check-constraints-in-dev") {
+            WriteSupport::Supported
+        } else {
+            WriteSupport::Unsupported
+        }
     )]
     // Unusual names, accepted only because other Delta writers can store and enforce them.
     #[case::bare_prefix(
@@ -1423,6 +1431,37 @@ mod test {
         assert_eq!(has_check_constraints, expected);
     }
 
+    #[cfg(feature = "check-constraints-in-dev")]
+    #[rstest]
+    #[case::names_differ_in_case("delta.constraints.positive", "delta.constraints.POSITIVE")]
+    fn constraint_keys_differing_only_in_case_are_writable_and_all_discovered(
+        #[case] first_key: &str,
+        #[case] second_key: &str,
+    ) {
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_properties([(first_key, "amount > 0"), (second_key, "amount > 1")])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_writer_features([TableFeature::CheckConstraints])
+                    .build(),
+            )
+            .build();
+
+        let write_supported = table_config
+            .ensure_operation_supported(Operation::Write)
+            .is_ok();
+        assert!(write_supported);
+
+        let mut discovered: Vec<_> = table_config
+            .table_properties()
+            .check_constraints
+            .iter()
+            .map(|c| c.raw_sql())
+            .collect();
+        discovered.sort();
+        assert_eq!(discovered, ["amount > 0", "amount > 1"]);
+    }
+
     #[test]
     fn table_configuration_rejects_duplicate_partition_columns() {
         let result = MockTableConfigurationBuilder::new()
@@ -1470,6 +1509,33 @@ mod test {
             .build();
         assert!(table_config.is_feature_supported(&TableFeature::DeletionVectors));
         assert!(table_config.is_feature_enabled(&TableFeature::DeletionVectors));
+    }
+
+    #[rstest]
+    #[case::no_constraint(&[])]
+    #[case::named_constraint(&[("delta.constraints.positive", "amount > 0")])]
+    #[case::non_lowercase_prefix(&[("DELTA.CONSTRAINTS.positive", "amount > 0")])]
+    #[case::bare_prefix_empty_name(&[("delta.constraints.", "1 > 0")])]
+    #[case::whitespace_only_name(&[("delta.constraints.   ", "1 > 0")])]
+    fn check_constraints_enabled_exactly_when_supported(
+        #[case] properties: &[(&str, &str)],
+        #[values(true, false)] feature_listed: bool,
+    ) {
+        let writer_features = if feature_listed {
+            vec![TableFeature::CheckConstraints]
+        } else {
+            vec![]
+        };
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_properties(properties)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_writer_features(writer_features)
+                    .build(),
+            )
+            .build();
+        let is_enabled = table_config.is_feature_enabled(&TableFeature::CheckConstraints);
+        assert_eq!(is_enabled, feature_listed);
     }
 
     #[rstest]
