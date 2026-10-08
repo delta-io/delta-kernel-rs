@@ -24,7 +24,7 @@
 # This script prepares Kernel and UC releases, publishes the Kernel crates, and creates release tags.
 #
 # UC crates have literal versions and `release = false` to exclude them from Kernel version bumps.
-# `--isolated` allows selecting them for per-crate bumps and updates dependent requirements.
+# `--isolated` ignores cargo-release configuration so `-p` can select them for version bumps.
 
 # Exit on error, undefined variables, and pipe failures
 set -euo pipefail
@@ -317,9 +317,9 @@ warn_dependents() {
 
     [[ -n "$dependents" ]] || return 0
 
-    log_warning "These crates depend on $crate_name and keep their own versions. If $version breaks"
-    log_warning "their API, prepare each dependent release on a separate crate-release/ branch"
-    log_warning "before tagging:"
+    log_warning "These crates depend on $crate_name and keep their own versions."
+    log_warning "If $crate_name $version breaks their API, prepare each dependent release on a"
+    log_warning "separate crate-release/ branch before tagging:"
     while read -r dependent; do
         [[ -n "$dependent" ]] || continue
         log_warning "  ./release.sh crate $dependent <version>"
@@ -396,7 +396,7 @@ update_crate_changelog() {
     [[ -f "$changelog" ]] || : > "$changelog"
     if ! git cliff --repository "$REPO_ROOT" --config "$REPO_ROOT/cliff.toml" \
         --use-branch-tags \
-        --tag-pattern "^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?_${crate_name}$" \
+        --tag-pattern "^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?(\+[0-9A-Za-z.-]+)?_${crate_name}$" \
         --unreleased --prepend "$changelog" --include-path "$crate_path/*" \
         --tag "${version}_${crate_name}"; then
         log_error "Failed to update $changelog"
@@ -474,7 +474,7 @@ tag_release() {
     local manifest="Cargo.toml"
     [[ "$crate_name" == delta_kernel ]] || manifest="$(crate_directory "$crate_name")/Cargo.toml"
     git -C "$REPO_ROOT" diff --quiet "$commit_hash" -- "$manifest" || \
-        log_error "Checkout's release manifest must match the commit being tagged"
+        log_error "Checkout's release manifest must match the commit being tagged; check out that commit first"
 
     if confirm "Tag $crate_name $version as $tag at $(git rev-parse --short "$commit_hash")?"; then
         git tag -a "$tag" "$commit_hash" -m "Release $tag"
@@ -508,7 +508,6 @@ publish() {
 
 validate_version() {
     local version=$1
-    # Check if version starts with a number
     if [[ ! $version =~ ^[0-9] ]]; then
         log_error "Version must start with a number (e.g., '0.1.1'). Got: '$version'"
     fi

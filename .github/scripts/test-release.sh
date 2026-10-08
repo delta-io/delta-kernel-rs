@@ -355,7 +355,7 @@ test_crate_changelog_ranges() {
     local crate="unity-catalog-delta-client-api"
     local previous_version next_version changelog crate_path=client-api
 
-    for previous_version in "" 0.1.0 0.2.0-rc.1; do
+    for previous_version in "" 0.1.0 0.2.0-rc.1 0.1.0+build.1; do
         init_test_repository "$TEST_ROOT/crate-${previous_version:-first}"
         cp "$REPOSITORY_ROOT/release.sh" "$REPOSITORY_ROOT/cliff.toml" .
         mkdir -p "$crate_path"

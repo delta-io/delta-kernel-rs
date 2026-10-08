@@ -147,10 +147,11 @@ git pull --ff-only upstream main
 ```
 
 For version `0.2.0`, this creates and pushes the annotated tag
-`v0.2.0_unity-catalog-delta-client-api`. To tag a specific commit, pass its reference:
+`v0.2.0_unity-catalog-delta-client-api`. To tag a historical release, check out its commit first:
 
 ```bash
-./release.sh tag unity-catalog-delta-client-api <release-commit>
+git switch --detach <release-commit>
+./release.sh tag unity-catalog-delta-client-api
 ```
 
 The version in the tag comes from the current checkout's manifest, which must match the target
