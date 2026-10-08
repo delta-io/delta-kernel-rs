@@ -95,8 +95,9 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   CREATE TABLE rejects `delta.constraints.*` properties). With it, kernel discovers constraints and
   exposes their raw SQL through `check_constraints()` on `Snapshot` and `Transaction`, ALTER TABLE
   adds and drops them (`add_check_constraint`, `drop_check_constraint`,
-  `drop_check_constraint_if_exists`, adding enables the feature), and on a constrained table
-  `write_state` and every commit require `Transaction::ack_check_constraints`. Kernel does not
+  `drop_check_constraint_if_exists`, adding enables the feature), and whenever a transaction's
+  effective CHECK constraints are not empty, `write_state` and every commit require
+  `Transaction::ack_check_constraints`. Kernel does not
   evaluate constraint SQL, so enforcement is the connector's responsibility. Also gates the
   internal SQL tokenizer and parser.
 - `adaptive-metadata-in-dev`: adaptiveMetadata (Iceberg V4 adaptive metadata tree) support

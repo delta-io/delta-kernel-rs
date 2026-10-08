@@ -286,7 +286,8 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     // config, this is cloned from the read snapshot; when the config changes (e.g. schema
     // evolution), it is constructed separately with the new schema/protocol.
     effective_table_config: TableConfiguration,
-    // Whether to emit a Protocol action. True for CREATE TABLE, false otherwise.
+    // Whether to emit a Protocol action. True for CREATE TABLE and for an ALTER TABLE that changes
+    // the protocol, false otherwise.
     should_emit_protocol: bool,
     // Whether to emit a Metadata action. True for CREATE TABLE and transactions with staged
     // schema changes, false otherwise.

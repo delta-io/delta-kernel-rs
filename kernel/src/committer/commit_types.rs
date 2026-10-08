@@ -58,9 +58,10 @@ pub struct CommitProtocolMetadata {
     read_protocol: Option<Protocol>,
     /// Existing table metadata from read snapshot. `None` for create-table.
     read_metadata: Option<Metadata>,
-    /// New protocol being committed. `Some` for create-table and future ALTER TABLE.
+    /// New protocol being committed. `Some` for create-table and for an ALTER TABLE that changes
+    /// the protocol.
     new_protocol: Option<Protocol>,
-    /// New metadata being committed. `Some` for create-table and future ALTER TABLE.
+    /// New metadata being committed. `Some` for create-table and ALTER TABLE.
     new_metadata: Option<Metadata>,
 }
 
