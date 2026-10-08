@@ -502,8 +502,7 @@ impl<S> Transaction<S> {
 impl<S> Transaction<S> {
     /// Acknowledges that the connector enforces this table's CHECK constraints.
     ///
-    /// Kernel does not see the rows a connector writes, so it does not evaluate constraints.
-    /// Acknowledging without enforcing them lets constraint-violating rows reach the table. The
+    /// Kernel does not see the rows a connector writes, so it does not evaluate constraints. The
     /// connector must:
     /// - Discover the constraints of this transaction via
     ///   [`TableWriteExpressions::check_constraints`] and parse each one's
@@ -1062,8 +1061,8 @@ impl<S> Transaction<S> {
     #[cfg(feature = "check-constraints-in-dev")]
     fn ensure_check_constraints_acknowledged(&self) -> KernelResult<()> {
         require!(
-            self.check_constraints_acknowledged
-                || !self.effective_table_config.has_check_constraints(),
+            !self.effective_table_config.has_check_constraints()
+                || self.check_constraints_acknowledged,
             KernelError::invalid_transaction_state(
                 "Writing to a table with CHECK constraints requires calling \
                  Transaction::ack_check_constraints() first",
