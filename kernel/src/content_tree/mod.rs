@@ -6,6 +6,7 @@
 
 mod builder;
 mod dv_conversion;
+mod reader;
 pub(crate) mod stats;
 
 use std::collections::HashMap;
@@ -39,9 +40,10 @@ pub(crate) const EQUALITY_IDS: &str = "equalityIds";
 pub(crate) const FORMAT_VERSION: &str = "formatVersion";
 pub(crate) const TAGS: &str = "tags";
 
-/// Field names within the [`TrackingInfo`] sub-struct that the write path populates.
+/// Field names within the [`TrackingInfo`] sub-struct, shared by the AMT write and read paths.
 pub(crate) const TRACKING_STATUS: &str = "status";
 pub(crate) const TRACKING_SNAPSHOT_ID: &str = "snapshotId";
+pub(crate) const DV_SNAPSHOT_ID: &str = "dvSnapshotId";
 pub(crate) const SEQUENCE_NUMBER: &str = "sequenceNumber";
 pub(crate) const FILE_SEQUENCE_NUMBER: &str = "fileSequenceNumber";
 pub(crate) const FIRST_ROW_ID: &str = "firstRowId";
@@ -111,7 +113,8 @@ pub struct TrackingInfo {
     #[field_id = 1]
     pub snapshot_id: Option<i64>,
 
-    /// Snapshot ID in which this entry's deletion vector last changed.
+    /// Snapshot ID in which this entry's deletion vector last changed. May predate this entry's
+    /// own snapshot for a carried-forward entry, so it can be set on any live status.
     #[field_id = 5]
     pub(crate) dv_snapshot_id: Option<i64>,
 
@@ -254,6 +257,22 @@ pub enum DataContentType {
     DeleteManifest = 4, // kept for backwards compat reading only
 }
 
+impl DataContentType {
+    /// Maps the on-disk integer representation to the enum, erroring on unknown values.
+    pub(crate) fn try_from_repr(value: i32) -> KernelResult<Self> {
+        match value {
+            0 => Ok(Self::Data),
+            1 => Ok(Self::PositionDeletes),
+            2 => Ok(Self::EqualityDeletes),
+            3 => Ok(Self::DataManifest),
+            4 => Ok(Self::DeleteManifest),
+            other => Err(KernelError::generic(format!(
+                "Invalid AMT content type value: {other}"
+            ))),
+        }
+    }
+}
+
 impl ToDataType for DataContentType {
     fn to_data_type() -> DataType {
         DataType::INTEGER
@@ -281,12 +300,19 @@ impl ToDataType for DataFileFormat {
     }
 }
 
+impl DataFileFormat {
+    /// The on-disk name of this format.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Parquet => "parquet",
+            Self::Puffin => "puffin",
+        }
+    }
+}
+
 impl From<DataFileFormat> for Scalar {
     fn from(value: DataFileFormat) -> Self {
-        match value {
-            DataFileFormat::Parquet => Scalar::String("parquet".to_string()),
-            DataFileFormat::Puffin => Scalar::String("puffin".to_string()),
-        }
+        Scalar::String(value.name().to_string())
     }
 }
 
@@ -296,6 +322,27 @@ pub enum TrackingStatus {
     Added = 1,
     Deleted = 2,
     Replaced = 3,
+}
+
+impl TrackingStatus {
+    /// Maps the on-disk integer representation to the enum, erroring on unknown values.
+    pub(crate) fn try_from_repr(value: i32) -> KernelResult<Self> {
+        match value {
+            0 => Ok(Self::Existing),
+            1 => Ok(Self::Added),
+            2 => Ok(Self::Deleted),
+            3 => Ok(Self::Replaced),
+            other => Err(KernelError::generic(format!(
+                "Invalid AMT tracking status value: {other}"
+            ))),
+        }
+    }
+
+    /// Whether this entry contributes rows to reads. Live entries (`Existing`, `Added`) are
+    /// surfaced as `Add` actions; not-live entries (`Deleted`, `Replaced`) are not.
+    pub(crate) fn is_live(self) -> bool {
+        self == Self::Existing || self == Self::Added
+    }
 }
 
 impl ToDataType for TrackingStatus {
@@ -382,6 +429,8 @@ fn struct_expr_from_schema(
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, ToSchema};
     use crate::unit_test_utils::assert_result_error_with_message;
@@ -397,6 +446,50 @@ mod tests {
         let schema = StructType::new_unchecked([StructField::nullable("opt", DataType::INTEGER)]);
         let expr = struct_expr_from_schema(&schema, |_| None).unwrap();
         assert_eq!(expr, Expression::struct_from([null_lit(DataType::INTEGER)]));
+    }
+
+    #[rstest]
+    #[case(0, TrackingStatus::Existing)]
+    #[case(1, TrackingStatus::Added)]
+    #[case(2, TrackingStatus::Deleted)]
+    #[case(3, TrackingStatus::Replaced)]
+    fn tracking_status_try_from_repr_roundtrips(
+        #[case] repr: i32,
+        #[case] expected: TrackingStatus,
+    ) {
+        assert_eq!(TrackingStatus::try_from_repr(repr).unwrap(), expected);
+        assert_eq!(expected as i32, repr);
+    }
+
+    #[rstest]
+    #[case(4)]
+    #[case(5)]
+    #[case(-1)]
+    #[case(i32::MAX)]
+    fn tracking_status_try_from_repr_rejects_unknown(#[case] repr: i32) {
+        assert!(TrackingStatus::try_from_repr(repr).is_err());
+    }
+
+    #[rstest]
+    #[case(0, DataContentType::Data)]
+    #[case(1, DataContentType::PositionDeletes)]
+    #[case(2, DataContentType::EqualityDeletes)]
+    #[case(3, DataContentType::DataManifest)]
+    #[case(4, DataContentType::DeleteManifest)]
+    fn data_content_type_try_from_repr_roundtrips(
+        #[case] repr: i32,
+        #[case] expected: DataContentType,
+    ) {
+        assert_eq!(DataContentType::try_from_repr(repr).unwrap(), expected);
+        assert_eq!(expected as i32, repr);
+    }
+
+    #[rstest]
+    #[case(5)]
+    #[case(-1)]
+    #[case(i32::MAX)]
+    fn data_content_type_try_from_repr_rejects_unknown(#[case] repr: i32) {
+        assert!(DataContentType::try_from_repr(repr).is_err());
     }
 
     /// The `ContentTreeNodeEntry` Parquet field IDs and nullability are a protocol contract. This
