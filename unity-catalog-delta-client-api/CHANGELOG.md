@@ -36,5 +36,3 @@
 [#3033]: https://github.com/delta-io/delta-kernel-rs/pull/3033
 [#3061]: https://github.com/delta-io/delta-kernel-rs/pull/3061
 [#3062]: https://github.com/delta-io/delta-kernel-rs/pull/3062
-
-

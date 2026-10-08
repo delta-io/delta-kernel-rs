@@ -102,5 +102,3 @@
 [#3403]: https://github.com/delta-io/delta-kernel-rs/pull/3403
 [#3477]: https://github.com/delta-io/delta-kernel-rs/pull/3477
 [#3478]: https://github.com/delta-io/delta-kernel-rs/pull/3478
-
-
