@@ -11,7 +11,6 @@
 //! [`Transaction::ack_check_constraints`]: crate::transaction::Transaction::ack_check_constraints
 
 use crate::table_properties::CheckConstraint;
-use crate::Snapshot;
 
 /// Read-only discovery of a table's CHECK constraints, implemented by both [`Snapshot`] and
 /// [`Transaction`] so a connector can discover from either.
@@ -22,16 +21,11 @@ use crate::Snapshot;
 /// Discovery has no side effect: it does not acknowledge anything. See
 /// [`Transaction::ack_check_constraints`] for which operations require the acknowledgement.
 ///
+/// [`Snapshot`]: crate::Snapshot
 /// [`Transaction`]: crate::transaction::Transaction
 /// [`Transaction::ack_check_constraints`]: crate::transaction::Transaction::ack_check_constraints
 pub trait TableWriteExpressions {
     /// The table's CHECK constraints, sorted by name and then SQL. Empty when the table declares
     /// none.
     fn check_constraints(&self) -> &[CheckConstraint];
-}
-
-impl TableWriteExpressions for Snapshot {
-    fn check_constraints(&self) -> &[CheckConstraint] {
-        &self.table_properties().check_constraints
-    }
 }

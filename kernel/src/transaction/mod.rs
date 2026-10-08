@@ -507,7 +507,7 @@ impl<S> Transaction<S> {
     /// - Discover the constraints of this transaction via
     ///   [`TableWriteExpressions::check_constraints`] and parse each one's
     ///   [`raw_sql`](crate::table_properties::CheckConstraint::raw_sql) itself. The SQL refers to
-    ///   logical column names. Enforce every entry.
+    ///   logical column names.
     /// - Reject every written row, including its partition values, for which a constraint evaluates
     ///   to `false` or `NULL`. This includes files written for an earlier commit attempt, such as
     ///   one that conflicted, and validated against an older table version.
