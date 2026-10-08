@@ -131,9 +131,8 @@ fn convert_entries_with(
 /// Builds the transform mapping a [`ContentTreeNodeEntry`] row to a `{ add: Add }` struct matching
 /// [`crate::actions::LOG_ADD_SCHEMA`].
 ///
-/// `modificationTime` and `dataChange` have no AMT source and are taken from `ctx`; `baseRowId` and
-/// `defaultRowCommitVersion` are taken from `sources` (so a caller can apply inheritance); nullable
-/// fields not listed here fall through to a typed null via [`struct_expr_from_schema`].
+/// ctx provides constants that aren't available in the AMT today.
+/// sources allows for differing logic between root and leaf translation.
 fn build_entry_to_add_expression(
     ctx: &ReadContext,
     sources: &AddFieldSources,
