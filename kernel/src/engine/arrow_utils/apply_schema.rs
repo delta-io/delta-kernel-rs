@@ -368,7 +368,10 @@ fn apply_schema_to_inner(
     let array: ArrayRef = match schema {
         #[cfg(feature = "udt-in-dev")]
         UserDefined(udt) => {
+            // Reject mismatched struct arity before rebuilding, allowing nullability normalization.
             ensure_data_types(udt.sql_type(), array.data_type(), ValidationMode::TypesOnly)?;
+            // Column-mapping ancestry ends at the UDT boundary: nothing under `sqlType` carries a
+            // field ID.
             apply_schema_to_inner(array, udt.sql_type(), None, "")?
         }
         Struct(stype) => Arc::new(apply_schema_to_struct(array, stype)?),
@@ -448,6 +451,15 @@ mod apply_schema_validation_tests {
             apply_schema_to(&input, &DataType::from(udt)),
             "Struct field count mismatch",
         );
+    }
+
+    #[cfg(feature = "udt-in-dev")]
+    #[test]
+    fn apply_schema_rejects_udt_long_over_utf8() {
+        let input: ArrayRef = Arc::new(crate::arrow::array::StringArray::from(vec!["42"]));
+        let udt =
+            crate::schema::UserDefinedType::try_new(DataType::LONG, Default::default()).unwrap();
+        assert!(apply_schema_to(&input, &DataType::from(udt)).is_err());
     }
 
     #[rstest]

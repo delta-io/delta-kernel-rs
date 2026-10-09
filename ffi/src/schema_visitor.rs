@@ -857,7 +857,8 @@ fn visit_field_map_impl(
 /// visiting metadata, consumes `sql_type_id` even if UDT validation fails. Earlier errors and
 /// disabled UDT support leave the ID available. The physical field's name, nullability, and
 /// metadata are ignored. Returns an error for invalid IDs, invalid UTF-8, duplicate or reserved
-/// annotation keys, failed metadata callbacks, nested UDTs, or disabled UDT support.
+/// annotation keys, failed metadata callbacks, physical types containing UDTs or metadata columns,
+/// or disabled UDT support.
 ///
 /// # Safety
 ///
@@ -884,10 +885,7 @@ pub unsafe extern "C" fn visit_field_user_defined(
         let physical = unwrap_field(state, sql_type_id).ok_or_else(|| {
             KernelError::schema(format!("Invalid UDT physical type ID {sql_type_id}"))
         })?;
-        let udt = delta_kernel::schema::UserDefinedType::try_new(
-            physical.data_type,
-            annotation.into_iter().collect(),
-        )?;
+        let udt = delta_kernel::schema::UserDefinedType::try_new(physical.data_type, annotation)?;
         Ok(wrap_field(
             state,
             StructField::new(name, udt, nullable).with_metadata(metadata),
@@ -967,10 +965,9 @@ mod tests {
 
     use super::*;
     use crate::error::{EngineError, FFIKernelError};
-    #[cfg(feature = "udt-in-dev")]
-    use crate::ffi_test_utils::assert_extern_result_error_contains;
     use crate::ffi_test_utils::{
-        allocate_err, assert_extern_result_error_with_message, ok_or_panic,
+        allocate_err, assert_extern_result_error_contains, assert_extern_result_error_with_message,
+        ok_or_panic,
     };
     use crate::scan::visit_metadata_map;
     use crate::{KernelStringSlice, NullableCvoid};
@@ -986,7 +983,12 @@ mod tests {
         #[values(false, true)] duplicate: bool,
     ) {
         let mut state = KernelSchemaVisitorState::default();
-        let physical = wrap_field(&mut state, StructField::nullable("sqlType", DataType::LONG));
+        let physical = wrap_field(
+            &mut state,
+            StructField::not_null("sqlType", DataType::LONG)
+                .with_metadata([("child", MetadataValue::String("ignored".into()))]),
+        );
+        let mut metadata = TestMetadata::from([("parent", MetadataValue::String("kept".into()))]);
         let entries: Vec<_> = (0..if duplicate { 2 } else { 1 })
             .map(|_| crate::delta_types::FfiNullableStringMapEntry {
                 key: unsafe { KernelStringSlice::new_unsafe(key) },
@@ -1003,7 +1005,7 @@ mod tests {
                     len: entries.len(),
                 },
                 true,
-                null(),
+                &test_engine_metadata(&mut metadata),
                 allocate_err,
             )
         };
@@ -1016,6 +1018,9 @@ mod tests {
             );
         } else if valid {
             let field = state.elements.take(ok_or_panic(result)).unwrap();
+            assert_eq!(field.name, "value");
+            assert!(field.nullable);
+            assert_eq!(field.metadata, metadata.values);
             let DataType::UserDefined(udt) = field.data_type else {
                 panic!("Expected UDT")
             };
@@ -1028,6 +1033,167 @@ mod tests {
                 Some("Schema error: UDT annotation keys type and sqlType are reserved"),
             );
         }
+    }
+
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest]
+    fn udt_schema_visit_rejects_invalid_or_consumed_id(#[values(false, true)] consumed: bool) {
+        let mut state = KernelSchemaVisitorState::default();
+        let unrelated = wrap_field(&mut state, StructField::nullable("other", DataType::STRING));
+        let physical = if consumed {
+            let id = wrap_field(&mut state, StructField::nullable("sqlType", DataType::LONG));
+            let udt_id = unsafe {
+                ok_or_panic(visit_field_user_defined(
+                    &mut state,
+                    KernelStringSlice::new_unsafe("first"),
+                    id,
+                    FfiNullableStringMap {
+                        ptr: null(),
+                        len: 0,
+                    },
+                    true,
+                    null(),
+                    allocate_err,
+                ))
+            };
+            assert!(state.elements.contains(udt_id));
+            id
+        } else {
+            usize::MAX
+        };
+        let result = unsafe {
+            visit_field_user_defined(
+                &mut state,
+                KernelStringSlice::new_unsafe("value"),
+                physical,
+                FfiNullableStringMap {
+                    ptr: null(),
+                    len: 0,
+                },
+                true,
+                null(),
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_contains(
+            result,
+            FFIKernelError::SchemaError,
+            "Invalid UDT physical type ID",
+        );
+        assert!(state.elements.contains(unrelated));
+        assert!(!state.elements.contains(physical));
+    }
+
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest]
+    #[case::name(0)]
+    #[case::annotation_key(1)]
+    #[case::annotation_value(2)]
+    #[case::metadata_callback(3)]
+    fn udt_schema_visit_early_errors_preserve_child(#[case] failure: usize) {
+        let mut state = KernelSchemaVisitorState::default();
+        let physical = wrap_field(&mut state, StructField::nullable("sqlType", DataType::LONG));
+        let valid = || unsafe { KernelStringSlice::new_unsafe("value") };
+        let invalid_bytes = [0xff_u8];
+        let invalid = || KernelStringSlice {
+            ptr: invalid_bytes.as_ptr().cast(),
+            len: 1,
+        };
+        let entry = crate::delta_types::FfiNullableStringMapEntry {
+            key: if failure == 1 { invalid() } else { valid() },
+            value: Some(if failure == 2 { invalid() } else { valid() }).into(),
+        };
+        let result = unsafe {
+            visit_field_user_defined(
+                &mut state,
+                if failure == 0 { invalid() } else { valid() },
+                physical,
+                FfiNullableStringMap {
+                    ptr: &entry,
+                    len: 1,
+                },
+                true,
+                &rejected_engine_metadata(),
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_with_message(
+            result,
+            if failure == 3 {
+                FFIKernelError::SchemaError
+            } else {
+                FFIKernelError::Utf8Error
+            },
+            None,
+        );
+        assert!(state.elements.contains(physical));
+    }
+
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest]
+    #[case::nested_udt(
+        DataType::from(delta_kernel::schema::UserDefinedType::try_new(DataType::LONG, HashMap::new()).unwrap()),
+        "must not contain another UDT"
+    )]
+    #[case::metadata_column(
+        DataType::from(StructType::try_new([StructField::create_metadata_column(
+            "row_index", delta_kernel::schema::MetadataColumnSpec::RowIndex
+        )]).unwrap()),
+        "must not contain a metadata column"
+    )]
+    fn udt_schema_visit_validation_errors_consume_child(
+        #[case] physical_type: DataType,
+        #[case] message: &str,
+    ) {
+        let mut state = KernelSchemaVisitorState::default();
+        let physical = wrap_field(&mut state, StructField::nullable("sqlType", physical_type));
+        let unrelated = wrap_field(&mut state, StructField::nullable("other", DataType::LONG));
+        let result = unsafe {
+            visit_field_user_defined(
+                &mut state,
+                KernelStringSlice::new_unsafe("value"),
+                physical,
+                FfiNullableStringMap {
+                    ptr: null(),
+                    len: 0,
+                },
+                true,
+                null(),
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_contains(result, FFIKernelError::SchemaError, message);
+        assert!(!state.elements.contains(physical));
+        assert!(state.elements.contains(unrelated));
+    }
+
+    #[cfg(not(feature = "udt-in-dev"))]
+    #[test]
+    fn udt_schema_visit_disabled_preserves_child_and_skips_metadata() {
+        let mut state = KernelSchemaVisitorState::default();
+        let physical = wrap_field(&mut state, StructField::nullable("sqlType", DataType::LONG));
+        let mut metadata = TestMetadata::default();
+        let result = unsafe {
+            visit_field_user_defined(
+                &mut state,
+                KernelStringSlice::new_unsafe("value"),
+                physical,
+                FfiNullableStringMap {
+                    ptr: null(),
+                    len: 0,
+                },
+                true,
+                &test_engine_metadata(&mut metadata),
+                allocate_err,
+            )
+        };
+        assert_extern_result_error_contains(
+            result,
+            FFIKernelError::UnsupportedError,
+            "requires udt-in-dev",
+        );
+        assert!(state.elements.contains(physical));
+        assert!(!metadata.visited);
     }
 
     #[derive(Default)]

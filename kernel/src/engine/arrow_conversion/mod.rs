@@ -343,7 +343,7 @@ impl TryFromKernel<&DataType> for ArrowDataType {
     fn try_from_kernel(t: &DataType) -> Result<Self, ArrowError> {
         match t {
             #[cfg(feature = "udt-in-dev")]
-            DataType::UserDefined(udt) => udt.sql_type().try_into_arrow(),
+            DataType::UserDefined(_) => t.physical_type().try_into_arrow(),
             DataType::Primitive(p) => {
                 match p {
                     PrimitiveType::String => Ok(ArrowDataType::Utf8),

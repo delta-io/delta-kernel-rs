@@ -510,12 +510,7 @@ fn get_indices(
             ..
         }) = kernel_field_info
         {
-            let requested_type = requested_field.data_type();
-            #[cfg(feature = "udt-in-dev")]
-            let requested_type = match requested_type {
-                DataType::UserDefined(udt) => udt.sql_type(),
-                data_type => data_type,
-            };
+            let requested_type = requested_field.data_type().physical_type();
             // If the field is a variant, make sure the parquet schema matches the unshredded
             // variant representation. This is to ensure that shredded reads are not
             // performed.
@@ -2203,6 +2198,19 @@ mod tests {
         let result_shredded = get_requested_indices(&requested_schema, &shredded_parquet_schema);
         assert!(matches!(result_shredded,
             Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
+        #[cfg(feature = "udt-in-dev")]
+        {
+            let udt = crate::schema::UserDefinedType::try_new(
+                DataType::unshredded_variant(),
+                Default::default(),
+            )
+            .unwrap();
+            let requested_schema = schema_ref! { nullable "v": (udt) };
+            assert!(get_requested_indices(&requested_schema, &unshredded_parquet_schema).is_ok());
+            let result = get_requested_indices(&requested_schema, &shredded_parquet_schema);
+            assert!(matches!(result,
+                Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
+        }
         let result_incorrect = get_requested_indices(&requested_schema, &incorrect_parquet_schema);
         assert!(matches!(result_incorrect,
             Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
