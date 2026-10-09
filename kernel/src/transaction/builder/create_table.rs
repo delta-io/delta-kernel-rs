@@ -32,15 +32,16 @@ use crate::table_features::{
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
-    CheckpointPolicy, TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY,
-    CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID,
-    COLUMN_MAPPING_MODE, DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS,
-    DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED,
-    ENABLE_DELETION_VECTORS, ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1,
-    ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
-    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION,
-    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
-    PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED, SET_TRANSACTION_RETENTION_DURATION,
+    strip_check_constraint_prefix, CheckpointPolicy, TableProperties, APPEND_ONLY,
+    CHECKPOINT_INTERVAL, CHECKPOINT_POLICY, CHECKPOINT_WRITE_STATS_AS_JSON,
+    CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE,
+    DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS, DELETED_FILE_RETENTION_DURATION,
+    DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS,
+    ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
+    ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
+    ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+    MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED,
+    SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -775,6 +776,11 @@ fn validate_extract_table_features_and_properties(
 
     // Validate remaining delta.* properties against the allow list
     for key in properties.keys() {
+        if strip_check_constraint_prefix(key).is_some() {
+            return Err(KernelError::generic(format!(
+                "Setting CHECK constraint property '{key}' is not supported during CREATE TABLE"
+            )));
+        }
         if key.starts_with(DELTA_PROPERTY_PREFIX)
             && !ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
         {
@@ -1141,6 +1147,17 @@ mod tests {
             builder.table_properties.get("key2"),
             Some(&"value2".to_string())
         );
+    }
+
+    #[rstest]
+    // Names a user would expect.
+    #[case::lowercase_prefix("delta.constraints.positive")]
+    // Unusual names, rejected like any other CHECK constraint key.
+    #[case::bare_prefix("delta.constraints.")]
+    fn create_table_rejects_check_constraint_properties(#[case] key: &str) {
+        let properties = HashMap::from([(key.to_string(), "amount > 0".to_string())]);
+        let result = validate_extract_table_features_and_properties(properties);
+        assert_result_error_with_message(result, "Setting CHECK constraint property");
     }
 
     #[test]

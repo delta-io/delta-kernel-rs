@@ -794,6 +794,11 @@ impl TableConfiguration {
         self.has_column_with_default
     }
 
+    /// Whether the table's metadata configuration declares at least one CHECK constraint.
+    pub(crate) fn has_check_constraints(&self) -> bool {
+        !self.table_properties.check_constraints.is_empty()
+    }
+
     /// The physical schema ([`SchemaRef`]) of this table at this version.
     ///
     /// When column mapping is disabled, this is identical to
@@ -1052,6 +1057,17 @@ impl TableConfiguration {
             self.check_feature_support(&feature, Operation::Write)?;
         }
 
+        // The protocol allows CHECK constraints only on tables that support the `checkConstraints`
+        // writer feature.
+        require!(
+            self.is_feature_supported(&TableFeature::CheckConstraints)
+                || !self.has_check_constraints(),
+            KernelError::invalid_protocol(
+                "Table contains CHECK constraints but does not support the 'checkConstraints' \
+                 writer feature",
+            )
+        );
+
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
         // TODO: Better story for schema validation for Invariants and other features
         if self.is_feature_supported(&TableFeature::Invariants)
@@ -1294,6 +1310,141 @@ mod test {
         assert_result_error_with_message(result, "Partition column 'missing' not found in schema");
     }
 
+    #[derive(Debug, PartialEq)]
+    enum WriteSupport {
+        Supported,
+        InvalidProtocol,
+        Unsupported,
+    }
+
+    #[rstest]
+    // Tables declaring CHECK constraints.
+    #[case::without_feature(
+        &[("delta.constraints.positive", "amount > 0")],
+        MockProtocolBuilder::new().build(),
+        WriteSupport::InvalidProtocol
+    )]
+    #[case::with_feature(
+        &[("delta.constraints.positive", "amount > 0")],
+        MockProtocolBuilder::new()
+            .with_writer_features([TableFeature::CheckConstraints])
+            .build(),
+        if cfg!(feature = "check-constraints-in-dev") {
+            WriteSupport::Supported
+        } else {
+            WriteSupport::Unsupported
+        }
+    )]
+    #[case::legacy_writer_below_min_version(
+        &[("delta.constraints.positive", "amount > 0")],
+        MockProtocolBuilder::new().with_versions(1, 2).build(),
+        WriteSupport::InvalidProtocol
+    )]
+    #[case::legacy_writer_at_min_version(
+        &[("delta.constraints.positive", "amount > 0")],
+        MockProtocolBuilder::new().with_versions(1, 3).build(),
+        if cfg!(feature = "check-constraints-in-dev") {
+            WriteSupport::Supported
+        } else {
+            WriteSupport::Unsupported
+        }
+    )]
+    // Unusual names, accepted only because other Delta writers can store and enforce them.
+    #[case::bare_prefix(
+        &[("delta.constraints.", "amount > 0")],
+        MockProtocolBuilder::new().with_versions(1, 2).build(),
+        WriteSupport::InvalidProtocol
+    )]
+    #[case::names_differing_only_in_case(
+        &[
+            ("delta.constraints.positive", "amount > 0"),
+            ("delta.constraints.POSITIVE", "amount > 1"),
+        ],
+        MockProtocolBuilder::new().with_versions(1, 2).build(),
+        WriteSupport::InvalidProtocol
+    )]
+    #[case::names_differing_only_in_case_with_feature(
+        &[
+            ("delta.constraints.positive", "amount > 0"),
+            ("delta.constraints.POSITIVE", "amount > 1"),
+        ],
+        MockProtocolBuilder::new()
+            .with_writer_features([TableFeature::CheckConstraints])
+            .build(),
+        if cfg!(feature = "check-constraints-in-dev") {
+            WriteSupport::Supported
+        } else {
+            WriteSupport::Unsupported
+        }
+    )]
+    // No CHECK constraint keys.
+    #[case::no_properties(
+        &[],
+        MockProtocolBuilder::new().with_versions(1, 2).build(),
+        WriteSupport::Supported
+    )]
+    #[case::unrelated_delta_property(
+        &[("delta.appendOnly", "false")],
+        MockProtocolBuilder::new().with_versions(1, 2).build(),
+        WriteSupport::Supported
+    )]
+    #[case::prefix_without_trailing_dot(
+        &[("delta.constraintsX", "amount > 0")],
+        MockProtocolBuilder::new().with_versions(1, 2).build(),
+        WriteSupport::Supported
+    )]
+    #[case::non_lowercase_prefix(
+        &[("DELTA.CONSTRAINTS.positive", "amount > 0")],
+        MockProtocolBuilder::new().with_versions(1, 2).build(),
+        WriteSupport::Supported
+    )]
+    fn write_and_read_support_for_check_constraints(
+        #[case] properties: &[(&str, &str)],
+        #[case] protocol: Protocol,
+        #[case] expected_write_support: WriteSupport,
+    ) {
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_properties(properties)
+            .with_protocol(protocol)
+            .build();
+
+        let write_support = match table_config.ensure_operation_supported(Operation::Write) {
+            Ok(()) => WriteSupport::Supported,
+            Err(KernelError::InvalidProtocol(_)) => WriteSupport::InvalidProtocol,
+            Err(KernelError::Unsupported(_)) => WriteSupport::Unsupported,
+            Err(err) => panic!("unexpected write error: {err:?}"),
+        };
+        assert_eq!(write_support, expected_write_support);
+
+        let read_supported = table_config
+            .ensure_operation_supported(Operation::Scan)
+            .is_ok();
+        assert!(read_supported);
+    }
+
+    #[rstest]
+    // Names a user would expect.
+    #[case::lowercase_prefix(&[("delta.constraints.positive", "amount > 0")], true)]
+    // Unusual names, accepted only because other Delta writers can store and enforce them.
+    #[case::bare_prefix(&[("delta.constraints.", "amount > 0")], true)]
+    #[case::whitespace_only_name(&[("delta.constraints.   ", "amount > 0")], true)]
+    // No CHECK constraint keys.
+    #[case::no_properties(&[], false)]
+    #[case::unrelated_delta_property(&[("delta.appendOnly", "false")], false)]
+    #[case::prefix_without_trailing_dot(&[("delta.constraintsX", "amount > 0")], false)]
+    #[case::non_lowercase_prefix(&[("DELTA.CONSTRAINTS.positive", "amount > 0")], false)]
+    fn has_check_constraints_detects_constraint_keys(
+        #[case] properties: &[(&str, &str)],
+        #[case] expected: bool,
+    ) {
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_properties(properties)
+            .build();
+
+        let has_check_constraints = table_config.has_check_constraints();
+        assert_eq!(has_check_constraints, expected);
+    }
+
     #[test]
     fn table_configuration_rejects_duplicate_partition_columns() {
         let result = MockTableConfigurationBuilder::new()
@@ -1341,6 +1492,33 @@ mod test {
             .build();
         assert!(table_config.is_feature_supported(&TableFeature::DeletionVectors));
         assert!(table_config.is_feature_enabled(&TableFeature::DeletionVectors));
+    }
+
+    #[rstest]
+    #[case::no_constraint(&[])]
+    #[case::named_constraint(&[("delta.constraints.positive", "amount > 0")])]
+    #[case::non_lowercase_prefix(&[("DELTA.CONSTRAINTS.positive", "amount > 0")])]
+    #[case::bare_prefix_empty_name(&[("delta.constraints.", "1 > 0")])]
+    #[case::whitespace_only_name(&[("delta.constraints.   ", "1 > 0")])]
+    fn check_constraints_enabled_exactly_when_supported(
+        #[case] properties: &[(&str, &str)],
+        #[values(true, false)] feature_listed: bool,
+    ) {
+        let writer_features = if feature_listed {
+            vec![TableFeature::CheckConstraints]
+        } else {
+            vec![]
+        };
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_properties(properties)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_writer_features(writer_features)
+                    .build(),
+            )
+            .build();
+        let is_enabled = table_config.is_feature_enabled(&TableFeature::CheckConstraints);
+        assert_eq!(is_enabled, feature_listed);
     }
 
     #[rstest]

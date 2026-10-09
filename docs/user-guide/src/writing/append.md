@@ -112,6 +112,10 @@ If the table declares column defaults, resolve any defaults your input needs and
 before requesting write state. See [Column defaults](./column_defaults.md) for both Kernel-parsed
 and connector-evaluated defaults.
 
+If the table declares CHECK constraints, acknowledge that your connector enforces them before
+requesting write state. See [Check constraints](./check_constraints.md) for discovery and
+validation.
+
 Before writing data, obtain a `WriteState` from the transaction. Bind the state to create a
 `BoundWriteContext`, which bundles everything needed to correctly write Parquet files:
 
