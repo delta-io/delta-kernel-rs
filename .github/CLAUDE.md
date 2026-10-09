@@ -68,6 +68,11 @@ run: |
     echo "Comment: $COMMENT_BODY"
 ```
 
+## UDT coverage
+
+UDT schema and FFI support are unconditional. Keep the no-default-feature checks alongside
+all-features tests so exhaustive type matches and protobuf conversion compile in minimal builds.
+
 ## Release tooling checks
 
 The `release-tooling` job in `build.yml` fetches full history and tags because release branches

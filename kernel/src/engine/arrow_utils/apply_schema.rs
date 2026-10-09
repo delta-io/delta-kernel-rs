@@ -366,6 +366,13 @@ fn apply_schema_to_inner(
 ) -> KernelResult<ArrayRef> {
     use DataType::*;
     let array: ArrayRef = match schema {
+        UserDefined(udt) => {
+            // Reject mismatched struct arity before rebuilding, allowing nullability normalization.
+            ensure_data_types(udt.sql_type(), array.data_type(), ValidationMode::TypesOnly)?;
+            // Column-mapping ancestry ends at the UDT boundary: nothing under `sqlType` carries a
+            // field ID.
+            apply_schema_to_inner(array, udt.sql_type(), None, "")?
+        }
         Struct(stype) => Arc::new(apply_schema_to_struct(array, stype)?),
         Array(atype) => Arc::new(apply_schema_to_list(array, atype, ancestor, relative_path)?),
         Map(mtype) => Arc::new(apply_schema_to_map(array, mtype, ancestor, relative_path)?),
@@ -391,6 +398,7 @@ mod apply_schema_validation_tests {
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
+    use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::{
         schema, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
@@ -400,6 +408,54 @@ mod apply_schema_validation_tests {
         array_in_map_with_field_ids, assert_result_error_with_message,
         collect_arrow_field_metadata, complex_nested_with_field_ids,
     };
+
+    #[rstest]
+    #[case::struct_type(
+        DataType::from(schema! { nullable "x": LONG }),
+        DataType::from(schema! { not_null "x": LONG }),
+    )]
+    #[case::array(
+        DataType::from(crate::schema::ArrayType::new(DataType::LONG, true)),
+        DataType::from(crate::schema::ArrayType::new(DataType::LONG, false))
+    )]
+    #[case::map(
+        DataType::from(crate::schema::MapType::new(DataType::STRING, DataType::LONG, true)),
+        DataType::from(crate::schema::MapType::new(DataType::STRING, DataType::LONG, false))
+    )]
+    fn apply_schema_normalizes_udt_child_nullability(
+        #[case] logical: DataType,
+        #[case] physical: DataType,
+    ) {
+        let physical: ArrowDataType = (&physical).try_into_arrow().unwrap();
+        let input = crate::arrow::array::new_empty_array(&physical);
+        let udt =
+            crate::schema::UserDefinedType::try_new(logical.clone(), Default::default()).unwrap();
+        let output = apply_schema_to(&input, &DataType::from(udt)).unwrap();
+        let expected: ArrowDataType = (&logical).try_into_arrow().unwrap();
+        assert_eq!(output.data_type(), &expected);
+    }
+
+    #[rstest]
+    fn apply_schema_rejects_udt_struct_field_count_mismatch(#[values(1, 3)] count: usize) {
+        let sql_type = DataType::from(schema! { nullable "x": LONG, nullable "y": LONG });
+        let udt = crate::schema::UserDefinedType::try_new(sql_type, Default::default()).unwrap();
+        let fields: Fields = (0..count)
+            .map(|i| ArrowField::new(format!("field{i}"), ArrowDataType::Int64, false))
+            .collect();
+        let input = crate::arrow::array::new_empty_array(&ArrowDataType::Struct(fields));
+        assert_result_error_with_message(
+            apply_schema_to(&input, &DataType::from(udt)),
+            "Struct field count mismatch",
+        );
+    }
+
+    #[test]
+    fn apply_schema_rejects_udt_long_over_utf8() {
+        let input: ArrayRef = Arc::new(crate::arrow::array::StringArray::from(vec!["42"]));
+        let udt =
+            crate::schema::UserDefinedType::try_new(DataType::LONG, Default::default()).unwrap();
+        assert!(apply_schema_to(&input, &DataType::from(udt)).is_err());
+    }
 
     #[rstest]
     fn apply_schema_accepts_any_binary_representation_for_variant(

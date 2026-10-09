@@ -17,6 +17,16 @@ target_compile_options(read_table PUBLIC)
 
 # Add the test
 include(CTest)
+add_executable(udt_annotation_test udt_annotation_test.c ../common/kernel_utils.c)
+target_compile_definitions(udt_annotation_test PUBLIC DEFINE_DEFAULT_ENGINE_BASE)
+target_include_directories(udt_annotation_test PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/ffi-headers"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../common")
+target_link_directories(udt_annotation_test PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/debug")
+target_link_libraries(udt_annotation_test PUBLIC delta_kernel_ffi)
+add_test(NAME udt_annotation_bytes COMMAND udt_annotation_test)
+add_test(NAME udt_annotation_round_trip COMMAND udt_annotation_test
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/udt-annotations/")
 set(TestRunner "../../../tests/read-table-testing/run_test.sh")
 set(DatPath "../../../../acceptance/tests/dat/out/reader_tests/generated")
 set(ExpectedPath "../../../tests/read-table-testing/expected-data")
@@ -51,10 +61,13 @@ endif(WIN32)
 
 if(MSVC)
   target_compile_options(read_table PRIVATE /W3 /WX)
+  target_compile_options(udt_annotation_test PRIVATE /W3 /WX)
 else()
   # no-strict-prototypes because arrow headers have fn defs without prototypes
   target_compile_options(read_table PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-strict-prototypes -g -fsanitize=address)
   target_link_options(read_table PRIVATE -g -fsanitize=address)
+  target_compile_options(udt_annotation_test PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-strict-prototypes -g -fsanitize=address)
+  target_link_options(udt_annotation_test PRIVATE -g -fsanitize=address)
 endif()
 
 if(VERBOSE)
