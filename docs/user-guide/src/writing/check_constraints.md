@@ -86,8 +86,9 @@ table's logical schema. Discovery has no side effects. It doesn't acknowledge an
 ### Enforcing constraints during an append
 
 This example appends batches to an existing unpartitioned table. Your connector supplies
-`compile_check`, which parses one constraint's SQL with your compute engine and returns a function
-that evaluates it over a batch. Kernel doesn't provide a SQL evaluator for constraints.
+`compile_check`, which parses one constraint's SQL with your compute engine. It returns a
+`CompiledCheck`, a function that evaluates the constraint over a batch and returns one Boolean per
+row. Kernel doesn't provide a SQL evaluator for constraints.
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -99,10 +100,8 @@ that evaluates it over a batch. Kernel doesn't provide a SQL evaluator for const
 # use delta_kernel::{KernelError, Result, SnapshotRef};
 # use delta_kernel_default_engine::executor::TaskExecutor;
 # use delta_kernel_default_engine::DefaultEngine;
+# type CompiledCheck = Box<dyn Fn(&RecordBatch) -> Result<BooleanArray>>;
 use delta_kernel::write_expressions::TableWriteExpressions;
-
-// A constraint compiled by your connector's SQL evaluator. Returns one Boolean per row.
-type CompiledCheck = Box<dyn Fn(&RecordBatch) -> Result<BooleanArray>>;
 
 async fn append_with_check_constraints(
     engine: &DefaultEngine<impl TaskExecutor>,
@@ -114,14 +113,11 @@ async fn append_with_check_constraints(
     let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine)?;
 
     // 2. Discover the constraints and compile each one before writing anything.
-    let checks = txn
-        .check_constraints()
-        .iter()
-        .map(|constraint| {
-            let check = compile_check(constraint.raw_sql())?;
-            Ok((constraint.name().to_string(), check))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut checks = Vec::new();
+    for constraint in txn.check_constraints() {
+        let check = compile_check(constraint.raw_sql())?;
+        checks.push((constraint.name().to_string(), check));
+    }
 
     // 3. Acknowledge responsibility for enforcement and prepare the write context.
     txn.ack_check_constraints();
