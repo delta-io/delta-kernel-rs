@@ -33,7 +33,8 @@ static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNamesAndT
     });
 
 /// Runs required validations for every selected RemoveFile row. When `pre_staged_file_actions` is
-/// provided, also validates file-action (addFile, removeFile) uniqueness.
+/// provided, also validates file-action (addFile, removeFile) uniqueness across
+/// `pre_staged_file_actions` and selected rows in `removes`.
 pub(crate) fn validate_remove_files(
     removes: &[FilteredEngineData],
     pre_staged_file_actions: Option<&mut FileActionTracker>,

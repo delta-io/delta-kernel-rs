@@ -20,7 +20,8 @@ static ADD_FILE_COLUMNS_FOR_VALIDATION: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| mandatory_add_file_schema().leaves(None));
 
 /// Runs required validations for every staged AddFile row. When `pre_staged_file_actions` is
-/// provided, also validates file-action (addFile, removeFile) uniqueness.
+/// provided, also validates file-action (addFile, removeFile) uniqueness across
+/// `pre_staged_file_actions` and `adds`.
 pub(crate) fn validate_add_files(
     adds: &[Box<dyn EngineData>],
     physical_partition_columns: impl IntoIterator<Item = String>,
