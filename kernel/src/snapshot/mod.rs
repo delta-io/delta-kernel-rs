@@ -273,34 +273,32 @@ impl Snapshot {
 
     /// The latest AMT `checkpoint` action this snapshot covers, or `None` when this snapshot's log
     /// segment has no checkpoint action (a classic non-AMT table, or an AMT table that has none
-    /// yet). Serves the action captured during P&M replay directly; otherwise (a CRC hint, or an
-    /// unresolved build) scans the log once and memoizes a successful scan, so later calls do not
-    /// re-scan (a failed scan is not cached and is retried). Memoizing is correct because the
-    /// snapshot's `log_segment` is frozen and Delta log files are immutable.
+    /// yet). Serves the action captured during P&M replay directly; otherwise reads it from the
+    /// manifest commit a CRC hint points at, or scans the log, and memoizes a successful result so
+    /// later calls do not re-read (a failure is not cached and is retried). Memoizing is correct
+    /// because the snapshot's `log_segment` is frozen and Delta log files are immutable.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub(crate) fn latest_checkpoint_action(
         &self,
         engine: &dyn Engine,
     ) -> Result<Option<Arc<CheckpointAction>>> {
-        match &self.checkpoint_action_resolution {
+        let hint = match &self.checkpoint_action_resolution {
             // Captured during replay: serve it directly (cheap `Arc` clone).
-            CheckpointActionResolution::Captured(action) => Ok(Some(action.clone())),
-            // TODO(#3495): when a `Hint` is present, resolve the action from the single manifest
-            // commit it names instead of scanning the whole log. For now both scan, memoizing the
-            // result. A concurrent caller may win the race to fill the cell; both compute the same
-            // action, so either value is correct.
-            CheckpointActionResolution::Hint(_) | CheckpointActionResolution::Unresolved => {
-                if let Some(cached) = self.checkpoint_action.get() {
-                    return Ok(cached.clone());
-                }
-                let found = self
-                    .log_segment
-                    .find_last_checkpoint_action(engine)?
-                    .map(Arc::new);
-                let _ = self.checkpoint_action.set(found.clone());
-                Ok(found)
-            }
+            CheckpointActionResolution::Captured(action) => return Ok(Some(action.clone())),
+            CheckpointActionResolution::Hint(hint) => Some(hint),
+            CheckpointActionResolution::Unresolved => None,
+        };
+        // A concurrent caller may win the race to fill the cell; both compute the same action, so
+        // either value is correct.
+        if let Some(cached) = self.checkpoint_action.get() {
+            return Ok(cached.clone());
         }
+        let found = self
+            .log_segment
+            .find_last_checkpoint_action(engine, hint)?
+            .map(Arc::new);
+        let _ = self.checkpoint_action.set(found.clone());
+        Ok(found)
     }
 
     /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`]. Takes Protocol and Metadata

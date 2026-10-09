@@ -14,7 +14,7 @@ use crate::actions::{
     SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{CheckpointAction, CHECKPOINT_ACTION_FIELD};
+use crate::actions::{CheckpointAction, LastManifestCommit, LOG_CHECKPOINT_SCHEMA};
 use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
@@ -32,6 +32,8 @@ use crate::plans::ir::nodes::{FileType, ScanFile};
 use crate::schema::compare::SchemaComparison;
 use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::EngineData;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
 use crate::{
@@ -878,30 +880,33 @@ impl LogSegment {
         Ok(result.actions)
     }
 
-    /// Scan this segment's log newest-first for the latest AMT `checkpoint` action, returning
-    /// `None` when the segment has no checkpoint action (a classic non-AMT table, or an AMT table
-    /// that has none yet). The first action found is the latest, since the files are read in
-    /// descending version order.
+    /// Find the latest AMT `checkpoint` action in this segment, returning `None` when the segment
+    /// has no checkpoint action (a classic non-AMT table, or an AMT table that has none yet).
     ///
-    /// This opens log files until an action is found. TODO: once commitInfo carries a pointer to
-    /// the latest checkpoint action (delta-io/delta#7533), resolve this by opening at most two log
-    /// files instead of scanning.
+    /// `hint` is a CRC's pointer to the latest manifest commit. When the hinted commit is listed
+    /// in this segment, only that one commit is read. Otherwise (or without a hint) the log is
+    /// scanned newest-first until an action is found.
+    ///
+    /// TODO(delta-io/delta#7533): use the commitInfo pointer when no CRC is available.
     ///
     /// # Errors
-    /// Returns an error if the log cannot be read or a checkpoint action fails to parse.
+    /// Returns an error if the log cannot be read, a checkpoint action fails to parse, or the
+    /// hinted commit does not carry the hinted checkpoint action.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub(crate) fn find_last_checkpoint_action(
         &self,
         engine: &dyn Engine,
+        hint: Option<&LastManifestCommit>,
     ) -> KernelResult<Option<CheckpointAction>> {
-        let schema = StructType::try_new([CHECKPOINT_ACTION_FIELD.clone()])?.into();
-        for batch in self.read_actions(engine, schema)? {
-            if let Some(checkpoint) = CheckpointAction::try_new_from_data(batch?.actions.as_ref())?
-            {
-                return Ok(Some(checkpoint));
+        if let Some(hint) = hint {
+            if let Some(commit) = self.hinted_commit(hint) {
+                return read_hinted_checkpoint_action(engine, commit, hint).map(Some);
             }
         }
-        Ok(None)
+        first_checkpoint_action(
+            self.read_actions(engine, LOG_CHECKPOINT_SCHEMA.clone())?
+                .map_ok(|batch| batch.actions),
+        )
     }
 
     /// Read this segment's JSON commit/compaction cover as [`ActionsBatch`]es (`is_log_batch =
@@ -1656,6 +1661,66 @@ impl LogSegment {
         debug!("Checkpoint schema has compatible partitionValues_parsed for partition pruning");
         true
     }
+
+    /// The commit `hint` points at, or `None` when that commit is not listed in this segment
+    /// (commits at or below the checkpoint never are).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn hinted_commit(&self, hint: &LastManifestCommit) -> Option<&ParsedLogPath> {
+        let commits = &self.listed.ascending_commit_files;
+        let version = Version::try_from(hint.version).ok()?;
+        let index = commits
+            .binary_search_by_key(&version, |commit| commit.version)
+            .ok()?;
+        commits.get(index)
+    }
+}
+
+/// The checkpoint action in `commit`, which `hint` names as the latest manifest commit.
+///
+/// # Errors
+/// Returns an error if the commit cannot be read, carries no checkpoint action, or its action's
+/// content root version differs from the hint's: the CRC and the log are inconsistent.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn read_hinted_checkpoint_action(
+    engine: &dyn Engine,
+    commit: &ParsedLogPath,
+    hint: &LastManifestCommit,
+) -> KernelResult<CheckpointAction> {
+    let inconsistent = |detail: String| {
+        KernelError::invalid_log_segment(format!(
+            "lastManifestCommit names manifest commit version {} as the source of content root \
+             version {}, but {detail}",
+            hint.version, hint.content_root_version
+        ))
+    };
+    let files = std::slice::from_ref(&commit.location);
+    let batches =
+        engine
+            .json_handler()
+            .read_json_files(files, LOG_CHECKPOINT_SCHEMA.clone(), None)?;
+    let action = first_checkpoint_action(batches)?
+        .ok_or_else(|| inconsistent("that commit carries no checkpoint action".to_string()))?;
+    require!(
+        action.content_root_version() == hint.content_root_version,
+        inconsistent(format!(
+            "that commit's checkpoint action has content root version {}",
+            action.content_root_version()
+        ))
+    );
+    Ok(action)
+}
+
+/// The first checkpoint action in `batches`, or `None` when no batch carries one.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn first_checkpoint_action(
+    batches: impl Iterator<Item = Result<Box<dyn EngineData>>>,
+) -> KernelResult<Option<CheckpointAction>> {
+    for batch in batches {
+        if let Some(action) = CheckpointAction::try_new_from_data(batch?.as_ref())? {
+            return Ok(Some(action));
+        }
+    }
+    Ok(None)
 }
 
 fn validate_compaction_files(compactions: &[ParsedLogPath]) -> KernelResult<()> {
