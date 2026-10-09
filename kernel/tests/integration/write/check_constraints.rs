@@ -53,6 +53,19 @@ fn build_create_txn(
         .build(engine, Box::new(FileSystemCommitter::new()))
 }
 
+/// Creates a table with the given constraints (possibly none), acknowledging them on the create
+/// commit, and returns its URL.
+fn create_constrained_table(
+    engine: &dyn Engine,
+    table_path: &str,
+    constraints: &[(&str, &str)],
+) -> Result<Url, Box<dyn std::error::Error>> {
+    let mut txn = build_create_txn(engine, table_path, constraints)?;
+    txn.ack_check_constraints();
+    txn.commit(engine)?.unwrap_committed();
+    Ok(Url::from_directory_path(table_path).expect("table path must be a URL"))
+}
+
 fn stage_one_file(txn: &mut Transaction) -> Result<(), Box<dyn std::error::Error>> {
     let add = create_add_files_metadata(
         txn.add_files_schema(),
@@ -377,16 +390,24 @@ async fn table_with_constraints_but_without_feature_is_readable_but_not_writable
 #[rstest]
 #[tokio::test]
 async fn alter_table_on_constrained_table_requires_acknowledgement(
+    #[values(false, true)] drops_one_of_two_constraints: bool,
     #[values(true, false)] acknowledge: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp, table_path, engine) = test_table_setup()?;
-    let table_url = write_table(&table_path, CHECK_CONSTRAINTS_FEATURE, POSITIVE_AMOUNT).await?;
+    let constraints = [
+        ("nonempty_name", "name != ''"),
+        ("positive_amount", "amount > 0"),
+    ];
+    let table_url = write_table(&table_path, CHECK_CONSTRAINTS_FEATURE, &constraints).await?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let mut txn = snapshot
-        .alter_table()
-        .add_column(StructField::nullable("note", DataType::STRING))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let builder = snapshot.alter_table();
+    let builder = if drops_one_of_two_constraints {
+        builder.drop_check_constraint("nonempty_name")
+    } else {
+        builder.add_column(StructField::nullable("note", DataType::STRING))
+    };
+    let mut txn = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     if !acknowledge {
         assert_gate_error(txn.commit(engine.as_ref()));
         return Ok(());
@@ -395,7 +416,12 @@ async fn alter_table_on_constrained_table_requires_acknowledgement(
     txn.ack_check_constraints();
     let altered = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
     let from_altered = discovered(altered.as_ref());
-    assert_eq!(from_altered, POSITIVE_AMOUNT);
+    let expected = if drops_one_of_two_constraints {
+        &constraints[1..]
+    } else {
+        &constraints[..]
+    };
+    assert_eq!(from_altered, expected);
     Ok(())
 }
 

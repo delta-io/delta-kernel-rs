@@ -28,8 +28,10 @@ result is a violation. For the protocol contract, see
 [CHECK constraints in the Delta protocol][check-constraints].
 
 To declare constraints on a new table, pass them to Kernel's create-table builder, as shown in
-[Declaring constraints when creating a table](#declaring-constraints-when-creating-a-table).
-Constraints that other Delta writers add to a table work the same way.
+[Declaring constraints when creating a table](#declaring-constraints-when-creating-a-table). To add
+or drop constraints on an existing table, use the alter-table builder, as shown in
+[Adding and dropping constraints](#adding-and-dropping-constraints). Constraints that other Delta
+writers add to a table work the same way.
 
 ## How Kernel supports check constraints
 
@@ -200,6 +202,58 @@ commits. Before you acknowledge, check that each expression is a Boolean SQL exp
 references existing columns. Kernel doesn't check either. A malformed constraint makes later writes
 fail in every Delta writer that enforces it.
 
+### Adding and dropping constraints
+
+To change the constraints of an existing table, queue `add_check_constraint()` or
+`drop_check_constraint()` on its alter-table builder. See [Altering a table](./alter_table.md) for
+the builder itself.
+
+```rust,no_run
+# extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
+# use delta_kernel::committer::FileSystemCommitter;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel::{Result, Snapshot};
+# fn example() -> Result<()> {
+# let url = delta_kernel::try_parse_uri("/tmp/people")?;
+# let engine = DefaultEngine::builder(store_from_url(&url)?).build();
+let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
+let mut txn = snapshot
+    .alter_table()
+    .add_check_constraint("valid_age", "age > 0")
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+
+// Kernel doesn't read the table's rows, so check them against the new constraint first.
+txn.ack_check_constraints();
+txn.commit(&engine)?;
+
+// Dropping the table's only constraint needs no acknowledgement.
+let snapshot = Snapshot::builder_for(url).build(&engine)?;
+snapshot
+    .alter_table()
+    .drop_check_constraint("valid_age")
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit(&engine)?;
+# Ok(())
+# }
+```
+
+`add_check_constraint()` stores the name lowercased. It rejects a name that matches an existing
+constraint in any case, and an empty or whitespace-only expression. Adding the first constraint
+also adds the `checkConstraints` table feature to the table's protocol.
+
+Before you acknowledge an added constraint, check that its expression is Boolean and only references
+existing columns. Also check that every row already in the table satisfies it. Kernel does neither,
+so acknowledging without checking can leave rows in the table that violate the new constraint.
+
+`drop_check_constraint()` removes every constraint whose name matches in any case, and fails if
+none does. Use `drop_check_constraint_if_exists()` when a missing constraint isn't an error. The
+`checkConstraints` feature stays in the protocol after the last constraint is dropped.
+
+To change a constraint's expression, drop it and add it again in the same alter-table transaction.
+The builder applies constraint operations in the order you queue them.
+
 ## Limitations and common questions
 
 ### Which operations need the acknowledgement?
@@ -209,6 +263,10 @@ On a table that has CHECK constraints, `write_state()` and `commit()` both fail 
 every commit, including commits that only remove files or record a transaction identifier. Kernel
 can't tell which commits add unchecked rows, so it doesn't make exceptions. A table that supports
 the `checkConstraints` feature but declares no constraints needs no acknowledgement.
+
+Kernel checks the constraints the table has once the transaction commits. Adding a constraint
+therefore needs the acknowledgement, and so does dropping one while others remain. Dropping the
+last constraint doesn't.
 
 The acknowledgement belongs to one transaction. Acknowledge again on each new transaction.
 
@@ -229,10 +287,10 @@ Kernel's write context handle the mapping to physical names.
 
 ### Can I add or drop constraints through Kernel?
 
-You can declare constraints when you create a table, as described in
-[Declaring constraints when creating a table](#declaring-constraints-when-creating-a-table).
-Kernel's alter-table API can't add, change, or drop constraints on an existing table. Use another
-Delta writer for these operations.
+Yes. Declare them when you create a table, as described in
+[Declaring constraints when creating a table](#declaring-constraints-when-creating-a-table), or add
+and drop them on an existing table, as described in
+[Adding and dropping constraints](#adding-and-dropping-constraints).
 
 ### Why can I read a table that Kernel won't write to?
 

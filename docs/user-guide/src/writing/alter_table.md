@@ -25,7 +25,9 @@ concerned with data changes can ignore the commit.
 > [!NOTE]
 > The first supported operation is `add_column()`. Other schema operations
 > (drop column, rename, type changes) are not yet available through the
-> `AlterTableTransaction` API.
+> `AlterTableTransaction` API. With the experimental `check-constraints-in-dev`
+> Cargo feature, the builder can also add and drop CHECK constraints. See
+> [Check constraints](./check_constraints.md#adding-and-dropping-constraints).
 
 ## Adding a column
 
