@@ -35,6 +35,10 @@ pub enum UpdateTableOperation {
     /// built-in operation semantics from the name, but all other transaction and protocol
     /// checks still apply. Custom operations do not qualify for incremental version checksum
     /// construction.
+    ///
+    /// Custom names are not guaranteed to remain valid across Kernel versions. Adding a typed
+    /// variant reserves its exact name. Callers using that custom name must select the typed
+    /// variant before building a transaction.
     #[strum(disabled)]
     Custom(String),
 }

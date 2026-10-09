@@ -442,6 +442,9 @@ pub unsafe extern "C" fn update_table_txn_builder_with_operation(
 
 /// Sets a connector-defined operation name on an update-table builder.
 ///
+/// See [`UpdateTableOperation::Custom`] for name restrictions and compatibility across Kernel
+/// versions.
+///
 /// # Safety
 ///
 /// `builder`, `operation`, and `engine` must be valid. This call borrows `engine` and `operation`
