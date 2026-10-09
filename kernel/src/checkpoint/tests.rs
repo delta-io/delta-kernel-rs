@@ -855,10 +855,9 @@ async fn test_checkpoint_preserves_domain_metadata() -> Result<()> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
             .transaction_builder()
+            .with_domain_metadata(domain, value)
             .build(&engine, Box::new(FileSystemCommitter::new()))?;
-        let result = txn
-            .with_domain_metadata(domain.to_string(), value.to_string())
-            .commit(&engine)?;
+        let result = txn.commit(&engine)?;
         assert!(result.is_committed());
         Ok(())
     };
@@ -933,10 +932,9 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> Result<()> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let txn = snapshot
         .transaction_builder()
+        .with_domain_metadata("foo", "bar")
         .build(&engine, Box::new(FileSystemCommitter::new()))?;
-    let result = txn
-        .with_domain_metadata("foo".to_string(), "bar".to_string())
-        .commit(&engine)?;
+    let result = txn.commit(&engine)?;
     assert!(result.is_committed());
 
     // Verify domain exists before removal

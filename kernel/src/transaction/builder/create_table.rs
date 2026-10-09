@@ -13,10 +13,12 @@ use itertools::Itertools;
 use url::Url;
 use uuid::Uuid;
 
+use super::state::TransactionBuilderState;
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
+use crate::metrics::MetricId;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
@@ -28,8 +30,9 @@ use crate::table_features::{
     add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
     find_max_column_id_in_schema, get_any_level_column_physical_name,
     get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz,
-    strip_stray_column_mapping_metadata, ColumnMappingMode, TableFeature,
-    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    strip_stray_column_mapping_metadata, validate_iceberg_compat_if_needed, ColumnMappingMode,
+    IcebergCompatValidationContext, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
+    SET_TABLE_FEATURE_SUPPORTED_VALUE, V2_VALIDATOR,
 };
 use crate::table_properties::{
     strip_check_constraint_prefix, CheckpointPolicy, TableProperties, APPEND_ONLY,
@@ -43,11 +46,10 @@ use crate::table_properties::{
     MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED,
     SET_TRANSACTION_RETENTION_DURATION,
 };
-use crate::transaction::builder::TransactionBuilderState;
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
-use crate::transaction::Transaction;
-use crate::utils::{current_time_ms, try_parse_uri};
+use crate::transaction::{CommitOperation, Transaction};
+use crate::utils::{current_time_ms, try_parse_uri, PhantomType};
 use crate::{Engine, EngineData, KernelError, KernelResult, Result, StorageHandler};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
@@ -1138,7 +1140,7 @@ impl CreateTableTransactionBuilder {
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
 
         // Create Transaction<CreateTable> with the effective table configuration
-        Transaction::try_new_create_table(
+        try_new_create_table(
             table_configuration,
             committer,
             data_layout_result.system_domain_metadata,
@@ -1146,6 +1148,62 @@ impl CreateTableTransactionBuilder {
             self.state,
         )
     }
+}
+
+fn try_new_create_table(
+    effective_table_config: TableConfiguration,
+    committer: Box<dyn Committer>,
+    system_domain_metadata: Vec<DomainMetadata>,
+    clustering_columns: Option<Vec<ColumnName>>,
+    state: TransactionBuilderState,
+) -> KernelResult<CreateTableTransaction> {
+    validate_iceberg_compat_if_needed(
+        &effective_table_config,
+        &V2_VALIDATOR,
+        IcebergCompatValidationContext::Write,
+    )?;
+
+    let span = tracing::info_span!(
+        "txn",
+        path = %effective_table_config.table_root(),
+        operation = "CREATE",
+    );
+    let transaction = state.apply_to_transaction(Transaction {
+        span,
+        operation_id: MetricId::new(),
+        correlation_id: None,
+        read_snapshot_opt: None,
+        effective_table_config,
+        should_emit_protocol: true,
+        should_emit_metadata: true,
+        committer,
+        operation: Some(CommitOperation::CreateTable),
+        operation_parameters: None,
+        operation_metrics: None,
+        engine_info: None,
+        add_files_metadata: vec![],
+        remove_files_metadata: vec![],
+        set_transactions: vec![],
+        commit_timestamp: current_time_ms()?,
+        user_domain_metadata_additions: vec![],
+        system_domain_metadata_additions: system_domain_metadata,
+        provided_row_tracking_high_water_mark: None,
+        user_domain_removals: vec![],
+        data_change: true,
+        infer_data_change: false,
+        column_defaults_acknowledged: false,
+        row_tracking_preservation_acknowledged: false,
+        engine_commit_info: None,
+        is_blind_append: false,
+        dv_matched_files: vec![],
+        num_dv_updates: 0,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        manifest_write: None,
+        physical_clustering_columns: clustering_columns,
+        _state: PhantomType::default(),
+    });
+    transaction.validate_domain_metadata_operations()?;
+    Ok(transaction)
 }
 
 #[cfg(test)]

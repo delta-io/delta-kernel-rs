@@ -305,8 +305,8 @@ async fn alter_table_commit_info_includes_operation_maps() -> Result<(), Box<dyn
         .with_operation(UpdateTableOperation::AlterTable)
         .add_column(StructField::nullable("added", DataType::STRING))
         .with_operation_parameters([("columns", Some(r#"["added"]"#))])
-        .build(engine.as_ref(), committer())?
         .with_operation_metrics([("numAddedColumns", Some("1"))])
+        .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 

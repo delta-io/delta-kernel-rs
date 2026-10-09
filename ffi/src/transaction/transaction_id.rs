@@ -17,8 +17,9 @@ use crate::{
 /// A new handle to the update-table transaction builder.
 ///
 /// # Safety
-/// `builder` is consumed, including on error. `engine` must be a [valid][Handle#Validity] handle,
-/// and `app_id` must be a valid string slice.
+/// `builder` and `engine` must be [valid][Handle#Validity] handles, and `app_id` must be a valid
+/// string slice. This call borrows `engine` and `app_id` and unconditionally consumes `builder`,
+/// including on error.
 #[no_mangle]
 pub unsafe extern "C" fn update_table_txn_builder_with_transaction_id(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,

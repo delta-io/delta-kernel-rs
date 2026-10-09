@@ -128,7 +128,7 @@ impl TryFrom<c_int> for KernelDvStorageType {
 ///
 /// # Safety
 ///
-/// Caller must pass valid string slice and engine handle.
+/// `path_or_inline_dv` and `engine` must be valid. Both are borrowed for this call.
 #[no_mangle]
 pub unsafe extern "C" fn dv_descriptor_new(
     storage_type: c_int,
@@ -184,8 +184,8 @@ fn dv_descriptor_new_impl(
 ///
 /// # Safety
 ///
-/// Caller must pass valid handles. The descriptor handle is consumed and must not be used or freed
-/// after this call, regardless of the result.
+/// All handles and `data_file_path` must be valid. This call mutably borrows `map`, borrows
+/// `engine` and `data_file_path`, and unconditionally consumes `descriptor`, including on error.
 #[no_mangle]
 pub unsafe extern "C" fn dv_descriptor_map_insert(
     mut map: Handle<ExclusiveDvDescriptorMap>,
@@ -235,10 +235,9 @@ fn dv_descriptor_map_insert_impl(
 ///
 /// # Safety
 ///
-/// Caller must pass valid handles. The transaction handle is borrowed in place and remains
-/// valid after this call; the caller is expected to follow with `update_table_txn_commit` (or
-/// `free_update_table_txn`) on the same handle. The DV map and scan iterator handles are
-/// consumed and must not be used or freed after this call.
+/// All handles must be valid. This call mutably borrows `txn`, borrows `engine`, and
+/// unconditionally consumes both `dv_map` and `scan_iter`, including on error. Do not use or free
+/// either consumed handle afterward. The caller must eventually commit or free `txn`.
 #[no_mangle]
 pub unsafe extern "C" fn update_table_txn_update_deletion_vectors(
     mut txn: Handle<ExclusiveUpdateTableTransaction>,

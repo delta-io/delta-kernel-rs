@@ -426,8 +426,8 @@ fn create_table_and_commit(
     let schema = schema_ref! { nullable "id": INTEGER };
     let txn = create_table(table_path, schema, "test_engine")
         .with_data_layout(DataLayout::clustered(["id"]))
-        .build(engine, Box::new(FileSystemCommitter::new()))?
-        .with_domain_metadata("zip".to_string(), "zap0".to_string());
+        .with_domain_metadata("zip", "zap0")
+        .build(engine, Box::new(FileSystemCommitter::new()))?;
 
     Ok(txn.commit(engine)?.unwrap_committed())
 }
@@ -477,9 +477,10 @@ async fn test_post_commit_crc_chains_only_if_read_snapshot_has_crc(
     );
 
     let committed = begin_transaction_with(read_snapshot, engine.as_ref(), |builder| {
-        builder.with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
+        builder
+            .with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
+            .with_domain_metadata("zip", "zap1")
     })?
-    .with_domain_metadata("zip".to_string(), "zap1".to_string())
     .commit(engine.as_ref())?
     .unwrap_committed();
 
@@ -592,10 +593,11 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> Result<()> {
 
     // ===== WHEN: update zip -> zap1, add foo -> bar =====
     let txn = begin_transaction_with(snapshot_v0.clone(), engine.as_ref(), |builder| {
-        builder.with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
-    })?
-    .with_domain_metadata("zip".to_string(), "zap1".to_string()) // <-- set to zap1
-    .with_domain_metadata("foo".to_string(), "bar".to_string()); // <-- add foo
+        builder
+            .with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
+            .with_domain_metadata("zip", "zap1") // <-- set to zap1
+            .with_domain_metadata("foo", "bar") // <-- add foo
+    })?;
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
 
     // ===== THEN: should have CRC at v1 with zip -> zap1, foo -> bar =====
@@ -1336,10 +1338,11 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> Result<()> {
 
     // v1: update zip -> zap1, add foo -> bar
     let committed = begin_transaction_with(snapshot_v0.clone(), engine.as_ref(), |builder| {
-        builder.with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
+        builder
+            .with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
+            .with_domain_metadata("zip", "zap1")
+            .with_domain_metadata("foo", "bar")
     })?
-    .with_domain_metadata("zip".to_string(), "zap1".to_string())
-    .with_domain_metadata("foo".to_string(), "bar".to_string())
     .commit(engine.as_ref())?
     .unwrap_committed();
 
@@ -1436,9 +1439,10 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> Result<()
 
     // v1: post-commit chain accumulates DM into `Partial(map)`.
     let committed = begin_transaction_with(snapshot_v0.clone(), engine.as_ref(), |builder| {
-        builder.with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
+        builder
+            .with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
+            .with_domain_metadata("foo", "bar")
     })?
-    .with_domain_metadata("foo".to_string(), "bar".to_string())
     .commit(engine.as_ref())?
     .unwrap_committed();
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();

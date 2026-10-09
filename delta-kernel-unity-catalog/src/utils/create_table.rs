@@ -344,9 +344,9 @@ mod tests {
         );
         create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
+            .with_domain_metadata("myApp.retention", r#"{"days":30}"#)
             .build(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
-            .with_domain_metadata("myApp.retention".to_string(), r#"{"days":30}"#.to_string())
             .commit(&engine)
             .unwrap()
             .unwrap_committed();

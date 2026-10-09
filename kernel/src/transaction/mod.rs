@@ -70,8 +70,8 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
+use builder::collect_operation_metadata;
 pub use builder::update_table::UpdateTableTransactionBuilder;
-use builder::{collect_operation_metadata, TransactionBuilderState};
 mod bound_write_context;
 mod commit_info;
 mod domain_metadata;
@@ -207,6 +207,9 @@ pub struct CreateTable;
 /// The builder validates schema intent, and commit validates the staged actions; schema-only
 /// behavior is not enforced by the type parameter.
 ///
+/// Configure schema and data-change intent on the builder. Built transactions do not expose
+/// setters for either, including when the `internal-api` feature is enabled.
+///
 /// # Examples
 ///
 /// ```rust,ignore
@@ -215,6 +218,24 @@ pub struct CreateTable;
 ///     .with_operation(UpdateTableOperation::Write)
 ///     .build(&engine, Box::new(FileSystemCommitter::new()))?;
 /// txn.commit(&engine)?;
+/// ```
+///
+/// Schema changes cannot be added to a built transaction:
+///
+/// ```compile_fail
+/// # use delta_kernel::transaction::Transaction;
+/// fn change_schema(txn: Transaction) {
+///     let _ = txn.with_schema_changes(Vec::new());
+/// }
+/// ```
+///
+/// The data-change flag cannot be overridden on a built transaction:
+///
+/// ```compile_fail
+/// # use delta_kernel::transaction::Transaction;
+/// fn change_data_change<S>(txn: &mut Transaction<S>) {
+///     txn.set_data_change(false);
+/// }
 /// ```
 pub struct Transaction<S = ExistingTable> {
     span: tracing::Span,
@@ -453,8 +474,7 @@ impl<S> Transaction<S> {
 // =============================================================================
 impl<S> Transaction<S> {
     /// Sets the data-change flag directly.
-    #[internal_api]
-    #[allow(dead_code)] // retained for test utilities and the internal API
+    #[cfg(test)]
     pub(crate) fn set_data_change(&mut self, data_change: bool) {
         self.data_change = data_change;
         self.infer_data_change = false;
@@ -513,36 +533,6 @@ impl<S> Transaction<S> {
     pub fn with_domain_metadata(mut self, domain: String, configuration: String) -> Self {
         self.user_domain_metadata_additions
             .push(DomainMetadata::new(domain, configuration));
-        self
-    }
-
-    // TODO(#3149): Replace this helper with direct initialization of immutable transaction state.
-    pub(super) fn with_builder_state(mut self, state: TransactionBuilderState) -> Self {
-        let TransactionBuilderState {
-            correlation_id,
-            operation_parameters,
-            operation_metrics,
-            engine_info,
-            engine_commit_info,
-            transaction_ids,
-            domain_metadata_additions,
-            data_change,
-        } = state;
-
-        self.correlation_id = correlation_id;
-        self.operation_parameters = operation_parameters;
-        self.operation_metrics = operation_metrics;
-        self.engine_info = engine_info;
-        self.engine_commit_info = engine_commit_info;
-        self.set_transactions = transaction_ids
-            .into_iter()
-            .map(|(app_id, version)| {
-                SetTransaction::new(app_id, version, Some(self.commit_timestamp))
-            })
-            .collect();
-        self.user_domain_metadata_additions = domain_metadata_additions;
-        self.infer_data_change = data_change.is_none();
-        self.data_change = data_change.unwrap_or(true);
         self
     }
 

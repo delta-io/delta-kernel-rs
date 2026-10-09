@@ -45,12 +45,14 @@ that carry ownership semantics. There are two kinds:
 - **Shared handles** (`Arc`-like) represent shared ownership. Dropping the handle only
   drops the underlying object if it was the last reference.
 
-Every handle has a corresponding `free_*` function that you must call to release it.
+Every handle has a corresponding `free_*` function. Call it to release a handle that you haven't
+passed to a consuming function.
 For example, `free_engine`, `free_snapshot`, `free_scan`, `free_update_table_txn`.
 
-Several FFI functions _consume_ their handle argument and return a new handle. After
-calling such a function, you must not use the old handle. The function documentation
-notes this with "CONSUMES the handle."
+Several FFI functions _consume_ their handle arguments, including when they return an error. After
+calling such a function, don't use or free the consumed handles. A consuming setter returns a
+replacement handle only on success. Each function's safety documentation states which inputs it
+borrows and which it consumes.
 
 ## Core API surface
 
@@ -260,7 +262,7 @@ For partitioned writes, create one context per partition by passing a
 For distributed writes, `update_table_txn_write_state` borrows the transaction and returns an owned
 `SharedWriteState` that remains valid after the transaction is committed or freed. Encode it on the
 driver with `write_state_encode`, decode it on workers running the same Kernel version with
-`write_state_decode`, and create one consuming `ExclusiveWriteContextBuilder` per output partition.
+`write_state_decode`, and create one `ExclusiveWriteContextBuilder` per output partition.
 Builders and built contexts retain their own state reference, so callers may free the original
 state after creating them.
 
@@ -275,7 +277,7 @@ unpartitioned writes.
 |----------|---------|
 | `update_table_txn_write_state` | Borrow a transaction and return owned, immutable write state |
 | `write_state_encode` / `write_state_decode` | Transport write state between processes using the same Kernel version |
-| `write_context_builder` | Create a consuming builder for one output partition |
+| `write_context_builder` | Borrow write state and create a builder that retains its own state reference |
 | `write_context_builder_with_partition_values` / `write_context_builder_with_physical_partition_values` | Bind logical or physical partition values |
 | `write_context_builder_with_row_tracking_columns` / `write_context_builder_build` | Bind row-tracking columns and build the context |
 | `get_write_state_stats_columns` | Visit physical columns that require statistics |

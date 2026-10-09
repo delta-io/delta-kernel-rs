@@ -1594,8 +1594,8 @@ pub unsafe extern "C" fn checkpoint_snapshot(
 ///
 /// # Safety
 ///
-/// Caller must pass valid snapshot, committer, and engine handles. The committer handle is
-/// consumed and must not be used or freed afterward.
+/// All handles must be valid. This call borrows `snapshot` and `engine` and unconditionally
+/// consumes `committer`, including on error. Do not use or free `committer` afterward.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_publish_with_committer(
     snapshot: Handle<SharedSnapshot>,

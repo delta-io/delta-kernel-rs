@@ -30,7 +30,7 @@ pub(super) fn commit_result_to_committed_handle<S>(
 /// Free a committed-transaction handle.
 ///
 /// # Safety
-/// The handle must be valid and must not be used after this call.
+/// `txn` must be a valid handle and is consumed. Do not use or free it again.
 #[no_mangle]
 pub unsafe extern "C" fn free_committed_transaction(txn: Handle<ExclusiveCommittedTransaction>) {
     txn.drop_handle();
@@ -39,7 +39,7 @@ pub unsafe extern "C" fn free_committed_transaction(txn: Handle<ExclusiveCommitt
 /// Read the committed version without consuming the handle.
 ///
 /// # Safety
-/// The handle must be valid.
+/// `txn` must be a valid handle and is borrowed for this call.
 #[no_mangle]
 pub unsafe extern "C" fn committed_transaction_version(
     txn: &Handle<ExclusiveCommittedTransaction>,
@@ -52,7 +52,7 @@ pub unsafe extern "C" fn committed_transaction_version(
 /// The returned snapshot handle is independently owned. This does not consume `txn`.
 ///
 /// # Safety
-/// The handle must be valid.
+/// `txn` must be a valid handle and is borrowed for this call.
 #[no_mangle]
 pub unsafe extern "C" fn committed_transaction_post_commit_snapshot(
     txn: &Handle<ExclusiveCommittedTransaction>,

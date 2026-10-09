@@ -23,9 +23,8 @@ use delta_kernel::{Engine, Result, Snapshot};
 use itertools::Itertools;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::{
-    begin_transaction, begin_transaction_with, create_add_files_metadata,
-    create_table_and_load_snapshot, insert_data, load_test_data, read_add_infos, read_scan,
-    test_table_setup_mt, write_batch_to_table,
+    begin_transaction_with, create_add_files_metadata, create_table_and_load_snapshot, insert_data,
+    load_test_data, read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table,
 };
 
 use crate::common::read_utils::read_parquet_file;
@@ -356,8 +355,10 @@ async fn test_v2_checkpoint_with_sidecars() -> Result<()> {
     .await?
     .unwrap_post_commit_snapshot();
 
-    let post_ckpt_snapshot = begin_transaction(post_ckpt_snapshot, engine.as_ref())?
-        .with_domain_metadata("app.settings".to_string(), r#"{"version":3}"#.to_string())
+    let post_ckpt_snapshot =
+        begin_transaction_with(post_ckpt_snapshot, engine.as_ref(), |builder| {
+            builder.with_domain_metadata("app.settings", r#"{"version":3}"#)
+        })?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 
@@ -905,25 +906,23 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
 
     // Domain metadata commit (no data) -- exercises the empty-file-batch skip path in the
     // sidecar splitter. Sets two domains initially.
-    snapshot = begin_transaction(snapshot, engine.as_ref())?
-        .with_domain_metadata("app.settings".to_string(), r#"{"version":1}"#.to_string())
-        .with_domain_metadata(
-            "app.feature_flags".to_string(),
-            r#"{"dark_mode":true}"#.to_string(),
-        )
-        .commit(engine.as_ref())?
-        .unwrap_post_commit_snapshot();
+    snapshot = begin_transaction_with(snapshot, engine.as_ref(), |builder| {
+        builder
+            .with_domain_metadata("app.settings", r#"{"version":1}"#)
+            .with_domain_metadata("app.feature_flags", r#"{"dark_mode":true}"#)
+    })?
+    .commit(engine.as_ref())?
+    .unwrap_post_commit_snapshot();
 
     // Another domain metadata commit -- updates "app.settings" to verify reconciliation
     // picks the latest value, and adds a new domain.
-    snapshot = begin_transaction(snapshot, engine.as_ref())?
-        .with_domain_metadata(
-            "app.analytics".to_string(),
-            r#"{"tracking":false}"#.to_string(),
-        )
-        .with_domain_metadata("app.settings".to_string(), r#"{"version":2}"#.to_string())
-        .commit(engine.as_ref())?
-        .unwrap_post_commit_snapshot();
+    snapshot = begin_transaction_with(snapshot, engine.as_ref(), |builder| {
+        builder
+            .with_domain_metadata("app.analytics", r#"{"tracking":false}"#)
+            .with_domain_metadata("app.settings", r#"{"version":2}"#)
+    })?
+    .commit(engine.as_ref())?
+    .unwrap_post_commit_snapshot();
 
     // SetTransaction commits -- exercise `txn` actions in checkpoint. Two distinct app_ids
     // plus a second update to `app1` to verify reconciliation picks the latest version.

@@ -275,7 +275,7 @@ pub unsafe extern "C" fn get_write_state_stats_columns(
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a [valid][Handle#Validity] transaction handle and engine.
+/// `txn` and `engine` must be [valid][Handle#Validity] handles. Both are borrowed for this call.
 #[no_mangle]
 pub unsafe extern "C" fn update_table_txn_get_unpartitioned_write_context(
     txn: Handle<ExclusiveUpdateTableTransaction>,
@@ -296,7 +296,7 @@ pub unsafe extern "C" fn update_table_txn_get_unpartitioned_write_context(
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a [valid][Handle#Validity] transaction handle and engine.
+/// `txn` and `engine` must be [valid][Handle#Validity] handles. Both are borrowed for this call.
 #[no_mangle]
 pub unsafe extern "C" fn create_table_txn_get_unpartitioned_write_context(
     txn: Handle<ExclusiveCreateTableTransaction>,
@@ -326,8 +326,8 @@ pub unsafe extern "C" fn create_table_txn_get_unpartitioned_write_context(
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a [valid][Handle#Validity] transaction handle, partition
-/// value map handle, and engine.
+/// All handles must be [valid][Handle#Validity]. This call borrows `txn` and `engine` and
+/// unconditionally consumes `partition_values`, including on error.
 #[no_mangle]
 pub unsafe extern "C" fn update_table_txn_get_partitioned_write_context(
     txn: Handle<ExclusiveUpdateTableTransaction>,
@@ -355,8 +355,8 @@ pub unsafe extern "C" fn update_table_txn_get_partitioned_write_context(
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a [valid][Handle#Validity] transaction handle, partition
-/// value map handle, and engine.
+/// All handles must be [valid][Handle#Validity]. This call borrows `txn` and `engine` and
+/// unconditionally consumes `partition_values`, including on error.
 #[no_mangle]
 pub unsafe extern "C" fn create_table_txn_get_partitioned_write_context(
     txn: Handle<ExclusiveCreateTableTransaction>,

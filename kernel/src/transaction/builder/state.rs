@@ -3,23 +3,24 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::actions::DomainMetadata;
+use crate::actions::{DomainMetadata, SetTransaction};
 use crate::schema::SchemaRef;
 use crate::transaction::domain_metadata::validate_unique_domains;
+use crate::transaction::Transaction;
 use crate::utils::require;
 use crate::{EngineData, KernelError, Result};
 
 /// Transaction intent collected before building a transaction.
 #[derive(Default)]
-pub(crate) struct TransactionBuilderState {
-    pub(in crate::transaction) correlation_id: Option<Arc<str>>,
-    pub(in crate::transaction) operation_parameters: Option<HashMap<String, Option<String>>>,
-    pub(in crate::transaction) operation_metrics: Option<HashMap<String, Option<String>>>,
-    pub(in crate::transaction) engine_info: Option<String>,
-    pub(in crate::transaction) engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
-    pub(in crate::transaction) transaction_ids: Vec<(String, i64)>,
-    pub(in crate::transaction) domain_metadata_additions: Vec<DomainMetadata>,
-    pub(in crate::transaction) data_change: Option<bool>,
+pub(super) struct TransactionBuilderState {
+    pub(super) correlation_id: Option<Arc<str>>,
+    pub(super) operation_parameters: Option<HashMap<String, Option<String>>>,
+    pub(super) operation_metrics: Option<HashMap<String, Option<String>>>,
+    pub(super) engine_info: Option<String>,
+    pub(super) engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
+    pub(super) transaction_ids: Vec<(String, i64)>,
+    pub(super) domain_metadata_additions: Vec<DomainMetadata>,
+    pub(super) data_change: Option<bool>,
 }
 
 impl std::fmt::Debug for TransactionBuilderState {
@@ -38,11 +39,11 @@ impl std::fmt::Debug for TransactionBuilderState {
 }
 
 impl TransactionBuilderState {
-    pub(in crate::transaction) fn for_update_table() -> Self {
+    pub(super) fn for_update_table() -> Self {
         Self::default()
     }
 
-    pub(in crate::transaction) fn for_create_table(engine_info: String) -> Self {
+    pub(super) fn for_create_table(engine_info: String) -> Self {
         Self {
             engine_info: Some(engine_info),
             data_change: Some(true),
@@ -50,26 +51,17 @@ impl TransactionBuilderState {
         }
     }
 
-    pub(in crate::transaction) fn with_engine_info(
-        mut self,
-        engine_info: impl Into<String>,
-    ) -> Self {
+    pub(super) fn with_engine_info(mut self, engine_info: impl Into<String>) -> Self {
         self.engine_info = Some(engine_info.into());
         self
     }
 
-    pub(in crate::transaction) fn with_correlation_id(
-        mut self,
-        correlation_id: impl Into<Arc<str>>,
-    ) -> Self {
+    pub(super) fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
         self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
         self
     }
 
-    pub(in crate::transaction) fn with_operation_parameters<I, K, V>(
-        mut self,
-        parameters: I,
-    ) -> Self
+    pub(super) fn with_operation_parameters<I, K, V>(mut self, parameters: I) -> Self
     where
         I: IntoIterator<Item = (K, Option<V>)>,
         K: Into<String>,
@@ -79,7 +71,7 @@ impl TransactionBuilderState {
         self
     }
 
-    pub(in crate::transaction) fn with_operation_metrics<I, K, V>(mut self, metrics: I) -> Self
+    pub(super) fn with_operation_metrics<I, K, V>(mut self, metrics: I) -> Self
     where
         I: IntoIterator<Item = (K, Option<V>)>,
         K: Into<String>,
@@ -89,7 +81,7 @@ impl TransactionBuilderState {
         self
     }
 
-    pub(in crate::transaction) fn with_commit_info(
+    pub(super) fn with_commit_info(
         mut self,
         commit_info: Box<dyn EngineData>,
         commit_info_schema: SchemaRef,
@@ -98,16 +90,12 @@ impl TransactionBuilderState {
         self
     }
 
-    pub(in crate::transaction) fn with_transaction_id(
-        mut self,
-        app_id: impl Into<String>,
-        version: i64,
-    ) -> Self {
+    pub(super) fn with_transaction_id(mut self, app_id: impl Into<String>, version: i64) -> Self {
         self.transaction_ids.push((app_id.into(), version));
         self
     }
 
-    pub(in crate::transaction) fn with_domain_metadata(
+    pub(super) fn with_domain_metadata(
         mut self,
         domain: impl Into<String>,
         configuration: impl Into<String>,
@@ -117,7 +105,7 @@ impl TransactionBuilderState {
         self
     }
 
-    pub(in crate::transaction) fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         if let Some((commit_info, _)) = &self.engine_commit_info {
             require!(
                 commit_info.len() == 1,
@@ -150,6 +138,37 @@ impl TransactionBuilderState {
         )?;
 
         Ok(())
+    }
+
+    /// Transfers builder intent into the transaction's commit configuration.
+    // TODO(#3149): Replace this helper with direct initialization of immutable transaction state.
+    pub(super) fn apply_to_transaction<S>(self, mut transaction: Transaction<S>) -> Transaction<S> {
+        let Self {
+            correlation_id,
+            operation_parameters,
+            operation_metrics,
+            engine_info,
+            engine_commit_info,
+            transaction_ids,
+            domain_metadata_additions,
+            data_change,
+        } = self;
+
+        transaction.correlation_id = correlation_id;
+        transaction.operation_parameters = operation_parameters;
+        transaction.operation_metrics = operation_metrics;
+        transaction.engine_info = engine_info;
+        transaction.engine_commit_info = engine_commit_info;
+        transaction.set_transactions = transaction_ids
+            .into_iter()
+            .map(|(app_id, version)| {
+                SetTransaction::new(app_id, version, Some(transaction.commit_timestamp))
+            })
+            .collect();
+        transaction.user_domain_metadata_additions = domain_metadata_additions;
+        transaction.infer_data_change = data_change.is_none();
+        transaction.data_change = data_change.unwrap_or(true);
+        transaction
     }
 }
 

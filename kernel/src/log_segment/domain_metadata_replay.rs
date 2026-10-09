@@ -164,9 +164,9 @@ mod tests {
             "test",
         )
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
+        .with_domain_metadata("domainC", "cfgC")
         .build(&engine, Box::new(FileSystemCommitter::new()))
         .unwrap()
-        .with_domain_metadata("domainC".to_string(), "cfgC".to_string())
         .commit(&engine)
         .unwrap();
 
@@ -174,10 +174,10 @@ mod tests {
         let snapshot = Snapshot::builder_for(url.clone()).build(&engine).unwrap();
         let _ = snapshot
             .transaction_builder()
+            .with_domain_metadata("domainA", "cfgA")
+            .with_domain_metadata("domainB", "cfgB")
             .build(&engine, Box::new(FileSystemCommitter::new()))
             .unwrap()
-            .with_domain_metadata("domainA".to_string(), "cfgA".to_string())
-            .with_domain_metadata("domainB".to_string(), "cfgB".to_string())
             .commit(&engine)
             .unwrap();
 

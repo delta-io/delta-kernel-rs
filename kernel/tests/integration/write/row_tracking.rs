@@ -170,6 +170,7 @@ mod row_tracking_preservation {
     #[case::connector_commit_info_with_null_tags(ConnectorCommitInfoTestCase::NullTagsMap)]
     fn commit_info_preservation_tag_merges_connector_commit_info(
         #[case] test_case: ConnectorCommitInfoTestCase,
+        #[values(false, true)] set_commit_info_after_build: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // === Create a Row Tracking table ===
         let (_temp_dir, table_path, engine) = test_table_setup()?;
@@ -187,13 +188,18 @@ mod row_tracking_preservation {
         // === Commit with connector-provided CommitInfo ===
         let (connector_commit_info, connector_commit_info_schema) =
             test_case.connector_commit_info()?;
-        let commit_version = snapshot
-            .transaction_builder()
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .with_commit_info(
-                Box::new(ArrowEngineData::new(connector_commit_info)),
-                connector_commit_info_schema,
-            )
+        let commit_info = Box::new(ArrowEngineData::new(connector_commit_info));
+        let builder = snapshot.transaction_builder();
+        let txn = if set_commit_info_after_build {
+            builder
+                .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+                .with_commit_info(commit_info, connector_commit_info_schema)
+        } else {
+            builder
+                .with_commit_info(commit_info, connector_commit_info_schema)
+                .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        };
+        let commit_version = txn
             .commit(engine.as_ref())?
             .unwrap_committed()
             .commit_version();

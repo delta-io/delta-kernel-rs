@@ -30,9 +30,8 @@ use crate::{kernel_string_slice, KernelStringSlice, NullableCvoid, SharedExternE
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid transaction handle. The handle is borrowed and
-/// mutated in place, NOT consumed: unlike the `with_*` transaction builders, `txn` stays valid
-/// after this call and must still be freed by the caller.
+/// `txn` must be a valid handle. This call mutably borrows it; the caller must eventually commit
+/// or free it.
 #[no_mangle]
 pub unsafe extern "C" fn update_table_txn_ack_column_defaults(
     mut txn: Handle<ExclusiveUpdateTableTransaction>,
@@ -67,7 +66,7 @@ pub type ColumnDefaultVisitor = extern "C" fn(
 ///
 /// Caller is responsible for passing valid transaction and engine handles, a valid
 /// `engine_context` pointer passed through to each `visitor` invocation, and a valid `visitor`
-/// function pointer.
+/// function pointer. This call borrows `txn` and `engine`; the caller retains ownership.
 #[no_mangle]
 pub unsafe extern "C" fn update_table_txn_visit_top_level_column_defaults(
     txn: Handle<ExclusiveUpdateTableTransaction>,

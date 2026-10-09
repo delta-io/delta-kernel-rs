@@ -116,19 +116,20 @@ impl From<UpdateTableOperation> for CommitOperation {
     }
 }
 
+const RESERVED_TABLE_OPERATION_NAMES: &[&str] = &[
+    "CREATE TABLE",
+    "REPLACE TABLE",
+    "CREATE TABLE AS SELECT",
+    "REPLACE TABLE AS SELECT",
+    "CREATE OR REPLACE TABLE AS SELECT",
+];
+
 fn validate_custom_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("custom operation name cannot be empty".to_string());
     }
     if UpdateTableOperation::iter().any(|operation| operation.as_str() == name)
-        || matches!(
-            name,
-            "CREATE TABLE"
-                | "REPLACE TABLE"
-                | "CREATE TABLE AS SELECT"
-                | "REPLACE TABLE AS SELECT"
-                | "CREATE OR REPLACE TABLE AS SELECT"
-        )
+        || RESERVED_TABLE_OPERATION_NAMES.contains(&name)
     {
         return Err(format!(
             "custom operation name '{name}' is reserved; use the matching transaction builder or typed update-table operation"

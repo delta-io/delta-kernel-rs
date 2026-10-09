@@ -2,15 +2,21 @@
 
 use delta_kernel_derive::internal_api;
 
+use super::state::TransactionBuilderState;
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
+use crate::metrics::MetricId;
 use crate::schema::{SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
-use crate::transaction::builder::TransactionBuilderState;
+use crate::table_features::{
+    validate_iceberg_compat_if_needed, IcebergCompatValidationContext, Operation, V2_VALIDATOR,
+    V3_VALIDATOR,
+};
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::transaction::schema_evolution::SchemaOperation;
 use crate::transaction::{Transaction, UpdateTableOperation};
-use crate::{Engine, EngineData, KernelError, Result};
+use crate::utils::{current_time_ms, PhantomType};
+use crate::{Engine, EngineData, KernelError, KernelResult, Result};
 
 /// Configures DML and schema-changing DDL transactions against an existing table.
 ///
@@ -261,8 +267,7 @@ impl UpdateTableTransactionBuilder {
             is_blind_append,
         } = self;
 
-        let mut transaction =
-            Transaction::try_new_existing_table(snapshot, committer, engine, state)?;
+        let mut transaction = try_new_existing_table(snapshot, committer, engine, state)?;
 
         // TODO(#3149): Construct the transaction from complete validated builder intent.
         if let Some(operation) = operation {
@@ -330,6 +335,84 @@ impl UpdateTableTransactionBuilder {
         self.state.validate()?;
         Ok(())
     }
+}
+
+fn try_new_existing_table(
+    snapshot: impl Into<SnapshotRef>,
+    committer: Box<dyn Committer>,
+    engine: &dyn Engine,
+    state: TransactionBuilderState,
+) -> KernelResult<Transaction> {
+    let read_snapshot = snapshot.into();
+
+    // important! before writing to the table we must check it is supported
+    read_snapshot
+        .table_configuration()
+        .ensure_operation_supported(Operation::Write)?;
+
+    // TODO(#3240): Validate that delta.enableRowTracking=true has the required protocol support
+    // and materialized column-name properties. Materialized names must be distinct and must not
+    // collide with physical data columns.
+
+    // Read clustering columns from snapshot (returns None if clustering not enabled)
+    let clustering_columns = read_snapshot.get_physical_clustering_columns(engine)?;
+
+    let commit_timestamp = current_time_ms()?;
+
+    let span = tracing::info_span!(
+        "txn",
+        path = %read_snapshot.table_root(),
+        read_version = read_snapshot.version(),
+    );
+
+    let effective_table_config = read_snapshot.table_configuration().clone();
+
+    validate_iceberg_compat_if_needed(
+        &effective_table_config,
+        &V2_VALIDATOR,
+        IcebergCompatValidationContext::Write,
+    )?;
+
+    validate_iceberg_compat_if_needed(
+        &effective_table_config,
+        &V3_VALIDATOR,
+        IcebergCompatValidationContext::Write,
+    )?;
+
+    Ok(state.apply_to_transaction(Transaction {
+        span,
+        operation_id: MetricId::new(),
+        correlation_id: None,
+        read_snapshot_opt: Some(read_snapshot),
+        effective_table_config,
+        should_emit_protocol: false,
+        should_emit_metadata: false,
+        committer,
+        operation: None,
+        operation_parameters: None,
+        operation_metrics: None,
+        engine_info: None,
+        add_files_metadata: vec![],
+        remove_files_metadata: vec![],
+        set_transactions: vec![],
+        commit_timestamp,
+        user_domain_metadata_additions: vec![],
+        system_domain_metadata_additions: vec![],
+        provided_row_tracking_high_water_mark: None,
+        user_domain_removals: vec![],
+        data_change: true,
+        infer_data_change: false,
+        column_defaults_acknowledged: false,
+        row_tracking_preservation_acknowledged: false,
+        engine_commit_info: None,
+        is_blind_append: false,
+        dv_matched_files: vec![],
+        num_dv_updates: 0,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        manifest_write: None,
+        physical_clustering_columns: clustering_columns,
+        _state: PhantomType::default(),
+    }))
 }
 
 #[cfg(test)]

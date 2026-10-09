@@ -112,9 +112,10 @@ async fn test_with_root_manifest_file_merges_domain_metadata_and_transactions(
         setup_adaptive_metadata_table("root_manifest_file_merge").await?;
 
     let txn = begin_transaction_with(snapshot, &engine, |builder| {
-        builder.with_transaction_id("app-1", 5)
-    })?
-    .with_domain_metadata("my.domain".to_string(), "v1".to_string());
+        builder
+            .with_transaction_id("app-1", 5)
+            .with_domain_metadata("my.domain", "v1")
+    })?;
     let snapshot = txn.commit(&engine)?.unwrap_post_commit_snapshot();
 
     let file = FileMeta {
@@ -123,10 +124,11 @@ async fn test_with_root_manifest_file_merges_domain_metadata_and_transactions(
         size: 1024,
     };
     let txn = begin_transaction_with(snapshot, &engine, |builder| {
-        builder.with_transaction_id("app-2", 7)
+        builder
+            .with_transaction_id("app-2", 7)
+            .with_domain_metadata("my.domain", "v2")
     })?
-    .with_root_manifest_file(file)?
-    .with_domain_metadata("my.domain".to_string(), "v2".to_string());
+    .with_root_manifest_file(file)?;
     txn.commit(&engine)?.unwrap_committed();
 
     let checkpoint_actions = read_actions_from_commit(&table_url, 2, "checkpoint")?;

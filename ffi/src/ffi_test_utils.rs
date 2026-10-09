@@ -125,7 +125,7 @@ pub(crate) unsafe fn build_snapshot(
 ///
 /// # Safety
 ///
-/// `path` and `engine` must be valid. This consumes `engine`.
+/// `path` and `engine` must be valid. This call borrows both inputs; the caller retains ownership.
 #[cfg(test)]
 pub(crate) unsafe fn build_update_table_txn(
     path: KernelStringSlice,
