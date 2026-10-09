@@ -32,18 +32,18 @@ static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNamesAndT
         columns_from_schema(&scan_row_schema(), names)
     });
 
-/// Runs required validations for every selected RemoveFile row. When `staged_file_actions` is
+/// Runs required validations for every selected RemoveFile row. When `pre_staged_file_actions` is
 /// provided, also validates file-action (addFile, removeFile) uniqueness.
 pub(crate) fn validate_remove_files(
     removes: &[FilteredEngineData],
-    staged_file_actions: Option<&mut FileActionTracker>,
+    pre_staged_file_actions: Option<&mut FileActionTracker>,
 ) -> KernelResult<()> {
-    StagedDataValidator::staged_remove_file(staged_file_actions)?.validate_filtered(removes)
+    StagedDataValidator::staged_remove_file(pre_staged_file_actions)?.validate_filtered(removes)
 }
 
 impl<'a> StagedDataValidator<'a> {
     fn staged_remove_file(
-        staged_file_actions: Option<&'a mut FileActionTracker>,
+        pre_staged_file_actions: Option<&'a mut FileActionTracker>,
     ) -> KernelResult<Self> {
         let columns = REMOVE_FILE_COLUMNS_FOR_VALIDATION
             .as_ref()
@@ -53,9 +53,9 @@ impl<'a> StagedDataValidator<'a> {
                 ))
             })?;
         let mut validations: Vec<Box<dyn Validation + 'a>> = vec![Box::new(RequiredRemoveFileVal)];
-        if let Some(staged_file_actions) = staged_file_actions {
+        if let Some(pre_staged_file_actions) = pre_staged_file_actions {
             validations.push(Box::new(RepeatedFileActionValidation {
-                staged_file_actions,
+                pre_staged_file_actions,
             }));
         }
         Ok(StagedDataValidator::new(columns, validations))
@@ -99,7 +99,7 @@ impl Validation for RequiredRemoveFileVal {
 }
 
 struct RepeatedFileActionValidation<'a> {
-    staged_file_actions: &'a mut FileActionTracker,
+    pre_staged_file_actions: &'a mut FileActionTracker,
 }
 
 impl Validation for RepeatedFileActionValidation<'_> {
@@ -110,7 +110,7 @@ impl Validation for RepeatedFileActionValidation<'_> {
     ) -> KernelResult<()> {
         let path: &str = getters[PATH].get(row, PATH_NAME)?;
         let dv_id = dv_id_at(getters, DELETION_VECTOR_STORAGE_TYPE, row)?;
-        self.staged_file_actions.record_remove(path, dv_id)
+        self.pre_staged_file_actions.record_remove(path, dv_id)
     }
 }
 

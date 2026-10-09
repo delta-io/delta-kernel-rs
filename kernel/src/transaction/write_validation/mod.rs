@@ -39,13 +39,6 @@ pub(super) struct FileActionTracker {
 }
 
 impl FileActionTracker {
-    pub(super) fn with_capacity(add_capacity: usize, remove_capacity: usize) -> Self {
-        Self {
-            add_paths: HashMap::with_capacity(add_capacity),
-            remove_paths: HashMap::with_capacity(remove_capacity),
-        }
-    }
-
     fn record_add(&mut self, path: &str, dv_id: Option<String>) -> KernelResult<()> {
         Self::record(
             path,

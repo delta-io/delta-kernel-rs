@@ -43,15 +43,18 @@ static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNames
         columns_from_schema(intermediate_dv_schema(), names)
     });
 
-/// Runs required validations for every selected DV-update row. When `staged_file_actions` is
+/// Runs required validations for every selected DV-update row. When `pre_staged_file_actions` is
 /// provided, also validates file-action (addFile, removeFile) uniqueness.
 pub(crate) fn validate_dv_matched_files(
     dv_matched_files: &[FilteredEngineData],
     physical_partition_columns: impl IntoIterator<Item = String>,
-    staged_file_actions: Option<&mut FileActionTracker>,
+    pre_staged_file_actions: Option<&mut FileActionTracker>,
 ) -> KernelResult<()> {
-    StagedDataValidator::staged_dv_matched_file(physical_partition_columns, staged_file_actions)?
-        .validate_filtered(dv_matched_files)
+    StagedDataValidator::staged_dv_matched_file(
+        physical_partition_columns,
+        pre_staged_file_actions,
+    )?
+    .validate_filtered(dv_matched_files)
 }
 
 /// Required validations for every selected DV-update row.
@@ -101,7 +104,7 @@ impl Validation for RequiredDvMatchedFileVal {
 }
 
 struct RepeatedFileActionValidation<'a> {
-    staged_file_actions: &'a mut FileActionTracker,
+    pre_staged_file_actions: &'a mut FileActionTracker,
 }
 
 impl Validation for RepeatedFileActionValidation<'_> {
@@ -113,15 +116,16 @@ impl Validation for RepeatedFileActionValidation<'_> {
         let path: &str = getters[PATH].get(row, PATH_NAME)?;
         let old_dv_id = dv_id_at(getters, OLD_DELETION_VECTOR_STORAGE_TYPE, row)?;
         let new_dv_id = dv_id_at(getters, NEW_DELETION_VECTOR_STORAGE_TYPE, row)?;
-        self.staged_file_actions.record_remove(path, old_dv_id)?;
-        self.staged_file_actions.record_add(path, new_dv_id)
+        self.pre_staged_file_actions
+            .record_remove(path, old_dv_id)?;
+        self.pre_staged_file_actions.record_add(path, new_dv_id)
     }
 }
 
 impl<'a> StagedDataValidator<'a> {
     fn staged_dv_matched_file(
         physical_partition_columns: impl IntoIterator<Item = String>,
-        staged_file_actions: Option<&'a mut FileActionTracker>,
+        pre_staged_file_actions: Option<&'a mut FileActionTracker>,
     ) -> KernelResult<Self> {
         let columns = DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION
             .as_ref()
@@ -134,9 +138,9 @@ impl<'a> StagedDataValidator<'a> {
             vec![Box::new(RequiredDvMatchedFileVal {
                 physical_partition_columns: physical_partition_columns.into_iter().collect(),
             })];
-        if let Some(staged_file_actions) = staged_file_actions {
+        if let Some(pre_staged_file_actions) = pre_staged_file_actions {
             validations.push(Box::new(RepeatedFileActionValidation {
-                staged_file_actions,
+                pre_staged_file_actions,
             }));
         }
         Ok(StagedDataValidator::new(columns, validations))

@@ -374,21 +374,6 @@ where
     }))
 }
 
-fn selected_row_count(batches: &[FilteredEngineData]) -> usize {
-    batches
-        .iter()
-        .map(|batch| {
-            batch
-                .selection_vector()
-                .iter()
-                .filter(|&&selected| selected)
-                .count()
-                + batch.data().len()
-                - batch.selection_vector().len()
-        })
-        .sum()
-}
-
 // =============================================================================
 // Imperative commit APIs
 // =============================================================================
@@ -1426,34 +1411,25 @@ impl<S> Transaction<S> {
         self.validate_add_files_stats(&self.add_files_metadata)?;
 
         // Share the tracker across validations to detect cross-source conflicts.
-        let mut staged_file_actions = self.dedup_validation_enabled.then(|| {
-            let add_file_count = self
-                .add_files_metadata
-                .iter()
-                .map(|batch| batch.len())
-                .sum::<usize>();
-            let remove_file_count = selected_row_count(&self.remove_files_metadata);
-            let dv_update_count = selected_row_count(&self.dv_matched_files);
-            write_validation::FileActionTracker::with_capacity(
-                add_file_count + dv_update_count,
-                remove_file_count + dv_update_count,
-            )
-        });
+        // TODO(#3545): Pre-size the tracker maps.
+        let mut pre_staged_file_actions = self
+            .dedup_validation_enabled
+            .then(write_validation::FileActionTracker::default);
         write_validation::validate_add_files(
             &self.add_files_metadata,
             self.effective_table_config.physical_partition_columns(),
-            staged_file_actions.as_mut(),
+            pre_staged_file_actions.as_mut(),
         )?;
 
         write_validation::validate_dv_matched_files(
             &self.dv_matched_files,
             self.effective_table_config.physical_partition_columns(),
-            staged_file_actions.as_mut(),
+            pre_staged_file_actions.as_mut(),
         )?;
 
         write_validation::validate_remove_files(
             &self.remove_files_metadata,
-            staged_file_actions.as_mut(),
+            pre_staged_file_actions.as_mut(),
         )?;
 
         Ok(())
