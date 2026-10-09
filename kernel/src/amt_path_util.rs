@@ -37,6 +37,51 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult
     }
 }
 
+/// Resolve a strictly table-relative `path` into an absolute [`Url`] under `table_root`.
+///
+/// Unlike [`resolve_amt_location`], an absolute `path` is rejected rather than used as-is: the
+/// `path` must be non-empty, must not begin with `/`, and must not carry a URI scheme. This
+/// enforces the invariant for callers (such as unencoded-relative deletion vectors) whose paths
+/// are required to be table-relative, including those built without going through a validating
+/// constructor.
+///
+/// # Errors
+///
+/// Returns an error if `path` is empty, begins with `/`, carries a URI scheme, or if the resolved
+/// location fails to parse as a [`Url`].
+pub(crate) fn resolve_table_relative(path: &str, table_root: &Url) -> KernelResult<Url> {
+    validate_table_relative(path)?;
+    encode_and_join(path, table_root)
+}
+
+/// Validates that `path` is strictly table-relative: non-empty, no leading `/`, and no URI scheme.
+///
+/// Shared by [`resolve_table_relative`] and by callers that validate a path at construction time,
+/// before a table root is available to resolve against.
+///
+/// # Errors
+///
+/// Returns an error if `path` is empty, begins with `/`, or carries a URI scheme.
+pub(crate) fn validate_table_relative(path: &str) -> KernelResult<()> {
+    require!(
+        !path.is_empty(),
+        KernelError::generic("table-relative path must not be empty")
+    );
+    require!(
+        !path.starts_with('/'),
+        KernelError::generic(format!(
+            "table-relative path must not begin with a leading '/': {path}"
+        ))
+    );
+    require!(
+        scheme_len(path).is_none(),
+        KernelError::generic(format!(
+            "table-relative path must not be an absolute URL: {path}"
+        ))
+    );
+    Ok(())
+}
+
 /// Returns the byte length of `location`'s URI scheme (excluding the terminating `:`), or `None`
 /// if `location` does not begin with one, per [RFC 3986 section 3.1]:
 /// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, terminated by `:`.
