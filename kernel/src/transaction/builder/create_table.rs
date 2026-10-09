@@ -923,6 +923,14 @@ impl CreateTableTransactionBuilder {
         self
     }
 
+    /// Skips commit-time checks for repeated AddFile paths, which are enabled by default.
+    ///
+    /// The caller must ensure that AddFile paths are unique. Other validations remain enabled.
+    pub fn without_dedup_validation(mut self) -> Self {
+        self.state.skip_dedup_validation = true;
+        self
+    }
+
     /// Adds an application transaction identifier to emit as a `txn` action.
     ///
     /// The action's `lastUpdated` value uses the transaction's commit timestamp.
@@ -1262,6 +1270,7 @@ mod tests {
     fn common_builder_state_preserves_data_change_through_empty_commit(
         #[case] overrides: &[bool],
         #[case] expected_data_change: bool,
+        #[values(false, true)] skip_dedup_validation: bool,
     ) -> Result<()> {
         let tempdir = tempfile::tempdir()?;
         let table_path = tempdir.path().join("table");
@@ -1281,8 +1290,12 @@ mod tests {
         for &data_change in overrides {
             builder = builder.with_data_change(data_change);
         }
+        if skip_dedup_validation {
+            builder = builder.without_dedup_validation();
+        }
         let mut transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
 
+        assert_eq!(transaction.dedup_validation_enabled, !skip_dedup_validation);
         assert_eq!(transaction.engine_info.as_deref(), Some("test-engine"));
         assert_eq!(
             transaction.correlation_id.as_deref(),
