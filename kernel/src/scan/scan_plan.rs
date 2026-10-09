@@ -416,7 +416,7 @@ impl Scan {
     /// checkpoint exists.
     ///
     /// ## SQL equivalent:
-    //
+    ///
     /// SELECT PATCH_STRUCT(add, <needed parsed fields>, <unrequested field drops>) AS add,
     ///        file_key(add) AS key
     /// FROM checkpoint_actions

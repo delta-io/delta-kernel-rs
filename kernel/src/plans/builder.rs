@@ -346,7 +346,9 @@ impl PlanBuilder {
     ) -> Result<Self> {
         let (out, expr) = patch(ProjectionStructPatchBuilder::new(self.schema())).build()?;
         match expr.as_ref() {
-            Expression::StructPatch(patch) if patch.is_empty() => Ok(self),
+            Expression::StructPatch(patch) if patch.is_empty() && patch.input_path().is_none() => {
+                Ok(self)
+            }
             _ => self.project(expr, out),
         }
     }
@@ -691,6 +693,8 @@ fn check_file_constant_columns<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use test_utils::assert_result_error_with_message;
 
     use super::*;
@@ -1135,6 +1139,21 @@ mod tests {
     fn project_patch_elides_empty_projection() -> Result<()> {
         let patched = vals(nested_ab_c()).project_patch(|patch| patch)?;
         assert_plan(patched, &[(&[], "values")]);
+        Ok(())
+    }
+
+    #[test]
+    fn project_patch_preserves_empty_nested_projection() -> Result<()> {
+        // The non-const schema needs a static lifetime for project_patch's higher-ranked closure.
+        static INPUT: LazyLock<SchemaRef> = LazyLock::new(nested_ab_c);
+        let patched = vals(Arc::clone(&INPUT))
+            .project_patch(|_| ProjectionStructPatchBuilder::new_nested(&INPUT, ["outer"]))?;
+        let expected = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": STRING,
+        };
+        assert_eq!(patched.schema(), &expected);
+        assert_plan(patched, &[(&[], "values"), (&[0], "project")]);
         Ok(())
     }
 
