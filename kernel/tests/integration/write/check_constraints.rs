@@ -61,19 +61,6 @@ fn build_create_txn(
         .build(engine, Box::new(FileSystemCommitter::new()))
 }
 
-/// Creates a table with the given constraints (possibly none), acknowledging them on the create
-/// commit, and returns its URL.
-fn create_constrained_table(
-    engine: &dyn Engine,
-    table_path: &str,
-    constraints: &[(&str, &str)],
-) -> KernelResult<Url, Box<dyn std::error::Error>> {
-    let mut txn = build_create_txn(engine, table_path, constraints)?;
-    txn.ack_check_constraints();
-    txn.commit(engine)?.unwrap_committed();
-    Ok(Url::from_directory_path(table_path).expect("table path must be a URL"))
-}
-
 fn stage_one_file(txn: &mut Transaction) -> KernelResult<()> {
     let add = create_add_files_metadata(
         txn.add_files_schema(),
