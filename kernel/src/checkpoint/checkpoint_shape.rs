@@ -57,11 +57,20 @@ impl CheckpointShape {
         fields(enable_call_frame),
         err
     )]
-    pub(crate) fn try_new(
+    pub(crate) fn try_new_for_segment(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
     ) -> KernelResult<CheckpointShape> {
-        Self::try_new_impl(exec, snapshot, false)
+        Self::try_new_impl(exec, snapshot.log_segment(), false)
+    }
+
+    /// Resolves checkpoint topology from an ephemeral log segment.
+    pub(crate) fn try_new_for_log_segment(
+        exec: &dyn PlanExecutor,
+        segment: &LogSegment,
+        needs_leaf_schema: bool,
+    ) -> KernelResult<CheckpointShape> {
+        Self::try_new_impl(exec, segment, needs_leaf_schema)
     }
 
     /// Resolves `snapshot`'s checkpoint topology and retains the checkpoint leaf schema.
@@ -78,16 +87,14 @@ impl CheckpointShape {
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
     ) -> KernelResult<CheckpointShape> {
-        Self::try_new_impl(exec, snapshot, true)
+        Self::try_new_impl(exec, snapshot.log_segment(), true)
     }
 
     fn try_new_impl(
         exec: &dyn PlanExecutor,
-        snapshot: &Snapshot,
+        segment: &LogSegment,
         needs_leaf_schema: bool,
     ) -> KernelResult<CheckpointShape> {
-        let segment = snapshot.log_segment();
-
         let (root_checkpoint, file_type) = match segment.listed.checkpoint_parts.first() {
             Some(checkpoint) if checkpoint.is_json() => (&checkpoint.location, FileType::Json),
             Some(checkpoint) => (&checkpoint.location, FileType::Parquet),
@@ -423,7 +430,7 @@ mod tests {
         let shape = if stats_schema.is_some() {
             CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref())
         } else {
-            CheckpointShape::try_new(&exec, snapshot.as_ref())
+            CheckpointShape::try_new_for_segment(&exec, snapshot.as_ref())
         }
         .unwrap();
         let parsed_stats_schema = stats_schema
@@ -544,7 +551,7 @@ mod tests {
         let shape = if needs_leaf_schema {
             CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref())
         } else {
-            CheckpointShape::try_new(&exec, snapshot.as_ref())
+            CheckpointShape::try_new_for_segment(&exec, snapshot.as_ref())
         }
         .unwrap();
 

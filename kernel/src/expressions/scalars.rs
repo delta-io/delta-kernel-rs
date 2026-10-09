@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
+use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use delta_kernel_derive::internal_api;
@@ -668,6 +669,12 @@ where
 {
     fn from(map: HashMap<K, V>) -> Self {
         Self::Map(map.into())
+    }
+}
+
+impl From<Arc<String>> for Scalar {
+    fn from(value: Arc<String>) -> Self {
+        Self::String(Arc::unwrap_or_clone(value))
     }
 }
 
