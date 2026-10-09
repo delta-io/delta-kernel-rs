@@ -21,7 +21,7 @@ use super::manifest_commit_state::ManifestCommitState;
 use super::root_manifest_file::RootManifestFile;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use super::ManifestWrite;
-use super::Transaction;
+use super::{ExecutionMode, ExistingTable, Imperative, Transaction};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::BackReference;
@@ -55,7 +55,7 @@ use crate::{DataType, Engine, Expression, KernelResult, Result};
 // =============================================================================
 // Update table transactions only
 // =============================================================================
-impl Transaction {
+impl<MODE: ExecutionMode> Transaction<ExistingTable, MODE> {
     // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
@@ -120,8 +120,7 @@ impl Transaction {
             engine_info: None,
             operation_parameters: None,
             operation_metrics: None,
-            add_files_metadata: vec![],
-            remove_files_metadata: vec![],
+            staged_data_changes: Default::default(),
             set_transactions: vec![],
             commit_timestamp,
             user_domain_metadata_additions: vec![],
@@ -133,8 +132,6 @@ impl Transaction {
             row_tracking_preservation_acknowledged: false,
             engine_commit_info: None,
             is_blind_append: false,
-            dv_matched_files: vec![],
-            num_dv_updates: 0,
             #[cfg(feature = "adaptive-metadata-in-dev")]
             manifest_write: None,
             physical_clustering_columns: clustering_columns,
@@ -274,8 +271,8 @@ impl Transaction {
 
     /// Stages `file` to be committed as the table's root manifest.
     ///
-    /// Mutually exclusive with [`with_manifest_commit`](Self::with_manifest_commit), which has
-    /// kernel build the tree instead.
+    /// Mutually exclusive with [`with_manifest_commit`](Transaction::with_manifest_commit), which
+    /// has kernel build the tree instead.
     ///
     /// # Errors
     ///
@@ -305,7 +302,9 @@ impl Transaction {
         )));
         Ok(self)
     }
+}
 
+impl Transaction<ExistingTable, Imperative> {
     /// Enables a manifest (content-tree) commit for this transaction, returning the
     /// [`ManifestCommitState`] that hands out leaf writers accepting file changes.
     ///
@@ -396,7 +395,9 @@ impl Transaction {
     /// # }
     /// ```
     pub fn remove_files(&mut self, remove_metadata: FilteredEngineData) {
-        self.remove_files_metadata.push(remove_metadata);
+        self.staged_data_changes
+            .remove_files_metadata
+            .push(remove_metadata);
     }
 
     // -------------------------------------------------------------------------
@@ -545,8 +546,10 @@ impl Transaction {
             )));
         }
 
-        self.dv_matched_files.extend(matched_files);
-        self.num_dv_updates += matched_dv_files;
+        self.staged_data_changes
+            .dv_matched_files
+            .extend(matched_files);
+        self.staged_data_changes.num_dv_updates += matched_dv_files;
         Ok(())
     }
 
@@ -663,11 +666,9 @@ pub(super) fn new_dv_column_schema() -> &'static SchemaRef {
     &NEW_DV_COLUMN_SCHEMA
 }
 
-// These methods are generic over the transaction state `S` because they are called from the
-// shared `commit()` path in `mod.rs` (`impl<S> Transaction<S>`). DV updates can only be
-// populated on `ExistingTableTransaction`, so the `is_create_table()` guard below is
-// defense-in-depth against future misuse.
-impl<S> Transaction<S> {
+// DV updates can only be staged on existing-table transactions. The create-table guard protects
+// action generation, which is shared by all imperative transaction states.
+impl<STATE> Transaction<STATE, Imperative> {
     /// Generate remove/add action pairs for files with DV updates.
     ///
     /// This method processes the cached matched files, generating the necessary Remove and Add
@@ -679,7 +680,7 @@ impl<S> Transaction<S> {
         engine: &'a dyn Engine,
     ) -> KernelResult<impl Iterator<Item = KernelResult<FilteredEngineData>> + Send + 'a> {
         // Create-table transactions should not have any DV update actions
-        if self.is_create_table() && !self.dv_matched_files.is_empty() {
+        if self.is_create_table() && !self.staged_data_changes.dv_matched_files.is_empty() {
             return Err(crate::error::KernelError::internal_error(
                 "CREATE TABLE transaction cannot have DV update actions",
             ));
@@ -687,10 +688,13 @@ impl<S> Transaction<S> {
 
         let remove_actions = self.generate_remove_actions(
             engine,
-            self.dv_matched_files.iter(),
+            self.staged_data_changes.dv_matched_files.iter(),
             true, /* has_dv_update_columns */
         )?;
-        let add_actions = self.generate_adds_for_dv_update(engine, self.dv_matched_files.iter())?;
+        let add_actions = self.generate_adds_for_dv_update(
+            engine,
+            self.staged_data_changes.dv_matched_files.iter(),
+        )?;
         Ok(remove_actions.chain(add_actions))
     }
 

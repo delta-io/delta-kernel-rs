@@ -44,7 +44,7 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     validate_iceberg_compat_if_needed, IcebergCompatValidationContext, V2_VALIDATOR,
 };
-use crate::transaction::{CreateTable, Transaction};
+use crate::transaction::{CreateTable, ExecutionMode, Transaction};
 use crate::utils::{current_time_ms, PhantomType};
 use crate::KernelResult;
 
@@ -132,7 +132,7 @@ pub fn create_table(
     CreateTableTransactionBuilder::new(path, schema, engine_info)
 }
 
-impl CreateTableTransaction {
+impl<MODE: ExecutionMode> Transaction<CreateTable, MODE> {
     /// Create a new transaction for creating a new table. This is used when the table doesn't
     /// exist yet and we need to create it with Protocol and Metadata actions.
     ///
@@ -172,8 +172,7 @@ impl CreateTableTransaction {
             engine_info: Some(engine_info),
             operation_parameters: None,
             operation_metrics: None,
-            add_files_metadata: vec![],
-            remove_files_metadata: vec![],
+            staged_data_changes: Default::default(),
             set_transactions: vec![],
             commit_timestamp: current_time_ms()?,
             user_domain_metadata_additions: vec![],
@@ -185,8 +184,6 @@ impl CreateTableTransaction {
             row_tracking_preservation_acknowledged: false,
             engine_commit_info: None,
             is_blind_append: false,
-            dv_matched_files: vec![],
-            num_dv_updates: 0,
             #[cfg(feature = "adaptive-metadata-in-dev")]
             manifest_write: None,
             physical_clustering_columns: clustering_columns,
