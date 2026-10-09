@@ -3,15 +3,18 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-use super::utils::{validate_partition_keys, validate_required_field_exist};
-use super::{StagedDataValidator, Validation};
-use crate::engine_data::{GetData, TypedGetData as _};
+use super::utils::{
+    columns_from_schema, dv_id_at, validate_partition_keys, validate_required_field_exist,
+    DELETION_VECTOR_NAME, OFFSET_NAME, PATH_OR_INLINE_DV_NAME, STORAGE_TYPE_NAME,
+};
+use super::{FileActionTracker, StagedDataValidator, Validation};
+use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::expressions::column_name;
 use crate::scan::log_replay::{
     FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
 };
-use crate::scan::scan_row_schema;
 use crate::schema::ColumnNamesAndTypes;
+use crate::transaction::update::{intermediate_dv_schema, NEW_DELETION_VECTOR_NAME};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
@@ -19,33 +22,44 @@ const PATH: usize = 0;
 const SIZE: usize = 1;
 const MODIFICATION_TIME: usize = 2;
 const PARTITION_VALUES: usize = 3;
+const OLD_DELETION_VECTOR_STORAGE_TYPE: usize = 4;
+const NEW_DELETION_VECTOR_STORAGE_TYPE: usize = 7;
 const MODIFICATION_TIME_NAME: &str = "modificationTime";
 
-static DV_MATCHED_FILE_COLUMNS: LazyLock<KernelResult<ColumnNamesAndTypes>> = LazyLock::new(|| {
-    let names = vec![
-        column_name!(PATH_NAME),
-        column_name!(SIZE_NAME),
-        column_name!(MODIFICATION_TIME_NAME),
-        column_name!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME),
-    ];
-    // Derive types from the canonical scan schema so this projection stays compatible with scan
-    // metadata if those field definitions change.
-    let types = names
-        .iter()
-        .map(|name| {
-            scan_row_schema()
-                .field_at(name)
-                .map(|field| field.data_type().clone())
-        })
-        .collect::<KernelResult<Vec<_>>>()?;
-    Ok((names, types).into())
-});
+static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNamesAndTypes>> =
+    LazyLock::new(|| {
+        let names = vec![
+            column_name!(PATH_NAME),
+            column_name!(SIZE_NAME),
+            column_name!(MODIFICATION_TIME_NAME),
+            column_name!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME),
+            column_name!(DELETION_VECTOR_NAME, STORAGE_TYPE_NAME),
+            column_name!(DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME),
+            column_name!(DELETION_VECTOR_NAME, OFFSET_NAME),
+            column_name!(NEW_DELETION_VECTOR_NAME, STORAGE_TYPE_NAME),
+            column_name!(NEW_DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME),
+            column_name!(NEW_DELETION_VECTOR_NAME, OFFSET_NAME),
+        ];
+        columns_from_schema(intermediate_dv_schema(), names)
+    });
 
-struct DvMatchedFileRequiredFields {
+/// Runs required validations for every selected DV-update row. When `staged_file_actions` is
+/// provided, also validates file-action (addFile, removeFile) uniqueness.
+pub(crate) fn validate_dv_matched_files(
+    dv_matched_files: &[FilteredEngineData],
+    physical_partition_columns: impl IntoIterator<Item = String>,
+    staged_file_actions: Option<&mut FileActionTracker>,
+) -> KernelResult<()> {
+    StagedDataValidator::staged_dv_matched_file(physical_partition_columns, staged_file_actions)?
+        .validate_filtered(dv_matched_files)
+}
+
+/// Required validations for every selected DV-update row.
+struct RequiredDvMatchedFileVal {
     physical_partition_columns: HashSet<String>,
 }
 
-impl Validation for DvMatchedFileRequiredFields {
+impl Validation for RequiredDvMatchedFileVal {
     fn validate_row<'a>(
         &mut self,
         row: usize,
@@ -86,24 +100,46 @@ impl Validation for DvMatchedFileRequiredFields {
     }
 }
 
-impl StagedDataValidator<'_> {
-    /// Creates a validator for selected rows staged for deletion-vector updates.
-    ///
-    /// Errors if the required columns are absent from the scan-row schema.
-    pub(crate) fn staged_dv_matched_file(
+struct RepeatedFileActionValidation<'a> {
+    staged_file_actions: &'a mut FileActionTracker,
+}
+
+impl Validation for RepeatedFileActionValidation<'_> {
+    fn validate_row<'a>(
+        &mut self,
+        row: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> KernelResult<()> {
+        let path: &str = getters[PATH].get(row, PATH_NAME)?;
+        let old_dv_id = dv_id_at(getters, OLD_DELETION_VECTOR_STORAGE_TYPE, row)?;
+        let new_dv_id = dv_id_at(getters, NEW_DELETION_VECTOR_STORAGE_TYPE, row)?;
+        self.staged_file_actions.record_remove(path, old_dv_id)?;
+        self.staged_file_actions.record_add(path, new_dv_id)
+    }
+}
+
+impl<'a> StagedDataValidator<'a> {
+    fn staged_dv_matched_file(
         physical_partition_columns: impl IntoIterator<Item = String>,
+        staged_file_actions: Option<&'a mut FileActionTracker>,
     ) -> KernelResult<Self> {
-        let columns = DV_MATCHED_FILE_COLUMNS.as_ref().map_err(|error| {
-            KernelError::internal_error(format!(
-                "DV validation columns must exist in the scan-row schema: {error}"
-            ))
-        })?;
-        Ok(StagedDataValidator::new(
-            columns,
-            vec![Box::new(DvMatchedFileRequiredFields {
+        let columns = DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION
+            .as_ref()
+            .map_err(|error| {
+                KernelError::internal_error(format!(
+                    "DV validation columns must exist in the intermediate DV schema: {error}"
+                ))
+            })?;
+        let mut validations: Vec<Box<dyn Validation + 'a>> =
+            vec![Box::new(RequiredDvMatchedFileVal {
                 physical_partition_columns: physical_partition_columns.into_iter().collect(),
-            })],
-        ))
+            })];
+        if let Some(staged_file_actions) = staged_file_actions {
+            validations.push(Box::new(RepeatedFileActionValidation {
+                staged_file_actions,
+            }));
+        }
+        Ok(StagedDataValidator::new(columns, validations))
     }
 }
 
@@ -112,16 +148,18 @@ mod tests {
     use std::sync::Arc;
 
     use rstest::rstest;
-    use test_utils::replace_column;
+    use test_utils::{deletion_vector_array, replace_column};
 
     use super::*;
-    use crate::arrow::array::{new_null_array, ArrayRef, Int64Array, StructArray};
-    use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
+    use crate::arrow::array::{new_null_array, Array as _, ArrayRef, Int64Array, StructArray};
+    use crate::arrow::datatypes::{
+        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    };
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine_data::FilteredEngineData;
     use crate::expressions::column_name;
+    use crate::scan::scan_row_schema;
     use crate::unit_test_utils::{
         add_files_with_partition_values, assert_result_error_with_message, nullable_add_files,
         set_field_as_null,
@@ -129,6 +167,7 @@ mod tests {
 
     fn make_staged_dv_from_addfile(
         batch: RecordBatch,
+        dv_paths: &[&str],
         selection_vector: Vec<bool>,
     ) -> FilteredEngineData {
         let column = |name| {
@@ -166,17 +205,30 @@ mod tests {
                 _ => new_null_array(field.data_type(), batch.num_rows()),
             })
             .collect();
-        let batch = RecordBatch::try_new(Arc::new(schema), columns)
+        let mut batch = RecordBatch::try_new(Arc::new(schema), columns)
             .expect("staged DV schema and columns should form a valid batch");
+        assert_eq!(batch.num_rows(), dv_paths.len());
+        let dv_paths = dv_paths.iter().copied().map(Some).collect::<Vec<_>>();
+        let new_dv = deletion_vector_array("i", &dv_paths);
+        let mut fields = batch.schema().fields().to_vec();
+        fields.push(Arc::new(ArrowField::new(
+            NEW_DELETION_VECTOR_NAME,
+            new_dv.data_type().clone(),
+            true,
+        )));
+        let mut columns = batch.columns().to_vec();
+        columns.push(Arc::new(new_dv));
+        batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)
+            .expect("new deletion-vector column should append to the scan-row batch");
         FilteredEngineData::try_new(Box::new(ArrowEngineData::new(batch)), selection_vector)
             .expect("selection vector length should match staged DV row count")
     }
 
     #[test]
     fn column_indices_match_schema_order() {
-        let columns = DV_MATCHED_FILE_COLUMNS
+        let columns = DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION
             .as_ref()
-            .expect("DV validation columns should exist in the scan-row schema");
+            .expect("DV validation columns should exist in the intermediate DV schema");
         let (names, _) = columns.as_ref();
         assert_eq!(names[PATH], column_name!(PATH_NAME));
         assert_eq!(names[SIZE], column_name!(SIZE_NAME));
@@ -188,6 +240,84 @@ mod tests {
             names[PARTITION_VALUES],
             column_name!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME)
         );
+        assert_eq!(
+            names[OLD_DELETION_VECTOR_STORAGE_TYPE],
+            column_name!(DELETION_VECTOR_NAME, STORAGE_TYPE_NAME)
+        );
+        assert_eq!(
+            names[OLD_DELETION_VECTOR_STORAGE_TYPE + 1],
+            column_name!(DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME)
+        );
+        assert_eq!(
+            names[OLD_DELETION_VECTOR_STORAGE_TYPE + 2],
+            column_name!(DELETION_VECTOR_NAME, OFFSET_NAME)
+        );
+        assert_eq!(
+            names[NEW_DELETION_VECTOR_STORAGE_TYPE],
+            column_name!(NEW_DELETION_VECTOR_NAME, STORAGE_TYPE_NAME)
+        );
+        assert_eq!(
+            names[NEW_DELETION_VECTOR_STORAGE_TYPE + 1],
+            column_name!(NEW_DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME)
+        );
+        assert_eq!(
+            names[NEW_DELETION_VECTOR_STORAGE_TYPE + 2],
+            column_name!(NEW_DELETION_VECTOR_NAME, OFFSET_NAME)
+        );
+        assert_eq!(names.len(), 10);
+    }
+
+    #[rstest]
+    #[case::selected(&[true, true], true, Some("multiple RemoveFile actions"))]
+    #[case::implicitly_selected(&[true], true, Some("multiple RemoveFile actions"))]
+    #[case::unselected(&[true, false], true, None)]
+    #[case::dedup_disabled(&[true, true], false, None)]
+    #[case::dedup_disabled_implicit_tail(&[true], false, None)]
+    fn duplicate_dv_update_paths_validate_selected_rows(
+        #[case] selection_vector: &[bool],
+        #[case] dedup_validation_enabled: bool,
+        #[case] expected_error: Option<&str>,
+        #[values(false, true)] multiple_batches: bool,
+    ) {
+        let batches = if multiple_batches {
+            (0..2)
+                .map(|batch_index| {
+                    let row_selection = selection_vector
+                        .get(batch_index)
+                        .copied()
+                        .into_iter()
+                        .collect();
+                    make_staged_dv_from_addfile(
+                        nullable_add_files(&["path"]),
+                        &[if batch_index == 0 {
+                            "new-dv-0"
+                        } else {
+                            "new-dv-1"
+                        }],
+                        row_selection,
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![make_staged_dv_from_addfile(
+                nullable_add_files(&["path", "path"]),
+                &["new-dv-0", "new-dv-1"],
+                selection_vector.to_vec(),
+            )]
+        };
+        let mut file_actions = FileActionTracker::default();
+        let result = StagedDataValidator::staged_dv_matched_file(
+            std::iter::empty(),
+            dedup_validation_enabled.then_some(&mut file_actions),
+        )
+        .expect("DV validator should use the intermediate DV schema")
+        .validate_filtered(&batches);
+
+        if let Some(expected_error) = expected_error {
+            assert_result_error_with_message(result, expected_error);
+        } else {
+            result.expect("DV update should pass the enabled validations");
+        }
     }
 
     #[rstest]
@@ -199,9 +329,14 @@ mod tests {
             field,
             Arc::new(Int64Array::from(vec![value])),
         );
-        let batches = [make_staged_dv_from_addfile(batch, vec![true])];
-        StagedDataValidator::staged_dv_matched_file(std::iter::empty())
-            .expect("DV validator should use the scan-row schema")
+        let batches = [make_staged_dv_from_addfile(
+            batch,
+            &["new-dv-0"],
+            vec![true],
+        )];
+        let mut file_actions = FileActionTracker::default();
+        StagedDataValidator::staged_dv_matched_file(std::iter::empty(), Some(&mut file_actions))
+            .expect("DV validator should use the intermediate DV schema")
             .validate_filtered(&batches)
             .expect("protocol-valid boundary value should be accepted");
     }
@@ -230,13 +365,17 @@ mod tests {
                 } else {
                     batch
                 };
-                make_staged_dv_from_addfile(batch, vec![true, true])
+                make_staged_dv_from_addfile(batch, &["new-dv-0", "new-dv-1"], vec![true, true])
             })
             .collect();
+        let mut file_actions = FileActionTracker::default();
         assert_result_error_with_message(
-            StagedDataValidator::staged_dv_matched_file(std::iter::empty())
-                .expect("DV validator should use the scan-row schema")
-                .validate_filtered(&batches),
+            StagedDataValidator::staged_dv_matched_file(
+                std::iter::empty(),
+                Some(&mut file_actions),
+            )
+            .expect("DV validator should use the intermediate DV schema")
+            .validate_filtered(&batches),
             field,
         );
     }
@@ -258,12 +397,16 @@ mod tests {
         );
         let batches = [make_staged_dv_from_addfile(
             batch,
+            &["new-dv-0", "new-dv-1"],
             selection_vector.to_vec(),
         )];
-        let result =
-            StagedDataValidator::staged_dv_matched_file(["p1".to_string(), "p2".to_string()])
-                .expect("DV validator should use the scan-row schema")
-                .validate_filtered(&batches);
+        let mut file_actions = FileActionTracker::default();
+        let result = StagedDataValidator::staged_dv_matched_file(
+            ["p1".to_string(), "p2".to_string()],
+            Some(&mut file_actions),
+        )
+        .expect("DV validator should use the intermediate DV schema")
+        .validate_filtered(&batches);
         if let Some(expected_error) = expected_error {
             assert_result_error_with_message(result, expected_error);
         } else {
