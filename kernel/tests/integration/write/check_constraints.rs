@@ -62,6 +62,19 @@ fn build_create_txn(
         .build(engine, Box::new(FileSystemCommitter::new()))
 }
 
+/// Creates a table with the given constraints (possibly none), acknowledging them on the create
+/// commit, and returns its URL.
+fn create_constrained_table(
+    engine: &dyn Engine,
+    table_path: &str,
+    constraints: &[(&str, &str)],
+) -> KernelResult<Url> {
+    let mut txn = build_create_txn(engine, table_path, constraints)?;
+    txn.ack_check_constraints();
+    txn.commit(engine)?.unwrap_committed();
+    Ok(Url::from_directory_path(table_path).expect("table path must be a URL"))
+}
+
 fn stage_one_file(txn: &mut Transaction) -> KernelResult<()> {
     let add = create_add_files_metadata(
         txn.add_files_schema(),
@@ -328,17 +341,25 @@ async fn constraints_without_feature_are_discoverable_but_txn_build_fails() -> K
 
 #[rstest]
 #[tokio::test]
-async fn alter_table_commit_succeeds_only_with_ack_and_keeps_constraints(
+async fn alter_table_commit_succeeds_only_with_ack_and_keeps_undropped_constraints(
+    #[values(false, true)] drops_one_of_two_constraints: bool,
     #[values(true, false)] acknowledge: bool,
 ) -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
-    let table_url = write_table(&table_path, CHECK_CONSTRAINTS_FEATURE, POSITIVE_AMOUNT).await?;
+    let constraints = [
+        ("nonempty_name", "name != ''"),
+        ("positive_amount", "amount > 0"),
+    ];
+    let table_url = write_table(&table_path, CHECK_CONSTRAINTS_FEATURE, &constraints).await?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let mut txn = snapshot
-        .update_table(UpdateTableOperation::AlterTable, "Test/1.0", false)
-        .add_column(StructField::nullable("note", DataType::STRING))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let builder = snapshot.update_table(UpdateTableOperation::AlterTable, "Test/1.0", false);
+    let builder = if drops_one_of_two_constraints {
+        builder.drop_check_constraint("nonempty_name")
+    } else {
+        builder.add_column(StructField::nullable("note", DataType::STRING))
+    };
+    let mut txn = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     if !acknowledge {
         assert_gate_error(txn.commit(engine.as_ref()));
         return Ok(());
@@ -347,7 +368,12 @@ async fn alter_table_commit_succeeds_only_with_ack_and_keeps_constraints(
     txn.ack_check_constraints();
     let altered = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
     let from_altered = constraint_pairs(altered.check_constraints());
-    assert_eq!(from_altered, POSITIVE_AMOUNT);
+    let expected = if drops_one_of_two_constraints {
+        &constraints[1..]
+    } else {
+        &constraints[..]
+    };
+    assert_eq!(from_altered, expected);
     Ok(())
 }
 
@@ -355,13 +381,13 @@ async fn alter_table_commit_succeeds_only_with_ack_and_keeps_constraints(
 #[tokio::test]
 async fn alter_table_add_constraint_requires_acknowledgement(
     #[values(true, false)] acknowledge: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = create_constrained_table(engine.as_ref(), &table_path, &[])?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = snapshot
-        .alter_table()
+        .update_table(UpdateTableOperation::AlterTable, "Test/1.0", false)
         .add_check_constraint("Positive_Amount", "amount > 0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     if acknowledge {
@@ -374,7 +400,7 @@ async fn alter_table_add_constraint_requires_acknowledgement(
     }
 
     let altered = result?.unwrap_post_commit_snapshot();
-    let from_altered = discovered(altered.check_constraints());
+    let from_altered = constraint_pairs(altered.check_constraints());
     let expected = [("positive_amount", "amount > 0")];
     assert_eq!(from_altered, expected);
 
@@ -390,14 +416,13 @@ async fn alter_table_add_constraint_requires_acknowledgement(
 }
 
 #[tokio::test]
-async fn alter_table_adds_column_and_constraint_in_one_commit(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn alter_table_adds_column_and_constraint_in_one_commit() -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = create_constrained_table(engine.as_ref(), &table_path, &[])?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let mut txn = snapshot
-        .alter_table()
+        .update_table(UpdateTableOperation::AlterTable, "Test/1.0", false)
         .add_column(StructField::nullable("discount", DataType::LONG))
         .add_check_constraint("nonnegative_discount", "discount >= 0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
@@ -406,21 +431,20 @@ async fn alter_table_adds_column_and_constraint_in_one_commit(
 
     let has_column = altered.schema().contains("discount");
     assert!(has_column);
-    let from_altered = discovered(altered.check_constraints());
+    let from_altered = constraint_pairs(altered.check_constraints());
     let expected = [("nonnegative_discount", "discount >= 0")];
     assert_eq!(from_altered, expected);
     Ok(())
 }
 
 #[tokio::test]
-async fn alter_table_applies_constraint_operations_in_order(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn alter_table_applies_constraint_operations_in_order() -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = create_constrained_table(engine.as_ref(), &table_path, &[])?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let mut txn = snapshot
-        .alter_table()
+        .update_table(UpdateTableOperation::AlterTable, "Test/1.0", false)
         .add_check_constraint("positive_amount", "amount > 0")
         .add_check_constraint("named", "name IS NOT NULL")
         .drop_check_constraint("POSITIVE_AMOUNT")
@@ -429,7 +453,7 @@ async fn alter_table_applies_constraint_operations_in_order(
     txn.ack_check_constraints();
     let altered = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
 
-    let from_altered = discovered(altered.check_constraints());
+    let from_altered = constraint_pairs(altered.check_constraints());
     let expected = [
         ("named", "name IS NOT NULL"),
         ("positive_amount", "amount > 1"),
@@ -439,15 +463,14 @@ async fn alter_table_applies_constraint_operations_in_order(
 }
 
 #[tokio::test]
-async fn alter_table_add_constraint_upgrades_legacy_protocol(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn alter_table_add_constraint_upgrades_legacy_protocol() -> KernelResult<()> {
     let (store, engine, table_url) = engine_store_setup("legacy_protocol", None);
     let table_url =
         create_test_table(store, table_url, test_schema(), &[], false, vec![], vec![]).await?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let mut txn = snapshot
-        .alter_table()
+        .update_table(UpdateTableOperation::AlterTable, "Test/1.0", false)
         .add_check_constraint("positive_amount", "amount > 0")
         .build(&engine, Box::new(FileSystemCommitter::new()))?;
     txn.ack_check_constraints();
@@ -459,7 +482,7 @@ async fn alter_table_add_constraint_upgrades_legacy_protocol(
     assert_eq!(versions, (1, 3));
     let writer_features = protocol.writer_features();
     assert_eq!(writer_features, None);
-    let from_altered = discovered(altered.check_constraints());
+    let from_altered = constraint_pairs(altered.check_constraints());
     let expected = [("positive_amount", "amount > 0")];
     assert_eq!(from_altered, expected);
     Ok(())
@@ -472,7 +495,7 @@ async fn alter_table_add_constraint_upgrades_legacy_protocol(
 async fn alter_table_rejects_invalid_constraint_addition(
     #[case] name: &str,
     #[case] raw_sql: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = create_constrained_table(
         engine.as_ref(),
@@ -482,7 +505,7 @@ async fn alter_table_rejects_invalid_constraint_addition(
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let result = snapshot
-        .alter_table()
+        .update_table(UpdateTableOperation::AlterTable, "Test/1.0", false)
         .add_check_constraint(name, raw_sql)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
     let rejected = matches!(result, Err(KernelError::Generic(_)));
@@ -495,7 +518,7 @@ async fn alter_table_rejects_invalid_constraint_addition(
 async fn alter_table_drops_last_constraint_without_acknowledgement_and_keeps_feature(
     #[values("positive_amount", "POSITIVE_AMOUNT")] name: &str,
     #[values(false, true)] if_exists: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = create_constrained_table(
         engine.as_ref(),
@@ -504,7 +527,7 @@ async fn alter_table_drops_last_constraint_without_acknowledgement_and_keeps_fea
     )?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let builder = snapshot.alter_table();
+    let builder = snapshot.update_table(UpdateTableOperation::AlterTable, "Test/1.0", false);
     let builder = if if_exists {
         builder.drop_check_constraint_if_exists(name)
     } else {
@@ -528,7 +551,7 @@ async fn alter_table_drops_last_constraint_without_acknowledgement_and_keeps_fea
 #[tokio::test]
 async fn alter_table_drop_of_missing_constraint(
     #[values(false, true)] if_exists: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = create_constrained_table(
         engine.as_ref(),
@@ -537,7 +560,7 @@ async fn alter_table_drop_of_missing_constraint(
     )?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let builder = snapshot.alter_table();
+    let builder = snapshot.update_table(UpdateTableOperation::AlterTable, "Test/1.0", false);
     let result = if if_exists {
         builder.drop_check_constraint_if_exists("missing")
     } else {
@@ -553,7 +576,7 @@ async fn alter_table_drop_of_missing_constraint(
     let mut txn = result?;
     txn.ack_check_constraints();
     let altered = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
-    let from_altered = discovered(altered.check_constraints());
+    let from_altered = constraint_pairs(altered.check_constraints());
     let expected = [("positive_amount", "amount > 0")];
     assert_eq!(from_altered, expected);
     Ok(())

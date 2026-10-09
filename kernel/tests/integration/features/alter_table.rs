@@ -495,14 +495,14 @@ async fn alter_table_commit_info_includes_operation_maps() -> KernelResult<()> {
 
 #[tokio::test]
 async fn alter_table_without_protocol_change_writes_no_protocol_action(
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> KernelResult<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
     let table_url = snapshot.table_root().clone();
 
     snapshot
-        .alter_table()
+        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(StructField::nullable("added", DataType::STRING))
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
