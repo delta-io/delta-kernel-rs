@@ -459,10 +459,19 @@ impl CheckpointWriter {
             .log_segment()
             .read_actions(engine, self.read_schema.clone())?;
 
+        // Under adaptiveMetadata, the deduplicator normalizes DV identity against the table root;
+        // `None` otherwise leaves the legacy identity in effect.
+        let table_root = self
+            .snapshot
+            .table_configuration()
+            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+            .then(|| self.snapshot.table_root().clone());
+
         // Process actions through reconciliation
         let checkpoint_data = ActionReconciliationProcessor::new(
             self.deleted_file_retention_timestamp()?,
             self.get_transaction_expiration_timestamp()?,
+            table_root,
         )
         .process_actions_iter(actions);
 

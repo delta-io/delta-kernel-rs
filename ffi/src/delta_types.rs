@@ -584,6 +584,10 @@ pub enum FfiDeletionVectorStorageType {
     Inline,
     /// Persisted absolute path.
     PersistedAbsolute,
+    /// Persisted raw (unencoded) table-relative path. Only valid when built with the
+    /// `adaptive-metadata-in-dev` cargo feature.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    PersistedUnencodedRelative,
 }
 
 /// Borrowed Delta deletion-vector descriptor.
@@ -664,6 +668,10 @@ impl<'a> AddBacking<'a> {
                         DeletionVectorStorageType::Inline => FfiDeletionVectorStorageType::Inline,
                         DeletionVectorStorageType::PersistedAbsolute => {
                             FfiDeletionVectorStorageType::PersistedAbsolute
+                        }
+                        #[cfg(feature = "adaptive-metadata-in-dev")]
+                        DeletionVectorStorageType::PersistedUnencodedRelative => {
+                            FfiDeletionVectorStorageType::PersistedUnencodedRelative
                         }
                     },
                     path_or_inline_dv: kernel_string_slice!(path),
@@ -1232,6 +1240,10 @@ impl From<FfiDeletionVectorStorageType> for DeletionVectorStorageType {
             FfiDeletionVectorStorageType::PersistedRelative => Self::PersistedRelative,
             FfiDeletionVectorStorageType::Inline => Self::Inline,
             FfiDeletionVectorStorageType::PersistedAbsolute => Self::PersistedAbsolute,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            FfiDeletionVectorStorageType::PersistedUnencodedRelative => {
+                Self::PersistedUnencodedRelative
+            }
         }
     }
 }
