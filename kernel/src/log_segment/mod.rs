@@ -883,11 +883,10 @@ impl LogSegment {
     /// Find the latest AMT `checkpoint` action in this segment, returning `None` when the segment
     /// has no checkpoint action (a classic non-AMT table, or an AMT table that has none yet).
     ///
-    /// `hint` is a CRC's pointer to the latest manifest commit. When the hint is accurate 
-    /// only that one commit is read; otherwise the log is scanned newest-first until an
-    /// action is found. TODO: once commitInfo carries the same pointer (delta-io/delta#7533), use
-    /// it when no CRC is available. Will be implemented once the following PR has been merged:
-    /// https://github.com/delta-io/delta-kernel-rs/pull/3534
+    /// `hint` is a CRC's pointer to the latest manifest commit. When the hint is accurate, only
+    /// that one commit is read; otherwise the log is scanned newest-first until an action is found.
+    ///
+    /// TODO(delta-io/delta#7533): use the commitInfo pointer when no CRC is available.
     ///
     /// # Errors
     /// Returns an error if the log cannot be read or a checkpoint action fails to parse.
@@ -899,16 +898,18 @@ impl LogSegment {
     ) -> KernelResult<Option<CheckpointAction>> {
         let schema: SchemaRef = StructType::try_new([CHECKPOINT_ACTION_FIELD.clone()])?.into();
         if let Some(hint) = hint {
-            if let Some(action) =
-                self.read_hinted_checkpoint_action(engine, hint, schema.clone())?
-            {
-                return Ok(Some(action));
+            if let Some(commit) = self.hinted_commit(hint) {
+                if let Some(action) =
+                    read_hinted_checkpoint_action(engine, commit, hint, schema.clone())?
+                {
+                    return Ok(Some(action));
+                }
+                warn!(
+                    "lastManifestCommit hint at version {} names a commit without the hinted \
+                     checkpoint action; scanning the log instead",
+                    hint.version
+                );
             }
-            warn!(
-                "lastManifestCommit hint at version {} did not resolve a checkpoint action in \
-                 this log segment; scanning the log instead",
-                hint.version
-            );
         }
         first_checkpoint_action(
             self.read_actions(engine, schema)?
@@ -1669,34 +1670,33 @@ impl LogSegment {
         true
     }
 
-    /// The checkpoint action in the commit `hint` points at, or `None` when that commit is not
-    /// listed in this segment (commits at or below the checkpoint never are) or does not carry the
-    /// hinted action.
+    /// The commit `hint` points at, or `None` when that commit is not listed in this segment
+    /// (commits at or below the checkpoint never are).
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn read_hinted_checkpoint_action(
-        &self,
-        engine: &dyn Engine,
-        hint: &LastManifestCommit,
-        schema: SchemaRef,
-    ) -> KernelResult<Option<CheckpointAction>> {
+    fn hinted_commit(&self, hint: &LastManifestCommit) -> Option<&ParsedLogPath> {
         let commits = &self.listed.ascending_commit_files;
-        let commit = Version::try_from(hint.version)
-            .ok()
-            .and_then(|version| {
-                commits
-                    .binary_search_by_key(&version, |commit| commit.version)
-                    .ok()
-            })
-            .and_then(|index| commits.get(index));
-        let Some(commit) = commit else {
-            return Ok(None);
-        };
-        let files = std::slice::from_ref(&commit.location);
-        Ok(
-            first_checkpoint_action(engine.json_handler().read_json_files(files, schema, None)?)?
-                .filter(|action| action.version() == hint.version),
-        )
+        let version = Version::try_from(hint.version).ok()?;
+        let index = commits
+            .binary_search_by_key(&version, |commit| commit.version)
+            .ok()?;
+        commits.get(index)
     }
+}
+
+/// The checkpoint action in `commit` matching `hint`, or `None` when the commit does not carry
+/// the hinted action.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn read_hinted_checkpoint_action(
+    engine: &dyn Engine,
+    commit: &ParsedLogPath,
+    hint: &LastManifestCommit,
+    schema: SchemaRef,
+) -> KernelResult<Option<CheckpointAction>> {
+    let files = std::slice::from_ref(&commit.location);
+    Ok(
+        first_checkpoint_action(engine.json_handler().read_json_files(files, schema, None)?)?
+            .filter(|action| action.content_root_version() == hint.content_root_version),
+    )
 }
 
 /// The first checkpoint action in `batches`, or `None` when no batch carries one.

@@ -1828,6 +1828,12 @@ impl CheckpointAction {
         &self.content_root.path
     }
 
+    /// The table version the root manifest reflects (delegates to the nested [`ContentRoot`]).
+    #[internal_api]
+    pub(crate) fn content_root_version(&self) -> i64 {
+        self.content_root.version
+    }
+
     /// Get the checkpoint version.
     #[internal_api]
     pub(crate) fn version(&self) -> i64 {
