@@ -13,6 +13,7 @@
 use std::collections::HashSet;
 
 use tracing::warn;
+use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
@@ -50,6 +51,16 @@ pub(crate) trait Deduplicator {
     /// (read-only).
     fn is_log_batch(&self) -> bool;
 
+    /// The table root against which [`Self::extract_dv_unique_id`] normalizes deletion-vector
+    /// identities, or `None` to use the legacy storage-type-prefixed identity.
+    ///
+    /// Returns `Some` iff the table has `adaptiveMetadata` enabled, where the same physical DV
+    /// blob may be encoded under different storage types across an `add`/`remove` pair. The
+    /// default is `None` (legacy behavior).
+    fn dv_normalization_table_root(&self) -> Option<&Url> {
+        None
+    }
+
     /// Extracts the deletion vector unique ID if it exists.
     ///
     /// This function retrieves the necessary fields for constructing a deletion vector unique ID
@@ -58,13 +69,17 @@ pub(crate) trait Deduplicator {
     /// - `dv_start_index + 1` retrieves the path or inline deletion vector
     ///   (`deletionVector.pathOrInlineDv`).
     /// - `dv_start_index + 2` retrieves the optional offset (`deletionVector.offset`).
+    ///
+    /// When [`Self::dv_normalization_table_root`] is `Some` (adaptiveMetadata), the id is the
+    /// normalized object identity so an `add` and `remove` that encode the same blob under
+    /// different storage types still match; otherwise it is the legacy identity.
     fn extract_dv_unique_id<'a>(
         &self,
         i: usize,
         getters: &[&'a dyn GetData<'a>],
         dv_start_index: usize,
     ) -> KernelResult<Option<String>> {
-        let Some(storage_type) =
+        let Some(storage_type): Option<&str> =
             getters[dv_start_index].get_opt(i, "deletionVector.storageType")?
         else {
             return Ok(None);
@@ -72,11 +87,18 @@ pub(crate) trait Deduplicator {
         let path_or_inline = getters[dv_start_index + 1].get(i, "deletionVector.pathOrInlineDv")?;
         let offset = getters[dv_start_index + 2].get_opt(i, "deletionVector.offset")?;
 
-        Ok(Some(DeletionVectorDescriptor::unique_id_from_parts(
-            storage_type,
-            path_or_inline,
-            offset,
-        )))
+        let unique_id = match self.dv_normalization_table_root() {
+            Some(table_root) => DeletionVectorDescriptor::normalized_unique_id_from_parts(
+                storage_type.parse()?,
+                path_or_inline,
+                offset,
+                table_root,
+            )?,
+            None => {
+                DeletionVectorDescriptor::unique_id_from_parts(storage_type, path_or_inline, offset)
+            }
+        };
+        Ok(Some(unique_id))
     }
 }
 
@@ -93,6 +115,9 @@ pub(crate) struct CheckpointDeduplicator<'a> {
     add_path_index: usize,
     add_size_index: usize,
     add_dv_start_index: usize,
+    /// Table root used to normalize the deletion-vector identity under adaptiveMetadata; `Some`
+    /// iff adaptiveMetadata is enabled for the table. See [`Deduplicator::extract_dv_unique_id`].
+    table_root: Option<Url>,
 }
 
 impl<'a> CheckpointDeduplicator<'a> {
@@ -102,12 +127,14 @@ impl<'a> CheckpointDeduplicator<'a> {
         add_path_index: usize,
         add_size_index: usize,
         add_dv_start_index: usize,
+        table_root: Option<Url>,
     ) -> KernelResult<Self> {
         Ok(CheckpointDeduplicator {
             seen_file_keys,
             add_path_index,
             add_size_index,
             add_dv_start_index,
+            table_root,
         })
     }
 }
@@ -149,5 +176,9 @@ impl Deduplicator for CheckpointDeduplicator<'_> {
     /// Always `false` - checkpoint batches never update the seen set.
     fn is_log_batch(&self) -> bool {
         false
+    }
+
+    fn dv_normalization_table_root(&self) -> Option<&Url> {
+        self.table_root.as_ref()
     }
 }

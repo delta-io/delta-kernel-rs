@@ -998,8 +998,12 @@ fn visit_content_root_at<'a>(
 mod tests {
     use super::*;
     #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::actions::deletion_vector::DeletionVectorStorageType;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::actions::LOG_CHECKPOINT_SCHEMA;
     use crate::arrow::array::{BooleanArray, StringArray};
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::arrow::array::{Int32Array, Int64Array};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1029,6 +1033,30 @@ mod tests {
             err.to_string()
                 .contains("Wrong number of DeletionVectorVisitor getters"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn visit_deletion_vector_preserves_unencoded_relative_fields() {
+        let storage_type: StringArray = vec!["r"].into();
+        let path: StringArray = vec!["data/dv.bin"].into();
+        let offset: Int32Array = vec![1].into();
+        let size_in_bytes: Int32Array = vec![4].into();
+        let cardinality: Int64Array = vec![2i64].into();
+        let getters: &[&dyn GetData<'_>] =
+            &[&storage_type, &path, &offset, &size_in_bytes, &cardinality];
+
+        let dv = visit_deletion_vector_at(0, getters).unwrap().unwrap();
+        assert_eq!(
+            dv,
+            DeletionVectorDescriptor {
+                storage_type: DeletionVectorStorageType::PersistedUnencodedRelative,
+                path_or_inline_dv: "data/dv.bin".to_string(),
+                offset: Some(1),
+                size_in_bytes: 4,
+                cardinality: 2,
+            }
         );
     }
 
