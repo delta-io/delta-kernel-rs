@@ -25,7 +25,7 @@ use crate::{KernelStringSlice, SharedExternEngine, TryFromStringSlice};
 /// Engines build the map by inserting descriptors and pass it to
 /// [`transaction_update_deletion_vectors`].
 pub struct DvDescriptorMap {
-    inner: HashMap<String, DeletionVectorDescriptor>,
+    pub(super) inner: HashMap<String, DeletionVectorDescriptor>,
 }
 
 /// Mutable handle for a deletion vector descriptor map.
