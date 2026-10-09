@@ -14,7 +14,7 @@ use crate::actions::{
     SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{CheckpointAction, LastManifestCommit, CHECKPOINT_ACTION_FIELD};
+use crate::actions::{CheckpointAction, LastManifestCommit, LOG_CHECKPOINT_SCHEMA};
 use crate::cancellation::CancellationTokenRef;
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
@@ -883,36 +883,28 @@ impl LogSegment {
     /// Find the latest AMT `checkpoint` action in this segment, returning `None` when the segment
     /// has no checkpoint action (a classic non-AMT table, or an AMT table that has none yet).
     ///
-    /// `hint` is a CRC's pointer to the latest manifest commit. When the hint is accurate, only
-    /// that one commit is read; otherwise the log is scanned newest-first until an action is found.
+    /// `hint` is a CRC's pointer to the latest manifest commit. When the hinted commit is listed
+    /// in this segment, only that one commit is read. Otherwise (or without a hint) the log is
+    /// scanned newest-first until an action is found.
     ///
     /// TODO(delta-io/delta#7533): use the commitInfo pointer when no CRC is available.
     ///
     /// # Errors
-    /// Returns an error if the log cannot be read or a checkpoint action fails to parse.
+    /// Returns an error if the log cannot be read, a checkpoint action fails to parse, or the
+    /// hinted commit does not carry the hinted checkpoint action.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub(crate) fn find_last_checkpoint_action(
         &self,
         engine: &dyn Engine,
         hint: Option<&LastManifestCommit>,
     ) -> KernelResult<Option<CheckpointAction>> {
-        let schema: SchemaRef = StructType::try_new([CHECKPOINT_ACTION_FIELD.clone()])?.into();
         if let Some(hint) = hint {
             if let Some(commit) = self.hinted_commit(hint) {
-                if let Some(action) =
-                    read_hinted_checkpoint_action(engine, commit, hint, schema.clone())?
-                {
-                    return Ok(Some(action));
-                }
-                warn!(
-                    "lastManifestCommit hint at version {} names a commit without the hinted \
-                     checkpoint action; scanning the log instead",
-                    hint.version
-                );
+                return read_hinted_checkpoint_action(engine, commit, hint).map(Some);
             }
         }
         first_checkpoint_action(
-            self.read_actions(engine, schema)?
+            self.read_actions(engine, LOG_CHECKPOINT_SCHEMA.clone())?
                 .map_ok(|batch| batch.actions),
         )
     }
@@ -1683,20 +1675,39 @@ impl LogSegment {
     }
 }
 
-/// The checkpoint action in `commit` matching `hint`, or `None` when the commit does not carry
-/// the hinted action.
+/// The checkpoint action in `commit`, which `hint` names as the latest manifest commit.
+///
+/// # Errors
+/// Returns an error if the commit cannot be read, carries no checkpoint action, or its action's
+/// content root version differs from the hint's: the CRC and the log are inconsistent.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn read_hinted_checkpoint_action(
     engine: &dyn Engine,
     commit: &ParsedLogPath,
     hint: &LastManifestCommit,
-    schema: SchemaRef,
-) -> KernelResult<Option<CheckpointAction>> {
+) -> KernelResult<CheckpointAction> {
+    let inconsistent = |detail: String| {
+        KernelError::invalid_log_segment(format!(
+            "lastManifestCommit names manifest commit version {} as the source of content root \
+             version {}, but {detail}",
+            hint.version, hint.content_root_version
+        ))
+    };
     let files = std::slice::from_ref(&commit.location);
-    Ok(
-        first_checkpoint_action(engine.json_handler().read_json_files(files, schema, None)?)?
-            .filter(|action| action.content_root_version() == hint.content_root_version),
-    )
+    let batches =
+        engine
+            .json_handler()
+            .read_json_files(files, LOG_CHECKPOINT_SCHEMA.clone(), None)?;
+    let action = first_checkpoint_action(batches)?
+        .ok_or_else(|| inconsistent("that commit carries no checkpoint action".to_string()))?;
+    require!(
+        action.content_root_version() == hint.content_root_version,
+        inconsistent(format!(
+            "that commit's checkpoint action has content root version {}",
+            action.content_root_version()
+        ))
+    );
+    Ok(action)
 }
 
 /// The first checkpoint action in `batches`, or `None` when no batch carries one.

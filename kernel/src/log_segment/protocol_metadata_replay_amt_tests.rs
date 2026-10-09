@@ -4,17 +4,17 @@
 use std::sync::Arc;
 
 use rstest::rstest;
-use test_utils::{add_commit, delta_path_for_version};
+use test_utils::{add_commit, assert_result_error_with_message, delta_path_for_version};
 
-use super::{read_hinted_checkpoint_action, CheckpointActionResolution, LogSegment};
-use crate::actions::{LastManifestCommit, CHECKPOINT_ACTION_FIELD};
+use super::{CheckpointActionResolution, LogSegment};
+use crate::actions::LastManifestCommit;
 use crate::crc::{Crc, FileStats, FileStatsState};
 use crate::engine::sync::SyncEngine;
 #[cfg(feature = "declarative-plans")]
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
-use crate::schema::{SchemaRef, StructType};
+use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
@@ -449,32 +449,36 @@ async fn incremental_update_resolves_latest_checkpoint_action(
 }
 
 // A CRC at the target version carrying `lastManifestCommit` makes `latest_checkpoint_action` read
-// only the commit it points at, scanning the log when that commit does not carry the hinted action.
-// Each case has checkpoint commits at v0 and v2, the given v1, and a CRC at v2 holding the hint.
-// The scan always finds v2's action first, so any other expected version proves the hint was
-// followed, and an expected v2 for a hint at v1 proves the hinted read was rejected.
+// only the commit it points at, failing when that commit does not carry the hinted action. Each
+// case has checkpoint commits at v0 and v2, the given v1, and a CRC at v2 holding the hint. A scan
+// would find v2's action first, so any other expected version proves the hint was followed.
 #[rstest]
-#[case::hint_names_latest_manifest_commit(checkpoint_commit(1, &[], one_column_schema()), 2, 2, 2)]
-#[case::hint_is_read_instead_of_scanning(checkpoint_commit(1, &[], one_column_schema()), 1, 1, 1)]
+#[case::hint_names_latest_manifest_commit(checkpoint_commit(1, &[], one_column_schema()), 2, 2, Ok(2))]
+#[case::hint_is_read_instead_of_scanning(checkpoint_commit(1, &[], one_column_schema()), 1, 1, Ok(1))]
 #[case::hint_names_commit_checkpointing_older_version(
     checkpoint_commit(0, &[], one_column_schema()),
     1,
     0,
-    0
+    Ok(0)
 )]
-#[case::hinted_commit_without_action_scans(metadata_commit(one_column_schema()), 1, 1, 2)]
-#[case::hinted_commit_with_other_content_root_version_scans(
+#[case::hinted_commit_without_action_fails(
+    metadata_commit(one_column_schema()),
+    1,
+    1,
+    Err("that commit carries no checkpoint action")
+)]
+#[case::hinted_commit_with_other_content_root_version_fails(
     checkpoint_commit(0, &[], one_column_schema()),
     1,
     1,
-    2
+    Err("that commit's checkpoint action has content root version 0")
 )]
 #[tokio::test]
 async fn latest_checkpoint_action_reads_commit_named_by_crc_hint(
     #[case] v1: String,
     #[case] hinted_version: i64,
     #[case] hinted_content_root_version: i64,
-    #[case] expected_version: i64,
+    #[case] expected: Result<i64, &str>,
 ) {
     let store = Arc::new(InMemory::new());
     let table_root = url::Url::parse("memory:///").unwrap();
@@ -494,8 +498,11 @@ async fn latest_checkpoint_action_reads_commit_named_by_crc_hint(
     let engine = non_plan_engine(store);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
-    let action = snapshot.latest_checkpoint_action(&engine).unwrap();
-    assert_eq!(action.map(|a| a.version), Some(expected_version));
+    let result = snapshot.latest_checkpoint_action(&engine);
+    match expected {
+        Ok(version) => assert_eq!(result.unwrap().map(|a| a.version), Some(version)),
+        Err(message) => assert_result_error_with_message(result, message),
+    }
 }
 
 // A hint naming a commit outside the segment's commit list cannot vouch for the latest action in
@@ -530,47 +537,6 @@ async fn find_last_checkpoint_action_scans_when_hinted_commit_is_not_listed() {
         .unwrap()
         .expect("scan should find v1's checkpoint action");
     assert_eq!(action.version, 1);
-}
-
-// A manifest commit may checkpoint an older version than its own: here commit v1 carries a
-// checkpoint of v0. The hint matches on the content root version, not the checkpoint version.
-#[rstest]
-#[case::matching_content_root_version_resolves(0, Some(0))]
-#[case::other_content_root_version_does_not_resolve(1, None)]
-#[tokio::test]
-async fn read_hinted_checkpoint_action_matches_on_content_root_version(
-    #[case] hinted_content_root_version: i64,
-    #[case] expected_version: Option<i64>,
-) {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
-    for version in 0..2 {
-        add_commit(
-            table_root.as_str(),
-            store.as_ref(),
-            version,
-            checkpoint_commit(0, &[], one_column_schema()),
-        )
-        .await
-        .unwrap();
-    }
-
-    let engine = non_plan_engine(store);
-    let storage = engine.storage_handler();
-    let log_root = table_root.join("_delta_log/").unwrap();
-    let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
-            .unwrap();
-
-    let hint = LastManifestCommit::new(1, hinted_content_root_version).unwrap();
-    let schema: SchemaRef = StructType::try_new([CHECKPOINT_ACTION_FIELD.clone()])
-        .unwrap()
-        .into();
-    let commit = log_segment
-        .hinted_commit(&hint)
-        .expect("hinted commit should be listed");
-    let action = read_hinted_checkpoint_action(&engine, commit, &hint, schema).unwrap();
-    assert_eq!(action.map(|a| a.version), expected_version);
 }
 
 // Writes a CRC at `version` carrying `hint` as its `lastManifestCommit`.
