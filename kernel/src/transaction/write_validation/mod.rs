@@ -12,8 +12,6 @@ use std::collections::HashMap;
 
 pub(super) use addfile::validate_add_files;
 use derive_more::Constructor;
-pub(super) use dv::validate_dv_matched_files;
-pub(super) use removefile::validate_remove_files;
 
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
@@ -53,16 +51,6 @@ impl FileActionTracker {
             "AddFile",
             &mut self.add_paths,
             &self.remove_paths,
-        )
-    }
-
-    fn record_remove(&mut self, path: &str, dv_id: Option<String>) -> KernelResult<()> {
-        Self::record(
-            path,
-            dv_id,
-            "RemoveFile",
-            &mut self.remove_paths,
-            &self.add_paths,
         )
     }
 
@@ -109,14 +97,14 @@ pub(crate) trait Validation {
 /// The `'a` lifetime lets validations borrow shared state, such as [`FileActionTracker`], so all
 /// the checks can be run in one pass.
 #[derive(Constructor)]
-struct StagedDataValidator<'a> {
+pub(crate) struct StagedDataValidator<'a> {
     columns_and_types: &'static ColumnNamesAndTypes,
     validations: Vec<Box<dyn Validation + 'a>>,
 }
 
 impl<'a> StagedDataValidator<'a> {
     /// Run every validation against each batch. Returns the first validation error encountered.
-    fn validate(mut self, batches: &[Box<dyn EngineData>]) -> KernelResult<()> {
+    pub(crate) fn validate(mut self, batches: &[Box<dyn EngineData>]) -> KernelResult<()> {
         for batch in batches {
             RowVisitor::visit_rows_of(&mut self, batch.as_ref())?;
         }
@@ -124,7 +112,7 @@ impl<'a> StagedDataValidator<'a> {
     }
 
     /// Runs every validation against each selected staged-data row.
-    fn validate_filtered(mut self, batches: &[FilteredEngineData]) -> KernelResult<()> {
+    pub(crate) fn validate_filtered(mut self, batches: &[FilteredEngineData]) -> KernelResult<()> {
         for batch in batches {
             FilteredRowVisitor::visit_rows_of(&mut self, batch)?;
         }
@@ -184,48 +172,6 @@ mod tests {
         ],
         Some("multiple AddFile actions"),
     )]
-    #[case::duplicate_remove_different_dv(
-        &[
-            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same_path", Some("dv-1")),
-            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same_path", Some("dv-2")),
-        ],
-        Some("multiple RemoveFile actions"),
-    )]
-    #[case::add_remove_same_dv(
-        &[
-            FileActionTrackerTestCase::new(TestFileActionType::Add, "same_path", Some("dv")),
-            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same_path", Some("dv")),
-        ],
-        Some("same deletion vector ID"),
-    )]
-    #[case::remove_add_same_dv(
-        &[
-            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same_path", None),
-            FileActionTrackerTestCase::new(TestFileActionType::Add, "same_path", None),
-        ],
-        Some("without a deletion vector"),
-    )]
-    #[case::remove_add_same_non_null_dv(
-        &[
-            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same_path", Some("dv")),
-            FileActionTrackerTestCase::new(TestFileActionType::Add, "same_path", Some("dv")),
-        ],
-        Some("same deletion vector ID"),
-    )]
-    #[case::remove_add_different_dv(
-        &[
-            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same_path", Some("dv-1")),
-            FileActionTrackerTestCase::new(TestFileActionType::Add, "same_path", Some("dv-2")),
-        ],
-        None,
-    )]
-    #[case::add_remove_different_dv(
-        &[
-            FileActionTrackerTestCase::new(TestFileActionType::Add, "same_path", Some("dv-1")),
-            FileActionTrackerTestCase::new(TestFileActionType::Remove, "same_path", Some("dv-2")),
-        ],
-        None,
-    )]
     #[case::same_dv_different_paths(
         &[
             FileActionTrackerTestCase::new(TestFileActionType::Add, "path_0", Some("dv")),
@@ -256,7 +202,6 @@ mod tests {
     #[derive(Clone, Copy)]
     enum TestFileActionType {
         Add,
-        Remove,
     }
 
     impl TestFileActionType {
@@ -268,7 +213,6 @@ mod tests {
         ) -> KernelResult<()> {
             match self {
                 Self::Add => tracker.record_add(path, dv_id),
-                Self::Remove => tracker.record_remove(path, dv_id),
             }
         }
     }

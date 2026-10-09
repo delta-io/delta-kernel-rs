@@ -24,15 +24,75 @@ use itertools::Itertools;
 use rstest::rstest;
 use serde_json::{json, Deserializer};
 use test_utils::{
-    assert_result_error_with_message, into_record_batch, load_and_begin_transaction,
-    modify_add_file_partition_keys, set_json_value, setup_test_tables, test_read,
-    AddFilePartitionKeyModify,
+    assert_result_error_with_message, create_add_files_metadata, into_record_batch,
+    load_and_begin_transaction, modify_add_file_partition_keys, set_json_value, setup_test_tables,
+    test_read, test_table_setup, AddFilePartitionKeyModify,
 };
 
 use crate::common::write_utils::{
-    check_action_timestamps, get_and_check_all_parquet_sizes, get_simple_int_schema,
-    validate_txn_id, write_data_and_check_result_and_stats, ZERO_UUID,
+    check_action_timestamps, get_and_check_all_parquet_sizes, get_scan_files,
+    get_simple_int_schema, validate_txn_id, write_data_and_check_result_and_stats, ZERO_UUID,
 };
+
+#[rstest]
+#[case::unique(&["path-0.parquet", "path-1.parquet"], true, None)]
+#[case::duplicate(
+    &["path.parquet", "path.parquet"], true, Some("multiple AddFile actions")
+)]
+#[case::dedup_disabled(&["path.parquet", "path.parquet"], false, None)]
+#[case::dedup_disabled_empty_path(
+    &["", "path.parquet"], false, Some("AddFile path must not be empty")
+)]
+#[tokio::test]
+async fn commit_validates_add_file_path_uniqueness(
+    #[case] paths: &[&str],
+    #[case] dedup_validation_enabled: bool,
+    #[case] expected_error: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    create_table(&table_path, schema_ref! { nullable "id": INTEGER }, "test")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let mut txn = load_and_begin_transaction(&table_path, engine.as_ref())?;
+    if !dedup_validation_enabled {
+        txn = txn.without_dedup_validation();
+    }
+    txn.add_files(create_add_files_metadata(
+        txn.add_files_schema(),
+        paths
+            .iter()
+            .map(|path| {
+                (
+                    *path,
+                    1, /* size */
+                    1, /* modification_time */
+                    Some(1),
+                )
+            })
+            .collect(),
+    )?);
+
+    let result = txn.commit(engine.as_ref());
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, expected_error);
+    } else {
+        let snapshot = result?.unwrap_post_commit_snapshot();
+        let mut actual_paths = Vec::new();
+        for scan_files in get_scan_files(snapshot, engine.as_ref())? {
+            let batch = into_record_batch(scan_files.apply_selection_vector()?);
+            let column = batch.column(batch.schema().index_of("path")?);
+            let column = column.as_any().downcast_ref::<StringArray>().unwrap();
+            actual_paths.extend(column.iter().map(|path| path.unwrap().to_owned()));
+        }
+        actual_paths.sort();
+        assert_eq!(
+            actual_paths,
+            paths.iter().copied().unique().sorted().collect::<Vec<_>>()
+        );
+    }
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_append() -> Result<(), Box<dyn std::error::Error>> {

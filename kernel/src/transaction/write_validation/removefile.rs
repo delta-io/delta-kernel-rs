@@ -2,75 +2,42 @@
 
 use std::sync::LazyLock;
 
-use super::utils::{
-    columns_from_schema, dv_id_at, validate_required_field_exist, DELETION_VECTOR_NAME,
-    OFFSET_NAME, PATH_OR_INLINE_DV_NAME, STORAGE_TYPE_NAME,
-};
-use super::{FileActionTracker, StagedDataValidator, Validation};
-use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
-use crate::expressions::column_name;
-use crate::scan::log_replay::{PATH_NAME, SIZE_NAME};
-use crate::scan::scan_row_schema;
-use crate::schema::ColumnNamesAndTypes;
+use super::utils::validate_required_field_exist;
+use super::{StagedDataValidator, Validation};
+use crate::engine_data::{GetData, TypedGetData as _};
+use crate::schema::{lazy_schema_ref, ColumnNamesAndTypes, SchemaRef};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
-/// Column indices, matching the order in [`REMOVE_FILE_COLUMNS_FOR_VALIDATION`].
+/// Column indices, matching the order in [`MANDATORY_REMOVE_FILE_COLUMNS`].
 const PATH: usize = 0;
 const SIZE: usize = 1;
-const DELETION_VECTOR_STORAGE_TYPE: usize = 2;
 
-static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNamesAndTypes>> =
-    LazyLock::new(|| {
-        let names = vec![
-            column_name!(PATH_NAME),
-            column_name!(SIZE_NAME),
-            column_name!(DELETION_VECTOR_NAME, STORAGE_TYPE_NAME),
-            column_name!(DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME),
-            column_name!(DELETION_VECTOR_NAME, OFFSET_NAME),
-        ];
-        columns_from_schema(&scan_row_schema(), names)
-    });
+static MANDATORY_REMOVE_FILE_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    nullable "path": STRING,
+    nullable "size": LONG,
+};
 
-/// Runs required validations for every selected RemoveFile row. When `staged_file_actions` is
-/// provided, also validates file-action (addFile, removeFile) uniqueness.
-pub(crate) fn validate_remove_files(
-    removes: &[FilteredEngineData],
-    staged_file_actions: Option<&mut FileActionTracker>,
-) -> KernelResult<()> {
-    StagedDataValidator::staged_remove_file(staged_file_actions)?.validate_filtered(removes)
-}
+static MANDATORY_REMOVE_FILE_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| MANDATORY_REMOVE_FILE_SCHEMA.leaves(None));
 
-impl<'a> StagedDataValidator<'a> {
-    fn staged_remove_file(
-        staged_file_actions: Option<&'a mut FileActionTracker>,
-    ) -> KernelResult<Self> {
-        let columns = REMOVE_FILE_COLUMNS_FOR_VALIDATION
-            .as_ref()
-            .map_err(|error| {
-                KernelError::internal_error(format!(
-                    "RemoveFile validation columns must exist in the scan-row schema: {error}"
-                ))
-            })?;
-        let mut validations: Vec<Box<dyn Validation + 'a>> = vec![Box::new(RequiredRemoveFileVal)];
-        if let Some(staged_file_actions) = staged_file_actions {
-            validations.push(Box::new(RepeatedFileActionValidation {
-                staged_file_actions,
-            }));
-        }
-        Ok(StagedDataValidator::new(columns, validations))
+impl StagedDataValidator<'_> {
+    pub(crate) fn staged_remove_file() -> Self {
+        StagedDataValidator::new(
+            &MANDATORY_REMOVE_FILE_COLUMNS,
+            vec![Box::new(RemoveFileRequiredFields)],
+        )
     }
 }
 
-/// Required validations for every selected RemoveFile row.
-///
-/// `path` must be present and non-empty, and `size` must be present and non-negative.
+/// Validates required `RemoveFile` fields: `path` must be present and non-empty, and `size`
+/// must be present and non-negative.
 ///
 /// The protocol defines `size` as optional, but kernel requires it because its `RemoveFile`
 /// actions currently come only from `AddFile` actions, which provide `size`.
-struct RequiredRemoveFileVal;
+struct RemoveFileRequiredFields;
 
-impl Validation for RequiredRemoveFileVal {
+impl Validation for RemoveFileRequiredFields {
     fn validate_row<'a>(
         &mut self,
         row: usize,
@@ -98,101 +65,30 @@ impl Validation for RequiredRemoveFileVal {
     }
 }
 
-struct RepeatedFileActionValidation<'a> {
-    staged_file_actions: &'a mut FileActionTracker,
-}
-
-impl Validation for RepeatedFileActionValidation<'_> {
-    fn validate_row<'a>(
-        &mut self,
-        row: usize,
-        getters: &[&'a dyn GetData<'a>],
-    ) -> KernelResult<()> {
-        let path: &str = getters[PATH].get(row, PATH_NAME)?;
-        let dv_id = dv_id_at(getters, DELETION_VECTOR_STORAGE_TYPE, row)?;
-        self.staged_file_actions.record_remove(path, dv_id)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use rstest::rstest;
-    use test_utils::{deletion_vector_array, replace_column};
+    use test_utils::replace_column;
 
     use super::*;
-    use crate::arrow::array::{new_null_array, ArrayRef, Int64Array, StringArray};
+    use crate::arrow::array::{ArrayRef, Int64Array, StringArray};
     use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine_data::FilteredEngineData;
     use crate::expressions::ColumnName;
     use crate::unit_test_utils::assert_result_error_with_message;
 
     #[test]
     fn column_indices_match_schema_order() {
-        let columns = REMOVE_FILE_COLUMNS_FOR_VALIDATION
-            .as_ref()
-            .expect("RemoveFile validation columns should exist in the scan-row schema");
-        let (names, _) = columns.as_ref();
+        let (names, _) = MANDATORY_REMOVE_FILE_COLUMNS.as_ref();
         assert_eq!(names[PATH], ColumnName::new(["path"]));
         assert_eq!(names[SIZE], ColumnName::new(["size"]));
-        assert_eq!(
-            names[DELETION_VECTOR_STORAGE_TYPE],
-            ColumnName::new([DELETION_VECTOR_NAME, STORAGE_TYPE_NAME])
-        );
-        assert_eq!(
-            names[DELETION_VECTOR_STORAGE_TYPE + 1],
-            ColumnName::new([DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME])
-        );
-        assert_eq!(
-            names[DELETION_VECTOR_STORAGE_TYPE + 2],
-            ColumnName::new([DELETION_VECTOR_NAME, OFFSET_NAME])
-        );
-        assert_eq!(names.len(), 5);
-    }
-
-    #[rstest]
-    #[case::selected(&[true, true], Some("multiple RemoveFile actions"))]
-    #[case::unselected(&[true, false], None)]
-    fn duplicate_remove_paths_validate_selected_rows(
-        #[case] selection_vector: &[bool],
-        #[case] expected_error: Option<&str>,
-        #[values(false, true)] multiple_batches: bool,
-    ) {
-        let removes = if multiple_batches {
-            selection_vector
-                .iter()
-                .zip(["dv-1", "dv-2"])
-                .map(|(&selected, dv_id)| {
-                    FilteredEngineData::try_new(
-                        Box::new(ArrowEngineData::new(nullable_staged_remove_file(
-                            "same",
-                            Some(dv_id),
-                        ))),
-                        vec![selected],
-                    )
-                    .expect("selection vector length should match staged RemoveFile row count")
-                })
-                .collect()
-        } else {
-            let batch =
-                nullable_staged_remove_files(&["same", "same"], &[Some("dv-1"), Some("dv-2")]);
-            vec![FilteredEngineData::try_new(
-                Box::new(ArrowEngineData::new(batch)),
-                selection_vector.to_vec(),
-            )
-            .expect("selection vector length should match staged RemoveFile row count")]
-        };
-        let result = validate_remove_files(&removes);
-
-        if let Some(expected_error) = expected_error {
-            assert_result_error_with_message(result, expected_error);
-        } else {
-            result.expect("unselected duplicate RemoveFile should be ignored");
-        }
+        assert_eq!(names.len(), 2);
     }
 
     #[rstest]
@@ -268,10 +164,7 @@ mod tests {
         #[values(0, 1)] case_batch_index: usize,
     ) {
         let batch = replace_column(
-            &nullable_staged_remove_files(
-                &["valid-path-0", "valid-path-1", "valid-path-2"],
-                &[None, None, None],
-            ),
+            &nullable_staged_remove_files(paths.len()),
             "path",
             Arc::new(StringArray::from(paths.to_vec())),
         );
@@ -280,13 +173,13 @@ mod tests {
             Box::new(ArrowEngineData::new(batch)),
             selection_vector.to_vec(),
         )
-        .expect("selection vector length should match staged RemoveFile row count");
+        .expect("valid remove-file selection vector");
         let mut removes = vec![
-            all_rows_selected(nullable_staged_remove_file("default-path-0", None)),
-            all_rows_selected(nullable_staged_remove_file("default-path-1", None)),
+            all_rows_selected(nullable_staged_remove_file()),
+            all_rows_selected(nullable_staged_remove_file()),
         ];
         removes[case_batch_index] = remove;
-        let result = validate_remove_files(&removes);
+        let result = remove_validator().validate_filtered(&removes);
 
         if let Some(expected_error) = expected_error {
             assert_result_error_with_message(result, expected_error);
@@ -295,43 +188,33 @@ mod tests {
         }
     }
 
-    fn nullable_staged_remove_file(path: &str, dv_id: Option<&str>) -> RecordBatch {
-        let arrow_schema: ArrowSchema = scan_row_schema()
+    fn nullable_staged_remove_file() -> RecordBatch {
+        let arrow_schema: ArrowSchema = MANDATORY_REMOVE_FILE_SCHEMA
             .as_ref()
             .try_into_arrow()
-            .expect("scan-row schema should convert to Arrow");
-        let columns = arrow_schema
-            .fields()
-            .iter()
-            .map(|field| match field.name().as_str() {
-                "path" => Arc::new(StringArray::from(vec![path])) as ArrayRef,
-                "size" => Arc::new(Int64Array::from(vec![1])) as ArrayRef,
-                DELETION_VECTOR_NAME => Arc::new(deletion_vector_array("i", &[dv_id])) as ArrayRef,
-                _ => new_null_array(field.data_type(), 1 /* length */),
-            })
-            .collect();
+            .expect("remove-file schema should convert to Arrow");
 
-        RecordBatch::try_new(Arc::new(arrow_schema), columns)
-            .expect("valid staged remove-file batch")
+        RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![
+                Arc::new(StringArray::from(vec!["dummy"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            ],
+        )
+        .expect("valid staged remove-file batch")
     }
 
-    fn nullable_staged_remove_files(paths: &[&str], dv_ids: &[Option<&str>]) -> RecordBatch {
-        assert_eq!(paths.len(), dv_ids.len());
-        let batches: Vec<_> = paths
-            .iter()
-            .zip(dv_ids)
-            .map(|(path, dv_id)| nullable_staged_remove_file(path, *dv_id))
-            .collect();
-        concat_batches(&batches[0].schema(), &batches)
-            .expect("failed to concatenate remove-file rows")
+    fn nullable_staged_remove_files(row_count: usize) -> RecordBatch {
+        let batch = nullable_staged_remove_file();
+        concat_batches(&batch.schema(), &vec![batch; row_count])
+            .expect("failed to concatenate rows into a multi-row remove-file batch")
     }
 
     fn all_rows_selected(batch: RecordBatch) -> FilteredEngineData {
         FilteredEngineData::with_all_rows_selected(Box::new(ArrowEngineData::new(batch)))
     }
 
-    fn validate_remove_files(removes: &[FilteredEngineData]) -> KernelResult<()> {
-        let mut file_actions = FileActionTracker::default();
-        super::validate_remove_files(removes, Some(&mut file_actions))
+    fn remove_validator() -> StagedDataValidator<'static> {
+        StagedDataValidator::staged_remove_file()
     }
 }
