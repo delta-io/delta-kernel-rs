@@ -87,9 +87,7 @@ pub(crate) struct FileActionDeduplicator<'seen> {
     /// Starting index for remove action deletion vector columns
     remove_dv_start_index: usize,
     /// Table root used to normalize the deletion-vector identity under adaptiveMetadata; `Some`
-    /// iff adaptiveMetadata is enabled for the table. Not yet consumed by `extract_dv_unique_id`.
-    // TODO(dv-r): consumed in sub-PR C
-    #[allow(dead_code)]
+    /// iff adaptiveMetadata is enabled for the table. See [`Deduplicator::extract_dv_unique_id`].
     table_root: Option<Url>,
 }
 
@@ -217,6 +215,10 @@ impl Deduplicator for FileActionDeduplicator<'_> {
     /// `false` indicates we are processing a batch from a checkpoint.
     fn is_log_batch(&self) -> bool {
         self.is_log_batch
+    }
+
+    fn dv_normalization_table_root(&self) -> Option<&Url> {
+        self.table_root.as_ref()
     }
 }
 
@@ -720,6 +722,45 @@ mod tests {
             Some("s3path/to/dv@100")
         ));
         assert!(is_add);
+
+        Ok(())
+    }
+
+    /// Under adaptiveMetadata (table root `Some`), the deduplicator keys on the normalized DV
+    /// object identity, so the same physical blob encoded as `'u'` and as `'r'` yields the same
+    /// `dv_unique_id` (an `add`/`remove` pair would match); without a table root (legacy), the two
+    /// encodings produce different ids.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_adaptive_metadata_normalizes_dv_identity_across_storage_types() -> Result<()> {
+        let seen = HashSet::new();
+        let table_root = Url::parse("s3://mytable/").unwrap();
+
+        // One DV file encoded two ways: `'u'` (z85 UUID with an "ab" prefix) and `'r'` (the
+        // decoded table-relative path it names). Same offset -> same physical blob.
+        let decoded = "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin";
+        let dv_id = |storage_type: &str, path: &str, root: Option<Url>| -> Result<String> {
+            let dedup = CheckpointDeduplicator::try_new(&seen, 0, 1, 2, root)?;
+            let mut mock = MockGetData::new();
+            mock.add_string(0, "add.path", "f.parquet");
+            mock.add_string(0, "deletionVector.storageType", storage_type);
+            mock.add_string(0, "deletionVector.pathOrInlineDv", path);
+            mock.add_int(0, "deletionVector.offset", 4);
+            let getters = create_getters_with_mocks(Some(&mock), None);
+            let info = dedup.extract_file_action(0, &getters, false)?.unwrap();
+            Ok(info.key.dv_unique_id.unwrap())
+        };
+
+        // adaptiveMetadata: both encodings normalize to the same identity.
+        let u = dv_id("u", "ab^-aqEH.-t@S}K{vb[*k^", Some(table_root.clone()))?;
+        let r = dv_id("r", decoded, Some(table_root.clone()))?;
+        assert_eq!(u, r);
+        assert_eq!(u, format!("r{decoded}@4"));
+
+        // Legacy (no table root): the two encodings keep distinct, storage-type-prefixed ids.
+        let u_legacy = dv_id("u", "ab^-aqEH.-t@S}K{vb[*k^", None)?;
+        let r_legacy = dv_id("r", decoded, None)?;
+        assert_ne!(u_legacy, r_legacy);
 
         Ok(())
     }
