@@ -18,14 +18,10 @@ use crate::{KernelError, KernelResult};
 /// These characters have special meaning in Parquet schema syntax.
 const INVALID_PARQUET_CHARS: &[char] = &[' ', ',', ';', '{', '}', '(', ')', '\n', '\t', '='];
 
-/// Validates a schema for CREATE TABLE or ALTER TABLE.
+/// Validates a schema and its metadata annotations for CREATE TABLE or ALTER TABLE.
 ///
-/// Performs the following checks:
-/// 1. No duplicate column names (case-insensitive, including nested fields)
-/// 2. Column names contain only valid characters
-/// 3. Rejects fields with `delta.invariants` metadata (SQL expression invariants are not supported
-///    by kernel)
-/// 4. When `cdf_enabled` is true, rejects top-level column names reserved by CDF (case-insensitive)
+/// Applies column-name rules for `column_mapping_mode` and CDF restrictions when `cdf_enabled` is
+/// true. Returns an error if schema or metadata annotation validation fails.
 pub(crate) fn validate_schema(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
@@ -469,6 +465,16 @@ mod tests {
     #[case::top_level_dup(schema_top_level_dup(), ColumnMappingMode::None, &["duplicate"])]
     #[case::array_element_dup(schema_array_dup(), ColumnMappingMode::None, &["duplicate"])]
     #[case::multi_error(schema_multi_bad(), ColumnMappingMode::None, &["bad column", "col;name"])]
+    #[case::malformed_collation_metadata(
+        schema! {
+            (StructField::nullable("field", DataType::STRING).with_metadata([(
+                ColumnMetadataKey::Collations.as_ref(),
+                MetadataValue::Other(serde_json::json!({"field": 12})),
+            )])),
+        },
+        ColumnMappingMode::None,
+        &["__COLLATIONS", "string identifier"]
+    )]
     fn invalid_schema_rejected(
         #[case] schema: StructType,
         #[case] cm: ColumnMappingMode,
