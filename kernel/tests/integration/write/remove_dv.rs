@@ -369,6 +369,7 @@ fn selected_scan_file_batch(
 async fn commit_validates_file_action_uniqueness(
     #[case] case: FileActionUniquenessCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // === Initialize table with files ===
     let schema = schema_ref! { nullable "id": INTEGER };
     let (_store, engine, table_url, _) = create_dv_table_with_files(
         "file_action_uniqueness",
@@ -398,6 +399,7 @@ async fn commit_validates_file_action_uniqueness(
         }
     })?;
 
+    // === Stage AddFiles ===
     txn.add_files(create_add_files_metadata(
         txn.add_files_schema(),
         case.adds
@@ -412,11 +414,15 @@ async fn commit_validates_file_action_uniqueness(
             })
             .collect(),
     )?);
+
+    // === Stage RemoveFiles ===
     let removes = apply_path_dv(&base_row, &case.removes.rows)?;
     txn.remove_files(FilteredEngineData::try_new(
         Box::new(ArrowEngineData::new(removes)),
         case.removes.selection_vector.to_vec(),
     )?);
+
+    // === Stage DV updates ===
     let scan_file = apply_path_dv(&base_row, &case.dv_updates.rows)?;
     let descriptors = case
         .dv_updates
@@ -449,6 +455,7 @@ async fn commit_validates_file_action_uniqueness(
         )?)),
     )?;
 
+    // === Commit and assert the result ===
     let result = txn.commit(engine.as_ref());
     if let Some(expected_error) = case.expected_error {
         assert_result_error_with_message(result, expected_error);

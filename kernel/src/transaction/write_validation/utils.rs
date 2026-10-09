@@ -12,7 +12,7 @@ pub(super) const STORAGE_TYPE_NAME: &str = "storageType";
 pub(super) const PATH_OR_INLINE_DV_NAME: &str = "pathOrInlineDv";
 pub(super) const OFFSET_NAME: &str = "offset";
 
-pub(super) fn columns_from_schema(
+pub(super) fn columns_and_types_from_schema(
     schema: &StructType,
     names: Vec<ColumnName>,
 ) -> KernelResult<ColumnNamesAndTypes> {
@@ -23,7 +23,8 @@ pub(super) fn columns_from_schema(
     Ok((names, types).into())
 }
 
-/// Reads contiguous `storageType`, `pathOrInlineDv`, and `offset` getters starting at `base`.
+/// Gets the DV ID by reading contiguous `storageType`, `pathOrInlineDv`, and `offset` getters
+/// starting at `base`.
 pub(super) fn dv_id_at<'a>(
     getters: &[&'a dyn GetData<'a>],
     base: usize,

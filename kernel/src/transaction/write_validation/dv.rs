@@ -4,8 +4,9 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use super::utils::{
-    columns_from_schema, dv_id_at, validate_partition_keys, validate_required_field_exist,
-    DELETION_VECTOR_NAME, OFFSET_NAME, PATH_OR_INLINE_DV_NAME, STORAGE_TYPE_NAME,
+    columns_and_types_from_schema, dv_id_at, validate_partition_keys,
+    validate_required_field_exist, DELETION_VECTOR_NAME, OFFSET_NAME, PATH_OR_INLINE_DV_NAME,
+    STORAGE_TYPE_NAME,
 };
 use super::{FileActionTracker, StagedDataValidator, Validation};
 use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
@@ -40,7 +41,7 @@ static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNames
             column_name!(NEW_DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME),
             column_name!(NEW_DELETION_VECTOR_NAME, OFFSET_NAME),
         ];
-        columns_from_schema(intermediate_dv_schema(), names)
+        columns_and_types_from_schema(intermediate_dv_schema(), names)
     });
 
 /// Runs required validations for every selected DV-update row. When `pre_staged_file_actions` is

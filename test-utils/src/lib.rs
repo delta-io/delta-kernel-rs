@@ -620,7 +620,8 @@ pub fn replace_array_row(column: &ArrayRef, replacement: ArrayRef, row: usize) -
     concat(&arrays).expect("replacement value must match the modified column type")
 }
 
-/// Builds nullable deletion-vector values for tests.
+/// Builds nullable deletion-vector values (`addFile.deletionVector` or `removeFile.deletionVector`)
+/// for tests.
 ///
 /// Each entry supplies `pathOrInlineDv`; `None` produces a null descriptor. Present descriptors
 /// have no offset and use placeholder size and cardinality values.

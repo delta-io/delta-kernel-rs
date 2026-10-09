@@ -3,7 +3,7 @@
 use std::sync::LazyLock;
 
 use super::utils::{
-    columns_from_schema, dv_id_at, validate_required_field_exist, DELETION_VECTOR_NAME,
+    columns_and_types_from_schema, dv_id_at, validate_required_field_exist, DELETION_VECTOR_NAME,
     OFFSET_NAME, PATH_OR_INLINE_DV_NAME, STORAGE_TYPE_NAME,
 };
 use super::{FileActionTracker, StagedDataValidator, Validation};
@@ -29,7 +29,7 @@ static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNamesAndT
             column_name!(DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME),
             column_name!(DELETION_VECTOR_NAME, OFFSET_NAME),
         ];
-        columns_from_schema(&scan_row_schema(), names)
+        columns_and_types_from_schema(&scan_row_schema(), names)
     });
 
 /// Runs required validations for every selected RemoveFile row. When `pre_staged_file_actions` is

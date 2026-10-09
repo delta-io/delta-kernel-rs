@@ -1394,24 +1394,24 @@ impl<S> Transaction<S> {
 
         // Share the tracker across validations to detect cross-source conflicts.
         // TODO(#3545): Pre-size the tracker maps.
-        let mut pre_staged_file_actions = self
+        let mut staged_file_actions = self
             .dedup_validation_enabled
             .then(write_validation::FileActionTracker::default);
         write_validation::validate_add_files(
             &self.add_files_metadata,
             self.effective_table_config.physical_partition_columns(),
-            pre_staged_file_actions.as_mut(),
+            staged_file_actions.as_mut(),
         )?;
 
         write_validation::validate_dv_matched_files(
             &self.dv_matched_files,
             self.effective_table_config.physical_partition_columns(),
-            pre_staged_file_actions.as_mut(),
+            staged_file_actions.as_mut(),
         )?;
 
         write_validation::validate_remove_files(
             &self.remove_files_metadata,
-            pre_staged_file_actions.as_mut(),
+            staged_file_actions.as_mut(),
         )?;
 
         Ok(())
