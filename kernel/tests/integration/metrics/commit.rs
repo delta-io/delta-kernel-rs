@@ -11,13 +11,13 @@ use delta_kernel::metrics::{MetricEvent, MetricsReporter, TableType, Transaction
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{schema_ref, DataType, StructField};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel::{Result, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
-    assert_result_error_with_message, begin_transaction, create_add_files_metadata, insert_data,
-    insert_data_with, install_thread_local_metrics_reporter, test_table_setup_mt,
+    assert_result_error_with_message, begin_transaction_with, create_add_files_metadata,
+    insert_data, insert_data_with, install_thread_local_metrics_reporter, test_table_setup_mt,
 };
 use url::Url;
 
@@ -62,6 +62,7 @@ fn setup_empty_table() -> Result<(tempfile::TempDir, Url)> {
 
 #[rstest]
 #[case::write_append("WRITE", true, false)]
+#[case::custom_insert("INSERT", true, false)]
 #[case::blind_append("WRITE", true, true)]
 #[case::optimize_no_data_change("OPTIMIZE", false, false)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -112,9 +113,11 @@ async fn commit_reports_added_file_count_not_batch_count() -> Result<()> {
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let snap = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
-    let mut txn = begin_transaction(snap, engine.as_ref())?
-        .with_operation("WRITE".to_string())
-        .with_data_change(true);
+    let mut txn = begin_transaction_with(snap, engine.as_ref(), |builder| {
+        builder
+            .with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
+            .with_data_change(true)
+    })?;
     let add_files_schema = txn.add_files_schema();
     // Two separate add_files() calls -> two batches, four files total.
     let batches = vec![
@@ -139,8 +142,7 @@ async fn commit_reports_added_file_count_not_batch_count() -> Result<()> {
     Ok(())
 }
 
-/// Sets the correlation id on the `Transaction` returned by `build()` and checks it reaches the
-/// commit metric event. The two tests below instead set it on the builder.
+/// Sets the correlation id on the create-table builder and checks it reaches the commit metric.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_success_carries_correlation_id() -> Result<()> {
     let (_temp_dir, table_path, setup_engine) = test_table_setup_mt()?;
@@ -148,8 +150,8 @@ async fn commit_success_carries_correlation_id() -> Result<()> {
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
     create_table(&table_path, simple_schema(), "Test/1.0")
-        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .with_correlation_id("commit-req-1")
+        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(setup_engine.as_ref())?
         .unwrap_committed();
 
@@ -216,7 +218,9 @@ async fn alter_table_builder_carries_correlation_id(
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     // Set the id in the `Ready` state (before `add_column`) to exercise the carry-through.
-    let mut builder = snapshot.alter_table();
+    let mut builder = snapshot
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::AlterTable);
     if let Some(id) = correlation_id {
         builder = builder.with_correlation_id(id);
     }
@@ -317,9 +321,11 @@ async fn commit_dv_update_reports_updated_file_count_not_batch_count(
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_operation("UPDATE".to_string())
-        .with_data_change(true);
+    let mut txn = begin_transaction_with(snapshot.clone(), engine.as_ref(), |builder| {
+        builder
+            .with_operation(delta_kernel::transaction::UpdateTableOperation::Update)
+            .with_data_change(true)
+    })?;
 
     let mut paths_with_unmatched = file_paths.clone();
     paths_with_unmatched.push("missing.parquet".to_string());
@@ -360,9 +366,11 @@ async fn commit_dv_update_accumulates_file_count_across_calls(
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_operation("UPDATE".to_string())
-        .with_data_change(true);
+    let mut txn = begin_transaction_with(snapshot.clone(), engine.as_ref(), |builder| {
+        builder
+            .with_operation(delta_kernel::transaction::UpdateTableOperation::Update)
+            .with_data_change(true)
+    })?;
 
     // Each call re-derives scan files from the same snapshot and updates exactly one file, so
     // matched_dv_files is 1 per call and the accumulator must reach 2.

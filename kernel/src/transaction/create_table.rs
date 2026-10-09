@@ -31,22 +31,10 @@
 // and for tests. Also allow dead_code since these are used by integration tests.
 #![allow(unreachable_pub, dead_code)]
 
-use std::sync::Arc;
-
 // Re-export the builder so callers can still access it from this module path.
 pub use super::builder::create_table::CreateTableTransactionBuilder;
-use crate::actions::DomainMetadata;
-use crate::committer::Committer;
-use crate::expressions::ColumnName;
-use crate::metrics::MetricId;
 use crate::schema::SchemaRef;
-use crate::table_configuration::TableConfiguration;
-use crate::table_features::{
-    validate_iceberg_compat_if_needed, IcebergCompatValidationContext, V2_VALIDATOR,
-};
 use crate::transaction::{CreateTable, Transaction};
-use crate::utils::{current_time_ms, PhantomType};
-use crate::KernelResult;
 
 /// A type alias for create-table transactions.
 ///
@@ -61,7 +49,6 @@ use crate::KernelResult;
 /// - **`remove_files()`** — Cannot remove files from a table that has no files.
 /// - **`with_blind_append()`** — Blind append semantics don't apply to table creation.
 /// - **`update_deletion_vectors()`** — Deletion vectors require an existing table.
-/// - **`with_transaction_id()`** — Transaction ID (app_id) tracking is for existing tables.
 /// - **`with_operation()`** — The operation is fixed to `"CREATE TABLE"`.
 ///
 /// # Example
@@ -130,68 +117,4 @@ pub fn create_table(
     engine_info: impl Into<String>,
 ) -> CreateTableTransactionBuilder {
     CreateTableTransactionBuilder::new(path, schema, engine_info)
-}
-
-impl CreateTableTransaction {
-    /// Create a new transaction for creating a new table. This is used when the table doesn't
-    /// exist yet and we need to create it with Protocol and Metadata actions.
-    ///
-    /// The `effective_table_config` is the table configuration that will be committed (protocol,
-    /// metadata, schema).
-    ///
-    /// This is typically called via `CreateTableTransactionBuilder::build()` rather than directly.
-    pub(crate) fn try_new_create_table(
-        effective_table_config: TableConfiguration,
-        engine_info: String,
-        committer: Box<dyn Committer>,
-        system_domain_metadata: Vec<DomainMetadata>,
-        clustering_columns: Option<Vec<ColumnName>>,
-        correlation_id: Option<Arc<str>>,
-    ) -> KernelResult<Self> {
-        validate_iceberg_compat_if_needed(
-            &effective_table_config,
-            &V2_VALIDATOR,
-            IcebergCompatValidationContext::Write,
-        )?;
-
-        let span = tracing::info_span!(
-            "txn",
-            path = %effective_table_config.table_root(),
-            operation = "CREATE",
-        );
-        Ok(Transaction {
-            span,
-            operation_id: MetricId::new(),
-            correlation_id,
-            read_snapshot_opt: None,
-            effective_table_config,
-            should_emit_protocol: true,
-            should_emit_metadata: true,
-            committer,
-            operation: Some("CREATE TABLE".to_string()),
-            engine_info: Some(engine_info),
-            operation_parameters: None,
-            operation_metrics: None,
-            add_files_metadata: vec![],
-            remove_files_metadata: vec![],
-            set_transactions: vec![],
-            commit_timestamp: current_time_ms()?,
-            user_domain_metadata_additions: vec![],
-            system_domain_metadata_additions: system_domain_metadata,
-            provided_row_tracking_high_water_mark: None,
-            user_domain_removals: vec![],
-            data_change: true,
-            dedup_validation_enabled: true,
-            column_defaults_acknowledged: false,
-            row_tracking_preservation_acknowledged: false,
-            engine_commit_info: None,
-            is_blind_append: false,
-            dv_matched_files: vec![],
-            num_dv_updates: 0,
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            manifest_write: None,
-            physical_clustering_columns: clustering_columns,
-            _state: PhantomType::default(),
-        })
-    }
 }

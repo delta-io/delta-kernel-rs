@@ -78,10 +78,11 @@ fn test_at_timestamp_resolves_to_intermediate_version() -> Result<()> {
 
     // v1..=4: noop commits (each writes a metaData-free, add-free commit JSON).
     for _ in 1..=4 {
-        snap = test_utils::begin_transaction(snap.clone(), engine.as_ref())?
-            .with_engine_info("AtTimestampTest")
-            .commit(engine.as_ref())?
-            .unwrap_post_commit_snapshot();
+        snap = test_utils::begin_transaction_with(snap.clone(), engine.as_ref(), |builder| {
+            builder.with_engine_info("AtTimestampTest")
+        })?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
     }
 
     // Set each commit's mtime to a distinct, monotonic value (in ms).

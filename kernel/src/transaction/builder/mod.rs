@@ -5,5 +5,8 @@
 // and for tests. Also allow dead_code since these are used by integration tests.
 #![allow(unreachable_pub, dead_code)]
 
-pub mod alter_table;
 pub mod create_table;
+mod state;
+pub mod update_table;
+
+pub(super) use state::collect_operation_metadata;

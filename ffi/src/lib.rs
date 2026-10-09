@@ -519,6 +519,16 @@ pub unsafe extern "C" fn allocate_kernel_bytes(
 mod private {
     use std::ptr::NonNull;
 
+    use crate::handle::BoxExt;
+
+    /// Convert a `Vec<T>` into a thin `(ptr, len)` pair, shrinking capacity to `len`.
+    ///
+    /// Pair with [`Vec::from_raw_parts(ptr.as_ptr(), len, len)`](Vec::from_raw_parts).
+    fn vec_into_ffi_ptr<T>(val: Vec<T>) -> (NonNull<T>, usize) {
+        let ptr = BoxExt::into_non_null(val.into_boxed_slice());
+        (ptr.cast(), ptr.len())
+    }
+
     /// Represents an owned slice of boolean values allocated by the kernel. Any time the engine
     /// receives a `KernelBoolSlice` as a return value from a kernel method, engine is responsible
     /// to free that slice, by calling [super::free_bool_slice] exactly once.
@@ -566,11 +576,7 @@ mod private {
     #[cfg(feature = "declarative-plans")]
     impl From<Vec<u8>> for KernelOwnedBytes {
         fn from(val: Vec<u8>) -> Self {
-            let len = val.len();
-            let boxed = val.into_boxed_slice();
-            let leaked_ptr = Box::leak(boxed).as_mut_ptr();
-            // safety: Box::leak always returns a valid, non-null pointer
-            let ptr = unsafe { NonNull::new_unchecked(leaked_ptr) };
+            let (ptr, len) = vec_into_ffi_ptr(val);
             KernelOwnedBytes { ptr, len }
         }
     }
@@ -628,13 +634,7 @@ mod private {
 
     impl From<Vec<bool>> for KernelBoolSlice {
         fn from(val: Vec<bool>) -> Self {
-            let len = val.len();
-            let boxed = val.into_boxed_slice();
-            let leaked_ptr = Box::leak(boxed).as_mut_ptr();
-            // safety: Box::leak always returns a valid, non-null pointer
-            #[allow(clippy::expect_used)]
-            let ptr = NonNull::new(leaked_ptr)
-                .expect("This should never be null please report this bug.");
+            let (ptr, len) = vec_into_ffi_ptr(val);
             KernelBoolSlice { ptr, len }
         }
     }
@@ -684,13 +684,7 @@ mod private {
 
     impl From<Vec<u64>> for KernelRowIndexArray {
         fn from(vec: Vec<u64>) -> Self {
-            let len = vec.len();
-            let boxed = vec.into_boxed_slice();
-            let leaked_ptr = Box::leak(boxed).as_mut_ptr();
-            // safety: Box::leak always returns a valid, non-null pointer
-            #[allow(clippy::expect_used)]
-            let ptr = NonNull::new(leaked_ptr)
-                .expect("This should never be null please report this bug.");
+            let (ptr, len) = vec_into_ffi_ptr(vec);
             KernelRowIndexArray { ptr, len }
         }
     }
@@ -1595,13 +1589,13 @@ pub unsafe extern "C" fn checkpoint_snapshot(
 ///
 /// Caller owns the returned handle ([`free_snapshot`]). The input snapshot is borrowed; the
 /// committer is consumed (do not free). The returned snapshot carries the published watermark
-/// used by subsequent catalog commits -- use it for the next `transaction_with_committer` /
-/// checkpoint.
+/// used by subsequent catalog commits -- use it for the next
+/// `update_table_txn_builder_build_with_committer` call or checkpoint.
 ///
 /// # Safety
 ///
-/// Caller must pass valid snapshot, committer, and engine handles. The committer handle is
-/// consumed and must not be used or freed afterward.
+/// All handles must be valid. This call borrows `snapshot` and `engine` and unconditionally
+/// consumes `committer`, including on error. Do not use or free `committer` afterward.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_publish_with_committer(
     snapshot: Handle<SharedSnapshot>,

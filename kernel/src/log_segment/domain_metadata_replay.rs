@@ -141,6 +141,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
     use crate::transaction::create_table::create_table as create_table_txn;
+    use crate::transaction::UpdateTableOperation;
     use crate::{RowVisitor as _, Snapshot};
 
     /// Builds a two-commit in-memory Delta table:
@@ -164,19 +165,21 @@ mod tests {
             "test",
         )
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
+        .with_domain_metadata("domainC", "cfgC")
         .build(&engine, Box::new(FileSystemCommitter::new()))
         .unwrap()
-        .with_domain_metadata("domainC".to_string(), "cfgC".to_string())
         .commit(&engine)
         .unwrap();
 
         // Commit 1: add domainA and domainB via an existing-table transaction.
         let snapshot = Snapshot::builder_for(url.clone()).build(&engine).unwrap();
         let _ = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .transaction_builder()
+            .with_operation(UpdateTableOperation::Write)
+            .with_domain_metadata("domainA", "cfgA")
+            .with_domain_metadata("domainB", "cfgB")
+            .build(&engine, Box::new(FileSystemCommitter::new()))
             .unwrap()
-            .with_domain_metadata("domainA".to_string(), "cfgA".to_string())
-            .with_domain_metadata("domainB".to_string(), "cfgB".to_string())
             .commit(&engine)
             .unwrap();
 
@@ -315,9 +318,11 @@ mod tests {
         let (engine, snapshot) = build_two_commit_log();
         let table_root = snapshot.table_root().clone();
         let _ = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .transaction_builder()
+            .with_operation(UpdateTableOperation::Write)
+            .with_domain_metadata_removed("domainA")
+            .build(&engine, Box::new(FileSystemCommitter::new()))
             .unwrap()
-            .with_domain_metadata_removed("domainA".to_string())
             .commit(&engine)
             .unwrap();
         let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();

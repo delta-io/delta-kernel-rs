@@ -1,13 +1,8 @@
 //! Update table transaction methods.
 //!
-//! This module contains the constructor, public API, and deletion vector update logic for
-//! update-table transactions. Each transaction type lives in its own file;
-//! see [`mod.rs`](super) for shared commit logic.
-//!
-//! Includes:
-//! - [`try_new_existing_table`](Transaction::try_new_existing_table) constructor
-//! - Deletion vector updates
-//! - Blind append, operation setting, domain metadata removal, and file removal
+//! This module contains staging APIs and deletion vector update logic for update-table
+//! transactions. Construction lives in [`builder::update_table`](super::builder::update_table).
+//! See [`mod.rs`](super) for shared commit logic.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -26,7 +21,6 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::BackReference;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
-use crate::committer::Committer;
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };
@@ -36,18 +30,13 @@ use crate::expressions::null_lit;
 use crate::expressions::{
     col, column_name, lit, ArrayData, ColumnName, ExpressionStructPatchBuilder, Scalar, StructData,
 };
-use crate::metrics::MetricId;
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{lazy_schema_ref, ArrayType, SchemaRef, StructField, ToSchema};
-use crate::snapshot::SnapshotRef;
-use crate::table_features::{
-    validate_iceberg_compat_if_needed, IcebergCompatValidationContext, Operation, TableFeature,
-    V2_VALIDATOR, V3_VALIDATOR,
-};
-use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
-use crate::utils::{current_time_ms, require, PhantomType};
+use crate::table_features::TableFeature;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::utils::require;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::FileMeta;
 use crate::{DataType, Engine, Expression, KernelResult, Result};
@@ -57,160 +46,8 @@ use crate::{DataType, Engine, Expression, KernelResult, Result};
 // =============================================================================
 impl Transaction {
     // -------------------------------------------------------------------------
-    // Constructor
-    // -------------------------------------------------------------------------
-
-    /// Create a new transaction from a snapshot for an existing table. The snapshot will be used
-    /// to read the current state of the table (e.g. to read the current version).
-    ///
-    /// Instead of using this API, the more typical (user-facing) API is
-    /// [Snapshot::transaction](crate::snapshot::Snapshot::transaction) to create a transaction from
-    /// a snapshot.
-    pub(crate) fn try_new_existing_table(
-        snapshot: impl Into<SnapshotRef>,
-        committer: Box<dyn Committer>,
-        engine: &dyn Engine,
-    ) -> KernelResult<Self> {
-        let read_snapshot = snapshot.into();
-
-        // important! before writing to the table we must check it is supported
-        read_snapshot
-            .table_configuration()
-            .ensure_operation_supported(Operation::Write)?;
-
-        // TODO(#3240): Validate that delta.enableRowTracking=true has the required protocol support
-        // and materialized column-name properties. Materialized names must be distinct and must not
-        // collide with physical data columns.
-
-        // Read clustering columns from snapshot (returns None if clustering not enabled)
-        let clustering_columns = read_snapshot.get_physical_clustering_columns(engine)?;
-
-        let commit_timestamp = current_time_ms()?;
-
-        let span = tracing::info_span!(
-            "txn",
-            path = %read_snapshot.table_root(),
-            read_version = read_snapshot.version(),
-        );
-
-        let effective_table_config = read_snapshot.table_configuration().clone();
-
-        validate_iceberg_compat_if_needed(
-            &effective_table_config,
-            &V2_VALIDATOR,
-            IcebergCompatValidationContext::Write,
-        )?;
-
-        validate_iceberg_compat_if_needed(
-            &effective_table_config,
-            &V3_VALIDATOR,
-            IcebergCompatValidationContext::Write,
-        )?;
-
-        Ok(Transaction {
-            span,
-            operation_id: MetricId::new(),
-            correlation_id: None,
-            read_snapshot_opt: Some(read_snapshot),
-            effective_table_config,
-            should_emit_protocol: false,
-            should_emit_metadata: false,
-            committer,
-            operation: None,
-            engine_info: None,
-            operation_parameters: None,
-            operation_metrics: None,
-            add_files_metadata: vec![],
-            remove_files_metadata: vec![],
-            set_transactions: vec![],
-            commit_timestamp,
-            user_domain_metadata_additions: vec![],
-            system_domain_metadata_additions: vec![],
-            provided_row_tracking_high_water_mark: None,
-            user_domain_removals: vec![],
-            data_change: true,
-            dedup_validation_enabled: true,
-            column_defaults_acknowledged: false,
-            row_tracking_preservation_acknowledged: false,
-            engine_commit_info: None,
-            is_blind_append: false,
-            dv_matched_files: vec![],
-            num_dv_updates: 0,
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            manifest_write: None,
-            physical_clustering_columns: clustering_columns,
-            _state: PhantomType::default(),
-        })
-    }
-
-    // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
-
-    /// Mark this transaction as a blind append.
-    ///
-    /// Blind append transactions should only add new files and avoid write operations that
-    /// depend on existing table state.
-    pub fn with_blind_append(mut self) -> Self {
-        self.is_blind_append = true;
-        self
-    }
-
-    /// Set the operation that this transaction is performing. This string will be persisted in the
-    /// commit and visible to anyone who describes the table history.
-    pub fn with_operation(mut self, operation: String) -> Self {
-        self.operation = Some(operation);
-        self
-    }
-
-    /// Stages schema changes for this transaction. Call before staging data-file actions.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `changes` is empty, Iceberg compatibility or column defaults are
-    /// enabled, data-file actions have already been staged, an operation is invalid for the
-    /// current schema or table configuration, or a manifest (content-tree) commit was already
-    /// staged (adaptive-metadata-in-dev only).
-    #[internal_api]
-    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn with_schema_changes(mut self, changes: Vec<SchemaOperation>) -> Result<Self> {
-        if self
-            .effective_table_config
-            .is_feature_enabled(&TableFeature::IcebergCompatV3)
-        {
-            return Err(KernelError::unsupported(
-                "Schema changes are not yet supported on tables with icebergCompatV3 enabled",
-            ));
-        }
-        if self
-            .effective_table_config
-            .is_feature_enabled(&TableFeature::AllowColumnDefaults)
-        {
-            return Err(KernelError::unsupported(
-                "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
-            ));
-        }
-        require!(
-            !changes.is_empty(),
-            KernelError::generic("with_schema_changes requires at least one schema operation")
-        );
-        require!(
-            !self.has_data_file_actions(),
-            KernelError::invalid_transaction_state(
-                "with_schema_changes must be called before staging data files"
-            )
-        );
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        require!(
-            !matches!(self.manifest_write, Some(ManifestWrite::Commit(_))),
-            KernelError::invalid_transaction_state(
-                "with_schema_changes cannot be called after staging a manifest commit"
-            )
-        );
-        self.effective_table_config = evolve_table_config(&self.effective_table_config, changes)?;
-        self.should_emit_metadata = true;
-        Ok(self)
-    }
 
     /// Remove domain metadata from the Delta log.
     /// If the domain exists in the Delta log, this creates a tombstone to logically delete
@@ -312,9 +149,8 @@ impl Transaction {
     ///
     /// Mutually exclusive with [`with_root_manifest_file`](Self::with_root_manifest_file), which
     /// commits a caller-supplied root manifest instead of having kernel build the tree. Repeated
-    /// calls return the state initialized by the first call. Call after
-    /// [`with_schema_changes`](Self::with_schema_changes), which rejects any staged manifest
-    /// commit.
+    /// calls return the state initialized by the first call. Configure schema changes on the
+    /// transaction builder before building the transaction and staging a manifest commit.
     ///
     /// # Errors
     ///
@@ -377,7 +213,11 @@ impl Transaction {
     /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::Result<()> {
     /// // Create a snapshot and transaction
     /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    /// let mut txn = snapshot
+    ///     .clone()
+    ///     .transaction_builder()
+    ///     .with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
+    ///     .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     ///
     /// // Get file metadata from a scan
     /// let scan = snapshot.scan_builder().build()?;
@@ -462,8 +302,11 @@ impl Transaction {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()))?
-    ///     .with_operation("UPDATE".to_string());
+    /// let mut txn = snapshot
+    ///     .clone()
+    ///     .transaction_builder()
+    ///     .with_operation(UpdateTableOperation::Update)
+    ///     .build(engine, Box::new(FileSystemCommitter::new()))?;
     ///
     /// let scan = snapshot.scan_builder().build()?;
     /// let files: Vec<FilteredEngineData> = scan.scan_metadata(engine)?

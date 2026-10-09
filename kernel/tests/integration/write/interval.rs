@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use delta_kernel::schema::{schema_ref, DataType};
-use test_utils::load_and_begin_transaction;
+use test_utils::load_and_begin_transaction_with;
 
 mod supported {
     use std::collections::HashMap;
@@ -61,8 +61,10 @@ mod supported {
             .unwrap_post_commit_snapshot();
         let table_url = snapshot.table_root().clone();
 
-        let mut txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?
-            .with_engine_info("default engine");
+        let mut txn =
+            load_and_begin_transaction_with(table_url.clone(), engine.as_ref(), |builder| {
+                builder.with_engine_info("default engine")
+            })?;
         let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
         let arrow_schema = Arc::new(arrow_schema);
         let nested_fields = match arrow_schema.field_with_name("nested").unwrap().data_type() {

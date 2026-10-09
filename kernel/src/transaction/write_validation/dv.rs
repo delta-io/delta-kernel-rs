@@ -14,7 +14,7 @@ use crate::scan::log_replay::{
     FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
 };
 use crate::schema::ColumnNamesAndTypes;
-use crate::transaction::update::{intermediate_dv_schema, NEW_DELETION_VECTOR_NAME};
+use crate::transaction::update_table::{intermediate_dv_schema, NEW_DELETION_VECTOR_NAME};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
