@@ -8,9 +8,9 @@ Before reading this page, make sure you understand [Appending data](./append.md)
 
 > [!NOTE]
 > CHECK constraint support is experimental and requires the `check-constraints-in-dev` Cargo feature
-> on `delta_kernel`. Without it, the APIs on this page don't exist and Kernel rejects writes to any
-> table that supports the `checkConstraints` table feature. See
-> [Feature flags](../concepts/feature_flags.md).
+> on `delta_kernel`. Without it, the APIs on this page don't exist, Kernel's create-table API
+> rejects CHECK constraint properties, and Kernel rejects writes to any table that supports the
+> `checkConstraints` table feature. See [Feature flags](../concepts/feature_flags.md).
 
 ## Check constraints example
 
@@ -27,12 +27,9 @@ A row passes only when every constraint evaluates to `true`. Unlike a SQL `WHERE
 result is a violation. For the protocol contract, see
 [CHECK constraints in the Delta protocol][check-constraints].
 
-Kernel's create-table API rejects CHECK constraint properties. Add constraints with another Delta
-writer. For example, in a SQL engine that supports Delta CHECK constraints:
-
-```sql
-ALTER TABLE people ADD CONSTRAINT valid_age CHECK (age > 0);
-```
+To declare constraints on a new table, pass them to Kernel's create-table builder, as shown in
+[Declaring constraints when creating a table](#declaring-constraints-when-creating-a-table).
+Constraints that other Delta writers add to a table work the same way.
 
 ## How Kernel supports check constraints
 
@@ -162,6 +159,47 @@ violate it into the table. Handle the returned `CommitResult` as described in
 > every constraint. Kernel doesn't verify it. Acknowledging without validating writes rows that
 > other Delta writers consider invalid, and readers can't detect them.
 
+### Declaring constraints when creating a table
+
+To create a table with constraints, pass each one as a `delta.constraints.<name>` table property.
+Kernel enables the `checkConstraints` table feature for you. It stores each name lowercased, so
+`ValidAge` becomes `validage`. It rejects two names that differ only in case.
+
+```rust,no_run
+# extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
+# use std::sync::Arc;
+# use delta_kernel::committer::FileSystemCommitter;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel::schema::{DataType, StructField, StructType};
+# use delta_kernel::transaction::create_table::create_table;
+# use delta_kernel::Result;
+# fn example() -> Result<()> {
+# let url = delta_kernel::try_parse_uri("/tmp/people")?;
+# let engine = DefaultEngine::builder(store_from_url(&url)?).build();
+let schema = Arc::new(StructType::try_new([
+    StructField::nullable("name", DataType::STRING),
+    StructField::nullable("age", DataType::INTEGER),
+    StructField::nullable("city", DataType::STRING),
+])?);
+
+let mut txn = create_table(url.as_str(), schema, "my-app/1.0")
+    .with_table_properties([("delta.constraints.valid_age", "age > 0")])
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+
+// Kernel doesn't parse the SQL, so validate the new constraint before acknowledging it.
+txn.ack_check_constraints();
+txn.commit(&engine)?;
+# Ok(())
+# }
+```
+
+The create-table commit needs the acknowledgement too, because the table has constraints once it
+commits. Before you acknowledge, check that each expression is a Boolean SQL expression that only
+references existing columns. Kernel doesn't check either. A malformed constraint makes later writes
+fail in every Delta writer that enforces it.
+
 ## Limitations and common questions
 
 ### Which operations need the acknowledgement?
@@ -191,8 +229,10 @@ Kernel's write context handle the mapping to physical names.
 
 ### Can I add or drop constraints through Kernel?
 
-No. Kernel's create-table API rejects `delta.constraints.<name>` properties, and its alter-table
-API can't change constraints. Use another Delta writer for these operations.
+You can declare constraints when you create a table, as described in
+[Declaring constraints when creating a table](#declaring-constraints-when-creating-a-table).
+Kernel's alter-table API can't add, change, or drop constraints on an existing table. Use another
+Delta writer for these operations.
 
 ### Why can I read a table that Kernel won't write to?
 

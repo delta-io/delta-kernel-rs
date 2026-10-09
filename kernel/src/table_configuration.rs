@@ -1349,7 +1349,8 @@ mod test {
             WriteSupport::Unsupported
         }
     )]
-    // Unusual names, accepted only because other Delta writers can store and enforce them.
+    // Unusual names, recognized as constraints because other Delta writers can store and enforce
+    // them.
     #[case::bare_prefix(
         &[("delta.constraints.", "amount > 0")],
         MockProtocolBuilder::new().with_versions(1, 2).build(),
