@@ -17,6 +17,7 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
+use crate::schema::file_utils::schema_contains_file_type;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
@@ -378,6 +379,21 @@ fn maybe_enable_variant_type(schema: &SchemaRef, validated: &mut ValidatedTableP
     if schema_contains_variant_type(schema) {
         add_feature_to_lists(
             TableFeature::VariantType,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
+/// Conditionally adds the `fileType-preview` feature to the protocol when the schema contains File
+/// columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
+///
+/// The stable `fileType` feature is deliberately not written: the protocol change is still only
+/// proposed, and a stable feature name is permanent once it is in a table's protocol.
+fn maybe_enable_file_type(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    if schema_contains_file_type(schema) {
+        add_feature_to_lists(
+            TableFeature::FileTypePreview,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
@@ -1018,6 +1034,7 @@ impl CreateTableTransactionBuilder {
 
         // Schema-driven auto-enablement: detect types or annotations that require a feature
         maybe_enable_variant_type(&effective_schema, &mut validated);
+        maybe_enable_file_type(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
         maybe_enable_invariants(&effective_schema, &mut validated);
 
@@ -1496,6 +1513,7 @@ mod tests {
         };
 
         maybe_enable_variant_type(&schema, &mut validated);
+        maybe_enable_file_type(&schema, &mut validated);
         maybe_enable_timestamp_ntz(&schema, &mut validated);
 
         for feature in expected_features {

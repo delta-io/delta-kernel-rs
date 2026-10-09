@@ -136,6 +136,12 @@ pub trait SchemaTransform<'a> {
         Carrier::from_inner(Cow::Borrowed(udt))
     }
 
+    /// Called for each file value encountered. The provided implementation just
+    /// forwards to [`Self::recurse_into_struct`].
+    fn transform_file(&mut self, stype: &'a StructType) -> Self::Output<StructType> {
+        self.recurse_into_struct(stype)
+    }
+
     /// General entry point for a recursive traversal over any data type. Also invoked internally to
     /// dispatch on nested data types encountered during the traversal.
     fn transform(&mut self, data_type: &'a DataType) -> Self::Output<DataType> {
@@ -164,6 +170,10 @@ pub trait SchemaTransform<'a> {
             DataType::UserDefined(udt) => {
                 let child = self.transform_user_defined(udt);
                 map_owned_or_else(data_type, child, DataType::UserDefined)
+            }
+            DataType::File(stype) => {
+                let child = self.transform_file(stype);
+                map_owned_or_else(data_type, child, |s| DataType::File(Box::new(s)))
             }
         }
     }

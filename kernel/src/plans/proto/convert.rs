@@ -656,6 +656,9 @@ impl From<&DataType> for proto_schema::DataType {
                         .collect(),
                 }))
             }
+            // The proto `FileType` is empty: a `file` has a fixed, canonical set of sub-fields, so
+            // the type identity alone is enough to reconstruct it.
+            DataType::File(_) => DataTypeKind::File(proto_schema::FileType {}),
         };
         proto_schema::DataType { kind: Some(kind) }
     }
@@ -862,6 +865,7 @@ impl TryFrom<proto_schema::DataType> for DataType {
                     return Err(KernelError::unsupported("UDT requires udt-in-dev"));
                 }
             }
+            DataTypeKind::File(_) => DataType::file_type(),
         };
         Ok(data_type)
     }
@@ -2206,6 +2210,7 @@ mod tests {
     #[case(DataType::from(schema! { nullable "a": INTEGER }), "struct")]
     #[case(MapType::new(DataType::STRING, DataType::INTEGER, true).into(), "map")]
     #[case(DataType::unshredded_variant(), "variant")]
+    #[case(DataType::file_type(), "file")]
     fn from_data_type(#[case] value: DataType, #[case] expected: &str) {
         use proto_schema::data_type::Kind;
         let kind = match proto_schema::DataType::from(&value).kind.unwrap() {
@@ -2215,6 +2220,7 @@ mod tests {
             Kind::Map(_) => "map",
             Kind::Variant(_) => "variant",
             Kind::UserDefined(_) => "udt",
+            Kind::File(_) => "file",
         };
         assert_eq!(kind, expected);
     }
@@ -2497,6 +2503,22 @@ mod tests {
             decoded.expect("decode succeeds"),
             DataType::unshredded_variant()
         );
+    }
+
+    /// A `file` keeps its logical type on the wire: it must decode back to a `file`, not to the
+    /// plain struct it is physically stored as. Covers a top-level column and nested positions.
+    #[test]
+    fn file_round_trips() {
+        use crate::schema::StructField;
+        let schema = StructType::new_unchecked([
+            StructField::nullable("f", DataType::file_type()),
+            StructField::nullable("arr", ArrayType::new(DataType::file_type(), true)),
+            StructField::nullable(
+                "m",
+                MapType::new(DataType::STRING, DataType::file_type(), true),
+            ),
+        ]);
+        assert_schema_round_trips(schema);
     }
 
     // Builds a proto `DataType::Primitive` with the given (possibly malformed) primitive kind.

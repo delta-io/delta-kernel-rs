@@ -305,7 +305,7 @@ fn kernel_field_into_arrow(
                 false, /* keys_sorted */
             ))
         }
-        DataType::Struct(_) | DataType::Primitive(_) | DataType::Variant(_) => {
+        DataType::Struct(_) | DataType::Primitive(_) | DataType::Variant(_) | DataType::File(_) => {
             datatype.try_into_arrow()
         }
     }
@@ -403,6 +403,17 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                 } else {
                     Err(ArrowError::SchemaError(format!(
                         "Incorrect Variant Schema: {t}. Only the unshredded variant schema is supported right now."
+                    )))
+                }
+            }
+            DataType::File(s) => {
+                if *t == DataType::file_type() {
+                    Ok(ArrowDataType::Struct(
+                        try_kernel_struct_to_arrow_fields(s)?.into(),
+                    ))
+                } else {
+                    Err(ArrowError::SchemaError(format!(
+                        "Incorrect File Schema: {t}. Only the canonical file schema is supported."
                     )))
                 }
             }
@@ -1181,6 +1192,28 @@ mod tests {
             Some(&MetadataValue::Other(serde_json::json!({"arr.element": 7}))),
         );
         Ok(())
+    }
+
+    /// Only the canonical `file` schema converts to Arrow; a struct that merely resembles it, or a
+    /// file with a different field set, is rejected rather than silently converted.
+    #[test]
+    fn test_non_canonical_file_schema_is_rejected() {
+        let non_canonical = DataType::File(Box::new(crate::schema::StructType::new_unchecked([
+            crate::schema::StructField::nullable("uri", DataType::STRING),
+        ])));
+        let err = ArrowDataType::try_from_kernel(&non_canonical).unwrap_err();
+        assert!(
+            err.to_string().contains("Only the canonical file schema"),
+            "unexpected error: {err}"
+        );
+
+        // The canonical file converts to a struct of its six fields.
+        let ArrowDataType::Struct(fields) =
+            ArrowDataType::try_from_kernel(&DataType::file_type()).unwrap()
+        else {
+            panic!("expected a struct");
+        };
+        assert_eq!(fields.len(), 6);
     }
 
     fn arc_elem_with_id(id: i32) -> Arc<ArrowField> {

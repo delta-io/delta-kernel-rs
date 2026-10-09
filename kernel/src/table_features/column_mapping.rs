@@ -446,6 +446,54 @@ type NestedFieldIds = serde_json::Map<String, serde_json::Value>;
 /// quintillion) is over four billion times the protocol-permitted maximum and points at a bug
 /// in the connector's id allocator rather than legitimate id exhaustion. The error message
 /// reflects that diagnosis.
+/// The number of field ids a `file` column reserves after its own id, one per sub-field (`uri` =
+/// +1, `offset` = +2, `size` = +3, `content_type` = +4, `checksum` = +5, `inline` = +6). The
+/// offsets match the Iceberg `FILE` type. The sub-fields are implicit (they are not schema
+/// fields), so their ids are reserved rather than stored.
+const FILE_SUBFIELD_ID_COUNT: i64 = 6;
+
+/// If `data_type` is a `file`, advances `max_id` past the ids reserved for its sub-fields, given
+/// that the `file` itself has id `id`. A no-op for every other type.
+fn reserve_file_subfield_ids(data_type: &DataType, id: i64, max_id: &mut i64) -> KernelResult<()> {
+    if !matches!(data_type, DataType::File(_)) {
+        return Ok(());
+    }
+    let last = id
+        .checked_add(FILE_SUBFIELD_ID_COUNT)
+        .filter(|last| *last <= MAX_COLUMN_MAPPING_ID)
+        .ok_or_else(|| {
+            KernelError::generic(format!(
+                "Cannot reserve the sub-field ids of a `file` column with column mapping id {id}: \
+                 they would exceed the Delta protocol's 32-bit non-negative maximum \
+                 ({MAX_COLUMN_MAPPING_ID})."
+            ))
+        })?;
+    *max_id = (*max_id).max(last);
+    Ok(())
+}
+
+/// Collects the paths (`<path>.element`, `<path>.key`, `<path>.value`, as used by
+/// `delta.columnMapping.nested.ids`) of the array/map slots in `data_type` that hold a `file`.
+fn collect_file_slot_paths(data_type: &DataType, path: &str, out: &mut Vec<String>) {
+    let visit = |slot: &DataType, slot_path: String, out: &mut Vec<String>| {
+        if matches!(slot, DataType::File(_)) {
+            out.push(slot_path.clone());
+        }
+        collect_file_slot_paths(slot, &slot_path, out);
+    };
+    match data_type {
+        DataType::Array(array_type) => {
+            visit(array_type.element_type(), format!("{path}.element"), out)
+        }
+        DataType::Map(map_type) => {
+            visit(map_type.key_type(), format!("{path}.key"), out);
+            visit(map_type.value_type(), format!("{path}.value"), out);
+        }
+        // Struct fields carry their own ids; primitives, variants and files have no slots.
+        _ => {}
+    }
+}
+
 fn next_column_mapping_id(max_id: &mut i64) -> KernelResult<i64> {
     let next = max_id.checked_add(1).ok_or_else(|| {
         KernelError::generic(format!(
@@ -550,6 +598,11 @@ pub(crate) fn try_assign_flat_column_mapping_info(
         }
     }
 
+    // A `file` column reserves the ids of its sub-fields right after its own id.
+    if let Some(id) = new_field.column_mapping_id() {
+        reserve_file_subfield_ids(&field.data_type, id, max_id)?;
+    }
+
     // Recursively process nested types (struct/array/map descend; primitive/variant pass through).
     new_field.data_type = flat_cm_info_for_nested_data_type(&field.data_type, max_id)?;
 
@@ -585,8 +638,8 @@ fn flat_cm_info_for_nested_data_type(
                 map_type.value_contains_null(),
             )))
         }
-        // Primitive and Variant types don't contain nested struct fields - return as-is
-        DataType::Primitive(_) | DataType::Variant(_) => Ok(data_type.clone()),
+        // Primitive, Variant, and File types don't contain nested struct fields - return as-is
+        DataType::Primitive(_) | DataType::Variant(_) | DataType::File(_) => Ok(data_type.clone()),
         #[cfg(feature = "udt-in-dev")]
         DataType::UserDefined(_) => Ok(data_type.clone()),
     }
@@ -622,6 +675,8 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> KernelResult<S
                 let element_path = format!("{path}.element");
                 *max_id += 1;
                 nested_ids.insert(element_path.clone(), serde_json::Value::from(*max_id));
+                let slot_id = *max_id;
+                reserve_file_subfield_ids(array_type.element_type(), slot_id, max_id)?;
                 let new_element =
                     walk(array_type.element_type(), max_id, &element_path, nested_ids)?;
                 Ok(DataType::from(ArrayType::new(
@@ -634,9 +689,13 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> KernelResult<S
                 let value_path = format!("{path}.value");
                 *max_id += 1;
                 nested_ids.insert(key_path.clone(), serde_json::Value::from(*max_id));
+                let slot_id = *max_id;
+                reserve_file_subfield_ids(map_type.key_type(), slot_id, max_id)?;
                 let new_key = walk(map_type.key_type(), max_id, &key_path, nested_ids)?;
                 *max_id += 1;
                 nested_ids.insert(value_path.clone(), serde_json::Value::from(*max_id));
+                let slot_id = *max_id;
+                reserve_file_subfield_ids(map_type.value_type(), slot_id, max_id)?;
                 let new_value = walk(map_type.value_type(), max_id, &value_path, nested_ids)?;
                 Ok(DataType::from(MapType::new(
                     new_key,
@@ -644,7 +703,9 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> KernelResult<S
                     map_type.value_contains_null(),
                 )))
             }
-            DataType::Primitive(_) | DataType::Variant(_) => Ok(data_type.clone()),
+            DataType::Primitive(_) | DataType::Variant(_) | DataType::File(_) => {
+                Ok(data_type.clone())
+            }
             #[cfg(feature = "udt-in-dev")]
             DataType::UserDefined(_) => Ok(data_type.clone()),
         }
@@ -718,6 +779,9 @@ impl<'a> SchemaTransform<'a> for MaxColumnId {
     fn transform_struct_field(&mut self, field: &'a StructField) {
         if let Some(n) = field.column_mapping_id() {
             self.observe(n);
+            if matches!(field.data_type, DataType::File(_)) {
+                self.observe(n.saturating_add(FILE_SUBFIELD_ID_COUNT));
+            }
         }
         // `delta.columnMapping.nested.ids` is a JSON object set on Array/Map fields. Shape: {
         // "<phys>.key": <id>, "<phys>.value": <id>, "<phys>.key.element": <id>, ... }
@@ -730,6 +794,19 @@ impl<'a> SchemaTransform<'a> for MaxColumnId {
             for v in obj.values() {
                 if let Some(n) = v.as_i64() {
                     self.observe(n);
+                }
+            }
+            // A `file` held in an Array/Map slot reserves the ids after the slot's id.
+            if let Some(MetadataValue::String(physical_name)) = field
+                .metadata()
+                .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+            {
+                let mut file_slots = Vec::new();
+                collect_file_slot_paths(&field.data_type, physical_name, &mut file_slots);
+                for path in file_slots {
+                    if let Some(n) = obj.get(&path).and_then(|v| v.as_i64()) {
+                        self.observe(n.saturating_add(FILE_SUBFIELD_ID_COUNT));
+                    }
                 }
             }
         }
@@ -2026,6 +2103,104 @@ mod tests {
 
         assert_eq!(seen_ids.len(), 3);
         assert_eq!(seen_physical_names.len(), 3);
+    }
+
+    /// A `file` column reserves the six ids after its own (one per sub-field), so the next column
+    /// must not be assigned any of them.
+    #[test]
+    fn test_assign_column_mapping_metadata_file_reserves_subfield_ids() {
+        let schema = schema! {
+            nullable "f": (DataType::file_type()),
+            nullable "next": LONG,
+        };
+        let mut max_id = 0;
+        let result = assign_column_mapping_metadata(&schema, &mut max_id, false).unwrap();
+
+        // `f` = 1, its sub-fields reserve 2..=7, so `next` = 8.
+        assert_eq!(result.field("f").unwrap().column_mapping_id(), Some(1));
+        assert_eq!(result.field("next").unwrap().column_mapping_id(), Some(8));
+        assert_eq!(max_id, 8);
+        // Recomputing the max from the annotated schema agrees with the allocator.
+        assert_eq!(find_max_column_id_in_schema(&result), Some(8));
+    }
+
+    /// A `file` nested in a struct is reserved like a top-level one.
+    #[test]
+    fn test_assign_column_mapping_metadata_nested_file_reserves_subfield_ids() {
+        let schema = schema! {
+            nullable "outer": { nullable "f": (DataType::file_type()), nullable "x": LONG },
+            nullable "next": LONG,
+        };
+        let mut max_id = 0;
+        let result = assign_column_mapping_metadata(&schema, &mut max_id, false).unwrap();
+
+        // outer = 1; (outer.f = 2, reserving 3..=8); outer.x = 9; next = 10.
+        let outer = unwrap_struct(&result.field("outer").unwrap().data_type, "outer");
+        assert_eq!(outer.field("f").unwrap().column_mapping_id(), Some(2));
+        assert_eq!(outer.field("x").unwrap().column_mapping_id(), Some(9));
+        assert_eq!(result.field("next").unwrap().column_mapping_id(), Some(10));
+        assert_eq!(find_max_column_id_in_schema(&result), Some(max_id));
+    }
+
+    /// A `file` held in an array element or map value slot reserves the ids after the slot's id.
+    #[test]
+    fn test_assign_column_mapping_metadata_file_in_array_and_map_slots() {
+        let schema = schema! {
+            nullable "arr": (ArrayType::new(DataType::file_type(), true)),
+            nullable "m": (MapType::new(DataType::STRING, DataType::file_type(), true)),
+            nullable "next": LONG,
+        };
+        let mut max_id = 0;
+        let result = assign_column_mapping_metadata(&schema, &mut max_id, true).unwrap();
+
+        let nested_id = |name: &str, suffix: &str| -> i64 {
+            let field = result.field(name).unwrap();
+            let physical = expect_physical_name(field).unwrap();
+            let Some(MetadataValue::Other(serde_json::Value::Object(obj))) = field
+                .metadata()
+                .get(ColumnMetadataKey::ColumnMappingNestedIds.as_ref())
+            else {
+                panic!("expected nested ids on `{name}`");
+            };
+            obj[&format!("{physical}.{suffix}")].as_i64().unwrap()
+        };
+
+        // Top-level fields first: arr = 1, m = 2, next = 3. Then the nested slots:
+        // arr.element = 4 (reserving 5..=10), m.key = 11, m.value = 12 (reserving 13..=18).
+        assert_eq!(result.field("next").unwrap().column_mapping_id(), Some(3));
+        assert_eq!(nested_id("arr", "element"), 4);
+        assert_eq!(nested_id("m", "key"), 11);
+        assert_eq!(nested_id("m", "value"), 12);
+        assert_eq!(max_id, 18);
+        // Recomputing the max from the annotated schema agrees with the allocator.
+        assert_eq!(find_max_column_id_in_schema(&result), Some(18));
+    }
+
+    /// The reservation respects the protocol's 32-bit cap on column mapping ids.
+    #[test]
+    fn test_reserve_file_subfield_ids_respects_protocol_max() {
+        let mut max_id = 0;
+        reserve_file_subfield_ids(
+            &DataType::file_type(),
+            MAX_COLUMN_MAPPING_ID - 6,
+            &mut max_id,
+        )
+        .unwrap();
+        assert_eq!(max_id, MAX_COLUMN_MAPPING_ID);
+
+        let mut max_id = 0;
+        assert_result_error_with_message(
+            reserve_file_subfield_ids(
+                &DataType::file_type(),
+                MAX_COLUMN_MAPPING_ID - 5,
+                &mut max_id,
+            ),
+            "32-bit",
+        );
+        // Other types reserve nothing.
+        let mut max_id = 0;
+        reserve_file_subfield_ids(&DataType::LONG, MAX_COLUMN_MAPPING_ID, &mut max_id).unwrap();
+        assert_eq!(max_id, 0);
     }
 
     #[test]
