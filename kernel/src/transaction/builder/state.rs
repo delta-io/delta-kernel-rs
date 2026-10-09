@@ -21,6 +21,7 @@ pub(super) struct TransactionBuilderState {
     pub(super) transaction_ids: Vec<(String, i64)>,
     pub(super) domain_metadata_additions: Vec<DomainMetadata>,
     pub(super) data_change: Option<bool>,
+    pub(super) skip_dedup_validation: bool,
 }
 
 impl std::fmt::Debug for TransactionBuilderState {
@@ -34,6 +35,7 @@ impl std::fmt::Debug for TransactionBuilderState {
             .field("transaction_ids", &self.transaction_ids)
             .field("domain_metadata_additions", &self.domain_metadata_additions)
             .field("data_change", &self.data_change)
+            .field("skip_dedup_validation", &self.skip_dedup_validation)
             .finish()
     }
 }
@@ -152,6 +154,7 @@ impl TransactionBuilderState {
             transaction_ids,
             domain_metadata_additions,
             data_change,
+            skip_dedup_validation,
         } = self;
 
         transaction.correlation_id = correlation_id;
@@ -168,6 +171,7 @@ impl TransactionBuilderState {
         transaction.user_domain_metadata_additions = domain_metadata_additions;
         transaction.infer_data_change = data_change.is_none();
         transaction.data_change = data_change.unwrap_or(true);
+        transaction.dedup_validation_enabled = !skip_dedup_validation;
         transaction
     }
 }

@@ -282,6 +282,7 @@ pub struct Transaction<S = ExistingTable> {
     engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
     remove_files_metadata: Vec<FilteredEngineData>,
+    dedup_validation_enabled: bool,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
     // HashSet::insert drops the to-be-inserted value without returning the existing one, which
@@ -1391,20 +1392,27 @@ impl<S> Transaction<S> {
         // each stats column.
         self.validate_add_files_stats(&self.add_files_metadata)?;
 
-        // Validate required fields for addFile.
-        write_validation::StagedDataValidator::staged_add_file(
+        // Share the tracker across validations to detect cross-source conflicts.
+        // TODO(#3545): Pre-size the tracker maps.
+        let mut staged_file_actions = self
+            .dedup_validation_enabled
+            .then(write_validation::FileActionTracker::default);
+        write_validation::validate_add_files(
+            &self.add_files_metadata,
             self.effective_table_config.physical_partition_columns(),
-        )
-        .validate(&self.add_files_metadata)?;
+            staged_file_actions.as_mut(),
+        )?;
 
-        write_validation::StagedDataValidator::staged_dv_matched_file(
+        write_validation::validate_dv_matched_files(
+            &self.dv_matched_files,
             self.effective_table_config.physical_partition_columns(),
-        )?
-        .validate_filtered(&self.dv_matched_files)?;
+            staged_file_actions.as_mut(),
+        )?;
 
-        // Validate required fields for RemoveFile.
-        write_validation::StagedDataValidator::staged_remove_file()
-            .validate_filtered(&self.remove_files_metadata)?;
+        write_validation::validate_remove_files(
+            &self.remove_files_metadata,
+            staged_file_actions.as_mut(),
+        )?;
 
         Ok(())
     }
