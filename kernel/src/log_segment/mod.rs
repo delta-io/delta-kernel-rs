@@ -884,7 +884,7 @@ impl LogSegment {
     /// has no checkpoint action (a classic non-AMT table, or an AMT table that has none yet).
     ///
     /// `hint` is a CRC's pointer to the latest manifest commit. When the hint is accurate 
-    /// segment, only that one commit is read; otherwise the log is scanned newest-first until an
+    /// only that one commit is read; otherwise the log is scanned newest-first until an
     /// action is found. TODO: once commitInfo carries the same pointer (delta-io/delta#7533), use
     /// it when no CRC is available. Will be implemented once the following PR has been merged:
     /// https://github.com/delta-io/delta-kernel-rs/pull/3534
