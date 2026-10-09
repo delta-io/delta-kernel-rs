@@ -1,0 +1,2 @@
+{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+{"metaData":{"id":"udt-annotations","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":{\"type\":\"udt\",\"sqlType\":\"long\",\"class\":\"example.Value\",\"pyClass\":null,\"\":\"\",\"a\\u0000b\":\"x\\u0000y\"},\"nullable\":true,\"metadata\":{}},{\"name\":\"empty\",\"type\":{\"type\":\"udt\",\"sqlType\":\"long\"},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":0}}
