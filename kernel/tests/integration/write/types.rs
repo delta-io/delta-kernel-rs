@@ -15,14 +15,14 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::{KernelError, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
-    begin_transaction, create_add_files_metadata, create_table, engine_store_setup, test_read,
-    test_table_setup,
+    create_add_files_metadata, create_table, engine_store_setup, test_read, test_table_setup,
 };
 use url::Url;
 
@@ -46,8 +46,10 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let mut txn = test_utils::load_and_begin_transaction(table_url.clone(), &engine)?
-        .with_engine_info("default engine");
+    let mut txn =
+        test_utils::load_and_begin_transaction_with(table_url.clone(), &engine, |builder| {
+            builder.with_engine_info("default engine")
+        })?;
 
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
     // These are microseconds since Unix epoch
@@ -133,8 +135,10 @@ async fn test_append_timestamp_stats_are_millisecond_truncated(
     )
     .await?;
 
-    let mut txn = test_utils::load_and_begin_transaction(table_url.clone(), &engine)?
-        .with_engine_info("default engine");
+    let mut txn =
+        test_utils::load_and_begin_transaction_with(table_url.clone(), &engine, |builder| {
+            builder.with_engine_info("default engine")
+        })?;
 
     // Spans [.298677, .307735]; a conforming writer floors the stats to [.298, .307].
     let timestamp_values = vec![1_783_007_755_298_677i64, 1_783_007_755_307_735i64];
@@ -229,7 +233,9 @@ async fn test_append_variant(
     .await?;
 
     let mut txn =
-        test_utils::load_and_begin_transaction(table_url.clone(), &engine)?.with_data_change(true);
+        test_utils::load_and_begin_transaction_with(table_url.clone(), &engine, |builder| {
+            builder.with_data_change(true)
+        })?;
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -422,7 +428,9 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     .await?;
 
     let mut txn =
-        test_utils::load_and_begin_transaction(table_url.clone(), &engine)?.with_data_change(true);
+        test_utils::load_and_begin_transaction_with(table_url.clone(), &engine, |builder| {
+            builder.with_data_change(true)
+        })?;
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -558,7 +566,9 @@ async fn test_not_null_data_column_rejects_null_in_batch(
         "non-null schema must auto-enable the `invariants` writer feature",
     );
 
-    let txn = begin_transaction(snapshot, engine.as_ref())?.with_engine_info("default engine");
+    let txn = test_utils::begin_transaction_with(snapshot, engine.as_ref(), |builder| {
+        builder.with_engine_info("default engine")
+    })?;
     let write_context = txn.write_state()?.write_context_builder().build()?;
 
     // Use the connector-facing physical schema (not the logical one); the logical schema
@@ -602,7 +612,9 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         .build(engine.as_ref())
         .expect("snapshot should build");
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
         .expect("transaction should create");
 
     // Add dummy file metadata to trigger write validation
@@ -740,7 +752,9 @@ async fn write_state_creation_fails_fast_on_invalid_void_schema(
         .build(engine.as_ref())
         .expect("snapshot should build");
     let txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
         .expect("transaction should create");
 
     let err = txn
@@ -772,7 +786,10 @@ async fn write_context_excludes_void_from_physical_schema() -> Result<(), Box<dy
         assert!(logical.field("v").is_some());
     }
 
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let txn = snapshot
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
     let wc = txn.write_state()?.write_context_builder().build()?;
     let physical = wc.physical_data_schema();
@@ -799,7 +816,10 @@ async fn metadata_only_commit_with_void_in_array_succeeds() -> Result<(), Box<dy
     let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![]).await?;
     let engine = Arc::new(engine);
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let txn = snapshot
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
     // Commit with NO add_files — this is a metadata-only operation and should succeed
     let result = txn.commit(engine.as_ref());
@@ -843,7 +863,10 @@ async fn write_context_excludes_nested_void_from_physical_schema(
         }
     }
 
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let txn = snapshot
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let wc = txn.write_state()?.write_context_builder().build()?;
     let physical = wc.physical_data_schema();
 
@@ -881,7 +904,10 @@ async fn write_transform_drops_nested_void_fields() -> Result<(), Box<dyn std::e
     let engine = Arc::new(engine);
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let txn = snapshot
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let wc = txn.write_state()?.write_context_builder().build()?;
 
     // The transform expression should mention dropping "b" inside the struct

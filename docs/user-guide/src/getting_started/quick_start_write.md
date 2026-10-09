@@ -41,7 +41,7 @@ use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel::{Result, Snapshot};
 
 #[tokio::main]
@@ -69,10 +69,11 @@ async fn main() -> Result<()> {
     let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
 
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-        .with_operation("INSERT".to_string())
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
         .with_engine_info("quick-start/1.0")
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
     // Build an Arrow RecordBatch
     let arrow_schema: delta_kernel::arrow::datatypes::Schema =
@@ -155,9 +156,10 @@ The write flow has four parts:
 **Start a transaction:**
 ```rust,ignore
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_data_change(true);
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
+    .with_data_change(true)
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
 
 **Build your data as an Arrow RecordBatch and wrap it:**

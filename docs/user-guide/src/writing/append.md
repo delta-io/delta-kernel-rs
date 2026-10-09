@@ -31,7 +31,7 @@ may differ.
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::transaction::CommitResult;
+# use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 # use delta_kernel::{Result, Snapshot};
 # #[tokio::main]
 # async fn main() -> Result<()> {
@@ -42,10 +42,11 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
 // 2. Create a transaction
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Write)
     .with_engine_info("my-app/1.0")
-    .with_data_change(true);
+    .with_data_change(true)
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 // 3. Create write state and bind a write context
 let write_state = txn.write_state()?;
@@ -92,18 +93,19 @@ writing against:
 
 ```rust,ignore
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Write)
     .with_engine_info("my-app/1.0")
-    .with_data_change(true);
+    .with_data_change(true)
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
 
 The builder methods:
 
 | Method | Purpose |
 |--------|---------|
-| `with_operation(String)` | Operation name stored in the commit log (e.g. `"INSERT"`, `"MERGE"`) |
-| `with_engine_info(impl Into<String>)` | Identifies your application in the commit log |
+| `with_operation(UpdateTableOperation)` | Required before `build()`. Sets the typed operation stored in the commit log. Use `UpdateTableOperation::Custom` for connector-specific names |
+| `with_engine_info(impl Into<String>)` | Supplies the connector name and version recorded in commit information |
 | `with_data_change(bool)` | Whether this commit materially changes data (`true`) or just reorganizes it (`false`, e.g. OPTIMIZE) |
 
 ## WriteState and BoundWriteContext
@@ -214,9 +216,9 @@ txn.add_files(add_file_metadata);
 You can call `add_files` multiple times to write multiple files in one transaction.
 
 > [!NOTE]
-> Transaction methods that prepare or register data files (`write_state`, `add_files`, and
-> `stats_schema`) are gated by the `SupportsDataFiles` trait bound. They're available on standard
-> write transactions but not on metadata-only transaction states such as `AlterTable`.
+> Unless overridden, transactions with schema changes infer `dataChange` from staged file batches:
+> `false` when none are staged and `true` otherwise, including empty or unselected batches.
+> Transactions without schema changes default to `true`.
 
 ## Committing
 
@@ -247,25 +249,26 @@ construction:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
-    .with_blind_append();
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
+    .with_blind_append()
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
 
 Kernel records `isBlindAppend: true` in the commit's `commitInfo` action. This flag
 enables conflict resolution optimizations: two blind appends to the same table can never
 conflict with each other, because neither depends on the other's output.
 
-Kernel validates the following rules at commit time. If any rule is violated, `commit()`
-returns an error:
+Kernel rejects incompatible intent during `build()`: `ALTER TABLE`, schema changes, and
+`dataChange = false`. During `commit()`, Kernel requires staged Add metadata and rejects staged
+Remove metadata or deletion-vector batches. These checks use batch presence, so empty or fully
+unselected batches still count as staged.
 
 | Rule | Rationale |
 |------|-----------|
 | The transaction must add at least one file | A blind append with no data is meaningless |
-| `data_change` must be `true` | Blind appends are logical data additions, not reorganizations |
 | The transaction must not remove any files | Removing files means the write depends on existing state |
 | The transaction must not update deletion vectors | Deletion vector updates depend on existing state |
-| The transaction must not be a create-table transaction | Table creation is not an append |
 
 > [!TIP]
 > Mark your transaction as a blind append whenever you are inserting new data without reading
@@ -279,10 +282,11 @@ that action, call `with_commit_info()` with your custom data and its schema:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_operation("INSERT".to_string())
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
     .with_operation_parameters([("mode", Some("Append")), ("predicate", None)])
     .with_operation_metrics([("numFiles", Some("1"))])
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
     .with_commit_info(engine_commit_info, commit_info_schema);
 ```
 
@@ -296,13 +300,13 @@ these fields in your custom commit info:
 | Field | Meaning | Value written by Kernel |
 |-------|---------|-------------------------|
 | `timestamp` | The transaction's commit timestamp | Current time when the transaction is created |
-| `inCommitTimestamp` | The table's in-commit timestamp | The in-commit timestamp when enabled; omitted otherwise |
-| `operation` | The operation name | The value from `with_operation()`; defaults to `UNKNOWN` for existing-table transactions and is fixed for create and alter transactions |
-| `operationParameters` | Parameters describing the operation | The value from `with_operation_parameters()`; defaults to `{}` |
-| `operationMetrics` | Metrics recorded for the operation | The value from `with_operation_metrics()`; omitted when unset, while an explicitly empty map is written as `{}` |
+| `inCommitTimestamp` | The table's in-commit timestamp | The in-commit timestamp when enabled. Omitted otherwise |
+| `operation` | The operation name | The required `UpdateTableOperation` for existing tables. Fixed to `CREATE TABLE` for creation |
+| `operationParameters` | Parameters describing the operation | The value from `with_operation_parameters()`, defaulting to `{}` |
+| `operationMetrics` | Metrics recorded for the operation | The value from `with_operation_metrics()`. Omitted when unset. An explicitly empty map is written as `{}` |
 | `kernelVersion` | The Kernel library version | Current Kernel version |
-| `isBlindAppend` | Whether the commit is a blind append | `true` after `with_blind_append()`; omitted (`false`) otherwise |
-| `engineInfo` | The engine identifier | The value from `with_engine_info()`; omitted for existing and alter transactions when unset, while create uses its required engine identifier |
+| `isBlindAppend` | Whether the commit is a blind append | `true` after `with_blind_append()`. Omitted (`false`) otherwise |
+| `engineInfo` | The engine identifier | Omitted for existing-table transactions when unset. Required by create table |
 | `txnId` | A unique transaction identifier | A new UUID generated for the commit |
 
 Kernel ignores reserved fields in custom commit info. Use `with_operation_parameters()` and

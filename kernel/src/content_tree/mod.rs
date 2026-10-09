@@ -15,10 +15,10 @@ use delta_kernel_derive::ToSchema;
 use url::Url;
 
 use crate::engine_data::EngineData;
-use crate::expressions::{Scalar, StructData};
+use crate::expressions::{null_lit, Expression, Scalar, StructData};
 use crate::schema::derive_macro_utils::ToDataType;
-use crate::schema::DataType;
-use crate::Version;
+use crate::schema::{DataType, StructType};
+use crate::{KernelError, KernelResult, Version};
 
 /// Field names in the [`ContentTreeNodeEntry`] schema.
 pub(crate) const CONTENT_TYPE: &str = "contentType";
@@ -353,10 +353,51 @@ pub(crate) struct ManifestInfo {
     pub(crate) dv_cardinality: Option<i64>,
 }
 
+// === Helpers ===
+
+/// Builds a struct expression matching `schema` field-for-field. `project` supplies the expression
+/// for a named field; an unmatched nullable field (one returning `None`) becomes a typed null
+/// literal, so the result matches the schema in field order and type.
+///
+/// # Errors
+/// Returns an error if a non-nullable field has no projection: falling back to a typed null there
+/// would silently emit a null in a non-nullable column.
+fn struct_expr_from_schema(
+    schema: &StructType,
+    project: impl Fn(&str) -> Option<Expression>,
+) -> KernelResult<Expression> {
+    let fields = schema
+        .fields()
+        .map(|field| match project(field.name().as_str()) {
+            Some(expr) => Ok(expr),
+            None if field.is_nullable() => Ok(null_lit(field.data_type().clone())),
+            None => Err(KernelError::generic(format!(
+                "struct_expr_from_schema: no projection for required field '{}'",
+                field.name()
+            ))),
+        })
+        .collect::<KernelResult<Vec<_>>>()?;
+    Ok(Expression::struct_from(fields))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{ColumnMetadataKey, MetadataValue, ToSchema};
+    use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, ToSchema};
+    use crate::unit_test_utils::assert_result_error_with_message;
+
+    #[test]
+    fn struct_expr_from_schema_errors_on_missing_required_field() {
+        let schema = StructType::new_unchecked([StructField::not_null("req", DataType::INTEGER)]);
+        assert_result_error_with_message(struct_expr_from_schema(&schema, |_| None), "req");
+    }
+
+    #[test]
+    fn struct_expr_from_schema_fills_missing_nullable_field_with_typed_null() {
+        let schema = StructType::new_unchecked([StructField::nullable("opt", DataType::INTEGER)]);
+        let expr = struct_expr_from_schema(&schema, |_| None).unwrap();
+        assert_eq!(expr, Expression::struct_from([null_lit(DataType::INTEGER)]));
+    }
 
     /// The `ContentTreeNodeEntry` Parquet field IDs and nullability are a protocol contract. This
     /// pins the name, field ID, and nullability of every field in `to_schema()` so an accidental

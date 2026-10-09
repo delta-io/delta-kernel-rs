@@ -14,9 +14,9 @@ Before reading this page, make sure you understand
 
 ## Writing domain metadata
 
-To attach domain metadata to a commit, call `with_domain_metadata()` on the
-transaction. This method is available on both create-table and existing-table
-transactions.
+To attach domain metadata known before writing, call `with_domain_metadata()` on the builder. Both
+create-table and existing-table builders support this method. You can also add metadata learned
+while writing to a built transaction before committing it.
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -26,6 +26,7 @@ transactions.
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel::transaction::UpdateTableOperation;
 # use delta_kernel::{Result, Snapshot};
 # #[tokio::main]
 # async fn main() -> Result<()> {
@@ -33,21 +34,33 @@ transactions.
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction_builder()
     .with_domain_metadata(
         "myConnector.settings".to_string(),
         r#"{"version": 1, "compress": true}"#.to_string(),
     )
-    .with_operation("UPDATE METADATA".to_string());
+    .with_operation(UpdateTableOperation::Custom(
+        "UPDATE METADATA".to_string(),
+    ))
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 txn.commit(&engine)?;
 # Ok(())
 # }
 ```
 
-The `with_domain_metadata` signature takes two `String` arguments:
+The builder setter accepts values convertible to `String` and validates them during `build()`. The
+late-bound transaction setter takes owned strings and validates them during `commit()`:
 
 ```rust,ignore
+// UpdateTableTransactionBuilder
+pub fn with_domain_metadata(
+    self,
+    domain: impl Into<String>,
+    configuration: impl Into<String>,
+) -> Self
+
+// Transaction
 pub fn with_domain_metadata(self, domain: String, configuration: String) -> Self
 ```
 
@@ -61,9 +74,9 @@ calling `with_domain_metadata` more than once with different domain names.
 ## Removing domain metadata
 
 To remove a domain from an existing table, call `with_domain_metadata_removed()`
-on an existing-table transaction. This method is not available on create-table
-transactions because there is no metadata to remove from a table that does not
-exist yet.
+on the update-table builder or built transaction. This method is not available
+on create-table transactions because there is no metadata to remove from a table
+that does not exist yet.
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -73,6 +86,7 @@ exist yet.
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel::transaction::UpdateTableOperation;
 # use delta_kernel::{Result, Snapshot};
 # #[tokio::main]
 # async fn main() -> Result<()> {
@@ -80,9 +94,12 @@ exist yet.
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-    .with_domain_metadata_removed("myConnector.settings".to_string())
-    .with_operation("REMOVE METADATA".to_string());
+    .transaction_builder()
+    .with_operation(UpdateTableOperation::Custom(
+        "REMOVE METADATA".to_string(),
+    ))
+    .with_domain_metadata_removed("myConnector.settings")
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 txn.commit(&engine)?;
 # Ok(())
@@ -137,13 +154,13 @@ match config {
 
 ## Constraints and validation
 
-Kernel validates domain metadata operations at commit time. The following rules
-apply:
+Kernel validates builder-provided domain metadata during `build()` and late-bound transaction
+metadata during `commit()`. The following rules apply:
 
 - **One domain per transaction.** Each domain name can appear at most once per
   transaction. You cannot set and remove the same domain in a single commit,
   and you cannot set the same domain twice. If you include a duplicate domain,
-  the commit fails with an error.
+  validation fails at the applicable `build()` or `commit()` boundary.
 
 - **Reserved prefix.** Domain names starting with `delta.` are reserved for
   Kernel's internal use (e.g., clustering metadata). Attempting to read, write,
@@ -151,7 +168,7 @@ apply:
 
 - **Feature requirement.** Domain metadata operations require the
   `domainMetadata` writer feature to be enabled on the table (writer version 7).
-  If the feature is not enabled, the commit fails.
+  If the feature is not enabled, validation fails at the applicable boundary.
 
 - **No removals on create-table.** The `with_domain_metadata_removed()` method
   is only available on existing-table transactions. The Rust type system
@@ -162,10 +179,8 @@ apply:
   transaction.
 
 > [!NOTE]
-> Validation is deferred until `commit()`. The builder methods
-> `with_domain_metadata()` and `with_domain_metadata_removed()` do not check
-> for duplicates or reserved prefixes eagerly. Errors surface when you call
-> `commit()`.
+> Builder-provided domain metadata is validated by `build()`. Additions attached to a built
+> transaction are validated by `commit()`. Setter calls themselves only accumulate intent.
 
 ## What's next
 

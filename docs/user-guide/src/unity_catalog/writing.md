@@ -3,9 +3,9 @@
 <!-- Page type: How-to -->
 <!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-client-api, unity-catalog-delta-rest-client -->
 
-To write to a Unity Catalog-managed Delta table, you create a `UCCommitter`,
-pass it to a Kernel transaction, and then publish the staged commit to make it
-visible in `_delta_log/`.
+To write to a Unity Catalog-managed Delta table, you create a `UCCommitter`, pass it to
+`UpdateTableTransactionBuilder::build()`, and then publish the staged commit to make it visible in
+`_delta_log/`.
 
 Before reading this page, make sure you understand the generic
 [catalog-managed write lifecycle](../catalog_managed/writing.md) and the
@@ -69,6 +69,7 @@ Catalog to ratify. Construct it with the commit client and the table's
 three-part name plus its table ID.
 
 ```rust,ignore
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel_unity_catalog::UCCommitter;
 use unity_catalog_delta_client_api::TableIdentifier;
 
@@ -78,8 +79,9 @@ let committer = Box::new(UCCommitter::new(
     table_id.clone(),
     TableIdentifier::new("my_catalog", "my_schema", "my_table"),
 ));
-let mut txn = snapshot.clone().transaction(committer, &engine)?
-    .with_operation("INSERT".to_string());
+let mut txn = snapshot.clone().transaction_builder()
+    .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
+    .build(&engine, committer)?;
 ```
 
 `UCCommitter` requires a multi-threaded tokio runtime. The default Kernel
@@ -251,7 +253,7 @@ checkpointing fails because it can only operate on published versions.
 
 ```rust,ignore
 use std::sync::Arc;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel_unity_catalog::{snapshot_builder_from_load_table, UCCommitter};
 use unity_catalog_delta_client_api::{Operation, TableIdentifier};
 use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
@@ -285,8 +287,9 @@ let committer = Box::new(UCCommitter::new(
     table_id.clone(),
     TableIdentifier::new("my_catalog", "my_schema", "my_table"),
 ));
-let mut txn = snapshot.clone().transaction(committer, &engine)?
-    .with_operation("INSERT".to_string());
+let mut txn = snapshot.clone().transaction_builder()
+    .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
+    .build(&engine, committer)?;
 
 // 6. Write data
 let write_state = txn.write_state()?;

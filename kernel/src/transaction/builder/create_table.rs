@@ -13,10 +13,12 @@ use itertools::Itertools;
 use url::Url;
 use uuid::Uuid;
 
+use super::state::TransactionBuilderState;
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
+use crate::metrics::MetricId;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
@@ -28,8 +30,9 @@ use crate::table_features::{
     add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
     find_max_column_id_in_schema, get_any_level_column_physical_name,
     get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz,
-    strip_stray_column_mapping_metadata, ColumnMappingMode, TableFeature,
-    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    strip_stray_column_mapping_metadata, validate_iceberg_compat_if_needed, ColumnMappingMode,
+    IcebergCompatValidationContext, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
+    SET_TABLE_FEATURE_SUPPORTED_VALUE, V2_VALIDATOR,
 };
 use crate::table_properties::{
     strip_check_constraint_prefix, CheckpointPolicy, TableProperties, APPEND_ONLY,
@@ -45,9 +48,9 @@ use crate::table_properties::{
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
-use crate::transaction::Transaction;
-use crate::utils::{current_time_ms, try_parse_uri};
-use crate::{Engine, KernelError, KernelResult, Result, StorageHandler};
+use crate::transaction::{CommitOperation, Transaction};
+use crate::utils::{current_time_ms, try_parse_uri, PhantomType};
+use crate::{Engine, EngineData, KernelError, KernelResult, Result, StorageHandler};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
 ///
@@ -806,10 +809,9 @@ fn validate_extract_table_features_and_properties(
 pub struct CreateTableTransactionBuilder {
     path: String,
     schema: SchemaRef,
-    engine_info: String,
     table_properties: HashMap<String, String>,
     data_layout: DataLayout,
-    correlation_id: Option<Arc<str>>,
+    state: TransactionBuilderState,
 }
 
 impl CreateTableTransactionBuilder {
@@ -821,10 +823,9 @@ impl CreateTableTransactionBuilder {
         Self {
             path: path.as_ref().to_string(),
             schema,
-            engine_info: engine_info.into(),
             table_properties: HashMap::new(),
             data_layout: DataLayout::None,
-            correlation_id: None,
+            state: TransactionBuilderState::for_create_table(engine_info.into()),
         }
     }
 
@@ -912,10 +913,87 @@ impl CreateTableTransactionBuilder {
         self
     }
 
+    /// Sets whether files added during creation represent a logical data change.
+    ///
+    /// `data_change` defaults to `true`. `false` indicates no logical change to the table's data.
+    /// Returns the updated builder. Consecutive calls replace the previous value. The configured
+    /// value is preserved through commit, including when no files are added.
+    pub fn with_data_change(mut self, data_change: bool) -> Self {
+        self.state.data_change = Some(data_change);
+        self
+    }
+
+    /// Adds an application transaction identifier to emit as a `txn` action.
+    ///
+    /// The action's `lastUpdated` value uses the transaction's commit timestamp.
+    /// An application id may occur only once. Duplicate ids are rejected by [`build`](Self::build).
+    pub fn with_transaction_id(mut self, app_id: impl Into<String>, version: i64) -> Self {
+        self.state = self.state.with_transaction_id(app_id, version);
+        self
+    }
+
+    /// Adds user-controlled domain metadata.
+    ///
+    /// Each domain may occur only once. Duplicates are rejected by [`build`](Self::build).
+    pub fn with_domain_metadata(
+        mut self,
+        domain: impl Into<String>,
+        configuration: impl Into<String>,
+    ) -> Self {
+        self.state = self.state.with_domain_metadata(domain, configuration);
+        self
+    }
+
     /// Attach an opaque, caller-supplied correlation id for joining the create-table commit's
     /// metric events to the caller's own request or operation id. An empty id is treated as unset.
     pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
-        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        self.state = self.state.with_correlation_id(correlation_id);
+        self
+    }
+
+    /// Replaces the operation parameters recorded in `commitInfo`.
+    ///
+    /// Values must already be stringified as expected in table history. `None` writes a null map
+    /// value. This map replaces rather than merges with an earlier map, and the last value wins
+    /// when a key occurs more than once. Dedicated parameters take precedence over a same-named
+    /// nested field supplied by [`with_commit_info`](Self::with_commit_info).
+    pub fn with_operation_parameters<I, K, V>(mut self, parameters: I) -> Self
+    where
+        I: IntoIterator<Item = (K, Option<V>)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.state = self.state.with_operation_parameters(parameters);
+        self
+    }
+
+    /// Replaces the operation metrics recorded in `commitInfo`.
+    ///
+    /// Values must already be stringified as expected in table history. `None` writes a null map
+    /// value. This map replaces rather than merges with an earlier map, and the last value wins
+    /// when a key occurs more than once. Metrics supplied to the built transaction replace these
+    /// values. Dedicated metrics take precedence over a same-named nested field supplied by
+    /// [`with_commit_info`](Self::with_commit_info).
+    pub fn with_operation_metrics<I, K, V>(mut self, metrics: I) -> Self
+    where
+        I: IntoIterator<Item = (K, Option<V>)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.state = self.state.with_operation_metrics(metrics);
+        self
+    }
+
+    /// Supplies one arbitrary connector-provided `commitInfo` row.
+    ///
+    /// Consecutive calls replace the previous row. Kernel-owned fields and dedicated operation
+    /// parameter or metric maps take precedence over same-named fields in this row.
+    pub fn with_commit_info(
+        mut self,
+        commit_info: Box<dyn EngineData>,
+        commit_info_schema: SchemaRef,
+    ) -> Self {
+        self.state = self.state.with_commit_info(commit_info, commit_info_schema);
         self
     }
 
@@ -952,11 +1030,15 @@ impl CreateTableTransactionBuilder {
     /// - CDF is enabled and the schema contains a top-level column reserved for CDF
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
+    /// - Connector commit information does not contain exactly one row
+    /// - An application transaction identifier occurs more than once
     pub fn build(
         self,
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
     ) -> Result<CreateTableTransaction> {
+        self.state.validate()?;
+
         // Validate path
         let table_url = try_parse_uri(&self.path)?;
 
@@ -1058,15 +1140,70 @@ impl CreateTableTransactionBuilder {
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
 
         // Create Transaction<CreateTable> with the effective table configuration
-        Transaction::try_new_create_table(
+        try_new_create_table(
             table_configuration,
-            self.engine_info,
             committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
-            self.correlation_id,
+            self.state,
         )
     }
+}
+
+fn try_new_create_table(
+    effective_table_config: TableConfiguration,
+    committer: Box<dyn Committer>,
+    system_domain_metadata: Vec<DomainMetadata>,
+    clustering_columns: Option<Vec<ColumnName>>,
+    state: TransactionBuilderState,
+) -> KernelResult<CreateTableTransaction> {
+    validate_iceberg_compat_if_needed(
+        &effective_table_config,
+        &V2_VALIDATOR,
+        IcebergCompatValidationContext::Write,
+    )?;
+
+    let span = tracing::info_span!(
+        "txn",
+        path = %effective_table_config.table_root(),
+        operation = "CREATE",
+    );
+    let transaction = state.apply_to_transaction(Transaction {
+        span,
+        operation_id: MetricId::new(),
+        correlation_id: None,
+        read_snapshot_opt: None,
+        effective_table_config,
+        should_emit_protocol: true,
+        should_emit_metadata: true,
+        committer,
+        operation: Some(CommitOperation::CreateTable),
+        operation_parameters: None,
+        operation_metrics: None,
+        engine_info: None,
+        add_files_metadata: vec![],
+        remove_files_metadata: vec![],
+        set_transactions: vec![],
+        commit_timestamp: current_time_ms()?,
+        user_domain_metadata_additions: vec![],
+        system_domain_metadata_additions: system_domain_metadata,
+        provided_row_tracking_high_water_mark: None,
+        user_domain_removals: vec![],
+        data_change: true,
+        infer_data_change: false,
+        column_defaults_acknowledged: false,
+        row_tracking_preservation_acknowledged: false,
+        engine_commit_info: None,
+        is_blind_append: false,
+        dv_matched_files: vec![],
+        num_dv_updates: 0,
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        manifest_write: None,
+        physical_clustering_columns: clustering_columns,
+        _state: PhantomType::default(),
+    });
+    transaction.validate_domain_metadata_operations()?;
+    Ok(transaction)
 }
 
 #[cfg(test)]
@@ -1076,7 +1213,15 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::arrow::array::StringArray;
+    use crate::arrow::datatypes::Schema as ArrowSchema;
+    use crate::arrow::record_batch::RecordBatch;
+    use crate::committer::FileSystemCommitter;
+    use crate::engine::arrow_conversion::TryIntoArrow;
+    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_name, ColumnName};
+    use crate::metrics::MetricEvent;
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
     use crate::schema::{
         schema, schema_ref, try_schema, ColumnMetadataKey, DataType, MetadataValue, StructField,
@@ -1089,6 +1234,7 @@ mod tests {
     use crate::transforms::SchemaTransform;
     use crate::unit_test_utils::{
         assert_result_error_with_message, build_complex_nested_kernel_schema,
+        install_thread_local_metrics_reporter, CapturingReporter,
     };
 
     fn test_schema() -> SchemaRef {
@@ -1102,8 +1248,174 @@ mod tests {
             CreateTableTransactionBuilder::new("/path/to/table", schema.clone(), "TestApp/1.0");
 
         assert_eq!(builder.path, "/path/to/table");
-        assert_eq!(builder.engine_info, "TestApp/1.0");
+        assert_eq!(builder.state.engine_info.as_deref(), Some("TestApp/1.0"));
         assert!(builder.table_properties.is_empty());
+    }
+
+    #[rstest]
+    #[case::default(&[], true)]
+    #[case::explicit_true(&[true], true)]
+    #[case::explicit_false(&[false], false)]
+    #[case::last_true(&[false, true], true)]
+    #[case::last_false(&[true, false], false)]
+    fn common_builder_state_preserves_data_change_through_empty_commit(
+        #[case] overrides: &[bool],
+        #[case] expected_data_change: bool,
+    ) -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join("table");
+        std::fs::create_dir(&table_path)?;
+        let engine = SyncEngine::new();
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+        let mut builder = CreateTableTransactionBuilder::new(
+            table_path.to_string_lossy(),
+            test_schema(),
+            "test-engine",
+        )
+        .with_correlation_id("test-correlation")
+        .with_operation_parameters([("mode", Some("Create"))])
+        .with_transaction_id("app", 7);
+        for &data_change in overrides {
+            builder = builder.with_data_change(data_change);
+        }
+        let mut transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
+
+        assert_eq!(transaction.engine_info.as_deref(), Some("test-engine"));
+        assert_eq!(
+            transaction.correlation_id.as_deref(),
+            Some("test-correlation")
+        );
+        assert_eq!(
+            transaction.operation_parameters.as_ref().unwrap()["mode"].as_deref(),
+            Some("Create")
+        );
+        assert_eq!(transaction.set_transactions[0].app_id, "app");
+        assert_eq!(transaction.set_transactions[0].version, 7);
+        assert_eq!(transaction.data_change, expected_data_change);
+        assert!(!transaction.infer_data_change);
+        transaction.resolve_data_change();
+        assert_eq!(transaction.data_change, expected_data_change);
+        let committed = transaction.commit(&engine)?.unwrap_committed();
+        assert_eq!(committed.commit_version(), 0);
+        let metrics = reporter
+            .events()
+            .into_iter()
+            .find_map(|event| match event {
+                MetricEvent::TransactionCommitSuccess(metrics) => Some(metrics),
+                _ => None,
+            })
+            .expect("create-table commit metrics");
+        assert_eq!(metrics.data_change, expected_data_change);
+        assert_eq!(metrics.num_add_files, 0);
+        assert_eq!(metrics.num_remove_files, 0);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(2)]
+    fn builder_rejects_non_single_row_commit_info(#[case] row_count: usize) -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join("table");
+        std::fs::create_dir(&table_path)?;
+        let commit_info_schema = schema_ref! { nullable "tag": STRING };
+        let arrow_schema: ArrowSchema = commit_info_schema.as_ref().try_into_arrow()?;
+        let commit_info = Box::new(ArrowEngineData::new(RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![Arc::new(StringArray::from(vec![Some("value"); row_count]))],
+        )?));
+
+        let error = CreateTableTransactionBuilder::new(
+            table_path.to_string_lossy(),
+            test_schema(),
+            "test-engine",
+        )
+        .with_commit_info(commit_info, commit_info_schema)
+        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Connector commit info must contain exactly one row"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_transaction_ids_are_rejected() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join("table");
+        std::fs::create_dir(&table_path)?;
+        let error = CreateTableTransactionBuilder::new(
+            table_path.to_string_lossy(),
+            test_schema(),
+            "test-engine",
+        )
+        .with_transaction_id("app", 1)
+        .with_transaction_id("app", 2)
+        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("app_id app appears more than once"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::missing_feature("app.config", None, "domainMetadata")]
+    #[case::reserved_domain(
+        "delta.custom",
+        Some(("delta.feature.domainMetadata", "supported")),
+        "system controlled"
+    )]
+    fn invalid_domain_metadata_is_rejected_during_build(
+        #[case] domain: &str,
+        #[case] property: Option<(&str, &str)>,
+        #[case] expected: &str,
+    ) -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join("table");
+        std::fs::create_dir(&table_path)?;
+        let mut builder = CreateTableTransactionBuilder::new(
+            table_path.to_string_lossy(),
+            test_schema(),
+            "test-engine",
+        )
+        .with_domain_metadata(domain, "{}");
+        if let Some(property) = property {
+            builder = builder.with_table_properties([property]);
+        }
+
+        assert_result_error_with_message(
+            builder.build(&SyncEngine::new(), Box::new(FileSystemCommitter::new())),
+            expected,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn user_domain_cannot_conflict_with_generated_clustering_domain() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join("table");
+        std::fs::create_dir(&table_path)?;
+        let error = CreateTableTransactionBuilder::new(
+            table_path.to_string_lossy(),
+            test_schema(),
+            "test-engine",
+        )
+        .with_data_layout(DataLayout::clustered(["id"]))
+        .with_domain_metadata("delta.clustering", "{}")
+        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("system controlled"), "{error}");
+        Ok(())
     }
 
     #[test]

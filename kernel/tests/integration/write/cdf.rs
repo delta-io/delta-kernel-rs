@@ -9,16 +9,17 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
-use delta_kernel::schema::SchemaRef;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::schema::{DataType, SchemaRef, StructField};
+use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel::{Snapshot, Version};
 use rstest::rstest;
 use tempfile::{tempdir, TempDir};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    assert_result_error_with_message, begin_transaction, create_add_files_metadata, create_table,
-    engine_store_setup, into_record_batch, load_and_begin_transaction,
+    assert_result_error_with_message, begin_transaction, begin_transaction_with,
+    create_add_files_metadata, create_table, create_table_and_load_snapshot, engine_store_setup,
+    into_record_batch, load_and_begin_transaction_with, read_actions_from_commit, test_table_setup,
 };
 use url::Url;
 
@@ -56,8 +57,9 @@ async fn write_data_to_table(
     schema: SchemaRef,
     values: Vec<i32>,
 ) -> Result<Version, Box<dyn std::error::Error>> {
-    let mut txn =
-        load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_engine_info("test");
+    let mut txn = load_and_begin_transaction_with(table_url.clone(), engine.as_ref(), |builder| {
+        builder.with_engine_info("test")
+    })?;
 
     add_files_to_transaction(&mut txn, engine, schema, values).await?;
 
@@ -120,9 +122,11 @@ async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error:
 
     // Now remove the files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("cdf remove test")
-        .with_data_change(true);
+    let mut txn = begin_transaction_with(snapshot.clone(), engine.as_ref(), |builder| {
+        builder
+            .with_engine_info("cdf remove test")
+            .with_data_change(true)
+    })?;
 
     let scan = snapshot.scan_builder().build()?;
     let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
@@ -158,9 +162,11 @@ async fn test_cdf_write_mixed_no_data_change_succeeds() -> Result<(), Box<dyn st
 
     // Now create a transaction with both add AND remove files, but dataChange=false
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("cdf mixed test")
-        .with_data_change(false); // dataChange=false is key here
+    let mut txn = begin_transaction_with(snapshot.clone(), engine.as_ref(), |builder| {
+        builder
+            .with_engine_info("cdf mixed test")
+            .with_data_change(false)
+    })?; // dataChange=false is key here
 
     // Add new files
     add_files_to_transaction(&mut txn, &engine, schema, vec![4, 5, 6]).await?;
@@ -199,9 +205,11 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
 
     // Now create a transaction with both add AND remove files with dataChange=true
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("cdf mixed fail test")
-        .with_data_change(true); // dataChange=true - this should fail
+    let mut txn = begin_transaction_with(snapshot.clone(), engine.as_ref(), |builder| {
+        builder
+            .with_engine_info("cdf mixed fail test")
+            .with_data_change(true)
+    })?; // dataChange=true - this should fail
 
     // Add new files
     add_files_to_transaction(&mut txn, &engine, schema, vec![4, 5, 6]).await?;
@@ -223,54 +231,30 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
 }
 
 #[rstest]
-#[case::cdf_disabled_no_data_change(
-    false, /* cdf_enabled */
-    false, /* data_change */
-    None
-)]
-#[case::cdf_disabled_data_change(
-    false, /* cdf_enabled */
-    true,  /* data_change */
-    None
-)]
-#[case::cdf_enabled_no_data_change(
-    true,  /* cdf_enabled */
-    false, /* data_change */
-    None
-)]
-#[case::cdf_enabled_data_change(
-    true, /* cdf_enabled */
-    true, /* data_change */
-    Some("Cannot add and remove data in the same transaction")
-)]
+#[case::inferred(None)]
+#[case::logical_preserving(Some(false))]
+#[case::explicit_change(Some(true))]
 #[tokio::test]
-async fn test_add_and_dv_update_fails_for_data_changing_cdf_transaction(
-    #[case] cdf_enabled: bool,
-    #[case] data_change: bool,
-    #[case] expected_error: Option<&str>,
+async fn test_file_rewrite_resolves_data_change_before_cdf_validation(
+    #[case] explicit_data_change: Option<bool>,
+    #[values(false, true)] cdf_enabled: bool,
+    #[values(false, true)] schema_change: bool,
+    #[values(false, true)] use_dv: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = get_simple_int_schema();
-    let (store, engine, table_location) = engine_store_setup(
-        &format!("test_add_and_dv_update_{cdf_enabled}_{data_change}"),
-        None, /* local_directory */
-    );
-    let mut writer_features = vec!["deletionVectors"];
-    if cdf_enabled {
-        writer_features.push("changeDataFeed");
-    }
-    let table_url = create_table(
-        store,
-        table_location,
-        schema,
-        &[],  /* partition_columns */
-        true, /* use_37_protocol */
-        vec!["deletionVectors"],
-        writer_features,
-    )
-    .await?;
-
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut setup_txn = begin_transaction(snapshot, &engine)?;
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        get_simple_int_schema(),
+        engine.as_ref(),
+        &[
+            ("delta.enableDeletionVectors", "true"),
+            (
+                "delta.enableChangeDataFeed",
+                if cdf_enabled { "true" } else { "false" },
+            ),
+        ],
+    )?;
+    let mut setup_txn = begin_transaction(snapshot, engine.as_ref())?;
     let existing_file = create_add_files_metadata(
         setup_txn.add_files_schema(),
         vec![(
@@ -281,63 +265,102 @@ async fn test_add_and_dv_update_fails_for_data_changing_cdf_transaction(
         )],
     )?;
     setup_txn.add_files(existing_file);
-    let snapshot = setup_txn.commit(&engine)?.unwrap_post_commit_snapshot();
+    let before = setup_txn
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
 
-    let mut txn = begin_transaction(snapshot.clone(), &engine)?.with_data_change(data_change);
+    let mut txn = begin_transaction_with(before.clone(), engine.as_ref(), |mut builder| {
+        if schema_change {
+            builder = builder
+                .with_operation(UpdateTableOperation::AlterTable)
+                .add_column(StructField::nullable("added", DataType::INTEGER));
+        }
+        if let Some(data_change) = explicit_data_change {
+            builder = builder.with_data_change(data_change);
+        }
+        builder
+    })?;
     let new_file = create_add_files_metadata(
         txn.add_files_schema(),
         vec![(
             "new.parquet",
             100,   /* size */
             2_000, /* modification_time */
-            Some(1),
+            Some(if use_dv { 1 } else { 3 }),
         )],
     )?;
     txn.add_files(new_file);
-    let descriptor = DeletionVectorDescriptor::try_new(
-        DeletionVectorStorageType::PersistedAbsolute,
-        "memory:///dv.bin",
-        Some(0), /* offset */
-        1,       /* size_in_bytes */
-        1,       /* cardinality */
-    )?;
-    txn.update_deletion_vectors(
-        HashMap::from([("existing.parquet".to_string(), descriptor)]),
-        get_scan_files(snapshot, &engine)?.into_iter().map(Ok),
-    )?;
-
-    let commit_result = txn.commit(&engine);
-    if let Some(expected_error) = expected_error {
-        assert_result_error_with_message(commit_result, expected_error);
-        let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
-        assert_eq!(snapshot.version(), 1);
+    let old_files = get_scan_files(before.clone(), engine.as_ref())?;
+    if use_dv {
+        let descriptor = DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::PersistedAbsolute,
+            "memory:///dv.bin",
+            Some(0), /* offset */
+            1,       /* size_in_bytes */
+            1,       /* cardinality */
+        )?;
+        txn.update_deletion_vectors(
+            HashMap::from([("existing.parquet".to_string(), descriptor)]),
+            old_files.into_iter().map(Ok),
+        )?;
     } else {
-        let snapshot = commit_result?.unwrap_post_commit_snapshot();
-        let mut active_files = 0;
-        let mut existing_dv = None;
-        for files in get_scan_files(snapshot.clone(), &engine)? {
-            let batch = into_record_batch(files.apply_selection_vector()?);
-            active_files += batch.num_rows();
-
-            let batch = StructArray::from(batch);
-            let paths: &StringArray = resolve_struct_field(&batch, &["path".into()]);
-            if let Some(row) = paths
-                .iter()
-                .position(|path| path == Some("existing.parquet"))
-            {
-                let dv_paths: &StringArray = resolve_struct_field(
-                    &batch,
-                    &["deletionVector".into(), "pathOrInlineDv".into()],
-                );
-                let cardinalities: &Int64Array =
-                    resolve_struct_field(&batch, &["deletionVector".into(), "cardinality".into()]);
-                existing_dv = Some((dv_paths.value(row).to_string(), cardinalities.value(row)));
-            }
+        for files in old_files {
+            txn.remove_files(files);
         }
+    }
 
-        assert_eq!(snapshot.version(), 2);
-        assert_eq!(active_files, 2);
-        assert_eq!(existing_dv, Some(("memory:///dv.bin".to_string(), 1)));
+    let commit_result = txn.commit(engine.as_ref());
+    let data_change = explicit_data_change.unwrap_or(true);
+    if cdf_enabled && data_change {
+        assert_result_error_with_message(
+            commit_result,
+            "Cannot add and remove data in the same transaction",
+        );
+        let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+        assert_eq!(fresh.version(), before.version());
+        assert_eq!(fresh.schema(), before.schema());
+    } else {
+        let post = commit_result?.unwrap_post_commit_snapshot();
+        let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+        for snapshot in [post, fresh] {
+            assert_eq!(snapshot.version(), 2);
+            assert_eq!(snapshot.schema().contains("added"), schema_change);
+            let mut active_files = 0;
+            let mut existing_dv = None;
+            for files in get_scan_files(snapshot, engine.as_ref())? {
+                let batch = into_record_batch(files.apply_selection_vector()?);
+                active_files += batch.num_rows();
+
+                let batch = StructArray::from(batch);
+                let paths: &StringArray = resolve_struct_field(&batch, &["path".into()]);
+                if let Some(row) = paths
+                    .iter()
+                    .position(|path| path == Some("existing.parquet"))
+                {
+                    let dv_paths: &StringArray = resolve_struct_field(
+                        &batch,
+                        &["deletionVector".into(), "pathOrInlineDv".into()],
+                    );
+                    let cardinalities: &Int64Array = resolve_struct_field(
+                        &batch,
+                        &["deletionVector".into(), "cardinality".into()],
+                    );
+                    existing_dv = Some((dv_paths.value(row).to_string(), cardinalities.value(row)));
+                }
+            }
+            assert_eq!(active_files, if use_dv { 2 } else { 1 });
+            assert_eq!(
+                existing_dv,
+                use_dv.then(|| ("memory:///dv.bin".to_string(), 1)),
+            );
+        }
+        for (kind, expected_count) in [("add", if use_dv { 2 } else { 1 }), ("remove", 1)] {
+            let actions = read_actions_from_commit(before.table_root(), 2, kind)?;
+            assert_eq!(actions.len(), expected_count);
+            assert!(actions
+                .iter()
+                .all(|action| action["dataChange"] == data_change));
+        }
     }
 
     Ok(())
