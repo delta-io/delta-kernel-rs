@@ -99,6 +99,12 @@ pub type Result<T, E = KernelError> = std::result::Result<T, E>;
 /// A result whose error is a [`KernelError`].
 pub type KernelResult<T> = std::result::Result<T, KernelError>;
 
+/// A boxed, `Send` iterator of [`KernelResult<T>`] items.
+pub type KernelResultIterator<'a, T> = Box<dyn Iterator<Item = KernelResult<T>> + Send + 'a>;
+
+/// A [`KernelResultIterator`] that does not borrow data.
+pub type KernelResultIteratorStatic<T> = KernelResultIterator<'static, T>;
+
 /// A boxed, `Send` iterator of [`Result<T>`] items.
 ///
 /// Convenience alias for the common pattern of returning a streaming, fallible iterator from
@@ -635,6 +641,16 @@ impl KernelError {
         Self::PlanResultTypeMismatch { expected, actual }
     }
 
+    /// Returns the first error that is not wrapped by [`KernelError::Backtraced`].
+    ///
+    /// If this error has no backtrace wrapper, this returns `self`.
+    pub fn without_backtrace(&self) -> &Self {
+        match self {
+            Self::Backtraced { source, .. } => source.without_backtrace(),
+            error => error,
+        }
+    }
+
     // Capture a backtrace when the error is constructed.
     #[must_use]
     pub fn with_backtrace(self) -> Self {
@@ -684,9 +700,9 @@ impl From<object_store::Error> for KernelError {
 }
 
 /// This impl is needed so the `?` operator can auto-convert `Result<T, Infallible>` to
-/// `Result<T>`. For example, `TryFrom` impls for infallible conversions use `Infallible` as
+/// `KernelResult<T>`. For example, `TryFrom` impls for infallible conversions use `Infallible` as
 /// their error type, and this allows those results to be propagated with `?` in functions
-/// returning `Result`. The match is unreachable since `Infallible` has no variants.
+/// returning `KernelResult`. The match is unreachable since `Infallible` has no variants.
 impl From<Infallible> for KernelError {
     fn from(value: Infallible) -> Self {
         match value {}

@@ -9,7 +9,7 @@ use crate::schema::PrimitiveType::*;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::transforms::SchemaTransform as _;
-use crate::Result;
+use crate::KernelResult;
 
 /// V2 invariants paired with the version constant. Fed to
 /// [`super::validate_iceberg_compat_if_needed`].
@@ -46,7 +46,7 @@ fn is_v2_supported_type(dt: &DataType) -> bool {
     )
 }
 
-fn check_v2_supported_types(tc: &TableConfiguration) -> Result<()> {
+fn check_v2_supported_types(tc: &TableConfiguration) -> KernelResult<()> {
     check_only_supported_types(
         tc,
         is_v2_supported_type,
@@ -64,7 +64,7 @@ fn check_v2_supported_types(tc: &TableConfiguration) -> Result<()> {
 ///
 /// Returns an error if `delta.typeChanges` metadata is malformed, or if any recorded type change
 /// is outside Iceberg V2's allowed widening list.
-fn iceberg_compat_v2_type_changes_validation(tc: &TableConfiguration) -> Result<()> {
+fn iceberg_compat_v2_type_changes_validation(tc: &TableConfiguration) -> KernelResult<()> {
     if !tc.is_feature_supported(&TableFeature::TypeWidening)
         && !tc.is_feature_supported(&TableFeature::TypeWideningPreview)
     {

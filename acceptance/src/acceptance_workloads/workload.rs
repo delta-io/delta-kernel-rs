@@ -10,7 +10,7 @@ use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predic
 use delta_kernel::expressions::Predicate;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{Engine, KernelError, Result, Version};
+use delta_kernel::{Engine, KernelError, KernelResult, Result, Version};
 use delta_kernel_workloads::models::{ReadSpec, SnapshotConstructionSpec, Spec, TimeTravel};
 use delta_kernel_workloads::predicate_parser::parse_predicate;
 use itertools::Itertools;
@@ -45,7 +45,7 @@ fn build_snapshot(
     engine: &dyn Engine,
     table_root: &Url,
     time_travel: Option<&TimeTravel>,
-) -> Result<Arc<Snapshot>> {
+) -> KernelResult<Arc<Snapshot>> {
     let version = time_travel
         .map(TimeTravel::as_version)
         .transpose()
@@ -111,7 +111,7 @@ pub fn execute_read_workload(
 fn filter_batches_with_predicate(
     batches: Vec<RecordBatch>,
     predicate: Option<&Predicate>,
-) -> Result<Vec<RecordBatch>> {
+) -> KernelResult<Vec<RecordBatch>> {
     let Some(predicate) = predicate else {
         return Ok(batches);
     };
@@ -171,7 +171,7 @@ pub fn execute_and_validate_workload(
                 .as_ref()
                 .ok_or("SnapshotSpec must have expected or error field")?;
             let result = execute_snapshot_workload(engine, table_root, snapshot_spec.as_ref());
-            validate_snapshot(result, expected)?;
+            validate_snapshot(result, snapshot_spec.time_travel.as_ref(), expected)?;
         }
     }
     Ok(())

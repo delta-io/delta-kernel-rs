@@ -52,9 +52,9 @@ use crate::unit_test_utils::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::Snapshot;
 use crate::{
-    EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, ParquetFooter,
-    ParquetHandler, Predicate, PredicateRef, Result, ResultIteratorStatic, RowVisitor,
-    StorageHandler,
+    EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, KernelResult,
+    ParquetFooter, ParquetHandler, Predicate, PredicateRef, Result, ResultIteratorStatic,
+    RowVisitor, StorageHandler,
 };
 
 /// Processes sidecar files for the given checkpoint batch.
@@ -67,7 +67,7 @@ fn process_sidecars(
     batch: &dyn EngineData,
     checkpoint_read_schema: SchemaRef,
     meta_predicate: Option<PredicateRef>,
-) -> Result<Option<impl Iterator<Item = Result<Box<dyn EngineData>>> + Send>> {
+) -> KernelResult<Option<impl Iterator<Item = KernelResult<Box<dyn EngineData>>> + Send>> {
     // Visit the rows of the checkpoint batch to extract sidecar file references
     let mut visitor = SidecarVisitor::default();
     visitor.visit_rows_of(batch)?;
@@ -151,7 +151,7 @@ async fn write_parquet_to_store(
     store: &Arc<InMemory>,
     path: String,
     data: Box<dyn EngineData>,
-) -> Result<()> {
+) -> KernelResult<()> {
     write_multi_row_group_parquet_to_store(store, vec![data], &path).await
 }
 
@@ -161,7 +161,7 @@ pub(crate) async fn add_checkpoint_to_store(
     store: &Arc<InMemory>,
     data: Box<dyn EngineData>,
     filename: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     let path = format!("_delta_log/{filename}");
     write_parquet_to_store(store, path, data).await
 }
@@ -172,11 +172,11 @@ async fn write_multi_row_group_parquet_to_store(
     store: &Arc<InMemory>,
     row_groups: Vec<Box<dyn EngineData>>,
     path: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     let batches = row_groups
         .into_iter()
         .map(ArrowEngineData::try_from_engine_data)
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<KernelResult<Vec<_>>>()?;
     let schema = batches
         .first()
         .ok_or_else(|| KernelError::internal_error("at least one row group is required"))?
@@ -197,8 +197,8 @@ async fn write_multi_row_group_parquet_to_store(
 
 /// Returns the materialized row count and sorted paths of all materialized Add actions.
 fn collect_materialized_adds(
-    actions: impl Iterator<Item = Result<ActionsBatch>>,
-) -> Result<(usize, Vec<String>)> {
+    actions: impl Iterator<Item = KernelResult<ActionsBatch>>,
+) -> KernelResult<(usize, Vec<String>)> {
     let mut rows = 0;
     let mut add_paths: Vec<String> = Vec::new();
     for batch in actions {
@@ -215,7 +215,7 @@ fn collect_materialized_adds(
 fn collect_projected_adds(
     log_segment: &LogSegment,
     engine: &dyn Engine,
-) -> Result<(usize, Vec<String>)> {
+) -> KernelResult<(usize, Vec<String>)> {
     let actions = log_segment
         .read_actions_with_projected_checkpoint_actions(
             engine,
@@ -267,7 +267,7 @@ async fn add_sidecar_to_store(
     store: &Arc<InMemory>,
     data: Box<dyn EngineData>,
     filename: &str,
-) -> Result<FileMeta> {
+) -> KernelResult<FileMeta> {
     let path = format!("_delta_log/_sidecars/{filename}");
     write_parquet_to_store(store, path.clone(), data).await?;
     let size = get_file_size(store, &path).await;
@@ -285,7 +285,7 @@ async fn write_json_to_store(
     store: &Arc<InMemory>,
     actions: Vec<Action>,
     filename: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     let json_lines: Vec<String> = actions
         .into_iter()
         .map(|action| serde_json::to_string(&action).expect("action to string"))
@@ -3756,7 +3756,7 @@ fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField
 fn create_checkpoint_file_schema_with_stats_parsed(
     min_values_fields: Vec<StructField>,
     include_json_stats: bool,
-) -> Result<SchemaRef> {
+) -> KernelResult<SchemaRef> {
     let stats_parsed = StructField::nullable(
         "stats_parsed",
         schema! {
@@ -5407,20 +5407,17 @@ fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn find_last_checkpoint_action_returns_none_without_checkpoint() -> Result<()> {
+fn latest_checkpoint_action_returns_none_without_checkpoint() -> Result<()> {
     let (engine, table_root) = setup_table()?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    assert!(snapshot
-        .log_segment()
-        .find_last_checkpoint_action(&engine)?
-        .is_none());
+    assert!(snapshot.latest_checkpoint_action(&engine)?.is_none());
     Ok(())
 }
 
 // The log is replayed newest-first, so the most recent `checkpoint` action wins.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn find_last_checkpoint_action_returns_the_latest_of_multiple() -> Result<()> {
+fn latest_checkpoint_action_returns_the_latest_of_multiple() -> Result<()> {
     let (engine, table_root) = setup_table()?;
     write_commit(
         &engine,
@@ -5438,10 +5435,57 @@ fn find_last_checkpoint_action_returns_the_latest_of_multiple() -> Result<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert_eq!(snapshot.version(), 2);
     let checkpoint = snapshot
-        .log_segment()
-        .find_last_checkpoint_action(&engine)?
+        .latest_checkpoint_action(&engine)?
         .expect("checkpoint present");
     assert_eq!(checkpoint.version(), 2);
     assert_eq!(checkpoint.path(), "metadata/root-v2.parquet");
+    Ok(())
+}
+
+// A snapshot's frozen log segment makes `latest_checkpoint_action` stable: a newer checkpoint
+// action written to storage after the snapshot is built does not change the snapshot's result.
+// A fresh snapshot does observe it.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[test]
+fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> Result<()> {
+    let (engine, table_root) = setup_table()?;
+    write_commit(
+        &engine,
+        &table_root,
+        1,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?.into_engine_data(&engine)?,
+    )?;
+
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+    assert_eq!(snapshot.version(), 1);
+    let first = snapshot
+        .latest_checkpoint_action(&engine)?
+        .expect("checkpoint present");
+    assert_eq!(first.version(), 1);
+
+    // Write a newer checkpoint action AFTER the snapshot's log segment was frozen.
+    write_commit(
+        &engine,
+        &table_root,
+        2,
+        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?.into_engine_data(&engine)?,
+    )?;
+
+    // The frozen snapshot still reports version 1.
+    let second = snapshot
+        .latest_checkpoint_action(&engine)?
+        .expect("checkpoint present");
+    assert_eq!(second.version(), 1);
+    assert_eq!(second.path(), "metadata/root-v1.parquet");
+
+    // A fresh snapshot observes the newer checkpoint action.
+    let updated = Snapshot::builder_for(table_root).build(&engine)?;
+    assert_eq!(
+        updated
+            .latest_checkpoint_action(&engine)?
+            .expect("checkpoint present")
+            .version(),
+        2
+    );
     Ok(())
 }

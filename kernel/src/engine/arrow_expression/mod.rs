@@ -16,7 +16,7 @@ use crate::error::{KernelError, Result};
 use crate::expressions::{ArrayData, Expression, ExpressionRef, PredicateRef, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
-use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
+use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, KernelResult, PredicateEvaluator};
 
 pub mod evaluate_expression;
 pub mod opaque;
@@ -58,7 +58,7 @@ impl Scalar {
     // rows, because empty list/map is a valid state. But struct builders _DO_ require appending
     // (possibly NULL) entries in order to preserve consistent row counts between the struct and its
     // fields.
-    fn append_to(&self, builder: &mut dyn ArrayBuilder, num_rows: usize) -> Result<()> {
+    fn append_to(&self, builder: &mut dyn ArrayBuilder, num_rows: usize) -> KernelResult<()> {
         use Scalar::*;
         macro_rules! builder_as {
             ($t:ty) => {{
@@ -154,7 +154,7 @@ impl Scalar {
         builder: &mut dyn ArrayBuilder,
         data_type: &DataType,
         num_rows: usize,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         // Almost the same as above -- differs only in the data type parameter
         macro_rules! builder_as {
             ($t:ty) => {{
@@ -172,6 +172,12 @@ impl Scalar {
         }
 
         match *data_type {
+            #[cfg(feature = "udt-in-dev")]
+            DataType::UserDefined(_) => {
+                return Err(KernelError::unsupported(
+                    "UDT expressions are not yet supported",
+                ))
+            }
             DataType::INTEGER => append_nulls_as!(array::Int32Builder),
             DataType::LONG => append_nulls_as!(array::Int64Builder),
             DataType::SHORT => append_nulls_as!(array::Int16Builder),
@@ -396,7 +402,7 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
 fn validate_data_schema_top_level(
     expected_schema: &SchemaRef,
     data_schema: &ArrowSchema,
-) -> Result<()> {
+) -> KernelResult<()> {
     let mut data_fields = data_schema.fields().iter();
     // Some Kernel code does not provide the full input schema to the evaluator. For example,
     // `scan_metadata_from` may evaluate scan rows containing optional `stats_parsed` and

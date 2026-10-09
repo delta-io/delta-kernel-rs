@@ -9,7 +9,7 @@ use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::utils::require;
-use crate::{version_as_i64, Engine, Result, Version};
+use crate::{version_as_i64, Engine, KernelResult, Result, Version};
 
 /// State for an in-progress manifest (content-tree) commit.
 #[internal_api]
@@ -38,7 +38,7 @@ impl ManifestCommitState {
         read_snapshot: SnapshotRef,
         version_to_write: Version,
         table_config: &TableConfiguration,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         require!(
             table_config.is_feature_supported(&TableFeature::AdaptiveMetadataPreview),
             KernelError::unsupported(
@@ -48,10 +48,7 @@ impl ManifestCommitState {
         // TODO(#2866): tighten this check (checkpoints that spill to sidecars, log compaction, and
         // the precise "since the last manifest commit" semantics) once the manifest-commit write
         // path lands.
-        if let Some(checkpoint) = read_snapshot
-            .log_segment()
-            .find_last_checkpoint_action(engine)?
-        {
+        if let Some(checkpoint) = read_snapshot.latest_checkpoint_action(engine)? {
             let snapshot_version = version_as_i64(read_snapshot.version())?;
             require!(
                 checkpoint.version() >= snapshot_version,

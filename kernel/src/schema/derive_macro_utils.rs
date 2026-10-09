@@ -7,10 +7,10 @@ use bytes::Bytes;
 use delta_kernel_derive::internal_api;
 
 use crate::error::add_scalar_path_context;
-use crate::expressions::{Scalar, StructData};
+use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{ArrayType, DataType, MapType, StructField, StructType, ToSchema};
 use crate::utils::require;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult};
 
 /// Converts a type to a [`DataType`]. Implemented for the primitive types and automatically derived
 /// for all types that implement [`ToSchema`].
@@ -132,6 +132,38 @@ impl<K: ToDataType, V: ToDataType> ToNullableContainerType for HashMap<K, V> {
     }
 }
 
+/// Converts a container into a scalar whose type permits null container values.
+///
+/// This supports `IntoStructData` fields annotated with `#[allow_null_container_values]`.
+#[internal_api]
+pub(crate) trait IntoNullableContainerScalar {
+    /// Consumes the container while retaining nullable values in the scalar's data type.
+    fn into_nullable_container_scalar(self) -> Scalar;
+}
+
+impl<K, V> IntoNullableContainerScalar for HashMap<K, V>
+where
+    K: Into<Scalar> + ToDataType,
+    V: Into<Scalar> + ToDataType,
+{
+    fn into_nullable_container_scalar(self) -> Scalar {
+        Scalar::Map(MapData::from_pairs::<K, V>(self, true))
+    }
+}
+
+impl<K, V> IntoNullableContainerScalar for Option<HashMap<K, V>>
+where
+    K: Into<Scalar> + ToDataType,
+    V: Into<Scalar> + ToDataType,
+{
+    fn into_nullable_container_scalar(self) -> Scalar {
+        match self {
+            Some(map) => map.into_nullable_container_scalar(),
+            None => Scalar::Null(MapType::new(K::to_data_type(), V::to_data_type(), true).into()),
+        }
+    }
+}
+
 // The [`delta_kernel_derive::ToSchema`] macro uses this to convert a struct field's name + type
 // into a `StructField` definition for a container with nullable values, when the struct field was
 // annotated with the `allow_null_container_values` attribute.
@@ -165,7 +197,7 @@ pub(crate) struct StructDataFields {
 }
 
 impl StructDataFields {
-    pub(crate) fn try_new(data: StructData, expected: StructType) -> Result<Self> {
+    pub(crate) fn try_new(data: StructData, expected: StructType) -> KernelResult<Self> {
         let (actual_fields, values) = data.into_parts();
         require!(
             actual_fields.len() == values.len(),
@@ -202,7 +234,7 @@ impl StructDataFields {
     pub(crate) fn take_field<T: TryFrom<Scalar, Error = KernelError>>(
         &mut self,
         field_name: &str,
-    ) -> Result<T> {
+    ) -> KernelResult<T> {
         let expected = self.expected.field(field_name).ok_or_else(|| {
             KernelError::InternalError(format!(
                 "Derived schema does not contain generated field {field_name:?}"
@@ -237,7 +269,7 @@ impl StructDataFields {
     }
 
     /// Verifies that every named field was consumed.
-    pub(crate) fn finish(self) -> Result<()> {
+    pub(crate) fn finish(self) -> KernelResult<()> {
         if self.fields.is_empty() {
             return Ok(());
         }

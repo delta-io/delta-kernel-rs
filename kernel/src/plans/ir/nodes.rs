@@ -16,7 +16,7 @@ use crate::error::add_scalar_path_context;
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema};
 use crate::utils::CollectInto;
-use crate::{FileMeta, KernelError, Result};
+use crate::{FileMeta, KernelError, KernelResult, Result};
 
 // ============================================================================
 // Operator: enumerates every operator kind
@@ -573,7 +573,7 @@ impl DynamicScan {
         schema: &SchemaRef,
         column: &ColumnName,
         expected_type: &DataType,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let fields = schema.fields_of_path(column)?;
         let Some((field, ancestors)) = fields.split_last() else {
             return Err(KernelError::internal_error(
@@ -598,7 +598,7 @@ impl DynamicScan {
         input_schema: &SchemaRef,
         output_schema: &SchemaRef,
         file_constant_columns: &[String],
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         for name in file_constant_columns {
             let Some(input_field) = input_schema.field(name) else {
                 return Err(KernelError::generic(format!(
@@ -907,7 +907,7 @@ impl Agg {
         &self,
         input_schema: &StructType,
         alias: Option<String>,
-    ) -> Result<StructField> {
+    ) -> KernelResult<StructField> {
         // `output_data_type: None` preserves the input field's type and metadata; `Some` overrides
         // the type and strips metadata (new column).
         let resolve = |value: &ColumnName, output_data_type: Option<DataType>, nullable: bool| {

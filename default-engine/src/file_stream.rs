@@ -6,7 +6,7 @@ use std::task::{ready, Context, Poll};
 
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use delta_kernel::{FileMeta, Result};
+use delta_kernel::{FileMeta, KernelResult, Result};
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use futures::FutureExt;
@@ -117,12 +117,12 @@ impl FileStream {
     ///
     /// Since file opening is mostly IO (and may involve a
     /// bunch of sequential IO), it can be parallelized with decoding.
-    fn start_next_file(&mut self) -> Option<Result<FileOpenFuture>> {
+    fn start_next_file(&mut self) -> Option<KernelResult<FileOpenFuture>> {
         let file_meta = self.file_iter.pop_front()?;
         Some(self.file_opener.open(file_meta, None))
     }
 
-    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
+    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<KernelResult<RecordBatch>>> {
         loop {
             match &mut self.state {
                 FileStreamState::Idle => match self.start_next_file().transpose() {

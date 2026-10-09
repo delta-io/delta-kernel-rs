@@ -12,7 +12,7 @@ use delta_kernel::arrow::array::{
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use delta_kernel::EngineData;
 #[cfg(feature = "default-engine-base")]
-use delta_kernel::Result;
+use delta_kernel::{KernelResult, Result};
 
 use super::handle::Handle;
 #[cfg(feature = "default-engine-base")]
@@ -113,7 +113,7 @@ pub unsafe extern "C" fn get_raw_arrow_data(
 }
 
 #[cfg(feature = "default-engine-base")]
-fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> Result<*mut ArrowFFIData> {
+fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> KernelResult<*mut ArrowFFIData> {
     Ok(Box::into_raw(Box::new(ArrowFFIData::try_from_engine_data(
         data,
     )?)))
@@ -168,7 +168,7 @@ pub unsafe extern "C" fn get_engine_data(
 unsafe fn get_engine_data_impl(
     array: FFI_ArrowArray,
     schema: &FFI_ArrowSchema,
-) -> Result<Handle<ExclusiveEngineData>> {
+) -> KernelResult<Handle<ExclusiveEngineData>> {
     let array_data = unsafe { arrow::array::ffi::from_ffi(array, schema) };
     let record_batch: RecordBatch = StructArray::from(array_data?).into();
     let arrow_engine_data: ArrowEngineData = record_batch.into();

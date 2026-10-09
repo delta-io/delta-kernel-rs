@@ -24,7 +24,7 @@ use crate::path::LogPathFileType::*;
 use crate::path::{
     may_begin_listable_log_path, CheckpointInstance, LogPathFileType, ParsedLogPath,
 };
-use crate::{KernelError, Result, StorageHandler, Version};
+use crate::{KernelError, KernelResult, Result, StorageHandler, Version};
 
 #[cfg(test)]
 mod tests;
@@ -384,12 +384,12 @@ impl LogSegmentFiles {
     /// - `end_version`: upper bound (inclusive) on versions to include, `None` means no bound
     /// - `checkpoint_handling`: whether complete checkpoints replace the replay base
     pub(crate) fn build_log_segment_files(
-        fs_files: impl Iterator<Item = Result<ParsedLogPath>>,
+        fs_files: impl Iterator<Item = KernelResult<ParsedLogPath>>,
         log_tail: Vec<ParsedLogPath>,
         start_version: Version,
         end_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         // check log_tail is only commits
         // note that LogSegment checks no gaps/duplicates so we don't duplicate that here
         debug_assert!(
@@ -531,7 +531,7 @@ impl LogSegmentFiles {
         start_version: Option<Version>,
         end_version: Option<Version>,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         debug_assert!(
             log_tail.iter().all(|entry| entry.is_commit()),
             "log_tail should only contain commits"
@@ -599,7 +599,7 @@ impl LogSegmentFiles {
         start_version: Option<Version>,
         end_version: Option<Version>,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         Self::list_with_checkpoint_handling(
             storage,
             log_root,
@@ -619,7 +619,7 @@ impl LogSegmentFiles {
         end_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
         let fs_iter =
@@ -641,7 +641,7 @@ impl LogSegmentFiles {
         log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let listed_files = Self::list(
             storage,
             log_root,
@@ -725,7 +725,7 @@ impl LogSegmentFiles {
         log_tail: Vec<ParsedLogPath>,
         end_version: Version,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         // Scan backward in 1000-version windows, collecting ALL file types, until a complete
         // checkpoint is found or the log is exhausted.
         let mut windows: Vec<Vec<ParsedLogPath>> = Vec::new();

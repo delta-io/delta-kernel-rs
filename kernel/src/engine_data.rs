@@ -11,7 +11,7 @@ use crate::expressions::ArrayData;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{ColumnName, DataType, SchemaRef};
 use crate::utils::require;
-use crate::{AsAny, KernelError, Result};
+use crate::{AsAny, KernelError, KernelResult, Result};
 
 /// Engine data paired with a selection vector indicating which rows are logically selected.
 ///
@@ -610,7 +610,7 @@ pub trait EngineData: AsAny {
 pub(crate) fn filter_by_predicate(
     filter: &dyn crate::PredicateEvaluator,
     batch: Box<dyn EngineData>,
-) -> Result<Box<dyn EngineData>> {
+) -> KernelResult<Box<dyn EngineData>> {
     let predicate_result = filter.evaluate(batch.as_ref())?;
     let mut visitor = SelectionVectorVisitor::default();
     visitor.visit_rows_of(predicate_result.as_ref())?;

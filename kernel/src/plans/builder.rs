@@ -50,7 +50,7 @@ use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, Struct
 use crate::schema::{SchemaRef, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::CollectInto;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult, Result};
 
 /// One node of a plan DAG: an operator, its inputs, and its output schema. Node identity is the
 /// `Arc`'s address ([`PlanBuilder::build`] dedups shared subgraphs by pointer). Inputs are always
@@ -141,7 +141,7 @@ impl PlanBuilder {
         files: impl IntoIterator<Item = impl Into<ScanFile>>,
         file_constant_columns: &[&str],
         schema: impl Into<SchemaRef>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let schema = schema.into();
         let files = Vec::from_iter(files.into_iter().map(Into::into));
         let cols = Vec::from_iter(file_constant_columns.iter().map(|&c| c.to_string()));
@@ -504,7 +504,7 @@ impl PlanBuilder {
         inverted: bool,
         probe_keys: impl IntoIterator<Item = ColumnName>,
         build_keys: impl IntoIterator<Item = ColumnName>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let probe_keys = Vec::from_iter(probe_keys);
         let build_keys = Vec::from_iter(build_keys);
         if probe_keys.len() != build_keys.len() {
@@ -650,7 +650,7 @@ fn check_columns_resolve<'a>(
     schema: &SchemaRef,
     cols: impl IntoIterator<Item = &'a ColumnName>,
     ctx: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     for col in cols {
         schema.field_at(col).map_err(|_| {
             KernelError::generic(format!(
@@ -669,7 +669,7 @@ fn check_file_constant_columns<'a>(
     schema: &SchemaRef,
     names: impl IntoIterator<Item = &'a String>,
     ctx: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     for name in names {
         let Some(field) = schema.field(name.as_str()) else {
             return Err(KernelError::generic(format!(
@@ -1162,7 +1162,10 @@ mod tests {
         Ok(())
     }
 
-    fn dynamic_scan_node(input_schema: &SchemaRef, out_schema: SchemaRef) -> Result<DynamicScan> {
+    fn dynamic_scan_node(
+        input_schema: &SchemaRef,
+        out_schema: SchemaRef,
+    ) -> KernelResult<DynamicScan> {
         DynamicScan::try_new(
             input_schema,
             out_schema,
@@ -1228,11 +1231,14 @@ mod tests {
         schema_with_field(dynamic_scan_input_schema(), field)
     }
 
-    fn construct_dynamic_scan(input: SchemaRef) -> Result<DynamicScan> {
+    fn construct_dynamic_scan(input: SchemaRef) -> KernelResult<DynamicScan> {
         dynamic_scan_node(&input, dynamic_scan_output_schema())
     }
 
-    fn build_dynamic_scan_with_schemas(input: SchemaRef, output: SchemaRef) -> Result<PlanBuilder> {
+    fn build_dynamic_scan_with_schemas(
+        input: SchemaRef,
+        output: SchemaRef,
+    ) -> KernelResult<PlanBuilder> {
         let dynamic_scan = dynamic_scan_node(&input, output)?;
         vals(input).dynamic_scan(dynamic_scan)
     }

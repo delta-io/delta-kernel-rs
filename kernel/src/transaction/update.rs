@@ -50,7 +50,7 @@ use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation}
 use crate::utils::{current_time_ms, require, PhantomType};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::FileMeta;
-use crate::{DataType, Engine, Expression, Result};
+use crate::{DataType, Engine, Expression, KernelResult, Result};
 
 // =============================================================================
 // Update table transactions only
@@ -70,7 +70,7 @@ impl Transaction {
         snapshot: impl Into<SnapshotRef>,
         committer: Box<dyn Committer>,
         engine: &dyn Engine,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let read_snapshot = snapshot.into();
 
         // important! before writing to the table we must check it is supported
@@ -553,7 +553,7 @@ impl Transaction {
 
     /// Verify the table has deletion vectors *enabled* (feature supported in both reader and
     /// writer features AND the `delta.enableDeletionVectors` table property set to `true`).
-    fn ensure_deletion_vectors_enabled(&self) -> Result<()> {
+    fn ensure_deletion_vectors_enabled(&self) -> KernelResult<()> {
         if !self
             .effective_table_config
             .is_feature_enabled(&TableFeature::DeletionVectors)
@@ -678,7 +678,7 @@ impl<S> Transaction<S> {
     pub(super) fn generate_dv_update_actions<'a>(
         &'a self,
         engine: &'a dyn Engine,
-    ) -> Result<impl Iterator<Item = Result<FilteredEngineData>> + Send + 'a> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<FilteredEngineData>> + Send + 'a> {
         // Create-table transactions should not have any DV update actions
         if self.is_create_table() && !self.dv_matched_files.is_empty() {
             return Err(crate::error::KernelError::internal_error(
@@ -703,7 +703,7 @@ impl<S> Transaction<S> {
         &'a self,
         engine: &'a dyn Engine,
         file_metadata_batch: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
-    ) -> Result<impl Iterator<Item = Result<FilteredEngineData>> + Send + 'a> {
+    ) -> KernelResult<impl Iterator<Item = KernelResult<FilteredEngineData>> + Send + 'a> {
         let evaluation_handler = engine.evaluation_handler();
         // Struct patch to replace the deletionVector field with the new DV/stats from
         // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME, then drop the
@@ -743,8 +743,8 @@ impl<S> Transaction<S> {
             with_data_change_expr,
             nullable_add_log_schema().clone().into(),
         )?;
-        Ok(
-            file_metadata_batch.map(move |file_metadata_batch| -> Result<FilteredEngineData> {
+        Ok(file_metadata_batch.map(
+            move |file_metadata_batch| -> KernelResult<FilteredEngineData> {
                 let with_new_dv_data = with_new_dv_eval.evaluate(file_metadata_batch.data())?;
 
                 let as_partial_add_data = restored_add_eval.evaluate(with_new_dv_data.as_ref())?;
@@ -756,8 +756,8 @@ impl<S> Transaction<S> {
                     with_data_change_data,
                     file_metadata_batch.selection_vector().to_vec(),
                 )
-            }),
-        )
+            },
+        ))
     }
 }
 

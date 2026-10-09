@@ -36,7 +36,7 @@ use crate::transaction::data_layout::DataLayout;
 use crate::unit_test_utils::TestCancellationToken;
 use crate::{
     CancellationTokenRef, Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
-    ParquetFooter, ParquetHandler, PredicateRef, ResultIteratorStatic, Snapshot,
+    KernelResult, ParquetFooter, ParquetHandler, PredicateRef, ResultIteratorStatic, Snapshot,
 };
 
 mod variant_stats;
@@ -617,7 +617,7 @@ fn test_without_row_transforms_scan_metadata_surfaces_deletion_vectors() {
     );
 }
 
-fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> Result<Vec<String>> {
+fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> KernelResult<Vec<String>> {
     let scan_metadata_iter = scan.scan_metadata(engine)?;
     fn scan_metadata_callback(paths: &mut Vec<String>, scan_file: ScanFile) {
         paths.push(scan_file.path.to_string());

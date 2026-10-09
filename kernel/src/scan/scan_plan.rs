@@ -28,7 +28,7 @@ use crate::schema::{
 use crate::struct_patch::{project_struct_preserving_nulls, ProjectionStructPatchBuilder};
 use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::utils::FoldWithOption as _;
-use crate::{KernelError, PlanBuilder, Result};
+use crate::{KernelError, KernelResult, PlanBuilder};
 
 // === Internal column names ===
 
@@ -53,7 +53,10 @@ impl Scan {
         fields(enable_call_frame),
         err
     )]
-    pub(super) fn build_metadata_scan_plan(&self, shape: &CheckpointShape) -> Result<Option<Plan>> {
+    pub(super) fn build_metadata_scan_plan(
+        &self,
+        shape: &CheckpointShape,
+    ) -> KernelResult<Option<Plan>> {
         let state = &self.state_info;
         // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
         if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
@@ -135,7 +138,7 @@ impl Scan {
     /// When the checkpoint lacks native parsed metadata, `FROM_JSON(add.stats, physical_stats)`
     /// and `MAP_TO_STRUCT(add.partitionValues, physical_partitions)` replace the corresponding
     /// fields above. A parsed field is omitted when its schema is absent.
-    fn checkpoint_arm(&self, shape: &CheckpointShape) -> Result<PlanBuilder> {
+    fn checkpoint_arm(&self, shape: &CheckpointShape) -> KernelResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
         let physical_stats = self.state_info.physical_stats_read_schema();
         let physical_partitions = self.state_info.physical_partition_schema.as_ref();
@@ -204,7 +207,7 @@ impl Scan {
     /// WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
     ///
     /// A parsed field is omitted when its schema is absent.
-    fn commit_arm(&self) -> Result<PlanBuilder> {
+    fn commit_arm(&self) -> KernelResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
         let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
         PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
@@ -236,7 +239,7 @@ impl Scan {
             })
     }
 
-    fn normalized_add_field(&self) -> Result<StructField> {
+    fn normalized_add_field(&self) -> KernelResult<StructField> {
         let physical_stats_read_schema = self.state_info.physical_stats_read_schema();
         let physical_partition_schema = self.state_info.physical_partition_schema.as_ref();
         let patch = SchemaStructPatchBuilder::new()
@@ -279,7 +282,7 @@ impl Scan {
     fn metadata_output_projection(
         &self,
         add_field: &StructField,
-    ) -> Result<(ExpressionRef, SchemaRef)> {
+    ) -> KernelResult<(ExpressionRef, SchemaRef)> {
         let input_schema = schema_ref! { (add_field.clone()) };
         let has_stats_parsed = input_schema.contains_col([ADD_NAME, STATS_PARSED_NAME]);
         let projection = ProjectionStructPatchBuilder::new_nested(&input_schema, [ADD_NAME]);
@@ -346,7 +349,7 @@ fn sidecar_actions(
     root_parts: Vec<ScanFile>,
     action_schema: SchemaRef,
     log_root: &Url,
-) -> Result<PlanBuilder> {
+) -> KernelResult<PlanBuilder> {
     const FILE_PATH: &str = "path";
     const FILE_SIZE: &str = "size";
     const FILE_MOD: &str = "filemod";
@@ -412,7 +415,7 @@ fn json_read_schema(include_remove: bool) -> SchemaRef {
 fn parquet_read_schema(
     physical_stats: Option<&SchemaRef>,
     physical_partitions: Option<&SchemaRef>,
-) -> Result<SchemaRef> {
+) -> KernelResult<SchemaRef> {
     let add_patch = SchemaStructPatchBuilder::new()
         .fold_with(physical_stats, |patch, schema| {
             patch.append(StructField::nullable(STATS_PARSED, schema.as_ref().clone()))
@@ -574,7 +577,7 @@ mod tests {
     use crate::unit_test_utils::{
         create_log_path, MockProtocolBuilder, MockTableConfigurationBuilder,
     };
-    use crate::Engine as _;
+    use crate::{Engine as _, Result};
 
     fn mock_snapshot(log_segment: LogSegment) -> Result<Arc<Snapshot>> {
         let table_configuration = MockTableConfigurationBuilder::new()

@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion};
+use delta_kernel::metrics::WithMetricsReporterLayer;
 use delta_kernel_benchmarks::registry::BenchRegistry;
 use delta_kernel_benchmarks::runners::{
     benchmark_name, configured_benchmark_name, create_read_runner, SnapshotConstructionRunner,
@@ -11,6 +12,7 @@ use delta_kernel_benchmarks::runners::{
 use delta_kernel_benchmarks::utils::load_all_workloads;
 use delta_kernel_workloads::models::{ReadOperation, Spec};
 use test_utils::CountingReporter;
+use tracing_subscriber::util::SubscriberInitExt;
 
 // Checked-in registry mapping each benchmark to its harness configs. Lives under the crate root
 // (not the gitignored, downloaded `workloads/` dir), so it is loaded relative to
@@ -35,6 +37,10 @@ fn workload_benchmarks(c: &mut Criterion) {
         .expect("bench-registry.json must match the loaded workload types");
 
     let reporter = Arc::new(CountingReporter::new());
+    tracing_subscriber::registry()
+        .with_metrics_reporter_layer(reporter.clone())
+        .try_init()
+        .expect("Failed to install benchmark metrics subscriber");
     let runtime = Arc::new(tokio::runtime::Runtime::new().expect("Failed to create tokio runtime"));
 
     for workload in &workloads {

@@ -16,7 +16,7 @@ use crate::scan::log_replay::{
 use crate::schema::ColumnNamesAndTypes;
 use crate::transaction::update::{intermediate_dv_schema, NEW_DELETION_VECTOR_NAME};
 use crate::utils::require;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult};
 
 const PATH: usize = 0;
 const SIZE: usize = 1;
@@ -26,7 +26,7 @@ const OLD_DELETION_VECTOR_STORAGE_TYPE: usize = 4;
 const NEW_DELETION_VECTOR_STORAGE_TYPE: usize = 7;
 const MODIFICATION_TIME_NAME: &str = "modificationTime";
 
-static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<Result<ColumnNamesAndTypes>> =
+static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNamesAndTypes>> =
     LazyLock::new(|| {
         let names = vec![
             column_name!(PATH_NAME),
@@ -49,7 +49,7 @@ pub(crate) fn validate_dv_matched_files(
     dv_matched_files: &[FilteredEngineData],
     physical_partition_columns: impl IntoIterator<Item = String>,
     staged_file_actions: Option<&mut FileActionTracker>,
-) -> Result<()> {
+) -> KernelResult<()> {
     StagedDataValidator::staged_dv_matched_file(physical_partition_columns, staged_file_actions)?
         .validate_filtered(dv_matched_files)
 }
@@ -60,7 +60,11 @@ struct RequiredDvMatchedFileVal {
 }
 
 impl Validation for RequiredDvMatchedFileVal {
-    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn validate_row<'a>(
+        &mut self,
+        row: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> KernelResult<()> {
         let path: &str = getters[PATH]
             .get_opt(row, PATH_NAME)?
             .ok_or_else(|| KernelError::missing_data("AddFile is missing required field 'path'"))?;
@@ -101,7 +105,11 @@ struct RepeatedFileActionValidation<'a> {
 }
 
 impl Validation for RepeatedFileActionValidation<'_> {
-    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn validate_row<'a>(
+        &mut self,
+        row: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> KernelResult<()> {
         let path: &str = getters[PATH].get(row, PATH_NAME)?;
         let old_dv_id = dv_id_at(getters, OLD_DELETION_VECTOR_STORAGE_TYPE, row)?;
         let new_dv_id = dv_id_at(getters, NEW_DELETION_VECTOR_STORAGE_TYPE, row)?;
@@ -114,7 +122,7 @@ impl<'a> StagedDataValidator<'a> {
     fn staged_dv_matched_file(
         physical_partition_columns: impl IntoIterator<Item = String>,
         staged_file_actions: Option<&'a mut FileActionTracker>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let columns = DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION
             .as_ref()
             .map_err(|error| {

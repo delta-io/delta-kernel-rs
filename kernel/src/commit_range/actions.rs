@@ -11,7 +11,7 @@ use crate::path::ParsedLogPath;
 use crate::schema::{lazy_schema_ref, SchemaRef};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{ensure_table_can_be_read, Operation};
-use crate::{Engine, FileDataReadResultIterator, KernelError, Result, Version};
+use crate::{Engine, FileDataReadResultIterator, KernelError, KernelResult, Result, Version};
 
 /// A Delta log action kind.
 ///
@@ -70,7 +70,7 @@ impl CommitAction {
         read_schema: SchemaRef,
         seed_protocol: Option<Protocol>,
         seed_metadata: Option<Metadata>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let timestamp = log_path.location.last_modified;
         let mut this = Self {
             table_root,
@@ -126,7 +126,7 @@ impl CommitAction {
     /// Read the commit header projected to `[protocol, metadata, commitInfo]`, overlay any
     /// `Protocol` / `Metadata` the commit carries onto `self` (a `None` extraction does NOT clear
     /// the inherited value), and return the commit's `inCommitTimestamp` if present.
-    fn read_commit_header(&mut self, engine: &dyn Engine) -> Result<Option<i64>> {
+    fn read_commit_header(&mut self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
         let json_iter = engine.json_handler().read_json_files(
             slice::from_ref(&self.log_path.location),
             HEADER_READ_SCHEMA.clone(),
@@ -176,7 +176,7 @@ impl CommitAction {
         &mut self,
         table_config: &Option<TableConfiguration>,
         extracted_ict: Option<i64>,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let version = self.version();
         self.timestamp = match table_config {
             Some(table_config) => {
@@ -204,7 +204,7 @@ impl CommitAction {
 
     /// Validate that the kernel can read this commit, given the prebuilt effective `table_config`
     /// (present iff both protocol and metadata are known at this commit).
-    fn protocol_validation(&self, table_config: &Option<TableConfiguration>) -> Result<()> {
+    fn protocol_validation(&self, table_config: &Option<TableConfiguration>) -> KernelResult<()> {
         match (table_config, &self.protocol) {
             (Some(table_config), _) => table_config.ensure_operation_supported(Operation::Scan),
             (None, Some(protocol)) => ensure_table_can_be_read(protocol),

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use rstest::rstest;
 use test_utils::add_commit;
 
+use super::{CheckpointActionResolution, LogSegment};
 use crate::engine::sync::SyncEngine;
 #[cfg(feature = "declarative-plans")]
 use crate::engine::test_delegating::DelegatingEngine;
@@ -40,6 +41,17 @@ fn checkpoint_commit(version: i64, extra_features: &[TableFeature], schema: Sche
 fn metadata_commit(schema: SchemaRef) -> String {
     let config = adaptive_metadata_table_configuration(schema, &[]);
     serde_json::json!({ "metaData": config.metadata() }).to_string()
+}
+
+// Builds a commit line with top-level `protocol` and `metaData` from an AMT config, and no
+// checkpoint action, so P&M come from standalone actions.
+fn standalone_pm_commit(schema: SchemaRef) -> String {
+    let config = adaptive_metadata_table_configuration(schema, &[]);
+    format!(
+        "{}\n{}",
+        serde_json::json!({ "protocol": config.protocol() }),
+        serde_json::json!({ "metaData": config.metadata() }),
+    )
 }
 
 // Builds a top-level `protocol` commit line with the given reader/writer versions (no features).
@@ -240,4 +252,195 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
     let schema = snapshot.schema();
     assert!(schema.field("name").is_some());
     assert_eq!(schema.num_fields(), 2);
+}
+
+// A fresh (no-CRC) load runs a full replay that captures the checkpoint action onto the snapshot:
+// `Snapshot::latest_checkpoint_action` returns `Some` with the action's version when a commit
+// carries one, and `None` when P&M come from standalone actions (a replay miss leaves the
+// resolution unset, so the accessor scans and still resolves `None`).
+#[rstest]
+#[case::commit_carries_checkpoint_action(checkpoint_commit(0, &[], one_column_schema()), Some(0))]
+#[case::standalone_pm_has_no_checkpoint_action(standalone_pm_commit(one_column_schema()), None)]
+#[tokio::test]
+async fn replay_captures_latest_checkpoint_action(
+    #[case] commit: String,
+    #[case] expected_version: Option<i64>,
+) {
+    assert_latest_checkpoint_action(&commit, expected_version, non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    assert_latest_checkpoint_action(&commit, expected_version, |store| {
+        SyncEngine::new_with_store(store)
+    })
+    .await;
+}
+
+async fn assert_latest_checkpoint_action<E: Engine>(
+    commit: &str,
+    expected_version: Option<i64>,
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    add_commit(table_root.as_str(), store.as_ref(), 0, commit.to_string())
+        .await
+        .unwrap();
+
+    let engine = make_engine(store);
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+
+    let action = snapshot.latest_checkpoint_action(&engine).unwrap();
+    assert_eq!(action.map(|action| action.version), expected_version);
+}
+
+// A snapshot built without P&M replay (`Snapshot::new`) leaves its checkpoint-action resolution
+// unset, so `latest_checkpoint_action` resolves lazily by scanning the log.
+#[tokio::test]
+async fn latest_checkpoint_action_scans_when_resolution_unknown() {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        0,
+        checkpoint_commit(0, &[], one_column_schema()),
+    )
+    .await
+    .unwrap();
+
+    let engine = non_plan_engine(store);
+    let storage = engine.storage_handler();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
+            .unwrap();
+    let table_configuration = adaptive_metadata_table_configuration(one_column_schema(), &[]);
+    let snapshot = Snapshot::new(log_segment, table_configuration).unwrap();
+
+    let action = snapshot
+        .latest_checkpoint_action(&engine)
+        .unwrap()
+        .expect("lazy scan should find the checkpoint action");
+    assert_eq!(action.version, 0);
+    assert_eq!(action.content_root.path, "metadata/root.parquet");
+}
+
+// `read_protocol_metadata_opt` captures the latest AMT checkpoint action during full replay and
+// reports it on the resolution. Asserts the resolution directly (not the accessor) because the
+// accessor returns the same action whether replay captured it or a later scan found it -- only the
+// resolution shows that replay itself captured it. Runs on both the plan and non-plan paths. Cases:
+// - a single checkpoint commit is captured;
+// - a checkpoint action in a non-first batch is still captured: replay stops only once both P&M are
+//   final, and a newer top-level `metaData` commit does not finalize Protocol, so replay continues
+//   into the older checkpoint commit;
+// - replay that resolves P&M from standalone actions reports no checkpoint action (`None`).
+#[rstest]
+#[case::single_checkpoint_commit(vec![checkpoint_commit(0, &[], one_column_schema())], Some(0))]
+#[case::checkpoint_action_in_non_first_batch(
+    vec![
+        checkpoint_commit(0, &[], one_column_schema()),
+        metadata_commit(test_schema_flat_with_column_mapping()),
+    ],
+    Some(0)
+)]
+#[case::standalone_pm_has_no_checkpoint_action(
+    vec![standalone_pm_commit(one_column_schema())],
+    None
+)]
+#[tokio::test]
+async fn replay_resolves_latest_checkpoint_action(
+    #[case] commits: Vec<String>,
+    #[case] expected_version: Option<i64>,
+) {
+    assert_replay_resolution(&commits, expected_version, non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    assert_replay_resolution(&commits, expected_version, |store| {
+        SyncEngine::new_with_store(store)
+    })
+    .await;
+}
+
+async fn assert_replay_resolution<E: Engine>(
+    commits: &[String],
+    expected_version: Option<i64>,
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    for (version, commit) in commits.iter().enumerate() {
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            version as u64,
+            commit.clone(),
+        )
+        .await
+        .unwrap();
+    }
+
+    let engine = make_engine(store);
+    let storage = engine.storage_handler();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
+            .unwrap();
+
+    let resolution = log_segment
+        .read_protocol_metadata_opt(&engine, None)
+        .unwrap();
+    // No CRC is passed, so replay never produces a `Hint`: only `Captured` or `Unresolved`.
+    let version = match resolution.checkpoint_action {
+        CheckpointActionResolution::Captured(action) => Some(action.version),
+        CheckpointActionResolution::Hint(_) | CheckpointActionResolution::Unresolved => None,
+    };
+    assert_eq!(version, expected_version);
+}
+
+// An incremental update resolves the latest checkpoint action for the updated snapshot: a new
+// commit carrying a newer checkpoint action surfaces that newer action, while a new commit carrying
+// none leaves the update's resolution unset so the accessor scans and still returns the base's
+// older action.
+#[rstest]
+#[case::new_commit_carries_a_newer_action(checkpoint_commit(1, &[], one_column_schema()), 1)]
+#[case::new_commit_carries_no_action(metadata_commit(one_column_schema()), 0)]
+#[tokio::test]
+async fn incremental_update_resolves_latest_checkpoint_action(
+    #[case] new_commit: String,
+    #[case] expected_version: i64,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        0,
+        checkpoint_commit(0, &[], one_column_schema()),
+    )
+    .await
+    .unwrap();
+
+    let engine = non_plan_engine(store.clone());
+    let base = Snapshot::builder_for(table_root.clone())
+        .at_version(0)
+        .build(&engine)
+        .unwrap();
+    assert_eq!(
+        base.latest_checkpoint_action(&engine)
+            .unwrap()
+            .map(|a| a.version),
+        Some(0)
+    );
+
+    add_commit(table_root.as_str(), store.as_ref(), 1, new_commit)
+        .await
+        .unwrap();
+    let updated = Snapshot::builder_from(base).build(&engine).unwrap();
+
+    assert_eq!(updated.version(), 1);
+    assert_eq!(
+        updated
+            .latest_checkpoint_action(&engine)
+            .unwrap()
+            .map(|a| a.version),
+        Some(expected_version)
+    );
 }

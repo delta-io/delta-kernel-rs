@@ -15,7 +15,7 @@ use crate::engine_data::{
 };
 use crate::schema::ColumnName;
 use crate::utils::require;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult, Result};
 
 // actual impls (todo: could macro these)
 
@@ -145,7 +145,7 @@ fn get_list_item<'a>(
     list: &'a impl ListLikeArray,
     row_index: usize,
     field_name: &str,
-) -> Result<Option<ListItem<'a>>> {
+) -> KernelResult<Option<ListItem<'a>>> {
     if !list.is_valid(row_index) {
         return Ok(None);
     }
@@ -159,7 +159,10 @@ fn get_list_item<'a>(
 
 /// Resolves the struct element type of a list-like array, erroring if the elements are not
 /// structs. A non-struct list is a type error for every row, even a null one.
-fn struct_elements<'a>(list: &'a impl ListLikeArray, field_name: &str) -> Result<&'a StructArray> {
+fn struct_elements<'a>(
+    list: &'a impl ListLikeArray,
+    field_name: &str,
+) -> KernelResult<&'a StructArray> {
     list.list_values().as_struct_opt().ok_or_else(|| {
         KernelError::unexpected_column_type(format!("{field_name}: list values are not structs"))
     })
@@ -171,7 +174,7 @@ fn get_struct_list_item<'a>(
     list: &'a impl ListLikeArray,
     row_index: usize,
     field_name: &str,
-) -> Result<Option<StructList<'a>>> {
+) -> KernelResult<Option<StructList<'a>>> {
     struct_elements(list, field_name)?;
     if !list.is_valid(row_index) {
         return Ok(None);
@@ -256,7 +259,7 @@ fn validate_and_get_physical_index(
     run_array: &RunArray<Int64Type>,
     row_index: usize,
     field_name: &str,
-) -> Result<usize> {
+) -> KernelResult<usize> {
     if row_index >= run_array.len() {
         return Err(KernelError::generic(format!(
             "Row index {row_index} out of bounds for field '{field_name}'"

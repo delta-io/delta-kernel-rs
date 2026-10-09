@@ -5,7 +5,7 @@ use crate::engine_data::{GetData, MapItem, TypedGetData as _};
 use crate::expressions::ColumnName;
 use crate::schema::{ColumnNamesAndTypes, StructType};
 use crate::utils::require;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult};
 
 pub(super) const DELETION_VECTOR_NAME: &str = "deletionVector";
 pub(super) const STORAGE_TYPE_NAME: &str = "storageType";
@@ -15,11 +15,11 @@ pub(super) const OFFSET_NAME: &str = "offset";
 pub(super) fn columns_from_schema(
     schema: &StructType,
     names: Vec<ColumnName>,
-) -> Result<ColumnNamesAndTypes> {
+) -> KernelResult<ColumnNamesAndTypes> {
     let types = names
         .iter()
         .map(|name| schema.field_at(name).map(|field| field.data_type().clone()))
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<KernelResult<Vec<_>>>()?;
     Ok((names, types).into())
 }
 
@@ -28,7 +28,7 @@ pub(super) fn dv_id_at<'a>(
     getters: &[&'a dyn GetData<'a>],
     base: usize,
     row: usize,
-) -> Result<Option<String>> {
+) -> KernelResult<Option<String>> {
     deletion_vector_unique_id(
         getters[base].get_opt(row, STORAGE_TYPE_NAME)?,
         getters[base + 1].get_opt(row, PATH_OR_INLINE_DV_NAME)?,
@@ -40,7 +40,7 @@ pub(super) fn validate_required_field_exist<T>(
     value: Option<T>,
     path: &str,
     field: &str,
-) -> Result<T> {
+) -> KernelResult<T> {
     value.ok_or_else(|| {
         KernelError::missing_data(format!(
             "AddFile for '{path}' is missing required field '{field}'"
@@ -52,7 +52,7 @@ pub(super) fn validate_partition_keys(
     path: &str,
     actual_partition_values: MapItem<'_>,
     expected_physical_partition_columns: &HashSet<String>,
-) -> Result<()> {
+) -> KernelResult<()> {
     let actual_keys_vec: Vec<&str> = actual_partition_values.keys().collect();
     let actual_keys_set: HashSet<&str> = actual_keys_vec.iter().copied().collect();
     let keys_match = actual_keys_set.len() == expected_physical_partition_columns.len()
@@ -81,7 +81,7 @@ pub(super) fn deletion_vector_unique_id(
     storage_type: Option<&str>,
     path_or_inline_dv: Option<&str>,
     offset: Option<i32>,
-) -> Result<Option<String>> {
+) -> KernelResult<Option<String>> {
     let Some(storage_type) = storage_type else {
         return Ok(None);
     };

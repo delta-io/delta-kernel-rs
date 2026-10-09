@@ -45,7 +45,7 @@ pub(crate) use writer::try_write_crc_file;
 use crate::actions::LastManifestCommit;
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
-use crate::{KernelError, Result, Version};
+use crate::{KernelError, KernelResult, Result, Version};
 
 // ============================================================================
 // Crc: in-memory representation
@@ -171,8 +171,9 @@ impl Crc {
 
     /// Returns the typed file-stats state. Useful for callers that want to inspect the
     /// variant directly (via `matches!` or the `is_*` predicates).
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn file_stats_state(&self) -> &FileStatsState {
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn file_stats_state(&self) -> &FileStatsState {
         &self.file_stats_state
     }
 
@@ -184,6 +185,42 @@ impl Crc {
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub fn all_files(&self) -> Option<&[Add]> {
         self.all_files.as_deref()
+    }
+
+    /// Returns the transaction identifier, if captured.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn txn_id(&self) -> Option<&str> {
+        self.txn_id.as_deref()
+    }
+
+    /// Returns the captured number of deleted records.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn num_deleted_records(&self) -> Option<i64> {
+        self.num_deleted_records_opt
+    }
+
+    /// Returns the captured number of deletion vectors.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn num_deletion_vectors(&self) -> Option<i64> {
+        self.num_deletion_vectors_opt
+    }
+
+    /// Returns the captured deleted-record-count histogram.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn deleted_record_counts_histogram(&self) -> Option<&DeletedRecordCountsHistogram> {
+        self.deleted_record_counts_histogram_opt.as_ref()
+    }
+
+    /// Returns the latest manifest commit captured by this CRC, if present.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn last_manifest_commit(&self) -> Option<&LastManifestCommit> {
+        self.last_manifest_commit_opt.as_ref()
     }
 }
 
@@ -394,7 +431,7 @@ where
 }
 
 impl Crc {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self) -> KernelResult<()> {
         for (name, value) in [
             ("numDeletedRecordsOpt", self.num_deleted_records_opt),
             ("numDeletionVectorsOpt", self.num_deletion_vectors_opt),
@@ -566,7 +603,7 @@ impl TryFrom<&[Add]> for DerivedDeletionStats {
     }
 }
 
-fn validate_sum(name: &str, values: &[i64], expected: i64) -> Result<()> {
+fn validate_sum(name: &str, values: &[i64], expected: i64) -> KernelResult<()> {
     let actual = checked_sum(name, values.iter().copied())?;
     if actual != expected {
         return Err(KernelError::generic(format!(
@@ -576,7 +613,7 @@ fn validate_sum(name: &str, values: &[i64], expected: i64) -> Result<()> {
     Ok(())
 }
 
-fn checked_sum(name: &str, mut values: impl Iterator<Item = i64>) -> Result<i64> {
+fn checked_sum(name: &str, mut values: impl Iterator<Item = i64>) -> KernelResult<i64> {
     values.try_fold(0_i64, |sum, value| {
         sum.checked_add(value)
             .ok_or_else(|| KernelError::generic(format!("CRC {name} overflow")))
@@ -622,6 +659,13 @@ impl TryFrom<DeletedRecordCountsHistogramRaw> for DeletedRecordCountsHistogram {
 }
 
 impl DeletedRecordCountsHistogram {
+    /// Returns the file counts in the deletion-count bins.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn deleted_record_counts(&self) -> &[i64] {
+        &self.deleted_record_counts
+    }
+
     /// Reconstructs a deleted-record-count histogram from its serialized bins.
     ///
     /// Returns an error unless exactly ten non-negative bin counts are provided.
@@ -634,7 +678,7 @@ impl DeletedRecordCountsHistogram {
         })
     }
 
-    fn try_from_cardinalities(cardinalities: impl IntoIterator<Item = i64>) -> Result<Self> {
+    fn try_from_cardinalities(cardinalities: impl IntoIterator<Item = i64>) -> KernelResult<Self> {
         let mut bins = vec![0; 10];
         for cardinality in cardinalities {
             if cardinality < 0 {
@@ -659,7 +703,7 @@ impl DeletedRecordCountsHistogram {
         Self::try_new(bins)
     }
 
-    fn validate(deleted_record_counts: &[i64]) -> Result<()> {
+    fn validate(deleted_record_counts: &[i64]) -> KernelResult<()> {
         if deleted_record_counts.len() != 10 {
             return Err(KernelError::generic(format!(
                 "deleted-record-count histogram must contain exactly 10 bins, got {}",

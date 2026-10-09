@@ -16,7 +16,7 @@ use crate::engine::arrow_expression::evaluate_expression::{extract_column, extra
 use crate::expressions::ColumnName;
 use crate::plans::ir::nodes::{Agg, Aggregate, NonNullByOperands};
 use crate::schema::DataType;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult, Result};
 
 /// A specific row of input: `(batch index, row index)`.
 type InputRow = (usize, usize);
@@ -43,7 +43,7 @@ trait BoundAggregate {
 pub(super) fn eval_aggregate(
     aggregate: &Aggregate,
     input: &[RecordBatch],
-) -> Result<Vec<RecordBatch>> {
+) -> KernelResult<Vec<RecordBatch>> {
     let ops: Vec<Box<dyn BoundAggregate>> = aggregate
         .aggs
         .iter()
@@ -93,7 +93,7 @@ pub(super) fn eval_aggregate(
 }
 
 // Extracts the named column from each of the input batches
-fn extract_column_values(input: &[RecordBatch], name: &ColumnName) -> Result<Vec<ArrayRef>> {
+fn extract_column_values(input: &[RecordBatch], name: &ColumnName) -> KernelResult<Vec<ArrayRef>> {
     input
         .iter()
         .map(|batch| extract_column(batch, name))
@@ -101,12 +101,12 @@ fn extract_column_values(input: &[RecordBatch], name: &ColumnName) -> Result<Vec
 }
 
 // Thin wrapper around arrow `interleave` that converts our `&[ArrayRef]` into `&[&dyn Array]`
-fn interleave_column_values(arrays: &[ArrayRef], indices: &[InputRow]) -> Result<ArrayRef> {
+fn interleave_column_values(arrays: &[ArrayRef], indices: &[InputRow]) -> KernelResult<ArrayRef> {
     let refs = Vec::from_iter(arrays.iter().map(|c| c.as_ref()));
     Ok(interleave(&refs, indices)?)
 }
 
-fn bind_aggregate(agg: &Agg, output_type: &DataType) -> Result<Box<dyn BoundAggregate>> {
+fn bind_aggregate(agg: &Agg, output_type: &DataType) -> KernelResult<Box<dyn BoundAggregate>> {
     match agg {
         Agg::Min(value) => {
             let op = LongAccumulator::MinMax(Comparison::Min);
@@ -156,7 +156,7 @@ impl LongAccumulatorAgg {
         value: &ColumnName,
         output_type: &DataType,
         op: LongAccumulator,
-    ) -> Result<Box<dyn BoundAggregate>> {
+    ) -> KernelResult<Box<dyn BoundAggregate>> {
         if output_type != &DataType::LONG {
             return Err(KernelError::unsupported(
                 "SyncPlanExecutor min/max/sum aggregate with non-LONG value",
@@ -229,7 +229,7 @@ impl CountAgg {
     fn try_new(
         value: Option<&ColumnName>,
         output_type: &DataType,
-    ) -> Result<Box<dyn BoundAggregate>> {
+    ) -> KernelResult<Box<dyn BoundAggregate>> {
         if output_type != &DataType::LONG {
             return Err(KernelError::unsupported(
                 "SyncPlanExecutor count aggregate with non-LONG output",
@@ -290,7 +290,7 @@ impl NonNullByAgg {
         operands: &NonNullByOperands,
         output_type: &DataType,
         comparison: Comparison,
-    ) -> Result<Box<dyn BoundAggregate>> {
+    ) -> KernelResult<Box<dyn BoundAggregate>> {
         Ok(Box::new(Self {
             value: operands.value.clone(),
             null_sentinel: operands.null_sentinel.clone(),
@@ -354,7 +354,10 @@ impl AggUpdater for NonNullByUpdater<'_> {
     }
 }
 
-fn extract_long_column<'a>(batch: &'a RecordBatch, name: &ColumnName) -> Result<&'a Int64Array> {
+fn extract_long_column<'a>(
+    batch: &'a RecordBatch,
+    name: &ColumnName,
+) -> KernelResult<&'a Int64Array> {
     let array = extract_column_ref(batch, name)?;
     array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
         KernelError::unsupported(format!(
@@ -363,7 +366,7 @@ fn extract_long_column<'a>(batch: &'a RecordBatch, name: &ColumnName) -> Result<
     })
 }
 
-fn downcast_state<T: 'static>(state: &dyn Any) -> Result<&T> {
+fn downcast_state<T: 'static>(state: &dyn Any) -> KernelResult<&T> {
     state.downcast_ref().ok_or_else(|| {
         KernelError::generic(format!(
             "Aggregate state is not a {}",
@@ -372,7 +375,7 @@ fn downcast_state<T: 'static>(state: &dyn Any) -> Result<&T> {
     })
 }
 
-fn downcast_state_mut<T: 'static>(state: &mut dyn Any) -> Result<&mut T> {
+fn downcast_state_mut<T: 'static>(state: &mut dyn Any) -> KernelResult<&mut T> {
     state.downcast_mut().ok_or_else(|| {
         KernelError::generic(format!(
             "Aggregate state is not a {}",

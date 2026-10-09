@@ -41,7 +41,7 @@ use delta_kernel::arrow::array::{
     self as arrow_array, Array, BinaryArray, Int64Array, StringArray, StructArray, UInt64Array,
 };
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
-use delta_kernel::{EngineData, KernelError, Result};
+use delta_kernel::{EngineData, KernelError, KernelResult};
 use derive_more::Constructor;
 use url::Url;
 
@@ -118,7 +118,7 @@ pub struct CFileMetaIterator {
 
 /// Helper function for invokeing an engine iterator's `next` callback and normalizing its
 /// out-pointer result into the next raw item.
-fn next_item<T>(next: CIterNextFn<T>, state: NullableCvoid) -> Option<Result<T>> {
+fn next_item<T>(next: CIterNextFn<T>, state: NullableCvoid) -> Option<KernelResult<T>> {
     let mut out = OptionalValue::Some(EngineExecResult::Uninit);
     next(state, &mut out);
     match out {
@@ -172,7 +172,7 @@ impl FfiEngineDataIter {
 }
 
 impl Iterator for FfiEngineDataIter {
-    type Item = Result<Box<dyn EngineData>>;
+    type Item = KernelResult<Box<dyn EngineData>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // into_inner transfers ownership of the EngineData to kernel, and kernel will free it when
@@ -201,7 +201,7 @@ impl FfiBytesIter {
         }
     }
 
-    fn arrow_array_to_bytes(array: FFI_ArrowArray) -> Result<Bytes> {
+    fn arrow_array_to_bytes(array: FFI_ArrowArray) -> KernelResult<Bytes> {
         let schema = FFI_ArrowSchema::try_from(&ArrowDataType::Binary)?;
         let array_data = unsafe { arrow_ffi::from_ffi(array, &schema) }?;
         let array = arrow_array::make_array(array_data);
@@ -231,7 +231,7 @@ impl FfiBytesIter {
 }
 
 impl Iterator for FfiBytesIter {
-    type Item = Result<Bytes>;
+    type Item = KernelResult<Bytes>;
 
     fn next(&mut self) -> Option<Self::Item> {
         next_item(self.next, self.cleanup.state())
@@ -270,7 +270,7 @@ impl FfiFileMetaIter {
 
     /// The fixed Arrow type expected by [`CFileMetaIterator`]: a non-null struct of
     /// `{location: Utf8, last_modified: Int64, size: UInt64}`, all non-null.
-    fn arrow_schema() -> Result<FFI_ArrowSchema> {
+    fn arrow_schema() -> KernelResult<FFI_ArrowSchema> {
         let schema = ArrowDataType::Struct(Fields::from(vec![
             ArrowField::new("location", ArrowDataType::Utf8, false),
             ArrowField::new("last_modified", ArrowDataType::Int64, false),
@@ -280,7 +280,9 @@ impl FfiFileMetaIter {
     }
 
     /// Decodes a single engine batch into a `Vec<FileMeta>`.
-    fn arrow_array_to_file_metas(array: FFI_ArrowArray) -> Result<Vec<delta_kernel::FileMeta>> {
+    fn arrow_array_to_file_metas(
+        array: FFI_ArrowArray,
+    ) -> KernelResult<Vec<delta_kernel::FileMeta>> {
         let schema = Self::arrow_schema()?;
         let array_data = unsafe { arrow_ffi::from_ffi(array, &schema) }?;
         let array = arrow_array::make_array(array_data);
@@ -345,7 +347,7 @@ impl FfiFileMetaIter {
 }
 
 impl Iterator for FfiFileMetaIter {
-    type Item = Result<delta_kernel::FileMeta>;
+    type Item = KernelResult<delta_kernel::FileMeta>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {

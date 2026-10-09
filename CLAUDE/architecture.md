@@ -35,8 +35,15 @@ snapshot. Its opt-in `skip_new_checkpoints()` mode keeps the input checkpoint an
 the update window so a snapshot-derived `CommitRange` can inspect them without another log
 listing.
 Under `internal-api`, `.with_snapshot_hint(hint)` constructs a snapshot without engine log I/O.
-Kernel validates structural consistency; the connector owns table-root membership,
-protocol/metadata provenance, `max_published_version`, and freshness.
+`SnapshotHint::try_new(table_root, ...)` validates every supplied log path beneath the table's
+`_delta_log` root before grouping and checkpoint selection. Kernel preserves the supplied locations;
+the connector must canonicalize them into the same URL form as the table root. Build checks the
+hint's table membership against the builder's root and validates structural consistency. The
+connector owns protocol/metadata provenance, publication state, and freshness.
+`Snapshot::to_snapshot_hint()` exports retained state without engine I/O, preserving build-time
+freshness, the selected log files and publication watermark, a matching checkpoint hint, and any CRC
+resolved at the snapshot version. It rejects log compactions. The FFI exports one complete borrowed
+typed hint through a callback; connectors must copy any state retained after the callback returns.
 
 **Snapshot loading internals:**
 1. Ordinary builds discover commits and checkpoints through **LogSegment**

@@ -8,7 +8,9 @@ use itertools::Itertools as _;
 use url::Url;
 
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
-use crate::{FileMeta, FileSlice, KernelError, Result, ResultIteratorStatic, StorageHandler};
+use crate::{
+    FileMeta, FileSlice, KernelError, KernelResult, Result, ResultIteratorStatic, StorageHandler,
+};
 
 /// A [`StorageHandler`] that delegates to a [`PlanExecutor`].
 #[derive(Constructor)]
@@ -17,7 +19,7 @@ pub struct PlanBasedStorageHandler {
 }
 
 impl PlanBasedStorageHandler {
-    fn execute_io(&self, op: IoOperation) -> Result<PlanResult> {
+    fn execute_io(&self, op: IoOperation) -> KernelResult<PlanResult> {
         self.executor.execute_op(Operation::IoOperation(op))
     }
 }

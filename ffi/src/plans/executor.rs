@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use delta_kernel::plans::proto::schema as proto_schema;
 use delta_kernel::schema::StructType;
-use delta_kernel::{KernelError, Operation, ParquetFooter, PlanExecutor, PlanResult, Result};
+use delta_kernel::{
+    KernelError, KernelResult, Operation, ParquetFooter, PlanExecutor, PlanResult, Result,
+};
 use delta_kernel_ffi_macros::handle_descriptor;
 use prost::Message as _;
 
@@ -90,7 +92,7 @@ impl PlanExecutor for FfiPlanExecutor {
 /// Consumes the embedded [`ExclusiveRustBytes`](crate::ExclusiveRustBytes) handle carrying
 /// the proto-serialized schema, returning an error if the bytes are not a valid schema proto
 /// message.
-fn decode_parquet_footer(footer: CParquetFooter) -> Result<ParquetFooter> {
+fn decode_parquet_footer(footer: CParquetFooter) -> KernelResult<ParquetFooter> {
     let CParquetFooter { schema_proto } = footer;
     // SAFETY: ExclusiveRustBytes should only have a single owner, so consuming here is safe.
     let bytes = *unsafe { schema_proto.into_inner() };
