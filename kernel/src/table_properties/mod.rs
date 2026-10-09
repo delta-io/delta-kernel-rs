@@ -245,6 +245,12 @@ pub struct TableProperties {
     /// The table's [CHECK constraints], one per `delta.constraints.<name>` property, sorted by
     /// name and then SQL.
     ///
+    /// Kernel follows the protocol's key format strictly and recognizes only the lowercase
+    /// `delta.constraints.` prefix. Delta Spark is more lenient: it also treats keys whose prefix
+    /// differs only in case, such as `DELTA.CONSTRAINTS.<name>`, as constraints and enforces them.
+    /// Kernel doesn't support such keys and leaves them in
+    /// [`unknown_properties`](Self::unknown_properties).
+    ///
     /// [CHECK constraints]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#check-constraints
     pub check_constraints: Vec<CheckConstraint>,
 
