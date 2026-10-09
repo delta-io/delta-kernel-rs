@@ -20,6 +20,22 @@
 //! NOTE: While shared handles could conceptually impl [`Clone`], cloning would require unsafe code
 //! and so we can't actually implement the trait. Use [`Handle::clone_handle`] instead.
 
+use std::ptr::NonNull;
+
+/// Emulates the standard library associated function `Box::into_non_null`, which is not stable
+/// until 1.99+. Call as [`BoxExt::into_non_null`] to avoid `unstable_name_collisions` warnings.
+pub(crate) trait BoxExt<T: ?Sized> {
+    /// Converts `self` into a [`NonNull`] pointer, transferring ownership to the caller.
+    fn into_non_null(self) -> NonNull<T>;
+}
+
+impl<T: ?Sized> BoxExt<T> for Box<T> {
+    fn into_non_null(self) -> NonNull<T> {
+        // SAFETY: `Box::into_raw` never returns a null pointer.
+        unsafe { NonNull::new_unchecked(Box::into_raw(self)) }
+    }
+}
+
 /// Describes the kind of handle a given opaque pointer type represents.
 ///
 /// It is not normally necessary to implement this trait directly; instead, use the provided
@@ -343,7 +359,7 @@ mod private {
         type Raw = T;
 
         fn into_handle_ptr(val: Box<T>) -> NonNull<T> {
-            Box::leak(val).into()
+            BoxExt::into_non_null(val)
         }
         unsafe fn as_ref<'a>(ptr: *const T) -> &'a T {
             &*ptr
@@ -406,7 +422,7 @@ mod private {
 
         fn into_handle_ptr(val: Box<T>) -> NonNull<Box<T>> {
             // Double-boxing needed in order to obtain a thin pointer
-            Box::leak(Box::new(val)).into()
+            BoxExt::into_non_null(Box::new(val))
         }
         unsafe fn as_ref<'a>(ptr: *const Box<T>) -> &'a T {
             let boxed = unsafe { &*ptr };
@@ -439,7 +455,7 @@ mod private {
 
         fn into_handle_ptr(val: Arc<T>) -> NonNull<Arc<T>> {
             // Double-boxing needed in order to obtain a thin pointer
-            Box::leak(Box::new(val)).into()
+            BoxExt::into_non_null(Box::new(val))
         }
         unsafe fn as_ref<'a>(ptr: *const Arc<T>) -> &'a T {
             let arc = unsafe { &*ptr };
@@ -499,6 +515,19 @@ mod tests {
     use delta_kernel_ffi_macros::handle_descriptor;
 
     use super::*;
+
+    // Fails when workspace MSRV is high enough to stabilize `Box::into_non_null`, so that `BoxExt`
+    // trait (and this test) can be removed.
+    #[test]
+    fn box_ext_is_required_by_msrv() {
+        let mut parts = env!("CARGO_PKG_RUST_VERSION").split('.');
+        let major: u32 = parts.next().unwrap().parse().unwrap();
+        let minor: u32 = parts.next().unwrap().parse().unwrap();
+        assert!(
+            (major, minor) < (1, 99),
+            "BoxExt is now obsolete. Delete the trait and use Box::into_non_null instead"
+        );
+    }
 
     #[allow(dead_code)]
     #[derive(Debug)]

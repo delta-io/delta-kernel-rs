@@ -1589,6 +1589,7 @@ dependencies = [
  "tempfile",
  "test_utils",
  "tokio",
+ "tracing-subscriber",
  "unity-catalog-delta-client-api",
  "unity-catalog-delta-rest-client",
  "ureq",
