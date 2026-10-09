@@ -118,6 +118,8 @@ pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
 pub mod transforms;
+#[cfg(feature = "check-constraints-in-dev")]
+pub mod write_expressions;
 
 pub use crc::{FileSizeHistogram, FileStats};
 pub use log_path::LogPath;

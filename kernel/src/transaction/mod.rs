@@ -49,7 +49,11 @@ use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
+#[cfg(feature = "check-constraints-in-dev")]
+use crate::table_properties::CheckConstraint;
 use crate::utils::{require, PhantomType};
+#[cfg(feature = "check-constraints-in-dev")]
+use crate::write_expressions::TableWriteExpressions;
 use crate::{
     create_row, version_as_i64, DataType, Engine, EngineData, Expression, FileMeta, KernelResult,
     KernelResultIterator, Predicate, Result, RowVisitor, Version,
@@ -277,6 +281,10 @@ pub struct Transaction<S = ExistingTable> {
     // handling. Whether the connector acknowledged responsibility for applying column
     // defaults.
     column_defaults_acknowledged: bool,
+    // Whether the connector acknowledged responsibility for enforcing this table's CHECK
+    // constraints.
+    #[cfg(feature = "check-constraints-in-dev")]
+    check_constraints_acknowledged: bool,
     // Whether the connector acknowledged responsibility for preserving Row IDs and Row Commit
     // Versions.
     row_tracking_preservation_acknowledged: bool,
@@ -324,6 +332,16 @@ impl<S> std::fmt::Debug for Transaction<S> {
             version_info,
             self.engine_info.is_some()
         ))
+    }
+}
+
+#[cfg(feature = "check-constraints-in-dev")]
+impl<S> TableWriteExpressions for Transaction<S> {
+    fn check_constraints(&self) -> &[CheckConstraint] {
+        &self
+            .effective_table_config
+            .table_properties()
+            .check_constraints
     }
 }
 
@@ -489,6 +507,31 @@ impl<S> Transaction<S> {
 // Shared methods available on ALL transaction types
 // =============================================================================
 impl<S> Transaction<S> {
+    /// Acknowledges that the connector enforces this table's CHECK constraints.
+    ///
+    /// Kernel does not see the rows a connector writes, so it does not evaluate constraints. The
+    /// connector must:
+    /// - Discover the constraints of this transaction via
+    ///   [`TableWriteExpressions::check_constraints`] and parse each one's
+    ///   [`raw_sql`](crate::table_properties::CheckConstraint::raw_sql) itself. The SQL refers to
+    ///   logical column names.
+    /// - Reject every written row, including its partition values, for which a constraint evaluates
+    ///   to `false` or `NULL`. This includes files written for an earlier commit attempt, such as
+    ///   one that conflicted, and validated against an older table version.
+    /// - When the commit introduces a constraint, verify that its SQL is a Boolean expression that
+    ///   only references existing logical columns, as the Delta protocol requires. Kernel checks
+    ///   neither, so this also applies to a table that holds no data.
+    /// - When the commit introduces a constraint on a table that already holds data, verify that
+    ///   every existing row satisfies it.
+    ///
+    /// The acknowledgement covers whatever this transaction commits. Without it, on a table that
+    /// has CHECK constraints once this transaction commits,
+    /// [`write_state`](Transaction::write_state) and [`commit`](Self::commit) fail.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn ack_check_constraints(&mut self) {
+        self.check_constraints_acknowledged = true;
+    }
+
     /// Set the data change flag.
     ///
     /// True indicates this commit is a "data changing" commit. False indicates table data was
@@ -750,10 +793,12 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// configuration.
     ///
     /// Returns an error if the table has an empty or unsupported schema, or if the table declares
-    /// column defaults that the connector has not acknowledged.
+    /// column defaults or CHECK constraints that the connector has not acknowledged.
     pub fn write_state(&self) -> Result<Arc<WriteState>> {
         self.ensure_schema_non_empty_for_write_state()?;
         self.ensure_column_defaults_acknowledged()?;
+        #[cfg(feature = "check-constraints-in-dev")]
+        self.ensure_check_constraints_acknowledged()?;
         self.validate_for_data_write()?;
         // The effective table configuration can change while building a transaction, so this
         // state must be derived on demand rather than cached on the transaction. TODO(#3149):
@@ -1020,6 +1065,22 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
+    /// Rejects writing to or committing to a table with CHECK constraints when the connector has
+    /// not acknowledged enforcing them. The table's constraints are those it has once this
+    /// transaction commits.
+    #[cfg(feature = "check-constraints-in-dev")]
+    fn ensure_check_constraints_acknowledged(&self) -> KernelResult<()> {
+        require!(
+            !self.effective_table_config.has_check_constraints()
+                || self.check_constraints_acknowledged,
+            KernelError::invalid_transaction_state(
+                "Writing to a table with CHECK constraints requires calling \
+                 Transaction::ack_check_constraints() first",
+            )
+        );
+        Ok(())
+    }
+
     fn ensure_row_tracking_preservation_acknowledged(&self) -> KernelResult<()> {
         if !self
             .effective_table_config
@@ -1117,6 +1178,9 @@ impl<S> Transaction<S> {
                 .validate_feature_support_for_remove()?;
             self.ensure_row_tracking_preservation_acknowledged()?;
         }
+
+        #[cfg(feature = "check-constraints-in-dev")]
+        self.ensure_check_constraints_acknowledged()?;
 
         // TODO(zach): we currently do this in two passes - can we do it in one and still keep refs
         // in the HashSet?

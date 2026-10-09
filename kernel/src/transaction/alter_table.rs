@@ -70,6 +70,8 @@ impl AlterTableTransaction {
             user_domain_removals: vec![],
             data_change: false,
             column_defaults_acknowledged: false,
+            #[cfg(feature = "check-constraints-in-dev")]
+            check_constraints_acknowledged: false,
             row_tracking_preservation_acknowledged: false,
             engine_commit_info: None,
             // TODO(#2446): match delta-spark's per-op isBlindAppend policy

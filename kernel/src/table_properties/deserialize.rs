@@ -30,6 +30,10 @@ where
             try_parse(&mut props, k.as_ref(), v.as_ref()).is_none()
         });
         props.unknown_properties = unparsed.map(|(k, v)| (k.into(), v.into())).collect();
+        // The configuration has no defined order, so sort to make equal configurations parse equal.
+        props
+            .check_constraints
+            .sort_by(|a, b| (&a.name, &a.raw_sql).cmp(&(&b.name, &b.raw_sql)));
         props
     }
 }
@@ -104,7 +108,13 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP => {
             props.in_commit_timestamp_enablement_timestamp = Some(parse_non_negative(v)?)
         }
-        _ => return None,
+        _ => {
+            let name = strip_check_constraint_prefix(k)?;
+            props.check_constraints.push(CheckConstraint {
+                name: name.to_string(),
+                raw_sql: v.to_string(),
+            });
+        }
     }
     Some(())
 }
