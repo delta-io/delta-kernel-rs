@@ -1211,14 +1211,10 @@ impl ScanLogReplayProcessor {
     }
 
     fn build_selection_vector(&self, batch: &dyn EngineData) -> Result<Vec<bool>> {
-        match self.data_skipping_filter() {
+        match &self.data_skipping_filter {
             Some(filter) => filter.apply(batch),
             None => Ok(vec![true; batch.len()]),
         }
-    }
-
-    fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
-        self.data_skipping_filter.as_ref()
     }
 }
 
