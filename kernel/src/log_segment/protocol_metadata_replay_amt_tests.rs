@@ -4,13 +4,16 @@
 use std::sync::Arc;
 
 use rstest::rstest;
-use test_utils::add_commit;
+use test_utils::{add_commit, delta_path_for_version};
 
 use super::{CheckpointActionResolution, LogSegment};
+use crate::actions::LastManifestCommit;
+use crate::crc::{Crc, FileStats, FileStatsState};
 use crate::engine::sync::SyncEngine;
 #[cfg(feature = "declarative-plans")]
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::object_store::memory::InMemory;
+use crate::object_store::ObjectStoreExt as _;
 use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
 use crate::unit_test_utils::{
@@ -443,4 +446,101 @@ async fn incremental_update_resolves_latest_checkpoint_action(
             .map(|a| a.version),
         Some(expected_version)
     );
+}
+
+// A CRC at the target version carrying `lastManifestCommit` makes `latest_checkpoint_action` read
+// only the commit it points at, scanning the log when that commit does not carry the hinted action.
+// Each case has a checkpoint commit at v0, the given v1, and a CRC at v1 pointing at
+// `hinted_version`. `hint_is_read_instead_of_scanning` points at the older v0 action while v1
+// carries a newer one, so returning v0 proves the hint was followed rather than a scan.
+#[rstest]
+#[case::hint_names_latest_manifest_commit(checkpoint_commit(1, &[], one_column_schema()), 1, 1)]
+#[case::hint_is_read_instead_of_scanning(checkpoint_commit(1, &[], one_column_schema()), 0, 0)]
+#[case::hinted_commit_without_action_scans(metadata_commit(one_column_schema()), 1, 0)]
+#[case::hinted_commit_with_other_version_scans(checkpoint_commit(0, &[], one_column_schema()), 1, 0)]
+#[tokio::test]
+async fn latest_checkpoint_action_reads_commit_named_by_crc_hint(
+    #[case] v1: String,
+    #[case] hinted_version: i64,
+    #[case] expected_version: i64,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        0,
+        checkpoint_commit(0, &[], one_column_schema()),
+    )
+    .await
+    .unwrap();
+    add_commit(table_root.as_str(), store.as_ref(), 1, v1)
+        .await
+        .unwrap();
+    put_crc_with_hint(&store, 1, hinted_version).await;
+
+    let engine = non_plan_engine(store);
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+
+    let action = snapshot.latest_checkpoint_action(&engine).unwrap();
+    assert_eq!(action.map(|a| a.version), Some(expected_version));
+}
+
+// A hint naming a commit outside the segment's commit list cannot vouch for the latest action in
+// this segment, so the lookup falls back to scanning. The segment keeps only v1, so the hinted v0
+// is not listed and the scan finds v1's action.
+#[tokio::test]
+async fn find_last_checkpoint_action_scans_when_hinted_commit_is_not_listed() {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    for version in 0..2 {
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            version,
+            checkpoint_commit(version as i64, &[], one_column_schema()),
+        )
+        .await
+        .unwrap();
+    }
+
+    let engine = non_plan_engine(store);
+    let storage = engine.storage_handler();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
+            .unwrap()
+            .segment_after_version(0);
+
+    let hint = LastManifestCommit::new(0, 0).unwrap();
+    let action = log_segment
+        .find_last_checkpoint_action(&engine, Some(&hint))
+        .unwrap()
+        .expect("scan should find v1's checkpoint action");
+    assert_eq!(action.version, 1);
+}
+
+// Writes a CRC at `version` whose `lastManifestCommit` points at the manifest commit at
+// `hinted_version`.
+async fn put_crc_with_hint(store: &InMemory, version: u64, hinted_version: i64) {
+    let config = adaptive_metadata_table_configuration(one_column_schema(), &[]);
+    let crc = Crc {
+        version,
+        protocol: config.protocol().clone(),
+        metadata: config.metadata().clone(),
+        file_stats_state: FileStatsState::Complete(FileStats::try_new(0, 0, None).unwrap()),
+        // AMT config enables ICT, so the CRC must carry an inCommitTimestampOpt.
+        in_commit_timestamp_opt: Some(1000),
+        last_manifest_commit_opt: Some(
+            LastManifestCommit::new(hinted_version, hinted_version).unwrap(),
+        ),
+        ..Default::default()
+    };
+    store
+        .put(
+            &delta_path_for_version(version, "crc"),
+            serde_json::to_vec(&crc).unwrap().into(),
+        )
+        .await
+        .unwrap();
 }

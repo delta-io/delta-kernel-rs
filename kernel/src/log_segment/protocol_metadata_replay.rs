@@ -293,11 +293,7 @@ pub(crate) enum CheckpointActionResolution {
     /// Not captured, but the CRC carries a [`LastManifestCommit`] pointer to the commit that
     /// emitted the latest checkpoint action, letting a consumer resolve it from that one commit
     /// instead of a full log scan.
-    //
-    // TODO(#3495): the pointer is carried but not yet read -- `Snapshot::latest_checkpoint_action`
-    // still falls back to a full scan on `Hint`. Resolving the action from the pointed commit will
-    // consume it; `#[allow(dead_code)]` holds the field until then.
-    Hint(#[allow(dead_code)] LastManifestCommit),
+    Hint(LastManifestCommit),
     /// Replay did not settle it and no pointer is available -- a miss, which does not prove
     /// absence since replay can stop early. Consumers fall back to a log scan.
     Unresolved,
