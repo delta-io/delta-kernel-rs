@@ -39,8 +39,8 @@ pub(crate) struct ReadContext {
     pub(crate) data_change: bool,
 }
 
-/// Caller-supplied expressions for columns that translation changes between Root and Leaf
-/// nodes in the AMT.
+/// Expressions for the `Add` row-tracking fields whose source differs between root and leaf
+/// manifests (a leaf entry inherits them from its parent).
 struct AddFieldSources {
     /// Expression producing `Add.baseRowId`.
     base_row_id: Expression,
@@ -131,8 +131,8 @@ fn convert_entries_with(
 /// Builds the transform mapping a [`ContentTreeNodeEntry`] row to a `{ add: Add }` struct matching
 /// [`crate::actions::LOG_ADD_SCHEMA`].
 ///
-/// ctx provides constants that aren't available in the AMT today.
-/// sources allows for differing logic between root and leaf translation.
+/// `ctx` supplies the fields the AMT entry cannot; `sources` supplies the row-tracking fields
+/// whose derivation differs between root and leaf entries.
 fn build_entry_to_add_expression(
     ctx: &ReadContext,
     sources: &AddFieldSources,
