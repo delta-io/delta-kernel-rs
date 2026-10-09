@@ -42,6 +42,7 @@ engine automatically activates the same version on `delta_kernel` (the two crate
 | `default-engine-base` | Shared Arrow modules used by the default engine. Pulled in automatically by `delta_kernel_default_engine`. |
 | `arrow-60` / `arrow-59` | Pin the Arrow version used by Kernel's arrow modules. |
 | `schema-diff` | Experimental schema diffing. |
+| `check-constraints-in-dev` | Experimental CHECK constraint support: discovery, connector acknowledgement, declaring constraints at table creation, and adding or dropping them on existing tables. See [Check constraints](../writing/check_constraints.md). |
 | `internal-api` | Expose additional APIs that aren't yet stabilized. Some examples in this guide need this. |
 | `prettyprint` | Arrow pretty-print helpers. Useful for debugging and examples. |
 | `test-utils` | Test-only constructors for downstream crate tests. Pulls in `prettyprint`. Not for production use. |

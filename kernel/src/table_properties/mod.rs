@@ -66,6 +66,7 @@ pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION: &str =
     "delta.inCommitTimestampEnablementVersion";
 pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP: &str =
     "delta.inCommitTimestampEnablementTimestamp";
+pub(crate) const CHECK_CONSTRAINT_PREFIX: &str = "delta.constraints.";
 
 /// Delta table properties. These are parsed from the 'configuration' map in the most recent
 /// 'Metadata' action of a table.
@@ -241,6 +242,18 @@ pub struct TableProperties {
     /// same as the inCommitTimestamp of the commit when this feature was enabled.
     pub in_commit_timestamp_enablement_timestamp: Option<i64>,
 
+    /// The table's [CHECK constraints], one per `delta.constraints.<name>` property, sorted by
+    /// name and then SQL.
+    ///
+    /// Kernel follows the protocol's key format strictly and recognizes only the lowercase
+    /// `delta.constraints.` prefix. Delta Spark is more lenient: it also treats keys whose prefix
+    /// differs only in case, such as `DELTA.CONSTRAINTS.<name>`, as constraints and enforces them.
+    /// Kernel doesn't support such keys and leaves them in
+    /// [`unknown_properties`](Self::unknown_properties).
+    ///
+    /// [CHECK constraints]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#check-constraints
+    pub check_constraints: Vec<CheckConstraint>,
+
     /// any unrecognized properties are passed through and ignored by the parser
     pub unknown_properties: HashMap<String, String>,
 }
@@ -385,9 +398,41 @@ pub enum ParquetCompressionCodec {
     Lz4Raw,
 }
 
+/// One CHECK constraint: its name and the raw SQL stored under `delta.constraints.<name>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckConstraint {
+    name: String,
+    raw_sql: String,
+}
+
+impl CheckConstraint {
+    /// The constraint's name: the `<name>` suffix of its `delta.constraints.<name>` config key.
+    /// Empty for a constraint stored under the bare `delta.constraints.` key.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The constraint's boolean SQL expression, verbatim from the table configuration.
+    pub fn raw_sql(&self) -> &str {
+        &self.raw_sql
+    }
+}
+
+/// Returns the CHECK constraint name for a `delta.constraints.<name>` configuration key, or `None`
+/// for any other key.
+///
+/// The prefix must be lowercase, as in the Delta protocol's key format, and the name keeps its
+/// original case. The bare prefix yields an empty name, because other Delta writers enforce such a
+/// key as a constraint.
+pub(crate) fn strip_check_constraint_prefix(key: &str) -> Option<&str> {
+    key.strip_prefix(CHECK_CONSTRAINT_PREFIX)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    use rstest::rstest;
 
     use super::*;
     use crate::expressions::column_name;
@@ -658,8 +703,65 @@ mod tests {
             parquet_format_version: Some("2.12.0".to_string()),
             parquet_compression_codec: Some(ParquetCompressionCodec::Zstd),
             in_commit_timestamp_enablement_timestamp: Some(1_612_345_678),
+            check_constraints: vec![],
             unknown_properties: HashMap::new(),
         };
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn check_constraint_keys_parse_into_check_constraints_sorted_by_name() {
+        let config = [
+            ("delta.constraints.positive", "amount > 1"),
+            // A case variant of the name above and the bare prefix, which other Delta writers can
+            // store and enforce.
+            ("delta.constraints.POSITIVE", "amount > 0"),
+            ("delta.constraints.", "1 > 0"),
+            // Not CHECK constraints, so they stay in `unknown_properties`.
+            ("custom.key", "value"),
+            ("DELTA.CONSTRAINTS.positive", "amount > 2"),
+        ];
+
+        let props = TableProperties::from(config);
+
+        let constraints: Vec<_> = props
+            .check_constraints
+            .iter()
+            .map(|constraint| (constraint.name(), constraint.raw_sql()))
+            .collect();
+        let expected_constraints = [
+            ("", "1 > 0"),
+            ("POSITIVE", "amount > 0"),
+            ("positive", "amount > 1"),
+        ];
+        assert_eq!(constraints, expected_constraints);
+        let expected_unknown = HashMap::from([
+            ("custom.key".to_string(), "value".to_string()),
+            (
+                "DELTA.CONSTRAINTS.positive".to_string(),
+                "amount > 2".to_string(),
+            ),
+        ]);
+        assert_eq!(props.unknown_properties, expected_unknown);
+    }
+
+    #[rstest]
+    // Names a user would expect.
+    #[case::lowercase_prefix("delta.constraints.c1", Some("c1"))]
+    #[case::name_case_preserved("delta.constraints.MyCheck", Some("MyCheck"))]
+    // Unusual names, accepted only because other Delta writers can store and enforce them.
+    #[case::whitespace_name("delta.constraints. ", Some(" "))]
+    #[case::whitespace_only_name("delta.constraints.   ", Some("   "))]
+    #[case::bare_prefix_empty_name("delta.constraints.", Some(""))]
+    // Keys that are not CHECK constraints. The prefix must be lowercase.
+    #[case::uppercase_prefix("DELTA.CONSTRAINTS.c1", None)]
+    #[case::mixed_case_prefix("Delta.Constraints.c1", None)]
+    #[case::uppercase_bare_prefix("DELTA.CONSTRAINTS.", None)]
+    #[case::unrecognized_long_key("delta.someOtherKey", None)]
+    #[case::prefix_without_trailing_dot("delta.constraintsX", None)]
+    #[case::too_short_for_prefix("delta.con", None)]
+    fn check_constraint_prefix_matching(#[case] key: &str, #[case] expected_name: Option<&str>) {
+        let name = strip_check_constraint_prefix(key);
+        assert_eq!(name, expected_name);
     }
 }
