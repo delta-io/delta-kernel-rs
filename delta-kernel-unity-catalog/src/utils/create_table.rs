@@ -199,6 +199,7 @@ mod tests {
     use delta_kernel::snapshot::Snapshot;
     use delta_kernel::transaction::create_table::create_table;
     use delta_kernel::transaction::data_layout::DataLayout;
+    use delta_kernel::transaction::UpdateTableOperation;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use test_utils::TestCatalogCommitter;
@@ -344,9 +345,9 @@ mod tests {
         );
         create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
+            .with_domain_metadata("myApp.retention", r#"{"days":30}"#)
             .build(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
-            .with_domain_metadata("myApp.retention".to_string(), r#"{"days":30}"#.to_string())
             .commit(&engine)
             .unwrap()
             .unwrap_committed();
@@ -427,7 +428,9 @@ mod tests {
             .build(&engine)
             .unwrap();
         let result = v0_snapshot
-            .transaction(Box::new(TestCatalogCommitter), &engine)
+            .transaction_builder()
+            .with_operation(UpdateTableOperation::Write)
+            .build(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
             .commit(&engine)
             .unwrap();

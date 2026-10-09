@@ -30,6 +30,7 @@ use crate::object_store::ObjectStoreExt as _;
 use crate::schema::{schema_ref, DataType as KernelDataType, StructField};
 use crate::table_features::TableFeature;
 use crate::transaction::create_table::create_table;
+use crate::transaction::UpdateTableOperation;
 use crate::unit_test_utils::Action;
 use crate::{FileMeta, KernelResult, LogPath, Result, Snapshot};
 
@@ -853,10 +854,12 @@ async fn test_checkpoint_preserves_domain_metadata() -> Result<()> {
 
     let commit_domain_metadata = |domain: &str, value: &str| -> Result<()> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        let result = txn
-            .with_domain_metadata(domain.to_string(), value.to_string())
-            .commit(&engine)?;
+        let txn = snapshot
+            .transaction_builder()
+            .with_operation(UpdateTableOperation::Write)
+            .with_domain_metadata(domain, value)
+            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        let result = txn.commit(&engine)?;
         assert!(result.is_committed());
         Ok(())
     };
@@ -929,10 +932,12 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> Result<()> {
 
     // ===== Commit domain metadata for "foo" =====
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-    let result = txn
-        .with_domain_metadata("foo".to_string(), "bar".to_string())
-        .commit(&engine)?;
+    let txn = snapshot
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
+        .with_domain_metadata("foo", "bar")
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    let result = txn.commit(&engine)?;
     assert!(result.is_committed());
 
     // Verify domain exists before removal
@@ -944,9 +949,11 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> Result<()> {
 
     // ===== Remove domain metadata for "foo" (tombstone) =====
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-    let result = txn
-        .with_domain_metadata_removed("foo".to_string())
+    let result = snapshot
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
+        .with_domain_metadata_removed("foo")
+        .build(&engine, Box::new(FileSystemCommitter::new()))?
         .commit(&engine)?;
     assert!(result.is_committed());
 

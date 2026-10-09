@@ -1,14 +1,16 @@
 //! Tests for `adaptiveMetadata-preview` manifest (content-tree) commits and root manifest file
 //! commits.
 
-use super::super::{ManifestCommitState, ManifestWrite, SchemaOperation, Transaction};
+use super::super::{ManifestCommitState, ManifestWrite, Transaction, UpdateTableOperation};
 use super::{add_dummy_file, create_existing_table_txn};
 use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
+use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::schema::{DataType, StructField};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::TableFeature;
+use crate::table_features::{find_max_column_id_in_schema, TableFeature};
+use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     minimal_checkpoint_action, setup_table, write_commit,
 };
@@ -196,30 +198,32 @@ fn new_leaf_node_writer_uses_effective_config_schema_not_snapshot() -> Result<()
 }
 
 #[test]
-fn with_schema_changes_rejects_after_staging_manifest_commit() -> Result<()> {
-    let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-    txn.effective_table_config = adaptive_table_config();
-    txn.with_manifest_commit(engine.as_ref())?;
-    let result = txn.with_schema_changes(vec![SchemaOperation::add_column(
-        None,
-        StructField::nullable("fresh_column", DataType::INTEGER),
-    )]);
-    assert_result_error_with_message(result, "after staging a manifest commit");
-    Ok(())
-}
-
-#[test]
 fn manifest_commit_after_schema_change_uses_evolved_schema() -> Result<()> {
-    let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-    txn.effective_table_config = adaptive_table_config();
-    let mut txn = txn.with_schema_changes(vec![SchemaOperation::add_column(
-        None,
-        StructField::nullable("fresh_column", DataType::INTEGER),
-    )])?;
+    let (engine, table_root) = setup_table()?;
+    let mut checkpoint = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
+    let max_column_id = find_max_column_id_in_schema(&checkpoint.metadata.parse_schema()?)
+        .expect("checkpoint fixture uses column mapping");
+    checkpoint.metadata = checkpoint
+        .metadata
+        .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, max_column_id.to_string());
+    write_commit(
+        &engine,
+        &table_root,
+        1,
+        checkpoint.into_engine_data(&engine)?,
+    )?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let initial_schema = snapshot.table_configuration().physical_schema();
+    let mut txn = snapshot
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::AlterTable)
+        .add_column(StructField::nullable("fresh_column", DataType::INTEGER))
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
     let expected = txn.effective_table_config.physical_schema();
+    assert_ne!(expected, initial_schema);
     let writer = txn
-        .with_manifest_commit(engine.as_ref())?
-        .new_leaf_node_writer(engine.as_ref());
+        .with_manifest_commit(&engine)?
+        .new_leaf_node_writer(&engine);
     assert_eq!(writer.physical_schema(), &expected);
     Ok(())
 }

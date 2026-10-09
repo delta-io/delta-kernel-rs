@@ -246,7 +246,10 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     /// Add action metadata ready for [`Transaction::add_files`].
     ///
     /// Note that the schema does not contain the dataChange column. In order to set `data_change`
-    /// flag, use [`delta_kernel::transaction::Transaction::with_data_change`].
+    /// flag, use
+    /// [`UpdateTableTransactionBuilder::with_data_change`][with_data_change].
+    ///
+    /// [with_data_change]: delta_kernel::transaction::UpdateTableTransactionBuilder::with_data_change
     ///
     /// [`BoundWriteContext::write_dir`]: delta_kernel::transaction::BoundWriteContext::write_dir
     /// [`Transaction::add_files`]: delta_kernel::transaction::Transaction::add_files

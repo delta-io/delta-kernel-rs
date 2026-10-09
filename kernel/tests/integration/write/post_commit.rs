@@ -14,7 +14,7 @@ use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Result, Snapshot};
 use tempfile::tempdir;
 use test_utils::{
-    begin_transaction, create_default_engine, setup_test_tables, write_batch_to_table,
+    begin_transaction_with, create_default_engine, setup_test_tables, write_batch_to_table,
 };
 use url::Url;
 
@@ -56,8 +56,9 @@ async fn test_post_commit_snapshot_create_then_insert() -> Result<()> {
     for i in 1..11 {
         let base_version = current_snapshot.version();
 
-        let txn =
-            begin_transaction(current_snapshot.clone(), engine.as_ref())?.with_engine_info("test");
+        let txn = begin_transaction_with(current_snapshot.clone(), engine.as_ref(), |builder| {
+            builder.with_engine_info("test")
+        })?;
 
         match txn.commit(engine.as_ref())? {
             CommitResult::Committed(committed) => {
@@ -129,7 +130,9 @@ async fn test_write_context_builder_rejects_partition_values_on_unpartitioned_ta
         setup_test_tables(schema.clone(), &[], None, "test_partition_reject").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = begin_transaction(snapshot.clone(), &engine)?.with_engine_info("test");
+        let txn = begin_transaction_with(snapshot.clone(), &engine, |builder| {
+            builder.with_engine_info("test")
+        })?;
         let write_state = txn.write_state()?;
 
         let result = write_state

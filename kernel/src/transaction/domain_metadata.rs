@@ -248,3 +248,18 @@ impl<S> Transaction<S> {
         Ok(dm_actions_vec)
     }
 }
+
+/// Returns the unique domains, or the caller's error for the first duplicate.
+pub(super) fn validate_unique_domains<'a>(
+    domains: impl IntoIterator<Item = &'a str>,
+    duplicate_error: impl FnOnce(&str) -> KernelError,
+) -> KernelResult<HashSet<&'a str>> {
+    let domains = domains.into_iter();
+    let mut seen = HashSet::with_capacity(domains.size_hint().0);
+    for domain in domains {
+        if !seen.insert(domain) {
+            return Err(duplicate_error(domain));
+        }
+    }
+    Ok(seen)
+}

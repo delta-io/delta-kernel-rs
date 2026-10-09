@@ -220,11 +220,28 @@ int main(int argc, char* argv[])
 
     SharedSnapshot* snapshot = snapshot_res.ok;
 
-    // Create a transaction with the UC committer
-    ExternResultHandleExclusiveTransaction txn_res =
-      transaction_with_committer(snapshot, engine, uc_committer);
+    HandleExclusiveUpdateTableTransactionBuilder txn_builder =
+        new_update_table_txn_builder(snapshot);
+    txn_builder = update_table_txn_builder_with_operation(
+        txn_builder, KernelUpdateTableOperationWrite);
+    const char* engine_info = "uc_example_engine";
+    KernelStringSlice engine_info_slice = { .ptr = engine_info, .len = strlen(engine_info) };
+    ExternResultHandleExclusiveUpdateTableTransactionBuilder builder_with_info_res =
+        update_table_txn_builder_with_engine_info(txn_builder, engine_info_slice, engine);
+    if (builder_with_info_res.tag != OkHandleExclusiveUpdateTableTransactionBuilder) {
+        print_error("Failed to set builder engine info", (Error*)builder_with_info_res.err);
+        free_error((Error*)builder_with_info_res.err);
+        free_engine(engine);
+        free_uc_committer(uc_committer);
+        free_uc_commit_client(uc_client);
+        free_snapshot(snapshot);
+        return -1;
+    }
+    ExternResultHandleExclusiveUpdateTableTransaction txn_res =
+      update_table_txn_builder_build_with_committer(
+          builder_with_info_res.ok, engine, uc_committer);
 
-    if (txn_res.tag != OkHandleExclusiveTransaction) {
+    if (txn_res.tag != OkHandleExclusiveUpdateTableTransaction) {
         print_error("Failed to create transaction with UC committer", (Error*)txn_res.err);
         free_error((Error*)txn_res.err);
         free_engine(engine);
@@ -233,29 +250,11 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    HandleExclusiveTransaction txn = txn_res.ok;
+    HandleExclusiveUpdateTableTransaction txn_with_info = txn_res.ok;
 
-    // In a real txn we could now add files using add_files()
-
-    // Add engine info to the transaction
-    const char* engine_info = "uc_example_engine";
-    KernelStringSlice engine_info_slice = { .ptr = engine_info, .len = strlen(engine_info) };
-
-    ExternResultHandleExclusiveTransaction txn_with_info_res =
-        with_engine_info(txn, engine_info_slice, engine);
-
-    if (txn_with_info_res.tag != OkHandleExclusiveTransaction) {
-        print_error("Failed to set engine info", (Error*)txn_with_info_res.err);
-        free_error((Error*)txn_with_info_res.err);
-        free_engine(engine);
-        free_uc_commit_client(uc_client);
-        free_snapshot(snapshot);
-        return -1;
-    }
-
-    HandleExclusiveTransaction txn_with_info = txn_with_info_res.ok;
+    // In a real txn we could now add files using update_table_txn_add_files().
     // calling commit here will end up calling our callback
-    ExternResultHandleExclusiveCommittedTransaction commit_res = commit(txn_with_info, engine);
+    ExternResultHandleExclusiveCommittedTransaction commit_res = update_table_txn_commit(txn_with_info, engine);
 
     if (commit_res.tag != OkHandleExclusiveCommittedTransaction) {
         print_error("Commit failed", (Error*)commit_res.err);
@@ -272,7 +271,7 @@ int main(int argc, char* argv[])
     free_committed_transaction(committed);
 
     // Cleanup
-    // Note: txn_with_info was consumed by commit(), so we don't free it
+    // Note: txn_with_info was consumed by update_table_txn_commit(), so we don't free it
     free_engine(engine);
     free_uc_commit_client(uc_client);
     free_snapshot(snapshot);

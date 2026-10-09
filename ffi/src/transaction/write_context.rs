@@ -9,7 +9,7 @@ use delta_kernel::{KernelError, KernelResult};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use super::partition_value::{ExclusivePartitionValueMap, PartitionValueMap};
-use super::{ExclusiveCreateTransaction, ExclusiveTransaction};
+use super::{ExclusiveCreateTableTransaction, ExclusiveUpdateTableTransaction};
 use crate::delta_types::{FfiColumnName, FfiColumnNameArray, FfiStringArray};
 use crate::error::{ExternResult, IntoExternResult};
 use crate::expressions::SharedExpression;
@@ -50,14 +50,14 @@ pub struct FfiRowTrackingMetadataColumns {
 
 /// Returns owned write state for an existing-table transaction without serializing it. Returns an
 /// error if the transaction cannot write. The state remains valid after the transaction is freed.
-/// Create-table transactions use the `create_table_get_*_write_context` functions instead.
+/// Create-table transactions use the `create_table_txn_get_*_write_context` functions instead.
 /// The transaction remains valid on success and error and must eventually be committed or freed.
 ///
 /// # Safety
 /// The transaction and engine handles are borrowed and must be valid.
 #[no_mangle]
-pub unsafe extern "C" fn transaction_write_state(
-    txn: Handle<ExclusiveTransaction>,
+pub unsafe extern "C" fn update_table_txn_write_state(
+    txn: Handle<ExclusiveUpdateTableTransaction>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteState>> {
     let txn = unsafe { txn.as_ref() };
@@ -270,15 +270,15 @@ pub unsafe extern "C" fn get_write_state_stats_columns(
 /// Gets the write context from a transaction for an unpartitioned table. The write context
 /// provides schema and path information needed for writing data.
 ///
-/// For partitioned tables, use [`get_partitioned_write_context`] instead. Returns an error if the
-/// table is partitioned.
+/// For partitioned tables, use [`update_table_txn_get_partitioned_write_context`] instead. Returns
+/// an error if the table is partitioned.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a [valid][Handle#Validity] transaction handle and engine.
+/// `txn` and `engine` must be [valid][Handle#Validity] handles. Both are borrowed for this call.
 #[no_mangle]
-pub unsafe extern "C" fn get_unpartitioned_write_context(
-    txn: Handle<ExclusiveTransaction>,
+pub unsafe extern "C" fn update_table_txn_get_unpartitioned_write_context(
+    txn: Handle<ExclusiveUpdateTableTransaction>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
     let txn = unsafe { txn.as_ref() };
@@ -291,15 +291,15 @@ pub unsafe extern "C" fn get_unpartitioned_write_context(
 
 /// Gets the write context from a create-table transaction for an unpartitioned table.
 ///
-/// For partitioned tables, use [`create_table_get_partitioned_write_context`] instead. Returns an
-/// error if the table is partitioned.
+/// For partitioned tables, use [`create_table_txn_get_partitioned_write_context`] instead. Returns
+/// an error if the table is partitioned.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a [valid][Handle#Validity] transaction handle and engine.
+/// `txn` and `engine` must be [valid][Handle#Validity] handles. Both are borrowed for this call.
 #[no_mangle]
-pub unsafe extern "C" fn create_table_get_unpartitioned_write_context(
-    txn: Handle<ExclusiveCreateTransaction>,
+pub unsafe extern "C" fn create_table_txn_get_unpartitioned_write_context(
+    txn: Handle<ExclusiveCreateTableTransaction>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
     let txn = unsafe { txn.as_ref() };
@@ -320,16 +320,17 @@ pub unsafe extern "C" fn create_table_get_unpartitioned_write_context(
 /// columns (the kernel validates completeness and value types and rejects extras). This function
 /// consumes the map handle on both success and error; do not use or free it afterward.
 ///
-/// Returns an error if the table is not partitioned (use [`get_unpartitioned_write_context`]
-/// instead) or if the partition values are invalid for the table's partition schema.
+/// Returns an error if the table is not partitioned (use
+/// [`update_table_txn_get_unpartitioned_write_context`] instead) or if the partition values are
+/// invalid for the table's partition schema.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a [valid][Handle#Validity] transaction handle, partition
-/// value map handle, and engine.
+/// All handles must be [valid][Handle#Validity]. This call borrows `txn` and `engine` and
+/// unconditionally consumes `partition_values`, including on error.
 #[no_mangle]
-pub unsafe extern "C" fn get_partitioned_write_context(
-    txn: Handle<ExclusiveTransaction>,
+pub unsafe extern "C" fn update_table_txn_get_partitioned_write_context(
+    txn: Handle<ExclusiveUpdateTableTransaction>,
     partition_values: Handle<ExclusivePartitionValueMap>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
@@ -349,15 +350,16 @@ pub unsafe extern "C" fn get_partitioned_write_context(
 }
 
 /// Gets the write context from a create-table transaction for a partitioned table. See
-/// [`get_partitioned_write_context`] for the contract; this is the create-table counterpart.
+/// [`update_table_txn_get_partitioned_write_context`] for the contract. This is the create-table
+/// counterpart.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a [valid][Handle#Validity] transaction handle, partition
-/// value map handle, and engine.
+/// All handles must be [valid][Handle#Validity]. This call borrows `txn` and `engine` and
+/// unconditionally consumes `partition_values`, including on error.
 #[no_mangle]
-pub unsafe extern "C" fn create_table_get_partitioned_write_context(
-    txn: Handle<ExclusiveCreateTransaction>,
+pub unsafe extern "C" fn create_table_txn_get_partitioned_write_context(
+    txn: Handle<ExclusiveCreateTableTransaction>,
     partition_values: Handle<ExclusivePartitionValueMap>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
