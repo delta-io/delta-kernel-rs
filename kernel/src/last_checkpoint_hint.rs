@@ -321,6 +321,18 @@ impl LastCheckpointHint {
         .drop_oversized_fields())
     }
 
+    /// For an adaptive-metadata (AMT) hint, the version of the manifest commit that emitted the
+    /// checkpoint action. `None` for a non-AMT hint, or an AMT-typed hint without `amtCheckpoint`.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn amt_manifest_commit_version(&self) -> Option<Version> {
+        if self.checkpoint_type != Some(CheckpointType::AdaptiveMetadataTree) {
+            return None;
+        }
+        self.amt_checkpoint
+            .as_ref()
+            .map(|amt| amt.manifest_commit_version)
+    }
+
     /// Whether this hint describes the checkpoint a log segment selected, given that segment's
     /// `checkpoint_parts`. Multiple checkpoints can share a version, so a matching version alone is
     /// not enough: the hint's own identity must equal the selected checkpoint's.
@@ -668,6 +680,29 @@ mod tests {
         assert_eq!(checkpoint.path(), "metadata/root-v7.parquet");
         assert_eq!(checkpoint.metadata().id(), "tid");
         assert_eq!(amt.leaves.expect("leaves present").len(), 1);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::amt_hint(Some(CheckpointType::AdaptiveMetadataTree), Some(7), Some(7))]
+    #[case::amt_type_without_amt_checkpoint(Some(CheckpointType::AdaptiveMetadataTree), None, None)]
+    #[case::no_checkpoint_type(None, Some(7), None)]
+    #[case::unknown_checkpoint_type(Some(CheckpointType::Unknown), Some(7), None)]
+    fn amt_manifest_commit_version_requires_amt_type_and_amt_checkpoint(
+        #[case] checkpoint_type: Option<CheckpointType>,
+        #[case] manifest_commit_version: Option<Version>,
+        #[case] expected: Option<Version>,
+    ) {
+        let hint = LastCheckpointHint {
+            version: 5,
+            checkpoint_type,
+            amt_checkpoint: manifest_commit_version.map(|manifest_commit_version| AmtCheckpoint {
+                manifest_commit_version,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(hint.amt_manifest_commit_version(), expected);
     }
 
     /// A `_last_checkpoint` without `checkpointType`/`amtCheckpoint` (classic / V2) leaves both
