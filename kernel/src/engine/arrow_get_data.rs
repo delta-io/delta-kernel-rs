@@ -271,7 +271,7 @@ fn validate_and_get_physical_index(
 }
 
 /// Implement GetData for RunArray directly, so we can return it as a trait object
-/// without needing a wrapper struct or Box::leak.
+/// without needing a wrapper struct.
 ///
 /// This implementation supports multiple value types (strings, integers, booleans, etc.)
 /// by runtime downcasting of the values array.
