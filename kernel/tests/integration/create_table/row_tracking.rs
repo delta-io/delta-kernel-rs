@@ -20,8 +20,8 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::Result;
 use rstest::rstest;
 use test_utils::{
-    get_materialized_row_tracking_column_names, get_row_tracking_add_actions, insert_data,
-    read_actions_from_commit, test_table_setup,
+    create_add_files_metadata, get_materialized_row_tracking_column_names,
+    get_row_tracking_add_actions, insert_data, read_actions_from_commit, test_table_setup,
 };
 use url::Url;
 
@@ -72,7 +72,8 @@ async fn test_create_table_with_row_tracking(
     )]
     activation: (&str, &str),
     #[values(false, true)] with_data: bool,
-) -> Result<()> {
+    #[values(0, 1, 2)] empty_batch_count: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (key, value) = activation;
     let expect_property_enabled = key == "delta.enableRowTracking";
 
@@ -82,6 +83,10 @@ async fn test_create_table_with_row_tracking(
     let mut txn = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties([(key, value)])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+    for _ in 0..empty_batch_count {
+        txn.add_files(create_add_files_metadata(txn.add_files_schema(), vec![])?);
+    }
 
     if with_data {
         // Write one parquet file with 5 rows
@@ -190,8 +195,11 @@ async fn test_create_table_with_row_tracking(
 
 /// Verifies that CTAS with multiple files assigns non-overlapping baseRowId ranges and
 /// computes the correct cumulative high water mark.
+#[rstest]
 #[tokio::test]
-async fn test_create_table_with_multiple_files_and_row_tracking() -> Result<()> {
+async fn test_create_table_with_multiple_files_and_row_tracking(
+    #[values(false, true)] stage_empty_batches: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = super::simple_schema()?;
@@ -229,8 +237,17 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> Result<()> 
         .write_parquet(&ArrowEngineData::new(batch2), &write_context)
         .await?;
 
+    if stage_empty_batches {
+        txn.add_files(create_add_files_metadata(txn.add_files_schema(), vec![])?);
+    }
     txn.add_files(adds1);
+    if stage_empty_batches {
+        txn.add_files(create_add_files_metadata(txn.add_files_schema(), vec![])?);
+    }
     txn.add_files(adds2);
+    if stage_empty_batches {
+        txn.add_files(create_add_files_metadata(txn.add_files_schema(), vec![])?);
+    }
 
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     assert_eq!(committed.commit_version(), 0);

@@ -590,31 +590,6 @@ async fn test_not_null_data_column_rejects_null_in_batch(
 
 // === Void type write-time validation tests ===
 
-/// Helper to create a table with a given schema and attempt a commit with dummy add_files.
-/// Returns the commit error (panics if commit succeeds).
-async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
-    let (store, engine, table_location) = engine_store_setup("void_write_test", None);
-    let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![])
-        .await
-        .expect("table creation should succeed");
-    let engine = Arc::new(engine);
-    let snapshot = Snapshot::builder_for(table_url)
-        .build(engine.as_ref())
-        .expect("snapshot should build");
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
-        .expect("transaction should create");
-
-    // Add dummy file metadata to trigger write validation
-    let add_schema = txn.add_files_schema().clone();
-    let metadata =
-        create_add_files_metadata(&add_schema, vec![("file.parquet", 100, 1000, Some(1))])
-            .expect("metadata creation should succeed");
-    txn.add_files(metadata);
-    txn.commit(engine.as_ref())
-        .expect_err("commit should fail for invalid void schema")
-}
-
 #[rstest]
 #[case::void_array_element(
     schema_ref! {
@@ -683,15 +658,45 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
     "struct nested in Array or Map must contain at least one non-void field"
 )]
 #[tokio::test]
-async fn write_rejects_invalid_void_placement(
+async fn invalid_write_schema_allows_noop_adds_but_rejects_files(
     #[case] schema: SchemaRef,
     #[case] expected_msg: &str,
-) {
-    let err = try_write_with_void_schema(schema).await;
-    assert!(
-        err.to_string().contains(expected_msg),
-        "Expected error containing '{expected_msg}', got: {err}"
-    );
+    #[values(None, Some(0), Some(1))] batch_rows: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (store, engine, table_location) = engine_store_setup("void_write_test", None);
+    let table_url = create_table(
+        store,
+        table_location,
+        schema.clone(),
+        &[],
+        false,
+        vec![],
+        vec![],
+    )
+    .await?;
+    let snapshot = Snapshot::builder_for(&table_url).build(&engine)?;
+    let mut txn = begin_transaction(snapshot, &engine)?;
+    if let Some(batch_rows) = batch_rows {
+        let files = if batch_rows == 0 {
+            vec![]
+        } else {
+            vec![("file.parquet", 100, 1000, Some(1))]
+        };
+        txn.add_files(create_add_files_metadata(txn.add_files_schema(), files)?);
+    }
+    let result = txn.commit(&engine);
+    if batch_rows == Some(1) {
+        test_utils::assert_result_error_with_message(result, expected_msg);
+        assert_eq!(
+            Snapshot::builder_for(&table_url).build(&engine)?.version(),
+            0
+        );
+    } else {
+        let snapshot = result?.unwrap_post_commit_snapshot();
+        assert_eq!(snapshot.version(), 1);
+        assert_eq!(snapshot.schema(), schema);
+    }
+    Ok(())
 }
 
 // Requesting write state must reject invalid schemas before any Parquet is written.
@@ -782,32 +787,6 @@ async fn write_context_excludes_void_from_physical_schema() -> Result<(), Box<dy
     assert!(physical.field("id").is_some());
     assert!(physical.field("name").is_some());
     assert!(physical.field("v").is_none());
-
-    Ok(())
-}
-
-// Metadata-only operations should always succeed, even for schemas that are
-// invalid for data writes (void-in-array, void-in-map, all-void structs).
-#[tokio::test]
-async fn metadata_only_commit_with_void_in_array_succeeds() -> Result<(), Box<dyn std::error::Error>>
-{
-    let schema = schema_ref! {
-        nullable "id": INTEGER,
-        nullable "arr": [ nullable VOID ],
-    };
-    let (store, engine, table_location) = engine_store_setup("void_metadata_test", None);
-    let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![]).await?;
-    let engine = Arc::new(engine);
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-
-    // Commit with NO add_files — this is a metadata-only operation and should succeed
-    let result = txn.commit(engine.as_ref());
-    assert!(
-        result.is_ok(),
-        "Metadata-only commit on void-in-array schema should succeed, got: {:?}",
-        result.err()
-    );
 
     Ok(())
 }

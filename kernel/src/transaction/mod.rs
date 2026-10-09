@@ -891,7 +891,7 @@ impl<S> Transaction<S> {
             )
         );
         require!(
-            !self.add_files_metadata.is_empty(),
+            self.has_add_file_actions(),
             KernelError::invalid_transaction_state(
                 "Blind append requires at least one added data file"
             )
@@ -901,11 +901,11 @@ impl<S> Transaction<S> {
             KernelError::invalid_transaction_state("Blind append requires data_change to be true")
         );
         require!(
-            self.remove_files_metadata.is_empty(),
+            !self.has_remove_file_actions(),
             KernelError::invalid_transaction_state("Blind append cannot remove files")
         );
         require!(
-            self.dv_matched_files.is_empty(),
+            !self.has_dv_update_actions(),
             KernelError::invalid_transaction_state("Blind append cannot update deletion vectors")
         );
 
@@ -1048,11 +1048,30 @@ impl<S> Transaction<S> {
         self.read_snapshot_opt.is_none()
     }
 
-    /// True iff this transaction stages any data-file action (add, remove, or DV update).
+    /// True iff this transaction emits at least one add-file action.
+    fn has_add_file_actions(&self) -> bool {
+        self.add_files_metadata.iter().any(|data| !data.is_empty())
+    }
+
+    /// True iff this transaction emits at least one remove-file action.
+    fn has_remove_file_actions(&self) -> bool {
+        self.remove_files_metadata
+            .iter()
+            .any(HasSelectionVector::has_selected_rows)
+    }
+
+    /// True iff this transaction emits at least one deletion-vector update.
+    fn has_dv_update_actions(&self) -> bool {
+        self.dv_matched_files
+            .iter()
+            .any(HasSelectionVector::has_selected_rows)
+    }
+
+    /// True iff this transaction emits any data-file action (add, remove, or DV update).
     fn has_data_file_actions(&self) -> bool {
-        !self.add_files_metadata.is_empty()
-            || !self.remove_files_metadata.is_empty()
-            || !self.dv_matched_files.is_empty()
+        self.has_add_file_actions()
+            || self.has_remove_file_actions()
+            || self.has_dv_update_actions()
     }
 
     // Returns the read snapshot. Returns an error if this is a create-table transaction.
@@ -1112,7 +1131,7 @@ impl<S> Transaction<S> {
     fn validate_commit(&self) -> KernelResult<()> {
         // Kernel cannot distinguish Remove actions and DV updates that only delete rows from those
         // that accompany copied or updated rows, so both require the preservation acknowledgment.
-        if !self.remove_files_metadata.is_empty() || self.num_dv_updates > 0 {
+        if self.has_remove_file_actions() || self.has_dv_update_actions() {
             self.effective_table_config
                 .validate_feature_support_for_remove()?;
             self.ensure_row_tracking_preservation_acknowledged()?;
@@ -1141,7 +1160,7 @@ impl<S> Transaction<S> {
 
         // Validate that the schema supports data writes when files are being added. Reads and
         // metadata-only commits are always allowed.
-        if !self.add_files_metadata.is_empty() {
+        if self.has_add_file_actions() {
             validate_schema_for_write(&self.effective_table_config.logical_schema())?;
         }
 
@@ -1150,8 +1169,8 @@ impl<S> Transaction<S> {
         // update rows require a `cdc` file, but Kernel does not currently support writing CDC
         // files.
         if !self.is_create_table()
-            && !self.add_files_metadata.is_empty()
-            && (!self.remove_files_metadata.is_empty() || self.num_dv_updates > 0)
+            && self.has_add_file_actions()
+            && (self.has_remove_file_actions() || self.has_dv_update_actions())
             && self.data_change
         {
             let cdf_enabled = self
@@ -1369,11 +1388,7 @@ impl<S> Transaction<S> {
             return Ok(());
         }
 
-        let removes_data = self
-            .remove_files_metadata
-            .iter()
-            .chain(&self.dv_matched_files)
-            .any(HasSelectionVector::has_selected_rows);
+        let removes_data = self.has_remove_file_actions() || self.has_dv_update_actions();
         require!(
             !removes_data,
             KernelError::invalid_transaction_state(
@@ -1614,7 +1629,7 @@ impl<S> Transaction<S> {
             .effective_table_config
             .should_assign_fresh_row_tracking_metadata();
 
-        if self.add_files_metadata.is_empty() {
+        if !self.has_add_file_actions() {
             // No files to add. For an empty CREATE TABLE with row tracking, emit the initial
             // high water mark domain metadata (rowIdHighWaterMark = -1) so subsequent writes
             // have a valid starting point. For all other empty commits (metadata-only, etc.),
@@ -2564,20 +2579,85 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn schema_changes_are_rejected_after_staging_data() -> Result<()> {
+    #[rstest]
+    fn schema_changes_ignore_noop_batches_but_reject_file_actions(
+        #[values(
+            StagedFileAction::None,
+            StagedFileAction::EmptyAdd,
+            StagedFileAction::Add,
+            StagedFileAction::EmptyRemove,
+            StagedFileAction::UnselectedRemove,
+            StagedFileAction::Remove,
+            StagedFileAction::ImplicitRemove,
+            StagedFileAction::EmptyDv,
+            StagedFileAction::UnselectedDv,
+            StagedFileAction::Dv,
+            StagedFileAction::ImplicitDv
+        )]
+        action: StagedFileAction,
+        #[values(false, true)] action_first: bool,
+    ) -> Result<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        add_dummy_file(&mut txn);
+        let companion = if action.has_actions() {
+            StagedFileAction::EmptyAdd
+        } else {
+            StagedFileAction::None
+        };
+        for staged_action in if action_first {
+            [action, companion]
+        } else {
+            [companion, action]
+        } {
+            staged_action.stage(&mut txn);
+        }
 
         let result = txn.with_schema_changes(vec![SchemaOperation::add_column(
             None,
             StructField::nullable("fresh_column", DataType::INTEGER),
         )]);
 
-        assert!(matches!(
-            result,
-            Err(KernelError::InvalidTransactionState(_))
-        ));
+        if action.has_actions() {
+            assert_result_error_with_message(result, "before staging data files");
+        } else {
+            let txn = result?;
+            assert!(txn
+                .effective_table_config
+                .logical_schema()
+                .contains("fresh_column"));
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    fn empty_schema_ignores_noop_batches_but_rejects_file_actions(
+        #[values(
+            StagedFileAction::None,
+            StagedFileAction::EmptyAdd,
+            StagedFileAction::Add,
+            StagedFileAction::EmptyRemove,
+            StagedFileAction::UnselectedRemove,
+            StagedFileAction::Remove,
+            StagedFileAction::ImplicitRemove,
+            StagedFileAction::EmptyDv,
+            StagedFileAction::UnselectedDv,
+            StagedFileAction::Dv,
+            StagedFileAction::ImplicitDv
+        )]
+        action: StagedFileAction,
+    ) -> Result<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        txn.replace_effective_table_config(
+            crate::unit_test_utils::MockTableConfigurationBuilder::new()
+                .with_schema(schema_ref! {})
+                .build(),
+        );
+        action.stage(&mut txn);
+        let result = txn.ensure_schema_non_empty_for_data_writes();
+        if action.has_actions() {
+            assert_result_error_with_message(result, "empty schema");
+        } else {
+            result?;
+        }
         Ok(())
     }
 
@@ -3203,10 +3283,72 @@ mod tests {
         txn.add_files(Box::new(ArrowEngineData::new(batch)));
     }
 
+    fn add_empty_file_batch<S: SupportsDataFiles>(txn: &mut Transaction<S>) {
+        let batch = create_valid_add_file_batch(false /* all_nullable */).slice(0, 0);
+        txn.add_files(Box::new(ArrowEngineData::new(batch)));
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum DataRemoval {
         RemoveFile,
         DeletionVectorUpdate,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum StagedFileAction {
+        None,
+        EmptyAdd,
+        Add,
+        EmptyRemove,
+        UnselectedRemove,
+        Remove,
+        ImplicitRemove,
+        EmptyDv,
+        UnselectedDv,
+        Dv,
+        ImplicitDv,
+    }
+
+    impl StagedFileAction {
+        fn has_actions(self) -> bool {
+            matches!(
+                self,
+                Self::Add | Self::Remove | Self::ImplicitRemove | Self::Dv | Self::ImplicitDv
+            )
+        }
+
+        fn stage(self, txn: &mut Transaction) {
+            match self {
+                Self::None => {}
+                Self::EmptyAdd => add_empty_file_batch(txn),
+                Self::Add => add_dummy_file(txn),
+                Self::EmptyRemove
+                | Self::UnselectedRemove
+                | Self::Remove
+                | Self::ImplicitRemove
+                | Self::EmptyDv
+                | Self::UnselectedDv
+                | Self::Dv
+                | Self::ImplicitDv => {
+                    let (row_count, selection): (usize, &[bool]) = match self {
+                        Self::EmptyRemove | Self::EmptyDv => (0, &[]),
+                        Self::UnselectedRemove | Self::UnselectedDv => (2, &[false, false]),
+                        Self::ImplicitRemove | Self::ImplicitDv => (2, &[false]),
+                        _ => (2, &[true, false]),
+                    };
+                    let data = make_scan_files(row_count, selection);
+                    if matches!(
+                        self,
+                        Self::EmptyDv | Self::UnselectedDv | Self::Dv | Self::ImplicitDv
+                    ) {
+                        txn.num_dv_updates += usize::from(data.has_selected_rows());
+                        txn.dv_matched_files.push(data);
+                    } else {
+                        txn.remove_files(data);
+                    }
+                }
+            }
+        }
     }
 
     fn set_append_only(txn: &mut Transaction, enabled: bool) -> KernelResult<()> {
@@ -3225,9 +3367,8 @@ mod tests {
         Ok(())
     }
 
-    fn make_scan_files(selection_vector: &[bool]) -> FilteredEngineData {
+    fn make_scan_files(row_count: usize, selection_vector: &[bool]) -> FilteredEngineData {
         let schema: ArrowSchema = scan_row_schema().as_ref().try_into_arrow().unwrap();
-        let row_count = selection_vector.len();
         let columns = schema
             .fields()
             .iter()
@@ -3280,7 +3421,7 @@ mod tests {
     }
 
     fn stage_data_removal(txn: &mut Transaction, removal: DataRemoval, selection_vector: &[bool]) {
-        let data = make_scan_files(selection_vector);
+        let data = make_scan_files(selection_vector.len(), selection_vector);
         match removal {
             DataRemoval::RemoveFile => txn.remove_files(data),
             DataRemoval::DeletionVectorUpdate => txn.dv_matched_files.push(data),
@@ -3320,6 +3461,59 @@ mod tests {
         txn = txn.with_blind_append();
         add_dummy_file(&mut txn);
         txn.validate_blind_append_semantics()?;
+        Ok(())
+    }
+
+    #[rstest]
+    fn generate_adds_treats_empty_batches_as_no_actions(
+        #[values(0, 1, 2)] empty_batch_count: usize,
+    ) -> Result<()> {
+        let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        for _ in 0..empty_batch_count {
+            add_empty_file_batch(&mut txn);
+        }
+
+        let (mut adds, row_tracking_domain_metadata) =
+            txn.generate_adds(engine.as_ref(), txn.get_commit_version())?;
+        assert!(adds.next().is_none());
+        assert!(row_tracking_domain_metadata.is_none());
+        Ok(())
+    }
+
+    #[rstest]
+    fn blind_append_ignores_noop_removals_but_rejects_selected_rows(
+        #[values(
+            StagedFileAction::None,
+            StagedFileAction::EmptyRemove,
+            StagedFileAction::UnselectedRemove,
+            StagedFileAction::Remove,
+            StagedFileAction::ImplicitRemove,
+            StagedFileAction::EmptyDv,
+            StagedFileAction::UnselectedDv,
+            StagedFileAction::Dv,
+            StagedFileAction::ImplicitDv
+        )]
+        action: StagedFileAction,
+        #[values(false, true)] action_first: bool,
+    ) -> Result<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        txn = txn.with_blind_append();
+        for staged_action in if action_first {
+            [action, StagedFileAction::Add]
+        } else {
+            [StagedFileAction::Add, action]
+        } {
+            staged_action.stage(&mut txn);
+        }
+        let result = txn.validate_blind_append_semantics();
+        if action.has_actions() {
+            assert!(matches!(
+                result,
+                Err(KernelError::InvalidTransactionState(_))
+            ));
+        } else {
+            result?;
+        }
         Ok(())
     }
 
@@ -3386,10 +3580,15 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_validate_blind_append_requires_adds() -> Result<()> {
+    #[rstest]
+    #[case::without_batch(false)]
+    #[case::empty_batch(true)]
+    fn test_validate_blind_append_requires_adds(#[case] stage_empty_batch: bool) -> Result<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
         txn = txn.with_blind_append();
+        if stage_empty_batch {
+            add_empty_file_batch(&mut txn);
+        }
         let result = txn.validate_blind_append_semantics();
         assert!(matches!(
             result,
