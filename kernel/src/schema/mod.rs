@@ -40,6 +40,8 @@ pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
 #[cfg(feature = "udt-in-dev")]
+pub(crate) mod udt_utils;
+#[cfg(feature = "udt-in-dev")]
 mod user_defined;
 pub(crate) mod validation;
 #[cfg(feature = "udt-in-dev")]
@@ -523,9 +525,8 @@ impl StructField {
     ///
     /// - `Ok(None)` -- no `CURRENT_DEFAULT` metadata.
     /// - `Ok(Some(_))` -- present as a [`MetadataValue::String`] and accepted by [`ColumnDefault`].
-    /// - `Err(_)` -- either not a [`MetadataValue::String`] (corrupt: the protocol defines
-    ///   `CURRENT_DEFAULT` as a SQL string, the only form the kernel writes), or rejected by
-    ///   [`ColumnDefault`] (a non-NULL default on a Variant column, which the protocol forbids).
+    /// - `Err(_)` -- `CURRENT_DEFAULT` is not a [`MetadataValue::String`], or the declared type
+    ///   rejects the default: any UDT default (including `NULL`) or a non-`NULL` Variant default.
     pub fn column_default(&self) -> Result<Option<ColumnDefault<'_>>> {
         let raw_sql = match self.get_config_value(&ColumnMetadataKey::CurrentDefault) {
             None => return Ok(None),
@@ -2418,6 +2419,21 @@ impl DataType {
         }
     }
 
+    /// Returns the storage type used to represent this data type.
+    ///
+    /// A UDT is stored as its `sqlType`; every other type is stored as itself.
+    #[cfg_attr(
+        not(any(feature = "arrow-conversion", feature = "arrow-expression")),
+        allow(dead_code)
+    )]
+    pub(crate) fn physical_type(&self) -> &DataType {
+        match self {
+            #[cfg(feature = "udt-in-dev")]
+            Self::UserDefined(udt) => udt.sql_type(),
+            data_type => data_type,
+        }
+    }
+
     /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> Result<Self> {
         Ok(PrimitiveType::decimal(precision, scale)?.into())
@@ -2689,6 +2705,15 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         // There is no column mapping metadata inside the struct fields of a variant, so
         // we do not recurse into the variant fields
         Ok(Cow::Borrowed(stype))
+    }
+
+    #[cfg(feature = "udt-in-dev")]
+    fn transform_user_defined(
+        &mut self,
+        udt: &'a UserDefinedType,
+    ) -> KernelResult<Cow<'a, UserDefinedType>> {
+        // Column mapping applies to the enclosing field; sqlType uses its own field names.
+        Ok(Cow::Borrowed(udt))
     }
 }
 

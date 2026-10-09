@@ -6,6 +6,7 @@ use serde::de::Error as _;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use super::udt_utils::contains_udt;
 use super::{DataType, StructField};
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{KernelError, Result};
@@ -130,20 +131,6 @@ impl<'de> Deserialize<'de> for UserDefinedType {
     }
 }
 
-struct ContainsUdt;
-
-impl<'a> SchemaTransform<'a> for ContainsUdt {
-    transform_output_type!(|'a, T| Result<(), ()>);
-
-    fn transform_user_defined(&mut self, _: &'a UserDefinedType) -> Result<(), ()> {
-        Err(())
-    }
-}
-
-fn contains_udt(data_type: &DataType) -> bool {
-    ContainsUdt.transform(data_type).is_err()
-}
-
 struct ContainsMetadataColumn;
 
 impl<'a> SchemaTransform<'a> for ContainsMetadataColumn {
@@ -161,7 +148,6 @@ impl<'a> SchemaTransform<'a> for ContainsMetadataColumn {
 fn contains_metadata_column(data_type: &DataType) -> bool {
     ContainsMetadataColumn.transform(data_type).is_err()
 }
-
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
