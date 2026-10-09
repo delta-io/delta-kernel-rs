@@ -7,8 +7,8 @@ This crate provides a C foreign function interface (ffi) for delta-kernel-rs.
 Connectors configure transaction intent on a builder and use the built transaction for
 write-dependent information and staged actions. Every `update_table_txn_builder_with_*` function
 consumes its builder handle and returns a replacement on success, so callers must overwrite the old
-handle. On error, the builder is dropped; don't use or free the old handle. Transaction builder,
-setter, and commit calls borrow the engine handle; the caller retains ownership.
+handle. On error, the builder is dropped. Don't use or free the old handle. Transaction builder,
+setter, and commit calls borrow the engine handle. The caller retains ownership.
 
 ```c
 HandleSharedSnapshot snapshot = /* unwrap(snapshot_builder_build(...)) */;
@@ -32,7 +32,7 @@ helpers.
 
 Create-table connectors use the same shape: call `new_create_table_txn_builder`, apply
 `create_table_txn_builder_with_*` functions, then call `create_table_txn_builder_build`. Application
-transaction identifiers are available on both builders; metadata removals are update-only. Nested
+transaction identifiers are available on both builders. Metadata removals are update-only. Nested
 schema changes use `update_table_txn_builder_add_column_at` and
 `update_table_txn_builder_set_nullable` with segmented `FfiColumnName` paths. A snapshot returned
 by `committed_transaction_post_commit_snapshot` is independently owned and must be released with

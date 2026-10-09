@@ -104,7 +104,7 @@ The builder methods:
 
 | Method | Purpose |
 |--------|---------|
-| `with_operation(UpdateTableOperation)` | Typed operation stored in the commit log; use `UpdateTableOperation::Custom` for connector-specific names |
+| `with_operation(UpdateTableOperation)` | Required before `build()`. Sets the typed operation stored in the commit log. Use `UpdateTableOperation::Custom` for connector-specific names |
 | `with_engine_info(impl Into<String>)` | Supplies the connector name and version recorded in commit information |
 | `with_data_change(bool)` | Whether this commit materially changes data (`true`) or just reorganizes it (`false`, e.g. OPTIMIZE) |
 
@@ -300,13 +300,13 @@ these fields in your custom commit info:
 | Field | Meaning | Value written by Kernel |
 |-------|---------|-------------------------|
 | `timestamp` | The transaction's commit timestamp | Current time when the transaction is created |
-| `inCommitTimestamp` | The table's in-commit timestamp | The in-commit timestamp when enabled; omitted otherwise |
-| `operation` | The operation name | The selected `UpdateTableOperation`; defaults to `UNKNOWN` for existing tables and is fixed to `CREATE TABLE` for creation |
-| `operationParameters` | Parameters describing the operation | The value from `with_operation_parameters()`; defaults to `{}` |
-| `operationMetrics` | Metrics recorded for the operation | The value from `with_operation_metrics()`; omitted when unset, while an explicitly empty map is written as `{}` |
+| `inCommitTimestamp` | The table's in-commit timestamp | The in-commit timestamp when enabled. Omitted otherwise |
+| `operation` | The operation name | The required `UpdateTableOperation` for existing tables. Fixed to `CREATE TABLE` for creation |
+| `operationParameters` | Parameters describing the operation | The value from `with_operation_parameters()`, defaulting to `{}` |
+| `operationMetrics` | Metrics recorded for the operation | The value from `with_operation_metrics()`. Omitted when unset. An explicitly empty map is written as `{}` |
 | `kernelVersion` | The Kernel library version | Current Kernel version |
-| `isBlindAppend` | Whether the commit is a blind append | `true` after `with_blind_append()`; omitted (`false`) otherwise |
-| `engineInfo` | The engine identifier | Omitted for existing-table transactions when unset; required by create table |
+| `isBlindAppend` | Whether the commit is a blind append | `true` after `with_blind_append()`. Omitted (`false`) otherwise |
+| `engineInfo` | The engine identifier | Omitted for existing-table transactions when unset. Required by create table |
 | `txnId` | A unique transaction identifier | A new UUID generated for the commit |
 
 Kernel ignores reserved fields in custom commit info. Use `with_operation_parameters()` and

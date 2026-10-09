@@ -82,6 +82,8 @@ new_update_table_txn_builder() -> Handle<ExclusiveUpdateTableTransactionBuilder>
         |
 update_table_txn_builder_with_engine_info()
         |
+update_table_txn_builder_with_operation()
+        |
 update_table_txn_builder_build() -> Handle<ExclusiveUpdateTableTransaction>
         |
     update_table_txn_add_files()
@@ -249,7 +251,7 @@ feature is enabled; the rest are always available.
 | `update_table_txn_remove_files` | Register Remove actions for the files selected by a scan-metadata batch |
 | `update_table_txn_commit` | Commit the transaction and return a committed-transaction handle |
 | `free_update_table_txn` | Release the transaction handle without committing |
-| `committed_transaction_version` / `committed_transaction_post_commit_snapshot` | Inspect a committed transaction without consuming it; the returned snapshot is independently owned |
+| `committed_transaction_version` / `committed_transaction_post_commit_snapshot` | Inspect a committed transaction without consuming it. The returned snapshot is independently owned |
 | `free_committed_transaction` | Release the committed-transaction handle |
 
 **Write context and file writing**

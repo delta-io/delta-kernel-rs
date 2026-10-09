@@ -36,6 +36,7 @@ async fn test_commit_info_defaults_to_empty_parameters_and_omitted_metrics(
         let txn = Snapshot::builder_for(table_url.clone())
             .build(&engine)?
             .transaction_builder()
+            .with_operation(UpdateTableOperation::Write)
             .with_engine_info("default engine")
             .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
@@ -66,7 +67,7 @@ async fn test_commit_info_defaults_to_empty_parameters_and_omitted_metrics(
         let expected_commit = json!({
             "commitInfo": {
                 "timestamp": 0,
-                "operation": "UNKNOWN",
+                "operation": "WRITE",
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                 "operationParameters": {},
                 "engineInfo": "default engine",
@@ -129,6 +130,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
         let txn = Snapshot::builder_for(table_url.clone())
             .build(&engine)?
             .transaction_builder()
+            .with_operation(UpdateTableOperation::Write)
             .with_engine_info("default engine")
             .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
@@ -154,7 +156,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
         let expected_commit = vec![json!({
             "commitInfo": {
                 "timestamp": 0,
-                "operation": "UNKNOWN",
+                "operation": "WRITE",
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                 "operationParameters": {},
                 "engineInfo": "default engine",

@@ -8,20 +8,22 @@ use crate::expressions::ColumnName;
 use crate::metrics::MetricId;
 use crate::schema::{SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
+use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    validate_iceberg_compat_if_needed, IcebergCompatValidationContext, Operation, V2_VALIDATOR,
-    V3_VALIDATOR,
+    validate_iceberg_compat_if_needed, IcebergCompatValidationContext, Operation, TableFeature,
+    V2_VALIDATOR, V3_VALIDATOR,
 };
 use crate::transaction::domain_metadata::validate_unique_domains;
-use crate::transaction::schema_evolution::SchemaOperation;
+use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
 use crate::transaction::{Transaction, UpdateTableOperation};
 use crate::utils::{current_time_ms, PhantomType};
 use crate::{Engine, EngineData, KernelError, KernelResult, Result};
 
 /// Configures DML and schema-changing DDL transactions against an existing table.
 ///
-/// This builder does not create or replace tables. Calling [`build`](Self::build) validates the
-/// accumulated intent and constructs the transaction.
+/// This builder does not create or replace tables. Set an operation with
+/// [`with_operation`](Self::with_operation) before calling [`build`](Self::build), which validates
+/// the accumulated intent and constructs the transaction.
 pub struct UpdateTableTransactionBuilder {
     snapshot: SnapshotRef,
     state: TransactionBuilderState,
@@ -55,8 +57,9 @@ impl UpdateTableTransactionBuilder {
 
     /// Sets the operation recorded in `commitInfo`.
     ///
-    /// Consecutive calls replace the previous operation. Invalid custom names and incompatible
-    /// operation/schema-change combinations are rejected by [`build`](Self::build).
+    /// Required before [`build`](Self::build). Consecutive calls replace the previous operation.
+    /// Invalid custom names and incompatible operation/schema-change combinations are rejected
+    /// during build.
     pub fn with_operation(mut self, operation: UpdateTableOperation) -> Self {
         self.operation = Some(operation);
         self
@@ -66,7 +69,7 @@ impl UpdateTableTransactionBuilder {
     ///
     /// `true` indicates that the commit changes the table's logical contents. Use `false` for
     /// metadata-only commits or rewrites that reorganize data without changing its contents.
-    /// Connector-supplied values are preserved through commit; Kernel does not compare file
+    /// Connector-supplied values are preserved through commit. Kernel does not compare file
     /// contents to verify them.
     ///
     /// If not set, transactions with schema changes infer the value at commit, after file staging:
@@ -141,7 +144,7 @@ impl UpdateTableTransactionBuilder {
     /// Adds an application transaction identifier to emit as a `txn` action.
     ///
     /// The action's `lastUpdated` value uses the transaction's commit timestamp.
-    /// An application id may occur only once; duplicate ids are rejected by [`build`](Self::build).
+    /// An application id may occur only once. Duplicate ids are rejected by [`build`](Self::build).
     pub fn with_transaction_id(mut self, app_id: impl Into<String>, version: i64) -> Self {
         self.state = self.state.with_transaction_id(app_id, version);
         self
@@ -191,7 +194,7 @@ impl UpdateTableTransactionBuilder {
     /// Replaces the operation parameters recorded in `commitInfo`.
     ///
     /// Common parameters include the write `mode`, `partitionBy` columns, and predicates used by
-    /// update or delete operations. Values must already be stringified; `None` writes a null map
+    /// update or delete operations. Values must already be stringified. `None` writes a null map
     /// value. This map replaces rather than merges with an earlier map, and the last value wins
     /// when a key occurs more than once.
     ///
@@ -210,7 +213,7 @@ impl UpdateTableTransactionBuilder {
     /// Replaces the operation metrics recorded in `commitInfo`.
     ///
     /// Common metrics include `numFiles`, `numOutputRows`, `numOutputBytes`, and
-    /// `executionTimeMs`. Values must already be stringified; `None` writes a null map value. This
+    /// `executionTimeMs`. Values must already be stringified. `None` writes a null map value. This
     /// map replaces rather than merges with an earlier map, and the last value wins when a key
     /// occurs more than once.
     ///
@@ -252,47 +255,26 @@ impl UpdateTableTransactionBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the table is not writable; operation or schema intent is invalid;
-    /// schema evolution or CDF validation fails; application ids or domain metadata conflict;
-    /// a domain is reserved or unsupported; connector commit information does not contain exactly
-    /// one row; or blind append is incompatible with the configured transaction intent.
+    /// Returns an error for:
+    /// - Missing or invalid operation intent, including incompatible blind-append or schema intent.
+    /// - Unsupported table writes, schema evolution, or CDF validation failures.
+    /// - Conflicting application ids or domain metadata, or reserved or unsupported domains.
+    /// - Connector commit information that does not contain exactly one row.
     pub fn build(self, engine: &dyn Engine, committer: Box<dyn Committer>) -> Result<Transaction> {
         self.validate()?;
-        let Self {
-            snapshot,
-            state,
-            operation,
-            schema_changes,
-            domain_metadata_removals,
-            is_blind_append,
-        } = self;
-
-        let mut transaction = try_new_existing_table(snapshot, committer, engine, state)?;
-
-        // TODO(#3149): Construct the transaction from complete validated builder intent.
-        if let Some(operation) = operation {
-            transaction = transaction.with_update_table_operation(operation);
-        }
-        if is_blind_append {
-            transaction = transaction.with_blind_append();
-        }
-        if !schema_changes.is_empty() {
-            transaction = transaction.with_schema_changes(schema_changes)?;
-        }
-        for domain in domain_metadata_removals {
-            transaction = transaction.with_domain_metadata_removed(domain);
-        }
+        let transaction = try_new_existing_table(self, committer, engine)?;
         transaction.validate_domain_metadata_operations()?;
         Ok(transaction)
     }
 
     fn validate(&self) -> Result<()> {
-        if let Some(operation) = &self.operation {
-            operation
-                .validate()
-                .map_err(KernelError::invalid_transaction_state)?;
-        }
-        if self.operation.as_ref() == Some(&UpdateTableOperation::AlterTable) {
+        let operation = self.operation.as_ref().ok_or_else(|| {
+            KernelError::invalid_transaction_state("Transaction operation must be set before build")
+        })?;
+        operation
+            .validate()
+            .map_err(KernelError::invalid_transaction_state)?;
+        if operation == &UpdateTableOperation::AlterTable {
             if self.schema_changes.is_empty() {
                 return Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE requires at least one schema change",
@@ -338,12 +320,18 @@ impl UpdateTableTransactionBuilder {
 }
 
 fn try_new_existing_table(
-    snapshot: impl Into<SnapshotRef>,
+    builder: UpdateTableTransactionBuilder,
     committer: Box<dyn Committer>,
     engine: &dyn Engine,
-    state: TransactionBuilderState,
 ) -> KernelResult<Transaction> {
-    let read_snapshot = snapshot.into();
+    let UpdateTableTransactionBuilder {
+        snapshot: read_snapshot,
+        state,
+        operation,
+        schema_changes,
+        domain_metadata_removals,
+        is_blind_append,
+    } = builder;
 
     // important! before writing to the table we must check it is supported
     read_snapshot
@@ -379,6 +367,13 @@ fn try_new_existing_table(
         IcebergCompatValidationContext::Write,
     )?;
 
+    let should_emit_metadata = !schema_changes.is_empty();
+    let effective_table_config = if should_emit_metadata {
+        apply_schema_changes(effective_table_config, schema_changes)?
+    } else {
+        effective_table_config
+    };
+
     Ok(state.apply_to_transaction(Transaction {
         span,
         operation_id: MetricId::new(),
@@ -386,9 +381,9 @@ fn try_new_existing_table(
         read_snapshot_opt: Some(read_snapshot),
         effective_table_config,
         should_emit_protocol: false,
-        should_emit_metadata: false,
+        should_emit_metadata,
         committer,
-        operation: None,
+        operation: operation.map(Into::into),
         operation_parameters: None,
         operation_metrics: None,
         engine_info: None,
@@ -399,13 +394,13 @@ fn try_new_existing_table(
         user_domain_metadata_additions: vec![],
         system_domain_metadata_additions: vec![],
         provided_row_tracking_high_water_mark: None,
-        user_domain_removals: vec![],
+        user_domain_removals: domain_metadata_removals,
         data_change: true,
         infer_data_change: false,
         column_defaults_acknowledged: false,
         row_tracking_preservation_acknowledged: false,
         engine_commit_info: None,
-        is_blind_append: false,
+        is_blind_append,
         dv_matched_files: vec![],
         num_dv_updates: 0,
         #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -413,6 +408,26 @@ fn try_new_existing_table(
         physical_clustering_columns: clustering_columns,
         _state: PhantomType::default(),
     }))
+}
+
+fn apply_schema_changes(
+    table_config: TableConfiguration,
+    changes: Vec<SchemaOperation>,
+) -> KernelResult<TableConfiguration> {
+    let unsupported_iceberg_compat = [TableFeature::IcebergCompatV2, TableFeature::IcebergCompatV3]
+        .into_iter()
+        .find(|feature| table_config.is_feature_enabled(feature));
+    if let Some(feature) = unsupported_iceberg_compat {
+        return Err(KernelError::unsupported(format!(
+            "Schema changes are not yet supported on tables with {feature} enabled"
+        )));
+    }
+    if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
+        return Err(KernelError::unsupported(
+            "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
+        ));
+    }
+    evolve_table_config(&table_config, changes)
 }
 
 #[cfg(test)]
@@ -527,6 +542,7 @@ mod tests {
         )?));
         let mut transaction = snapshot
             .transaction_builder()
+            .with_operation(UpdateTableOperation::Write)
             .with_engine_info("test-engine")
             .with_commit_info(commit_info, commit_info_schema)
             .with_correlation_id("correlation-id")
@@ -567,6 +583,7 @@ mod tests {
 
         let error = snapshot
             .transaction_builder()
+            .with_operation(UpdateTableOperation::Write)
             .with_commit_info(commit_info, commit_info_schema)
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
@@ -659,12 +676,17 @@ mod tests {
 
     #[derive(Debug)]
     enum InvalidIntent {
+        MissingOperation,
         AlterTableBlindAppend,
         BlindAppendWithoutDataChange,
         BlindAppendWithSchemaChange,
     }
 
     #[rstest]
+    #[case::missing_operation(
+        InvalidIntent::MissingOperation,
+        "operation must be set before build"
+    )]
     #[case::alter_blind_append(
         InvalidIntent::AlterTableBlindAppend,
         "cannot be marked as a blind append"
@@ -684,13 +706,15 @@ mod tests {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let builder = snapshot.transaction_builder();
         let builder = match intent {
+            InvalidIntent::MissingOperation => builder,
             InvalidIntent::AlterTableBlindAppend => builder
                 .with_operation(UpdateTableOperation::AlterTable)
                 .add_column(StructField::nullable("new_column", DataType::STRING))
                 .with_blind_append(),
-            InvalidIntent::BlindAppendWithoutDataChange => {
-                builder.with_blind_append().with_data_change(false)
-            }
+            InvalidIntent::BlindAppendWithoutDataChange => builder
+                .with_operation(UpdateTableOperation::Write)
+                .with_blind_append()
+                .with_data_change(false),
             InvalidIntent::BlindAppendWithSchemaChange => builder
                 .with_operation(UpdateTableOperation::Write)
                 .add_column(StructField::nullable("new_column", DataType::STRING))
@@ -822,7 +846,9 @@ mod tests {
         #[case] expected: &str,
     ) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let mut builder = snapshot.transaction_builder();
+        let mut builder = snapshot
+            .transaction_builder()
+            .with_operation(UpdateTableOperation::Write);
         for domain in additions {
             builder = builder.with_domain_metadata(*domain, "value");
         }
@@ -846,6 +872,7 @@ mod tests {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let error = snapshot
             .transaction_builder()
+            .with_operation(UpdateTableOperation::Write)
             .with_domain_metadata("app.config", "{}")
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();

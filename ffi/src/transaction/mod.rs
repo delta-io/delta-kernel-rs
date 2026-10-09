@@ -331,7 +331,7 @@ mod tests {
         engine: &Handle<SharedExternEngine>,
         data_change: bool,
         engine_info: Option<&str>,
-        operation: Option<KernelUpdateTableOperation>,
+        operation: KernelUpdateTableOperation,
     ) -> Handle<ExclusiveUpdateTableTransaction> {
         let snapshot = unsafe { build_snapshot(ffi_str(path), engine.shallow_copy()) };
         let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
@@ -347,12 +347,7 @@ mod tests {
             },
             None => builder,
         };
-        let builder = match operation {
-            Some(operation) => unsafe {
-                update_table_txn_builder_with_operation(builder, operation)
-            },
-            None => builder,
-        };
+        let builder = unsafe { update_table_txn_builder_with_operation(builder, operation) };
         unsafe {
             ok_or_panic(update_table_txn_builder_build(
                 builder,
@@ -460,7 +455,7 @@ mod tests {
                     &engine,
                     false,
                     Some("default_engine"),
-                    Some(KernelUpdateTableOperation::Write),
+                    KernelUpdateTableOperation::Write,
                 )
             };
 
@@ -895,7 +890,7 @@ mod tests {
                     &engine,
                     true,
                     Some("default_engine"),
-                    Some(KernelUpdateTableOperation::Write),
+                    KernelUpdateTableOperation::Write,
                 )
             };
 
@@ -1315,7 +1310,15 @@ mod tests {
         let table_path_str = table_url.as_str();
 
         // === Transaction 1: add domain metadata ===
-        let txn = unsafe { build_update_transaction(table_path_str, &engine, false, None, None) };
+        let txn = unsafe {
+            build_update_transaction(
+                table_path_str,
+                &engine,
+                false,
+                None,
+                KernelUpdateTableOperation::Write,
+            )
+        };
 
         let domain = "testDomain";
         let configuration = r#"{"key": "value"}"#;
@@ -1342,6 +1345,9 @@ mod tests {
             unsafe { build_snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy()) };
         let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
         unsafe { free_snapshot(snapshot) };
+        let builder = unsafe {
+            update_table_txn_builder_with_operation(builder, KernelUpdateTableOperation::Write)
+        };
         let builder = unsafe { update_table_txn_builder_with_data_change(builder, false) };
         let builder = ok_or_panic(unsafe {
             update_table_txn_builder_with_domain_metadata_removed(
@@ -1382,7 +1388,15 @@ mod tests {
 
         // update_table_txn_with_domain_metadata succeeds (validation is lazy), but commit should
         // fail
-        let txn = unsafe { build_update_transaction(table_path_str, &engine, false, None, None) };
+        let txn = unsafe {
+            build_update_transaction(
+                table_path_str,
+                &engine,
+                false,
+                None,
+                KernelUpdateTableOperation::Write,
+            )
+        };
 
         let sys_domain = "delta.system";
         let config = "config";
@@ -1587,7 +1601,15 @@ mod tests {
         let table_path_str = table_url.as_str();
 
         // Adding the same domain twice should cause commit to fail
-        let txn = unsafe { build_update_transaction(table_path_str, &engine, false, None, None) };
+        let txn = unsafe {
+            build_update_transaction(
+                table_path_str,
+                &engine,
+                false,
+                None,
+                KernelUpdateTableOperation::Write,
+            )
+        };
 
         let dup_domain = "dup";
         let config_a = "a";
@@ -1644,7 +1666,15 @@ mod tests {
         let table_path_str = table_path.to_str().unwrap();
         let engine = get_default_engine(table_path_str);
 
-        let txn = unsafe { build_update_transaction(table_path_str, &engine, false, None, None) };
+        let txn = unsafe {
+            build_update_transaction(
+                table_path_str,
+                &engine,
+                false,
+                None,
+                KernelUpdateTableOperation::Write,
+            )
+        };
 
         let domain = "myDomain";
         let config = "config";
@@ -1755,6 +1785,9 @@ mod tests {
             };
 
             let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+            let builder = unsafe {
+                update_table_txn_builder_with_operation(builder, KernelUpdateTableOperation::Write)
+            };
             let builder = unsafe { update_table_txn_builder_with_data_change(builder, false) };
             let builder = unsafe {
                 ok_or_panic(update_table_txn_builder_with_engine_info(
@@ -2686,6 +2719,12 @@ mod tests {
         let snapshot =
             unsafe { build_snapshot(ffi_str(table_url.as_str()), update_engine.shallow_copy()) };
         let update_builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+        let update_builder = unsafe {
+            update_table_txn_builder_with_operation(
+                update_builder,
+                KernelUpdateTableOperation::Write,
+            )
+        };
         let update_txn = ok_or_panic(unsafe {
             update_table_txn_builder_build(update_builder, update_engine.shallow_copy())
         });
@@ -2759,6 +2798,7 @@ mod tests {
 
     #[derive(Debug)]
     enum InvalidUpdateIntent {
+        MissingOperation,
         EmptyCustomOperation,
         ReservedCustomOperation,
         BlindAppendWithoutDataChange,
@@ -2766,6 +2806,10 @@ mod tests {
     }
 
     #[rstest]
+    #[case::missing_operation(
+        InvalidUpdateIntent::MissingOperation,
+        "operation must be set before build"
+    )]
     #[case::empty_custom(
         InvalidUpdateIntent::EmptyCustomOperation,
         "custom operation name cannot be empty"
@@ -2786,13 +2830,17 @@ mod tests {
     async fn invalid_update_table_intent_maps_through_ffi(
         #[case] intent: InvalidUpdateIntent,
         #[case] expected: &str,
+        #[values(false, true)] custom_committer: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let table_name = format!("test_invalid_update_intent_{intent:?}").to_lowercase();
         let (table_url, _store, engine) = setup_domain_metadata_table(&table_name, false).await?;
         let snapshot =
             unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
         let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+        let snapshot_arc = unsafe { snapshot.clone_as_arc() };
+        let snapshot_ref_count = Arc::strong_count(&snapshot_arc);
         let builder = match intent {
+            InvalidUpdateIntent::MissingOperation => builder,
             InvalidUpdateIntent::EmptyCustomOperation => ok_or_panic(unsafe {
                 update_table_txn_builder_with_custom_operation(
                     builder,
@@ -2808,10 +2856,22 @@ mod tests {
                 )
             }),
             InvalidUpdateIntent::BlindAppendWithoutDataChange => {
+                let builder = unsafe {
+                    update_table_txn_builder_with_operation(
+                        builder,
+                        KernelUpdateTableOperation::Write,
+                    )
+                };
                 let builder = unsafe { update_table_txn_builder_with_data_change(builder, false) };
                 unsafe { update_table_txn_builder_with_blind_append(builder) }
             }
             InvalidUpdateIntent::BlindAppendWithSchemaChange => {
+                let builder = unsafe {
+                    update_table_txn_builder_with_operation(
+                        builder,
+                        KernelUpdateTableOperation::Write,
+                    )
+                };
                 let fields = vec![StructField::nullable("added", DataType::INTEGER)];
                 let field = EngineSchema {
                     schema: &fields as *const Vec<StructField> as *mut c_void,
@@ -2824,15 +2884,85 @@ mod tests {
             }
         };
 
+        let drops = Arc::new(AtomicUsize::new(0));
+        let result = if custom_committer {
+            let committer: Box<dyn Committer> = Box::new(DropTrackingCommitter(Arc::clone(&drops)));
+            unsafe {
+                update_table_txn_builder_build_with_committer(
+                    builder,
+                    engine.shallow_copy(),
+                    committer.into(),
+                )
+            }
+        } else {
+            unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) }
+        };
         assert_extern_result_error_contains(
-            unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) },
+            result,
             FFIKernelError::InvalidTransactionStateError,
             expected,
         );
+        assert_eq!(drops.load(Ordering::SeqCst), usize::from(custom_committer));
+        assert_eq!(Arc::strong_count(&snapshot_arc), snapshot_ref_count - 1,);
         unsafe {
             free_snapshot(snapshot);
             free_engine(engine);
         }
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn update_table_blind_append_commits_expected_flag(
+        #[values(false, true)] blind_append: bool,
+        #[values(false, true)] custom_committer: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, store, engine) =
+            setup_domain_metadata_table("test_update_blind_append", false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+        unsafe { free_snapshot(snapshot) };
+        let builder = unsafe {
+            update_table_txn_builder_with_operation(builder, KernelUpdateTableOperation::Write)
+        };
+        let builder = if blind_append {
+            unsafe { update_table_txn_builder_with_blind_append(builder) }
+        } else {
+            builder
+        };
+        let txn = if custom_committer {
+            let committer: Box<dyn Committer> = Box::new(FileSystemCommitter::new());
+            ok_or_panic(unsafe {
+                update_table_txn_builder_build_with_committer(
+                    builder,
+                    engine.shallow_copy(),
+                    committer.into(),
+                )
+            })
+        } else {
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) })
+        };
+
+        let metadata_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() }
+            .as_ref()
+            .try_into_arrow()?;
+        let file_info = create_file_metadata("file.parquet", 1, 2, metadata_schema)?;
+        let metadata = ok_or_panic(unsafe {
+            get_engine_data(file_info.array, &file_info.schema, allocate_err)
+        });
+        unsafe { update_table_txn_add_files(txn.shallow_copy(), metadata) };
+
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+        let commit_info = read_commit_info_action(&store, &table_url, 1).await;
+        if blind_append {
+            assert_eq!(commit_info["commitInfo"]["isBlindAppend"], true);
+        } else {
+            assert!(commit_info["commitInfo"].get("isBlindAppend").is_none());
+        }
+
+        unsafe { free_engine(engine) };
         Ok(())
     }
 
@@ -2935,9 +3065,15 @@ mod tests {
         let snapshot =
             unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
         let first = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+        let first = unsafe {
+            update_table_txn_builder_with_operation(first, KernelUpdateTableOperation::Write)
+        };
         let first =
             ok_or_panic(unsafe { update_table_txn_builder_build(first, engine.shallow_copy()) });
         let second = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+        let second = unsafe {
+            update_table_txn_builder_with_operation(second, KernelUpdateTableOperation::Write)
+        };
         let second =
             ok_or_panic(unsafe { update_table_txn_builder_build(second, engine.shallow_copy()) });
 
@@ -2964,6 +3100,9 @@ mod tests {
         let snapshot =
             unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
         let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+        let builder = unsafe {
+            update_table_txn_builder_with_operation(builder, KernelUpdateTableOperation::Write)
+        };
         let committer: Box<dyn Committer> = Box::new(IoErrorCommitter);
         let txn = ok_or_panic(unsafe {
             update_table_txn_builder_build_with_committer(
@@ -3360,7 +3499,13 @@ mod tests {
 
         // Blind no-op commit on top of v1 -> v2.
         let txn = unsafe {
-            build_update_transaction(&table_path, &engine, false, Some("test-engine/1.0"), None)
+            build_update_transaction(
+                &table_path,
+                &engine,
+                false,
+                Some("test-engine/1.0"),
+                KernelUpdateTableOperation::Write,
+            )
         };
 
         let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
@@ -3794,7 +3939,13 @@ mod tests {
         ])?;
 
         let txn = unsafe {
-            build_update_transaction(table_path, &engine, true, Some("test-engine/1.0"), None)
+            build_update_transaction(
+                table_path,
+                &engine,
+                true,
+                Some("test-engine/1.0"),
+                KernelUpdateTableOperation::Write,
+            )
         };
 
         let parquet_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() };
@@ -3884,7 +4035,13 @@ mod tests {
         let (data, sv) = scan_meta.scan_files.into_parts();
 
         let txn = unsafe {
-            build_update_transaction(table_path_str, &engine, true, Some("test-engine/1.0"), None)
+            build_update_transaction(
+                table_path_str,
+                &engine,
+                true,
+                Some("test-engine/1.0"),
+                KernelUpdateTableOperation::Delete,
+            )
         };
 
         Ok((data, sv, txn, engine, kernel_engine, table_path))
@@ -4028,7 +4185,13 @@ mod tests {
         let table_path_str = table_url.as_str();
         let engine = engine_handle_for_store(Arc::clone(&store));
         let txn = unsafe {
-            build_update_transaction(table_path_str, &engine, true, Some("test-engine/1.0"), None)
+            build_update_transaction(
+                table_path_str,
+                &engine,
+                true,
+                Some("test-engine/1.0"),
+                KernelUpdateTableOperation::Delete,
+            )
         };
 
         // Build a descriptor from the connector-authored DV file metadata.

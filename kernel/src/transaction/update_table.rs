@@ -1,8 +1,8 @@
 //! Update table transaction methods.
 //!
 //! This module contains staging APIs and deletion vector update logic for update-table
-//! transactions. Construction lives in [`builder::update_table`](super::builder::update_table);
-//! see [`mod.rs`](super) for shared commit logic.
+//! transactions. Construction lives in [`builder::update_table`](super::builder::update_table).
+//! See [`mod.rs`](super) for shared commit logic.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -35,7 +35,7 @@ use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{lazy_schema_ref, ArrayType, SchemaRef, StructField, ToSchema};
 use crate::table_features::TableFeature;
-use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
+#[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::utils::require;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::FileMeta;
@@ -48,71 +48,6 @@ impl Transaction {
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
-
-    /// Mark this transaction as a blind append.
-    ///
-    /// Blind append transactions should only add new files and avoid write operations that
-    /// depend on existing table state.
-    pub(super) fn with_blind_append(mut self) -> Self {
-        self.is_blind_append = true;
-        self
-    }
-
-    pub(super) fn with_update_table_operation(
-        mut self,
-        operation: super::UpdateTableOperation,
-    ) -> Self {
-        self.operation = Some(operation.into());
-        self
-    }
-
-    /// Stages schema changes for this transaction. Call before staging data-file actions.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `changes` is empty, Iceberg compatibility or column defaults are
-    /// enabled, data-file actions have already been staged, an operation is invalid for the
-    /// current schema or table configuration, or a manifest (content-tree) commit was already
-    /// staged (adaptive-metadata-in-dev only).
-    pub(crate) fn with_schema_changes(mut self, changes: Vec<SchemaOperation>) -> Result<Self> {
-        let unsupported_iceberg_compat =
-            [TableFeature::IcebergCompatV2, TableFeature::IcebergCompatV3]
-                .into_iter()
-                .find(|feature| self.effective_table_config.is_feature_enabled(feature));
-        if let Some(feature) = unsupported_iceberg_compat {
-            return Err(KernelError::unsupported(format!(
-                "Schema changes are not yet supported on tables with {feature} enabled"
-            )));
-        }
-        if self
-            .effective_table_config
-            .is_feature_enabled(&TableFeature::AllowColumnDefaults)
-        {
-            return Err(KernelError::unsupported(
-                "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
-            ));
-        }
-        require!(
-            !changes.is_empty(),
-            KernelError::generic("with_schema_changes requires at least one schema operation")
-        );
-        require!(
-            !self.has_data_file_actions(),
-            KernelError::invalid_transaction_state(
-                "with_schema_changes must be called before staging data files"
-            )
-        );
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        require!(
-            !matches!(self.manifest_write, Some(ManifestWrite::Commit(_))),
-            KernelError::invalid_transaction_state(
-                "with_schema_changes cannot be called after staging a manifest commit"
-            )
-        );
-        self.effective_table_config = evolve_table_config(&self.effective_table_config, changes)?;
-        self.should_emit_metadata = true;
-        Ok(self)
-    }
 
     /// Remove domain metadata from the Delta log.
     /// If the domain exists in the Delta log, this creates a tombstone to logically delete
@@ -281,6 +216,7 @@ impl Transaction {
     /// let mut txn = snapshot
     ///     .clone()
     ///     .transaction_builder()
+    ///     .with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
     ///     .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     ///
     /// // Get file metadata from a scan

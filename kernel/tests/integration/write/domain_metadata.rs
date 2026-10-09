@@ -3,6 +3,7 @@
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::Snapshot;
 use itertools::Itertools;
 use serde_json::Deserializer;
@@ -273,6 +274,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     let err = snapshot
         .clone()
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .with_domain_metadata("app.config", "v1")
         .with_domain_metadata_removed("app.config")
         .build(&engine, Box::new(FileSystemCommitter::new()))
@@ -285,6 +287,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     let err = snapshot
         .clone()
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .with_domain_metadata_removed("test.domain")
         .with_domain_metadata("test.domain", "v1")
         .build(&engine, Box::new(FileSystemCommitter::new()))
@@ -297,6 +300,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     let err = snapshot
         .clone()
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .with_domain_metadata_removed("another.domain")
         .with_domain_metadata_removed("another.domain")
         .build(&engine, Box::new(FileSystemCommitter::new()))

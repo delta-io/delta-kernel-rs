@@ -941,6 +941,7 @@ defaults but never materializes them, so the connector fills every omitted colum
 
 ```
 new_update_table_txn_builder()
+  -> update_table_txn_builder_with_operation()
   -> update_table_txn_builder_build()
   -> update_table_txn_visit_top_level_column_defaults(txn, engine, ctx, visitor)
   -> update_table_txn_ack_column_defaults(txn)   // REQUIRED, else the write context errors with
@@ -954,6 +955,7 @@ Deletion vector update flow:
 
 ```
 new_update_table_txn_builder()
+  -> update_table_txn_builder_with_operation()
   -> update_table_txn_builder_build()
   -> dv_descriptor_map_new()
   -> dv_descriptor_new()
@@ -964,8 +966,8 @@ new_update_table_txn_builder()
 ```
 
 The engine authors the DV file and passes descriptor fields to `dv_descriptor_new`. The
-descriptor map and scan iterator are both consumed by `update_table_txn_update_deletion_vectors`;
-descriptor handles are consumed by `dv_descriptor_map_insert` regardless of the result. DV
+descriptor map and scan iterator are both consumed by `update_table_txn_update_deletion_vectors`.
+Descriptor handles are consumed by `dv_descriptor_map_insert` regardless of the result. DV
 updates require both the `deletionVectors` reader/writer feature and
 `delta.enableDeletionVectors=true`.
 

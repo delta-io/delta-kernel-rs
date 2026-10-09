@@ -18,7 +18,7 @@ use delta_kernel::schema::{schema, schema_ref};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::WriteState;
+use delta_kernel::transaction::{UpdateTableOperation, WriteState};
 use delta_kernel::{KernelError, Result, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
@@ -81,7 +81,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
             json!({
                 "commitInfo": {
                     "timestamp": 0,
-                    "operation": "UNKNOWN",
+                    "operation": "WRITE",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
                     "txnId": ZERO_UUID
@@ -297,7 +297,7 @@ async fn test_append_partitioned(
             json!({
                 "commitInfo": {
                     "timestamp": 0,
-                    "operation": "UNKNOWN",
+                    "operation": "WRITE",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
                     "engineInfo": "default engine",
@@ -550,6 +550,7 @@ async fn commit_rejects_add_with_invalid_partition_keys(
         .collect();
     let mut txn = snapshot
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .with_data_change(true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let write_state = txn.write_state()?;

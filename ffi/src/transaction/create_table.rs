@@ -78,8 +78,8 @@ pub unsafe extern "C" fn free_create_table_txn(txn: Handle<ExclusiveCreateTableT
 /// Add domain metadata to a create-table transaction.
 ///
 /// `domain` identifies the user-controlled metadata domain, and `configuration` is its arbitrary
-/// string value. Returns the updated transaction handle. Invalid strings are returned as errors;
-/// domain and table-feature validation occurs when the transaction is committed.
+/// string value. Returns the updated transaction handle. Invalid strings are returned as errors.
+/// Domain and table-feature validation occurs when the transaction is committed.
 ///
 /// # Safety
 ///
@@ -176,7 +176,7 @@ pub unsafe extern "C" fn create_table_txn_builder_with_data_change(
 
 /// Attaches a correlation identifier to create transaction metric events.
 ///
-/// Repeated calls replace the previous value; an empty value clears it.
+/// Repeated calls replace the previous value. An empty value clears it.
 ///
 /// # Safety
 ///
@@ -199,7 +199,7 @@ pub unsafe extern "C" fn create_table_txn_builder_with_correlation_id(
 
 /// Replaces create-table operation parameters recorded in `commitInfo`.
 ///
-/// Duplicate keys are rejected by the FFI map decoder; consecutive calls replace rather than
+/// Duplicate keys are rejected by the FFI map decoder. Consecutive calls replace rather than
 /// merge.
 ///
 /// # Safety
@@ -363,18 +363,18 @@ pub(super) unsafe fn collect_create_table_columns(
 }
 
 /// Set a clustered data layout on a [`CreateTableTransactionBuilder`] from an array of top-level
-/// clustering column names (in order). Clustering and partitioning are mutually exclusive; the
+/// clustering column names (in order). Clustering and partitioning are mutually exclusive. The
 /// last data-layout call wins. Column validation (existence, stats-eligible types, duplicates)
 /// happens later at [`create_table_txn_builder_build`].
 ///
-/// Only top-level columns are supported through this entry point (each slice is one column name);
-/// nested clustering columns must be set on the Rust builder directly.
+/// Only top-level columns are supported through this entry point (each slice is one column name).
+/// Nested clustering columns must be set on the Rust builder directly.
 ///
 /// # Safety
 ///
 /// `builder` and `engine` must be valid. This call borrows `engine` and the column array. When
 /// `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid `KernelStringSlice`
-/// values whose backing bytes are readable for the duration of the call; `columns` may be null
+/// values whose backing bytes are readable for the duration of the call. `columns` may be null
 /// when `num_columns == 0`. `builder` is consumed even when this returns an error.
 #[no_mangle]
 pub unsafe extern "C" fn create_table_txn_builder_with_clustering_columns(
@@ -391,7 +391,7 @@ pub unsafe extern "C" fn create_table_txn_builder_with_clustering_columns(
 }
 
 /// Set a partitioned data layout on a [`CreateTableTransactionBuilder`] from an array of top-level
-/// partition column names (in order). Clustering and partitioning are mutually exclusive; the last
+/// partition column names (in order). Clustering and partitioning are mutually exclusive. The last
 /// data-layout call wins. Column validation (existence, primitive types, subset of schema) happens
 /// later at [`create_table_txn_builder_build`].
 ///
@@ -399,7 +399,7 @@ pub unsafe extern "C" fn create_table_txn_builder_with_clustering_columns(
 ///
 /// `builder` and `engine` must be valid. This call borrows `engine` and the column array. When
 /// `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid `KernelStringSlice`
-/// values whose backing bytes are readable for the duration of the call; `columns` may be null
+/// values whose backing bytes are readable for the duration of the call. `columns` may be null
 /// when `num_columns == 0`. `builder` is consumed even when this returns an error.
 #[no_mangle]
 pub unsafe extern "C" fn create_table_txn_builder_with_partition_columns(
@@ -434,7 +434,7 @@ pub(super) fn create_table_txn_builder_with_data_layout_impl(
 /// # Safety
 ///
 /// `path`, `schema`, `engine_info`, and `engine` must be valid. All inputs are borrowed for the
-/// call; the caller retains ownership.
+/// call. The caller retains ownership.
 #[no_mangle]
 pub unsafe extern "C" fn new_create_table_txn_builder(
     path: KernelStringSlice,

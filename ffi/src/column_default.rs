@@ -6,6 +6,7 @@
 //!
 //! ```text
 //! new_update_table_txn_builder(snapshot)
+//! update_table_txn_builder_with_operation(builder, KernelUpdateTableOperation::Write)
 //! update_table_txn_builder_build(builder, engine)
 //! update_table_txn_visit_top_level_column_defaults(txn, engine, ctx, visitor)
 //!         // one callback per column with a default; the connector evaluates its raw SQL itself
@@ -30,7 +31,7 @@ use crate::{kernel_string_slice, KernelStringSlice, NullableCvoid, SharedExternE
 ///
 /// # Safety
 ///
-/// `txn` must be a valid handle. This call mutably borrows it; the caller must eventually commit
+/// `txn` must be a valid handle. This call mutably borrows it. The caller must eventually commit
 /// or free it.
 #[no_mangle]
 pub unsafe extern "C" fn update_table_txn_ack_column_defaults(
@@ -66,7 +67,7 @@ pub type ColumnDefaultVisitor = extern "C" fn(
 ///
 /// Caller is responsible for passing valid transaction and engine handles, a valid
 /// `engine_context` pointer passed through to each `visitor` invocation, and a valid `visitor`
-/// function pointer. This call borrows `txn` and `engine`; the caller retains ownership.
+/// function pointer. This call borrows `txn` and `engine`. The caller retains ownership.
 #[no_mangle]
 pub unsafe extern "C" fn update_table_txn_visit_top_level_column_defaults(
     txn: Handle<ExclusiveUpdateTableTransaction>,

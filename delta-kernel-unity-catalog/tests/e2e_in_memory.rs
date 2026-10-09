@@ -193,6 +193,7 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
     let err = snapshot
         .clone()
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .build(&engine, committer)?
         .commit(&engine)
         .unwrap_err();

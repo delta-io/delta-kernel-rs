@@ -141,6 +141,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
     use crate::transaction::create_table::create_table as create_table_txn;
+    use crate::transaction::UpdateTableOperation;
     use crate::{RowVisitor as _, Snapshot};
 
     /// Builds a two-commit in-memory Delta table:
@@ -174,6 +175,7 @@ mod tests {
         let snapshot = Snapshot::builder_for(url.clone()).build(&engine).unwrap();
         let _ = snapshot
             .transaction_builder()
+            .with_operation(UpdateTableOperation::Write)
             .with_domain_metadata("domainA", "cfgA")
             .with_domain_metadata("domainB", "cfgB")
             .build(&engine, Box::new(FileSystemCommitter::new()))
@@ -317,6 +319,7 @@ mod tests {
         let table_root = snapshot.table_root().clone();
         let _ = snapshot
             .transaction_builder()
+            .with_operation(UpdateTableOperation::Write)
             .with_domain_metadata_removed("domainA")
             .build(&engine, Box::new(FileSystemCommitter::new()))
             .unwrap()

@@ -350,7 +350,7 @@ pub unsafe extern "C" fn update_table_txn_get_partitioned_write_context(
 }
 
 /// Gets the write context from a create-table transaction for a partitioned table. See
-/// [`update_table_txn_get_partitioned_write_context`] for the contract; this is the create-table
+/// [`update_table_txn_get_partitioned_write_context`] for the contract. This is the create-table
 /// counterpart.
 ///
 /// # Safety

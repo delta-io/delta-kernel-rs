@@ -3,6 +3,7 @@
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::{KernelError, Snapshot};
 use itertools::Itertools;
 use serde_json::{json, Deserializer};
@@ -25,6 +26,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         assert!(matches!(
             snapshot.clone().transaction_builder()
+                .with_operation(UpdateTableOperation::Write)
                 .with_transaction_id("app_id1".to_string(), 0)
                 .with_transaction_id("app_id1".to_string(), 1)
                 .build(&engine, Box::new(FileSystemCommitter::new())),
@@ -33,6 +35,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
 
         let txn = snapshot
             .transaction_builder()
+            .with_operation(UpdateTableOperation::Write)
             .with_engine_info("default engine")
             .with_transaction_id("app_id1".to_string(), 1)
             .with_transaction_id("app_id2".to_string(), 2)
@@ -105,7 +108,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             json!({
                 "commitInfo": {
                     "timestamp": 0,
-                    "operation": "UNKNOWN",
+                    "operation": "WRITE",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
                     "engineInfo": "default engine",

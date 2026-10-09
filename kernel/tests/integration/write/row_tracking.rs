@@ -189,7 +189,9 @@ mod row_tracking_preservation {
         let (connector_commit_info, connector_commit_info_schema) =
             test_case.connector_commit_info()?;
         let commit_info = Box::new(ArrowEngineData::new(connector_commit_info));
-        let builder = snapshot.transaction_builder();
+        let builder = snapshot
+            .transaction_builder()
+            .with_operation(UpdateTableOperation::Write);
         let txn = if set_commit_info_after_build {
             builder
                 .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -389,6 +391,7 @@ mod row_tracking_preservation {
             .scan_files;
         let mut txn = snapshot
             .transaction_builder()
+            .with_operation(UpdateTableOperation::Write)
             .with_data_change(true)
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
         txn.remove_files(scan_files);
@@ -768,6 +771,7 @@ fn write_context_row_tracking_columns_respect_iceberg_compat_v3(
     .unwrap_post_commit_snapshot();
     let txn = snapshot
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let result = txn
         .write_state()?
@@ -846,6 +850,7 @@ async fn write_context_maps_row_tracking_metadata_to_physical(
     let txn = source_snapshot
         .clone()
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let write_context = txn
         .write_state()?

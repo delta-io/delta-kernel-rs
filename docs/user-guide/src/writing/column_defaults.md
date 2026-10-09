@@ -108,7 +108,7 @@ and per-row `DEFAULT` requests need separate handling.
 # use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel::expressions::Scalar;
-# use delta_kernel::transaction::CommitResult;
+# use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 # use delta_kernel::{Result, KernelError, SnapshotRef};
 # use delta_kernel_default_engine::executor::TaskExecutor;
 # use delta_kernel_default_engine::DefaultEngine;
@@ -128,6 +128,7 @@ async fn append_with_defaults(
     let table_schema = snapshot.schema();
     let mut txn = snapshot
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .build(engine, Box::new(FileSystemCommitter::new()))?;
 
     // 2. Build one reusable mapping from input columns or parsed defaults.

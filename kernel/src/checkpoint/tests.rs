@@ -30,6 +30,7 @@ use crate::object_store::ObjectStoreExt as _;
 use crate::schema::{schema_ref, DataType as KernelDataType, StructField};
 use crate::table_features::TableFeature;
 use crate::transaction::create_table::create_table;
+use crate::transaction::UpdateTableOperation;
 use crate::unit_test_utils::Action;
 use crate::{FileMeta, KernelResult, LogPath, Result, Snapshot};
 
@@ -855,6 +856,7 @@ async fn test_checkpoint_preserves_domain_metadata() -> Result<()> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
             .transaction_builder()
+            .with_operation(UpdateTableOperation::Write)
             .with_domain_metadata(domain, value)
             .build(&engine, Box::new(FileSystemCommitter::new()))?;
         let result = txn.commit(&engine)?;
@@ -932,6 +934,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> Result<()> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let txn = snapshot
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .with_domain_metadata("foo", "bar")
         .build(&engine, Box::new(FileSystemCommitter::new()))?;
     let result = txn.commit(&engine)?;
@@ -948,6 +951,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> Result<()> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let result = snapshot
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .with_domain_metadata_removed("foo")
         .build(&engine, Box::new(FileSystemCommitter::new()))?
         .commit(&engine)?;

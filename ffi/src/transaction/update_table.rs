@@ -15,7 +15,7 @@ pub struct ExclusiveUpdateTableTransaction;
 /// A handle for configuring a transaction against an existing table.
 ///
 /// Every `update_table_txn_builder_with_*` function consumes its input handle and returns a
-/// replacement on success; on error, the builder is dropped. The caller must build or free the
+/// replacement on success. On error, the builder is dropped. The caller must build or free the
 /// final returned handle.
 #[handle_descriptor(target=UpdateTableTransactionBuilder, mutable=true, sized=true)]
 pub struct ExclusiveUpdateTableTransactionBuilder;
@@ -36,6 +36,9 @@ pub unsafe extern "C" fn new_update_table_txn_builder(
 
 /// Builds an update-table transaction with the default filesystem committer.
 ///
+/// Returns an error if no operation was set with `update_table_txn_builder_with_operation` or
+/// `update_table_txn_builder_with_custom_operation`, or if the configured intent is invalid.
+///
 /// # Safety
 ///
 /// Both handles must be valid. This call borrows `engine` and unconditionally consumes `builder`,
@@ -55,7 +58,10 @@ pub unsafe extern "C" fn update_table_txn_builder_build(
     .into_extern_result(&extern_engine)
 }
 
-/// Starts an update-table transaction with a custom committer.
+/// Builds an update-table transaction with a custom committer.
+///
+/// Returns an error if no operation was set with `update_table_txn_builder_with_operation` or
+/// `update_table_txn_builder_with_custom_operation`, or if the configured intent is invalid.
 ///
 /// # Safety
 ///
@@ -424,7 +430,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_engine_info(
 /// # Safety
 ///
 /// `builder` must be valid and is consumed by this call. `operation` must contain a valid
-/// [`KernelUpdateTableOperation`] discriminant; any other tag is undefined behavior.
+/// [`KernelUpdateTableOperation`] discriminant. Any other tag is undefined behavior.
 #[no_mangle]
 pub unsafe extern "C" fn update_table_txn_builder_with_operation(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
@@ -623,7 +629,7 @@ pub unsafe extern "C" fn update_table_txn_add_files(
 /// `data` must use the scan-row schema and be derived from scan metadata. The removal selection
 /// must select only rows active in the original scan selection vector.
 ///
-/// A null or empty selection vector selects every row; use it only when every row is active and
+/// A null or empty selection vector selects every row. Use it only when every row is active and
 /// intended for removal. The engine-data handle is consumed even on error, while the transaction
 /// and engine handles remain owned by the caller.
 ///

@@ -19,7 +19,8 @@ use crate::{
     snapshot_builder_build,
     transaction::{
         new_update_table_txn_builder, update_table_txn_builder_build,
-        ExclusiveUpdateTableTransaction,
+        update_table_txn_builder_with_operation, ExclusiveUpdateTableTransaction,
+        KernelUpdateTableOperation,
     },
     ExternEngine, SharedExternEngine, SharedSnapshot,
 };
@@ -119,13 +120,13 @@ pub(crate) unsafe fn build_snapshot(
     ok_or_panic(snapshot_builder_build(builder))
 }
 
-/// Build an update-table transaction through the FFI snapshot and transaction-builder APIs.
+/// Build a `WRITE` transaction through the FFI snapshot and transaction-builder APIs.
 ///
 /// Returns an error if the transaction cannot be built. Panics if the snapshot cannot be loaded.
 ///
 /// # Safety
 ///
-/// `path` and `engine` must be valid. This call borrows both inputs; the caller retains ownership.
+/// `path` and `engine` must be valid. This call borrows both inputs. The caller retains ownership.
 #[cfg(test)]
 pub(crate) unsafe fn build_update_table_txn(
     path: KernelStringSlice,
@@ -133,6 +134,9 @@ pub(crate) unsafe fn build_update_table_txn(
 ) -> ExternResult<crate::handle::Handle<ExclusiveUpdateTableTransaction>> {
     let snapshot = unsafe { build_snapshot(path, engine.shallow_copy()) };
     let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+    let builder = unsafe {
+        update_table_txn_builder_with_operation(builder, KernelUpdateTableOperation::Write)
+    };
     unsafe { free_snapshot(snapshot) };
     unsafe { update_table_txn_builder_build(builder, engine) }
 }

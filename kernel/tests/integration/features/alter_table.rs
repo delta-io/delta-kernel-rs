@@ -1027,6 +1027,7 @@ async fn empty_create_then_add_column(
     let write_state_err = v0
         .clone()
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .with_engine_info("EmptySchemaApp/0.1.0")
         .build(engine.as_ref(), committer())?
         .write_state()
@@ -1539,6 +1540,7 @@ async fn add_column_with_orphan_default_metadata_succeeds() -> Result<()> {
 
     let txn = reloaded
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .build(engine.as_ref(), committer())?;
     assert!(
         txn.top_level_column_defaults()?.is_empty(),

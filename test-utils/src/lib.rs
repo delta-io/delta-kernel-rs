@@ -1226,18 +1226,25 @@ pub async fn insert_data_with<E: TaskExecutor>(
     txn.commit(engine.as_ref())
 }
 
-/// Starts a transaction using the passed snapshot using a [`FileSystemCommitter`].
+/// Starts a `WRITE` transaction using the passed snapshot and a [`FileSystemCommitter`].
 pub fn begin_transaction(snapshot: Arc<Snapshot>, engine: &dyn Engine) -> Result<Transaction> {
     begin_transaction_with(snapshot, engine, |builder| builder)
 }
 
-/// Starts a transaction after applying `configure` to its builder.
+/// Starts a transaction after applying `configure` to a builder configured for `WRITE`.
+///
+/// `configure` may replace the operation.
 pub fn begin_transaction_with(
     snapshot: Arc<Snapshot>,
     engine: &dyn Engine,
     configure: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
 ) -> Result<Transaction> {
-    configure(snapshot.transaction_builder()).build(engine, Box::new(FileSystemCommitter::new()))
+    configure(
+        snapshot
+            .transaction_builder()
+            .with_operation(UpdateTableOperation::Write),
+    )
+    .build(engine, Box::new(FileSystemCommitter::new()))
 }
 
 /// A catalog [`Committer`] for tests: writes every commit directly to the published Delta log
@@ -1645,6 +1652,7 @@ pub async fn write_batch_to_table(
     let mut txn = snapshot
         .clone()
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .with_engine_info("DefaultEngine")
         .with_data_change(true)
         .build(engine, Box::new(FileSystemCommitter::new()))?;
@@ -2129,6 +2137,7 @@ pub fn remove_all_and_get_remove_actions(
     let mut txn = snapshot
         .clone()
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .with_engine_info("DefaultEngine")
         .with_data_change(true)
         .build(engine, Box::new(FileSystemCommitter::new()))?;

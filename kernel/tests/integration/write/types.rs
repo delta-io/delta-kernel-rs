@@ -15,6 +15,7 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::{KernelError, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
@@ -612,6 +613,7 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         .expect("snapshot should build");
     let mut txn = snapshot
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
         .expect("transaction should create");
 
@@ -751,6 +753,7 @@ async fn write_state_creation_fails_fast_on_invalid_void_schema(
         .expect("snapshot should build");
     let txn = snapshot
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
         .expect("transaction should create");
 
@@ -785,6 +788,7 @@ async fn write_context_excludes_void_from_physical_schema() -> Result<(), Box<dy
 
     let txn = snapshot
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
     let wc = txn.write_state()?.write_context_builder().build()?;
@@ -814,6 +818,7 @@ async fn metadata_only_commit_with_void_in_array_succeeds() -> Result<(), Box<dy
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let txn = snapshot
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
     // Commit with NO add_files — this is a metadata-only operation and should succeed
@@ -860,6 +865,7 @@ async fn write_context_excludes_nested_void_from_physical_schema(
 
     let txn = snapshot
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let wc = txn.write_state()?.write_context_builder().build()?;
     let physical = wc.physical_data_schema();
@@ -900,6 +906,7 @@ async fn write_transform_drops_nested_void_fields() -> Result<(), Box<dyn std::e
 
     let txn = snapshot
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let wc = txn.write_state()?.write_context_builder().build()?;
 

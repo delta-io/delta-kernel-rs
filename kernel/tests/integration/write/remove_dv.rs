@@ -435,6 +435,7 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
     let mut txn = snapshot
         .clone()
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .with_engine_info("test engine")
         .with_data_change(true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;

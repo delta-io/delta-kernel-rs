@@ -7,7 +7,7 @@ use crate::crc::is_incremental_safe_operation;
 /// Identifies an operation supported by [`UpdateTableTransactionBuilder`].
 ///
 /// Typed variants provide compiler-checked names. [`Custom`](Self::Custom) preserves the protocol's
-/// extensibility. Create-table transactions fix their operation internally; replace-table
+/// extensibility. Create-table transactions fix their operation internally. Replace-table
 /// operations are not supported.
 ///
 /// [`UpdateTableTransactionBuilder`]: super::UpdateTableTransactionBuilder

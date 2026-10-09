@@ -127,6 +127,7 @@ IDs, catalog APIs, or catalog servers. Instead:
 |      .with_max_catalog_version(version)                   |
 |      .build(&engine)                                      |
 |    snapshot.transaction_builder()                         |
+|      .with_operation(UpdateTableOperation::Write)         |
 |      .build(&engine, committer)                           |
 +---------------------------+-------------------------------+
                             | calls Kernel APIs

@@ -916,7 +916,7 @@ impl CreateTableTransactionBuilder {
     /// Sets whether files added during creation represent a logical data change.
     ///
     /// `data_change` defaults to `true`. `false` indicates no logical change to the table's data.
-    /// Returns the updated builder; consecutive calls replace the previous value. The configured
+    /// Returns the updated builder. Consecutive calls replace the previous value. The configured
     /// value is preserved through commit, including when no files are added.
     pub fn with_data_change(mut self, data_change: bool) -> Self {
         self.state.data_change = Some(data_change);
@@ -926,7 +926,7 @@ impl CreateTableTransactionBuilder {
     /// Adds an application transaction identifier to emit as a `txn` action.
     ///
     /// The action's `lastUpdated` value uses the transaction's commit timestamp.
-    /// An application id may occur only once; duplicate ids are rejected by [`build`](Self::build).
+    /// An application id may occur only once. Duplicate ids are rejected by [`build`](Self::build).
     pub fn with_transaction_id(mut self, app_id: impl Into<String>, version: i64) -> Self {
         self.state = self.state.with_transaction_id(app_id, version);
         self
@@ -934,7 +934,7 @@ impl CreateTableTransactionBuilder {
 
     /// Adds user-controlled domain metadata.
     ///
-    /// Each domain may occur only once; duplicates are rejected by [`build`](Self::build).
+    /// Each domain may occur only once. Duplicates are rejected by [`build`](Self::build).
     pub fn with_domain_metadata(
         mut self,
         domain: impl Into<String>,
@@ -953,7 +953,7 @@ impl CreateTableTransactionBuilder {
 
     /// Replaces the operation parameters recorded in `commitInfo`.
     ///
-    /// Values must already be stringified as expected in table history; `None` writes a null map
+    /// Values must already be stringified as expected in table history. `None` writes a null map
     /// value. This map replaces rather than merges with an earlier map, and the last value wins
     /// when a key occurs more than once. Dedicated parameters take precedence over a same-named
     /// nested field supplied by [`with_commit_info`](Self::with_commit_info).
@@ -969,7 +969,7 @@ impl CreateTableTransactionBuilder {
 
     /// Replaces the operation metrics recorded in `commitInfo`.
     ///
-    /// Values must already be stringified as expected in table history; `None` writes a null map
+    /// Values must already be stringified as expected in table history. `None` writes a null map
     /// value. This map replaces rather than merges with an earlier map, and the last value wins
     /// when a key occurs more than once. Metrics supplied to the built transaction replace these
     /// values. Dedicated metrics take precedence over a same-named nested field supplied by

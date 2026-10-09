@@ -62,6 +62,8 @@ int main(int argc, char* argv[]) {
   }
   SharedSnapshot* snapshot = snapshot_res.ok;
   ExclusiveUpdateTableTransactionBuilder* txn_builder = new_update_table_txn_builder(snapshot);
+  txn_builder = update_table_txn_builder_with_operation(
+      txn_builder, KernelUpdateTableOperationWrite);
 
   // This empty commit does not add data.
   txn_builder = update_table_txn_builder_with_data_change(txn_builder, false);

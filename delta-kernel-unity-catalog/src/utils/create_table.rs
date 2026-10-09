@@ -199,6 +199,7 @@ mod tests {
     use delta_kernel::snapshot::Snapshot;
     use delta_kernel::transaction::create_table::create_table;
     use delta_kernel::transaction::data_layout::DataLayout;
+    use delta_kernel::transaction::UpdateTableOperation;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use test_utils::TestCatalogCommitter;
@@ -428,6 +429,7 @@ mod tests {
             .unwrap();
         let result = v0_snapshot
             .transaction_builder()
+            .with_operation(UpdateTableOperation::Write)
             .build(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
             .commit(&engine)

@@ -19,6 +19,7 @@ use delta_kernel::schema::{schema, schema_ref, DataType, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::Snapshot;
 use rstest::rstest;
 use test_utils::{get_column, read_scan, test_table_setup_mt, write_batch_to_table};
@@ -1110,6 +1111,7 @@ async fn test_materialize_partition_columns_e2e(
     // A single commit writing two distinct partitions.
     let mut txn = snapshot
         .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
         .with_engine_info("default engine")
         .with_data_change(true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
