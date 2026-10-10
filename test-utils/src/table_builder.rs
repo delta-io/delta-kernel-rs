@@ -68,7 +68,9 @@ use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, Error as ObjectStoreError, ObjectStoreExt as _};
-use delta_kernel::schema::{schema_ref, DataType, PrimitiveType, SchemaRef, StructType};
+use delta_kernel::schema::{
+    schema_ref, DataType, IntervalYearToMonthType, PrimitiveType, SchemaRef, StructType,
+};
 use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
@@ -1851,7 +1853,16 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
                 }
                 PrimitiveType::Void => panic!("void type is not a valid partition column"),
                 // Intervals are physical integers: months (year-month) / microseconds (day-time).
-                PrimitiveType::IntervalYearMonth => Scalar::IntervalYearMonth((seed % 100) as i32),
+                PrimitiveType::IntervalYearMonth(dtype) => {
+                    let months = (seed % 100) as i32;
+                    let months = if *dtype == IntervalYearToMonthType::IntervalYear {
+                        months / 12 * 12
+                    } else {
+                        months
+                    };
+                    Scalar::interval_year_month(months, *dtype)
+                        .expect("test seed produced invalid interval year-month")
+                }
                 PrimitiveType::IntervalDayTime => Scalar::IntervalDayTime((seed * 1000) as i64),
                 other => panic!("{other:?} is not a valid partition column type"),
             }

@@ -421,6 +421,10 @@ pub enum KernelError {
     #[error("Invalid decimal: {0}")]
     InvalidDecimal(String),
 
+    /// Interval value cannot be represented by its declared qualifier
+    #[error("Invalid interval: {0}")]
+    InvalidInterval(String),
+
     /// Invalid CRS or other parameter for a Geometry / Geography type
     #[error("Invalid geo parameters: {0}")]
     InvalidGeoParams(String),
@@ -562,6 +566,11 @@ impl KernelError {
     }
     pub fn invalid_decimal(msg: impl ToString) -> Self {
         Self::InvalidDecimal(msg.to_string())
+    }
+    /// Creates an InvalidInterval error. The message explains why the interval value cannot be
+    /// represented by its qualifier.
+    pub fn invalid_interval(msg: impl ToString) -> Self {
+        Self::InvalidInterval(msg.to_string())
     }
     #[cfg(feature = "geo-type-in-dev")]
     pub fn invalid_geo_params(msg: impl ToString) -> Self {

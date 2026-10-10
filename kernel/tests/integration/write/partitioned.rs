@@ -15,7 +15,7 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
-use delta_kernel::schema::{schema, schema_ref, DataType, StructType};
+use delta_kernel::schema::{schema, schema_ref, DataType, IntervalYearToMonthType, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -130,13 +130,22 @@ async fn test_write_partitioned_normal_values_roundtrip(
     Ok(())
 }
 
-/// Writes an interval partition column, asserts the partitionValues entry is the Spark ANSI
-/// interval literal (CM=None), and verifies the value round-trips through a scan.
+/// Checks interval partition serialization and scanned values.
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
-    Scalar::IntervalYearMonth(30),
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
     "INTERVAL '2-6' YEAR TO MONTH"
+)]
+#[case::year(
+    DataType::interval_year_month(IntervalYearToMonthType::IntervalYear),
+    Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
+    "INTERVAL '2' YEAR"
+)]
+#[case::month(
+    DataType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
+    "INTERVAL '30' MONTH"
 )]
 #[case::day_time(
     DataType::INTERVAL_DAY_TIME,
@@ -153,6 +162,22 @@ async fn test_write_partitioned_interval_roundtrip(
         ColumnMappingMode::Name,
         ColumnMappingMode::Id
     )]
+    cm_mode: ColumnMappingMode,
+) {
+    write_partitioned_interval_roundtrip(
+        interval,
+        partition_value,
+        expected_partition_value,
+        cm_mode,
+    )
+    .await
+    .unwrap();
+}
+
+async fn write_partitioned_interval_roundtrip(
+    interval: DataType,
+    partition_value: Scalar,
+    expected_partition_value: &str,
     cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = schema_ref! {
@@ -175,15 +200,17 @@ async fn test_write_partitioned_interval_roundtrip(
     )
     .await?;
 
-    // CM=None: the raw partitionValues entry is the Spark ANSI interval literal.
-    if cm_mode == ColumnMappingMode::None {
-        let (add, _rel) = read_single_add(&table_path, 1)?;
-        assert_eq!(
-            add["partitionValues"]["period"].as_str(),
-            Some(expected_partition_value),
-            "interval partition value should serialize to the ANSI literal"
-        );
-    }
+    let logical_schema = snapshot.schema();
+    let period_physical = logical_schema
+        .field("period")
+        .unwrap()
+        .physical_name(cm_mode);
+    let (add, _rel) = read_single_add(&table_path, 1)?;
+    assert_eq!(
+        add["partitionValues"][period_physical].as_str(),
+        Some(expected_partition_value),
+        "interval partition value should serialize to the ANSI literal"
+    );
 
     // The partition value round-trips: scan materializes `period` back as its physical integer.
     let sorted = read_sorted(&snapshot, engine as Arc<dyn delta_kernel::Engine>)?;
@@ -197,13 +224,59 @@ async fn test_write_partitioned_interval_roundtrip(
     Ok(())
 }
 
-/// Materialized interval partition columns are written into the Parquet file as physical integer
-/// values and still round-trip through scan output as logical partition columns.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_rejects_qualifier_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = schema_ref! {
+        nullable "value": INTEGER,
+        nullable "period": (DataType::interval_year_month(IntervalYearToMonthType::IntervalYear)),
+    };
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot = create_interval_partitioned_table(
+        &table_path,
+        engine.as_ref(),
+        schema,
+        ColumnMappingMode::None,
+        false,
+    )?;
+    let data_schema = schema! { nullable "value": INTEGER };
+    let batch = RecordBatch::try_new(
+        Arc::new((&data_schema).try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![7]))],
+    )?;
+    let partition_value = Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalMonth)?;
+    let error = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        batch,
+        HashMap::from([("period".to_string(), partition_value)]),
+    )
+    .await
+    .expect_err("mismatched partition qualifier should fail");
+    assert!(error
+        .to_string()
+        .contains("partition column 'period' has type"));
+
+    let latest = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(latest.version(), snapshot.version());
+    Ok(())
+}
+
+/// Checks partitionValues spelling before validating materialized Parquet columns and scans.
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
-    Scalar::IntervalYearMonth(30),
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
     "INTERVAL '2-6' YEAR TO MONTH"
+)]
+#[case::year(
+    DataType::interval_year_month(IntervalYearToMonthType::IntervalYear),
+    Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
+    "INTERVAL '2' YEAR"
+)]
+#[case::month(
+    DataType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
+    Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
+    "INTERVAL '30' MONTH"
 )]
 #[case::day_time(
     DataType::INTERVAL_DAY_TIME,
@@ -220,6 +293,22 @@ async fn test_materialized_partitioned_interval_roundtrip(
         ColumnMappingMode::Name,
         ColumnMappingMode::Id
     )]
+    cm_mode: ColumnMappingMode,
+) {
+    materialized_partitioned_interval_roundtrip(
+        interval,
+        partition_value,
+        expected_partition_value,
+        cm_mode,
+    )
+    .await
+    .unwrap();
+}
+
+async fn materialized_partitioned_interval_roundtrip(
+    interval: DataType,
+    partition_value: Scalar,
+    expected_partition_value: &str,
     cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = schema_ref! {
@@ -682,7 +771,7 @@ fn assert_interval_value(batch: &RecordBatch, column_name: &str, expected: &Scal
         Scalar::IntervalYearMonth(months) => {
             assert_eq!(
                 get_column!(batch, column_name, Int32Array).value(0),
-                *months,
+                months.months(),
                 "interval year-month column {column_name}"
             );
         }
