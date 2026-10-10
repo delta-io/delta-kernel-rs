@@ -854,6 +854,11 @@ impl Snapshot {
     /// Returns `Ok(None)` when the `ClusteredTable` feature is absent on the protocol, or when
     /// the domain has no current entry. The JSON has the shape
     /// `{"clusteringColumns":[["col1"],["addr","city"], ...]}` with physical column names.
+    /// Additional fields are preserved without parsing or reserialization.
+    ///
+    /// Uses `engine` to load domain metadata when it is not cached. Returns an error if loading
+    /// domain metadata fails.
+    #[internal_api]
     pub(crate) fn get_clustering_domain_metadata(
         &self,
         engine: &dyn Engine,
