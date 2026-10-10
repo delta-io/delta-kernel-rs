@@ -673,10 +673,11 @@ mod tests {
 
         let (engine, txn) = make_txn(None).unwrap();
         let mut commit_info = make_kernel_commit_info();
-        commit_info.last_manifest_commit =
-            last_manifest_commit.map(|(version, content_root_version)| {
+        commit_info.set_last_manifest_commit(last_manifest_commit.map(
+            |(version, content_root_version)| {
                 LastManifestCommit::new(version, content_root_version).unwrap()
-            });
+            },
+        ));
 
         let result = ArrowEngineData::try_from_engine_data(
             txn.generate_commit_info(engine.as_ref(), commit_info)

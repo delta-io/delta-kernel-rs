@@ -978,6 +978,14 @@ impl CommitInfo {
         self.data_change = Some(data_change);
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn set_last_manifest_commit(
+        &mut self,
+        last_manifest_commit: Option<LastManifestCommit>,
+    ) {
+        self.last_manifest_commit = last_manifest_commit;
+    }
+
     /// Merges the supplied tags into this CommitInfo's tags.
     ///
     /// Existing values take precedence when both maps contain the same key.

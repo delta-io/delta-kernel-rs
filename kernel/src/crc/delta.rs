@@ -12,6 +12,8 @@ use super::file_stats::FileStatsDelta;
 use super::{
     Crc, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::LastManifestCommit;
 use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::Version;
 
@@ -31,6 +33,10 @@ pub(crate) struct CrcDelta {
     /// In-commit timestamp at `Y`. Replaces the base's ICT unconditionally
     /// (whether `Some` or `None`).
     pub(crate) in_commit_timestamp: Option<i64>,
+    /// `lastManifestCommit` at `Y`. Replaces the base's value unconditionally (whether `Some` or
+    /// `None`), since every adaptiveMetadata commit carries the value forward.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) last_manifest_commit: Option<LastManifestCommit>,
     /// Whether the file-stats portion of this delta can be applied incrementally. When `false`,
     /// [`Crc::apply`] transitions [`FileStatsState`] to `Indeterminate`. Producers set this to
     /// `false` whenever they observe a signal that makes incremental tracking unsound (for
@@ -87,6 +93,8 @@ impl CrcDelta {
             domain_metadata_state,
             set_transaction_state,
             in_commit_timestamp_opt: self.in_commit_timestamp,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit_opt: self.last_manifest_commit,
             ..Default::default()
         })
     }
@@ -98,6 +106,7 @@ impl Crc {
     ///
     /// - Protocol / metadata: replaced when present in the delta, kept otherwise.
     /// - ICT: unconditional replace; the delta carries ICT at `Y` (whether `Some` or `None`).
+    /// - `lastManifestCommit`: unconditional replace, same as ICT.
     /// - Domain metadata: tombstones (`is_removed()`) drop the key from the base map; all others
     ///   upsert by domain. Set transactions: upsert by app_id. The `Complete`/`Partial` variant is
     ///   preserved in both cases.
@@ -136,6 +145,10 @@ impl Crc {
         // In-commit timestamp at `Y` (end of the range). Unconditional replace; `None` is a
         // legal value (ICT disabled at `Y`).
         self.in_commit_timestamp_opt = delta.in_commit_timestamp;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            self.last_manifest_commit_opt = delta.last_manifest_commit;
+        }
 
         self.file_stats_state = transition_file_stats(
             &self.file_stats_state,
@@ -485,6 +498,29 @@ mod tests {
         assert_eq!(crc.in_commit_timestamp_opt, None);
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    fn test_apply_replaces_last_manifest_commit(
+        #[values(None, Some((2, 1)))] base: Option<(i64, i64)>,
+        #[values(None, Some((5, 5)))] delta: Option<(i64, i64)>,
+    ) {
+        let to_lmc = |pair: Option<(i64, i64)>| {
+            pair.map(|(version, content_root)| {
+                LastManifestCommit::new(version, content_root).unwrap()
+            })
+        };
+        let delta = CrcDelta {
+            last_manifest_commit: to_lmc(delta),
+            ..add_files_delta(0, 0)
+        };
+        let crc = Crc {
+            last_manifest_commit_opt: to_lmc(base),
+            ..base_crc()
+        }
+        .apply(delta.clone(), 1);
+        assert_eq!(crc.last_manifest_commit_opt, delta.last_manifest_commit);
+    }
+
     // ===== CrcDelta::into_complete_crc tests =====
 
     fn test_protocol() -> Protocol {
@@ -568,6 +604,20 @@ mod tests {
         };
         let crc = delta.into_complete_crc(0).unwrap();
         assert_eq!(crc.in_commit_timestamp_opt, Some(12345));
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_into_complete_crc_with_last_manifest_commit() {
+        let last_manifest_commit = Some(LastManifestCommit::new(3, 2).unwrap());
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            last_manifest_commit: last_manifest_commit.clone(),
+            ..add_files_delta(0, 0)
+        };
+        let crc = delta.into_complete_crc(0).unwrap();
+        assert_eq!(crc.last_manifest_commit_opt, last_manifest_commit);
     }
 
     #[test]

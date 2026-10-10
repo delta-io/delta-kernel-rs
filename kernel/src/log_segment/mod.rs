@@ -44,9 +44,11 @@ mod domain_metadata_replay;
 mod protocol_metadata_replay;
 
 pub(crate) use domain_metadata_replay::DomainMetadataMap;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-pub(crate) use protocol_metadata_replay::CheckpointActionResolution;
 pub(crate) use protocol_metadata_replay::PmResolution;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) use protocol_metadata_replay::{
+    CheckpointActionResolution, LastManifestCommitResolution,
+};
 
 #[cfg(test)]
 mod crc_tests;

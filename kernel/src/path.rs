@@ -420,7 +420,6 @@ impl ParsedLogPath<FileMeta> {
     /// This method performs IO by reading the commit log file from storage. Returns an error if
     /// this is not a commit file, the file cannot be read, or the value is invalid.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[cfg_attr(not(test), allow(dead_code))]
     #[tracing::instrument(skip(engine), ret, fields(version = self.version, path = %self.location.as_url()))]
     pub(crate) fn read_last_manifest_commit(
         &self,
