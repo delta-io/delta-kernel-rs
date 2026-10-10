@@ -189,6 +189,11 @@ pub(crate) static CHECKPOINT_ACTION_FIELD: LazyLock<StructField> = LazyLock::new
     )
 });
 
+/// The `lastManifestCommit` field as nested in commitInfo actions and CRC files.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) static LAST_MANIFEST_COMMIT_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable("lastManifestCommit", LastManifestCommit::to_schema()));
+
 /// The `checkpoint` action field, present only under the `adaptive-metadata-in-dev` feature;
 /// otherwise an empty iterator.
 fn checkpoint_action_field() -> impl IntoIterator<Item = &'static StructField> {
