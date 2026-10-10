@@ -913,6 +913,12 @@ pub(crate) struct CommitInfo {
     pub(crate) txn_id: Option<String>,
     /// Map of tags associated with this commit.
     pub(crate) tags: Option<HashMap<String, Option<String>>>,
+    /// Whether this commit changes the table's logical records. Required on every commit when
+    /// adaptiveMetadata is enabled; readers then treat it as the source of truth over the
+    /// per-file-action `dataChange` flags.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) data_change: Option<bool>,
     /// Identifies the latest manifest commit up to this version. Absent until the table's first
     /// manifest commit (adaptiveMetadata).
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -940,6 +946,8 @@ impl CommitInfo {
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
             tags: None,
             #[cfg(feature = "adaptive-metadata-in-dev")]
+            data_change: None,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit: None,
         }
     }
@@ -963,6 +971,11 @@ impl CommitInfo {
         operation_metrics: HashMap<String, Option<String>>,
     ) {
         self.operation_metrics = Some(operation_metrics);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn set_data_change(&mut self, data_change: bool) {
+        self.data_change = Some(data_change);
     }
 
     /// Merges the supplied tags into this CommitInfo's tags.
@@ -2462,6 +2475,7 @@ mod tests {
                 nullable "engineInfo": STRING,
                 nullable "txnId": STRING,
                 nullable "tags": { STRING => nullable STRING },
+                nullable "dataChange": BOOLEAN,
                 nullable "lastManifestCommit": {
                     not_null "version": LONG,
                     not_null "contentRootVersion": LONG,
