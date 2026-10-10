@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use derive_more::Constructor;
 use tracing::debug;
@@ -603,6 +604,40 @@ pub trait EngineData: AsAny {
     /// For a top-level field named `"foo"`, use `column_name!("foo")`. For nested fields,
     /// each non-leaf element of the path must be a struct field at that level.
     fn has_field(&self, name: &ColumnName) -> bool;
+}
+
+/// Immutable, replayable collection of engine data.
+///
+/// Repeated reads contain the same rows, but may use different row ordering and batch boundaries.
+pub trait EngineRelation: AsAny {
+    /// Whether this relation contains no rows.
+    fn is_empty(&self) -> bool;
+}
+
+/// Shared reference to an immutable engine relation.
+pub type EngineRelationRef = Arc<dyn EngineRelation>;
+
+/// In-memory relation for connectors that already hold [`EngineData`] batches.
+pub struct InMemoryEngineRelation {
+    batches: Vec<Arc<dyn EngineData>>,
+}
+
+impl InMemoryEngineRelation {
+    /// Create an in-memory relation from `batches`.
+    pub fn new(batches: Vec<Arc<dyn EngineData>>) -> Self {
+        Self { batches }
+    }
+
+    pub(crate) fn into_iter(self: Arc<Self>) -> impl Iterator<Item = Arc<dyn EngineData>> {
+        let batch_count = self.batches.len();
+        (0..batch_count).map(move |i| Arc::clone(&self.batches[i]))
+    }
+}
+
+impl EngineRelation for InMemoryEngineRelation {
+    fn is_empty(&self) -> bool {
+        self.batches.iter().all(|batch| batch.is_empty())
+    }
 }
 
 /// Evaluates a predicate on the batch, extracts the resulting selection vector, and applies
