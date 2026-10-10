@@ -158,7 +158,7 @@ async fn read_json_files_parallel_impl(
     batch_size: usize,
     buffer_size: usize,
     parallel_chunks: usize,
-) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
+) -> Result<BoxStream<'static, Result<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
     }
@@ -175,7 +175,7 @@ async fn read_json_files_parallel_impl(
     let mut receivers = Vec::new();
     let mut handles = Vec::new();
     for chunk in chunks {
-        let (tx, rx) = mpsc::channel::<DeltaResult<Box<dyn EngineData>>>(per_chunk_buffer);
+        let (tx, rx) = mpsc::channel::<Result<Box<dyn EngineData>>>(per_chunk_buffer);
         receivers.push(rx);
 
         let store = store.clone();
@@ -249,13 +249,13 @@ impl Drop for AbortOnDropHandle {
 
 /// Drain `rx` then join `handle`. A panicked task is `Error::JoinFailure`, not EOF.
 fn drain_chunk(
-    rx: mpsc::Receiver<DeltaResult<Box<dyn EngineData>>>,
+    rx: mpsc::Receiver<Result<Box<dyn EngineData>>>,
     handle: AbortOnDropHandle,
-) -> impl futures::Stream<Item = DeltaResult<Box<dyn EngineData>>> {
+) -> impl futures::Stream<Item = Result<Box<dyn EngineData>>> {
     let batches = stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|item| (item, rx))
     });
-    let join = stream::once(async move { handle.join().await.map_err(Error::join_failure) })
+    let join = stream::once(async move { handle.join().await.map_err(KernelError::join_failure) })
         .filter_map(|result| async move {
             match result {
                 Ok(()) => None,
@@ -497,7 +497,7 @@ mod tests {
             location: &Path,
             payload: PutPayload,
             opts: PutOptions,
-        ) -> Result<PutResult> {
+        ) -> ObjectStoreResult<PutResult> {
             self.delay().await;
             self.inner.put_opts(location, payload, opts).await
         }
@@ -506,29 +506,37 @@ mod tests {
             &self,
             location: &Path,
             opts: PutMultipartOptions,
-        ) -> Result<Box<dyn MultipartUpload>> {
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
             self.delay().await;
             self.inner.put_multipart_opts(location, opts).await
         }
 
-        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
             self.delay().await;
             self.inner.get_opts(location, options).await
         }
 
-        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[Range<u64>],
+        ) -> ObjectStoreResult<Vec<Bytes>> {
             self.delay().await;
             self.inner.get_ranges(location, ranges).await
         }
 
         fn delete_stream(
             &self,
-            locations: BoxStream<'static, Result<Path>>,
-        ) -> BoxStream<'static, Result<Path>> {
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
             self.inner.delete_stream(locations)
         }
 
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
             self.inner.list(prefix)
         }
 
@@ -536,16 +544,24 @@ mod tests {
             &self,
             prefix: Option<&Path>,
             offset: &Path,
-        ) -> BoxStream<'static, Result<ObjectMeta>> {
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
             self.inner.list_with_offset(prefix, offset)
         }
 
-        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
             self.delay().await;
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
             self.delay().await;
             self.inner.copy_opts(from, to, options).await
         }
@@ -1160,7 +1176,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_drain_chunk_panicked_task_is_join_failure_not_eof() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<DeltaResult<Box<dyn EngineData>>>(1);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Box<dyn EngineData>>>(1);
         let handle = AbortOnDropHandle::new(tokio::spawn(async {
             panic!("chunk task panicked");
         }));
@@ -1173,7 +1189,7 @@ mod tests {
             "panicked chunk must yield an error, not EOF"
         );
         match &items[0] {
-            Err(Error::JoinFailure(_)) => {}
+            Err(KernelError::JoinFailure(_)) => {}
             Err(_) => panic!("expected JoinFailure, got a different error"),
             Ok(_) => panic!("expected JoinFailure, got a batch"),
         }
@@ -1204,7 +1220,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_drain_chunk_successful_task_yields_no_join_item() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<DeltaResult<Box<dyn EngineData>>>(1);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Box<dyn EngineData>>>(1);
         let handle = AbortOnDropHandle::new(tokio::spawn(async {}));
         drop(tx);
 
@@ -1217,7 +1233,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_drain_chunk_drop_aborts_unjoined_task() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<DeltaResult<Box<dyn EngineData>>>(1);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Box<dyn EngineData>>>(1);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         let handle = AbortOnDropHandle::new(tokio::spawn(async move {
             let _tx = tx;
@@ -1269,7 +1285,7 @@ mod tests {
         )
         .with_parallel_chunks(NonZero::new(4));
         let physical_schema = schema_ref! { nullable "val": INTEGER };
-        let result: DeltaResult<Vec<_>> = handler
+        let result: Result<Vec<_>> = handler
             .read_json_files(&files, physical_schema, None)
             .unwrap()
             .try_collect();
@@ -1310,7 +1326,7 @@ mod tests {
             .unwrap();
         let first = iter.next().expect("chunk 0 must yield a batch");
         assert!(first.is_ok(), "chunk 0 must succeed before chunk 1 errors");
-        let rest: DeltaResult<Vec<_>> = iter.try_collect();
+        let rest: Result<Vec<_>> = iter.try_collect();
         assert!(rest.is_err(), "missing file in a later chunk must error");
     }
 
@@ -1382,7 +1398,7 @@ mod tests {
         let result =
             handler.read_json_files_with_cancellation(&files, physical_schema, None, Some(token));
         assert!(
-            matches!(result, Err(Error::Cancelled)),
+            matches!(result, Err(KernelError::Cancelled)),
             "pre-cancelled token must yield Cancelled, not data"
         );
     }
@@ -1419,7 +1435,7 @@ mod tests {
             )),
         )
         .with_parallel_chunks(NonZero::new(2));
-        let result: DeltaResult<Vec<_>> = handler
+        let result: Result<Vec<_>> = handler
             .read_json_files(&files, physical_schema, None)
             .unwrap()
             .try_collect();
