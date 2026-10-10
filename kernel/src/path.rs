@@ -9,8 +9,11 @@ use uuid::Uuid;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
+use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, KernelResult, Result, Version};
+use crate::{
+    Engine, FileDataReadResultIterator, FileMeta, KernelError, KernelResult, Result, Version,
+};
 
 /// The delta log subdirectory with a trailing slash for directory URL joins.
 pub(crate) const DELTA_LOG_DIR_WITH_SLASH: &str = "_delta_log/";
@@ -385,18 +388,10 @@ impl ParsedLogPath<FileMeta> {
     /// Callers should handle enablement version checks before calling this method.
     #[tracing::instrument(skip(engine), ret, fields(version = self.version, path = %self.location.as_url()))]
     pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> KernelResult<i64> {
-        // Only works on commit files
-        if !self.is_commit() {
-            return Err(KernelError::generic(format!(
-                "read_in_commit_timestamp can only be called on commit files, got: {:?}",
-                self.file_type
-            )));
-        }
-
-        let mut action_iter = engine.json_handler().read_json_files(
-            slice::from_ref(&self.location),
+        let mut action_iter = self.read_commit_file_actions(
+            engine,
             InCommitTimestampVisitor::schema(),
-            None,
+            "read_in_commit_timestamp",
         )?;
 
         // Process the actions to find inCommitTimestamp
@@ -413,6 +408,25 @@ impl ParsedLogPath<FileMeta> {
             Some(Err(err)) => Err(err),
             None => Err(KernelError::generic("Commit file contains no actions")),
         }
+    }
+
+    /// Reads this commit log file's actions with `schema`. `caller` names the calling method in
+    /// the error returned when this is not a commit file.
+    fn read_commit_file_actions(
+        &self,
+        engine: &dyn Engine,
+        schema: SchemaRef,
+        caller: &str,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        if !self.is_commit() {
+            return Err(KernelError::generic(format!(
+                "{caller} can only be called on commit files, got: {:?}",
+                self.file_type
+            )));
+        }
+        engine
+            .json_handler()
+            .read_json_files(slice::from_ref(&self.location), schema, None)
     }
 }
 
