@@ -1112,7 +1112,8 @@ class InlineReviewTest(unittest.TestCase):
 
     def test_extract_inline_findings_enforces_cap(self) -> None:
         marker = "e" * 32
-        document = {"findings": [{"id": f"N{index}"} for index in range(1, 14)]}
+        findings = [{"id": f"N{index}"} for index in range(1, 26)]
+        document = {"findings": findings}
         review = (
             "Review\n"
             f"<!-- AI_REVIEW_INLINE_START_{marker} -->\n"
@@ -1120,6 +1121,16 @@ class InlineReviewTest(unittest.TestCase):
             f"<!-- AI_REVIEW_INLINE_END_{marker} -->"
         )
 
+        _, extracted = self.inline_review.extract_inline_findings(review, marker)
+        self.assertEqual(extracted, findings)
+
+        document["findings"].append({"id": "N-over-limit"})
+        review = (
+            "Review\n"
+            f"<!-- AI_REVIEW_INLINE_START_{marker} -->\n"
+            f"{json.dumps(document)}\n"
+            f"<!-- AI_REVIEW_INLINE_END_{marker} -->"
+        )
         with self.assertRaisesRegex(ValueError, "more than"):
             self.inline_review.extract_inline_findings(review, marker)
 
