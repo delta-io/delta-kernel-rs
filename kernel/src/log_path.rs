@@ -1,5 +1,6 @@
 //! Public-facing [`LogPath`] type for representing paths to delta log files.
 
+use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::path::ParsedLogPath;
@@ -21,6 +22,21 @@ impl From<LogPath> for ParsedLogPath {
 }
 
 impl LogPath {
+    /// Decodes an unchanged path exported by a validated source snapshot.
+    ///
+    /// Uses the general log-path classifier without cloning file metadata for diagnostics.
+    /// Returns an error if the supplied location is not a recognized log file.
+    #[internal_api]
+    pub(crate) fn try_new_from_trusted_snapshot(file_meta: FileMeta) -> Result<Self> {
+        let parsed = ParsedLogPath::try_from(file_meta)?
+            .ok_or_else(|| KernelError::invalid_log_path("source snapshot log path"))?;
+        require!(
+            !parsed.is_unknown(),
+            KernelError::invalid_log_path(&parsed.location.location)
+        );
+        Ok(Self(parsed))
+    }
+
     /// Attempt to create a `LogPath` from `FileMeta`. This returns an error if the path isn't a
     /// valid log path.
     pub fn try_new(file_meta: FileMeta) -> Result<Self> {

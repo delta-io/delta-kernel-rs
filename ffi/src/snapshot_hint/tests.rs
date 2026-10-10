@@ -36,6 +36,168 @@ fn slice(value: &'static str) -> KernelStringSlice {
     unsafe { KernelStringSlice::new_unsafe(value) }
 }
 
+#[cfg(feature = "declarative-plans")]
+mod planning_tests {
+    use super::*;
+    use crate::error::EngineExecResult;
+    use crate::plans::result::CPlanResult;
+    use crate::plans::{get_plan_based_engine, get_plan_executor};
+    use crate::scan::{free_scan, scan_builder, scan_builder_build};
+    use crate::snapshot_hint::planning::{
+        scan_declarative_metadata_plan_visit, snapshot_hint_declarative_metadata_plan_trusted,
+        snapshot_schema_to_proto,
+    };
+    use crate::KernelBytesSlice;
+
+    extern "C" fn no_checkpoint_executor(
+        _context: NullableCvoid,
+        _bytes: KernelBytesSlice,
+        _out: *mut EngineExecResult<CPlanResult>,
+    ) {
+        panic!("a table without checkpoints must not execute a plan during planning");
+    }
+
+    unsafe extern "C" fn copy_bytes(context: NullableCvoid, bytes: KernelBytesSlice) -> bool {
+        let output = unsafe { &mut *context.unwrap().as_ptr().cast::<Vec<u8>>() };
+        match unsafe { bytes.try_as_slice() } {
+            Ok(bytes) => {
+                output.extend_from_slice(bytes);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    unsafe extern "C" fn reject_bytes(_context: NullableCvoid, _bytes: KernelBytesSlice) -> bool {
+        false
+    }
+
+    struct PlanVisit<'a> {
+        engine: &'a Handle<SharedExternEngine>,
+        schema: &'a [u8],
+        bytes: Vec<u8>,
+        result: Option<ExternResult<bool>>,
+    }
+
+    extern "C" fn plan_hint(context: NullableCvoid, hint: *const FfiSnapshotHint) {
+        let state = unsafe { &mut *context.unwrap().as_ptr().cast::<PlanVisit<'_>>() };
+        state.result = Some(unsafe {
+            snapshot_hint_declarative_metadata_plan_trusted(
+                slice("memory:///hinted-table/"),
+                hint,
+                KernelBytesSlice::new_unsafe(state.schema),
+                state.engine.shallow_copy(),
+                Some(NonNull::from(&mut state.bytes).cast()),
+                copy_bytes,
+            )
+        });
+    }
+
+    #[test]
+    fn source_snapshot_plan_matches_retained_scan_with_borrowed_protobuf_delivery() {
+        let fallback = test_engine();
+        let paths = [
+            FfiLogPath::new(
+                slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+                12,
+                34,
+            ),
+            FfiLogPath::new(
+                slice("memory:///hinted-table/_delta_log/00000000000000000001.json"),
+                56,
+                78,
+            ),
+        ];
+        let mut hint = test_snapshot_hint(&paths, 1, FfiSnapshotHintFreshness::Latest);
+        hint.metadata.schema_string = slice(
+            r#"{"type":"struct","fields":[
+              {"name":"id","type":"integer","nullable":true,"metadata":{}}
+            ]}"#,
+        );
+        let builder = unsafe {
+            ok_or_panic(snapshot_builder_with_snapshot_hint(
+                test_builder(&fallback),
+                &hint,
+            ))
+        };
+        let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+        let executor = unsafe { get_plan_executor(None, no_checkpoint_executor) };
+        let engine = unsafe { get_plan_based_engine(executor, OptionalValue::None, allocate_err) };
+        let mut schema = Vec::new();
+        assert!(unsafe {
+            ok_or_panic(snapshot_schema_to_proto(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+                Some(NonNull::from(&mut schema).cast()),
+                copy_bytes,
+            ))
+        });
+        let scan = unsafe {
+            ok_or_panic(scan_builder_build(
+                scan_builder(snapshot.shallow_copy()),
+                engine.shallow_copy(),
+            ))
+        };
+        let mut baseline: Vec<u8> = Vec::new();
+        assert!(unsafe {
+            ok_or_panic(scan_declarative_metadata_plan_visit(
+                scan.shallow_copy(),
+                engine.shallow_copy(),
+                Some(NonNull::from(&mut baseline).cast()),
+                copy_bytes,
+            ))
+        });
+        let mut visit = PlanVisit {
+            engine: &engine,
+            schema: &schema,
+            bytes: Vec::new(),
+            result: None,
+        };
+        assert!(unsafe {
+            ok_or_panic(snapshot_to_snapshot_hint(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+                Some(NonNull::from(&mut visit).cast()),
+                plan_hint,
+            ))
+        });
+        assert!(ok_or_panic(visit.result.take().unwrap()));
+        assert_eq!(baseline, visit.bytes);
+        assert_extern_result_error_contains(
+            unsafe {
+                snapshot_schema_to_proto(
+                    snapshot.shallow_copy(),
+                    engine.shallow_copy(),
+                    None,
+                    reject_bytes,
+                )
+            },
+            FFIKernelError::InvalidSnapshotHint,
+            "byte callback rejected delivery",
+        );
+        assert_extern_result_error_contains(
+            unsafe {
+                snapshot_hint_declarative_metadata_plan_trusted(
+                    slice("memory:///hinted-table/"),
+                    std::ptr::null(),
+                    KernelBytesSlice::new_unsafe(&schema),
+                    engine.shallow_copy(),
+                    None,
+                    reject_bytes,
+                )
+            },
+            FFIKernelError::InvalidSnapshotHint,
+            "snapshot hint must not be null",
+        );
+        unsafe {
+            free_scan(scan);
+            free_snapshot(snapshot);
+            free_engine(engine);
+            free_engine(fallback);
+        }
+    }
+}
+
 fn invalid_utf8() -> KernelStringSlice {
     static INVALID_UTF8: [u8; 1] = [0xff];
     KernelStringSlice {

@@ -52,6 +52,8 @@ use crate::{
 };
 
 pub(crate) mod data_skipping;
+#[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+pub mod externalized;
 pub(crate) mod field_classifiers;
 pub mod log_replay;
 pub(crate) mod metrics;

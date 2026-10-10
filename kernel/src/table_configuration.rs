@@ -344,6 +344,19 @@ impl TableConfiguration {
         )
     }
 
+    /// Constructs read configuration from portable metadata and a complete decoded schema.
+    /// Table/protocol compatibility checks are identical to snapshot construction.
+    #[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
+    pub(crate) fn try_new_from_schema(
+        metadata: Metadata,
+        protocol: Protocol,
+        table_root: Url,
+        version: Version,
+        logical_schema: SchemaRef,
+    ) -> KernelResult<Self> {
+        Self::try_new_inner(metadata, protocol, table_root, version, logical_schema)
+    }
+
     fn try_new_inner(
         metadata: Metadata,
         protocol: Protocol,

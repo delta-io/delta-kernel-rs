@@ -795,6 +795,62 @@ impl From<&MetadataValue> for proto_schema::MetadataValue {
 
 // === Schema from Proto ===
 
+pub(super) fn trusted_struct_type_from_proto(
+    proto: proto_schema::StructType,
+) -> Result<StructType> {
+    let fields = proto
+        .fields
+        .into_iter()
+        .map(|field| {
+            let data_type = field
+                .data_type
+                .ok_or_else(|| KernelError::schema("StructField proto missing data_type"))?;
+            let metadata = field
+                .metadata
+                .into_iter()
+                .map(|(key, value)| Ok((key, MetadataValue::try_from(value)?)))
+                .collect::<Result<std::collections::HashMap<_, _>>>()?;
+            Ok(StructField {
+                name: field.name,
+                data_type: trusted_data_type_from_proto(data_type)?,
+                nullable: field.nullable,
+                metadata,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(StructType::new_unchecked(fields))
+}
+
+fn trusted_data_type_from_proto(proto: proto_schema::DataType) -> Result<DataType> {
+    let kind = proto
+        .kind
+        .ok_or_else(|| KernelError::schema("DataType proto missing kind"))?;
+    match kind {
+        DataTypeKind::Struct(value) => Ok(trusted_struct_type_from_proto(value)?.into()),
+        DataTypeKind::Array(value) => {
+            let element = value
+                .element_type
+                .ok_or_else(|| KernelError::schema("ArrayType proto missing element_type"))?;
+            Ok(ArrayType::new(trusted_data_type_from_proto(*element)?, value.contains_null).into())
+        }
+        DataTypeKind::Map(value) => {
+            let key = value
+                .key_type
+                .ok_or_else(|| KernelError::schema("MapType proto missing key_type"))?;
+            let item = value
+                .value_type
+                .ok_or_else(|| KernelError::schema("MapType proto missing value_type"))?;
+            Ok(MapType::new(
+                trusted_data_type_from_proto(*key)?,
+                trusted_data_type_from_proto(*item)?,
+                value.value_contains_null,
+            )
+            .into())
+        }
+        kind => DataType::try_from(proto_schema::DataType { kind: Some(kind) }),
+    }
+}
+
 impl TryFrom<proto_schema::StructType> for StructType {
     type Error = KernelError;
     fn try_from(proto: proto_schema::StructType) -> Result<Self> {
