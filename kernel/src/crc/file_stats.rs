@@ -9,6 +9,7 @@
 //! 1. In-memory transaction data via [`FileStatsDelta::try_compute_for_txn`]
 //! 2. A parsed .json commit file
 
+use std::ops::Deref;
 use std::sync::LazyLock;
 
 use delta_kernel_derive::internal_api;
@@ -155,10 +156,10 @@ impl FileStatsDelta {
     /// When `None`, the standard default boundaries are used. Callers should pass the previous
     /// CRC's boundaries when available so that `try_apply_delta` in [`Crc::apply`] succeeds.
     pub(crate) fn try_compute_for_txn(
-        add_files_metadata: &[Box<dyn EngineData>],
+        add_files_metadata: impl IntoIterator<Item = Result<impl Deref<Target = dyn EngineData>>>,
         remove_files_metadata: &[FilteredEngineData],
         bin_boundaries: Option<&[i64]>,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         let mut histogram = match bin_boundaries {
             Some(b) => FileSizeHistogram::create_empty_with_boundaries(b.to_vec())?,
             None => FileSizeHistogram::create_default(),
@@ -170,8 +171,9 @@ impl FileStatsDelta {
 
         // Visit add files (insert into histogram). Every row is a file being added.
         for batch in add_files_metadata {
+            let batch = batch?;
             let mut visitor = FileStatsVisitor::new(None, false, &mut histogram);
-            visitor.visit_rows_of(batch.as_ref())?;
+            visitor.visit_rows_of(&*batch)?;
             gross_add_files += visitor.count;
             gross_add_bytes += visitor.total_size;
         }
@@ -291,6 +293,17 @@ mod tests {
     use super::*;
     use crate::engine::arrow_data::ArrowEngineData;
 
+    impl FileStatsDelta {
+        fn try_compute_for_txn_slices(
+            add_files_metadata: &[Box<dyn EngineData>],
+            remove_files_metadata: &[FilteredEngineData],
+            bin_boundaries: Option<&[i64]>,
+        ) -> Result<Self> {
+            let add_files_metadata = add_files_metadata.iter().map(|batch| Ok(batch.as_ref()));
+            Self::try_compute_for_txn(add_files_metadata, remove_files_metadata, bin_boundaries)
+        }
+    }
+
     fn size_batch(sizes: Vec<i64>) -> Box<dyn EngineData> {
         let batch = generate_batch(vec![("size", sizes.into_arrow_array())]).unwrap();
         Box::new(ArrowEngineData::new(batch))
@@ -341,7 +354,7 @@ mod tests {
             .into_iter()
             .map(|sizes| FilteredEngineData::with_all_rows_selected(size_batch(sizes)))
             .collect();
-        let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, None).unwrap();
+        let stats = FileStatsDelta::try_compute_for_txn_slices(&adds, &removes, None).unwrap();
         assert_eq!(stats.net_files(), case.expected_net_files);
         assert_eq!(stats.net_bytes(), case.expected_net_bytes);
     }
@@ -357,7 +370,7 @@ mod tests {
             FilteredEngineData::try_new(size_batch(vec![600, 700, 800]), vec![false, true, true])
                 .unwrap(),
         ];
-        let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, None).unwrap();
+        let stats = FileStatsDelta::try_compute_for_txn_slices(&adds, &removes, None).unwrap();
         // adds: 3 files, 600 bytes (100 + 200 + 300)
         // removes: 4 files, 2400 bytes (400 + 500 + 700 + 800)
         assert_eq!(stats.net_files(), -1); // 3 - 4
@@ -374,7 +387,7 @@ mod tests {
         let removes = vec![FilteredEngineData::with_all_rows_selected(size_batch(
             vec![500, 700],
         ))];
-        let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, None).unwrap();
+        let stats = FileStatsDelta::try_compute_for_txn_slices(&adds, &removes, None).unwrap();
 
         // All sizes < 8KB so they all land in bin 0. Net: 3 adds - 2 removes = 1 file,
         // 600 - 1200 = -600 bytes.
@@ -385,7 +398,7 @@ mod tests {
 
     #[test]
     fn try_compute_empty_batches_produce_zero_histogram() {
-        let stats = FileStatsDelta::try_compute_for_txn(&[], &[], None).unwrap();
+        let stats = FileStatsDelta::try_compute_for_txn_slices(&[], &[], None).unwrap();
         let delta = stats.net_histogram.unwrap();
         assert!(delta.file_counts.iter().all(|&c| c == 0));
         assert!(delta.total_bytes.iter().all(|&b| b == 0));
@@ -399,7 +412,7 @@ mod tests {
             vec![true, false, true], // 300 selected, 400 skipped, 500 selected
         )
         .unwrap()];
-        let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, None).unwrap();
+        let stats = FileStatsDelta::try_compute_for_txn_slices(&adds, &removes, None).unwrap();
 
         // Net bin 0: 2 adds - 2 removes = 0 files, 300 - 800 = -500 bytes
         let delta = stats.net_histogram.unwrap();
@@ -415,7 +428,8 @@ mod tests {
         let removes = vec![FilteredEngineData::with_all_rows_selected(size_batch(
             vec![100, 500],
         ))];
-        let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, Some(boundaries)).unwrap();
+        let stats =
+            FileStatsDelta::try_compute_for_txn_slices(&adds, &removes, Some(boundaries)).unwrap();
 
         let delta = stats.net_histogram.unwrap();
         assert_eq!(delta.sorted_bin_boundaries, vec![0, 200, 1000]);
@@ -438,7 +452,7 @@ mod tests {
             vec![150],
         ))];
         let stats =
-            FileStatsDelta::try_compute_for_txn(&adds, &removes, Some(&boundaries)).unwrap();
+            FileStatsDelta::try_compute_for_txn_slices(&adds, &removes, Some(&boundaries)).unwrap();
 
         let delta = stats.net_histogram.unwrap();
         let merged = base.try_apply_delta(&delta).unwrap();
