@@ -355,6 +355,23 @@ impl LogSegment {
             .filter(|hint| hint.applies_to(&self.listed.checkpoint_parts))
     }
 
+    /// The checkpoint action embedded in this segment's AMT `_last_checkpoint` hint, when the
+    /// segment was listed from that hint but ends before the hint's manifest commit, so the action
+    /// is in no listed commit. Content roots never decrease across manifest commits, so this is
+    /// then the segment's latest checkpoint action.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn unlisted_amt_checkpoint_action(&self) -> Option<&CheckpointAction> {
+        if self.checkpoint_version.is_some() {
+            return None;
+        }
+        let hint = self.last_checkpoint_metadata.as_ref()?;
+        let manifest_commit_version = hint.amt_manifest_commit_version()?;
+        if hint.version > self.end_version || manifest_commit_version <= self.end_version {
+            return None;
+        }
+        hint.amt_checkpoint.as_ref()?.checkpoint.as_ref()
+    }
+
     /// The checkpoint schema from the `_last_checkpoint` hint, when the hint describes the selected
     /// checkpoint (see [`Self::checkpoint_hint`]) and carried a `checkpointSchema`. `None`
     /// otherwise -- the caller then reads the checkpoint footer instead.
