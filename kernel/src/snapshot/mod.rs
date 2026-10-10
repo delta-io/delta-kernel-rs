@@ -535,7 +535,8 @@ impl Snapshot {
 
     /// The held CRC regardless of version, for reuse that does not require an at-version CRC
     /// (e.g. checksum writes). Prefer [`Self::crc_at_version`] for authoritative queries.
-    fn base_crc(&self) -> Option<&Arc<Crc>> {
+    /// Replaying `allFiles` from this CRC requires applying commits newer than its version.
+    pub(crate) fn base_crc(&self) -> Option<&Arc<Crc>> {
         self.crc.base()
     }
 

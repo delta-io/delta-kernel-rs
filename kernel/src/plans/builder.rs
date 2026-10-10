@@ -46,7 +46,7 @@ use super::ir::nodes::{
     ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
 };
 use super::ir::plan::{Plan, PlanNode};
-use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
+use crate::expressions::{ColumnName, Expression, ExpressionRef, PredicateRef, Scalar, StructData};
 use crate::schema::{SchemaRef, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::CollectInto;
@@ -345,7 +345,10 @@ impl PlanBuilder {
         patch: impl FnOnce(ProjectionStructPatchBuilder<'_>) -> ProjectionStructPatchBuilder<'_>,
     ) -> Result<Self> {
         let (out, expr) = patch(ProjectionStructPatchBuilder::new(self.schema())).build()?;
-        self.project(expr, out)
+        match expr.as_ref() {
+            Expression::StructPatch(patch) if patch.is_empty() => Ok(self),
+            _ => self.project(expr, out),
+        }
     }
 
     /// Read data files named by `self`'s rows. Output schema is `dynamic_scan.schema`. See
@@ -1125,6 +1128,13 @@ mod tests {
         let a = vals(nested_ab_c()).project_patch(drop_c)?;
         let b = vals(nested_ab_c()).project_patch(drop_c)?;
         assert_eq!(a.schema(), b.schema());
+        Ok(())
+    }
+
+    #[test]
+    fn project_patch_elides_empty_projection() -> Result<()> {
+        let patched = vals(nested_ab_c()).project_patch(|patch| patch)?;
+        assert_plan(patched, &[(&[], "values")]);
         Ok(())
     }
 

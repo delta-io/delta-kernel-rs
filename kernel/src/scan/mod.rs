@@ -17,8 +17,6 @@ use crate::actions::deletion_vector::{
 };
 use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
-#[cfg(feature = "declarative-plans")]
-use crate::checkpoint::CheckpointShape;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
 use crate::kernel_predicates::{
@@ -110,6 +108,10 @@ pub use crate::parallel::parallel_scan_metadata::{
 /// Configures structured-stats output and JSON synthesis in scan metadata.
 /// Existing JSON passes through for commits and checkpoints without compatible structured stats
 /// unless stats are disabled.
+///
+/// Declarative metadata plans disable stats and partition pruning when JSON output is requested,
+/// including both-output requests. The data-row predicate and imperative metadata path are
+/// unchanged.
 ///
 /// Most consumers should pick one of the named constructors:
 /// - [`Self::json_only`] (default) -- JSON stats only.
@@ -1176,8 +1178,9 @@ impl Scan {
     #[cfg(feature = "declarative-plans")]
     /// Builds a declarative plan that produces the scan's live `add` actions.
     ///
-    /// `engine` supplies the plan executor used to inspect checkpoint shape. Returns `None` when
-    /// no Delta metadata matches this scan.
+    /// `engine` supplies the plan executor used to inspect checkpoint shape unless a CRC at least
+    /// as new as the checkpoint provides `allFiles`. Returns `None` when no Delta metadata matches
+    /// this scan.
     ///
     /// This method returns the metadata plan without executing it. A connector that consumes the
     /// resulting live `add` rows may run the plan through the generic
@@ -1187,8 +1190,9 @@ impl Scan {
     ///
     /// # Errors
     ///
-    /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
-    /// or if log discovery, checkpoint inspection, or plan construction fails.
+    /// Returns an error if no eligible CRC provides `allFiles` and the engine provides no
+    /// [`PlanExecutor`](crate::plans::PlanExecutor), even when there is no checkpoint, or if
+    /// log discovery, checkpoint inspection, or plan construction fails.
     #[tracing::instrument(
         name = "scan.declarative_metadata_scan_plan",
         skip_all,
@@ -1196,17 +1200,9 @@ impl Scan {
         err
     )]
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> Result<Option<Plan>> {
-        // Resolve the checkpoint shape once. Retain the leaf schema only when parsed metadata is
-        // needed for output or pruning.
-        let plan_executor = engine.require_plan_executor()?;
-        let needs_leaf_schema = self.state_info.physical_stats_read_schema().is_some()
-            || self.state_info.physical_partition_schema.is_some();
-        let shape = if needs_leaf_schema {
-            CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
-        } else {
-            CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?
-        };
-        self.build_metadata_scan_plan(&shape)
+        let planner = scan_plan::MetadataPlanner::try_new(self)?;
+        let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine, &planner)?;
+        self.build_metadata_scan_plan_with(base, &planner)
     }
 
     // Factored out to facilitate testing
