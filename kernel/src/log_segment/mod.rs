@@ -1563,7 +1563,7 @@ impl LogSegment {
     ///   unshredded VARIANT.
     /// - Missing fields in checkpoint: OK (will return null when accessed)
     /// - Extra fields in checkpoint: OK (ignored)
-    fn structs_have_compatible_types(
+    pub(crate) fn structs_have_compatible_types(
         available: &StructType,
         needed: &StructType,
         context: &str,
