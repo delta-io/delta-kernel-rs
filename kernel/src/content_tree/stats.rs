@@ -12,19 +12,24 @@
 //!
 //! As with all fields in Iceberg, statistics are projected by field ID.
 
+use std::sync::Arc;
+
 use tracing::warn;
 
-use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT};
+use crate::actions::{
+    MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS as DELTA_TIGHT_BOUNDS,
+};
 use crate::content_tree::{
-    AVG_VALUE_SIZE_IN_BYTES, LOWER_BOUND, NAN_VALUE_COUNT, NULL_VALUE_COUNT, TIGHT_BOUNDS,
+    LOWER_BOUND, NAN_VALUE_COUNT, NULL_VALUE_COUNT, RECORD_COUNT, TIGHT_BOUNDS, TOTAL_BYTES,
     UPPER_BOUND, VALUE_COUNT,
 };
-use crate::expressions::ColumnName;
+use crate::expressions::{lit, null_lit, ColumnName, Expression, ExpressionRef, Predicate};
 use crate::schema::{
-    ColumnMetadataKey, DataType, MetadataValue, PrimitiveType, StructField, StructType,
+    ColumnMetadataKey, DataType, MetadataValue, PrimitiveType, SchemaRef, StructField, StructType,
 };
+use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{KernelError, KernelResult};
+use crate::{Engine, EngineData, KernelError, KernelResult};
 
 /// Field ID offsets for stats fields within a column's stats struct.
 const STATS_OFFSET_LOWER_BOUND: i32 = 1;
@@ -33,7 +38,7 @@ const STATS_OFFSET_TIGHT_BOUNDS: i32 = 3;
 const STATS_OFFSET_VALUE_COUNT: i32 = 4;
 const STATS_OFFSET_NULL_VALUE_COUNT: i32 = 5;
 const STATS_OFFSET_NAN_VALUE_COUNT: i32 = 6;
-const STATS_OFFSET_AVG_VALUE_SIZE_IN_BYTES: i32 = 7;
+const STATS_OFFSET_TOTAL_BYTES: i32 = 7;
 
 /// Number of supported stats per column (each column gets a range of 200 field IDs).
 /// This value is the upper bound on the number of "statistic types", e.g. min/max.
@@ -177,7 +182,8 @@ impl StatCategories {
 /// - offset 4: `value_count` (long)
 /// - offset 5: `null_value_count` (long) - emitted regardless of the column's nullability
 /// - offset 6: `nan_value_count` (long) - only for float/double `bounds_type`
-/// - offset 7: `avg_value_size_in_bytes` (int) - for string/binary `bounds_type`, or any variant
+/// - offset 7: `total_bytes` (long) - total uncompressed size of the column's values; for
+///   string/binary `bounds_type`, or any variant
 ///
 /// `bounds_type` is the type the bounds are recorded at: the column's own type for primitives, or
 /// an unshredded variant type for variant columns.
@@ -186,7 +192,7 @@ impl StatCategories {
 /// (the unprojected path) keeps every type-eligible sub-field. When `Some`, a sub-field is kept
 /// only when a category backing it is present: `lower_bound`<-`minValues`,
 /// `upper_bound`<-`maxValues`, `value_count`/`null_value_count`<-`nullCount`,
-/// `tight_bounds`/`nan_value_count`<-either bound category. `avg_value_size_in_bytes` has no
+/// `tight_bounds`/`nan_value_count`<-either bound category. `total_bytes` has no
 /// backing category and is dropped whenever projecting -- so `null_value_count`, though independent
 /// of nullability, is still dropped when the leaf is absent from `nullCount`.
 fn build_stats_struct(
@@ -253,9 +259,9 @@ fn build_stats_struct(
             has_nan_count && has_bounds,
         ),
         (
-            AVG_VALUE_SIZE_IN_BYTES,
-            DataType::INTEGER,
-            STATS_OFFSET_AVG_VALUE_SIZE_IN_BYTES,
+            TOTAL_BYTES,
+            DataType::LONG,
+            STATS_OFFSET_TOTAL_BYTES,
             has_size_stats && !projecting,
         ),
     ];
@@ -592,11 +598,303 @@ fn collect_stats_schema<'a>(
     Ok(StructType::new_unchecked(fields))
 }
 
+// == AMT content_stats -> Delta stats columnar conversion ==
+
+/// Replaces `manifest_data`'s flat AMT `content_stats` column with a nested Delta stats column (the
+/// inverse of [`convert_delta_stats_to_amt_stats`]), passing every other column through. For
+/// example `{content_stats: {id: {lower_bound, null_value_count, ...}}, recordCount, ...}` becomes
+/// `{stats: {numRecords, nullCount: {id}, minValues: {id}, ...}, recordCount, ...}`.
+///
+/// The produced column is named `output_stats_column_name` and typed exactly as
+/// `delta_stats_schema` -- a *parsed* nested struct (`numRecords`, an optional `tightBounds`, and
+/// `nullCount`/`minValues`/`maxValues` mirroring the table), never a JSON string.
+/// `delta_stats_schema` both selects which leaves/categories to reconstruct and fixes the output
+/// shape, so it must be kernel-generated (its category sub-structs mirror the table, as
+/// [`projected_stats_schema`] requires). `table_schema` is the physical table layout (carrying
+/// `parquet.field.id`) naming the AMT leaves.
+///
+/// Field mapping (inverse of the forward pivot): `minValues` <- `lower_bound`, `maxValues` <-
+/// `upper_bound`, `nullCount` <- `null_value_count`, `numRecords` <- the sibling [`RECORD_COUNT`]
+/// column (the AMT per-column `value_count` is NOT read), and `tightBounds` <- the AND over bounded
+/// columns of `coalesce(tight_bounds, true)`.
+///
+/// This is a *semantic*, not bitwise, inverse: the forward pivot is lossy (it forces `tight_bounds`
+/// to `false` for string/binary/timestamp/float/double and sets `value_count` to `numRecords`), so
+/// a round trip need not reproduce the original stats exactly. A column the table records in
+/// `nullCount` but AMT does not track per-column (array/map columns, or columns whose field ID is
+/// outside the supported stats range) reconstructs as a null count, which only disables null-count
+/// data skipping for that column (never over-skips). A null `content_stats` cell yields null
+/// bounds/counts and a `tightBounds` of `true`, while `numRecords` still comes from
+/// [`RECORD_COUNT`].
+///
+/// Returns `Err` if `content_stats_column_name` is not a struct column in `input_schema`, the
+/// [`RECORD_COUNT`] column is absent, or the expression cannot be built or evaluated.
+pub(crate) fn convert_amt_stats_to_delta_stats(
+    engine: &dyn Engine,
+    manifest_data: &dyn EngineData,
+    content_stats_column_name: &str,
+    output_stats_column_name: &str,
+    table_schema: &StructType,
+    delta_stats_schema: &StructType,
+    input_schema: &StructType,
+) -> KernelResult<Box<dyn EngineData>> {
+    match input_schema
+        .field(content_stats_column_name)
+        .map(StructField::data_type)
+    {
+        Some(DataType::Struct(_)) => {}
+        other => {
+            return Err(KernelError::generic(format!(
+                "content_stats column '{content_stats_column_name}' must be a struct in the input \
+                 schema, found: {other:?}"
+            )))
+        }
+    }
+    if input_schema.field(RECORD_COUNT).is_none() {
+        return Err(KernelError::generic(format!(
+            "record count column '{RECORD_COUNT}' not found in input schema"
+        )));
+    }
+
+    let (output_schema, expr) = build_amt_to_delta_pivot_expression(
+        table_schema,
+        content_stats_column_name,
+        output_stats_column_name,
+        delta_stats_schema,
+        input_schema,
+    )?;
+
+    let evaluator = engine.evaluation_handler().new_expression_evaluator(
+        Arc::new(input_schema.clone()),
+        expr,
+        output_schema.as_ref().clone().into(),
+    )?;
+    evaluator.evaluate(manifest_data)
+}
+
+/// Builds the reverse pivot for `input_schema`: a struct-patch expression plus its output schema
+/// that replace the flat `content_stats_col` with a nested Delta stats column named
+/// `output_stats_column_name` and typed as `delta_stats_schema`, leaving every other column
+/// untouched. The replacement expression reads from `content_stats_col` and the sibling
+/// [`RECORD_COUNT`] column, which is why this is a column replacement rather than a pure rename.
+fn build_amt_to_delta_pivot_expression(
+    table_schema: &StructType,
+    content_stats_col: &str,
+    output_stats_column_name: &str,
+    delta_stats_schema: &StructType,
+    input_schema: &StructType,
+) -> KernelResult<(SchemaRef, ExpressionRef)> {
+    // Emit one top-level expression per Delta stats field, in schema order, so the struct
+    // expression aligns with `delta_stats_schema` field for field (the evaluator requires it).
+    let mut top_exprs: Vec<ExpressionRef> = Vec::new();
+    for field in delta_stats_schema.fields() {
+        let expr = match field.name().as_str() {
+            NUM_RECORDS => Expression::column([RECORD_COUNT]),
+            NULL_COUNT => build_category_expr(
+                delta_category_struct(field)?,
+                table_schema,
+                &mut Vec::new(),
+                content_stats_col,
+                NULL_VALUE_COUNT,
+            )?,
+            MIN_VALUES => build_category_expr(
+                delta_category_struct(field)?,
+                table_schema,
+                &mut Vec::new(),
+                content_stats_col,
+                LOWER_BOUND,
+            )?,
+            MAX_VALUES => build_category_expr(
+                delta_category_struct(field)?,
+                table_schema,
+                &mut Vec::new(),
+                content_stats_col,
+                UPPER_BOUND,
+            )?,
+            DELTA_TIGHT_BOUNDS => {
+                build_tight_bounds_expr(delta_stats_schema, table_schema, content_stats_col)?
+            }
+            other => {
+                return Err(KernelError::generic(format!(
+                    "unexpected top-level Delta stats field '{other}'"
+                )))
+            }
+        };
+        top_exprs.push(Arc::new(expr));
+    }
+
+    let output_field = StructField::nullable(output_stats_column_name, delta_stats_schema.clone());
+    ProjectionStructPatchBuilder::new(input_schema)
+        .replace(
+            content_stats_col,
+            output_field,
+            Arc::new(Expression::struct_from(top_exprs)),
+        )
+        .build()
+}
+
+/// Extracts a Delta stat category's sub-struct (`nullCount`/`minValues`/`maxValues`). Errors if the
+/// category is a scalar where a table-mirroring struct is required -- an internal invariant
+/// violation (the Delta stats schema is kernel-generated), surfaced rather than silently dropped,
+/// consistent with [`CategoryScopes::from_delta_stats_schema`].
+fn delta_category_struct(category_field: &StructField) -> KernelResult<&StructType> {
+    match category_field.data_type() {
+        DataType::Struct(s) => Ok(s.as_ref()),
+        other => Err(KernelError::generic(format!(
+            "Delta stats category '{}' must be a struct, found: {other:?}",
+            category_field.name()
+        ))),
+    }
+}
+
+/// Reconstructs one Delta stat category's nested struct expression by walking `category_struct`
+/// (the category's sub-schema, which mirrors the table) and reading `sub_field` from each leaf's
+/// flat `content_stats` entry under `content_stats_col`. `table_struct` is the parallel table
+/// nesting, used to decide whether a leaf has a `content_stats` entry and to type the null
+/// placeholder when it does not. `path` accumulates the root-to-leaf field names (the content_stats
+/// leaf key). The expression mirrors `category_struct` field for field, so it aligns with the
+/// output schema.
+fn build_category_expr(
+    category_struct: &StructType,
+    table_struct: &StructType,
+    path: &mut Vec<String>,
+    content_stats_col: &str,
+    sub_field: &str,
+) -> KernelResult<Expression> {
+    let mut exprs: Vec<ExpressionRef> = Vec::new();
+    for category_field in category_struct.fields() {
+        let name = category_field.name();
+        path.push(name.to_string());
+        let table_field = table_struct.field(name);
+        let expr = match category_field.data_type() {
+            DataType::Struct(child_category) => {
+                let Some(DataType::Struct(child_table)) = table_field.map(StructField::data_type)
+                else {
+                    return Err(KernelError::generic(format!(
+                        "Delta stats nests a struct at '{}' but the table does not",
+                        ColumnName::new(&*path)
+                    )));
+                };
+                build_category_expr(
+                    child_category,
+                    child_table,
+                    path,
+                    content_stats_col,
+                    sub_field,
+                )?
+            }
+            _ => leaf_category_expr(
+                table_field,
+                path,
+                content_stats_col,
+                sub_field,
+                category_field.data_type(),
+            )?,
+        };
+        exprs.push(Arc::new(expr));
+        path.pop();
+    }
+    Ok(Expression::struct_from(exprs))
+}
+
+/// Builds one leaf's value expression for a Delta stat category: a reference to
+/// `content_stats_col.<flat leaf name>.<sub_field>` when the leaf has a `content_stats` entry, or a
+/// typed null otherwise. A leaf has no entry when it is an array/map column or its field ID is
+/// outside the supported stats range (neither carries AMT per-column stats); a null there simply
+/// disables that leaf's data skipping. `null_type` is the category field's own type (`LONG` for
+/// `nullCount`, the column type for bounds). Errors if the leaf is missing its field-id metadata
+/// (via [`leaf_stats_field`]).
+fn leaf_category_expr(
+    table_field: Option<&StructField>,
+    path: &[String],
+    content_stats_col: &str,
+    sub_field: &str,
+    null_type: &DataType,
+) -> KernelResult<Expression> {
+    let has_entry = match table_field {
+        Some(field) => leaf_stats_field(field, path, None)?.is_some(),
+        None => false,
+    };
+    if !has_entry {
+        return Ok(null_lit(null_type.clone()));
+    }
+    let flat_name = ColumnName::new(path).to_string();
+    Ok(Expression::column([
+        content_stats_col,
+        flat_name.as_str(),
+        sub_field,
+    ]))
+}
+
+/// Builds Delta's per-file `tightBounds`: the AND over every bounded column (present in `minValues`
+/// or `maxValues`) of `coalesce(content_stats.<leaf>.tight_bounds, true)`. Delta treats bounds as
+/// tight only when every column's bounds are tight; a null or absent per-column `tight_bounds`
+/// defaults to `true`, and no bounded columns yields `true` (an empty AND).
+fn build_tight_bounds_expr(
+    delta_stats_schema: &StructType,
+    table_schema: &StructType,
+    content_stats_col: &str,
+) -> KernelResult<Expression> {
+    let scopes = CategoryScopes::from_delta_stats_schema(delta_stats_schema)?;
+    let mut preds: Vec<Predicate> = Vec::new();
+    collect_tight_bounds_preds(
+        table_schema,
+        scopes,
+        &mut Vec::new(),
+        content_stats_col,
+        &mut preds,
+    )?;
+    Ok(Expression::from_pred(Predicate::and_from(preds)))
+}
+
+/// Walks `table_struct` (threading the Delta stat `scopes`) and pushes a
+/// `coalesce(content_stats.<leaf>.tight_bounds, true)` predicate for each primitive leaf that has a
+/// `content_stats` entry and appears in `minValues` or `maxValues`. Variants carry no
+/// `tight_bounds` sub-field, so they are excluded.
+fn collect_tight_bounds_preds(
+    table_struct: &StructType,
+    scopes: CategoryScopes<'_>,
+    path: &mut Vec<String>,
+    content_stats_col: &str,
+    out: &mut Vec<Predicate>,
+) -> KernelResult<()> {
+    for field in table_struct.fields() {
+        path.push(field.name().to_string());
+        match field.data_type() {
+            DataType::Struct(child) => {
+                let child_scopes = scopes.descend(field.name(), path)?;
+                collect_tight_bounds_preds(child, child_scopes, path, content_stats_col, out)?;
+            }
+            _ => {
+                let categories = scopes.leaf_categories(field.name());
+                let has_bounds = categories.min_values || categories.max_values;
+                let is_primitive = matches!(field.data_type(), DataType::Primitive(_));
+                if has_bounds && is_primitive && leaf_stats_field(field, path, None)?.is_some() {
+                    let flat_name = ColumnName::new(&*path).to_string();
+                    let tight =
+                        Expression::column([content_stats_col, flat_name.as_str(), TIGHT_BOUNDS]);
+                    out.push(Predicate::from_expr(Expression::coalesce([
+                        tight,
+                        lit(true),
+                    ])));
+                }
+            }
+        }
+        path.pop();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::arrow::array::RecordBatch;
+    use crate::content_tree::CONTENT_STATS_FIELD_NAME;
+    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::sync::SyncEngine;
+    use crate::expressions::{Scalar, StructData};
     use crate::scan::data_skipping::stats_schema::{expected_stats_schema, StatsConfig};
     use crate::schema::{ArrayType, MapType};
     #[cfg(feature = "geo-type-in-dev")]
@@ -657,10 +955,7 @@ mod tests {
             || field.data_type() == &DataType::STRING
             || field.data_type() == &DataType::BINARY
         {
-            assert_offset(
-                AVG_VALUE_SIZE_IN_BYTES,
-                STATS_OFFSET_AVG_VALUE_SIZE_IN_BYTES,
-            );
+            assert_offset(TOTAL_BYTES, STATS_OFFSET_TOTAL_BYTES);
         }
         assert_offset(LOWER_BOUND, STATS_OFFSET_LOWER_BOUND);
         assert_offset(UPPER_BOUND, STATS_OFFSET_UPPER_BOUND);
@@ -890,7 +1185,7 @@ mod tests {
         );
         // Variants exclude tight_bounds and always include the size stat.
         assert!(v_stats.field(TIGHT_BOUNDS).is_none());
-        assert!(v_stats.field(AVG_VALUE_SIZE_IN_BYTES).is_some());
+        assert!(v_stats.field(TOTAL_BYTES).is_some());
         assert_stats_field_ids(&v_stats, 10_600, &field);
     }
 
@@ -1279,7 +1574,7 @@ mod tests {
 
         let projected = projected_stats_schema(&table, &delta).expect("projected should succeed");
         // Every leaf keeps its full category-backed set. This differs from the unprojected
-        // `stats_schema` only for the variant, whose `avg_value_size_in_bytes` (no backing Delta
+        // `stats_schema` only for the variant, whose `total_bytes` (no backing Delta
         // category) is dropped under the projection.
         let expected = StructType::new_unchecked([
             expected_leaf("id", DataType::LONG, 0, &STAT_CATEGORIES),
@@ -1327,7 +1622,7 @@ mod tests {
     /// projected tests (which build expectations via `build_stats_struct`), the expected sub-field
     /// names here are spelled out per case, so a wrong condition in `build_stats_struct` is caught.
     /// The leaf type varies to exercise the type-specific conditions (`nan_value_count`,
-    /// `avg_value_size_in_bytes`). Column `c` is always field id 1.
+    /// `total_bytes`). Column `c` is always field id 1.
     #[rstest]
     // Int: lower<-minValues, upper<-maxValues, tight_bounds<-either bound, value/null_value_count
     // <-nullCount.
@@ -1368,9 +1663,9 @@ mod tests {
         delta_stats(Some(stat_cols(["c"])), None, None),
         &[VALUE_COUNT, NULL_VALUE_COUNT],
     )]
-    // String/variant: avg_value_size_in_bytes has no backing category, so it is dropped under the
+    // String/variant: total_bytes has no backing category, so it is dropped under the
     // projection even when the leaf is in every category.
-    #[case::string_all_drops_avg(
+    #[case::string_all_drops_total_bytes(
         DataType::STRING,
         delta_stats(Some(stat_cols(["c"])), Some(stat_cols(["c"])), Some(stat_cols(["c"]))),
         &[LOWER_BOUND, UPPER_BOUND, TIGHT_BOUNDS, VALUE_COUNT, NULL_VALUE_COUNT],
@@ -1467,7 +1762,7 @@ mod tests {
 
     /// A variant survives the projection exactly when present in some category, like any other
     /// leaf. When present only in `nullCount` (its usual shape) it keeps just the count
-    /// sub-fields -- its bounds and `avg_value_size_in_bytes` have no backing category and are
+    /// sub-fields -- its bounds and `total_bytes` have no backing category and are
     /// pruned.
     #[rstest]
     #[case::present_in_null_count(
@@ -1672,5 +1967,451 @@ mod tests {
             .is_some());
         let projected = projected_stats_schema(&table, &delta).expect("should succeed");
         assert_eq!(projected, expected);
+    }
+
+    // == AMT content_stats -> Delta stats reverse pivot ==
+
+    /// Builds a `Scalar::Struct` of `values` typed by `schema` (values in field order).
+    fn struct_scalar(schema: &StructType, values: Vec<Scalar>) -> Scalar {
+        Scalar::Struct(StructData::try_new(schema.fields().cloned().collect(), values).unwrap())
+    }
+
+    /// The single-column `content_stats` leaf struct for `name` in `content_stats_schema`, filled
+    /// with `sub_values` in the leaf's sub-field order (see [`build_stats_struct`]).
+    fn leaf_scalar(
+        content_stats_schema: &StructType,
+        name: &str,
+        sub_values: Vec<Scalar>,
+    ) -> Scalar {
+        struct_scalar(
+            &stats_struct_for_name(name, content_stats_schema),
+            sub_values,
+        )
+    }
+
+    /// Converts an `EngineData` to its backing Arrow `RecordBatch` for comparison.
+    fn to_batch(data: Box<dyn EngineData>) -> RecordBatch {
+        ArrowEngineData::try_from_engine_data(data)
+            .unwrap()
+            .record_batch()
+            .clone()
+    }
+
+    /// Runs the reverse pivot over a single input row (`content_stats` + `recordCount`) and asserts
+    /// the produced batch equals one built directly from `expected_stats` (the Delta stats struct
+    /// scalar) and the same `record_count`. Uses the real evaluator end to end.
+    fn assert_reverse_pivot(
+        table: &StructType,
+        delta: &StructType,
+        content_stats: Scalar,
+        record_count: i64,
+        expected_stats: Scalar,
+    ) {
+        let content_stats_schema = projected_stats_schema(table, delta).expect("projected schema");
+        let input_schema = StructType::new_unchecked([
+            StructField::nullable(CONTENT_STATS_FIELD_NAME, content_stats_schema),
+            StructField::nullable(RECORD_COUNT, DataType::LONG),
+        ]);
+        let engine = SyncEngine::new();
+        let handler = engine.evaluation_handler();
+        let input = handler
+            .create_many(
+                Arc::new(input_schema.clone()),
+                vec![vec![content_stats, Scalar::Long(record_count)]],
+            )
+            .unwrap();
+
+        let (output_schema, _) = build_amt_to_delta_pivot_expression(
+            table,
+            CONTENT_STATS_FIELD_NAME,
+            "stats",
+            delta,
+            &input_schema,
+        )
+        .unwrap();
+        let expected = handler
+            .create_many(
+                output_schema,
+                vec![vec![expected_stats, Scalar::Long(record_count)]],
+            )
+            .unwrap();
+
+        let actual = convert_amt_stats_to_delta_stats(
+            &engine,
+            input.as_ref(),
+            CONTENT_STATS_FIELD_NAME,
+            "stats",
+            table,
+            delta,
+            &input_schema,
+        )
+        .unwrap();
+
+        assert_eq!(to_batch(actual), to_batch(expected));
+    }
+
+    /// A nested Delta stats schema with `numRecords`, the given category sub-structs, and
+    /// `tightBounds`. Mirrors the canonical Delta stats shape for building reverse-pivot targets.
+    fn delta_stats_with_bounds(
+        null_count: StructType,
+        min_values: StructType,
+        max_values: StructType,
+    ) -> StructType {
+        StructType::new_unchecked([
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(NULL_COUNT, null_count),
+            StructField::nullable(MIN_VALUES, min_values),
+            StructField::nullable(MAX_VALUES, max_values),
+            StructField::nullable(DELTA_TIGHT_BOUNDS, DataType::BOOLEAN),
+        ])
+    }
+
+    #[test]
+    fn reverse_pivot_maps_categories_and_record_count() {
+        let table = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, true, 0),
+            field_with_id("score", DataType::LONG, true, 1),
+        ]);
+        let delta = delta_stats_with_bounds(
+            stat_cols(["id", "score"]),
+            stat_cols(["id", "score"]),
+            stat_cols(["id", "score"]),
+        );
+        let content_stats_schema = projected_stats_schema(&table, &delta).unwrap();
+        // Leaf sub-field order (LONG, all categories): lower, upper, tight, value, null.
+        let content_stats = struct_scalar(
+            &content_stats_schema,
+            vec![
+                leaf_scalar(
+                    &content_stats_schema,
+                    "id",
+                    vec![
+                        Scalar::Long(1),
+                        Scalar::Long(10),
+                        Scalar::Boolean(true),
+                        Scalar::Long(100),
+                        Scalar::Long(5),
+                    ],
+                ),
+                leaf_scalar(
+                    &content_stats_schema,
+                    "score",
+                    vec![
+                        Scalar::Long(20),
+                        Scalar::Long(99),
+                        Scalar::Boolean(true),
+                        Scalar::Long(100),
+                        Scalar::Long(0),
+                    ],
+                ),
+            ],
+        );
+
+        let expected = struct_scalar(
+            &delta,
+            vec![
+                Scalar::Long(100), // numRecords <- recordCount
+                struct_scalar(
+                    &stat_cols(["id", "score"]),
+                    vec![Scalar::Long(5), Scalar::Long(0)],
+                ),
+                struct_scalar(
+                    &stat_cols(["id", "score"]),
+                    vec![Scalar::Long(1), Scalar::Long(20)],
+                ),
+                struct_scalar(
+                    &stat_cols(["id", "score"]),
+                    vec![Scalar::Long(10), Scalar::Long(99)],
+                ),
+                Scalar::Boolean(true), // tightBounds = true AND true
+            ],
+        );
+
+        assert_reverse_pivot(&table, &delta, content_stats, 100, expected);
+    }
+
+    #[test]
+    fn reverse_pivot_nested_leaf_rebuilds_nested_path() {
+        // Table a:{b: long}; the flat content_stats leaf is keyed by the dotted path "a.b".
+        let table = StructType::new_unchecked([struct_field_with_id(
+            "a",
+            9,
+            [field_with_id("b", DataType::LONG, true, 0)],
+        )]);
+        let delta = delta_stats_with_bounds(
+            nested_cat("a", ["b"]),
+            nested_cat("a", ["b"]),
+            nested_cat("a", ["b"]),
+        );
+        let content_stats_schema = projected_stats_schema(&table, &delta).unwrap();
+        let content_stats = struct_scalar(
+            &content_stats_schema,
+            vec![leaf_scalar(
+                &content_stats_schema,
+                "a.b",
+                vec![
+                    Scalar::Long(3),
+                    Scalar::Long(7),
+                    Scalar::Boolean(true),
+                    Scalar::Long(50),
+                    Scalar::Long(2),
+                ],
+            )],
+        );
+
+        let nested = |v: Scalar| {
+            struct_scalar(
+                &nested_cat("a", ["b"]),
+                vec![struct_scalar(&stat_cols(["b"]), vec![v])],
+            )
+        };
+        let expected = struct_scalar(
+            &delta,
+            vec![
+                Scalar::Long(50),
+                nested(Scalar::Long(2)),
+                nested(Scalar::Long(3)),
+                nested(Scalar::Long(7)),
+                Scalar::Boolean(true),
+            ],
+        );
+
+        assert_reverse_pivot(&table, &delta, content_stats, 50, expected);
+    }
+
+    #[test]
+    fn reverse_pivot_array_in_null_count_reconstructs_null_long() {
+        // An array column has no content_stats entry: Delta records it only in nullCount, and the
+        // reverse must emit a null LONG there to keep the nullCount struct field count aligned.
+        let table = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, true, 0),
+            field_with_id(
+                "arr",
+                DataType::from(ArrayType::new(DataType::LONG, true)),
+                true,
+                1,
+            ),
+        ]);
+        let delta = delta_stats_with_bounds(
+            stat_cols(["id", "arr"]), // nullCount includes the array
+            stat_cols(["id"]),        // min/max exclude it
+            stat_cols(["id"]),
+        );
+        let content_stats_schema = projected_stats_schema(&table, &delta).unwrap();
+        // Only "id" has a content_stats entry; "arr" is dropped.
+        let content_stats = struct_scalar(
+            &content_stats_schema,
+            vec![leaf_scalar(
+                &content_stats_schema,
+                "id",
+                vec![
+                    Scalar::Long(0),
+                    Scalar::Long(9),
+                    Scalar::Boolean(true),
+                    Scalar::Long(10),
+                    Scalar::Long(1),
+                ],
+            )],
+        );
+
+        let expected = struct_scalar(
+            &delta,
+            vec![
+                Scalar::Long(10),
+                struct_scalar(
+                    &stat_cols(["id", "arr"]),
+                    vec![Scalar::Long(1), Scalar::Null(DataType::LONG)],
+                ),
+                struct_scalar(&stat_cols(["id"]), vec![Scalar::Long(0)]),
+                struct_scalar(&stat_cols(["id"]), vec![Scalar::Long(9)]),
+                Scalar::Boolean(true),
+            ],
+        );
+
+        assert_reverse_pivot(&table, &delta, content_stats, 10, expected);
+    }
+
+    #[rstest]
+    #[case::all_tight(true, true, true)]
+    #[case::one_loose(true, false, false)]
+    #[case::both_loose(false, false, false)]
+    fn reverse_pivot_tight_bounds_is_and_of_columns(
+        #[case] id_tight: bool,
+        #[case] score_tight: bool,
+        #[case] expected_tight: bool,
+    ) {
+        let table = StructType::new_unchecked([
+            field_with_id("id", DataType::LONG, true, 0),
+            field_with_id("score", DataType::LONG, true, 1),
+        ]);
+        let delta = delta_stats_with_bounds(
+            stat_cols(["id", "score"]),
+            stat_cols(["id", "score"]),
+            stat_cols(["id", "score"]),
+        );
+        let content_stats_schema = projected_stats_schema(&table, &delta).unwrap();
+        let content_stats = struct_scalar(
+            &content_stats_schema,
+            vec![
+                leaf_scalar(
+                    &content_stats_schema,
+                    "id",
+                    vec![
+                        Scalar::Long(1),
+                        Scalar::Long(2),
+                        Scalar::Boolean(id_tight),
+                        Scalar::Long(3),
+                        Scalar::Long(0),
+                    ],
+                ),
+                leaf_scalar(
+                    &content_stats_schema,
+                    "score",
+                    vec![
+                        Scalar::Long(4),
+                        Scalar::Long(5),
+                        Scalar::Boolean(score_tight),
+                        Scalar::Long(3),
+                        Scalar::Long(0),
+                    ],
+                ),
+            ],
+        );
+
+        let expected = struct_scalar(
+            &delta,
+            vec![
+                Scalar::Long(3),
+                struct_scalar(
+                    &stat_cols(["id", "score"]),
+                    vec![Scalar::Long(0), Scalar::Long(0)],
+                ),
+                struct_scalar(
+                    &stat_cols(["id", "score"]),
+                    vec![Scalar::Long(1), Scalar::Long(4)],
+                ),
+                struct_scalar(
+                    &stat_cols(["id", "score"]),
+                    vec![Scalar::Long(2), Scalar::Long(5)],
+                ),
+                Scalar::Boolean(expected_tight),
+            ],
+        );
+
+        assert_reverse_pivot(&table, &delta, content_stats, 3, expected);
+    }
+
+    #[test]
+    fn reverse_pivot_projected_schema_emits_only_present_categories() {
+        // A Delta stats schema carrying only numRecords + nullCount: the output has exactly those
+        // two fields, and tightBounds is not emitted.
+        let table = StructType::new_unchecked([field_with_id("id", DataType::LONG, true, 0)]);
+        let delta = StructType::new_unchecked([
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(NULL_COUNT, stat_cols(["id"])),
+        ]);
+        let content_stats_schema = projected_stats_schema(&table, &delta).unwrap();
+        // A leaf only in nullCount keeps value_count + null_value_count (order per
+        // build_stats_struct).
+        let content_stats = struct_scalar(
+            &content_stats_schema,
+            vec![leaf_scalar(
+                &content_stats_schema,
+                "id",
+                vec![Scalar::Long(7), Scalar::Long(2)],
+            )],
+        );
+        let expected = struct_scalar(
+            &delta,
+            vec![
+                Scalar::Long(7),
+                struct_scalar(&stat_cols(["id"]), vec![Scalar::Long(2)]),
+            ],
+        );
+
+        assert_reverse_pivot(&table, &delta, content_stats, 7, expected);
+    }
+
+    #[test]
+    fn reverse_pivot_variant_null_count_only() {
+        // Variants carry stats only in nullCount today, with no tight_bounds sub-field. The leaf's
+        // projected content_stats struct is just [value_count, null_value_count].
+        let table = StructType::new_unchecked([field_with_id(
+            "v",
+            DataType::unshredded_variant(),
+            true,
+            0,
+        )]);
+        let delta = StructType::new_unchecked([
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(NULL_COUNT, stat_cols(["v"])),
+        ]);
+        let content_stats_schema = projected_stats_schema(&table, &delta).unwrap();
+        let content_stats = struct_scalar(
+            &content_stats_schema,
+            vec![leaf_scalar(
+                &content_stats_schema,
+                "v",
+                vec![Scalar::Long(8), Scalar::Long(3)],
+            )],
+        );
+        let expected = struct_scalar(
+            &delta,
+            vec![
+                Scalar::Long(8),
+                struct_scalar(&stat_cols(["v"]), vec![Scalar::Long(3)]),
+            ],
+        );
+
+        assert_reverse_pivot(&table, &delta, content_stats, 8, expected);
+    }
+
+    /// `content_stats_col` names the column passed to the pivot; `with_record_count` controls
+    /// whether the input schema carries the required [`RECORD_COUNT`] column.
+    #[rstest]
+    #[case::content_stats_missing("missing_cs", true, "must be a struct")]
+    #[case::record_count_missing(CONTENT_STATS_FIELD_NAME, false, "not found")]
+    fn reverse_pivot_errors_on_bad_columns(
+        #[case] content_stats_col: &str,
+        #[case] with_record_count: bool,
+        #[case] needle: &str,
+    ) {
+        let table = StructType::new_unchecked([field_with_id("id", DataType::LONG, true, 0)]);
+        let delta =
+            delta_stats_with_bounds(stat_cols(["id"]), stat_cols(["id"]), stat_cols(["id"]));
+        let content_stats_schema = projected_stats_schema(&table, &delta).unwrap();
+        let mut fields = vec![StructField::nullable(
+            CONTENT_STATS_FIELD_NAME,
+            content_stats_schema.clone(),
+        )];
+        // A null `content_stats` cell suffices: the error triggers in the precondition checks,
+        // before evaluation.
+        let mut row = vec![Scalar::Null(content_stats_schema.into())];
+        if with_record_count {
+            fields.push(StructField::nullable(RECORD_COUNT, DataType::LONG));
+            row.push(Scalar::Long(1));
+        }
+        let input_schema = StructType::new_unchecked(fields);
+        let engine = SyncEngine::new();
+        let input = engine
+            .evaluation_handler()
+            .create_many(Arc::new(input_schema.clone()), vec![row])
+            .unwrap();
+
+        let err = convert_amt_stats_to_delta_stats(
+            &engine,
+            input.as_ref(),
+            content_stats_col,
+            "stats",
+            &table,
+            &delta,
+            &input_schema,
+        )
+        .err()
+        .expect("should error on bad columns");
+        assert!(
+            err.to_string().contains(needle),
+            "error should mention '{needle}': {err}"
+        );
     }
 }
