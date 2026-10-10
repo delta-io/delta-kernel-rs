@@ -10,14 +10,16 @@
 #   CLAUDE_MAINTAINER_MODEL  Claude maintainer-pass model.
 #   CODEX_MAINTAINER_MODEL   Codex maintainer-pass model.
 #   DISPROVE_MODEL           GPT disprove-gate model.
+# Trusted users without write access may be listed in:
+#   .github/omnigent/ai-review-allowlist.txt
 # Optional named-bot comments:
 #   vars.OMNIGENT_BOT_APP_ID + secrets.OMNIGENT_BOT_APP_KEY
 #   vars.OMNIGENT_BOT_LOGIN  Exact GitHub App login used for history deduplication.
 #
-# Non-draft PRs from authors with write-or-higher permission are reviewed on open,
-# reopen, and ready-for-review transitions. Pushes do not trigger another review;
-# during iteration, an authorized actor can request one with /review inline.
-# Other /review modes and workflow dispatch remain available for experiments.
+# Non-draft PRs from authors with write-or-higher permission or an allowlist entry are
+# reviewed on open, reopen, and ready-for-review transitions. Pushes do not trigger another
+# review. During iteration, an authorized actor can request any /review mode. Workflow
+# dispatch remains limited to actors with write-or-higher permission.
 # =============================================================================
 name: AI PR Review
 
@@ -168,7 +170,7 @@ jobs:
           echo "output_mode=$mode" >> "$GITHUB_OUTPUT"
 
       - name: Check trigger subject has write access
-        id: access
+        id: permission
         if: steps.trigger.outputs.skip != 'true'
         env:
           AUTH_SUBJECT: ${{ steps.trigger.outputs.auth_subject }}
@@ -176,16 +178,59 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          perm="$(gh api "repos/${REPO}/collaborators/${AUTH_SUBJECT}/permission" --jq '.permission' 2>/dev/null || echo none)"
+          perm="$(gh api "repos/${REPO}/collaborators/${AUTH_SUBJECT}/permission" \
+            --jq '.permission' 2>/dev/null || echo none)"
           case "$perm" in
-            admin|maintain|write)
-              echo "allowed=true" >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              echo "::notice::${AUTH_SUBJECT} has '${perm}' access, not write/maintain/admin; skipping."
-              echo "allowed=false" >> "$GITHUB_OUTPUT"
-              ;;
+            admin|maintain|write) has_write=true ;;
+            *) has_write=false ;;
           esac
+          echo "has_write=$has_write" >> "$GITHUB_OUTPUT"
+
+      - name: Check out trusted AI review allowlist
+        if: >-
+          steps.trigger.outputs.skip != 'true' &&
+          steps.permission.outputs.has_write != 'true' &&
+          (
+            github.event_name == 'issue_comment' ||
+            github.event_name == 'pull_request_target'
+          )
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github/omnigent/ai-review-allowlist.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Check trigger subject is authorized
+        id: access
+        if: steps.trigger.outputs.skip != 'true'
+        env:
+          AUTH_SUBJECT: ${{ steps.trigger.outputs.auth_subject }}
+          ALLOWLIST_PATH: .github/omnigent/ai-review-allowlist.txt
+          EVENT_NAME: ${{ github.event_name }}
+          HAS_WRITE: ${{ steps.permission.outputs.has_write }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_WRITE" = "true" ]; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          allowlisted=false
+          # The allowlist comes from the default branch, so a PR cannot authorize its author.
+          if [[ "$EVENT_NAME" == "issue_comment" || \
+                "$EVENT_NAME" == "pull_request_target" ]] && \
+             [ -f "$ALLOWLIST_PATH" ] && \
+             grep -Fxiq -- "$AUTH_SUBJECT" "$ALLOWLIST_PATH"; then
+            allowlisted=true
+          fi
+          if [ "$allowlisted" = "true" ]; then
+            echo "::notice::Allowing AI review for allowlisted user ${AUTH_SUBJECT}."
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::${AUTH_SUBJECT} is not authorized to run this AI review; skipping."
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Acknowledge /review command
         continue-on-error: true

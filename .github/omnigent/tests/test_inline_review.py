@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -246,6 +247,61 @@ class InlineReviewTest(unittest.TestCase):
         )[0]
 
         self.assertIn("mode=inline", automatic_trigger)
+
+    def test_review_allowlist_uses_trusted_default_branch_file(self) -> None:
+        omnigent_dir = Path(__file__).parents[1]
+        workflow = (omnigent_dir.parent / "workflows" / "ai-review.yml").read_text()
+        checkout = workflow.partition(
+            "      - name: Check out trusted AI review allowlist"
+        )[2].partition("      - name: Check trigger subject is authorized")[0]
+        authorization = workflow.partition(
+            "      - name: Check trigger subject is authorized"
+        )[2].partition("      - name: Acknowledge /review command")[0]
+
+        self.assertIn("Check out trusted AI review allowlist", workflow)
+        self.assertLess(
+            workflow.index("      - name: Check trigger subject has write access"),
+            workflow.index("      - name: Check out trusted AI review allowlist"),
+        )
+        self.assertIn("steps.permission.outputs.has_write != 'true'", checkout)
+        self.assertIn("ref: ${{ github.event.repository.default_branch }}", checkout)
+        self.assertIn("sparse-checkout: .github/omnigent/ai-review-allowlist.txt", checkout)
+        self.assertNotIn("vars.AI_REVIEW_ALLOWLIST", workflow)
+        self.assertIn('"$EVENT_NAME" == "issue_comment"', authorization)
+        self.assertIn('"$EVENT_NAME" == "pull_request_target"', authorization)
+        self.assertNotIn('"$EVENT_NAME" == "workflow_dispatch"', authorization)
+        self.assertIn('grep -Fxiq -- "$AUTH_SUBJECT" "$ALLOWLIST_PATH"', authorization)
+        self.assertTrue((omnigent_dir / "ai-review-allowlist.txt").is_file())
+
+    def test_review_allowlist_matches_only_complete_login_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "allowlist.txt"
+            path.write_text(
+                "# trusted users\nAlice\nbob\nmalice\ncarol # note\ndave \neve\r\n"
+            )
+
+            def matches(login: str) -> bool:
+                return subprocess.run(
+                    ["grep", "-Fxiq", "--", login, str(path)], check=False
+                ).returncode == 0
+
+            self.assertTrue(matches("alice"))
+            self.assertTrue(matches("BOB"))
+            self.assertFalse(matches("ali"))
+            self.assertFalse(matches("trusted users"))
+            self.assertFalse(matches("carol"))
+            self.assertFalse(matches("dave"))
+            self.assertFalse(matches("eve"))
+
+            missing = path.with_name("missing.txt")
+            self.assertNotEqual(
+                subprocess.run(
+                    ["grep", "-Fxiq", "--", "alice", str(missing)],
+                    check=False,
+                    capture_output=True,
+                ).returncode,
+                0,
+            )
 
     def test_diff_positions_tracks_both_sides_and_context(self) -> None:
         self.assertEqual(
