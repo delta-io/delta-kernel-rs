@@ -71,6 +71,7 @@ pub mod data_layout;
 pub(crate) mod data_layout;
 
 use builder::collect_operation_metadata;
+pub use builder::replace_table::ReplaceTableTransactionBuilder;
 pub use builder::update_table::UpdateTableTransactionBuilder;
 mod bound_write_context;
 mod commit_info;
@@ -535,6 +536,19 @@ impl<S> Transaction<S> {
         self
     }
 
+    /// Adds an application transaction identifier to the commit.
+    ///
+    /// This can be called after building the transaction when the connector only knows its
+    /// progress version after writing files. Duplicate application IDs are rejected at commit.
+    pub fn with_transaction_id(mut self, app_id: impl Into<String>, version: i64) -> Self {
+        self.set_transactions.push(SetTransaction::new(
+            app_id.into(),
+            version,
+            Some(self.commit_timestamp),
+        ));
+        self
+    }
+
     /// Set domain metadata to be written to the Delta log.
     /// Note that each domain can only appear once per transaction. That is, multiple configurations
     /// of the same domain are disallowed in a single transaction, as well as setting and removing
@@ -569,6 +583,23 @@ impl<S> Transaction<S> {
     /// [`stats_schema`]: Transaction::stats_schema
     pub fn add_files_schema(&self) -> &'static SchemaRef {
         &BASE_ADD_FILES_SCHEMA
+    }
+}
+
+impl Transaction<ExistingTable> {
+    pub(super) fn with_table_replacement(
+        mut self,
+        config: TableConfiguration,
+        removals: Vec<FilteredEngineData>,
+    ) -> Self {
+        self.effective_table_config = config;
+        self.should_emit_metadata = true;
+        self.operation = Some(CommitOperation::Replace);
+        self.remove_files_metadata = removals;
+        self.data_change = true;
+        self.infer_data_change = false;
+        self.row_tracking_preservation_acknowledged = true;
+        self
     }
 }
 
@@ -1033,6 +1064,7 @@ impl<S> Transaction<S> {
                 ))
             }
             (false, Some(CommitOperation::UpdateTable(_))) => Ok(()),
+            (false, Some(CommitOperation::Replace)) => Ok(()),
             (true, _) => Err(KernelError::invalid_transaction_state(
                 "create-table transactions must use the CREATE TABLE operation",
             )),
