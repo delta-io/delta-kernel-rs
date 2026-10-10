@@ -137,14 +137,22 @@ pub(crate) struct ParsedLogPath<Location: AsUrl = FileMeta> {
     pub file_type: LogPathFileType,
 }
 
-// Internal helper used by TryFrom<FileMeta> below. It parses a fixed-length string into the numeric
-// type expected by the caller. A parsing failure returns None. A wrong length produces None, even
-// if the parse succeeded.
+// Internal helper used by TryFrom<FileMeta> below. It parses a fixed-length path component.
+// A parsing failure returns None. A wrong length produces None, even if the parse succeeded.
 fn parse_path_part<T: FromStr>(value: &str, expect_len: usize) -> Option<T> {
     match value.parse() {
         Ok(result) if value.len() == expect_len => Some(result),
         _ => None,
     }
+}
+
+// Numeric path components must contain only ASCII digits. Rust's integer parsers also accept a
+// leading `+`, which is not valid in Delta's zero-padded numeric filename components.
+fn parse_numeric_path_part<T: FromStr>(value: &str, expect_len: usize) -> Option<T> {
+    if !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    parse_path_part(value, expect_len)
 }
 
 // We normally construct ParsedLogPath from FileMeta, but in testing it's convenient to use
@@ -220,13 +228,9 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         #[allow(clippy::unwrap_used)]
         let version = split.next().unwrap();
 
-        // Every valid log path starts with a numeric version part. If version parsing fails, it
-        // must not be a log path and we simply return None. However, it is an error if version
-        // parsing succeeds for a wrong-length numeric string.
-        let version = match version.parse().ok() {
-            Some(v) if version.len() == VERSION_LEN => v,
-            Some(_) => return Ok(None), // has a version but it's not 20 chars
-            None => return Ok(None),
+        // Every valid log path starts with a zero-padded 20-digit version.
+        let Some(version) = parse_numeric_path_part::<Version>(version, VERSION_LEN) else {
+            return Ok(None);
         };
 
         // Every valid log path has a file extension as its last part. Return None if it's missing.
@@ -277,16 +281,16 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
                 LogPathFileType::UuidCheckpoint
             }
             [hi, "compacted", "json"] if in_delta_log_dir => {
-                let Some(hi) = parse_path_part(hi, VERSION_LEN) else {
+                let Some(hi) = parse_numeric_path_part(hi, VERSION_LEN) else {
                     return Ok(None);
                 };
                 LogPathFileType::CompactedCommit { hi }
             }
             ["checkpoint", part_num, num_parts, "parquet"] if in_delta_log_dir => {
-                let Some(part_num) = parse_path_part(part_num, MULTIPART_PART_LEN) else {
+                let Some(part_num) = parse_numeric_path_part(part_num, MULTIPART_PART_LEN) else {
                     return Ok(None);
                 };
-                let Some(num_parts) = parse_path_part(num_parts, MULTIPART_PART_LEN) else {
+                let Some(num_parts) = parse_numeric_path_part(num_parts, MULTIPART_PART_LEN) else {
                     return Ok(None);
                 };
 
@@ -691,6 +695,45 @@ pub(crate) mod tests {
         assert!(!may_begin_listable_log_path("Zsentinel"));
     }
 
+    #[rstest::rstest]
+    #[case::not_versioned("_last_checkpoint")]
+    #[case::missing_extension("00000000000000000010")]
+    #[case::invalid_version("abc.json")]
+    #[case::version_too_long("000000000000000000010.json")]
+    #[case::version_too_short("0000000000000000010.json")]
+    #[case::signed_version("+0000000000000000001.json")]
+    #[case::invalid_uuid_checkpoint("00000000000000000002.checkpoint.foo.parquet")]
+    #[case::short_uuid_checkpoint(
+        "00000000000000000010.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e.parquet"
+    )]
+    #[case::zero_checkpoint_part("00000000000000000008.checkpoint.0000000000.0000000002.parquet")]
+    #[case::checkpoint_part_exceeds_total(
+        "00000000000000000008.checkpoint.0000000003.0000000002.parquet"
+    )]
+    #[case::short_checkpoint_part("00000000000000000008.checkpoint.000000001.0000000002.parquet")]
+    #[case::signed_checkpoint_part("00000000000000000008.checkpoint.+000000001.0000000002.parquet")]
+    #[case::signed_checkpoint_total(
+        "00000000000000000008.checkpoint.0000000001.+000000002.parquet"
+    )]
+    #[case::short_checkpoint_total("00000000000000000008.checkpoint.0000000001.000000002.parquet")]
+    #[case::non_digit_checkpoint_part(
+        "00000000000000000008.checkpoint.00000000x1.0000000002.parquet"
+    )]
+    #[case::non_digit_checkpoint_total(
+        "00000000000000000008.checkpoint.0000000001.00000000x2.parquet"
+    )]
+    #[case::signed_compacted_high("00000000000000000008.+0000000000000000015.compacted.json")]
+    #[case::short_compacted_high("00000000000000000008.0000000000000000015.compacted.json")]
+    #[case::long_compacted_high("00000000000000000008.000000000000000000015.compacted.json")]
+    #[case::non_digit_compacted_high("00000000000000000008.00000000000000000a15.compacted.json")]
+    fn test_reject_invalid_log_paths(#[case] filename: &str) {
+        let log_path = table_log_dir_url().join(filename).unwrap();
+        assert!(
+            ParsedLogPath::try_from(log_path).unwrap().is_none(),
+            "expected {filename} to be rejected"
+        );
+    }
+
     #[test]
     fn test_unknown_invalid_patterns() {
         let table_log_dir = table_log_dir_url();
@@ -702,19 +745,6 @@ pub(crate) mod tests {
             .ends_with("/tests/data/table-with-dv-small/_delta_log/subdir/"));
         let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert!(log_path.is_none());
-
-        // ignored - not versioned
-        let log_path = table_log_dir.join("_last_checkpoint").unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
-        assert!(log_path.is_none());
-
-        // ignored - no extension
-        let log_path = table_log_dir.join("00000000000000000010").unwrap();
-        let result = ParsedLogPath::try_from(log_path);
-        assert!(
-            matches!(result, Ok(None)),
-            "Expected Ok(None) for missing file extension"
-        );
 
         // empty extension - should be treated as unknown file type
         let log_path = table_log_dir.join("00000000000000000011.").unwrap();
@@ -729,21 +759,6 @@ pub(crate) mod tests {
             ),
             "Expected Unknown file type, got {result:?}"
         );
-
-        // ignored - version fails to parse
-        let log_path = table_log_dir.join("abc.json").unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
-        assert!(log_path.is_none());
-
-        // invalid - version has too many digits
-        let log_path = table_log_dir.join("000000000000000000010.json").unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
-        assert!(log_path.is_none());
-
-        // invalid - version has too few digits
-        let log_path = table_log_dir.join("0000000000000000010.json").unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
-        assert!(log_path.is_none());
 
         // unknown - two parts
         let log_path = table_log_dir.join("00000000000000000010.foo").unwrap();
@@ -886,12 +901,6 @@ pub(crate) mod tests {
         assert!(!log_path.is_checkpoint());
         assert!(log_path.is_unknown());
 
-        let log_path = table_log_dir
-            .join("00000000000000000002.checkpoint.foo.parquet")
-            .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
-        assert!(log_path.is_none());
-
         // invalid file extension
         let log_path = table_log_dir
             .join("00000000000000000002.checkpoint.foo")
@@ -903,13 +912,6 @@ pub(crate) mod tests {
         assert!(!log_path.is_commit());
         assert!(!log_path.is_checkpoint());
         assert!(log_path.is_unknown());
-
-        // Boundary test - UUID with exactly 35 characters (one too short)
-        let log_path = table_log_dir
-            .join("00000000000000000010.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e.parquet")
-            .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
-        assert!(log_path.is_none());
     }
 
     #[test]
@@ -929,12 +931,6 @@ pub(crate) mod tests {
         assert!(!log_path.is_commit());
         assert!(!log_path.is_checkpoint());
         assert!(log_path.is_unknown());
-
-        let log_path = table_log_dir
-            .join("00000000000000000008.checkpoint.0000000000.0000000002.parquet")
-            .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
-        assert!(log_path.is_none());
 
         let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.0000000001.0000000002.parquet")
@@ -975,36 +971,6 @@ pub(crate) mod tests {
         ));
         assert!(!log_path.is_commit());
         assert!(log_path.is_checkpoint());
-
-        let log_path = table_log_dir
-            .join("00000000000000000008.checkpoint.0000000003.0000000002.parquet")
-            .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
-        assert!(log_path.is_none());
-
-        let log_path = table_log_dir
-            .join("00000000000000000008.checkpoint.000000001.0000000002.parquet")
-            .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
-        assert!(log_path.is_none());
-
-        let log_path = table_log_dir
-            .join("00000000000000000008.checkpoint.0000000001.000000002.parquet")
-            .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
-        assert!(log_path.is_none());
-
-        let log_path = table_log_dir
-            .join("00000000000000000008.checkpoint.00000000x1.0000000002.parquet")
-            .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
-        assert!(log_path.is_none());
-
-        let log_path = table_log_dir
-            .join("00000000000000000008.checkpoint.0000000001.00000000x2.parquet")
-            .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
-        assert!(log_path.is_none());
     }
 
     #[test]
@@ -1042,24 +1008,6 @@ pub(crate) mod tests {
         assert!(!log_path.is_commit());
         assert!(!log_path.is_checkpoint());
         assert!(log_path.is_unknown());
-
-        let log_path = table_log_dir
-            .join("00000000000000000008.0000000000000000015.compacted.json")
-            .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
-        assert!(log_path.is_none());
-
-        let log_path = table_log_dir
-            .join("00000000000000000008.000000000000000000015.compacted.json")
-            .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
-        assert!(log_path.is_none());
-
-        let log_path = table_log_dir
-            .join("00000000000000000008.00000000000000000a15.compacted.json")
-            .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
-        assert!(log_path.is_none());
     }
 
     #[test]
