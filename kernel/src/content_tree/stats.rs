@@ -16,8 +16,8 @@ use tracing::warn;
 
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT};
 use crate::content_tree::{
-    AVG_VALUE_SIZE_IN_BYTES, LOWER_BOUND, NAN_VALUE_COUNT, NULL_VALUE_COUNT, TIGHT_BOUNDS,
-    UPPER_BOUND, VALUE_COUNT,
+    LOWER_BOUND, NAN_VALUE_COUNT, NULL_VALUE_COUNT, TIGHT_BOUNDS, TOTAL_BYTES, UPPER_BOUND,
+    VALUE_COUNT,
 };
 use crate::expressions::ColumnName;
 use crate::schema::{
@@ -33,7 +33,7 @@ const STATS_OFFSET_TIGHT_BOUNDS: i32 = 3;
 const STATS_OFFSET_VALUE_COUNT: i32 = 4;
 const STATS_OFFSET_NULL_VALUE_COUNT: i32 = 5;
 const STATS_OFFSET_NAN_VALUE_COUNT: i32 = 6;
-const STATS_OFFSET_AVG_VALUE_SIZE_IN_BYTES: i32 = 7;
+const STATS_OFFSET_TOTAL_BYTES: i32 = 7;
 
 /// Number of supported stats per column (each column gets a range of 200 field IDs).
 /// This value is the upper bound on the number of "statistic types", e.g. min/max.
@@ -177,7 +177,8 @@ impl StatCategories {
 /// - offset 4: `value_count` (long)
 /// - offset 5: `null_value_count` (long) - emitted regardless of the column's nullability
 /// - offset 6: `nan_value_count` (long) - only for float/double `bounds_type`
-/// - offset 7: `avg_value_size_in_bytes` (int) - for string/binary `bounds_type`, or any variant
+/// - offset 7: `total_bytes` (long) - total uncompressed size of the column's values; for
+///   string/binary `bounds_type`, or any variant
 ///
 /// `bounds_type` is the type the bounds are recorded at: the column's own type for primitives, or
 /// an unshredded variant type for variant columns.
@@ -186,7 +187,7 @@ impl StatCategories {
 /// (the unprojected path) keeps every type-eligible sub-field. When `Some`, a sub-field is kept
 /// only when a category backing it is present: `lower_bound`<-`minValues`,
 /// `upper_bound`<-`maxValues`, `value_count`/`null_value_count`<-`nullCount`,
-/// `tight_bounds`/`nan_value_count`<-either bound category. `avg_value_size_in_bytes` has no
+/// `tight_bounds`/`nan_value_count`<-either bound category. `total_bytes` has no
 /// backing category and is dropped whenever projecting -- so `null_value_count`, though independent
 /// of nullability, is still dropped when the leaf is absent from `nullCount`.
 fn build_stats_struct(
@@ -253,9 +254,9 @@ fn build_stats_struct(
             has_nan_count && has_bounds,
         ),
         (
-            AVG_VALUE_SIZE_IN_BYTES,
-            DataType::INTEGER,
-            STATS_OFFSET_AVG_VALUE_SIZE_IN_BYTES,
+            TOTAL_BYTES,
+            DataType::LONG,
+            STATS_OFFSET_TOTAL_BYTES,
             has_size_stats && !projecting,
         ),
     ];
@@ -657,10 +658,7 @@ mod tests {
             || field.data_type() == &DataType::STRING
             || field.data_type() == &DataType::BINARY
         {
-            assert_offset(
-                AVG_VALUE_SIZE_IN_BYTES,
-                STATS_OFFSET_AVG_VALUE_SIZE_IN_BYTES,
-            );
+            assert_offset(TOTAL_BYTES, STATS_OFFSET_TOTAL_BYTES);
         }
         assert_offset(LOWER_BOUND, STATS_OFFSET_LOWER_BOUND);
         assert_offset(UPPER_BOUND, STATS_OFFSET_UPPER_BOUND);
@@ -890,7 +888,7 @@ mod tests {
         );
         // Variants exclude tight_bounds and always include the size stat.
         assert!(v_stats.field(TIGHT_BOUNDS).is_none());
-        assert!(v_stats.field(AVG_VALUE_SIZE_IN_BYTES).is_some());
+        assert!(v_stats.field(TOTAL_BYTES).is_some());
         assert_stats_field_ids(&v_stats, 10_600, &field);
     }
 
@@ -1279,7 +1277,7 @@ mod tests {
 
         let projected = projected_stats_schema(&table, &delta).expect("projected should succeed");
         // Every leaf keeps its full category-backed set. This differs from the unprojected
-        // `stats_schema` only for the variant, whose `avg_value_size_in_bytes` (no backing Delta
+        // `stats_schema` only for the variant, whose `total_bytes` (no backing Delta
         // category) is dropped under the projection.
         let expected = StructType::new_unchecked([
             expected_leaf("id", DataType::LONG, 0, &STAT_CATEGORIES),
@@ -1327,7 +1325,7 @@ mod tests {
     /// projected tests (which build expectations via `build_stats_struct`), the expected sub-field
     /// names here are spelled out per case, so a wrong condition in `build_stats_struct` is caught.
     /// The leaf type varies to exercise the type-specific conditions (`nan_value_count`,
-    /// `avg_value_size_in_bytes`). Column `c` is always field id 1.
+    /// `total_bytes`). Column `c` is always field id 1.
     #[rstest]
     // Int: lower<-minValues, upper<-maxValues, tight_bounds<-either bound, value/null_value_count
     // <-nullCount.
@@ -1368,9 +1366,9 @@ mod tests {
         delta_stats(Some(stat_cols(["c"])), None, None),
         &[VALUE_COUNT, NULL_VALUE_COUNT],
     )]
-    // String/variant: avg_value_size_in_bytes has no backing category, so it is dropped under the
+    // String/variant: total_bytes has no backing category, so it is dropped under the
     // projection even when the leaf is in every category.
-    #[case::string_all_drops_avg(
+    #[case::string_all_drops_total_bytes(
         DataType::STRING,
         delta_stats(Some(stat_cols(["c"])), Some(stat_cols(["c"])), Some(stat_cols(["c"]))),
         &[LOWER_BOUND, UPPER_BOUND, TIGHT_BOUNDS, VALUE_COUNT, NULL_VALUE_COUNT],
@@ -1467,7 +1465,7 @@ mod tests {
 
     /// A variant survives the projection exactly when present in some category, like any other
     /// leaf. When present only in `nullCount` (its usual shape) it keeps just the count
-    /// sub-fields -- its bounds and `avg_value_size_in_bytes` have no backing category and are
+    /// sub-fields -- its bounds and `total_bytes` have no backing category and are
     /// pruned.
     #[rstest]
     #[case::present_in_null_count(
