@@ -319,7 +319,7 @@ warn_dependents() {
 
     log_warning "These crates depend on $crate_name and keep their own versions."
     log_warning "If $crate_name $version breaks their API, prepare each dependent release on a"
-    log_warning "separate crate-release/ branch before tagging:"
+    log_warning "separate uc-crate-release/ branch before tagging:"
     while read -r dependent; do
         [[ -n "$dependent" ]] || continue
         log_warning "  ./release.sh crate $dependent <version>"

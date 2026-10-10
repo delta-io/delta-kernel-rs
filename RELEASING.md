@@ -12,9 +12,15 @@ The Unity Catalog (UC) crates have independent versions and `v<version>_<crate>`
 - `unity-catalog-delta-rest-client`
 - `delta-kernel-unity-catalog`
 
-Use `release` for the Kernel crates and `crate` for an individual UC crate. The `tag` command
-creates and pushes an annotated tag; it does not publish to crates.io.
-`tag delta_kernel` creates the shared Kernel tag when publishing is handled separately.
+`release.sh` provides these subcommands:
+
+- `./release.sh release <version>` prepares a Kernel release PR from a release branch.
+- `./release.sh release` publishes and tags the Kernel crates when run on `main`.
+- `./release.sh crate <crate> <version>` prepares a release PR for one UC crate.
+- `./release.sh tag <crate> [commit]` creates and pushes an annotated tag without publishing.
+
+Use `./release.sh tag delta_kernel` to create the shared Kernel tag when publishing is handled
+separately.
 
 ## Prerequisites
 
@@ -106,7 +112,7 @@ Create a release branch from the latest `upstream/main` and run the per-crate co
 
 ```bash
 git fetch upstream main --tags
-git switch -c crate-release/unity-catalog-delta-client-api-0.2.0 upstream/main
+git switch -c uc-crate-release/unity-catalog-delta-client-api-0.2.0 upstream/main
 ./release.sh crate unity-catalog-delta-client-api 0.2.0
 ```
 
@@ -115,8 +121,9 @@ It bumps the selected crate, updates its dependents' version requirements, and p
 notes to `<crate>/CHANGELOG.md`. It creates a release commit and can push the branch and open a PR.
 Review the manifests and changelog before merging; add dependency-upgrade notes when relevant.
 
-Use the `crate-release/` prefix for UC release branches. CI reserves `release/` for Kernel releases
-and runs Kernel changelog verification on those branches.
+Use the `uc-crate-release/` prefix for UC release branches. The build workflow runs Kernel-only
+changelog verification on branches beginning with `release/`. A different prefix avoids that
+unrelated check for UC release PRs; the workflow does not publish crates.
 
 Each crate's changelog uses its own release tags as boundaries. Kernel tags and other crates' tags
 do not truncate its history. `changelog` and `verify-changelog` apply to the Kernel changelog only.
@@ -132,9 +139,9 @@ such as `0.1.0` to `0.2.0`. A compatible patch does not require a dependent vers
 `unity-catalog-delta-rest-client` depends on `unity-catalog-delta-client-api`. The script warns about
 independently versioned dependents; review their APIs to decide which versions need to change.
 
-Prepare each dependent release on a separate `crate-release/` branch and PR. Merge the dependency's
-release PR first, then create the dependent's branch from updated `upstream/main` so it includes the
-new dependency requirement. Prepare affected dependent releases before tagging.
+Prepare each dependent release on a separate `uc-crate-release/` branch and PR. Merge the
+dependency's release PR first, then create the dependent's branch from updated `upstream/main`
+so it includes the new dependency requirement. Prepare affected dependent releases before tagging.
 
 ### Tag the release
 

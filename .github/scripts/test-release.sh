@@ -320,7 +320,7 @@ test_crate_release_guards() {
     local repository="$TEST_ROOT/crate-guards"
     local failure_log="$TEST_ROOT/crate-guard-failure" crate dependents
     init_release_workspace "$repository"
-    git switch -q -c crate-release/api
+    git switch -q -c uc-crate-release/api
 
     # shellcheck source=release.sh
     source "$REPOSITORY_ROOT/release.sh"
