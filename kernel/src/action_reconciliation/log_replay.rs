@@ -22,8 +22,8 @@
 //!   and determine if it should be included. It maintains state for deduplication across multiple
 //!   actions in a batch and efficiently handles all filtering rules.
 //!
-//! - [`ActionReconciliationProcessor`]: Implements the [`LogReplayProcessor`] trait and
-//!   orchestrates the overall process. For each batch of log actions, it:
+//! - [`ActionReconciliationProcessor`]: Orchestrates the overall process. For each batch of log
+//!   actions, it:
 //!   1. Creates a visitor with the current deduplication state
 //!   2. Applies the visitor to filter actions in the batch
 //!   3. Tracks state for deduplication across batches
@@ -35,16 +35,12 @@ use std::sync::{Arc, LazyLock};
 
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
-use crate::log_replay::{
-    ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector, LogReplayProcessor,
-};
-use crate::scan::data_skipping::DataSkippingFilter;
+use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector};
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{KernelError, KernelResult, KernelResultIteratorStatic, Result};
 
-/// The [`ActionReconciliationProcessor`] is an implementation of the [`LogReplayProcessor`]
-/// trait that filters log segment actions.
+/// Filters log segment actions for action reconciliation.
 pub(crate) struct ActionReconciliationProcessor {
     /// Tracks file actions that have been seen during log replay to avoid duplicates.
     /// Contains (data file path, dv_unique_id) pairs as `FileActionKey` instances.
@@ -185,9 +181,7 @@ impl Iterator for ActionReconciliationIterator {
     }
 }
 
-impl LogReplayProcessor for ActionReconciliationProcessor {
-    type Output = ActionReconciliationBatch;
-
+impl ActionReconciliationProcessor {
     /// Processes a batch of actions read from the log during reverse chronological replay
     /// and returns a [`ActionReconciliationBatch`], which contains the filtered actions,
     /// along with statistics about the included actions.
@@ -196,7 +190,10 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
     /// implements the deduplication rules described in the module documentation. The method
     /// tracks statistics about processed actions (total count, add actions count) and maintains
     /// state for cross-batch deduplication.
-    fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> Result<Self::Output> {
+    pub(crate) fn process_actions_batch(
+        &mut self,
+        actions_batch: ActionsBatch,
+    ) -> Result<ActionReconciliationBatch> {
         let ActionsBatch {
             actions,
             is_log_batch,
@@ -230,14 +227,6 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
         })
     }
 
-    /// We never do data skipping for action reconciliation log replay (entire table state is always
-    /// reproduced)
-    fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
-        None
-    }
-}
-
-impl ActionReconciliationProcessor {
     pub(crate) fn new(
         minimum_file_retention_timestamp: i64,
         txn_expiration_timestamp: Option<i64>,
@@ -712,8 +701,11 @@ mod tests {
     fn run_action_reconciliation_test(
         input_batches: Vec<ActionsBatch>,
     ) -> Result<(Vec<FilteredEngineData>, i64, i64)> {
-        let processed_batches: Vec<_> = ActionReconciliationProcessor::new(0, None)
-            .process_actions_iter(input_batches.into_iter().map(Ok))
+        let mut processor = ActionReconciliationProcessor::new(0, None);
+        let processed_batches: Vec<_> = input_batches
+            .into_iter()
+            .map(move |batch| processor.process_actions_batch(batch))
+            .filter_ok(HasSelectionVector::has_selected_rows)
             .try_collect()?;
         let total_count: i64 = processed_batches.iter().map(|b| b.actions_count).sum();
         let add_count: i64 = processed_batches.iter().map(|b| b.add_actions_count).sum();
@@ -1184,9 +1176,11 @@ mod tests {
         let input_batches = vec![create_batch(batch1)?, create_batch(batch2)?];
 
         // Create processor with txn expiration timestamp
-        let processor = ActionReconciliationProcessor::new(0, Some(1000));
-        let results: Vec<_> = processor
-            .process_actions_iter(input_batches.into_iter().map(Ok))
+        let mut processor = ActionReconciliationProcessor::new(0, Some(1000));
+        let results: Vec<_> = input_batches
+            .into_iter()
+            .map(move |batch| processor.process_actions_batch(batch))
+            .filter_ok(HasSelectionVector::has_selected_rows)
             .try_collect()?;
 
         // Verify results

@@ -30,8 +30,6 @@ pub(crate) mod stats_schema;
 #[cfg(test)]
 mod tests;
 
-use delta_kernel_derive::internal_api;
-
 /// Rewrites a predicate to a predicate that can be used to skip files based on their stats.
 /// Returns `None` if the predicate is not eligible for data skipping.
 ///
@@ -91,7 +89,6 @@ pub(crate) fn as_sql_data_skipping_predicate_with_stats_columns(
     DataSkippingPredicateCreator::new(partition_columns, stats_columns).eval_sql_where(pred)
 }
 
-#[internal_api]
 pub(crate) struct DataSkippingFilter {
     /// Evaluator that extracts file-level statistics from the input batch. The caller provides
     /// the expression at construction time, which determines where stats come from:

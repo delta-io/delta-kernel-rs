@@ -33,7 +33,7 @@ pub enum AfterSequentialScanMetadata {
 /// After exhaustion, call `finish()` to get the result which indicates whether
 /// a distributed phase is needed.
 pub struct SequentialScanMetadata {
-    pub(crate) sequential: SequentialPhase<ScanLogReplayProcessor>,
+    pub(crate) sequential: SequentialPhase,
     operation_id: MetricId,
     /// Opaque, caller-supplied correlation id propagated to both phases' metric events.
     correlation_id: Option<Arc<str>>,
@@ -42,10 +42,7 @@ pub struct SequentialScanMetadata {
 }
 
 impl SequentialScanMetadata {
-    pub(crate) fn new(
-        sequential: SequentialPhase<ScanLogReplayProcessor>,
-        correlation_id: Option<Arc<str>>,
-    ) -> Self {
+    pub(crate) fn new(sequential: SequentialPhase, correlation_id: Option<Arc<str>>) -> Self {
         let operation_id = MetricId::new();
         Self {
             sequential,
@@ -131,8 +128,8 @@ pub struct ParallelState {
 impl ParallelLogReplayProcessor for Arc<ParallelState> {
     type Output = ScanMetadata;
 
-    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> Result<Self::Output> {
-        self.inner.process_actions_batch(actions_batch)
+    fn process_actions_batch_parallel(&self, actions_batch: ActionsBatch) -> Result<Self::Output> {
+        self.inner.process_actions_batch_parallel(actions_batch)
     }
 }
 

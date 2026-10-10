@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use super::data_skipping::DataSkippingFilter;
@@ -17,7 +18,7 @@ use crate::expressions::{
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
-    ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor,
+    ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector,
     ParallelLogReplayProcessor,
 };
 use crate::log_segment::CheckpointReadInfo;
@@ -152,11 +153,10 @@ pub struct SerializableScanState {
 ///   those derived from projection or filters) are preserved and passed through to the engine,
 ///   which applies them as part of its scan execution logic.
 ///
-/// As an implementation of [`LogReplayProcessor`], [`ScanLogReplayProcessor`] provides the
-/// `process_actions_batch` method, which applies these steps to each batch of log actions and
-/// produces a [`ScanMetadata`] result. This result includes the transformed batch, a selection
-/// vector indicating which rows are valid, and any row-level transformation expressions that need
-/// to be applied to the selected rows.
+/// [`ScanLogReplayProcessor::process_actions_batch_sequential`] applies these steps to each batch
+/// of log actions and produces a [`ScanMetadata`] result. This result includes the transformed
+/// batch, a selection vector indicating which rows are valid, and any row-level transformation
+/// expressions that need to be applied to the selected rows.
 #[allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
 pub struct ScanLogReplayProcessor {
     data_skipping_filter: Option<DataSkippingFilter>,
@@ -1011,21 +1011,19 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
 }
 
 impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
-    type Output = <ScanLogReplayProcessor as LogReplayProcessor>::Output;
+    type Output = ScanMetadata;
 
-    // WARNING: This function performs all the same operations as [`<ScanLogReplayProcessor as
-    // LogReplayProcessor>::process_actions_batch`]! (See trait impl block below) Any changes
-    // performed to this function probably also need to be applied to the other copy of the
-    // function. The copy exists because [`LogReplayProcessor`] requires a `&mut self`, while
-    // [`ParallelLogReplayProcessor`] requires `&self`. Presently, the different in mutabilities
-    // cannot easily be unified.
+    // WARNING: This function performs all the same operations as
+    // [`ScanLogReplayProcessor::process_actions_batch_sequential`]! Any changes performed to this
+    // function probably also need to be applied to the other copy. The copy exists because
+    // parallel processing requires `&self`, while sequential processing requires `&mut self`.
     #[tracing::instrument(
-        name = "scan_log_replay.process_actions_batch",
+        name = "scan_log_replay.process_actions_batch_parallel",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> Result<Self::Output> {
+    fn process_actions_batch_parallel(&self, actions_batch: ActionsBatch) -> Result<Self::Output> {
         let ActionsBatch {
             actions,
             is_log_batch,
@@ -1111,21 +1109,22 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
     }
 }
 
-impl LogReplayProcessor for ScanLogReplayProcessor {
-    type Output = ScanMetadata;
-
-    // WARNING: This function performs all the same operations as [`<ScanLogReplayProcessor as
-    // ParallelLogReplayProcessor>::process_actions_batch`]! Any changes performed to this function
-    // probably also need to be applied to the other copy. The copy exists because
-    // [`LogReplayProcessor`] requires a `&mut self`, while [`ParallelLogReplayProcessor`] requires
-    // `&self`. Presently, the different in mutabilities cannot easily be unified.
+impl ScanLogReplayProcessor {
+    // WARNING: This function performs all the same operations as
+    // [`<ScanLogReplayProcessor as ParallelLogReplayProcessor>::process_actions_batch_parallel`]!
+    // Any changes performed to this function probably also need to be applied to the other copy.
+    // The copy exists because this method requires `&mut self`, while parallel processing requires
+    // `&self`.
     #[tracing::instrument(
-        name = "scan_log_replay.process_actions_batch",
+        name = "scan_log_replay.process_actions_batch_sequential",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> Result<Self::Output> {
+    pub(crate) fn process_actions_batch_sequential(
+        &mut self,
+        actions_batch: ActionsBatch,
+    ) -> Result<ScanMetadata> {
         let ActionsBatch {
             actions,
             is_log_batch,
@@ -1216,8 +1215,11 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         Ok(scan_metadata)
     }
 
-    fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
-        self.data_skipping_filter.as_ref()
+    fn build_selection_vector(&self, batch: &dyn EngineData) -> Result<Vec<bool>> {
+        match &self.data_skipping_filter {
+            Some(filter) => filter.apply(batch),
+            None => Ok(vec![true; batch.len()]),
+        }
     }
 }
 
@@ -1247,7 +1249,7 @@ pub(crate) fn scan_action_iter(
     impl Iterator<Item = KernelResult<ScanMetadata>>,
     Arc<ScanMetrics>,
 )> {
-    let processor = ScanLogReplayProcessor::new(
+    let mut processor = ScanLogReplayProcessor::new(
         engine,
         state_info,
         checkpoint_info,
@@ -1255,7 +1257,10 @@ pub(crate) fn scan_action_iter(
         partition_values_options,
     )?;
     let metrics = processor.metrics.clone();
-    Ok((processor.process_actions_iter(action_iter), metrics))
+    let action_iter = action_iter
+        .map(move |batch| processor.process_actions_batch_sequential(batch?))
+        .filter_ok(HasSelectionVector::has_selected_rows);
+    Ok((action_iter, metrics))
 }
 
 #[cfg(test)]
@@ -1280,7 +1285,7 @@ mod tests {
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
         IndirectDataSkippingPredicateEvaluator,
     };
-    use crate::log_replay::{ActionsBatch, LogReplayProcessor};
+    use crate::log_replay::ActionsBatch;
     use crate::log_segment::CheckpointReadInfo;
     use crate::metrics::{MetricId, ScanType};
     use crate::scan::state::ScanFile;
@@ -1428,11 +1433,8 @@ mod tests {
         });
 
         // Process one batch; the injected parse error must trigger one successful retry.
-        LogReplayProcessor::process_actions_batch(
-            &mut processor,
-            ActionsBatch::new(add_batch_simple(COMMIT_READ_SCHEMA.clone()), true),
-        )
-        .unwrap();
+        let batch = ActionsBatch::new(add_batch_simple(COMMIT_READ_SCHEMA.clone()), true);
+        processor.process_actions_batch_sequential(batch).unwrap();
 
         // Confirm both attempts ran and their deterministic delays were accumulated in the event.
         assert_eq!(calls.load(Ordering::Relaxed), 2);
