@@ -1718,6 +1718,12 @@ impl ContentRoot {
             version,
         }
     }
+
+    /// The table version the root manifest reflects.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn version(&self) -> i64 {
+        self.version
+    }
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]

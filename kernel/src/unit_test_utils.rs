@@ -323,8 +323,6 @@ pub(crate) fn checkpoint_action_batch() -> Box<dyn EngineData> {
 /// actions.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) mod adaptive_metadata_fixtures {
-    use std::iter;
-
     use super::*;
     use crate::actions::{CheckpointAction, ContentRoot};
     use crate::engine_data::FilteredEngineData;
@@ -379,13 +377,40 @@ pub(crate) mod adaptive_metadata_fixtures {
         version: Version,
         data: Box<dyn EngineData>,
     ) -> KernelResult<()> {
-        let filtered = FilteredEngineData::with_all_rows_selected(data);
+        write_commit_batches(engine, table_root, version, vec![data])
+    }
+
+    /// Writes a manifest commit at `version`: a `commitInfo` whose `lastManifestCommit` points at
+    /// this commit, followed by `checkpoint`, whose content root must also reflect `version`.
+    pub(crate) fn write_manifest_commit(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        checkpoint: CheckpointAction,
+    ) -> KernelResult<()> {
+        let version_i64 = version_as_i64(version)?;
+        let commit_info = serde_json::json!({ "commitInfo": { "lastManifestCommit": {
+            "version": version_i64,
+            "contentRootVersion": version_i64,
+        }}});
+        let commit_info = parse_json_batch(vec![commit_info.to_string()].into());
+        let batches = vec![commit_info, checkpoint.into_engine_data(engine)?];
+        write_commit_batches(engine, table_root, version, batches)
+    }
+
+    fn write_commit_batches(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        batches: Vec<Box<dyn EngineData>>,
+    ) -> KernelResult<()> {
         let commit_path = LogRoot::new(table_root.clone())?.new_commit_path(version)?;
-        engine.json_handler().write_json_file(
-            &commit_path.location,
-            Box::new(iter::once(Ok(filtered))),
-            false,
-        )?;
+        let batches = batches
+            .into_iter()
+            .map(|data| Ok(FilteredEngineData::with_all_rows_selected(data)));
+        engine
+            .json_handler()
+            .write_json_file(&commit_path.location, Box::new(batches), false)?;
         Ok(())
     }
 }

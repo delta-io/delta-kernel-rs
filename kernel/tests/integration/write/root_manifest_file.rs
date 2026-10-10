@@ -230,8 +230,8 @@ async fn test_commit_info_records_data_change(
 /// Every commit on an adaptiveMetadata table records `dataChange`, and `lastManifestCommit` is
 /// absent before the first manifest commit, set by it, then carried forward by later log commits.
 /// The carry-forward is read from the CRC when one exists at the read version, otherwise from the
-/// read version's commit file; a checksum written after the carry-forward (rebuilt by log replay)
-/// matches.
+/// newest commit during P&M replay; a checksum written after the carry-forward (rebuilt by log
+/// replay) matches.
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_commit_info_records_data_change_and_last_manifest_commit(

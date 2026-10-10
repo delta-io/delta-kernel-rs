@@ -12,7 +12,7 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{find_max_column_id_in_schema, TableFeature};
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    minimal_checkpoint_action, setup_table, write_commit,
+    minimal_checkpoint_action, setup_table, write_commit, write_manifest_commit,
 };
 use crate::unit_test_utils::{
     assert_result_error_with_message, create_valid_add_file_batch, MockProtocolBuilder,
@@ -206,12 +206,7 @@ fn manifest_commit_after_schema_change_uses_evolved_schema() -> Result<()> {
     checkpoint.metadata = checkpoint
         .metadata
         .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, max_column_id.to_string());
-    write_commit(
-        &engine,
-        &table_root,
-        1,
-        checkpoint.into_engine_data(&engine)?,
-    )?;
+    write_manifest_commit(&engine, &table_root, 1, checkpoint)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let initial_schema = snapshot.table_configuration().physical_schema();
     let mut txn = snapshot

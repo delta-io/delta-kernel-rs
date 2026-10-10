@@ -144,6 +144,15 @@ fn metadata(m: Metadata) -> serde_json::Value {
     json!({"metaData": serde_json::to_value(&m).unwrap()})
 }
 
+// A `commitInfo` carrying a `lastManifestCommit` pointer.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn last_manifest_commit_info(version: i64, content_root_version: i64) -> Value {
+    json!({"commitInfo": {"lastManifestCommit": {
+        "version": version,
+        "contentRootVersion": content_root_version,
+    }}})
+}
+
 // A `checkpoint` action carrying `p` and `m` at `checkpoint_version`.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn amt_checkpoint_action(checkpoint_version: i64, p: Protocol, m: Metadata) -> Value {
@@ -812,11 +821,14 @@ async fn test_crc_seeded_replay_captures_checkpoint_action_after_crc() {
         )
         .commit(
             1,
-            [amt_checkpoint_action(
-                1,
-                checkpoint_config.protocol().clone(),
-                checkpoint_config.metadata().clone(),
-            )],
+            [
+                last_manifest_commit_info(1, 1),
+                amt_checkpoint_action(
+                    1,
+                    checkpoint_config.protocol().clone(),
+                    checkpoint_config.metadata().clone(),
+                ),
+            ],
         )
         .build()
         .await
@@ -892,6 +904,37 @@ async fn test_crc_seeded_replay_without_checkpoint_action_is_unresolved() {
         .await
         .checkpoint_action_resolution();
     assert!(matches!(resolution, CheckpointActionResolution::Unresolved));
+}
+
+// A CRC-seeded pruned replay whose newest commit points at a manifest commit at or below the CRC
+// version cannot capture that action (the pruned replay never reads it), so the pointer becomes a
+// `Hint` for the accessor.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[tokio::test]
+async fn test_crc_seeded_replay_with_pointer_at_or_below_crc_is_hint() {
+    let config = adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
+    let resolution = CrcReadTest::new()
+        .commit(
+            0,
+            [
+                last_manifest_commit_info(0, 0),
+                amt_checkpoint_action(0, config.protocol().clone(), config.metadata().clone()),
+            ],
+        )
+        .crc(
+            0,
+            config.protocol().clone(),
+            config.metadata().clone(),
+            1000, // AMT config enables ICT, so the CRC must carry an inCommitTimestampOpt.
+        )
+        .commit(1, [last_manifest_commit_info(0, 0)])
+        .build()
+        .await
+        .checkpoint_action_resolution();
+    assert!(
+        matches!(&resolution, CheckpointActionResolution::Hint(p) if p.version == 0),
+        "expected a Hint at version 0, got {resolution:?}"
+    );
 }
 
 #[tokio::test]
