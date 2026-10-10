@@ -8,6 +8,8 @@ use std::path::Path;
 use acceptance::acceptance_workloads::workload::execute_and_validate_workload;
 use acceptance::acceptance_workloads::LoadedTestCase;
 
+const UNSUPPORTED_SPEC_TYPES: &[&str] = &["cdf", "checkpoint", "crc", "write"];
+
 fn corpus_relative_spec_id(spec_path: &Path, corpus_root: &Path) -> Result<String, String> {
     let relative = spec_path.strip_prefix(corpus_root).map_err(|_| {
         format!(
@@ -529,7 +531,7 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
     let test_case = match acceptance::acceptance_workloads::TestCase::load(&spec_path_abs)? {
         LoadedTestCase::Supported(test_case) => test_case,
         LoadedTestCase::Unsupported(spec_type)
-            if matches!(spec_type.as_str(), "cdf" | "checkpoint" | "crc" | "write") =>
+            if UNSUPPORTED_SPEC_TYPES.contains(&spec_type.as_str()) =>
         {
             return Ok(())
         }
