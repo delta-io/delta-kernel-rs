@@ -5493,27 +5493,61 @@ fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> R
 }
 
 // An AMT `_last_checkpoint` hint at version 5 has no checkpoint file. The listing starts at the
-// hinted version as long as the manifest commit carrying the checkpoint action is listed.
-// `manifest_commit = None` is an AMT-typed hint without `amtCheckpoint`. The success cases are
-// regressions: without AMT handling they failed with "didn't find any checkpoints".
+// hinted version as long as the manifest commit carrying the checkpoint action is listed, or, for
+// time travel before the manifest commit, the hint embeds that action. `manifest_commit = None` is
+// an AMT-typed hint without `amtCheckpoint`; `embedded_action` is the embedded action's version.
+// The success cases are regressions: without AMT handling they failed with "didn't find any
+// checkpoints".
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[rstest]
-#[case::manifest_commit_at_hint(Some(5), None, &[], None, Ok((None, vec![5, 6, 7])))]
-#[case::manifest_commit_after_hint(Some(6), None, &[], None, Ok((None, vec![5, 6, 7])))]
-#[case::hinted_commit_cleaned_up(Some(6), None, &[0, 1, 2, 3, 4, 5], None, Ok((None, vec![6, 7])))]
-#[case::time_travel_after_manifest_commit(Some(6), None, &[], Some(7), Ok((None, vec![5, 6, 7])))]
-#[case::time_travel_at_manifest_commit(Some(6), None, &[], Some(6), Ok((None, vec![5, 6])))]
+#[case::manifest_commit_at_hint(Some(5), None, None, &[], None, Ok((None, vec![5, 6, 7])))]
+#[case::manifest_commit_after_hint(Some(6), None, None, &[], None, Ok((None, vec![5, 6, 7])))]
+#[case::hinted_commit_cleaned_up(
+    Some(6),
+    None,
+    None,
+    &[0, 1, 2, 3, 4, 5],
+    None,
+    Ok((None, vec![6, 7]))
+)]
+#[case::time_travel_after_manifest_commit(
+    Some(6),
+    None,
+    None,
+    &[],
+    Some(7),
+    Ok((None, vec![5, 6, 7]))
+)]
+#[case::time_travel_at_manifest_commit(Some(6), None, None, &[], Some(6), Ok((None, vec![5, 6])))]
 #[case::time_travel_before_manifest_commit(
     Some(6),
+    Some(5),
     None,
     &[],
     Some(5),
-    Err("names manifest commit 6, which was not found in the log (listed commits Some(5)..=Some(5))")
+    Ok((None, vec![5]))
 )]
-#[case::time_travel_before_hint(Some(5), None, &[], Some(3), Ok((None, vec![0, 1, 2, 3])))]
-#[case::newer_checkpoint_file_wins(Some(5), Some(6), &[], None, Ok((Some(6), vec![7])))]
+#[case::time_travel_before_manifest_commit_without_embedded_action(
+    Some(6),
+    None,
+    None,
+    &[],
+    Some(5),
+    Err("names manifest commit 6 after end version 5 and embeds no checkpoint action")
+)]
+#[case::embedded_action_version_mismatch(
+    Some(6),
+    Some(4),
+    None,
+    &[],
+    Some(5),
+    Err("embeds a checkpoint action at version 4")
+)]
+#[case::time_travel_before_hint(Some(5), None, None, &[], Some(3), Ok((None, vec![0, 1, 2, 3])))]
+#[case::newer_checkpoint_file_wins(Some(5), None, Some(6), &[], None, Ok((Some(6), vec![7])))]
 #[case::commits_after_hint_missing(
     Some(7),
+    None,
     None,
     &[5, 6],
     None,
@@ -5522,6 +5556,7 @@ fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> R
 #[case::manifest_commit_not_listed(
     Some(9),
     None,
+    None,
     &[],
     None,
     Err("names manifest commit 9, which was not found in the log (listed commits Some(5)..=Some(7))")
@@ -5529,11 +5564,13 @@ fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> R
 #[case::manifest_commit_before_hint(
     Some(4),
     None,
+    None,
     &[],
     None,
     Err("manifest commit version 4 before its checkpoint version 5")
 )]
 #[case::missing_amt_checkpoint(
+    None,
     None,
     None,
     &[],
@@ -5543,17 +5580,22 @@ fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> R
 #[tokio::test]
 async fn amt_last_checkpoint_hint_bounds_listing(
     #[case] manifest_commit: Option<Version>,
+    #[case] embedded_action: Option<Version>,
     #[case] checkpoint_file: Option<Version>,
     #[case] missing_commits: &[Version],
     #[case] end_version: Option<Version>,
     #[case] expected: Result<(Option<Version>, Vec<Version>), &str>,
-) {
+) -> Result<()> {
+    let checkpoint = embedded_action
+        .map(|version| minimal_checkpoint_action("metadata/root.parquet", version))
+        .transpose()?;
     let hint = LastCheckpointHint {
         version: 5,
         size: 10,
         checkpoint_type: Some(CheckpointType::AdaptiveMetadataTree),
         amt_checkpoint: manifest_commit.map(|manifest_commit_version| AmtCheckpoint {
             manifest_commit_version,
+            checkpoint,
             ..Default::default()
         }),
         ..Default::default()
@@ -5581,6 +5623,7 @@ async fn amt_last_checkpoint_hint_bounds_listing(
         }
         Err(message) => assert_result_error_with_message(log_segment, message),
     }
+    Ok(())
 }
 
 // With an AMT hint, a snapshot is built from the commits at and after the hinted version alone:

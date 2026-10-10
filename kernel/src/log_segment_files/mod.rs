@@ -24,6 +24,8 @@ use crate::path::LogPathFileType::*;
 use crate::path::{
     may_begin_listable_log_path, CheckpointInstance, LogPathFileType, ParsedLogPath,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::version_as_i64;
 use crate::{KernelError, KernelResult, Result, StorageHandler, Version};
 
 #[cfg(test)]
@@ -189,13 +191,16 @@ fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option
 }
 
 /// Validates a listing bounded by an AMT `_last_checkpoint` hint: the manifest commit carrying the
-/// checkpoint action must be at or after the hinted version and listed, and the commits must start
-/// no later than just after the hinted version, else the hint does not describe this log.
+/// checkpoint action must be at or after the hinted version, and the commits must start no later
+/// than just after the hinted version. The manifest commit must also be listed, unless it is after
+/// `end_version`, in which case the hint must embed the checkpoint action at the hinted version.
+/// Otherwise the hint does not describe this log.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn validate_amt_listing(
     listed_files: &LogSegmentFiles,
     hint: &LastCheckpointHint,
     manifest_commit_version: Version,
+    end_version: Option<Version>,
 ) -> KernelResult<()> {
     let checkpoint_version = hint.version;
     if manifest_commit_version < checkpoint_version {
@@ -214,6 +219,29 @@ fn validate_amt_listing(
              at or before version {latest_first_commit}, but the first listed commit is \
              {first:?}"
         )));
+    }
+    if let Some(end_version) = end_version.filter(|&end| manifest_commit_version > end) {
+        // Time travel before the manifest commit: it is not part of the snapshot, so the
+        // checkpoint action must come from the hint itself.
+        let Some(action) = hint
+            .amt_checkpoint
+            .as_ref()
+            .and_then(|amt| amt.checkpoint.as_ref())
+        else {
+            return Err(KernelError::invalid_checkpoint(format!(
+                "_last_checkpoint AMT hint at version {checkpoint_version} names manifest commit \
+                 {manifest_commit_version} after end version {end_version} and embeds no \
+                 checkpoint action"
+            )));
+        };
+        if action.version() != version_as_i64(checkpoint_version)? {
+            return Err(KernelError::invalid_checkpoint(format!(
+                "_last_checkpoint AMT hint at version {checkpoint_version} embeds a checkpoint \
+                 action at version {}",
+                action.version()
+            )));
+        }
+        return Ok(());
     }
     if !commits.iter().any(|c| c.version == manifest_commit_version) {
         return Err(KernelError::invalid_checkpoint(format!(
@@ -695,7 +723,12 @@ impl LogSegmentFiles {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             if let Some(manifest_commit_version) = checkpoint_metadata.amt_manifest_commit_version()
             {
-                validate_amt_listing(&listed_files, checkpoint_metadata, manifest_commit_version)?;
+                validate_amt_listing(
+                    &listed_files,
+                    checkpoint_metadata,
+                    manifest_commit_version,
+                    end_version,
+                )?;
                 return Ok(listed_files);
             }
             // The hint names a checkpoint that no longer exists, and because the listing started

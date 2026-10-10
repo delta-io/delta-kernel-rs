@@ -11,6 +11,8 @@ use crate::engine::sync::SyncEngine;
 #[cfg(feature = "declarative-plans")]
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::object_store::memory::InMemory;
+use crate::object_store::path::Path;
+use crate::object_store::ObjectStoreExt as _;
 use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
 use crate::unit_test_utils::{
@@ -27,14 +29,28 @@ fn one_column_schema() -> SchemaRef {
 // Builds a commit line with a `checkpoint` action that carries protocol and metadata at
 // `version`. The commit has no top-level protocol/metaData, so P&M comes only from that action.
 fn checkpoint_commit(version: i64, extra_features: &[TableFeature], schema: SchemaRef) -> String {
+    serde_json::json!({ "checkpoint": checkpoint_entries(version, extra_features, schema) })
+        .to_string()
+}
+
+// The tagged entries of a `checkpoint` action carrying protocol and metadata at `version`.
+fn checkpoint_entries(
+    version: i64,
+    extra_features: &[TableFeature],
+    schema: SchemaRef,
+) -> serde_json::Value {
     let config = adaptive_metadata_table_configuration(schema, extra_features);
-    serde_json::json!({ "checkpoint": [
+    serde_json::json!([
         { "checkpointMetadata": { "version": version } },
         { "contentRoot": { "path": "metadata/root.parquet", "sizeInBytes": 1, "version": version } },
         { "protocol": config.protocol() },
         { "metaData": config.metadata() },
-    ] })
-    .to_string()
+    ])
+}
+
+// Builds a commit line with only a `commitInfo` action.
+fn commit_info_commit() -> String {
+    serde_json::json!({ "commitInfo": { "timestamp": 0, "inCommitTimestamp": 0 } }).to_string()
 }
 
 // Builds a top-level `metaData` commit line with the given schema (no protocol).
@@ -443,4 +459,103 @@ async fn incremental_update_resolves_latest_checkpoint_action(
             .map(|a| a.version),
         Some(expected_version)
     );
+}
+
+// Time travel to version 3 on a log listed from an AMT `_last_checkpoint` hint at content root 2
+// whose manifest commit 4 is after the snapshot. Commit 4 is not part of the snapshot, so its
+// checkpoint action and P&M come from the action embedded in the hint (one-column schema). Each
+// case varies commit 3 or adds a CRC at version 3; every case runs on both plan/non-plan replay
+// paths.
+#[rstest]
+#[case::no_pm_in_range(commit_info_commit(), false, 1)]
+// An older manifest commit's action (content root 1) in range loses to the embedded action.
+#[case::older_checkpoint_action_in_range(
+    checkpoint_commit(1, &[], test_schema_flat_with_column_mapping()),
+    false,
+    1
+)]
+#[case::newer_metadata_in_range(
+    metadata_commit(test_schema_flat_with_column_mapping()),
+    false,
+    test_schema_flat_with_column_mapping().fields().count()
+)]
+#[case::crc_at_target(commit_info_commit(), true, 1)]
+#[tokio::test]
+async fn time_travel_before_manifest_commit_uses_hint_checkpoint_action(
+    #[case] commit_3: String,
+    #[case] crc_at_target: bool,
+    #[case] expected_fields: usize,
+) {
+    check_hint_checkpoint_action(&commit_3, crc_at_target, expected_fields, non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    check_hint_checkpoint_action(&commit_3, crc_at_target, expected_fields, |store| {
+        SyncEngine::new_with_store(store)
+    })
+    .await;
+}
+
+async fn check_hint_checkpoint_action<E: Engine>(
+    commit_3: &str,
+    crc_at_target: bool,
+    expected_fields: usize,
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    let commits = [
+        (2, commit_info_commit()),
+        (3, commit_3.to_string()),
+        (4, checkpoint_commit(2, &[], one_column_schema())),
+    ];
+    for (version, commit) in commits {
+        add_commit(table_root.as_str(), store.as_ref(), version, commit)
+            .await
+            .unwrap();
+    }
+    let hint = serde_json::json!({
+        "version": 2,
+        "size": -1,
+        "checkpointType": "AdaptiveMetadataTree",
+        "amtCheckpoint": {
+            "manifestCommitVersion": 4,
+            "checkpoint": checkpoint_entries(2, &[], one_column_schema()),
+        },
+    });
+    store
+        .put(
+            &Path::from("_delta_log/_last_checkpoint"),
+            hint.to_string().into(),
+        )
+        .await
+        .unwrap();
+    if crc_at_target {
+        let config = adaptive_metadata_table_configuration(one_column_schema(), &[]);
+        let crc = serde_json::json!({
+            "tableSizeBytes": 0,
+            "numFiles": 0,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": config.metadata(),
+            "protocol": config.protocol(),
+        });
+        store
+            .put(
+                &Path::from("_delta_log/00000000000000000003.crc"),
+                crc.to_string().into(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let engine = make_engine(store);
+    let snapshot = Snapshot::builder_for(table_root)
+        .at_version(3)
+        .build(&engine)
+        .unwrap();
+    assert_eq!(snapshot.schema().fields().count(), expected_fields);
+    let action = snapshot
+        .latest_checkpoint_action(&engine)
+        .unwrap()
+        .expect("checkpoint action present");
+    assert_eq!(action.version(), 2);
 }
