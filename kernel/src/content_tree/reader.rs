@@ -21,8 +21,10 @@ use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DATA_CHANGE_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, MODIFICATION_TIME_NAME,
     PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
 };
-use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, ToSchema as _};
-use crate::{Engine, KernelError, KernelResult};
+use crate::schema::{
+    ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, ToSchema as _,
+};
+use crate::{Engine, ExpressionEvaluator, KernelError, KernelResult};
 
 /// Values the read path emits into every `Add` action but cannot derive from an AMT entry, so the
 /// caller must supply them.
@@ -37,60 +39,117 @@ pub(crate) struct ReadContext {
     pub(crate) data_change: bool,
 }
 
-/// Translates an AMT root manifest's content-tree entry batch into an `Add`-action batch, keeping
-/// only the rows that read as live data files.
-///
-/// An entry becomes an `Add` when its `contentType` is [`DataContentType::Data`] and its tracking
-/// status is [live](TrackingStatus::is_live); every other entry is dropped via the returned
-/// selection vector. [`DataContentType::DataManifest`] entries are dropped too: expanding a leaf
-/// manifest into its data files is the caller's responsibility.
+/// Expressions for the `Add` row-tracking fields whose source differs between root and leaf
+/// manifests (a leaf entry inherits them from its parent).
+struct AddFieldSources {
+    /// Expression producing `Add.baseRowId`.
+    base_row_id: Expression,
+    /// Expression producing `Add.defaultRowCommitVersion`.
+    default_row_commit_version: Expression,
+}
+
+impl AddFieldSources {
+    /// Root-manifest sources: read `tracking.firstRowId` / `tracking.sequenceNumber` straight off
+    /// the entry (a root entry carries both).
+    fn root() -> Self {
+        Self {
+            base_row_id: Expression::column([TRACKING, FIRST_ROW_ID]),
+            default_row_commit_version: Expression::column([TRACKING, SEQUENCE_NUMBER]),
+        }
+    }
+}
+
+/// Converts content-tree entry batches into `Add`-action batches. The entry->`Add` evaluator is
+/// built once, so one converter can be reused across every batch of a manifest.
+pub(crate) struct EntryConverter {
+    evaluator: Arc<dyn ExpressionEvaluator>,
+}
+
+impl EntryConverter {
+    /// Translates a content-tree entry batch into an `Add`-action batch, keeping only the rows that
+    /// read as live data files.
+    ///
+    /// An entry becomes an `Add` when its `contentType` is [`DataContentType::Data`] and its
+    /// tracking status is [live](TrackingStatus::is_live); every other entry is dropped via the
+    /// returned selection vector. [`DataContentType::DataManifest`] entries are dropped too:
+    /// expanding a leaf manifest into its data files is the caller's responsibility.
+    ///
+    /// # Parameters
+    /// - `entries`: a content-tree entry batch matching the converter's input schema (for a root
+    ///   converter, [`ContentTreeNodeEntry::to_schema`], the columnar form produced by
+    ///   [`super::builder`]).
+    ///
+    /// # Returns
+    /// A [`FilteredEngineData`] over an `Add`-action batch (one row per input entry, schema
+    /// [`crate::actions::LOG_ADD_SCHEMA`]), whose selection vector keeps only the entries that read
+    /// as live data files.
+    ///
+    /// # Errors
+    /// Returns an error if an entry carries an unknown content-type or tracking-status value, if a
+    /// delete entry (position/equality deletes or a delete manifest) is live, if a selected (live
+    /// `Data`) entry is not Parquet, has a non-zero partition spec id, or carries a deletion vector
+    /// (none yet supported by the read path), if the evaluator fails to evaluate, or if the
+    /// selection vector length exceeds the batch.
+    pub(crate) fn convert(&self, entries: &dyn EngineData) -> KernelResult<FilteredEngineData> {
+        let mut selector = AddSelectionVisitor::default();
+        selector.visit_rows_of(entries)?;
+        let actions = self.evaluator.evaluate(entries)?;
+        FilteredEngineData::try_new(actions, selector.selection)
+    }
+}
+
+/// Builds an [`EntryConverter`] for an AMT root manifest's content-tree entries.
 ///
 /// # Parameters
-/// - `engine`: provides the [`crate::EvaluationHandler`] used to evaluate the transform.
-/// - `entries`: a content-tree entry batch matching [`ContentTreeNodeEntry::to_schema`] (the
-///   columnar form produced by [`super::builder`]).
+/// - `engine`: provides the [`crate::EvaluationHandler`] used to build the evaluator.
 /// - `ctx`: the per-read values the entry cannot supply (see [`ReadContext`]).
 ///
-/// # Returns
-/// A [`FilteredEngineData`] over an `Add`-action batch (one row per input entry, schema
-/// [`crate::actions::LOG_ADD_SCHEMA`]), whose selection vector keeps only the entries that read as
-/// live data files.
-///
 /// # Errors
-/// Returns an error if an entry carries an unknown content-type or tracking-status value, if a
-/// delete entry (position/equality deletes or a delete manifest) is live, if a selected (live
-/// `Data`) entry is not Parquet, has a non-zero partition spec id, or carries a deletion vector
-/// (none yet supported by the read path), if the evaluator cannot be constructed or fails to
-/// evaluate, or if the selection vector length exceeds the batch.
-pub(crate) fn convert_root_entries_to_add_actions(
+/// Returns an error if the evaluator cannot be constructed.
+pub(crate) fn make_root_entry_converter(
     engine: &dyn Engine,
-    entries: &dyn EngineData,
     ctx: &ReadContext,
-) -> KernelResult<FilteredEngineData> {
-    // TODO(#2866): cache the expression/evaluator so repeated calls don't rebuild them.
-    let mut selector = AddSelectionVisitor::default();
-    selector.visit_rows_of(entries)?;
+) -> KernelResult<EntryConverter> {
+    make_entry_converter(
+        engine,
+        ctx,
+        &AddFieldSources::root(),
+        Arc::new(ContentTreeNodeEntry::to_schema()),
+    )
+}
 
-    let input_schema = Arc::new(ContentTreeNodeEntry::to_schema());
+// === Helpers ===
+
+/// Shared constructor for [`EntryConverter`]: builds the entry->`Add` transform (with the caller's
+/// [`AddFieldSources`]) and its evaluator.
+///
+/// `input_schema` is the schema the transform evaluates against -- the entry schema for a root
+/// batch, or an augmented schema when a caller appends helper columns.
+fn make_entry_converter(
+    engine: &dyn Engine,
+    ctx: &ReadContext,
+    sources: &AddFieldSources,
+    input_schema: SchemaRef,
+) -> KernelResult<EntryConverter> {
     let output_type = DataType::from(LOG_ADD_SCHEMA.as_ref().clone());
-    let expr = build_entry_to_add_expression(ctx)?;
+    let expr = build_entry_to_add_expression(ctx, sources)?;
     let evaluator = engine.evaluation_handler().new_expression_evaluator(
         input_schema,
         Arc::new(expr),
         output_type,
     )?;
-    let actions = evaluator.evaluate(entries)?;
-    FilteredEngineData::try_new(actions, selector.selection)
+    Ok(EntryConverter { evaluator })
 }
-
-// === Helpers ===
 
 /// Builds the transform mapping a [`ContentTreeNodeEntry`] row to a `{ add: Add }` struct matching
 /// [`crate::actions::LOG_ADD_SCHEMA`].
 ///
-/// `modificationTime` and `dataChange` have no AMT source and are taken from `ctx`; nullable fields
-/// not listed here fall through to a typed null via [`struct_expr_from_schema`].
-fn build_entry_to_add_expression(ctx: &ReadContext) -> KernelResult<Expression> {
+/// `ctx` supplies the fields the AMT entry cannot; `sources` supplies the row-tracking fields
+/// whose derivation differs between root and leaf entries.
+fn build_entry_to_add_expression(
+    ctx: &ReadContext,
+    sources: &AddFieldSources,
+) -> KernelResult<Expression> {
     // TODO(#3320): read partition values from the entry's `partition` tuple once the read path
     // carries a partition spec; the AMT root written by the minimal blind-append path is
     // unpartitioned. The map type is taken from the action schema so its value-nullability
@@ -117,10 +176,8 @@ fn build_entry_to_add_expression(ctx: &ReadContext) -> KernelResult<Expression> 
             // The AMT entry carries neither of these; both come from the caller's `ReadContext`.
             n if n == MODIFICATION_TIME_NAME => lit(ctx.modification_time),
             n if n == DATA_CHANGE_NAME => lit(ctx.data_change),
-            n if n == BASE_ROW_ID_NAME => Expression::column([TRACKING, FIRST_ROW_ID]),
-            n if n == DEFAULT_ROW_COMMIT_VERSION_NAME => {
-                Expression::column([TRACKING, SEQUENCE_NUMBER])
-            }
+            n if n == BASE_ROW_ID_NAME => sources.base_row_id.clone(),
+            n if n == DEFAULT_ROW_COMMIT_VERSION_NAME => sources.default_row_commit_version.clone(),
             _ => return None,
         })
     })?;
@@ -275,13 +332,22 @@ mod tests {
     /// to build a well-formed [`ContentTreeNodeEntry`].
     const AMT_FORMAT_VERSION: i32 = 4;
 
-    /// The [`ReadContext`] the tests read against; its values match [`expected_add_row`]'s
-    /// `modificationTime` (`i64::MAX`) and `dataChange` (`true`).
+    /// The [`ReadContext`] the tests read against; [`expected_add_row`] reads its values back.
+    /// Non-default values so a hard-coded `modificationTime` / `dataChange` would fail.
     fn read_ctx() -> ReadContext {
         ReadContext {
-            modification_time: i64::MAX,
-            data_change: true,
+            modification_time: 1234,
+            data_change: false,
         }
+    }
+
+    /// Builds a root converter and runs it over a single batch.
+    fn convert_root_entries_to_add_actions(
+        engine: &dyn Engine,
+        entries: &dyn EngineData,
+        ctx: &ReadContext,
+    ) -> KernelResult<FilteredEngineData> {
+        make_root_entry_converter(engine, ctx)?.convert(entries)
     }
 
     /// A minimal-root `Data`/`Added` entry with the given path, size, and row-tracking numbers.
@@ -411,8 +477,8 @@ mod tests {
                     .unwrap(),
                 ),
                 Scalar::Long(size),
-                Scalar::Long(i64::MAX),
-                Scalar::Boolean(true),
+                Scalar::Long(read_ctx().modification_time),
+                Scalar::Boolean(read_ctx().data_change),
                 null_of("stats"),
                 null_of("tags"),
                 null_of("deletionVector"),
@@ -469,6 +535,35 @@ mod tests {
     }
 
     #[test]
+    fn root_entry_converter_is_reusable_across_batches() {
+        let engine = SyncEngine::new();
+        let converter = make_root_entry_converter(&engine, &read_ctx()).unwrap();
+        let mut deleted = added_data_entry("deleted.parquet", 1, 1, 0, 0);
+        deleted.tracking.status = TrackingStatus::Deleted;
+        let batches = [
+            vec![added_data_entry("a.parquet", 100, 10, 0, 5)],
+            vec![deleted, added_data_entry("b.parquet", 200, 20, 10, 6)],
+        ];
+        let expected = [
+            (vec![true], expected_add_row("a.parquet", 100, 0, 5)),
+            (vec![false, true], expected_add_row("b.parquet", 200, 10, 6)),
+        ];
+
+        for (entries, (selection, row)) in batches.iter().zip(expected) {
+            let filtered = converter
+                .convert(entry_batch(&engine, entries).as_ref())
+                .unwrap();
+            assert_eq!(filtered.selection_vector(), selection.as_slice());
+            assert_eq!(
+                filtered_to_batch(filtered).try_into_record_batch().unwrap(),
+                expected_batch(&engine, &[row])
+                    .try_into_record_batch()
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn output_schema_matches_log_add_schema() {
         let engine = SyncEngine::new();
         let entries = [added_data_entry("a.parquet", 1, 1, 0, 0)];
@@ -515,6 +610,7 @@ mod tests {
     #[rstest]
     #[case(TrackingStatus::Existing, true)]
     #[case(TrackingStatus::Added, true)]
+    #[case(TrackingStatus::Modified, true)]
     #[case(TrackingStatus::Deleted, false)]
     #[case(TrackingStatus::Replaced, false)]
     fn selects_only_live_data_entries(#[case] status: TrackingStatus, #[case] kept: bool) {
@@ -611,13 +707,16 @@ mod tests {
     }
 
     #[rstest]
-    #[case::deletion_vector_struct(true, false)]
-    #[case::dv_snapshot_id(false, true)]
+    #[case::added_dv_struct(TrackingStatus::Added, true, false)]
+    #[case::added_dv_snapshot_id(TrackingStatus::Added, false, true)]
+    #[case::modified_dv_struct(TrackingStatus::Modified, true, false)]
     fn live_entry_with_deletion_vector_errors(
+        #[case] status: TrackingStatus,
         #[case] set_deletion_vector: bool,
         #[case] set_dv_snapshot_id: bool,
     ) {
         let mut entry = added_data_entry("f.parquet", 10, 5, 0, 1);
+        entry.tracking.status = status;
         if set_deletion_vector {
             entry.deletion_vector = Some(test_dv());
         }
