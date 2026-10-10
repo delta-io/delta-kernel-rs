@@ -24,7 +24,7 @@ use delta_kernel::table_features::{
 use delta_kernel::table_properties::TableProperties;
 use delta_kernel::transaction::create_table::{create_table, CreateTableTransaction};
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::Result;
+use delta_kernel::{KernelError, Result};
 use rstest::rstest;
 use serde_json::Value;
 use test_utils::{assert_result_error_with_message, test_table_setup, test_table_setup_mt};
@@ -274,7 +274,10 @@ async fn test_create_table_already_exists() -> Result<()> {
     let result = create_table(&table_path, schema.clone(), "UserManagementService/1.2.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
 
-    assert_result_error_with_message(result, "already exists");
+    assert!(matches!(
+        result,
+        Err(KernelError::TableAlreadyExistsAtPath(path)) if path == table_path
+    ));
 
     Ok(())
 }
