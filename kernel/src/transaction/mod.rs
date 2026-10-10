@@ -455,7 +455,10 @@ impl<S> Transaction<S> {
             metadata,
             set_transactions,
         } = self.prepare_nonfile_actions(engine)?;
-        let (actions, dm_changes) = self.assemble_commit_batches(
+        let CommitBatches {
+            actions,
+            dm_changes,
+        } = self.assemble_commit_batches(
             engine,
             commit_version,
             kernel_commit_info,
@@ -477,10 +480,13 @@ impl<S> Transaction<S> {
             self.perform_commit(engine, actions, commit_metadata);
 
         // === Result translation ===
-        self.translate_commit_result(
-            commit_response,
+        let post_commit_inputs = PostCommitInputs {
             in_commit_timestamp,
             dm_changes,
+        };
+        self.translate_commit_result(
+            commit_response,
+            post_commit_inputs,
             prepare_duration,
             committer_duration,
         )
@@ -505,6 +511,7 @@ impl<S> Transaction<S> {
     /// - `isBlindAppend`
     /// - `engineInfo`
     /// - `txnId`
+    /// - `dataChange` (adaptiveMetadata)
     ///
     /// Kernel merges the following field if it is set:
     ///
@@ -747,6 +754,19 @@ struct NonfileCommitActions {
     set_transactions: Vec<SetTransaction>,
 }
 
+/// The encoded commit actions, plus the state the post-commit CRC and snapshot are built from.
+struct CommitBatches<'a> {
+    actions: KernelResultIterator<'a, FilteredEngineData>,
+    dm_changes: Vec<DomainMetadata>,
+}
+
+/// Commit state produced during action generation that the post-commit CRC and snapshot are built
+/// from.
+struct PostCommitInputs {
+    in_commit_timestamp: Option<i64>,
+    dm_changes: Vec<DomainMetadata>,
+}
+
 impl<S> Transaction<S> {
     /// Determines the commit type based on whether this is a create-table operation and whether
     /// the table is catalog-managed.
@@ -931,6 +951,11 @@ impl<S> Transaction<S> {
             &self.set_transactions,
         )?;
         Ok(Some(action))
+    }
+
+    fn is_adaptive_metadata_enabled(&self) -> bool {
+        self.effective_table_config
+            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
     }
 
     /// Reject data file writes (add/remove/DV) against an empty-schema table.
@@ -1197,6 +1222,11 @@ impl<S> Transaction<S> {
         {
             kernel_commit_info.set_row_tracking_preserved();
         }
+
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if self.is_adaptive_metadata_enabled() {
+            kernel_commit_info.set_data_change(self.data_change);
+        }
         Ok(NonfileCommitActions {
             commit_version: self.get_commit_version(),
             in_commit_timestamp,
@@ -1410,8 +1440,8 @@ impl<S> Transaction<S> {
     }
 
     /// Encodes actions (both non-file and file) into a committable iterator of EngineData,
-    /// retaining per-action errors in the commit iterator. Returns the action iterator + domain
-    /// changes that can be used by the committer and post-commit CRC logic.
+    /// retaining per-action errors in the commit iterator. Returns the action iterator with the
+    /// domain changes used by the post-commit CRC and snapshot logic.
     fn assemble_commit_batches<'a>(
         &'a self,
         engine: &'a dyn Engine,
@@ -1420,10 +1450,7 @@ impl<S> Transaction<S> {
         protocol: Option<&Protocol>,
         metadata: Option<&Metadata>,
         set_transactions: Vec<SetTransaction>,
-    ) -> KernelResult<(
-        KernelResultIterator<'a, FilteredEngineData>,
-        Vec<DomainMetadata>,
-    )> {
+    ) -> KernelResult<CommitBatches<'a>> {
         let set_transaction_actions = set_transactions
             .into_iter()
             .map(|txn| create_row(engine, LOG_TXN_SCHEMA.clone(), txn));
@@ -1476,7 +1503,10 @@ impl<S> Transaction<S> {
             .chain(remove_actions)
             .chain(dv_update_actions);
 
-        Ok((Box::new(filtered_actions), dm_changes))
+        Ok(CommitBatches {
+            actions: Box::new(filtered_actions),
+            dm_changes,
+        })
     }
 
     /// Submits the action iterator and returns the committer's response + elapsed time.
@@ -1497,13 +1527,16 @@ impl<S> Transaction<S> {
     fn translate_commit_result(
         self,
         commit_response: KernelResult<CommitResponse>,
-        in_commit_timestamp: Option<i64>,
-        dm_changes: Vec<DomainMetadata>,
+        post_commit_inputs: PostCommitInputs,
         prepare_duration: Duration,
         committer_duration: Duration,
     ) -> KernelResult<CommitResult<S>> {
         match commit_response {
             Ok(CommitResponse::Committed { file_meta }) => {
+                let PostCommitInputs {
+                    in_commit_timestamp,
+                    dm_changes,
+                } = post_commit_inputs;
                 // TODO(#2717): the commit already succeeded atomically; the post-commit `?`
                 //              below must not fail the txn (and must not mislabel the metric).
                 let bin_boundaries = self
@@ -1758,9 +1791,7 @@ impl<S> Transaction<S> {
 
         // adaptiveMetadata removes must carry a null deletionTimestamp and extendedFileMetadata =
         // true (see `Remove` and `build_remove_struct_patch`).
-        let adaptive_metadata_enabled = self
-            .effective_table_config
-            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview);
+        let adaptive_metadata_enabled = self.is_adaptive_metadata_enabled();
 
         let make_eval = |coalesce_stats_with_parsed: bool| {
             let columns_to_drop: Vec<_> = columns_to_drop.iter().map(String::as_str).collect();
