@@ -163,7 +163,7 @@ async fn read_json_files_parallel_impl(
         return Ok(Box::pin(stream::empty()));
     }
 
-    let num_chunks = parallel_chunks.min(files.len()).max(1);
+    let num_chunks = parallel_chunks.min(files.len()).min(buffer_size).max(1);
     let chunk_size = files.len().div_ceil(num_chunks);
     let chunks: Vec<Vec<FileMeta>> = files
         .chunks(chunk_size)
