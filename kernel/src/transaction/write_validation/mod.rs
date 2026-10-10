@@ -2,6 +2,8 @@
 //!
 //! [`Transaction`]: super::Transaction
 
+use std::ops::Deref;
+
 // TODO(#2869): Add the remaining write-side validations:
 // - No duplicate (path, DvId) in `txn.add_files_metadata`, `txn.remove_files_metadata`,
 //   `txn.dv_matched_files`
@@ -38,9 +40,12 @@ pub(crate) struct StagedDataValidator {
 
 impl StagedDataValidator {
     /// Run every validation against each batch. Returns the first validation error encountered.
-    pub(crate) fn validate(mut self, batches: &[Box<dyn EngineData>]) -> KernelResult<()> {
+    pub(crate) fn validate(
+        mut self,
+        batches: impl IntoIterator<Item = Result<impl Deref<Target = dyn EngineData>>>,
+    ) -> Result<()> {
         for batch in batches {
-            RowVisitor::visit_rows_of(&mut self, batch.as_ref())?;
+            RowVisitor::visit_rows_of(&mut self, &*batch?)?;
         }
         Ok(())
     }

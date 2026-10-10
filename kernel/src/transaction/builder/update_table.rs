@@ -762,7 +762,7 @@ mod tests {
             ))
         };
         match action {
-            StagedFileAction::Add => transaction.add_files_metadata.push(data()),
+            StagedFileAction::Add => transaction.add_files(data()),
             StagedFileAction::Remove | StagedFileAction::DeletionVectorUpdate => {
                 let data = crate::FilteredEngineData::with_all_rows_selected(data());
                 match action {
@@ -809,11 +809,9 @@ mod tests {
         assert!(!transaction.data_change);
 
         let values = Arc::new(Int32Array::from_iter_values([1])) as ArrayRef;
-        transaction
-            .add_files_metadata
-            .push(Box::new(ArrowEngineData::new(RecordBatch::try_from_iter(
-                [("value", values)],
-            )?)));
+        transaction.add_files(Box::new(ArrowEngineData::new(RecordBatch::try_from_iter(
+            [("value", values)],
+        )?)));
         transaction.resolve_data_change();
         assert!(transaction.data_change);
         Ok(())

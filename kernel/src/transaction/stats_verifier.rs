@@ -5,6 +5,7 @@
 //! the `ClusteredTable` feature is enabled. This module validates that those stat entries
 //! exist for each required column.
 
+use std::ops::Deref;
 use std::sync::LazyLock;
 
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
@@ -13,7 +14,7 @@ use crate::error::KernelError;
 use crate::expressions::{column_name, ColumnName};
 use crate::schema::{ColumnNamesAndTypes, DataType, DecimalType, PrimitiveType};
 use crate::utils::require;
-use crate::{KernelResult, Result};
+use crate::{EngineData, KernelResult, Result};
 
 /// Verifies that add file statistics contain required columns.
 ///
@@ -33,30 +34,33 @@ impl StatsColumnVerifier {
     }
 
     /// Verify that all files in the provided batches have required statistics.
-    ///
-    /// For each required column, extracts all three stat columns (nullCount, minValues,
-    /// maxValues) in a single `visit_rows` call per batch.
     #[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
-    pub fn verify(&self, add_files: &[Box<dyn crate::EngineData>]) -> Result<()> {
-        if self.required_columns.is_empty() {
-            return Ok(());
+    pub fn verify(
+        &self,
+        add_files: impl IntoIterator<Item = Result<impl Deref<Target = dyn EngineData>>>,
+    ) -> Result<()> {
+        let mut validations: Vec<_> = self
+            .required_columns
+            .iter()
+            .map(|(column, data_type)| ColumnStatsValidator::try_new(column, data_type))
+            .collect::<Result<_>>()?;
+
+        for batch in add_files {
+            let batch = batch?;
+            for (column_names, validation) in &mut validations {
+                batch.visit_rows(column_names, validation)?;
+            }
         }
 
-        for (col, data_type) in &self.required_columns {
-            self.verify_column(add_files, col, data_type)?;
+        for (_, validation) in validations {
+            validation.finish()?;
         }
-
         Ok(())
     }
+}
 
-    /// Verify a single required column has nullCount, minValues, and maxValues stats in
-    /// every file. Extracts all three stat columns in a single `visit_rows` call per batch.
-    fn verify_column(
-        &self,
-        add_files: &[Box<dyn crate::EngineData>],
-        column: &ColumnName,
-        data_type: &DataType,
-    ) -> KernelResult<()> {
+impl ColumnStatsValidator {
+    fn try_new(column: &ColumnName, data_type: &DataType) -> Result<(Vec<ColumnName>, Self)> {
         let column_names = vec![
             column_name!("path"),
             column_name!("stats", NUM_RECORDS),
@@ -65,22 +69,27 @@ impl StatsColumnVerifier {
             build_stat_path(column, MAX_VALUES),
         ];
         let types = column_types_for(data_type)?;
-
-        let mut missing_null_count: Vec<String> = Vec::new();
-        let mut missing_min: Vec<String> = Vec::new();
-        let mut missing_max: Vec<String> = Vec::new();
-
-        for batch in add_files {
-            let mut visitor = ColumnStatsValidator {
-                data_type,
+        Ok((
+            column_names,
+            Self {
+                column: column.clone(),
+                data_type: data_type.clone(),
                 types,
-                missing_null_count: &mut missing_null_count,
-                missing_min: &mut missing_min,
-                missing_max: &mut missing_max,
-            };
-            batch.visit_rows(&column_names, &mut visitor)?;
-        }
+                missing_null_count: Vec::new(),
+                missing_min: Vec::new(),
+                missing_max: Vec::new(),
+            },
+        ))
+    }
 
+    fn finish(self) -> Result<()> {
+        let Self {
+            column,
+            missing_null_count,
+            missing_min,
+            missing_max,
+            ..
+        } = self;
         if !missing_null_count.is_empty() {
             return Err(KernelError::stats_validation(format!(
                 "Required column '{column}' is missing 'nullCount' statistics for files: [{}]",
@@ -260,15 +269,16 @@ fn is_stat_present<'b>(
 
 /// Visitor that checks nullCount, minValues, and maxValues for a single column in one pass.
 /// Expects 5 getters: [path, numRecords, nullCount, minValues, maxValues].
-struct ColumnStatsValidator<'a> {
-    data_type: &'a DataType,
+struct ColumnStatsValidator {
+    column: ColumnName,
+    data_type: DataType,
     types: &'static ColumnNamesAndTypes,
-    missing_null_count: &'a mut Vec<String>,
-    missing_min: &'a mut Vec<String>,
-    missing_max: &'a mut Vec<String>,
+    missing_null_count: Vec<String>,
+    missing_min: Vec<String>,
+    missing_max: Vec<String>,
 }
 
-impl RowVisitor for ColumnStatsValidator<'_> {
+impl RowVisitor for ColumnStatsValidator {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         self.types.as_ref()
     }
@@ -294,10 +304,10 @@ impl RowVisitor for ColumnStatsValidator<'_> {
             if null_count.is_none() {
                 self.missing_null_count.push(path.clone());
             }
-            if !(all_null || is_stat_present(getters[3], row_idx, self.data_type)?) {
+            if !(all_null || is_stat_present(getters[3], row_idx, &self.data_type)?) {
                 self.missing_min.push(path.clone());
             }
-            if !(all_null || is_stat_present(getters[4], row_idx, self.data_type)?) {
+            if !(all_null || is_stat_present(getters[4], row_idx, &self.data_type)?) {
                 self.missing_max.push(path);
             }
         }
@@ -309,10 +319,13 @@ impl RowVisitor for ColumnStatsValidator<'_> {
 /// Verify that every `add` action has `stats.numRecords` populated. Short-circuits on the first
 /// violation and returns an error containing the `add.path`.
 #[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
-pub fn verify_num_records_present(add_files: &[Box<dyn crate::EngineData>]) -> Result<()> {
+pub fn verify_num_records_present(
+    add_files: impl IntoIterator<Item = Result<impl Deref<Target = dyn EngineData>>>,
+) -> Result<()> {
     let column_names = vec![column_name!("path"), column_name!("stats", NUM_RECORDS)];
     let mut first_missing: Option<String> = None;
     for batch in add_files {
+        let batch = batch?;
         let mut visitor = NumRecordsValidator {
             first_missing: &mut first_missing,
         };

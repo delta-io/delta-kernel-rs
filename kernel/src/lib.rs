@@ -109,6 +109,7 @@ pub mod partition;
 pub(crate) mod path_encoding;
 #[cfg(feature = "declarative-plans")]
 pub mod plans;
+mod relation_handler;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -192,7 +193,8 @@ use cancellation::{check_cancelled, CancellableIterator};
 pub use cancellation::{CancellationToken, CancellationTokenRef, CancelledFuture};
 pub use delta_kernel_derive;
 pub use engine_data::{
-    EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
+    EngineData, EngineRelation, EngineRelationRef, FilteredEngineData, FilteredRowVisitor, GetData,
+    InMemoryEngineRelation, RowIndexIterator, RowVisitor,
 };
 pub use error::{
     Error, KernelError, KernelResult, KernelResultIterator, KernelResultIteratorStatic, Result,
@@ -203,6 +205,7 @@ pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
 #[cfg(feature = "declarative-plans")]
 pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
+pub use relation_handler::RelationHandler;
 use schema::StructField;
 pub use snapshot::{Snapshot, SnapshotRef};
 
@@ -1061,6 +1064,11 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
+
+    /// Get the connector provided [`RelationHandler`].
+    fn relation_handler(&self) -> Arc<dyn RelationHandler> {
+        relation_handler::default_relation_handler()
+    }
 
     /// Get the connector provided [`PlanExecutor`], or `None` if this engine provides none.
     ///
