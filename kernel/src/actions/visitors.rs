@@ -14,6 +14,8 @@ use crate::log_segment::DomainMetadataMap;
 use crate::schema::{
     column_name, lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::schema::{schema, StructField};
 use crate::utils::require;
 use crate::{KernelError, KernelResult, Result};
 
@@ -748,6 +750,76 @@ impl RowVisitor for InCommitTimestampVisitor {
         }
         Ok(())
     }
+}
+
+/// Extracts `commitInfo.lastManifestCommit` (adaptiveMetadata) from a commit's actions. Leaves
+/// `last_manifest_commit` as `None` if no visited row carries it. The [`EngineData`] being visited
+/// must have the schema defined in [`LastManifestCommitVisitor::schema`].
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Default)]
+pub(crate) struct LastManifestCommitVisitor {
+    pub(crate) last_manifest_commit: Option<LastManifestCommit>,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl LastManifestCommitVisitor {
+    /// The `commitInfo` field projecting only `lastManifestCommit`, for read schemas that feed
+    /// this visitor.
+    pub(crate) fn commit_info_field() -> &'static StructField {
+        static FIELD: LazyLock<StructField> = LazyLock::new(|| {
+            StructField::nullable(COMMIT_INFO_NAME, schema! { (&LAST_MANIFEST_COMMIT_FIELD) })
+        });
+        &FIELD
+    }
+
+    /// Get the schema that the visitor expects the data to have.
+    pub(crate) fn schema() -> SchemaRef {
+        static SCHEMA: LazyLock<SchemaRef> =
+            lazy_schema_ref! { (LastManifestCommitVisitor::commit_info_field()) };
+        SCHEMA.clone()
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl RowVisitor for LastManifestCommitVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| LastManifestCommitVisitor::schema().leaves(None));
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+        for i in 0..row_count {
+            if let Some(last_manifest_commit) = visit_last_manifest_commit_at(i, getters)? {
+                self.last_manifest_commit = Some(last_manifest_commit);
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Parses the `lastManifestCommit` at row `i`, or `None` if the row has none.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn visit_last_manifest_commit_at<'a>(
+    i: usize,
+    getters: &[&'a dyn GetData<'a>],
+) -> Result<Option<LastManifestCommit>> {
+    let [version_getter, content_root_version_getter] = getters else {
+        return Err(KernelError::internal_error(format!(
+            "Wrong number of lastManifestCommit getters: {}",
+            getters.len()
+        )));
+    };
+    let Some(version) = version_getter.get_opt(i, "lastManifestCommit.version")? else {
+        return Ok(None);
+    };
+    let content_root_version =
+        content_root_version_getter.get(i, "lastManifestCommit.contentRootVersion")?;
+    Ok(Some(LastManifestCommit::new(
+        version,
+        content_root_version,
+    )?))
 }
 
 // === Checkpoint action (adaptiveMetadata) ===

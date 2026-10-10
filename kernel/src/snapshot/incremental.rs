@@ -210,6 +210,8 @@ impl Snapshot {
                     crc,
                     #[cfg(feature = "adaptive-metadata-in-dev")]
                     checkpoint_action,
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    last_manifest_commit,
                 } = Self::prepare_new_from_log_segment(
                     existing_snapshot.table_root(),
                     segment,
@@ -229,6 +231,8 @@ impl Snapshot {
                     false, /* skipped_new_checkpoints */
                     #[cfg(feature = "adaptive-metadata-in-dev")]
                     checkpoint_action,
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    last_manifest_commit,
                 );
                 return Ok(Arc::new(snapshot));
             }
@@ -309,6 +313,8 @@ impl Snapshot {
             skipped_new_checkpoints,
             #[cfg(feature = "adaptive-metadata-in-dev")]
             resolution.checkpoint_action,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            resolution.last_manifest_commit,
         );
         Ok(Arc::new(snapshot))
     }

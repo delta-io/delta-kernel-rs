@@ -4,19 +4,22 @@
 use std::sync::Arc;
 
 use rstest::rstest;
-use test_utils::add_commit;
+use test_utils::{add_commit, delta_path_for_version};
 
 use super::{CheckpointActionResolution, LogSegment};
+use crate::committer::FileSystemCommitter;
 use crate::engine::sync::SyncEngine;
 #[cfg(feature = "declarative-plans")]
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::object_store::memory::InMemory;
+use crate::object_store::ObjectStoreExt as _;
 use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
+use crate::transaction::UpdateTableOperation;
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
 };
-use crate::{Engine, Snapshot};
+use crate::{Engine, FileMeta, Snapshot};
 
 fn one_column_schema() -> SchemaRef {
     test_schema_flat_with_column_mapping()
@@ -443,4 +446,63 @@ async fn incremental_update_resolves_latest_checkpoint_action(
             .map(|a| a.version),
         Some(expected_version)
     );
+}
+
+// A post-commit snapshot resolves the latest checkpoint action without reading the log: a root
+// manifest commit captures the action it wrote, and a plain commit carries the read snapshot's
+// action forward. Deleting every commit file before asking proves no scan is needed.
+#[rstest]
+#[case::root_manifest_commit_captures_its_action(true, 1)]
+#[case::plain_commit_carries_the_read_snapshot_action(false, 0)]
+#[tokio::test]
+async fn post_commit_snapshot_resolves_latest_checkpoint_action(
+    #[case] write_root_manifest: bool,
+    #[case] expected_version: i64,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        0,
+        format!(
+            "{}\n{}",
+            serde_json::json!({ "commitInfo": { "timestamp": 1, "inCommitTimestamp": 1 } }),
+            checkpoint_commit(0, &[], one_column_schema()),
+        ),
+    )
+    .await
+    .unwrap();
+    let engine = non_plan_engine(store.clone());
+    let snapshot = Snapshot::builder_for(table_root.clone())
+        .build(&engine)
+        .unwrap();
+
+    let mut txn = snapshot
+        .transaction_builder()
+        .with_operation(UpdateTableOperation::Write)
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap();
+    if write_root_manifest {
+        txn = txn
+            .with_root_manifest_file(FileMeta {
+                location: table_root.join("metadata/root-v1.parquet").unwrap(),
+                last_modified: 0,
+                size: 1024,
+            })
+            .unwrap();
+    }
+    let post_commit = txn.commit(&engine).unwrap().unwrap_post_commit_snapshot();
+
+    for version in 0..=1 {
+        store
+            .delete(&delta_path_for_version(version, "json"))
+            .await
+            .unwrap();
+    }
+    let action = post_commit
+        .latest_checkpoint_action(&engine)
+        .unwrap()
+        .expect("post-commit snapshot should resolve the checkpoint action");
+    assert_eq!(action.version, expected_version);
 }

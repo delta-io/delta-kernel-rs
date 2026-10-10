@@ -105,6 +105,8 @@ impl LogSegment {
                     source: ProtocolMetadataSource::CrcSeededPmOnlyReplay,
                     #[cfg(feature = "adaptive-metadata-in-dev")]
                     checkpoint_action,
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    last_manifest_commit: LastManifestCommitResolution::Unresolved,
                 });
             }
 
@@ -118,6 +120,8 @@ impl LogSegment {
                 source: ProtocolMetadataSource::CrcSeededPmOnlyReplay,
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 checkpoint_action,
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                last_manifest_commit: LastManifestCommitResolution::Unresolved,
             });
         }
 
@@ -131,6 +135,8 @@ impl LogSegment {
             checkpoint_action: CheckpointActionResolution::from_replay(
                 candidate.checkpoint.map(|(_, c)| c),
             ),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit: LastManifestCommitResolution::Unresolved,
         })
     }
 
@@ -286,7 +292,7 @@ impl LogSegment {
 /// How the latest AMT `checkpoint` action was resolved during P&M replay, stored on the
 /// [`Snapshot`](crate::Snapshot) so consumers can read it without re-scanning the log.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum CheckpointActionResolution {
     /// The latest `checkpoint` action, captured during replay.
     Captured(Arc<CheckpointAction>),
@@ -319,6 +325,19 @@ impl CheckpointActionResolution {
     }
 }
 
+/// How a snapshot's `lastManifestCommit` was resolved at build time, stored on the
+/// [`Snapshot`](crate::Snapshot) so consumers can read it without opening the log.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone)]
+pub(crate) enum LastManifestCommitResolution {
+    /// Read from the CRC at the snapshot version or the committing transaction. `None` means the
+    /// table has no manifest commit at this version.
+    Resolved(Option<LastManifestCommit>),
+    /// The build never read the snapshot version's commitInfo; consumers read it from that
+    /// version's commit file.
+    Unresolved,
+}
+
 /// Result of a P&M resolution (see [`LogSegment::read_protocol_metadata_opt`]).
 pub(crate) struct PmResolution {
     pub(crate) metadata: Option<Metadata>,
@@ -329,6 +348,9 @@ pub(crate) struct PmResolution {
     /// CRC's manifest-commit pointer, or unresolved. See [`CheckpointActionResolution`].
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub(crate) checkpoint_action: CheckpointActionResolution,
+    /// How the segment's `lastManifestCommit` was resolved. See [`LastManifestCommitResolution`].
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) last_manifest_commit: LastManifestCommitResolution,
 }
 
 impl PmResolution {
@@ -344,6 +366,10 @@ impl PmResolution {
             checkpoint_action: crc.last_manifest_commit_opt.clone().map_or(
                 CheckpointActionResolution::Unresolved,
                 CheckpointActionResolution::Hint,
+            ),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit: LastManifestCommitResolution::Resolved(
+                crc.last_manifest_commit_opt.clone(),
             ),
         }
     }

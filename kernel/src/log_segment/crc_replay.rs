@@ -16,9 +16,13 @@ use std::sync::{Arc, LazyLock};
 use tracing::{instrument, warn};
 
 use super::LogSegment;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::visitors::visit_last_manifest_commit_at;
 use crate::actions::visitors::{
     visit_metadata_at, visit_protocol_at, METADATA_LEAVES, PROTOCOL_LEAVES,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::LastManifestCommit;
 use crate::actions::{
     DomainMetadata, SetTransaction, ADD_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_FIELD,
     METADATA_FIELD, PROTOCOL_FIELD, REMOVE_NAME, SET_TRANSACTION_FIELD,
@@ -55,6 +59,10 @@ static REPLAY_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable COMMIT_INFO_NAME: {
         nullable "operation": STRING,
         nullable "inCommitTimestamp": LONG,
+        nullable "lastManifestCommit": {
+            not_null "version": LONG,
+            not_null "contentRootVersion": LONG,
+        },
     },
     (StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath)),
 };
@@ -388,6 +396,15 @@ impl CrcReplayAccumulator {
         }
     }
 
+    /// Called for each commitInfo row carrying a `lastManifestCommit`. Only the newest commit
+    /// contributes, so an absent value on the newest commit leaves the delta's `None`.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn on_last_manifest_commit(&mut self, last_manifest_commit: LastManifestCommit) {
+        if self.is_first_commit {
+            self.delta.last_manifest_commit = Some(last_manifest_commit);
+        }
+    }
+
     fn on_add(&mut self, size: i64) -> KernelResult<()> {
         self.current_commit_saw_file_action = true;
         // Once the delta is no longer incremental-safe, [`Crc::apply`] will transition the
@@ -579,8 +596,12 @@ const COL_OP: usize = 1;
 const COL_ICT: usize = 2;
 const COL_REMOVE_PATH: usize = 3;
 const COL_REMOVE_SIZE: usize = 4;
+#[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(dead_code))]
+const COL_LMC_VERSION: usize = 5;
+#[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(dead_code))]
+const COL_LMC_CONTENT_ROOT_VERSION: usize = 6;
 /// Source-specific columns end here; the shared columns follow.
-const N_CRC_SPECIFIC_COLS: usize = COL_REMOVE_SIZE + 1;
+const N_CRC_SPECIFIC_COLS: usize = COL_LMC_CONTENT_ROOT_VERSION + 1;
 const N_FIXED_COLS: usize = N_CRC_SPECIFIC_COLS + N_SHARED_SINGLE_LEAF_COLS;
 
 /// Thin shim that pulls leaf values from `getters` and forwards them to the accumulator's
@@ -598,6 +619,14 @@ impl RowVisitor for CommitCrcVisitor<'_> {
                 (DataType::LONG, column_name!("commitInfo.inCommitTimestamp")),
                 (DataType::STRING, column_name!("remove.path")),
                 (DataType::LONG, column_name!("remove.size")),
+                (
+                    DataType::LONG,
+                    column_name!("commitInfo.lastManifestCommit.version"),
+                ),
+                (
+                    DataType::LONG,
+                    column_name!("commitInfo.lastManifestCommit.contentRootVersion"),
+                ),
             ];
             fixed.extend(shared_columns());
             append_protocol_metadata_leaves(fixed).into()
@@ -620,6 +649,13 @@ impl RowVisitor for CommitCrcVisitor<'_> {
             let ict: Option<i64> = getters[COL_ICT].get_opt(i, "commitInfo.inCommitTimestamp")?;
             if operation.is_some() || ict.is_some() {
                 self.acc.on_commit_info(operation.as_deref(), ict);
+            }
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            if let Some(last_manifest_commit) = visit_last_manifest_commit_at(
+                i,
+                &getters[COL_LMC_VERSION..=COL_LMC_CONTENT_ROOT_VERSION],
+            )? {
+                self.acc.on_last_manifest_commit(last_manifest_commit);
             }
 
             let remove_path: Option<String> = getters[COL_REMOVE_PATH].get_opt(i, "remove.path")?;
@@ -736,6 +772,29 @@ mod tests {
         acc.process_batch_start("v1.json");
         acc.on_commit_info(Some("WRITE"), Some(1000));
         assert_eq!(acc.delta.in_commit_timestamp, None);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn on_last_manifest_commit_captures_only_on_first_commit() {
+        let lmc = |v| LastManifestCommit::new(v, v).unwrap();
+        let mut acc = CrcReplayAccumulator::new(None);
+        acc.process_batch_start("v3.json");
+        acc.on_last_manifest_commit(lmc(3));
+        acc.process_batch_start("v2.json");
+        acc.on_last_manifest_commit(lmc(1));
+        assert_eq!(acc.delta.last_manifest_commit, Some(lmc(3)));
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn on_last_manifest_commit_absent_on_newest_commit_is_not_backfilled_by_older() {
+        let mut acc = CrcReplayAccumulator::new(None);
+        acc.process_batch_start("v3.json");
+        acc.on_commit_info(Some("WRITE"), None);
+        acc.process_batch_start("v2.json");
+        acc.on_last_manifest_commit(LastManifestCommit::new(1, 1).unwrap());
+        assert_eq!(acc.delta.last_manifest_commit, None);
     }
 
     // ===== add =====
