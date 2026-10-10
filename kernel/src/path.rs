@@ -8,9 +8,16 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::visitors::LastManifestCommitVisitor;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::LastManifestCommit;
 use crate::engine_data::RowVisitor;
+use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, KernelResult, Result, Version};
+use crate::{
+    Engine, FileDataReadResultIterator, FileMeta, KernelError, KernelResult, Result, Version,
+};
 
 /// The delta log subdirectory with a trailing slash for directory URL joins.
 pub(crate) const DELTA_LOG_DIR_WITH_SLASH: &str = "_delta_log/";
@@ -385,18 +392,10 @@ impl ParsedLogPath<FileMeta> {
     /// Callers should handle enablement version checks before calling this method.
     #[tracing::instrument(skip(engine), ret, fields(version = self.version, path = %self.location.as_url()))]
     pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> KernelResult<i64> {
-        // Only works on commit files
-        if !self.is_commit() {
-            return Err(KernelError::generic(format!(
-                "read_in_commit_timestamp can only be called on commit files, got: {:?}",
-                self.file_type
-            )));
-        }
-
-        let mut action_iter = engine.json_handler().read_json_files(
-            slice::from_ref(&self.location),
+        let mut action_iter = self.read_commit_file_actions(
+            engine,
             InCommitTimestampVisitor::schema(),
-            None,
+            "read_in_commit_timestamp",
         )?;
 
         // Process the actions to find inCommitTimestamp
@@ -413,6 +412,51 @@ impl ParsedLogPath<FileMeta> {
             Some(Err(err)) => Err(err),
             None => Err(KernelError::generic("Commit file contains no actions")),
         }
+    }
+
+    /// Extract `commitInfo.lastManifestCommit` (adaptiveMetadata) from this commit log file, or
+    /// `None` if the commit carries none.
+    ///
+    /// This method performs IO by reading the commit log file from storage. Returns an error if
+    /// this is not a commit file, the file cannot be read, or the value is invalid.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[tracing::instrument(skip(engine), ret, fields(version = self.version, path = %self.location.as_url()))]
+    pub(crate) fn read_last_manifest_commit(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<LastManifestCommit>> {
+        let mut visitor = LastManifestCommitVisitor::default();
+        for actions in self.read_commit_file_actions(
+            engine,
+            LastManifestCommitVisitor::schema(),
+            "read_last_manifest_commit",
+        )? {
+            visitor.visit_rows_of(actions?.as_ref())?;
+            if visitor.last_manifest_commit.is_some() {
+                break;
+            }
+        }
+        Ok(visitor.last_manifest_commit)
+    }
+
+    /// Reads this commit log file's actions with `schema`. `caller` names the calling method in
+    /// the error returned when this is not a commit file.
+    fn read_commit_file_actions(
+        &self,
+        engine: &dyn Engine,
+        schema: SchemaRef,
+        caller: &str,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        if !self.is_commit() {
+            return Err(KernelError::generic(format!(
+                "{caller} can only be called on commit files, got: {:?}",
+                self.file_type
+            )));
+        }
+        engine
+            .json_handler()
+            .read_json_files(slice::from_ref(&self.location), schema, None)
     }
 }
 
@@ -1275,6 +1319,59 @@ pub(crate) mod tests {
             result,
             "read_in_commit_timestamp can only be called on commit files",
         );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest::rstest]
+    #[case::no_commit_info(r#"{"txn":{"appId":"a","version":1}}"#, None, None)]
+    #[case::commit_info_without_it(r#"{"commitInfo":{"timestamp":1}}"#, None, None)]
+    #[case::on_a_later_line(
+        concat!(
+            r#"{"txn":{"appId":"a","version":1}}"#,
+            "\n",
+            r#"{"commitInfo":{"lastManifestCommit":{"version":3,"contentRootVersion":2}}}"#,
+        ),
+        Some((3, 2)),
+        None
+    )]
+    #[case::missing_content_root_version(
+        r#"{"commitInfo":{"lastManifestCommit":{"version":3}}}"#,
+        None,
+        Some(r#""contentRootVersion""#)
+    )]
+    #[case::missing_version(
+        r#"{"commitInfo":{"lastManifestCommit":{"contentRootVersion":2}}}"#,
+        None,
+        Some(r#""version""#)
+    )]
+    #[case::content_root_newer_than_version(
+        r#"{"commitInfo":{"lastManifestCommit":{"version":1,"contentRootVersion":2}}}"#,
+        None,
+        Some("lastManifestCommit contentRootVersion 2 exceeds version 1")
+    )]
+    #[tokio::test]
+    async fn test_read_last_manifest_commit(
+        #[case] commit_content: &str,
+        #[case] expected: Option<(i64, i64)>,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let table_root = "memory://test/";
+        add_commit(table_root, store.as_ref(), 0, commit_content.to_string())
+            .await
+            .unwrap();
+        let parsed_path =
+            ParsedLogPath::create_parsed_published_commit(&url::Url::parse(table_root).unwrap(), 0);
+
+        let result = parsed_path.read_last_manifest_commit(&engine);
+        match expected_error {
+            Some(message) => assert_result_error_with_message(result, message),
+            None => assert_eq!(
+                result.unwrap(),
+                expected.map(|(v, c)| LastManifestCommit::new(v, c).unwrap())
+            ),
+        }
     }
 
     /// Verifies `new_sidecar` builds a `<version:020>.checkpoint.<uuid>.parquet` filename

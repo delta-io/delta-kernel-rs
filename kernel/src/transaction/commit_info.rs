@@ -46,10 +46,16 @@ fn commit_info_literal_exprs(
         ),
     ];
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    literal_exprs.push((
-        "lastManifestCommit",
-        Arc::new(lit(commit_info.last_manifest_commit)),
-    ));
+    literal_exprs.extend([
+        (
+            "dataChange",
+            Arc::new(lit(commit_info.data_change)) as ExpressionRef,
+        ),
+        (
+            "lastManifestCommit",
+            Arc::new(lit(commit_info.last_manifest_commit)),
+        ),
+    ]);
     let expected_expr_len = CommitInfo::to_schema().fields().len();
     if literal_exprs.len() != expected_expr_len {
         return Err(KernelError::Generic(format!("expect the commit_info_literal_exprs return {expected_expr_len} expressions, but only get {} expressions. \
@@ -616,6 +622,40 @@ mod tests {
 
         for (i, field) in kernel_schema.fields().enumerate() {
             assert_eq!(ci.fields()[i].name(), field.name());
+        }
+        Ok(())
+    }
+
+    /// Kernel's `dataChange` is emitted (null when unset) and overrides any engine-supplied value.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest::rstest]
+    fn test_build_commit_info_data_change(
+        #[values(None, Some(true), Some(false))] data_change: Option<bool>,
+        #[values(false, true)] engine_supplies_data_change: bool,
+    ) -> Result<()> {
+        let engine_commit_info = engine_supplies_data_change.then(|| {
+            let stale = !data_change.unwrap_or(false);
+            make_engine_commit_info(
+                vec![ArrowField::new("dataChange", ArrowDataType::Boolean, true)],
+                vec![Arc::new(BooleanArray::from(vec![Some(stale)])) as ArrayRef],
+            )
+        });
+        let (engine, txn) = make_txn(engine_commit_info)?;
+        let mut commit_info = make_kernel_commit_info();
+        if let Some(data_change) = data_change {
+            commit_info.set_data_change(data_change);
+        }
+
+        let result = ArrowEngineData::try_from_engine_data(
+            txn.generate_commit_info(engine.as_ref(), commit_info)?,
+        )?;
+        let ci = commit_info_struct(&result);
+        let column = ci
+            .column_by_name("dataChange")
+            .expect("dataChange column should be present");
+        match data_change {
+            None => assert!(column.is_null(0)),
+            Some(data_change) => assert_eq!(get_bool(ci, "dataChange"), data_change),
         }
         Ok(())
     }
