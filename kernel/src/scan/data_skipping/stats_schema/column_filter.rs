@@ -23,6 +23,10 @@ pub(crate) struct StatsConfig<'a> {
     /// struct. Orthogonal to the filtering above: a VARIANT leaf counts against the column limit
     /// and appears in `nullCount` either way.
     pub(crate) variant_min_max: bool,
+    /// Whether Geometry bounding-box statistics are included with the column's logical type.
+    /// Geometry counts as one leaf and has a `nullCount` independently of this option.
+    #[cfg(feature = "geo-type-in-dev")]
+    pub(crate) geometry_min_max: bool,
 }
 
 /// Handles column filtering logic for statistics based on table properties.
