@@ -86,8 +86,15 @@ impl CheckpointShape {
         snapshot: &Snapshot,
         needs_leaf_schema: bool,
     ) -> KernelResult<CheckpointShape> {
-        let segment = snapshot.log_segment();
+        Self::try_new_for_segment(exec, snapshot.log_segment(), needs_leaf_schema)
+    }
 
+    /// Resolves a request-local log segment without retaining a snapshot.
+    pub(crate) fn try_new_for_segment(
+        exec: &dyn PlanExecutor,
+        segment: &LogSegment,
+        needs_leaf_schema: bool,
+    ) -> KernelResult<CheckpointShape> {
         let (root_checkpoint, file_type) = match segment.listed.checkpoint_parts.first() {
             Some(checkpoint) if checkpoint.is_json() => (&checkpoint.location, FileType::Json),
             Some(checkpoint) => (&checkpoint.location, FileType::Parquet),

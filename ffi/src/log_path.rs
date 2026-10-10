@@ -9,6 +9,37 @@ use crate::{FfiSlice, KernelStringSlice, TryFromStringSlice};
 pub type LogPathArray = FfiSlice<FfiLogPath>;
 
 impl LogPathArray {
+    /// Decodes unchanged source-snapshot paths, joining recognized URLs against parsed roots.
+    ///
+    /// # Safety
+    ///
+    /// The array and all nested strings must be readable for this call, and must contain the
+    /// unchanged paths exported by the source snapshot.
+    pub(crate) unsafe fn trusted_snapshot_log_paths(
+        &self,
+        table_root: &Url,
+    ) -> KernelResult<Vec<LogPath>> {
+        let log_root = table_root.join("_delta_log/")?;
+        unsafe { self.try_as_slice() }?
+            .iter()
+            .map(|path| {
+                let location: &str = unsafe { TryFromStringSlice::try_from_slice(&path.location) }?;
+                let location = if let Some(suffix) = location.strip_prefix(log_root.as_str()) {
+                    log_root.join(suffix)?
+                } else if let Some(suffix) = location.strip_prefix(table_root.as_str()) {
+                    table_root.join(suffix)?
+                } else {
+                    Url::parse(location)?
+                };
+                LogPath::try_new_from_trusted_snapshot(FileMeta {
+                    location,
+                    last_modified: path.last_modified,
+                    size: path.size,
+                })
+            })
+            .collect()
+    }
+
     /// Convert this array into a Vec of kernel LogPaths
     ///
     /// # Safety
