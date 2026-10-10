@@ -9,8 +9,8 @@
 //! # What a plan is
 //!
 //! A [`Plan`] is a DAG of relational operators ([`Operator`](ir::nodes::Operator)):
-//! sources, transforms, and set combinators. Most map one-to-one onto a SQL operator, so a plan
-//! reads like a query. The live-add metadata plan built in `scan::scan_plan`, for example, is
+//! sources, transforms, writes, and set combinators. Most map one-to-one onto a SQL operator, so a
+//! plan reads like a query. The live-add metadata plan built in `scan::scan_plan`, for example, is
 //! roughly:
 //!
 //! ```sql

@@ -72,6 +72,18 @@ message FilterNode {
 
 message UnionAllNode {}
 
+message WriteJsonNode {
+  string file_path = 1;
+  bool overwrite = 2;
+  delta.kernel.schema.StructType schema = 3;
+}
+
+message WriteParquetNode {
+  string file_path = 1;
+  bool overwrite = 2;
+  delta.kernel.schema.StructType schema = 3;
+}
+
 enum FileType {
   FILE_TYPE_UNSPECIFIED = 0;
   FILE_TYPE_PARQUET = 1;
@@ -158,6 +170,9 @@ message Operator {
     DynamicScanNode dynamic_scan = 7;
     AggregateNode aggregate = 8;
     SemiJoinNode semi_join = 9;
+    // Sinks (write nodes)
+    WriteJsonNode write_json = 11;
+    WriteParquetNode write_parquet = 12;
   }
 }
 

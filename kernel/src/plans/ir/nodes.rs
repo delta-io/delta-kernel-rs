@@ -14,7 +14,7 @@ use url::Url;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::error::add_scalar_path_context;
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
-use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema};
+use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema};
 use crate::utils::CollectInto;
 use crate::{FileMeta, KernelError, KernelResult, Result};
 
@@ -26,12 +26,13 @@ use crate::{FileMeta, KernelError, KernelResult, Result};
 /// documenting that operator's semantics, invariants, and output shape.
 ///
 /// An operator that reshapes its rows (a source, projection, aggregation, or file scan) carries a
-/// caller-declared `schema` field holding its output schema. The rest emit rows they were given, so
-/// they inherit an input's schema; each payload's docs name which input.
+/// caller-declared `schema` field holding its output schema. File writes emit [`FILE_META_SCHEMA`].
+/// The remaining operators inherit an input's schema; each payload's docs name which input.
 #[derive(Debug, Clone, Display, From)]
 #[strum(serialize_all = "snake_case")]
 pub enum Operator {
     // === Source operators (0 inputs) =========================================
+    // TODO(#3517): Unify JSON and Parquet scan/write nodes.
     ScanParquet(ScanParquet),
     ScanJson(ScanJson),
     Values(Values),
@@ -44,12 +45,70 @@ pub enum Operator {
     Filter(Filter),
     DynamicScan(DynamicScan),
     Aggregate(Aggregate),
+    // TODO(#3517): Unify JSON and Parquet scan/write nodes.
+    WriteJson(WriteJson),
+    WriteParquet(WriteParquet),
 
     // === Binary operators (2 inputs) =========================================
     SemiJoin(SemiJoin),
 
     // === N-ary operators (variable inputs) ===================================
     UnionAll(UnionAll),
+}
+
+/// Output schema of [`WriteJson`] and [`WriteParquet`]: the file's fully qualified `location`,
+/// `size` in bytes, and `last_modified` in milliseconds since the Unix epoch.
+pub static FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    not_null "location": STRING,
+    not_null "size": LONG,
+    not_null "last_modified": LONG,
+};
+
+/// Writes all rows from its single input to one newline-delimited JSON file at `file_path`.
+/// Outputs exactly one row matching [`FILE_META_SCHEMA`] after the write succeeds.
+///
+/// # Implementation Contract
+///
+/// - The declared `schema` supplies the JSON field names and types. Every input batch must match
+///   it, including field order, nullability, and metadata. A schema mismatch is an error and must
+///   leave the destination untouched.
+/// - When `overwrite` is false, the destination must be created atomically without replacing an
+///   existing file. When true, the file is replaced, rather than appended to.
+/// - Empty input is considered invalid; valid Delta metadata files (e.g commits and checkpoints)
+///   should never be empty. It is recommended that implementors reject such inputs with an error,
+///   however kernel does not rely on such behavior and will perform its own pre-write validations
+///   to ensure this does not happen.
+/// - The output row order is unspecified.
+/// - Behavior can be undefined if a single plan contains multiple writes to the same destination,
+///   because execution order is unspecified and executors may optimize away common table
+///   expressions.
+///
+/// # Errors
+///
+/// - [`KernelError::Schema`] if the declared schema is unsupported or an input batch does not match
+///   it.
+/// - [`KernelError::FileAlreadyExists`] if the destination exists and `overwrite` is false.
+/// - [`KernelError::Generic`] otherwise (e.g. no input rows, serialization or storage I/O fails,
+///   etc.).
+#[derive(Debug, Clone)]
+pub struct WriteJson {
+    /// Declared schema for the output rows.
+    pub schema: SchemaRef,
+    /// Fully qualified URL of the destination file.
+    pub file_path: Url,
+    /// Whether an existing destination may be replaced.
+    pub overwrite: bool,
+}
+
+/// The Parquet equivalent of [`WriteJson`], with the same behavior and semantics.
+#[derive(Debug, Clone)]
+pub struct WriteParquet {
+    /// Declared schema for the output rows.
+    pub schema: SchemaRef,
+    /// Fully qualified URL of the destination file.
+    pub file_path: Url,
+    /// Whether an existing destination may be replaced.
+    pub overwrite: bool,
 }
 
 /// An engine-assigned identifier for a relation retained by a
