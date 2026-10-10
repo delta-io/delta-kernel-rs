@@ -19,15 +19,35 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::expressions::column_name;
+    use delta_kernel::expressions::{column_name, ColumnName};
     use delta_kernel::schema::DataType;
     use delta_kernel::transaction::stats_verifier::{
-        verify_num_records_present, StatsColumnVerifier,
+        verify_num_records_present as verify_num_records_present_iter,
+        StatsColumnVerifier as KernelStatsColumnVerifier,
     };
-    use delta_kernel::{EngineData, KernelError};
+    use delta_kernel::{EngineData, KernelError, Result};
     use rstest::rstest;
 
     use crate::stats::collect_stats_for_test as collect_stats;
+
+    struct StatsColumnVerifier(KernelStatsColumnVerifier);
+
+    impl StatsColumnVerifier {
+        fn new(required_columns: Vec<(ColumnName, DataType)>) -> Self {
+            Self(KernelStatsColumnVerifier::new(required_columns))
+        }
+
+        fn verify(&self, add_files: &[Box<dyn EngineData>]) -> Result<()> {
+            self.0
+                .verify(add_files.iter().map(|batch| Ok(batch.as_ref())))
+        }
+    }
+
+    fn verify_num_records_present(
+        add_files: &[Box<dyn EngineData>],
+    ) -> Result<()> {
+        verify_num_records_present_iter(add_files.iter().map(|batch| Ok(batch.as_ref())))
+    }
 
     /// Creates test add file data with stats.numRecords, stats.nullCount.col,
     /// stats.minValues.col, and stats.maxValues.col — all of type LONG.
