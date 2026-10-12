@@ -21,6 +21,8 @@ use url::Url;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{CheckpointInstance, LogPathFileType, ParsedLogPath};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::version_as_i64;
 use crate::{KernelError, KernelResult, KernelResultIterator, StorageHandler, Version};
 
 #[cfg(test)]
@@ -180,14 +182,16 @@ fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option
 }
 
 /// Checks that a listing from an AMT hint's version can stand in for a checkpoint: the checkpoint
-/// version must be less than or equal to the version of the manifest commit it was added in, that
-/// manifest commit must be listed, and the commits must start no later than the version after the
-/// hint.
+/// version must be less than or equal to the version of the manifest commit it was added in, and
+/// the commits must start no later than the version after the hint. The manifest commit must also
+/// be listed, unless it is after the snapshot's last version, in which case the hint must embed the
+/// checkpoint action at the hinted version.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn validate_amt_listing(
     listed_files: &LogSegmentFiles,
     hint: &LastCheckpointHint,
     manifest_commit_version: Version,
+    end_version: Option<Version>,
 ) -> KernelResult<()> {
     let checkpoint_version = hint.version;
     if manifest_commit_version < checkpoint_version {
@@ -213,6 +217,39 @@ fn validate_amt_listing(
              at or before version {latest_first_commit}, but the first listed commit is \
              {first:?}"
         )));
+    }
+    // A manifest commit after the snapshot's last version is not part of the snapshot, so its
+    // checkpoint action must come from the hint itself. This happens when time traveling before
+    // the manifest commit (say hint 5, manifest commit 8, snapshot at 6), or when loading the
+    // latest snapshot before the manifest commit is visible in the log (say hint 5, manifest
+    // commit 8, newest listed commit 7, as with a not yet backfilled catalog commit). The embedded
+    // action then supplies protocol, metadata and the content root at 5, and it is the latest
+    // checkpoint action: content roots never decrease across manifest commits, so any checkpoint
+    // action in commits 6 or 7 comes from an earlier manifest commit and describes a root at or
+    // before 5.
+    if let Some(snapshot_end) = end_version
+        .or(last)
+        .filter(|&end| manifest_commit_version > end)
+    {
+        let Some(action) = hint
+            .amt_checkpoint
+            .as_ref()
+            .and_then(|amt| amt.checkpoint.as_ref())
+        else {
+            return Err(KernelError::invalid_checkpoint(format!(
+                "_last_checkpoint AMT hint at version {checkpoint_version} names manifest commit \
+                 {manifest_commit_version} after the snapshot's last version {snapshot_end} and \
+                 embeds no checkpoint action"
+            )));
+        };
+        if action.version() != version_as_i64(checkpoint_version)? {
+            return Err(KernelError::invalid_checkpoint(format!(
+                "_last_checkpoint AMT hint at version {checkpoint_version} embeds a checkpoint \
+                 action at version {}",
+                action.version()
+            )));
+        }
+        return Ok(());
     }
     if !commits.iter().any(|c| c.version == manifest_commit_version) {
         return Err(KernelError::invalid_checkpoint(format!(
@@ -677,7 +714,12 @@ impl LogSegmentFiles {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             if let Some(manifest_commit_version) = checkpoint_metadata.amt_manifest_commit_version()
             {
-                validate_amt_listing(&listed_files, checkpoint_metadata, manifest_commit_version)?;
+                validate_amt_listing(
+                    &listed_files,
+                    checkpoint_metadata,
+                    manifest_commit_version,
+                    end_version,
+                )?;
                 return Ok(listed_files);
             }
             // The hint names a checkpoint that no longer exists, and because the listing started
