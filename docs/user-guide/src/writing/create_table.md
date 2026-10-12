@@ -104,7 +104,8 @@ containing a JSON object whose keys identify STRING targets relative to that fie
 
 Array elements and map keys/values use `.element`, `.key`, and `.value` path segments.
 Nested struct children own their annotations. Kernel validates the object, STRING targets,
-and `Provider.Name[.Version]` identifier syntax before creating or altering a schema.
+and non-default `Provider.Name` identifiers before creating or altering a schema.
+Use unversioned identifiers in schema annotations. Per-file statistics use versioned identifiers.
 
 An annotated schema automatically selects the stable `collations` writer feature unless
 `collations` or `collations-preview` is already requested. You can request either with
