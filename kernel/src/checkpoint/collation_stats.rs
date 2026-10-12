@@ -5,12 +5,15 @@
 
 use std::sync::{Arc, LazyLock};
 
+use itertools::Itertools;
 use serde_json::Value;
 
+use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData};
 use crate::expressions::{
     col, column_name, ColumnName, Expression, ExpressionRef, UnaryExpressionOp,
 };
+use crate::log_replay::HasSelectionVector;
 use crate::schema::{
     schema, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
 };
@@ -93,7 +96,7 @@ pub(crate) fn normalize_collation_stats(
     }))
 }
 
-/// Extends only the checkpoint stats schema with identifiers and bounds present in the log.
+/// Extends the checkpoint stats schema with identifiers and bounds from active Adds.
 ///
 /// Returns an error for unreadable log data or non-STRING collation bounds.
 pub(super) fn checkpoint_stats_schema(
@@ -102,11 +105,15 @@ pub(super) fn checkpoint_stats_schema(
     binary_stats: SchemaRef,
 ) -> KernelResult<SchemaRef> {
     let mut visitor = CollationStatsVisitor::default();
-    let read_schema = crate::schema::schema_ref! {
-        nullable "add": { nullable "path": STRING, nullable "stats": STRING },
-    };
-    for batch in snapshot.log_segment().read_actions(engine, read_schema)? {
-        visitor.visit_rows_of(batch?.actions.as_ref())?;
+    let actions = snapshot
+        .log_segment()
+        .read_actions(engine, super::CHECKPOINT_ACTIONS_SCHEMA_V1.clone())?;
+    let mut processor = ActionReconciliationProcessor::new(i64::MAX, None);
+    let reconciled = actions
+        .map(move |batch| processor.process_actions_batch(batch?))
+        .filter_ok(HasSelectionVector::has_selected_rows);
+    for batch in reconciled {
+        visitor.visit_rows_of(batch?.filtered_data.apply_selection_vector()?.as_ref())?;
     }
     if visitor.schema.num_fields() == 0 {
         return Ok(binary_stats);
@@ -179,6 +186,7 @@ fn merge_bound_schema(schema: &StructType, bounds: &Value) -> KernelResult<Struc
     for (name, value) in bounds {
         let existing = fields.iter().position(|field| field.name() == name);
         let data_type = match value {
+            Value::Null => continue,
             Value::Object(_) => {
                 let empty = schema! {};
                 let child = match existing.map(|index| fields[index].data_type()) {
@@ -194,7 +202,7 @@ fn merge_bound_schema(schema: &StructType, bounds: &Value) -> KernelResult<Struc
                 }
                 DataType::from(child)
             }
-            Value::String(_) | Value::Null => {
+            Value::String(_) => {
                 if existing.is_some_and(|index| fields[index].data_type() != &DataType::STRING) {
                     return Err(KernelError::schema("Conflicting collation bound types"));
                 }
@@ -217,14 +225,23 @@ fn merge_bound_schema(schema: &StructType, bounds: &Value) -> KernelResult<Struc
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use itertools::Itertools;
     use rstest::rstest;
     use serde_json::json;
+    use test_utils::add_commit;
+    use url::Url;
 
     use super::*;
+    use crate::actions::{Metadata, Protocol};
     use crate::arrow::array::{StringArray, StructArray};
+    use crate::checkpoint::CHECKPOINT_ACTIONS_SCHEMA_V1;
     use crate::engine::arrow_data::EngineDataArrowExt;
     use crate::engine::sync::SyncEngine;
-    use crate::schema::{schema, schema_ref};
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::DynObjectStore;
+    use crate::schema::{schema, schema_ref, ColumnMetadataKey, MetadataValue};
 
     #[test]
     fn discovers_literal_identifiers_and_sparse_nested_bounds() {
@@ -253,6 +270,193 @@ mod tests {
                 .data_type(),
             &DataType::STRING
         );
+    }
+
+    #[rstest]
+    #[case::struct_bound(json!({ "leaf": "Alice" }), schema! { nullable "leaf": STRING }.into())]
+    #[case::string_bound(json!("Alice"), DataType::STRING)]
+    fn null_bounds_do_not_infer_or_replace_types(
+        #[case] value: Value,
+        #[case] data_type: DataType,
+        #[values(true, false)] null_first: bool,
+        #[values("minValues", "maxValues")] bound: &str,
+    ) {
+        let null = json!({ "ICU.en_US.72": { bound: { "nested": null } } });
+        let populated = json!({ "ICU.en_US.72": { bound: { "nested": value } } });
+        let empty = schema! {};
+        let values = if null_first {
+            [&null, &populated]
+        } else {
+            [&populated, &null]
+        };
+        let discovered = values.iter().fold(empty, |schema, value| {
+            merge_bound_schema(&schema, value).unwrap()
+        });
+        assert_eq!(
+            discovered
+                .field_at(&ColumnName::new(["ICU.en_US.72", bound, "nested"]))
+                .unwrap()
+                .data_type(),
+            &data_type,
+        );
+        assert_eq!(merge_bound_schema(&schema! {}, &null).unwrap(), schema! {});
+    }
+
+    #[rstest]
+    #[case::removed_file(false)]
+    #[case::replaced_deletion_vector(true)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_discovers_only_active_collation_bounds(
+        #[case] replace_dv: bool,
+        #[values(false, true)] earlier_checkpoint: bool,
+        #[values(false, true)] write_json: bool,
+    ) -> Result<()> {
+        let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let table_root = "memory:///";
+        let field = StructField::nullable("nested", DataType::STRING).with_metadata([(
+            ColumnMetadataKey::Collations.as_ref(),
+            MetadataValue::Other(json!({ "nested": "icu.en_US" })),
+        )]);
+        let old_schema = schema_ref! { (field) };
+        let new_schema = if replace_dv {
+            old_schema.clone()
+        } else {
+            let leaf = StructField::nullable("leaf", DataType::STRING).with_metadata([(
+                ColumnMetadataKey::Collations.as_ref(),
+                MetadataValue::Other(json!({ "leaf": "icu.en_US" })),
+            )]);
+            schema_ref! { nullable "nested": { (leaf) } }
+        };
+        let metadata = Metadata::try_new(
+            Some("test-table".into()),
+            None,
+            old_schema,
+            vec![],
+            0,
+            HashMap::from([
+                (
+                    "delta.checkpoint.writeStatsAsJson".into(),
+                    write_json.to_string(),
+                ),
+                ("delta.checkpoint.writeStatsAsStruct".into(), "true".into()),
+            ]),
+        )?;
+        let updated_metadata = metadata.clone().with_schema(new_schema)?;
+        let protocol =
+            Protocol::try_new_modern(["deletionVectors"], ["deletionVectors", "collations"])?;
+        let old_dv = replace_dv.then(|| {
+            json!({
+                "storageType": "p", "pathOrInlineDv": "file:///deletion-vectors.bin", "offset": 0,
+                "sizeInBytes": 1, "cardinality": 1,
+            })
+        });
+        let old_stats = json!({
+            "numRecords": 2,
+            COLLATION_STATS: {
+                "ICU.en_US.71": { "minValues": { "nested": "Old" } },
+                "ICU.en_US.72": { "minValues": { "nested": "Old" } },
+            },
+        });
+        let first_commit = [
+            json!({ "protocol": protocol }),
+            json!({ "metaData": metadata }),
+            json!({ "add": {
+                "path": "old.parquet", "partitionValues": {}, "size": 10,
+                "modificationTime": 0, "dataChange": true,
+                "deletionVector": old_dv, "stats": old_stats.to_string(),
+            } }),
+        ];
+        add_commit(
+            table_root,
+            &store,
+            0,
+            first_commit.iter().map(Value::to_string).join("\n"),
+        )
+        .await
+        .unwrap();
+        if earlier_checkpoint {
+            let parsed_stats = schema! {
+                nullable "numRecords": LONG,
+                nullable COLLATION_STATS: (
+                    merge_bound_schema(&schema! {}, &old_stats[COLLATION_STATS])?
+                ),
+            };
+            let mut patch = SchemaStructPatchBuilder::new()
+                .append_at(["add"], StructField::nullable("stats_parsed", parsed_stats));
+            if !write_json {
+                patch = patch.drop_at(["add"], "stats");
+            }
+            let checkpoint_schema = Arc::new(patch.build(&CHECKPOINT_ACTIONS_SCHEMA_V1)?);
+            let mut checkpoint_actions = first_commit.clone();
+            checkpoint_actions[2]["add"]["stats_parsed"] = old_stats;
+            let data = engine.json_handler().parse_json(
+                crate::unit_test_utils::string_array_to_engine_data(StringArray::from(
+                    checkpoint_actions
+                        .iter()
+                        .map(Value::to_string)
+                        .collect::<Vec<_>>(),
+                )),
+                checkpoint_schema,
+            )?;
+            engine.parquet_handler().write_parquet_file(
+                Url::parse("memory:///_delta_log/00000000000000000000.checkpoint.parquet")?,
+                Box::new(std::iter::once(Ok(data))),
+            )?;
+        }
+        let active_value = if replace_dv {
+            json!("Alice")
+        } else {
+            json!({ "leaf": "Alice" })
+        };
+        let active_bounds = json!({
+            "ICU.en_US.72": {
+                "minValues": { "nested": active_value },
+                "maxValues": { "nested": active_value },
+            },
+        });
+        let new_dv = replace_dv.then(|| {
+            json!({
+                "storageType": "p", "pathOrInlineDv": "file:///deletion-vectors.bin", "offset": 1,
+                "sizeInBytes": 1, "cardinality": 1,
+            })
+        });
+        let replacement_commit = [
+            json!({ "metaData": updated_metadata }),
+            json!({ "remove": {
+                "path": "old.parquet", "deletionTimestamp": 0,
+                "dataChange": true, "deletionVector": old_dv,
+            } }),
+            json!({ "add": {
+                "path": if replace_dv { "old.parquet" } else { "new.parquet" },
+                "partitionValues": {}, "size": 10, "modificationTime": 0, "dataChange": true,
+                "deletionVector": new_dv,
+                "stats": json!({ "numRecords": 2, COLLATION_STATS: active_bounds }).to_string(),
+            } }),
+        ];
+        add_commit(
+            table_root,
+            &store,
+            1,
+            replacement_commit.iter().map(Value::to_string).join("\n"),
+        )
+        .await
+        .unwrap();
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        assert_eq!(
+            snapshot.log_segment().checkpoint_version,
+            earlier_checkpoint.then_some(0)
+        );
+        let binary_stats = schema_ref! { nullable "numRecords": LONG };
+        let expected = schema_ref! {
+            nullable "numRecords": LONG,
+            nullable COLLATION_STATS: (merge_bound_schema(&schema! {}, &active_bounds)?),
+        };
+        assert_eq!(
+            checkpoint_stats_schema(&snapshot, &engine, binary_stats)?,
+            expected,
+        );
+        Ok(())
     }
 
     #[rstest]
