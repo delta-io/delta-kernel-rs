@@ -739,7 +739,7 @@ mod tests {
     fn collation_objects_round_trip_through_arrow(#[case] data_type: DataType, #[case] path: &str) {
         let field = StructField::nullable("field", data_type).with_metadata([(
             ColumnMetadataKey::Collations.as_ref(),
-            MetadataValue::Other(serde_json::json!({ path: "custom.name.75.1" })),
+            MetadataValue::Other(serde_json::json!({ path: "custom.name" })),
         )]);
         let kernel_schema = StructType::try_new([field]).unwrap();
         let arrow: ArrowSchema = (&kernel_schema).try_into_arrow().unwrap();

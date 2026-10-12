@@ -14,9 +14,9 @@ pub(crate) fn schema_has_collations(schema: &Schema) -> bool {
         .is_err()
 }
 
-/// Validates annotation objects, STRING targets and `Provider.Name[.Version]` identifiers.
+/// Validates annotation objects, STRING targets and non-default `Provider.Name` identifiers.
 ///
-/// Returns a schema error for malformed annotations. Provider and version support is not checked.
+/// Returns a schema error for malformed annotations. Provider support is not checked.
 pub(crate) fn validate_collation_annotations(schema: &Schema) -> KernelResult<()> {
     if !schema_has_collations(schema) {
         return Ok(());
@@ -49,7 +49,7 @@ impl<'a> SchemaTransform<'a> for CollationAnnotationValidator {
                     valid_collation_identifier(identifier),
                     KernelError::schema(format!(
                         "__COLLATIONS entry '{path}' has invalid identifier '{identifier}'; \
-                         expected Provider.Name[.Version]"
+                         expected non-default Provider.Name without a version"
                     ))
                 );
                 require!(
@@ -68,10 +68,11 @@ impl<'a> SchemaTransform<'a> for CollationAnnotationValidator {
 }
 
 fn valid_collation_identifier(identifier: &str) -> bool {
-    let mut parts = identifier.splitn(3, '.');
+    let mut parts = identifier.split('.');
     parts.next().is_some_and(|provider| !provider.is_empty())
         && parts.next().is_some_and(|name| !name.is_empty())
-        && parts.next().is_none_or(|version| !version.is_empty())
+        && parts.next().is_none()
+        && !identifier.eq_ignore_ascii_case("SPARK.UTF8_BINARY")
 }
 
 fn is_string_target(data_type: &DataType, suffix: &str) -> bool {
@@ -98,7 +99,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::schema::validation::validate_schema;
     use crate::schema::{schema, ArrayType, MapType, StructType};
+    use crate::table_features::ColumnMappingMode;
 
     fn annotated(
         name: &str,
@@ -156,17 +159,30 @@ mod tests {
     }
 
     #[rstest]
-    #[case("unknown.name")]
-    #[case("unknown.name.72")]
-    #[case("unknown.name.75.1")]
-    fn identifiers_do_not_require_known_providers_or_versions(#[case] identifier: &str) {
+    #[case::unknown_provider("unknown.name", true)]
+    #[case::binary_name_other_provider("unknown.UTF8_BINARY", true)]
+    #[case::non_default_spark("SPARK.UTF8_LCASE", true)]
+    #[case::lowercase_non_default("spark.utf8_lcase", true)]
+    #[case::versioned("unknown.name.72", false)]
+    #[case::dotted_version("unknown.name.75.1", false)]
+    #[case::default_binary("SPARK.UTF8_BINARY", false)]
+    #[case::lowercase_default_binary("spark.utf8_binary", false)]
+    #[case::mixed_case_default_binary("SpArK.UtF8_BiNaRy", false)]
+    fn schema_identifiers_must_be_unversioned_and_non_default(
+        #[case] identifier: &str,
+        #[case] valid: bool,
+    ) {
         let schema = StructType::try_new([annotated(
             "field",
             DataType::STRING,
             json!({"field": identifier}),
         )])
         .unwrap();
-        validate_collation_annotations(&schema).unwrap();
+        assert_eq!(
+            validate_schema(&schema, ColumnMappingMode::None, false).is_ok(),
+            valid,
+            "{identifier}"
+        );
     }
 
     #[rstest]
@@ -185,7 +201,7 @@ mod tests {
         let field = annotated(
             "a.b",
             ArrayType::new(DataType::STRING, true),
-            json!({"a.b.element": "custom.name.1.2"}),
+            json!({"a.b.element": "custom.name"}),
         )
         .add_metadata([
             (
