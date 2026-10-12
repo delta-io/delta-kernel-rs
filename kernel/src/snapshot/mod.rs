@@ -1325,9 +1325,10 @@ impl Snapshot {
 
     /// Creates a builder that replaces the table schema and all active data files.
     ///
-    /// The existing table identity, properties, and protocol are preserved. A data layout
-    /// supplied to the builder replaces the current partitioning; otherwise it is inherited.
-    /// The builder validates the replacement and stages old-file removals during build.
+    /// The existing table identity, properties, and protocol are preserved. Properties referencing
+    /// dropped columns remain unchanged; schemas requiring a new table feature are rejected.
+    /// A data layout supplied to the builder replaces the current partitioning; otherwise it is
+    /// inherited. The builder validates the replacement and stages old-file removals during build.
     pub fn replace_table(self: Arc<Self>, schema: SchemaRef) -> ReplaceTableTransactionBuilder {
         ReplaceTableTransactionBuilder::new(self, schema)
     }

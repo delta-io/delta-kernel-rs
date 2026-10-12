@@ -659,8 +659,6 @@ impl Transaction<UpdateTable> {
         self.should_emit_metadata = true;
         self.operation = Some(CommitOperation::Replace);
         self.remove_files_metadata = removals;
-        self.data_change = true;
-        self.infer_data_change = false;
         // Replacing every row leaves no old row IDs or commit versions to preserve.
         self.row_tracking_preservation_acknowledged = true;
         self

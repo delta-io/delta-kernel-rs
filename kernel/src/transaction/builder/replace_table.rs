@@ -88,8 +88,10 @@ impl TransactionBuilder<ReplaceTable> {
     ///
     /// # Errors
     ///
-    /// Rejects invalid or empty schemas, invalid partition columns, conflicting mapping metadata,
-    /// and schema features absent from the existing protocol. CDF and append-only must be disabled.
+    /// Rejects `dataChange = false`, invalid or empty schemas, invalid partition columns,
+    /// conflicting mapping metadata, and schema features absent from the existing protocol;
+    /// replacement does not upgrade it.
+    /// CDF and append-only must be disabled.
     /// Clustering, Iceberg compatibility, column defaults, and adaptive metadata are unsupported.
     /// Both the source and replacement must pass Kernel's write-support checks, including rejection
     /// of SQL-expression invariants. NOT NULL constraints remain the writer's responsibility.
@@ -167,6 +169,7 @@ impl TransactionBuilder<ReplaceTable> {
                 Ok(FilteredEngineData::with_all_rows_selected(selected))
             })
             .collect::<KernelResult<Vec<_>>>()?;
+        // Reuse Write's source validation and commit setup, then replace its operation and config.
         let mut builder = self
             .local_state
             .snapshot

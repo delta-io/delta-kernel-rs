@@ -34,6 +34,38 @@ use url::Url;
 use crate::common::read_utils::read_parquet_file;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_empty_schema_table_with_data() -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, path, engine) = test_table_setup_mt()?;
+    let empty = create_table(&path, schema_ref! {}, "test")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    assert_result_error_with_message(empty.clone().scan_builder().build(), "empty schema");
+
+    let schema = schema_ref! { nullable "amount": INTEGER };
+    let mut txn = empty
+        .replace_table(schema)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let context = txn.write_state()?.write_context_builder().build()?;
+    let batch = RecordBatch::try_new(
+        Arc::new(context.logical_data_schema().as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![1, 2]))],
+    )?;
+    txn.add_files(
+        engine
+            .write_parquet(&ArrowEngineData::new(batch), &context)
+            .await?,
+    );
+    let post = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let reloaded = Snapshot::builder_for(&path).build(engine.as_ref())?;
+    assert_eq!(reloaded.version(), post.version());
+    assert_eq!(reloaded.schema(), post.schema());
+    let batches = read_scan(&reloaded.scan_builder().build()?, engine)?;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replacement_builder_accepts_snapshot_lsn_before_writes(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup_mt()?;
@@ -890,6 +922,9 @@ async fn replace_table_rejects_noncanonical_variant_before_write_state(
 #[case::empty_schema(Arc::new(StructType::try_new([]).unwrap()), vec![], "non-empty")]
 #[case::non_null_without_invariants(schema_ref! { not_null "amount": INTEGER }, vec![], "Non-null fields")]
 #[case::orphan_default(schema_ref! { (StructField::nullable("amount", DataType::INTEGER).add_metadata([("CURRENT_DEFAULT", MetadataValue::String("42".into()))])) }, vec![], "CURRENT_DEFAULT")]
+#[case::exists_default(schema_ref! { (StructField::nullable("amount", DataType::INTEGER).add_metadata([("EXISTS_DEFAULT", MetadataValue::String("42".into()))])) }, vec![], "EXISTS_DEFAULT")]
+#[case::generated_column(schema_ref! { (StructField::nullable("amount", DataType::INTEGER).add_metadata([("delta.generationExpression", MetadataValue::String("42".into()))])) }, vec![], "delta.generationExpression")]
+#[case::identity_column(schema_ref! { (StructField::nullable("amount", DataType::INTEGER).add_metadata([("delta.identity.start", MetadataValue::Number(1))])) }, vec![], "delta.identity.start")]
 #[case::invariant(Arc::new(StructType::try_new([StructField::nullable("amount", DataType::INTEGER).add_metadata([("delta.invariants", MetadataValue::String(r#"{"expression":{"expression":"amount > 0"}}"#.into()))])]).unwrap()), vec![], "invariants")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replace_table_rejects_invalid_replacement_before_commit(

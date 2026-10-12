@@ -3,6 +3,7 @@
 //! TODO(#2201): Add end-to-end tests for insert + scan + checkpoint on partitioned tables.
 
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
@@ -38,6 +39,27 @@ fn test_create_table_partitioned_basic(#[case] partition_col: &str) -> KernelRes
         "Partitioned table should not have clustering columns"
     );
 
+    Ok(())
+}
+
+#[test]
+fn test_create_table_partition_column_unicode_case() -> Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    create_table(
+        &table_path,
+        schema_ref! { nullable "É": STRING, nullable "amount": INTEGER },
+        "Test/1.0",
+    )
+    .with_data_layout(DataLayout::partitioned(["é"]))
+    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+    .commit(engine.as_ref())?
+    .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        snapshot.table_configuration().logical_partition_columns(),
+        &["É"]
+    );
     Ok(())
 }
 
