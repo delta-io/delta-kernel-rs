@@ -67,6 +67,8 @@ impl<'a> SchemaTransform<'a> for CollationAnnotationValidator {
     }
 }
 
+/// Accepts unversioned `Provider.Name` with nonempty parts, excluding `SPARK.UTF8_BINARY`
+/// case-insensitively.
 fn valid_collation_identifier(identifier: &str) -> bool {
     let mut parts = identifier.split('.');
     parts.next().is_some_and(|provider| !provider.is_empty())
