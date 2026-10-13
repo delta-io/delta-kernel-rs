@@ -64,7 +64,9 @@ fn add_field(parent: &mut StructType, field: StructField, parent_path: String) -
             parent_path,
         )));
     }
-    parent.field_map_mut().insert(field.name().clone(), field);
+    parent
+        .field_map_mut()
+        .insert(field.name().clone(), Arc::new(field));
     Ok(())
 }
 
@@ -99,7 +101,7 @@ fn set_field_nullable(parent: &mut StructType, name: &str) -> KernelResult<()> {
         .values_mut()
         .find(|parent| parent.name().to_lowercase() == name.to_lowercase())
         .ok_or_else(|| KernelError::schema(format!("field '{}' does not exist", name)))?;
-    parent.nullable = true;
+    Arc::make_mut(parent).nullable = true;
     Ok(())
 }
 

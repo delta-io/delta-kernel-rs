@@ -855,14 +855,14 @@ impl Display for StructField {
 
 /// A struct is used to represent both the top-level schema of the table
 /// as well as struct columns that contain nested columns.
-#[derive(Debug, PartialEq, Clone, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct StructType {
     type_name: String,
     /// The fields stored in this struct
     // We use indexmap to preserve the order of fields as they are defined in the schema
     // while also allowing for fast lookup by name. The alternative is to do a linear search
     // for each field by name would be potentially quite expensive for large schemas.
-    fields: IndexMap<String, StructField>,
+    fields: IndexMap<String, Arc<StructField>>,
     /// The metadata columns in this struct
     // We use a dedicated map for metadata columns to allow for fast lookup without having to
     // iterate over all fields.
@@ -871,6 +871,20 @@ pub struct StructType {
 
 pub struct StructTypeBuilder {
     fields: IndexMap<String, StructField>,
+}
+
+impl Clone for StructType {
+    fn clone(&self) -> Self {
+        Self {
+            type_name: self.type_name.clone(),
+            fields: self
+                .fields
+                .iter()
+                .map(|(name, field)| (name.clone(), Arc::new(field.as_ref().clone())))
+                .collect(),
+            metadata_columns: self.metadata_columns.clone(),
+        }
+    }
 }
 
 impl Default for StructTypeBuilder {
@@ -888,7 +902,10 @@ impl StructTypeBuilder {
 
     pub fn from_schema(schema: &StructType) -> Self {
         Self {
-            fields: schema.fields.clone(),
+            fields: schema
+                .fields()
+                .map(|field| (field.name.clone(), field.clone()))
+                .collect(),
         }
     }
 
@@ -907,6 +924,27 @@ impl StructTypeBuilder {
 }
 
 impl StructType {
+    /// Builds a subset sharing immutable fields from this already-valid schema.
+    pub(crate) fn share_selected_fields(&self, mut keep: impl FnMut(usize) -> bool) -> Self {
+        let fields: IndexMap<_, _> = self
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| keep(*index))
+            .map(|(_, (name, field))| (name.clone(), field.clone()))
+            .collect();
+        let metadata_columns = fields
+            .values()
+            .enumerate()
+            .filter_map(|(index, field)| field.get_metadata_column_spec().map(|spec| (spec, index)))
+            .collect();
+        Self {
+            type_name: self.type_name.clone(),
+            fields,
+            metadata_columns,
+        }
+    }
+
     /// Creates a new [`StructType`] from the given fields.
     ///
     /// Returns an error if:
@@ -945,7 +983,7 @@ impl StructType {
                 )));
             }
 
-            field_map.insert(field.name.clone(), field);
+            field_map.insert(field.name.clone(), Arc::new(field));
         }
 
         Ok(Self {
@@ -985,7 +1023,7 @@ impl StructType {
             if let Some(metadata_column_spec) = field.get_metadata_column_spec() {
                 metadata_columns.insert(metadata_column_spec, i);
             }
-            field_map.insert(field.name.clone(), field);
+            field_map.insert(field.name.clone(), Arc::new(field));
         }
 
         Self {
@@ -1002,7 +1040,7 @@ impl StructType {
         let fields = names.iter().map(|name| {
             self.fields
                 .get(name.as_ref())
-                .cloned()
+                .map(|field| field.as_ref().clone())
                 .ok_or_else(|| KernelError::missing_column(name.as_ref()))
         });
         Self::try_from_results(fields)
@@ -1018,7 +1056,7 @@ impl StructType {
 
     /// Adds fields to this [`StructType`], returning a new [`StructType`].
     pub fn add(&self, fields: impl IntoIterator<Item = StructField>) -> KernelResult<Self> {
-        Self::try_new(self.fields.values().cloned().chain(fields))
+        Self::try_new(self.fields().cloned().chain(fields))
     }
 
     /// Adds a predefined metadata column to this [`StructType`], returning a new [`StructType`].
@@ -1052,7 +1090,7 @@ impl StructType {
 
     /// Gets the field with the given name.
     pub fn field(&self, name: impl AsRef<str>) -> Option<&StructField> {
-        self.fields.get(name.as_ref())
+        self.fields.get(name.as_ref()).map(Arc::as_ref)
     }
 
     /// Retrieves the nested field named by the given column path.
@@ -1146,31 +1184,33 @@ impl StructType {
     pub fn field_with_index(&self, name: impl AsRef<str>) -> Option<(usize, &StructField)> {
         self.fields
             .get_full(name.as_ref())
-            .map(|(index, _, field)| (index, field))
+            .map(|(index, _, field)| (index, field.as_ref()))
     }
 
     /// Gets the field at the given index.
     pub fn field_at_index(&self, index: usize) -> Option<&StructField> {
-        self.fields.get_index(index).map(|(_, field)| field)
+        self.fields
+            .get_index(index)
+            .map(|(_, field)| field.as_ref())
     }
 
     /// Gets a reference to all the fields in this struct type.
     pub fn fields(
         &self,
     ) -> impl ExactSizeIterator<Item = &StructField> + DoubleEndedIterator + FusedIterator {
-        self.fields.values()
+        self.fields.values().map(Arc::as_ref)
     }
 
     /// Gets an iterator over all the fields in this struct type.
     pub fn into_fields(
         self,
     ) -> impl ExactSizeIterator<Item = StructField> + DoubleEndedIterator + FusedIterator {
-        self.fields.into_values()
+        self.fields.into_values().map(Arc::unwrap_or_clone)
     }
 
     /// Gets a mutable reference to the underlying field map.
     #[internal_api]
-    pub(crate) fn field_map_mut(&mut self) -> &mut IndexMap<String, StructField> {
+    pub(crate) fn field_map_mut(&mut self) -> &mut IndexMap<String, Arc<StructField>> {
         &mut self.fields
     }
 
@@ -1256,16 +1296,20 @@ impl StructType {
 
     /// Gets a reference to the metadata column with the given spec.
     pub fn metadata_column(&self, spec: &MetadataColumnSpec) -> Option<&StructField> {
-        self.metadata_columns
-            .get(spec)
-            .and_then(|index| self.fields.get_index(*index).map(|(_, field)| field))
+        self.metadata_columns.get(spec).and_then(|index| {
+            self.fields
+                .get_index(*index)
+                .map(|(_, field)| field.as_ref())
+        })
     }
 
     /// Gets an iterator over all the metadata columns in this struct type.
     pub fn metadata_columns(&self) -> impl Iterator<Item = &StructField> {
-        self.metadata_columns
-            .values()
-            .filter_map(|index| self.fields.get_index(*index).map(|(_, field)| field))
+        self.metadata_columns.values().filter_map(|index| {
+            self.fields
+                .get_index(*index)
+                .map(|(_, field)| field.as_ref())
+        })
     }
 
     /// Extracts the name and type of all leaf columns, in schema order. Caller should pass Some
@@ -1479,14 +1523,14 @@ impl<'a> IntoIterator for &'a StructType {
 /// [`IndexMap`]: indexmap::IndexMap
 #[derive(Debug)]
 pub struct StructFieldIntoIter {
-    inner: indexmap::map::IntoValues<String, StructField>,
+    inner: indexmap::map::IntoValues<String, Arc<StructField>>,
 }
 
 impl Iterator for StructFieldIntoIter {
     type Item = StructField;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        self.inner.next().map(Arc::unwrap_or_clone)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1498,11 +1542,11 @@ impl Iterator for StructFieldIntoIter {
     }
 
     fn last(self) -> Option<Self::Item> {
-        self.inner.last()
+        self.inner.last().map(Arc::unwrap_or_clone)
     }
 
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth(n)
+        self.inner.nth(n).map(Arc::unwrap_or_clone)
     }
 }
 
@@ -1516,7 +1560,7 @@ impl FusedIterator for StructFieldIntoIter {}
 
 impl DoubleEndedIterator for StructFieldIntoIter {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back()
+        self.inner.next_back().map(Arc::unwrap_or_clone)
     }
 }
 
@@ -1561,14 +1605,14 @@ impl DoubleEndedIterator for StructFieldIntoIter {
 /// [`IndexMap`]: indexmap::IndexMap
 #[derive(Debug, Clone)]
 pub struct StructFieldRefIter<'a> {
-    inner: indexmap::map::Values<'a, String, StructField>,
+    inner: indexmap::map::Values<'a, String, Arc<StructField>>,
 }
 
 impl<'a> Iterator for StructFieldRefIter<'a> {
     type Item = &'a StructField;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        self.inner.next().map(Arc::as_ref)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1586,7 +1630,7 @@ impl FusedIterator for StructFieldRefIter<'_> {}
 
 impl DoubleEndedIterator for StructFieldRefIter<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back()
+        self.inner.next_back().map(Arc::as_ref)
     }
 }
 
@@ -1716,7 +1760,7 @@ impl Serialize for StructType {
     {
         StructTypeSerDeHelper {
             type_name: self.type_name.clone(),
-            fields: self.fields.values().cloned().collect(),
+            fields: self.fields().cloned().collect(),
         }
         .serialize(serializer)
     }
@@ -2698,14 +2742,16 @@ impl DataType {
                 ("value", DataType::Map(map)) => &mut map.value_type,
                 (name, DataType::Struct(parent)) => {
                     let lowered = name.to_lowercase();
-                    &mut parent
-                        .field_map_mut()
-                        .values_mut()
-                        .find(|field| field.name().to_lowercase() == lowered)
-                        .ok_or_else(|| {
-                            KernelError::schema(format!("field '{name}' does not exist"))
-                        })?
-                        .data_type
+                    &mut Arc::make_mut(
+                        parent
+                            .field_map_mut()
+                            .values_mut()
+                            .find(|field| field.name().to_lowercase() == lowered)
+                            .ok_or_else(|| {
+                                KernelError::schema(format!("field '{name}' does not exist"))
+                            })?,
+                    )
+                    .data_type
                 }
                 (segment, data_type) => {
                     return Err(KernelError::schema(format!(
@@ -3114,6 +3160,64 @@ mod tests {
         assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
         test_deep_nested_schema_missing_leaf_cm,
     };
+
+    #[test]
+    fn partition_subset_shares_fields_and_isolates_mutation() {
+        let schema = StructType::try_new([
+            StructField::nullable("partition", DataType::STRING),
+            StructField::not_null(
+                "data",
+                StructType::try_new([StructField::nullable("nested", DataType::LONG)
+                    .with_metadata([("custom", MetadataValue::String("kept".into()))])])
+                .unwrap(),
+            ),
+        ])
+        .unwrap();
+        let mut subset = schema.share_selected_fields(|index| index == 1);
+        assert!(Arc::ptr_eq(&schema.fields["data"], &subset.fields["data"]));
+        let expected = StructType::try_new([schema.field("data").unwrap().clone()]).unwrap();
+        assert_eq!(subset, expected);
+        assert_eq!(
+            serde_json::to_value(&subset).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        Arc::make_mut(subset.fields.get_mut("data").unwrap()).nullable = true;
+        assert!(!schema.field("data").unwrap().nullable);
+        assert!(subset.field("data").unwrap().nullable);
+        assert!(!Arc::ptr_eq(&schema.fields["data"], &subset.fields["data"]));
+        let shared = schema.share_selected_fields(|index| index == 1);
+        let mut owned = shared.into_fields().next().unwrap();
+        owned
+            .metadata
+            .insert("added".into(), MetadataValue::Boolean(true));
+        assert!(!schema.field("data").unwrap().metadata.contains_key("added"));
+    }
+
+    #[test]
+    fn partition_subset_reindexes_metadata_columns() {
+        let schema = StructType::try_new([
+            StructField::nullable("partition", DataType::STRING),
+            StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
+            StructField::nullable("value", DataType::LONG),
+        ])
+        .unwrap();
+        let subset = schema.share_selected_fields(|index| index != 0);
+        assert_eq!(
+            subset
+                .fields()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["row_index", "value"]
+        );
+        assert_eq!(
+            subset.index_of_metadata_column(&MetadataColumnSpec::RowIndex),
+            Some(&0)
+        );
+        assert!(Arc::ptr_eq(
+            &schema.fields["row_index"],
+            &subset.fields["row_index"]
+        ));
+    }
 
     #[cfg(feature = "geo-type-in-dev")]
     fn geography(crs: &str, algorithm: EdgeInterpolationAlgorithm) -> PrimitiveType {
@@ -4885,7 +4989,7 @@ mod tests {
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),
-                nested_field_with_metadata,
+                Arc::new(nested_field_with_metadata),
             )]
             .into_iter()
             .collect(),
@@ -4910,7 +5014,7 @@ mod tests {
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),
-                nested_field_with_metadata,
+                Arc::new(nested_field_with_metadata),
             )]
             .into_iter()
             .collect(),
@@ -4936,7 +5040,7 @@ mod tests {
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),
-                nested_field_with_metadata,
+                Arc::new(nested_field_with_metadata),
             )]
             .into_iter()
             .collect(),
