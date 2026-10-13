@@ -5,7 +5,6 @@
 
 use std::sync::{Arc, LazyLock};
 
-use itertools::Itertools;
 use serde_json::Value;
 
 use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
@@ -13,7 +12,6 @@ use crate::engine_data::{GetData, RowVisitor, TypedGetData};
 use crate::expressions::{
     col, column_name, ColumnName, Expression, ExpressionRef, UnaryExpressionOp,
 };
-use crate::log_replay::HasSelectionVector;
 use crate::schema::{
     schema, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
 };
@@ -108,10 +106,8 @@ pub(super) fn checkpoint_stats_schema(
     let actions = snapshot
         .log_segment()
         .read_actions(engine, super::CHECKPOINT_ACTIONS_SCHEMA_V1.clone())?;
-    let mut processor = ActionReconciliationProcessor::new(i64::MAX, None);
-    let reconciled = actions
-        .map(move |batch| processor.process_actions_batch(batch?))
-        .filter_ok(HasSelectionVector::has_selected_rows);
+    let reconciled =
+        ActionReconciliationProcessor::new(i64::MAX, None).process_actions_iter(actions);
     for batch in reconciled {
         visitor.visit_rows_of(batch?.filtered_data.apply_selection_vector()?.as_ref())?;
     }
