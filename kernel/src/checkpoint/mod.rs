@@ -101,7 +101,6 @@
 //! [`Snapshot::create_checkpoint_writer`]: crate::Snapshot::create_checkpoint_writer
 use std::sync::{Arc, LazyLock, Mutex};
 
-use itertools::Itertools;
 use tracing::info;
 use url::Url;
 
@@ -119,7 +118,6 @@ use crate::actions::{
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, Scalar};
 use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::log_replay::HasSelectionVector;
 use crate::path::{self, ParsedLogPath};
 use crate::schema::{lazy_schema_ref, SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
@@ -462,13 +460,11 @@ impl CheckpointWriter {
             .read_actions(engine, self.read_schema.clone())?;
 
         // Process actions through reconciliation
-        let mut processor = ActionReconciliationProcessor::new(
+        let checkpoint_data = ActionReconciliationProcessor::new(
             self.deleted_file_retention_timestamp()?,
             self.get_transaction_expiration_timestamp()?,
-        );
-        let checkpoint_data = actions
-            .map(move |batch| processor.process_actions_batch(batch?))
-            .filter_ok(HasSelectionVector::has_selected_rows);
+        )
+        .process_actions_iter(actions);
 
         // Create the expression evaluator for the checkpoint transform.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).
