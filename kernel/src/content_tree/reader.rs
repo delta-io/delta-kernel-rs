@@ -283,6 +283,8 @@ fn build_entry_to_add_expression(
             // location for non-root entries) is not yet done -- it flows through verbatim, which
             // round-trips only the minimal-root case that stored the raw path.
             n if n == PATH_NAME => Expression::column([LOCATION]),
+            // TODO(#3320): read partition values from the entry's `partition` tuple once the read
+            // path carries a partition spec.
             n if n == PARTITION_VALUES_NAME => empty_partition_values.clone(),
             n if n == SIZE_NAME => Expression::column([FILE_SIZE_IN_BYTES]),
             // The AMT entry carries neither of these; both come from the caller's `ReadContext`.
