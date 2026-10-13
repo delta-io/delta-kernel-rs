@@ -538,6 +538,9 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::content_tree::test_utils::{
+        added_data_entry, entry_batch, struct_batch, with_field,
+    };
     use crate::content_tree::{DeletionVectorInfo, ManifestInfo};
     use crate::engine::arrow_conversion::TryFromArrow as _;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
@@ -545,10 +548,6 @@ mod tests {
     use crate::expressions::StructData;
     use crate::schema::StructType;
     use crate::unit_test_utils::assert_result_error_with_message;
-
-    /// AMT/Iceberg format version stamped on entries; irrelevant to the `Add` output but required
-    /// to build a well-formed [`ContentTreeNodeEntry`].
-    const AMT_FORMAT_VERSION: i32 = 4;
 
     /// The [`ReadContext`] the tests read against; [`expected_add_row`] reads its values back.
     /// Non-default values so a hard-coded `modificationTime` / `dataChange` would fail.
@@ -566,78 +565,6 @@ mod tests {
         ctx: &ReadContext,
     ) -> KernelResult<FilteredEngineData> {
         make_root_entry_converter(engine, ctx)?.convert(entries)
-    }
-
-    /// A minimal-root `Data`/`Added` entry with the given path, size, and row-tracking numbers.
-    fn added_data_entry(
-        path: &str,
-        size: i64,
-        num_records: i64,
-        base_row_id: i64,
-        commit_version: i64,
-    ) -> ContentTreeNodeEntry {
-        ContentTreeNodeEntry {
-            content_type: DataContentType::Data,
-            location: path.to_string(),
-            file_format: DataFileFormat::Parquet,
-            tracking: TrackingInfo {
-                status: TrackingStatus::Added,
-                snapshot_id: Some(1),
-                dv_snapshot_id: None,
-                sequence_number: Some(commit_version),
-                file_sequence_number: Some(commit_version),
-                first_row_id: Some(base_row_id),
-                deleted_positions: None,
-                replaced_positions: None,
-            },
-            deletion_vector: None,
-            spec_id: Some(0),
-            partition: None,
-            sort_order_id: None,
-            record_count: num_records,
-            file_size_in_bytes: size,
-            content_stats: None,
-            manifest_info: None,
-            key_metadata: None,
-            split_offsets: None,
-            equality_ids: None,
-            format_version: AMT_FORMAT_VERSION,
-            tags: None,
-        }
-    }
-
-    /// Builds a content-tree entry batch (input to the read path) from explicit entries.
-    fn entry_batch(engine: &dyn Engine, entries: &[ContentTreeNodeEntry]) -> Box<dyn EngineData> {
-        let structs: Vec<StructData> = entries.iter().cloned().map(Into::into).collect();
-        struct_batch(engine, &structs)
-    }
-
-    /// Builds a content-tree entry batch from already-encoded entry rows, so tests can inject
-    /// on-disk values the typed [`ContentTreeNodeEntry`] cannot express.
-    fn struct_batch(engine: &dyn Engine, entries: &[StructData]) -> Box<dyn EngineData> {
-        let rows: Vec<Vec<Scalar>> = entries.iter().map(|s| s.values().to_vec()).collect();
-        engine
-            .evaluation_handler()
-            .create_many(Arc::new(ContentTreeNodeEntry::to_schema()), rows)
-            .unwrap()
-    }
-
-    /// Returns `data` with the (possibly nested) field at `path` replaced by `value`.
-    fn with_field(data: &StructData, path: &[&str], value: Scalar) -> StructData {
-        let idx = data
-            .fields()
-            .iter()
-            .position(|f| f.name() == path[0])
-            .unwrap();
-        let mut values = data.values().to_vec();
-        values[idx] = match &path[1..] {
-            [] => value,
-            rest => match &values[idx] {
-                Scalar::Struct(child) => Scalar::Struct(with_field(child, rest, value)),
-                other => panic!("field '{}' is not a struct: {other:?}", path[0]),
-            },
-        };
-        StructData::try_new(data.fields().to_vec(), values).unwrap()
     }
 
     /// Runs the read path over `entries`.
