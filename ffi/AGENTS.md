@@ -855,6 +855,9 @@ and a type tag -- without exposing the guarded `delta.*` domain JSON directly. I
 `OptionalValue<usize>`: `None` means not clustered, `Some(0)` means clustered on no columns. The
 type tag reuses the `visit_expression_literal_null` encoding, with 255 for types that don't fit a
 compact tag (struct, array, map, variant, void, and geometry/geography).
+`get_clustering_domain_metadata` returns the complete clustering configuration through an allocator
+callback, preserving extension fields. It returns no value when the clustering feature or active
+domain is absent; generic domain APIs still exclude system domains.
 
 ## Commit Range Flow
 
