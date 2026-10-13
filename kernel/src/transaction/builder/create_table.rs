@@ -100,8 +100,6 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // Dependent features (ColumnMapping, RowTracking, DomainMetadata) are auto-added during
     // create table.
     TableFeature::IcebergCompatV3,
-    // `delta.enableIcebergNativeV4=true` adds the dependent features. The feature signal alone
-    // only marks IcebergNativeV4 as supported.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     TableFeature::IcebergNativeV4Preview,
 ];
@@ -653,8 +651,7 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
     Ok(())
 }
 
-/// Adds the IcebergNativeV4 dependencies when `delta.enableIcebergNativeV4=true`. Missing
-/// values get defaults. Conflicting values return an error.
+/// Adds the IcebergNativeV4 dependencies when `delta.enableIcebergNativeV4=true`.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn maybe_enable_iceberg_native_v4_dependencies(
     validated: &mut ValidatedTableProperties,
@@ -750,10 +747,9 @@ fn maybe_apply_column_mapping_for_table_create(
             // missing piece of that pair, and assign fresh metadata to bare fields (matches
             // delta-spark's `DeltaColumnMapping.assignColumnIdAndPhysicalName`). Seed
             // `max_id` from the schema's existing max so newly assigned IDs cannot collide
-            // with preserved ones. When IcebergCompatV2, IcebergCompatV3, or IcebergNativeV4 is
-            // enabled, also allocate nested ids for `Array.element` and `Map.key`/`Map.value` and
-            // store them under `delta.columnMapping.nested.ids` on the nearest ancestor
-            // `StructField`.
+            // with preserved ones. When an Iceberg compat feature is enabled, also
+            // allocate nested ids for `Array.element` and `Map.key`/`Map.value` and store them
+            // under `delta.columnMapping.nested.ids` on the nearest ancestor `StructField`.
             let assign_nested_field_ids = validated.is_property_true(ENABLE_ICEBERG_COMPAT_V2)
                 || validated.is_property_true(ENABLE_ICEBERG_COMPAT_V3)
                 || validated.is_property_true(ENABLE_ICEBERG_NATIVE_V4);
