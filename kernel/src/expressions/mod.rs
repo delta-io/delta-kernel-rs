@@ -298,6 +298,12 @@ pub trait OpaquePredicateOp: DynPartialEq + std::fmt::Debug {
     /// An output of `None` indicates that this operation does not support conversion to a data
     /// skipping predicate, or was invoked incorrectly (e.g. wrong number and/or types of arguments,
     /// None input, etc.); the operation is disqualified from participating in file pruning.
+    ///
+    /// Rewrites over collation bounds require an exact statistics request through
+    /// [`StatsOptions::with_collation_stats`](crate::scan::StatsOptions::with_collation_stats).
+    /// Keep column references in `exprs` so logical-to-physical mapping can transform them. Missing
+    /// bounds must produce unknown or keep decisions. Use `inverted` to rewrite the comparison;
+    /// negating an already computed "may match" result is unsafe.
     //
     // NOTE: It would be nicer if this method could accept an `Arc<Self>`, in case the data skipping
     // predicate rewrite can reuse the same operation. But sadly, that would not be dyn-compatible.
@@ -327,6 +333,7 @@ pub struct UnaryPredicate {
     pub expr: Box<Expression>,
 }
 
+/// A comparison between two expressions, optionally using connector-defined string semantics.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BinaryPredicate {
     /// The operator.
@@ -335,6 +342,9 @@ pub struct BinaryPredicate {
     pub left: Box<Expression>,
     /// The right-hand side of the operation.
     pub right: Box<Expression>,
+    /// String comparison identifier. Binary evaluators defer annotated comparisons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -656,7 +666,12 @@ impl BinaryPredicate {
     ) -> Self {
         let left = Box::new(left.into());
         let right = Box::new(right.into());
-        Self { op, left, right }
+        Self {
+            op,
+            left,
+            right,
+            collation: None,
+        }
     }
 }
 
@@ -1123,10 +1138,22 @@ impl Predicate {
         lhs: impl Into<Expression>,
         rhs: impl Into<Expression>,
     ) -> Self {
+        Self::Binary(BinaryPredicate::new(op, lhs, rhs))
+    }
+
+    /// Creates `lhs OP rhs` annotated with `collation`, for connector-defined string comparison.
+    ///
+    /// Kernel's binary pruning defers this comparison, including under negation. The identifier
+    /// does not select statistics or enable row evaluation; use an opaque operation for execution.
+    pub fn binary_with_collation(
+        op: BinaryPredicateOp,
+        lhs: impl Into<Expression>,
+        rhs: impl Into<Expression>,
+        collation: impl Into<String>,
+    ) -> Self {
         Self::Binary(BinaryPredicate {
-            op,
-            left: Box::new(lhs.into()),
-            right: Box::new(rhs.into()),
+            collation: Some(collation.into()),
+            ..BinaryPredicate::new(op, lhs, rhs)
         })
     }
 
@@ -1309,8 +1336,20 @@ impl Display for Predicate {
                 op: BinaryPredicateOp::Distinct,
                 left,
                 right,
+                collation: None,
             }) => write!(f, "DISTINCT({left}, {right})"),
-            Binary(BinaryPredicate { op, left, right }) => write!(f, "{left} {op} {right}"),
+            Binary(BinaryPredicate {
+                op,
+                left,
+                right,
+                collation,
+            }) => {
+                write!(f, "{left} {op} {right}")?;
+                if let Some(collation) = collation {
+                    write!(f, " COLLATE {collation}")?;
+                }
+                Ok(())
+            }
             Unary(UnaryPredicate { op, expr }) => match op {
                 UnaryPredicateOp::IsNull => write!(f, "{expr} IS NULL"),
             },

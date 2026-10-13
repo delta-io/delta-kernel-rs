@@ -18,7 +18,8 @@ use crate::schema::{
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::{Engine, KernelError, KernelResult, Result, Snapshot};
 
-const COLLATION_STATS: &str = "statsWithCollation";
+/// Statistics extension keyed by exact versioned collation identifiers.
+pub(crate) const COLLATION_STATS: &str = "statsWithCollation";
 
 /// Returns the complete source parsed-stats schema when it contains collation bounds.
 pub(crate) fn source_collation_stats(schema: &StructType) -> Option<&StructType> {

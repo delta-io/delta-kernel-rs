@@ -1276,6 +1276,8 @@ mod tests {
         get_add_transform_expr, scan_action_iter, InternalScanState, ScanLogReplayProcessor,
         ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
     };
+    use crate::arrow::array::{BooleanArray, RecordBatch};
+    use crate::engine::arrow_expression::opaque::{ArrowOpaquePredicate, ArrowOpaquePredicateOp};
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
         col, column_name, lit, null_lit, BinaryExpressionOp, Expression, OpaquePredicateOp,
@@ -1368,6 +1370,85 @@ mod tests {
         ) -> Option<Predicate> {
             unimplemented!()
         }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct RejectAddsOp;
+
+    impl ArrowOpaquePredicateOp for RejectAddsOp {
+        fn name(&self) -> &str {
+            "reject_adds"
+        }
+
+        fn eval_pred(
+            &self,
+            _args: &[Expression],
+            batch: &RecordBatch,
+            _inverted: bool,
+        ) -> Result<BooleanArray> {
+            Ok(BooleanArray::from(vec![false; batch.num_rows()]))
+        }
+
+        fn eval_pred_scalar(
+            &self,
+            _eval_expr: &ScalarExpressionEvaluator<'_>,
+            _evaluator: &DirectPredicateEvaluator<'_>,
+            _exprs: &[Expr],
+            _inverted: bool,
+        ) -> Result<Option<bool>> {
+            Err(KernelError::unsupported("No scalar evaluation"))
+        }
+
+        fn eval_as_data_skipping_predicate(
+            &self,
+            _evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+            _exprs: &[Expr],
+            _inverted: bool,
+        ) -> Option<bool> {
+            None
+        }
+
+        fn as_data_skipping_predicate(
+            &self,
+            _evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+            _exprs: &[Expr],
+            _inverted: bool,
+        ) -> Option<Predicate> {
+            Some(Predicate::arrow_opaque(Self, []))
+        }
+    }
+
+    #[test]
+    fn opaque_pruning_rejects_adds_before_deduplication_and_records_removes() {
+        let engine = SyncEngine::new();
+        let state = get_state_info(
+            schema_ref! { nullable "value": INTEGER },
+            vec![],
+            Some(Arc::new(Predicate::arrow_opaque(
+                RejectAddsOp,
+                [col!("value")],
+            ))),
+            &[],
+            HashMap::new(),
+            vec![],
+        )
+        .unwrap();
+        let mut processor = ScanLogReplayProcessor::new(
+            &engine,
+            Arc::new(state),
+            test_checkpoint_info(),
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
+        )
+        .unwrap();
+        let metadata = processor
+            .process_actions_batch_sequential(ActionsBatch::new(
+                add_batch_with_remove(COMMIT_READ_SCHEMA.clone()),
+                true,
+            ))
+            .unwrap();
+        assert!(!metadata.scan_files.selection_vector().contains(&true));
+        assert_eq!(processor.seen_file_keys.len(), 1);
     }
 
     // dv-info is more complex to validate, we validate that works in the test for visit_scan_files

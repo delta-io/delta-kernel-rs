@@ -15,7 +15,9 @@ use super::{annotated_field, create_fixture, simple_batch, CollationStats, Colla
 
 const SYNTHETIC_ID: &str = "test.ASCII_CI.1";
 
-#[derive(Clone, Copy, Debug)]
+mod batch_pruning;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Operation {
     Equal,
     Greater,

@@ -387,7 +387,10 @@ pub trait ExpressionTransform<'a> {
     ) -> Self::Output<BinaryPredicate> {
         let left = self.transform_expr(&b.left);
         let right = self.transform_expr(&b.right);
-        let f = |(left, right)| BinaryPredicate::new(b.op, left, right);
+        let f = |(left, right)| BinaryPredicate {
+            collation: b.collation.clone(),
+            ..BinaryPredicate::new(b.op, left, right)
+        };
         map_owned_pair_or_else(b, left, right, f)
     }
 
@@ -640,6 +643,30 @@ mod tests {
                 Cow::Borrowed(name)
             }
         }
+    }
+
+    #[test]
+    fn transformed_collated_comparison_preserves_annotation_and_serialization() {
+        let predicate = Pred::binary_with_collation(
+            crate::expressions::BinaryPredicateOp::Equal,
+            col!("old_col"),
+            lit("alice"),
+            "test.ci.1",
+        );
+        let transformed = ColumnReplacer.transform_pred(&predicate).into_owned();
+        let expected = Pred::binary_with_collation(
+            crate::expressions::BinaryPredicateOp::Equal,
+            col!("new_col"),
+            lit("alice"),
+            "test.ci.1",
+        );
+        assert_eq!(transformed, expected);
+        let json = serde_json::to_string(&transformed).unwrap();
+        assert_eq!(serde_json::from_str::<Pred>(&json).unwrap(), expected);
+        let binary = Pred::eq(col!("old_col"), lit("alice"));
+        let json = serde_json::to_string(&binary).unwrap();
+        assert!(!json.contains("collation"));
+        assert_eq!(serde_json::from_str::<Pred>(&json).unwrap(), binary);
     }
 
     #[test]
