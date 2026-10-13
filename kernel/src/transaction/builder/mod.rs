@@ -38,8 +38,8 @@ pub trait TransactionType: private::Sealed {
 /// Use [`create_table`](super::create_table::create_table),
 /// [`Snapshot::update_table`](crate::Snapshot::update_table), or
 /// [`Snapshot::replace_table`](crate::Snapshot::replace_table) to obtain a builder.
-/// These entry points select [`Imperative`]. With `declarative-plans`, use `with_execution_mode`
-/// to select another mode before building the transaction.
+/// These entry points select [`Imperative`]. With `declarative-plans`, create and update builders
+/// can use `with_execution_mode` to select another mode before building the transaction.
 ///
 /// The operation cannot be changed on a builder:
 ///

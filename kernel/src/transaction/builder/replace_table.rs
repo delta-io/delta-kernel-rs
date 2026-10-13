@@ -2,6 +2,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
+
 use super::create_table::validate_partition_columns;
 use super::state::TransactionBuilderState;
 use super::TransactionBuilder;
@@ -27,12 +29,42 @@ use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{Engine, FilteredEngineData, KernelError, KernelResult};
 
-/// Builds a full-table replacement from a fixed source snapshot and replacement schema.
+/// Metadata changes to apply while replacing all data files.
+#[derive(Debug, Default)]
+pub struct MetadataPatch {
+    schema: Option<SchemaRef>,
+}
+
+impl MetadataPatch {
+    /// Replaces the schema while retaining unspecified table metadata.
+    pub fn with_schema(mut self, schema: SchemaRef) -> Self {
+        self.schema = Some(schema);
+        self
+    }
+}
+
+/// Selects how a full-table replacement constructs its target metadata.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum MetadataPolicy {
+    /// Retains the existing table identity, properties, protocol, and column-mapping mode while
+    /// applying the specified changes. An empty patch leaves metadata unchanged. Retained fields
+    /// keep their mapping IDs and physical names, even when their types change.
+    Patch(MetadataPatch),
+}
+
+impl MetadataPolicy {
+    /// Patches the schema while preserving other metadata and replacing all data files.
+    pub fn patch_schema(schema: SchemaRef) -> Self {
+        Self::Patch(MetadataPatch::default().with_schema(schema))
+    }
+}
+
+/// Builds a full-table replacement from a fixed source snapshot and metadata policy.
 ///
-/// The table identity, properties, protocol, and column-mapping mode are preserved. Fields at
-/// the same logical path retain their mapping IDs and physical names, even when their types
-/// change. This identity policy does not imply type compatibility across table versions. New
-/// fields receive fresh identities; renames and moves are not inferred.
+/// All replacement modes remove the active data files. The supported metadata policy is
+/// [`MetadataPolicy::Patch`]; retained mapping identities do not imply type compatibility across
+/// table versions. New fields receive fresh identities; renames and moves are not inferred.
 ///
 /// cbindgen:ignore
 pub type ReplaceTableTransactionBuilder = TransactionBuilder<ReplaceTable>;
@@ -41,7 +73,7 @@ pub type ReplaceTableTransactionBuilder = TransactionBuilder<ReplaceTable>;
 #[doc(hidden)]
 pub struct ReplaceTableBuilderState {
     snapshot: SnapshotRef,
-    schema: SchemaRef,
+    metadata_policy: MetadataPolicy,
     data_layout: Option<DataLayout>,
 }
 
@@ -54,7 +86,7 @@ impl std::fmt::Debug for TransactionBuilder<ReplaceTable> {
 }
 
 impl TransactionBuilder<ReplaceTable> {
-    pub(crate) fn new(snapshot: SnapshotRef, schema: SchemaRef) -> Self {
+    pub(crate) fn new(snapshot: SnapshotRef, metadata_policy: MetadataPolicy) -> Self {
         Self {
             common_state: TransactionBuilderState {
                 data_change: Some(true),
@@ -62,14 +94,15 @@ impl TransactionBuilder<ReplaceTable> {
             },
             local_state: ReplaceTableBuilderState {
                 snapshot,
-                schema,
+                metadata_policy,
                 data_layout: None,
             },
         }
     }
 
     /// Sets the replacement partition layout. Omission preserves the existing layout.
-    pub fn with_data_layout(mut self, data_layout: DataLayout) -> Self {
+    #[internal_api]
+    pub(crate) fn with_data_layout(mut self, data_layout: DataLayout) -> Self {
         self.local_state.data_layout = Some(data_layout);
         self
     }
@@ -106,58 +139,17 @@ impl TransactionBuilder<ReplaceTable> {
             self.common_state.data_change != Some(false),
             KernelError::invalid_transaction_state("REPLACE TABLE requires data_change to be true")
         );
-        let old_config = self.local_state.snapshot.table_configuration();
+        let ReplaceTableBuilderState {
+            snapshot,
+            metadata_policy,
+            data_layout,
+        } = self.local_state;
+        let old_config = snapshot.table_configuration();
         old_config.ensure_read_write_supported()?;
-        for feature in [
-            TableFeature::ChangeDataFeed,
-            TableFeature::AppendOnly,
-            TableFeature::ClusteredTable,
-            TableFeature::IcebergCompatV1,
-            TableFeature::IcebergCompatV2,
-            TableFeature::IcebergCompatV3,
-            TableFeature::AllowColumnDefaults,
-            TableFeature::AdaptiveMetadataPreview,
-        ] {
-            require!(
-                !old_config.is_feature_enabled(&feature),
-                KernelError::unsupported(format!(
-                    "REPLACE TABLE is not supported with {feature} enabled"
-                ))
-            );
-        }
-        let partition_columns = match self.local_state.data_layout {
-            None => normalize_column_names_to_schema_casing(
-                &self.local_state.schema,
-                &old_config
-                    .logical_partition_columns()
-                    .iter()
-                    .cloned()
-                    .map(|column| ColumnName::new([column]))
-                    .collect::<Vec<_>>(),
-            )
-            .into_iter()
-            .map(|column| column.into_inner().remove(0))
-            .collect(),
-            Some(DataLayout::None) => Vec::new(),
-            Some(DataLayout::Partitioned { columns }) => {
-                let columns =
-                    normalize_column_names_to_schema_casing(&self.local_state.schema, &columns);
-                validate_partition_columns(&self.local_state.schema, &columns)?;
-                columns
-                    .into_iter()
-                    .map(|column| column.into_inner().remove(0))
-                    .collect()
-            }
-            Some(DataLayout::Clustered { .. }) => {
-                return Err(KernelError::unsupported(
-                    "REPLACE TABLE does not support clustered layout",
-                ));
-            }
+        let (config, emit_metadata) = match metadata_policy {
+            MetadataPolicy::Patch(patch) => patch_existing_config(old_config, patch, data_layout)?,
         };
-        let config = replacement_config(old_config, &self.local_state.schema, partition_columns)?;
-        let scan = self
-            .local_state
-            .snapshot
+        let scan = snapshot
             .clone()
             .scan_builder()
             .without_row_transforms()
@@ -170,18 +162,79 @@ impl TransactionBuilder<ReplaceTable> {
             })
             .collect::<KernelResult<Vec<_>>>()?;
         // Reuse Write's source validation and commit setup, then replace its operation and config.
-        let mut builder = self
-            .local_state
-            .snapshot
+        let mut builder = snapshot
             .transaction_builder()
             .with_operation(UpdateTableOperation::Write);
         builder.common_state = self.common_state;
-        let transaction = builder
-            .build(engine, committer)?
-            .with_table_replacement(config, removals);
+        let transaction = builder.build(engine, committer)?.with_table_replacement(
+            config,
+            removals,
+            emit_metadata,
+        );
         transaction.validate_domain_metadata_operations()?;
         Ok(transaction)
     }
+}
+
+fn patch_existing_config(
+    old_config: &TableConfiguration,
+    patch: MetadataPatch,
+    data_layout: Option<DataLayout>,
+) -> KernelResult<(TableConfiguration, bool)> {
+    for feature in [
+        TableFeature::ChangeDataFeed,
+        TableFeature::AppendOnly,
+        TableFeature::ClusteredTable,
+        TableFeature::IcebergCompatV1,
+        TableFeature::IcebergCompatV2,
+        TableFeature::IcebergCompatV3,
+        TableFeature::AllowColumnDefaults,
+        TableFeature::AdaptiveMetadataPreview,
+    ] {
+        require!(
+            !old_config.is_feature_enabled(&feature),
+            KernelError::unsupported(format!(
+                "REPLACE TABLE is not supported with {feature} enabled"
+            ))
+        );
+    }
+    let emit_metadata = patch.schema.is_some() || data_layout.is_some();
+    if !emit_metadata {
+        return Ok((old_config.clone(), false));
+    }
+    let schema = patch.schema.unwrap_or_else(|| old_config.logical_schema());
+    let partition_columns = match data_layout {
+        None => normalize_column_names_to_schema_casing(
+            &schema,
+            &old_config
+                .logical_partition_columns()
+                .iter()
+                .cloned()
+                .map(|column| ColumnName::new([column]))
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(|column| column.into_inner().remove(0))
+        .collect(),
+        Some(DataLayout::None) => Vec::new(),
+        Some(DataLayout::Partitioned { columns }) => {
+            let columns = normalize_column_names_to_schema_casing(&schema, &columns);
+            validate_partition_columns(&schema, &columns)?;
+            columns
+                .into_iter()
+                .map(|column| column.into_inner().remove(0))
+                .collect()
+        }
+        Some(DataLayout::Clustered { .. }) => {
+            return Err(KernelError::unsupported(
+                "REPLACE TABLE does not support clustered layout",
+            ));
+        }
+    };
+    Ok((
+        replacement_config(old_config, &schema, partition_columns)?,
+        true,
+    ))
 }
 
 fn replacement_config(
@@ -383,6 +436,7 @@ impl<'a> SchemaTransform<'a> for TransferMappings<'_> {
 mod tests {
     use test_utils::{actions_to_string, add_commit, engine_store_setup, TestAction};
 
+    use super::MetadataPolicy;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::snapshot::Snapshot;
@@ -425,16 +479,18 @@ mod tests {
 
         let txn = snapshot
             .clone()
-            .replace_table(snapshot.schema())
+            .replace_table(MetadataPolicy::patch_schema(snapshot.schema()))
             .build(&engine, Box::new(FileSystemCommitter::new()))?;
         assert_eq!(
-            txn.remove_files_metadata
+            txn.staged_data_changes
+                .remove_files_metadata
                 .iter()
                 .map(|batch| batch.data().len())
                 .sum::<usize>(),
             1
         );
         assert!(txn
+            .staged_data_changes
             .remove_files_metadata
             .iter()
             .all(|batch| batch.selection_vector().is_empty()));

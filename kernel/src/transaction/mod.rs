@@ -72,7 +72,7 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
-pub use builder::replace_table::ReplaceTableTransactionBuilder;
+pub use builder::replace_table::{MetadataPatch, MetadataPolicy, ReplaceTableTransactionBuilder};
 pub use builder::update_table::UpdateTableTransactionBuilder;
 use builder::TransactionBuilderState;
 pub use builder::{TransactionBuilder, TransactionType};
@@ -654,11 +654,12 @@ impl Transaction<UpdateTable> {
         mut self,
         config: TableConfiguration,
         removals: Vec<FilteredEngineData>,
+        emit_metadata: bool,
     ) -> Self {
         self.effective_table_config = config;
-        self.should_emit_metadata = true;
+        self.should_emit_metadata = emit_metadata;
         self.operation = Some(CommitOperation::Replace);
-        self.remove_files_metadata = removals;
+        self.staged_data_changes.remove_files_metadata = removals;
         // Replacing every row leaves no old row IDs or commit versions to preserve.
         self.row_tracking_preservation_acknowledged = true;
         self

@@ -46,7 +46,8 @@ use crate::table_features::{physical_to_logical_column_name_and_type, Operation,
 use crate::table_properties::CheckConstraint;
 use crate::table_properties::TableProperties;
 use crate::transaction::{
-    ReplaceTableTransactionBuilder, UpdateTableOperation, UpdateTableTransactionBuilder,
+    MetadataPolicy, ReplaceTableTransactionBuilder, UpdateTableOperation,
+    UpdateTableTransactionBuilder,
 };
 use crate::utils::require;
 use crate::{Engine, KernelError, KernelResult, LogCompactionWriter, Version};
@@ -1323,14 +1324,19 @@ impl Snapshot {
         UpdateTableTransactionBuilder::new(self, operation, engine_info.into(), data_change)
     }
 
-    /// Creates a builder that replaces the table schema and all active data files.
+    /// Creates a builder that replaces all active data files and changes the table definition.
     ///
-    /// The existing table identity, properties, and protocol are preserved. Properties referencing
-    /// dropped columns remain unchanged; schemas requiring a new table feature are rejected.
-    /// A data layout supplied to the builder replaces the current partitioning; otherwise it is
-    /// inherited. The builder validates the replacement and stages old-file removals during build.
-    pub fn replace_table(self: Arc<Self>, schema: SchemaRef) -> ReplaceTableTransactionBuilder {
-        ReplaceTableTransactionBuilder::new(self, schema)
+    /// [`MetadataPolicy::Patch`] preserves unspecified metadata, including properties and
+    /// protocol. An empty patch replaces only the data files, without emitting a metadata action.
+    /// Properties referencing dropped columns remain unchanged; schemas requiring a new table
+    /// feature are rejected. Under `internal-api`, a data layout supplied to the builder replaces
+    /// the current partitioning; otherwise it is inherited. The builder stages old-file removals
+    /// during build.
+    pub fn replace_table(
+        self: Arc<Self>,
+        metadata_policy: MetadataPolicy,
+    ) -> ReplaceTableTransactionBuilder {
+        ReplaceTableTransactionBuilder::new(self, metadata_policy)
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.

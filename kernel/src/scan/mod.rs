@@ -535,7 +535,8 @@ impl ScanBuilder {
     ///
     /// The kernel then skips building the per-file transform expressions and the per-row
     /// partition-value parse done only to build them. The returned `scan_file_transforms` is left
-    /// empty (each row's transform is `None`); use [`Scan::scan_metadata`] for listing.
+    /// empty (each row's transform is `None`); use [`Scan::scan_metadata`] for listing. On
+    /// empty-schema tables, this permits metadata-only scans; [`Scan::execute`] still errors.
     ///
     /// With this set the engine must itself apply every physical-to-logical fixup the transform
     /// would normally perform: partition column injection, column-mapping renames, generated Row
@@ -591,7 +592,8 @@ impl ScanBuilder {
         // Predicates may reference columns outside self.logical_read_schema, so resolve against the
         // full table schema
         let table_schema = self.snapshot.schema();
-        // Empty-schema tables cannot be read as rows, but their file metadata can be listed.
+        // A zero-column row scan cannot derive row counts and can panic in the arrow layer.
+        // Metadata-only scans do not read rows, so they can still list files.
         if table_schema.num_fields() == 0 && !self.without_row_transforms {
             return Err(KernelError::generic(
                 "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \

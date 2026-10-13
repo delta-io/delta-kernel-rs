@@ -21,7 +21,9 @@ use delta_kernel::schema::{
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::{CommitResult, UpdateTableOperation, WriteState};
+use delta_kernel::transaction::{
+    CommitResult, MetadataPatch, MetadataPolicy, UpdateTableOperation, WriteState,
+};
 use delta_kernel::{Engine, FilteredEngineData, KernelResult, KernelResultIterator};
 use rstest::rstest;
 use test_utils::{
@@ -44,7 +46,7 @@ async fn replace_empty_schema_table_with_data() -> Result<(), Box<dyn std::error
 
     let schema = schema_ref! { nullable "amount": INTEGER };
     let mut txn = empty
-        .replace_table(schema)
+        .replace_table(MetadataPolicy::patch_schema(schema))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let context = txn.write_state()?.write_context_builder().build()?;
     let batch = RecordBatch::try_new(
@@ -66,6 +68,62 @@ async fn replace_empty_schema_table_with_data() -> Result<(), Box<dyn std::error
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_table_with_empty_metadata_patch_replaces_only_data(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, path, engine) = test_table_setup_mt()?;
+    let schema = schema_ref! { nullable "amount": INTEGER };
+    let snapshot = create_table_and_load_snapshot(
+        &path,
+        schema.clone(),
+        engine.as_ref(),
+        &[("app.property", "preserved")],
+    )?;
+    let old_batch = RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![1, 2]))],
+    )?;
+    let snapshot =
+        write_batch_to_table(&snapshot, engine.as_ref(), old_batch, HashMap::new()).await?;
+    let old_metadata = snapshot.table_configuration().metadata().clone();
+
+    let mut txn = snapshot
+        .replace_table(MetadataPolicy::Patch(MetadataPatch::default()))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let context = txn.write_state()?.write_context_builder().build()?;
+    assert_eq!(context.logical_data_schema(), &schema);
+    let new_batch = RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![3]))],
+    )?;
+    txn.add_files(
+        engine
+            .write_parquet(&ArrowEngineData::new(new_batch), &context)
+            .await?,
+    );
+    let post = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let table_url = Url::from_directory_path(&path).unwrap();
+    assert!(read_actions_from_commit(&table_url, post.version(), "metaData")?.is_empty());
+    assert_eq!(
+        read_actions_from_commit(&table_url, post.version(), "remove")?.len(),
+        1
+    );
+    let reloaded = Snapshot::builder_for(&path).build(engine.as_ref())?;
+    assert_eq!(reloaded.table_configuration().metadata(), &old_metadata);
+    let batches = read_scan(&reloaded.scan_builder().build()?, engine)?;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        3
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replacement_builder_accepts_snapshot_lsn_before_writes(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup_mt()?;
@@ -79,14 +137,14 @@ async fn replacement_builder_accepts_snapshot_lsn_before_writes(
     assert_result_error_with_message(
         snapshot
             .clone()
-            .replace_table(schema.clone())
+            .replace_table(MetadataPolicy::patch_schema(schema.clone()))
             .with_data_change(false)
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
         "data_change",
     );
     let snapshot_lsn = 7_i64;
     let txn = snapshot
-        .replace_table(schema.clone())
+        .replace_table(MetadataPolicy::patch_schema(schema.clone()))
         .with_data_layout(DataLayout::None)
         .with_engine_info("wal2delta")
         .with_transaction_id("app", snapshot_lsn)
@@ -177,7 +235,9 @@ async fn replace_table_catalog_managed_forwards_metadata_and_preserves_required_
         previous: old_config.metadata().clone(),
     };
     let mut txn = snapshot
-        .replace_table(schema_ref! { not_null "amount": STRING })
+        .replace_table(MetadataPolicy::patch_schema(
+            schema_ref! { not_null "amount": STRING },
+        ))
         .build(engine.as_ref(), Box::new(committer))?;
     let context = txn.write_state()?.write_context_builder().build()?;
     let replacement = RecordBatch::try_new(
@@ -245,7 +305,9 @@ async fn replace_table_assigns_fresh_row_tracking_metadata(
     let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
     let old_adds = read_actions_from_commit(&table_url, 1, "add")?;
     let mut txn = snapshot
-        .replace_table(schema_ref! { nullable "amount": STRING })
+        .replace_table(MetadataPolicy::patch_schema(
+            schema_ref! { nullable "amount": STRING },
+        ))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let context = txn.write_state()?.write_context_builder().build()?;
     let batch = RecordBatch::try_new(
@@ -300,7 +362,7 @@ async fn replace_table_requires_cdf_and_append_only_disabled(
     )?;
     let protocol = snapshot.table_configuration().protocol().clone();
     let result = snapshot
-        .replace_table(schema)
+        .replace_table(MetadataPolicy::patch_schema(schema))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
     if enabled {
         assert_result_error_with_message(result, feature);
@@ -381,7 +443,7 @@ async fn replace_table_replaces_all_rows_and_preserves_retained_column_identity(
     let replacement = schema_ref! { nullable "added": INTEGER, (amount) };
     let mut txn = snapshot
         .clone()
-        .replace_table(replacement)
+        .replace_table(MetadataPolicy::patch_schema(replacement))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let context = txn.write_state()?.write_context_builder().build()?;
     assert_eq!(
@@ -522,12 +584,14 @@ async fn replace_table_normalizes_partition_casing_and_distinguishes_omitted_lay
     assert_result_error_with_message(
         snapshot
             .clone()
-            .replace_table(schema_ref! { nullable "amount": INTEGER, nullable "other": STRING })
+            .replace_table(MetadataPolicy::patch_schema(
+                schema_ref! { nullable "amount": INTEGER, nullable "other": STRING },
+            ))
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
         "not found",
     );
     let snapshot = snapshot
-        .replace_table(schema.clone())
+        .replace_table(MetadataPolicy::patch_schema(schema.clone()))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
@@ -537,7 +601,7 @@ async fn replace_table_normalizes_partition_casing_and_distinguishes_omitted_lay
     );
     let schema = schema_ref! { nullable "amount": INTEGER, nullable "region": STRING };
     let snapshot = snapshot
-        .replace_table(schema.clone())
+        .replace_table(MetadataPolicy::patch_schema(schema.clone()))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
@@ -546,7 +610,7 @@ async fn replace_table_normalizes_partition_casing_and_distinguishes_omitted_lay
         &["region"]
     );
     let snapshot = snapshot
-        .replace_table(schema.clone())
+        .replace_table(MetadataPolicy::patch_schema(schema.clone()))
         .with_data_layout(DataLayout::None)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
@@ -556,7 +620,7 @@ async fn replace_table_normalizes_partition_casing_and_distinguishes_omitted_lay
         .logical_partition_columns()
         .is_empty());
     let snapshot = snapshot
-        .replace_table(schema)
+        .replace_table(MetadataPolicy::patch_schema(schema))
         .with_data_layout(DataLayout::Partitioned {
             columns: vec![column_name!("REGION")],
         })
@@ -620,7 +684,9 @@ async fn replace_table_changes_partitioning_from_checkpoint(
         vec![]
     };
     let mut txn = snapshot
-        .replace_table(schema_ref! { nullable "amount": STRING, nullable "new_part": INTEGER })
+        .replace_table(MetadataPolicy::patch_schema(
+            schema_ref! { nullable "amount": STRING, nullable "new_part": INTEGER },
+        ))
         .with_data_layout(if partitioned {
             DataLayout::Partitioned {
                 columns: vec![column_name!("new_part")],
@@ -723,7 +789,7 @@ async fn replace_table_preserves_nested_mappings(
         .table_properties()
         .column_mapping_max_column_id;
     let unchanged = snapshot
-        .replace_table(original_schema.clone())
+        .replace_table(MetadataPolicy::patch_schema(original_schema.clone()))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
@@ -737,7 +803,7 @@ async fn replace_table_preserves_nested_mappings(
     );
     let replacement = schema_ref! { (StructField::nullable("container", wrap(replacement_container, schema! { nullable "added": STRING, nullable "kept": STRING }))) };
     let mut txn = unchanged
-        .replace_table(replacement)
+        .replace_table(MetadataPolicy::patch_schema(replacement))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let batch = if replacement_container == "array" {
         let context = txn.write_state()?.write_context_builder().build()?;
@@ -859,7 +925,9 @@ async fn replace_table_preserves_case_only_mapping_identity(
         outer.metadata = old_outer.metadata.clone();
     }
     let post = snapshot
-        .replace_table(Arc::new(StructType::try_new([outer])?))
+        .replace_table(MetadataPolicy::patch_schema(Arc::new(StructType::try_new(
+            [outer],
+        )?)))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
@@ -891,13 +959,13 @@ async fn replace_table_rejects_noncanonical_variant_before_write_state(
     assert_result_error_with_message(
         snapshot
             .clone()
-            .replace_table(invalid)
+            .replace_table(MetadataPolicy::patch_schema(invalid))
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
         "canonical unshredded variant",
     );
 
     let txn = snapshot
-        .replace_table(schema.clone())
+        .replace_table(MetadataPolicy::patch_schema(schema.clone()))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let write_state = txn.write_state()?;
     let decoded = WriteState::decode(&write_state.encode()?)?;
@@ -951,7 +1019,7 @@ async fn replace_table_rejects_invalid_replacement_before_commit(
     };
     assert_result_error_with_message(
         snapshot
-            .replace_table(replacement)
+            .replace_table(MetadataPolicy::patch_schema(replacement))
             .with_data_layout(layout)
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
         error,
@@ -985,7 +1053,9 @@ async fn replace_table_rejects_conflicting_mapping_annotations(
         .add_metadata([(key.as_ref(), value)]);
     assert_result_error_with_message(
         snapshot
-            .replace_table(Arc::new(StructType::try_new([field])?))
+            .replace_table(MetadataPolicy::patch_schema(Arc::new(StructType::try_new(
+                [field],
+            )?)))
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
         "Conflicting",
     );
@@ -1009,7 +1079,9 @@ async fn replace_table_conflicts_with_concurrent_add() -> Result<(), Box<dyn std
     let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), old, HashMap::new()).await?;
     let txn = snapshot
         .clone()
-        .replace_table(schema_ref! { nullable "replacement": STRING })
+        .replace_table(MetadataPolicy::patch_schema(
+            schema_ref! { nullable "replacement": STRING },
+        ))
         .with_domain_metadata("app.version", "loser")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let mut winner = snapshot
@@ -1072,7 +1144,9 @@ async fn replace_table_removes_dv_files_with_original_metadata(
     assert_eq!(original.len(), 1);
     let post = snapshot
         .clone()
-        .replace_table(schema_ref! { nullable "replacement": STRING })
+        .replace_table(MetadataPolicy::patch_schema(
+            schema_ref! { nullable "replacement": STRING },
+        ))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
@@ -1109,7 +1183,9 @@ async fn replace_table_cannot_bypass_source_invariants() -> Result<(), Box<dyn s
     let snapshot = Snapshot::builder_for(location).build(&engine)?;
     assert_result_error_with_message(
         snapshot
-            .replace_table(schema_ref! { nullable "replacement": STRING })
+            .replace_table(MetadataPolicy::patch_schema(
+                schema_ref! { nullable "replacement": STRING },
+            ))
             .build(&engine, Box::new(FileSystemCommitter::new())),
         "invariants",
     );
@@ -1137,7 +1213,9 @@ async fn replace_table_rejects_schema_dependent_features(
     let snapshot = Snapshot::builder_for(location).build(&engine)?;
     assert_result_error_with_message(
         snapshot
-            .replace_table(schema_ref! { nullable "replacement": STRING })
+            .replace_table(MetadataPolicy::patch_schema(
+                schema_ref! { nullable "replacement": STRING },
+            ))
             .build(&engine, Box::new(FileSystemCommitter::new())),
         feature,
     );
@@ -1165,7 +1243,9 @@ async fn replace_table_does_not_recycle_dropped_mapping_ids(
         .unwrap();
     assert_eq!(dropped.column_mapping_id(), Some(original_max));
     let post = snapshot
-        .replace_table(schema_ref! { nullable "kept": INTEGER })
+        .replace_table(MetadataPolicy::patch_schema(
+            schema_ref! { nullable "kept": INTEGER },
+        ))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
@@ -1176,7 +1256,9 @@ async fn replace_table_does_not_recycle_dropped_mapping_ids(
         Some(original_max)
     );
     let post = post
-        .replace_table(schema_ref! { nullable "kept": INTEGER, nullable "dropped": INTEGER })
+        .replace_table(MetadataPolicy::patch_schema(
+            schema_ref! { nullable "kept": INTEGER, nullable "dropped": INTEGER },
+        ))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
