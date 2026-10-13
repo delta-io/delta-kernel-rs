@@ -41,7 +41,8 @@ use crate::table_features::{
 use crate::table_properties::COLUMN_MAPPING_MODE;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_properties::{
-    ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
+    ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_NATIVE_V4, ENABLE_IN_COMMIT_TIMESTAMPS,
+    ENABLE_ROW_TRACKING,
 };
 use crate::transaction::create_table::create_table;
 use crate::transaction::{CreateTable, Transaction, BASE_ADD_FILES_SCHEMA};
@@ -542,6 +543,7 @@ impl MockTableConfigurationBuilder {
 }
 
 /// Builds an adaptive-metadata configuration from a column-mapped schema and extra features.
+/// Listing `icebergNativeV4-preview` in `extra_features` also enables it via its property.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) fn adaptive_metadata_table_configuration(
     schema: SchemaRef,
@@ -555,14 +557,18 @@ pub(crate) fn adaptive_metadata_table_configuration(
         TableFeature::DomainMetadata,
         TableFeature::InCommitTimestamp,
     ];
+    let mut properties = vec![
+        (ENABLE_ROW_TRACKING, "true"),
+        (ENABLE_DELETION_VECTORS, "true"),
+        (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
+    ];
+    if extra_features.contains(&TableFeature::IcebergNativeV4Preview) {
+        properties.push((ENABLE_ICEBERG_NATIVE_V4, "true"));
+    }
     MockTableConfigurationBuilder::new()
         .with_schema(schema)
         .with_column_mapping(ColumnMappingMode::Id)
-        .with_properties([
-            (ENABLE_ROW_TRACKING, "true"),
-            (ENABLE_DELETION_VECTORS, "true"),
-            (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
-        ])
+        .with_properties(properties)
         .with_protocol(
             MockProtocolBuilder::new()
                 .with_features(features.iter().chain(extra_features))

@@ -17,6 +17,8 @@ use delta_kernel_derive::internal_api;
 pub(crate) use geospatial::validate_geospatial_feature_support;
 pub(crate) use iceberg_compat::v2::V2_VALIDATOR;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) use iceberg_compat::v4::V4_VALIDATOR;
 pub(crate) use iceberg_compat::{
     validate_iceberg_compat_if_needed, IcebergCompatValidationContext,
 };
@@ -512,13 +514,51 @@ static ICEBERG_NATIVE_V4_PREVIEW_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::NotEnabled(TableFeature::CheckConstraints),
         FeatureRequirement::NotEnabled(TableFeature::GeneratedColumns),
         FeatureRequirement::NotEnabled(TableFeature::IdentityColumns),
+        FeatureRequirement::Custom(check_iceberg_native_v4_allowed_writer_features),
     ],
     #[cfg(feature = "adaptive-metadata-in-dev")]
     kernel_support: KernelSupport::Supported,
     #[cfg(not(feature = "adaptive-metadata-in-dev"))]
     kernel_support: KernelSupport::NotSupported,
-    enablement_check: EnablementCheck::AlwaysIfSupported,
+    enablement_check: EnablementCheck::EnabledIf(|props| {
+        props.enable_iceberg_native_v4 == Some(true)
+    }),
 };
+
+/// Writer features an `icebergNativeV4-preview` table may list, per the RFC allow-list.
+const ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURES: &[TableFeature] = &[
+    TableFeature::IcebergNativeV4Preview,
+    TableFeature::AdaptiveMetadataPreview,
+    TableFeature::ColumnMapping,
+    TableFeature::DeletionVectors,
+    TableFeature::RowTracking,
+    TableFeature::DomainMetadata,
+    TableFeature::InCommitTimestamp,
+    TableFeature::VacuumProtocolCheck,
+    TableFeature::ClusteredTable,
+    TableFeature::TimestampWithoutTimezone,
+    TableFeature::TypeWidening,
+    TableFeature::TypeWideningPreview,
+    TableFeature::VariantType,
+    TableFeature::VariantTypePreview,
+    TableFeature::VariantShredding,
+    TableFeature::VariantShreddingPreview,
+    TableFeature::GeospatialType,
+    TableFeature::CatalogManaged,
+    TableFeature::CatalogOwnedPreview,
+    // Redundant with IcebergNativeV4, so it is allowed. The RFC list does not include it.
+    TableFeature::MaterializePartitionColumns,
+    // Allowed only while inactive. The `NotEnabled` requirements check this.
+    TableFeature::AppendOnly,
+    TableFeature::ChangeDataFeed,
+    TableFeature::Invariants,
+    TableFeature::CheckConstraints,
+    TableFeature::GeneratedColumns,
+    TableFeature::IdentityColumns,
+    TableFeature::IcebergCompatV1,
+    TableFeature::IcebergCompatV2,
+    TableFeature::IcebergCompatV3,
+];
 
 static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
@@ -977,6 +1017,22 @@ pub(crate) fn ensure_table_can_be_read(protocol: &Protocol) -> KernelResult<()> 
         }
     }
 
+    Ok(())
+}
+
+fn check_iceberg_native_v4_allowed_writer_features(
+    protocol: &Protocol,
+    _properties: &TableProperties,
+) -> KernelResult<()> {
+    let writer_features = protocol.writer_features().unwrap_or_default();
+    if let Some(feature) = writer_features
+        .iter()
+        .find(|f| !ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURES.contains(*f))
+    {
+        return Err(KernelError::invalid_protocol(format!(
+            "Feature 'icebergNativeV4-preview' requires '{feature}' to not be supported"
+        )));
+    }
     Ok(())
 }
 
