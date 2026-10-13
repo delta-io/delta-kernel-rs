@@ -29,8 +29,8 @@ use crate::scan::log_replay::{
     PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
 };
 use crate::schema::{
-    ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType,
-    ToSchema as _,
+    ArrayType, ColumnNamesAndTypes, DataType, MapType, MetadataColumnSpec, SchemaRef, StructField,
+    StructType, ToSchema as _,
 };
 use crate::{Engine, ExpressionEvaluator, FileMeta, KernelError, KernelResult};
 
@@ -111,6 +111,40 @@ impl LeafRef {
             manifest_dv: manifest_dv.map(Bytes::copy_from_slice),
             format_version: fields[3].get(row, FORMAT_VERSION)?,
         })
+    }
+}
+
+/// Name of the leaf read's `_file` metadata column, which tags each batch with the leaf it came
+/// from.
+const FILE_PATH_COLUMN: &str = "_file";
+
+/// Name of the leaf read's row-index metadata column: each entry's position within its leaf, the
+/// position a manifest deletion vector or backreference refers to.
+const ROW_INDEX_COLUMN: &str = "_row_index";
+
+/// The schemas AMT root and leaf manifests are read with.
+struct ManifestReadSchemas {
+    /// Root manifest read schema: [`ContentTreeNodeEntry::to_schema`].
+    root: SchemaRef,
+    /// Leaf manifest read schema: [`Self::root`] plus the [`FILE_PATH_COLUMN`] and
+    /// [`ROW_INDEX_COLUMN`] metadata columns. Root entries need neither: they are never addressed
+    /// by position.
+    leaf: SchemaRef,
+}
+
+impl ManifestReadSchemas {
+    /// Builds the manifest read schemas.
+    fn new() -> Self {
+        let entry_schema = Arc::new(ContentTreeNodeEntry::to_schema());
+        let metadata = [
+            StructField::create_metadata_column(FILE_PATH_COLUMN, MetadataColumnSpec::FilePath),
+            StructField::create_metadata_column(ROW_INDEX_COLUMN, MetadataColumnSpec::RowIndex),
+        ];
+        let leaf = StructType::new_unchecked(entry_schema.fields().cloned().chain(metadata));
+        Self {
+            root: entry_schema,
+            leaf: Arc::new(leaf),
+        }
     }
 }
 
@@ -673,17 +707,24 @@ impl RowVisitor for FirstRowIdVisitor {
 
 #[cfg(test)]
 mod tests {
+    use std::slice;
+
     use rstest::rstest;
 
     use super::*;
+    use crate::arrow::array::{AsArray as _, RecordBatch};
+    use crate::arrow::compute::concat_batches;
+    use crate::arrow::datatypes::Int64Type;
     use crate::content_tree::test_utils::{
         added_data_entry, data_manifest_entry, entry_batch, struct_batch, with_field,
+        write_manifest,
     };
     use crate::content_tree::{DeletionVectorInfo, ManifestInfo};
     use crate::engine::arrow_conversion::TryFromArrow as _;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::StructData;
+    use crate::object_store::memory::InMemory;
     use crate::schema::StructType;
     use crate::unit_test_utils::assert_result_error_with_message;
 
@@ -908,6 +949,59 @@ mod tests {
         let batch = struct_batch(&engine, &[with_field(&entry.into(), path, value)]);
         let mut visitor = LeafRefVisitor::new(&table_root);
         assert_result_error_with_message(visitor.visit_rows_of(batch.as_ref()), message);
+    }
+
+    // === Manifest read schemas ===
+
+    #[test]
+    fn manifest_read_schemas_add_leaf_metadata_columns() {
+        let entry_schema = Arc::new(ContentTreeNodeEntry::to_schema());
+        let schemas = ManifestReadSchemas::new();
+
+        assert_eq!(schemas.root, entry_schema);
+        let leaf: Vec<_> = schemas.leaf.fields().collect();
+        let (entries, metadata) = leaf.split_at(leaf.len() - 2);
+        assert_eq!(entries, entry_schema.fields().collect::<Vec<_>>());
+        let specs: Vec<_> = metadata
+            .iter()
+            .map(|f| f.get_metadata_column_spec())
+            .collect();
+        assert_eq!(
+            specs,
+            [
+                Some(MetadataColumnSpec::FilePath),
+                Some(MetadataColumnSpec::RowIndex)
+            ]
+        );
+    }
+
+    #[test]
+    fn leaf_read_schema_reads_file_and_row_index() {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let location = Url::parse("memory:///table/metadata/leaf.parquet").unwrap();
+        let entries = [
+            added_data_entry("a.parquet", 1, 1, 0, 0),
+            added_data_entry("b.parquet", 1, 1, 1, 0),
+        ];
+        let file = write_manifest(&engine, location.clone(), &entries);
+        let schemas = ManifestReadSchemas::new();
+
+        let batches: Vec<RecordBatch> = engine
+            .parquet_handler()
+            .read_parquet_files(slice::from_ref(&file), schemas.leaf.clone(), None)
+            .unwrap()
+            .map(|batch| batch.unwrap().try_into_record_batch().unwrap())
+            .collect();
+        let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+        let column = |name: &str| batch.column_by_name(name).unwrap().clone();
+        let files: Vec<_> = column(FILE_PATH_COLUMN)
+            .as_string::<i32>()
+            .iter()
+            .map(|file| file.unwrap().to_owned())
+            .collect();
+        assert_eq!(files, vec![location.to_string(); 2]);
+        let rows = column(ROW_INDEX_COLUMN);
+        assert_eq!(rows.as_primitive::<Int64Type>().values(), &[0, 1]);
     }
 
     #[test]
