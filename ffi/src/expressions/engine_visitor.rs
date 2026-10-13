@@ -744,7 +744,12 @@ fn visit_predicate_impl(
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
-        Predicate::Binary(BinaryPredicate { op, left, right }) => {
+        Predicate::Binary(BinaryPredicate {
+            collation: Some(_), ..
+        }) => visit_unknown(visitor, sibling_list_id, "collated comparison"),
+        Predicate::Binary(BinaryPredicate {
+            op, left, right, ..
+        }) => {
             let child_list_id = call!(visitor, make_field_list, 2);
             visit_expression_impl(visitor, left, child_list_id);
             visit_expression_impl(visitor, right, child_list_id);
@@ -996,6 +1001,26 @@ mod tests {
             vec![LiteralEvent::Column {
                 sibling_list_id: 0,
                 parts: vec!["a".to_string(), "b.c".to_string(), "d".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn visit_collated_comparison_defers_without_visiting_binary_operands() {
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+        let predicate = Predicate::binary_with_collation(
+            BinaryPredicateOp::Equal,
+            Expression::column(["name"]),
+            lit("alice"),
+            "test.ci.1",
+        );
+        visit_predicate_internal(&Predicate::not(predicate), &mut visitor);
+        assert_eq!(
+            builder.events,
+            vec![LiteralEvent::Unknown {
+                sibling_list_id: 1,
+                name: "collated comparison".to_string(),
             }]
         );
     }
