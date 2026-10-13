@@ -22,7 +22,8 @@ use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{KernelError, KernelResult, Snapshot};
 
-const COLLATION_STATS: &str = "statsWithCollation";
+/// Statistics extension keyed by exact versioned collation identifiers.
+pub(crate) const COLLATION_STATS: &str = "statsWithCollation";
 
 /// Returns the source collation stats field, if present in parsed checkpoint stats.
 pub(crate) fn source_collation_stats(schema: &StructType) -> Option<&StructField> {
