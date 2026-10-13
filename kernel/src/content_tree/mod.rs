@@ -12,15 +12,16 @@ pub(crate) mod stats;
 pub(crate) mod test_utils;
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use bytes::Bytes;
 use delta_kernel_derive::ToSchema;
 use url::Url;
 
-use crate::engine_data::EngineData;
+use crate::engine_data::{EngineData, GetData, TypedGetData as _};
 use crate::expressions::{null_lit, Expression, Scalar, StructData};
 use crate::schema::derive_macro_utils::ToDataType;
-use crate::schema::{DataType, StructType};
+use crate::schema::{ColumnNamesAndTypes, DataType, StructType, ToSchema as _};
 use crate::{KernelError, KernelResult, Version};
 
 /// Field names in the [`ContentTreeNodeEntry`] schema.
@@ -36,6 +37,9 @@ pub(crate) const RECORD_COUNT: &str = "recordCount";
 pub(crate) const FILE_SIZE_IN_BYTES: &str = "fileSizeInBytes";
 pub(crate) const CONTENT_STATS_FIELD_NAME: &str = "content_stats";
 pub(crate) const MANIFEST_INFO: &str = "manifestInfo";
+/// Field names within the [`ManifestInfo`] sub-struct.
+pub(crate) const MANIFEST_DV: &str = "dv";
+pub(crate) const MANIFEST_DV_CARDINALITY: &str = "dvCardinality";
 pub(crate) const KEY_METADATA: &str = "keyMetadata";
 pub(crate) const SPLIT_OFFSETS: &str = "splitOffsets";
 pub(crate) const COLUMN_FILES: &str = "columnFiles";
@@ -55,6 +59,8 @@ pub(crate) const MODIFIED_SNAPSHOT_ID: &str = "modifiedSnapshotId";
 pub(crate) const SEQUENCE_NUMBER: &str = "sequenceNumber";
 pub(crate) const FILE_SEQUENCE_NUMBER: &str = "fileSequenceNumber";
 pub(crate) const FIRST_ROW_ID: &str = "firstRowId";
+pub(crate) const DELETED_POSITIONS: &str = "deletedPositions";
+pub(crate) const REPLACED_POSITIONS: &str = "replacedPositions";
 
 /// Field names for the different fields within content_stats.
 pub(crate) const LOWER_BOUND: &str = "lower_bound";
@@ -114,7 +120,7 @@ pub(crate) struct DeletionVectorInfo {
 /// of the history of a file in the AMT (its current state,
 /// a sequence number for when it was added, etc).
 #[derive(Debug, Clone, ToSchema)]
-#[cfg_attr(test, derive(delta_kernel_derive::IntoStructData))]
+#[cfg_attr(test, derive(PartialEq, delta_kernel_derive::IntoStructData))]
 pub struct TrackingInfo {
     /// Whether this entry is added, existing, or deleted.
     #[field_id = 0]
@@ -160,6 +166,45 @@ pub struct TrackingInfo {
     // TODO: always `None` until DvCache tracks replaced positions in a later change.
     #[field_id = 7]
     pub(crate) replaced_positions: Option<Bytes>,
+}
+
+/// The `tracking.*` leaf columns [`TrackingInfo::try_from_getters`] reads, in getter order.
+pub(crate) static TRACKING_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| TrackingInfo::to_schema().leaves(TRACKING));
+
+impl TrackingInfo {
+    /// Parses one row's `tracking` struct from `getters`, which must follow [`TRACKING_COLUMNS`]
+    /// order.
+    ///
+    /// # Errors
+    /// Returns an error if the getter count differs from [`TRACKING_COLUMNS`], if `status` is null
+    /// or not a known [`TrackingStatus`], or if a getter yields a value of the wrong type.
+    pub(crate) fn try_from_getters<'a>(
+        row: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> KernelResult<Self> {
+        let expected = TRACKING_COLUMNS.as_ref().0.len();
+        if getters.len() != expected {
+            return Err(KernelError::internal_error(format!(
+                "Expected {expected} AMT tracking getters, got {}",
+                getters.len()
+            )));
+        }
+        let positions = |getter: &'a dyn GetData<'a>, field: &str| -> KernelResult<_> {
+            let bytes: Option<&[u8]> = getter.get_opt(row, field)?;
+            Ok(bytes.map(Bytes::copy_from_slice))
+        };
+        Ok(Self {
+            status: TrackingStatus::try_from_repr(getters[0].get(row, TRACKING_STATUS)?)?,
+            snapshot_id: getters[1].get_opt(row, TRACKING_SNAPSHOT_ID)?,
+            dv_snapshot_id: getters[2].get_opt(row, DV_SNAPSHOT_ID)?,
+            sequence_number: getters[3].get_opt(row, SEQUENCE_NUMBER)?,
+            file_sequence_number: getters[4].get_opt(row, FILE_SEQUENCE_NUMBER)?,
+            first_row_id: getters[5].get_opt(row, FIRST_ROW_ID)?,
+            deleted_positions: positions(getters[6], DELETED_POSITIONS)?,
+            replaced_positions: positions(getters[7], REPLACED_POSITIONS)?,
+        })
+    }
 }
 
 /// Represents an entry/row in a ContentTree node.
@@ -474,8 +519,95 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, ToSchema};
+    use crate::content_tree::test_utils::{
+        added_data_entry, entry_batch, struct_batch, with_field,
+    };
+    use crate::engine::sync::SyncEngine;
+    use crate::engine_data::RowVisitor;
+    use crate::schema::{ColumnMetadataKey, ColumnName, MetadataValue, StructField, ToSchema};
     use crate::unit_test_utils::assert_result_error_with_message;
+
+    /// Collects every row's [`TrackingInfo`] via [`TrackingInfo::try_from_getters`].
+    #[derive(Default)]
+    struct TrackingVisitor {
+        tracking: Vec<TrackingInfo>,
+    }
+
+    impl RowVisitor for TrackingVisitor {
+        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+            TRACKING_COLUMNS.as_ref()
+        }
+
+        fn visit<'a>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'a dyn GetData<'a>],
+        ) -> KernelResult<()> {
+            for row in 0..row_count {
+                self.tracking
+                    .push(TrackingInfo::try_from_getters(row, getters)?);
+            }
+            Ok(())
+        }
+    }
+
+    fn visit_tracking(batch: &dyn EngineData) -> KernelResult<Vec<TrackingInfo>> {
+        let mut visitor = TrackingVisitor::default();
+        visitor.visit_rows_of(batch)?;
+        Ok(visitor.tracking)
+    }
+
+    #[rstest]
+    #[case::all_fields_set(TrackingInfo {
+        status: TrackingStatus::Existing,
+        snapshot_id: Some(1),
+        dv_snapshot_id: Some(2),
+        sequence_number: Some(3),
+        file_sequence_number: Some(4),
+        first_row_id: Some(5),
+        deleted_positions: Some(Bytes::from_static(b"deleted")),
+        replaced_positions: Some(Bytes::from_static(b"replaced")),
+    })]
+    #[case::optional_fields_null(TrackingInfo {
+        status: TrackingStatus::Deleted,
+        snapshot_id: None,
+        dv_snapshot_id: None,
+        sequence_number: None,
+        file_sequence_number: None,
+        first_row_id: None,
+        deleted_positions: None,
+        replaced_positions: None,
+    })]
+    fn tracking_info_parses_from_getters(#[case] tracking: TrackingInfo) {
+        let engine = SyncEngine::new();
+        let mut entry = added_data_entry("a.parquet", 1, 1, 0, 0);
+        entry.tracking = tracking.clone();
+        let batch = entry_batch(&engine, &[entry]);
+        assert_eq!(visit_tracking(batch.as_ref()).unwrap(), vec![tracking]);
+    }
+
+    #[test]
+    fn tracking_info_rejects_unknown_status() {
+        let engine = SyncEngine::new();
+        let entry = with_field(
+            &added_data_entry("a.parquet", 1, 1, 0, 0).into(),
+            &[TRACKING, TRACKING_STATUS],
+            Scalar::Integer(9),
+        );
+        let batch = struct_batch(&engine, &[entry]);
+        assert_result_error_with_message(
+            visit_tracking(batch.as_ref()),
+            "Invalid AMT tracking status value: 9",
+        );
+    }
+
+    #[test]
+    fn tracking_info_rejects_wrong_getter_count() {
+        assert_result_error_with_message(
+            TrackingInfo::try_from_getters(0, &[]),
+            "AMT tracking getters, got 0",
+        );
+    }
 
     #[test]
     fn struct_expr_from_schema_errors_on_missing_required_field() {
