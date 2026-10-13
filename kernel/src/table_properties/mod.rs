@@ -157,8 +157,7 @@ pub struct TableProperties {
     /// ensures compatibility with Apache Iceberg V3 table format.
     pub enable_iceberg_compat_v3: Option<bool>,
 
-    /// Whether IcebergNativeV4 is enabled. If enabled, the table keeps its file metadata in the
-    /// adaptive metadata tree.
+    /// When enabled, table content metadata is kept in AMT.
     pub enable_iceberg_native_v4: Option<bool>,
 
     /// The degree to which a transaction must be isolated from modifications made by concurrent

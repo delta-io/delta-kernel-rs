@@ -539,7 +539,7 @@ static ICEBERG_NATIVE_V4_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-/// Writer features an `icebergNativeV4-preview` table may list, per the RFC allow-list.
+/// Writer features an `icebergNativeV4-preview` table may list.
 const ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURES: &[TableFeature] = &[
     TableFeature::IcebergNativeV4Preview,
     TableFeature::AdaptiveMetadataPreview,

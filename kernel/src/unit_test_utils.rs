@@ -624,7 +624,6 @@ impl MockTableConfigurationBuilder {
 }
 
 /// Builds an adaptive-metadata configuration from a column-mapped schema and extra features.
-/// Listing `icebergNativeV4-preview` in `extra_features` also enables it via its property.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) fn adaptive_metadata_table_configuration(
     schema: SchemaRef,

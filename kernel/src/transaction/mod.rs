@@ -2823,7 +2823,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_create_table_with_data_rejected_on_iceberg_native_v4_table() -> KernelResult<()> {
+    fn test_ctas_rejected_on_iceberg_native_v4_table() -> KernelResult<()> {
         let tempdir = tempfile::tempdir()?;
         let table_path = tempdir.path().join("table");
         std::fs::create_dir(&table_path)?;
