@@ -8,13 +8,15 @@
 //! action is the file location, size, and row-tracking numbers. `modificationTime` and
 //! `dataChange` have no AMT source and are supplied by the caller via [`ReadContext`].
 
-use std::iter;
 use std::sync::{Arc, LazyLock};
+use std::{iter, slice};
 
 use bytes::Bytes;
 use url::Url;
 
-use crate::actions::{amt_manifest_filemeta, ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA};
+use crate::actions::{
+    amt_manifest_filemeta, CheckpointAction, ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA,
+};
 use crate::content_tree::{
     struct_expr_from_schema, ColumnFile, ContentTreeNodeEntry, DataContentType, DataFileFormat,
     TrackingInfo, TrackingStatus, COLUMN_FILES, CONTENT_TYPE, DV_INFO, FILE_FORMAT,
@@ -32,7 +34,59 @@ use crate::schema::{
     ArrayType, ColumnNamesAndTypes, DataType, MapType, MetadataColumnSpec, SchemaRef, StructField,
     StructType, ToSchema as _,
 };
-use crate::{Engine, ExpressionEvaluator, FileMeta, KernelError, KernelResult};
+use crate::{
+    Engine, ExpressionEvaluator, FileMeta, KernelError, KernelResult, KernelResultIteratorStatic,
+};
+
+/// Reads the `Add` actions for every live data file in an AMT checkpoint's content tree.
+///
+/// Reads the root manifest eagerly and returns its live `Data` entries as `Add` actions. A root
+/// that references a live leaf manifest is rejected as unsupported.
+///
+/// # Parameters
+/// - `engine`: provides the parquet and evaluation handlers.
+/// - `checkpoint`: the AMT `checkpoint` action whose content tree to read.
+/// - `table_root`: the table root URL relative manifest locations resolve against.
+/// - `ctx`: the per-read values the entries cannot supply (see [`ReadContext`]).
+///
+/// # Returns
+/// An iterator of `Add`-action batches (schema [`LOG_ADD_SCHEMA`]) whose selection vectors keep
+/// only live data files.
+///
+/// # Errors
+/// Returns an error if the root manifest cannot be read, if any root entry fails conversion or
+/// leaf-reference collection (see [`EntryConverter::convert`] and [`LeafRefVisitor`]), or if the
+/// root references a live leaf manifest (unsupported).
+pub(crate) fn read_actions_from_amt(
+    engine: &dyn Engine,
+    checkpoint: &CheckpointAction,
+    table_root: &Url,
+    ctx: &ReadContext,
+) -> KernelResult<KernelResultIteratorStatic<FilteredEngineData>> {
+    let root = checkpoint.root_filemeta(table_root)?;
+    let schemas = ManifestReadSchemas::new();
+    let converter = make_root_entry_converter(engine, ctx)?;
+    let mut root_actions = Vec::new();
+    let mut leaves = LeafRefVisitor::new(table_root);
+    let batches = engine.parquet_handler().read_parquet_files(
+        slice::from_ref(&root),
+        schemas.root.clone(),
+        None,
+    )?;
+    for batch in batches {
+        let batch = batch?;
+        leaves.visit_rows_of(batch.as_ref())?;
+        if let Some(leaf) = leaves.leaves.first() {
+            return Err(KernelError::unsupported(format!(
+                "AMT content-tree read path does not yet read leaf manifests; root manifest '{}' \
+                 references '{}'",
+                root.location, leaf.file_meta.location
+            )));
+        }
+        root_actions.push(converter.convert(batch.as_ref())?);
+    }
+    Ok(Box::new(root_actions.into_iter().map(Ok)))
+}
 
 /// Values the read path emits into every `Add` action but cannot derive from an AMT entry, so the
 /// caller must supply them.
@@ -726,6 +780,7 @@ mod tests {
     use crate::expressions::StructData;
     use crate::object_store::memory::InMemory;
     use crate::schema::StructType;
+    use crate::unit_test_utils::adaptive_metadata_fixtures::checkpoint_action_with_root;
     use crate::unit_test_utils::assert_result_error_with_message;
 
     /// The [`ReadContext`] the tests read against; [`expected_add_row`] reads its values back.
@@ -1002,6 +1057,92 @@ mod tests {
         assert_eq!(files, vec![location.to_string(); 2]);
         let rows = column(ROW_INDEX_COLUMN);
         assert_eq!(rows.as_primitive::<Int64Type>().values(), &[0, 1]);
+    }
+
+    // === Content-tree read ===
+
+    const TABLE_ROOT: &str = "memory:///table/";
+    const ROOT_PATH: &str = "metadata/root.parquet";
+
+    fn table_root() -> Url {
+        Url::parse(TABLE_ROOT).unwrap()
+    }
+
+    /// An engine over an empty in-memory store.
+    fn memory_engine() -> SyncEngine {
+        SyncEngine::new_with_store(Arc::new(InMemory::new()))
+    }
+
+    /// Writes `entries` as the root manifest and returns a checkpoint action referencing it.
+    fn write_root(engine: &dyn Engine, entries: &[ContentTreeNodeEntry]) -> CheckpointAction {
+        let root = write_manifest(engine, table_root().join(ROOT_PATH).unwrap(), entries);
+        checkpoint_action_with_root(ROOT_PATH, root.size as i64, 1).unwrap()
+    }
+
+    /// Reads `checkpoint`'s content tree, returning each batch's selected `Add` rows.
+    fn read_tree(
+        engine: &dyn Engine,
+        checkpoint: &CheckpointAction,
+    ) -> KernelResult<Vec<RecordBatch>> {
+        read_actions_from_amt(engine, checkpoint, &table_root(), &read_ctx())?
+            .map(|batch| filtered_to_batch(batch?).try_into_record_batch())
+            .collect()
+    }
+
+    /// The expected `Add` batch for `rows` of `(path, size, baseRowId, defaultRowCommitVersion)`.
+    fn expected_adds(engine: &dyn Engine, rows: &[(&str, i64, i64, i64)]) -> RecordBatch {
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|&(path, size, base_row_id, version)| {
+                expected_add_row(path, size, base_row_id, version)
+            })
+            .collect();
+        expected_batch(engine, &rows)
+            .try_into_record_batch()
+            .unwrap()
+    }
+
+    #[test]
+    fn read_actions_from_amt_reads_root_data_entries() {
+        let engine = memory_engine();
+        let deleted = with_status(
+            added_data_entry("deleted.parquet", 1, 1, 0, 0),
+            TrackingStatus::Deleted,
+        );
+        let checkpoint = write_root(
+            &engine,
+            &[
+                added_data_entry("a.parquet", 100, 10, 0, 5),
+                deleted,
+                added_data_entry("b.parquet", 200, 20, 10, 5),
+            ],
+        );
+
+        let actual = read_tree(&engine, &checkpoint).unwrap();
+        let expected = expected_adds(
+            &engine,
+            &[("a.parquet", 100, 0, 5), ("b.parquet", 200, 10, 5)],
+        );
+        assert_eq!(actual, vec![expected]);
+    }
+
+    #[test]
+    fn read_actions_from_amt_rejects_live_leaf_manifest() {
+        let engine = memory_engine();
+        let leaf = data_manifest_entry("metadata/leaf.parquet", 1, TrackingStatus::Added);
+        let checkpoint = write_root(&engine, &[leaf]);
+        let err = read_tree(&engine, &checkpoint).unwrap_err();
+        assert!(matches!(err, KernelError::Unsupported(_)), "{err}");
+        assert!(err
+            .to_string()
+            .contains("references 'memory:///table/metadata/leaf.parquet'"));
+    }
+
+    #[test]
+    fn read_actions_from_amt_errors_on_missing_root() {
+        let engine = memory_engine();
+        let checkpoint = checkpoint_action_with_root(ROOT_PATH, 1, 1).unwrap();
+        assert_result_error_with_message(read_tree(&engine, &checkpoint), ROOT_PATH);
     }
 
     #[test]
