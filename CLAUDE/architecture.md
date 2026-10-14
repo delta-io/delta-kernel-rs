@@ -2,8 +2,10 @@
 
 This file helps contributors find implementation boundaries. It does not define public API
 contracts or retell the connector workflow. Use the
-[user guide](https://docs.delta.io/kernel/rust/) for cross-API explanations and
-[rustdoc](https://docs.rs/delta_kernel/latest/delta_kernel/) for exact public behavior.
+[user guide](https://docs.delta.io/kernel/rust/) for introductions and connector workflows, and
+[rustdoc](https://docs.rs/delta_kernel/latest/delta_kernel/) for API usage and behavior.
+Source comments are authoritative for implementation gotchas, pitfalls, invariants, and low-level
+design decisions. This map provides entry points and broader design context.
 
 ## Find the owning module
 
