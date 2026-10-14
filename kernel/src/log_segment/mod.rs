@@ -168,7 +168,6 @@ pub(crate) struct LogSegment {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AmtBase<'a> {
     /// The version of the checkpoint action's content root. The segment's commits follow it.
-    #[allow(dead_code)]
     pub(crate) version: Version,
     /// The checkpoint action, when the `_last_checkpoint` hint embeds it. Otherwise the manifest
     /// commit that added it is in the segment and replay reads it from there. The snapshot's
