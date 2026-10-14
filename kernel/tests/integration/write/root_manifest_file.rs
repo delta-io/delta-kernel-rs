@@ -2,6 +2,7 @@
 #![cfg(feature = "adaptive-metadata-in-dev")]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{schema_ref, DataType, StructField};
@@ -11,6 +12,8 @@ use delta_kernel::{Engine, FileMeta, KernelError, KernelResult};
 use rstest::rstest;
 use serde_json::{json, Value};
 use tempfile::TempDir;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
     assert_result_error_with_message, begin_transaction_with, create_table,
     create_table_with_column_mapping_mode, engine_store_setup, read_actions_from_commit,
@@ -33,13 +36,19 @@ const WRITER_FEATURES: &[&str] = &[
 
 /// Creates a file-backed table supporting `adaptiveMetadata-preview` (and its dependencies) at
 /// version 0, and loads a snapshot at that version. The returned [`TempDir`] must be kept alive
-/// for the table's lifetime.
+/// for the table's lifetime. The engine runs on the caller's multi-thread runtime, so tests can
+/// checkpoint with it.
 async fn setup_adaptive_metadata_table(
     table_name: &str,
 ) -> Result<(impl Engine, TempDir, Url, SnapshotRef), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let dir_url = Url::from_directory_path(temp_dir.path()).expect("valid directory url");
-    let (store, engine, table_url) = engine_store_setup(table_name, Some(&dir_url));
+    let (store, _, table_url) = engine_store_setup(table_name, Some(&dir_url));
+    let engine = DefaultEngineBuilder::new(store.clone())
+        .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        )))
+        .build();
     let schema = schema_ref! { nullable "id": INTEGER };
 
     create_table_with_column_mapping_mode(
@@ -297,14 +306,13 @@ async fn test_commit_info_data_change(
 
 /// Every commit on an adaptiveMetadata table records `dataChange`, and `lastManifestCommit` is
 /// absent before the first manifest commit, set by it, replaced by the next manifest commit, then
-/// carried forward by later log commits. The carry-forward is read from the CRC when one exists at
-/// the read version, otherwise from the newest commit during P&M replay; a checksum written after
-/// the carry-forward (rebuilt by log replay) matches.
+/// carried forward by later log commits, whether the next writer reuses the post-commit snapshot or
+/// loads a fresh one.
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_commit_info_records_data_change_and_last_manifest_commit(
     #[values(true, false)] data_change: bool,
-    #[values(true, false)] crc_at_read_version: bool,
+    #[values(true, false)] reload_snapshot: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("commit_info_last_manifest_commit").await?;
@@ -347,23 +355,68 @@ async fn test_commit_info_records_data_change_and_last_manifest_commit(
     let expected_last_manifest_commit = json!({ "version": 3, "contentRootVersion": 3 });
     assert_commit_info(3, &expected_last_manifest_commit)?;
 
-    // v4: log commit carries lastManifestCommit forward from a freshly loaded snapshot.
-    if crc_at_read_version {
-        snapshot.write_checksum(&engine)?;
-    }
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let snapshot = begin_with_data_change(snapshot, &engine, data_change)?
+    // v4: log commit carries lastManifestCommit forward.
+    let snapshot = if reload_snapshot {
+        Snapshot::builder_for(table_url.clone()).build(&engine)?
+    } else {
+        snapshot
+    };
+    begin_with_data_change(snapshot, &engine, data_change)?
+        .commit(&engine)?
+        .unwrap_committed();
+    assert_commit_info(4, &expected_last_manifest_commit)?;
+    Ok(())
+}
+
+/// A manifest commit records its files in the manifest rather than as add/remove actions, so
+/// kernel cannot count them: file stats are unknown from the manifest commit onward and no
+/// checksum can be written, whether it is resolved from the post-commit snapshot, by replaying
+/// the log, or from a checkpoint.
+#[rstest]
+#[case::post_commit("post_commit", "Indeterminate file stats")]
+#[case::log_replay("log_replay", "Indeterminate file stats")]
+#[case::checkpoint(
+    "checkpoint",
+    "file stats are unknown after an adaptiveMetadata manifest commit"
+)]
+#[case::checkpoint_with_tail(
+    "checkpoint_with_tail",
+    "file stats are unknown after an adaptiveMetadata manifest commit"
+)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_no_checksum_after_manifest_commit(
+    #[case] source: &str,
+    #[case] expected_error: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (engine, _temp_dir, table_url, snapshot) =
+        setup_adaptive_metadata_table("no_checksum_after_manifest_commit").await?;
+    let file = FileMeta {
+        location: table_url.join("metadata/root-v1.parquet")?,
+        last_modified: 0,
+        size: 1024,
+    };
+    let snapshot = begin_with_data_change(snapshot, &engine, true)?
+        .with_root_manifest_file(file)?
         .commit(&engine)?
         .unwrap_post_commit_snapshot();
-    assert_commit_info(4, &expected_last_manifest_commit)?;
-
-    snapshot.write_checksum(&engine)?;
-    let crc_path = table_url
-        .to_file_path()
-        .expect("file url")
-        .join("_delta_log/00000000000000000004.crc");
-    let crc: Value = serde_json::from_str(&std::fs::read_to_string(crc_path)?)?;
-    assert_eq!(crc["lastManifestCommit"], expected_last_manifest_commit);
+    let snapshot = match source {
+        "post_commit" => snapshot,
+        "log_replay" => Snapshot::builder_for(table_url.clone()).build(&engine)?,
+        "checkpoint" => {
+            snapshot.checkpoint(&engine, None)?;
+            Snapshot::builder_for(table_url.clone()).build(&engine)?
+        }
+        _ => {
+            snapshot.checkpoint(&engine, None)?;
+            let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+            begin_with_data_change(snapshot, &engine, true)?
+                .commit(&engine)?
+                .unwrap_committed();
+            Snapshot::builder_for(table_url.clone()).build(&engine)?
+        }
+    };
+    assert!(snapshot.get_file_stats_if_present().is_none());
+    assert_result_error_with_message(snapshot.write_checksum(&engine), expected_error);
     Ok(())
 }
 
