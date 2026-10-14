@@ -105,6 +105,14 @@ fn rows(batches: &[RecordBatch]) -> Vec<(i32, String)> {
     rows
 }
 
+#[test]
+fn missing_required_minimum_retains_file() {
+    let stats = json!({"statsWithCollation": {
+        SYNTHETIC_ID: {"maxValues": {"name": "Alice"}}
+    }});
+    assert!(Operation::Equal.may_match(&stats, "Zoe"));
+}
+
 #[rstest]
 #[case::matching(Some(SYNTHETIC_ID), true)]
 #[case::missing(None, false)]
