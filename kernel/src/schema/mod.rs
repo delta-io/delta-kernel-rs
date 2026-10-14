@@ -720,6 +720,9 @@ impl StructField {
     /// `Id` or `Name`, this is specified in [`ColumnMetadataKey::ColumnMappingPhysicalName`].
     /// Otherwise, the field's logical name is used.
     ///
+    /// Collation annotation paths use the physical field name as their owning-field prefix.
+    /// The logical field's annotations are unchanged.
+    ///
     /// Returns an error if a field has invalid or inconsistent column mapping annotations (e.g.
     /// missing or wrong-typed when column mapping is enabled), or if a metadata column is
     /// encountered (metadata columns should not participate in column mapping). When column
@@ -805,6 +808,24 @@ impl StructField {
                 base_metadata.remove(parquet_field_id_key);
                 // TODO(#1070): Remove nested column ids when they are supported in kernel
             }
+        }
+        match base_metadata.get_mut(ColumnMetadataKey::Collations.as_ref()) {
+            Some(MetadataValue::Other(serde_json::Value::Object(collations)))
+                if self.physical_name(column_mapping_mode) != self.name() =>
+            {
+                let physical_name = self.physical_name(column_mapping_mode);
+                *collations = std::mem::take(collations)
+                    .into_iter()
+                    .map(|(path, identifier)| {
+                        let physical_path = path
+                            .strip_prefix(self.name().as_str())
+                            .map(|suffix| format!("{physical_name}{suffix}"))
+                            .unwrap_or(path);
+                        (physical_path, identifier)
+                    })
+                    .collect();
+            }
+            _ => {}
         }
         base_metadata
     }
@@ -3244,6 +3265,69 @@ mod tests {
         };
         let struct_field = stype.fields.get_index(0).unwrap().1;
         assert_eq!(struct_field.name, "d");
+    }
+
+    #[rstest]
+    #[case::string(DataType::STRING, "")]
+    #[case::array(DataType::from(ArrayType::new(DataType::STRING, true)), ".element")]
+    #[case::nested_array(
+        DataType::from(ArrayType::new(ArrayType::new(DataType::STRING, true), true)),
+        ".element.element"
+    )]
+    #[case::map_key(
+        DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)),
+        ".key"
+    )]
+    #[case::map_value(
+        DataType::from(MapType::new(DataType::INTEGER, DataType::STRING, true)),
+        ".value"
+    )]
+    #[case::array_map(
+        DataType::from(ArrayType::new(
+            MapType::new(DataType::STRING, DataType::STRING, true),
+            true
+        )),
+        ".element.value"
+    )]
+    fn physical_collation_annotations_resolve_to_physical_fields(
+        #[case] data_type: DataType,
+        #[case] suffix: &str,
+        #[values(
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id
+        )]
+        mode: ColumnMappingMode,
+    ) {
+        let logical_path = format!("name{suffix}");
+        let annotation = MetadataValue::Other(serde_json::json!({
+            &logical_path: "test.ASCII_CI"
+        }));
+        let logical = StructField::nullable("name", data_type).with_metadata([
+            (ColumnMetadataKey::Collations.as_ref(), annotation.clone()),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-physical".to_string()),
+            ),
+        ]);
+        let physical = logical.make_physical(mode).unwrap();
+        let physical_path = format!("{}{suffix}", physical.name());
+        assert_eq!(
+            physical.get_config_value(&ColumnMetadataKey::Collations),
+            Some(&MetadataValue::Other(serde_json::json!({
+                physical_path: "test.ASCII_CI"
+            })))
+        );
+        assert_eq!(
+            logical.get_config_value(&ColumnMetadataKey::Collations),
+            Some(&annotation)
+        );
+        collation_utils::validate_collation_annotations(&StructType::try_new([physical]).unwrap())
+            .unwrap();
     }
 
     #[test]

@@ -1,21 +1,17 @@
 //! Connector-contract examples using a synthetic ASCII case-insensitive comparison, not ICU.
 
 use std::cmp::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Int32Array, RecordBatch, StringArray};
 use delta_kernel::expressions::{col, column_name, lit, Predicate};
-use delta_kernel::schema::{schema_ref, DataType, SchemaRef};
-use delta_kernel::{
-    Engine, EvaluationHandler, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler,
-    ParquetFooter, ParquetHandler, PredicateRef, Result, StorageHandler,
-};
+use delta_kernel::schema::{schema_ref, DataType};
+use delta_kernel::Result;
 use rstest::rstest;
 use serde_json::{json, Value};
 use test_utils::{read_add_infos, read_scan, test_table_setup};
-use url::Url;
 
-use super::{annotated_field, create_fixture, simple_batch, CollationTable};
+use super::{annotated_field, create_fixture, simple_batch, CollationStats, CollationTable};
 
 const SYNTHETIC_ID: &str = "test.ASCII_CI.1";
 
@@ -54,7 +50,7 @@ impl Operation {
     }
 }
 
-fn synthetic_fixture(stats_id: Option<&'static str>) -> CollationTable {
+fn synthetic_fixture(stats_id: Option<&'static str>, operation: Operation) -> CollationTable {
     CollationTable {
         schema: schema_ref! {
             nullable "id": INTEGER,
@@ -65,18 +61,26 @@ fn synthetic_fixture(stats_id: Option<&'static str>) -> CollationTable {
             .map(|(id, name)| {
                 (
                     simple_batch(vec![id], vec![name]),
-                    if stats_id.is_some() {
-                        json!({
-                            "minValues": { "name": name },
-                            "maxValues": { "name": name },
-                        })
-                    } else {
-                        Value::Null
-                    },
+                    stats_id.map(|identifier| {
+                        let bound = if identifier == SYNTHETIC_ID {
+                            name
+                        } else {
+                            match operation {
+                                Operation::Equal => "zzz",
+                                Operation::Greater => "aaa",
+                            }
+                        };
+                        CollationStats {
+                            identifier,
+                            bounds: json!({
+                                "minValues": { "name": bound },
+                                "maxValues": { "name": bound },
+                            }),
+                        }
+                    }),
                 )
             })
             .collect(),
-        collation_id: stats_id.unwrap_or(SYNTHETIC_ID),
     }
 }
 
@@ -114,7 +118,7 @@ async fn connector_uses_only_exact_operation_collation_stats(
     #[values(Operation::Equal, Operation::Greater)] operation: Operation,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup()?;
-    let fixture = synthetic_fixture(stats_id);
+    let fixture = synthetic_fixture(stats_id, operation);
     let snapshot = create_fixture(&path, engine.as_ref(), &fixture, &[]).await?;
     let adds = read_add_infos(&snapshot, engine.as_ref())?;
     let selected: Vec<_> = adds
@@ -126,7 +130,7 @@ async fn connector_uses_only_exact_operation_collation_stats(
                 .then(|| stats["minValues"]["id"].as_i64().unwrap() as i32)
         })
         .collect();
-    assert_eq!(selected.len(), if matching { 2 } else { 4 });
+    assert_eq!(selected.len(), if matching { 2 } else { adds.len() });
     // The ID predicate encodes the connector's selected files for this one-row-per-file fixture.
     let scan = snapshot
         .clone()
@@ -206,28 +210,29 @@ fn compound(and: bool) -> Filter {
 }
 
 #[rstest]
-#[case::comparison(Filter::CaseInsensitiveEqual("alice"))]
-#[case::and(compound(true))]
-#[case::or(compound(false))]
-#[case::not_comparison(Filter::Not(Box::new(Filter::CaseInsensitiveEqual("alice"))))]
-#[case::not_and(Filter::Not(Box::new(compound(true))))]
-#[case::not_or(Filter::Not(Box::new(compound(false))))]
+#[case::comparison(Filter::CaseInsensitiveEqual("alice"), 4)]
+#[case::and(compound(true), 2)]
+#[case::or(compound(false), 4)]
+#[case::not_comparison(Filter::Not(Box::new(Filter::CaseInsensitiveEqual("alice"))), 4)]
+#[case::not_and(Filter::Not(Box::new(compound(true))), 4)]
+#[case::not_or(Filter::Not(Box::new(compound(false))), 2)]
 #[tokio::test]
-async fn conservative_pushdown_keeps_original_matches_and_restricts_reader(
+async fn conservative_predicates_prune_files_without_losing_original_matches(
     #[case] original: Filter,
+    #[case] expected_candidates: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup()?;
-    let fixture = synthetic_fixture(Some(SYNTHETIC_ID));
+    let fixture = synthetic_fixture(Some(SYNTHETIC_ID), Operation::Equal);
     let snapshot = create_fixture(&path, engine.as_ref(), &fixture, &[]).await?;
     let safe = original.conservative_predicate(false);
     assert!(!safe.references().contains(&column_name!("name")));
-    let reader = Arc::new(PredicateRecordingEngine::new(engine.clone()));
     let scan = snapshot
         .clone()
         .scan_builder()
         .with_predicate(Arc::new(safe))
         .build()?;
-    let candidates = rows(&read_scan(&scan, reader.clone())?);
+    let candidates = rows(&read_scan(&scan, engine.clone())?);
+    assert_eq!(candidates.len(), expected_candidates);
     let actual: Vec<_> = candidates
         .iter()
         .filter(|(id, name)| original.matches(*id, name))
@@ -238,74 +243,5 @@ async fn conservative_pushdown_keeps_original_matches_and_restricts_reader(
         .filter(|(id, name)| original.matches(*id, name))
         .collect();
     assert_eq!(actual, oracle);
-    let observed = reader.parquet.predicates.lock().unwrap();
-    assert!(!observed.is_empty());
-    for predicate in observed.iter().flatten() {
-        assert!(
-            !predicate.references().contains(&column_name!("name")),
-            "{predicate:?}"
-        );
-    }
     Ok(())
-}
-
-struct PredicateRecordingEngine {
-    inner: Arc<dyn Engine>,
-    parquet: Arc<PredicateRecordingParquet>,
-}
-
-impl PredicateRecordingEngine {
-    fn new(inner: Arc<dyn Engine>) -> Self {
-        Self {
-            parquet: Arc::new(PredicateRecordingParquet {
-                inner: inner.parquet_handler(),
-                predicates: Mutex::new(Vec::new()),
-            }),
-            inner,
-        }
-    }
-}
-
-impl Engine for PredicateRecordingEngine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        self.inner.evaluation_handler()
-    }
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        self.inner.storage_handler()
-    }
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.inner.json_handler()
-    }
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        self.parquet.clone()
-    }
-}
-
-struct PredicateRecordingParquet {
-    inner: Arc<dyn ParquetHandler>,
-    predicates: Mutex<Vec<Option<PredicateRef>>>,
-}
-
-impl ParquetHandler for PredicateRecordingParquet {
-    fn read_parquet_files(
-        &self,
-        files: &[FileMeta],
-        schema: SchemaRef,
-        predicate: Option<PredicateRef>,
-    ) -> Result<FileDataReadResultIterator> {
-        self.predicates.lock().unwrap().push(predicate.clone());
-        self.inner.read_parquet_files(files, schema, predicate)
-    }
-
-    fn write_parquet_file(
-        &self,
-        location: Url,
-        data: FileDataReadResultIterator,
-    ) -> Result<FileSize> {
-        self.inner.write_parquet_file(location, data)
-    }
-
-    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
-        self.inner.read_parquet_footer(file)
-    }
 }

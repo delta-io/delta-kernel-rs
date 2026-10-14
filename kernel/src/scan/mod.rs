@@ -18,8 +18,6 @@ use crate::actions::deletion_vector::{
 use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
-use crate::checkpoint::collation_stats::snapshot_has_collations;
-#[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
@@ -409,9 +407,7 @@ impl ScanBuilder {
     /// Kernel's pruning ignores `statsWithCollation`. For collation-aware queries, the connector
     /// must derive a conservative predicate whose TRUE rows include every match of the original
     /// filter, and apply the original filter after reading. Unsupported comparisons must not
-    /// discard rows through Kernel or underlying-reader pushdown. In particular, removing an
-    /// unsupported OR branch or negating a relaxed predicate can discard matches.
-    /// See the [connector contract](https://github.com/delta-io/delta-kernel-rs/blob/main/docs/user-guide/src/reading/filter_pushdown.md#collation-aware-queries).
+    /// discard rows through Kernel or underlying-reader pushdown.
     ///
     /// [`StructType::add_metadata_column`]: crate::schema::StructType::add_metadata_column
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
