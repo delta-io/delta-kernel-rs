@@ -7,7 +7,7 @@ use url::Url;
 
 use crate::actions::{
     CheckpointAction, ADD_NAME, LOG_ADD_SCHEMA, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA,
-    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+    LOG_TXN_SCHEMA, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
 };
 use crate::content_tree::{read_actions_from_amt, struct_expr_from_schema, ReadContext};
 use crate::expressions::{Expression, Scalar};
@@ -18,13 +18,19 @@ use crate::{
 };
 
 /// The action kinds a read schema may ask a checkpoint action for.
-const CHECKPOINT_ACTION_KINDS: &[&str] = &[ADD_NAME, PROTOCOL_NAME, METADATA_NAME, REMOVE_NAME];
+const CHECKPOINT_ACTION_KINDS: &[&str] = &[
+    ADD_NAME,
+    PROTOCOL_NAME,
+    METADATA_NAME,
+    SET_TRANSACTION_NAME,
+    REMOVE_NAME,
+];
 
 /// Reads the actions `read_schema` asks for from `checkpoint`, as checkpoint batches
 /// (`is_log_batch = false`) matching `read_schema`.
 ///
-/// `add` rows come from the action's content tree, and `protocol` / `metaData` from the action
-/// itself. A checkpoint holds reconciled state, so `remove` rows are never produced.
+/// `add` rows come from the action's content tree, and `protocol`, `metaData`, and `txn` rows from
+/// the action itself. A checkpoint holds reconciled state, so `remove` rows are never produced.
 ///
 /// # Errors
 /// Returns an error if `read_schema` asks for an action kind the checkpoint action cannot supply,
@@ -45,6 +51,12 @@ pub(super) fn read_checkpoint_action(
              supported"
         )));
     }
+    if let (Some(_), Some(sidecar)) = (
+        read_schema.field(SET_TRANSACTION_NAME),
+        checkpoint.txn_sidecars.first(),
+    ) {
+        return Err(unsupported_sidecar(SET_TRANSACTION_NAME, &sidecar.path));
+    }
     let mut streams = Vec::new();
     for field in read_schema.fields() {
         let stream = match field.name().as_str() {
@@ -61,6 +73,18 @@ pub(super) fn read_checkpoint_action(
                 METADATA_NAME,
                 LOG_METADATA_SCHEMA.clone(),
                 vec![checkpoint.metadata().clone().into()],
+                read_schema.clone(),
+            )?,
+            SET_TRANSACTION_NAME => inline_actions(
+                engine,
+                SET_TRANSACTION_NAME,
+                LOG_TXN_SCHEMA.clone(),
+                checkpoint
+                    .transactions
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
                 read_schema.clone(),
             )?,
             // `remove`, which a checkpoint never holds.
@@ -169,6 +193,15 @@ fn action_struct<'a>(schema: &'a StructType, action: &str) -> KernelResult<&'a S
     }
 }
 
+// TODO(#2866): read sidecars once the adaptiveMetadata sidecar file format is defined. Until then
+// a checkpoint action that spills `action` rows into one fails rather than silently dropping them.
+fn unsupported_sidecar(action: &str, path: &str) -> KernelError {
+    KernelError::unsupported(format!(
+        "reading `{action}` actions from adaptiveMetadata checkpoint sidecar `{path}` is not yet \
+         supported"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -177,9 +210,10 @@ mod tests {
     use test_utils::add_commit;
 
     use super::*;
+    use crate::actions::visitors::{SetTransactionMap, SetTransactionVisitor};
     use crate::actions::{
-        get_commit_schema, Metadata, Protocol, ADD_SCHEMA, LOG_TXN_SCHEMA, REMOVE_FIELD,
-        SET_TRANSACTION_NAME,
+        get_commit_schema, Metadata, Protocol, SetTransaction, Sidecar, ADD_SCHEMA,
+        DOMAIN_METADATA_NAME, LOG_DOMAIN_METADATA_SCHEMA, REMOVE_FIELD,
     };
     use crate::arrow::array::{AsArray as _, RecordBatch};
     use crate::arrow::datatypes::Int64Type;
@@ -195,6 +229,7 @@ mod tests {
     use crate::schema::{schema_ref, StructType};
     use crate::unit_test_utils::adaptive_metadata_fixtures::checkpoint_action_with_root;
     use crate::unit_test_utils::assert_result_error_with_message;
+    use crate::RowVisitor as _;
 
     const TABLE_ROOT: &str = "memory:///";
     const ROOT_PATH: &str = "metadata/root.parquet";
@@ -527,9 +562,40 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_action_kind_errors() {
+    fn transactions_come_from_the_checkpoint_action() {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
-        let checkpoint = checkpoint_action_with_root(ROOT_PATH, 1, 1).unwrap();
+        // The root manifest does not exist, so reading it would fail.
+        let mut checkpoint = checkpoint_action_with_root(ROOT_PATH, 1, 1).unwrap();
+        let txn = |app_id: &str, version| SetTransaction {
+            app_id: app_id.to_string(),
+            version,
+            last_updated: None,
+        };
+        checkpoint.transactions = vec![txn("a", 1), txn("b", 2)];
+
+        let mut visitor = SetTransactionVisitor::new(None);
+        for batch in
+            read_checkpoint_action(&engine, &checkpoint, &table_root(), LOG_TXN_SCHEMA.clone())
+                .unwrap()
+        {
+            let batch = batch.unwrap();
+            assert!(!batch.is_log_batch);
+            visitor.visit_rows_of(batch.actions.as_ref()).unwrap();
+        }
+
+        let expected: SetTransactionMap = [("a", txn("a", 1)), ("b", txn("b", 2))]
+            .into_iter()
+            .map(|(app_id, txn)| (app_id.to_string(), txn))
+            .collect();
+        assert_eq!(visitor.set_transactions, expected);
+    }
+
+    #[test]
+    fn transaction_sidecar_is_unsupported_before_any_read() {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        // The root manifest does not exist, so reading it first would fail differently.
+        let mut checkpoint = checkpoint_action_with_root(ROOT_PATH, 1, 1).unwrap();
+        checkpoint.txn_sidecars = vec![Sidecar::new("txn.parquet".to_string(), 1, 1, None)];
         let schema = Arc::new(
             StructType::try_new(
                 CHECKPOINT_READ_SCHEMA
@@ -541,7 +607,26 @@ mod tests {
         );
         assert_result_error_with_message(
             read_checkpoint_action(&engine, &checkpoint, &table_root(), schema),
-            &format!("reading `{SET_TRANSACTION_NAME}` actions"),
+            "checkpoint sidecar `txn.parquet`",
+        );
+    }
+
+    #[test]
+    fn unsupported_action_kind_errors() {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let checkpoint = checkpoint_action_with_root(ROOT_PATH, 1, 1).unwrap();
+        let schema = Arc::new(
+            StructType::try_new(
+                CHECKPOINT_READ_SCHEMA
+                    .fields()
+                    .cloned()
+                    .chain(LOG_DOMAIN_METADATA_SCHEMA.fields().cloned()),
+            )
+            .unwrap(),
+        );
+        assert_result_error_with_message(
+            read_checkpoint_action(&engine, &checkpoint, &table_root(), schema),
+            &format!("reading `{DOMAIN_METADATA_NAME}` actions"),
         );
     }
 }
