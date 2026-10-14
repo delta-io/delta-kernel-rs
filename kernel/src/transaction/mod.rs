@@ -962,8 +962,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         Ok(())
     }
 
-    /// Rejects write-state creation when the table has Concurrent Identity Columns: kernel cannot
-    /// yet hand the connector the columns it must fill.
+    /// Rejects write-state creation when the table has Concurrent Identity Columns.
+    // TODO(#3586): surface the CIC columns to the connector instead of rejecting.
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
     fn ensure_no_concurrent_identity_columns(&self) -> KernelResult<()> {
         require!(

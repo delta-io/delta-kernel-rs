@@ -22,11 +22,13 @@ use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
 pub(crate) use crate::schema::file_utils::validate_file_type_feature_support;
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+use crate::schema::has_concurrent_sequence_id;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
-    schema_has_invariants, validate_column_defaults_metadata, ColumnMetadataKey, SchemaRef,
-    StructField, StructType,
+    concurrent_identity_column, schema_has_concurrent_sequence_id, schema_has_invariants,
+    validate_column_defaults_metadata, ColumnMetadataKey, SchemaRef, StructField, StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::table_features::validate_geospatial_feature_support;
@@ -447,7 +449,7 @@ impl TableConfiguration {
             table_config.has_concurrent_identity_column = table_config
                 .logical_schema
                 .fields()
-                .any(crate::schema::has_concurrent_sequence_id);
+                .any(has_concurrent_sequence_id);
         }
         // Reject tables with geo-typed columns that don't declare the `geospatial` feature.
         #[cfg(feature = "geo-type-in-dev")]
@@ -1145,12 +1147,17 @@ impl TableConfiguration {
     /// `concurrentIdentityColumns`, the feature's requirements hold and every identity column is a
     /// valid Concurrent Identity Column. On any other table, no field carries a `sequenceId`.
     ///
-    /// Runs on the write path, and on the configuration CREATE and ALTER are about to commit, so
-    /// kernel never commits a CIC table it would then refuse to write.
+    /// Must hold for any configuration kernel commits, so kernel never commits a table that would
+    /// fail [`Self::ensure_operation_supported`] for writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `InvalidProtocol` error if a `sequenceId` appears on a table without the feature,
+    /// or a schema error describing the first CIC rule violation.
     pub(crate) fn validate_concurrent_identity_columns(&self) -> KernelResult<()> {
         if !self.is_feature_supported(&TableFeature::ConcurrentIdentityColumns) {
             require!(
-                !crate::schema::schema_has_concurrent_sequence_id(&self.logical_schema),
+                !schema_has_concurrent_sequence_id(&self.logical_schema),
                 KernelError::invalid_protocol(format!(
                     "A column carries '{}' but the table does not support the \
                      'concurrentIdentityColumns' feature",
@@ -1160,7 +1167,7 @@ impl TableConfiguration {
             return Ok(());
         }
         self.validate_feature_requirements(&TableFeature::ConcurrentIdentityColumns)?;
-        crate::schema::validate_concurrent_identity_columns(
+        concurrent_identity_column::validate_concurrent_identity_columns(
             &self.logical_schema,
             self.metadata.partition_columns(),
             true,
@@ -1336,10 +1343,9 @@ mod test {
 
     use super::{InCommitTimestampEnablement, StatsOutputSchemas, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
-    use crate::schema::concurrent_identity_column::concurrent_identity_column;
     use crate::schema::{
-        column_name, schema, schema_ref, ColumnMetadataKey, ColumnName, DataType, MetadataValue,
-        SchemaRef, StructField, StructType,
+        classic_identity_column, column_name, concurrent_identity_column, schema, schema_ref,
+        ColumnName, DataType, SchemaRef, StructField, StructType,
     };
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
@@ -1351,8 +1357,9 @@ mod test {
         ENABLE_ROW_TRACKING,
     };
     use crate::unit_test_utils::{
-        assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
-        test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
+        assert_result_error_with_message, concurrent_identity_config, test_schema_flat,
+        test_schema_flat_with_column_mapping, test_schema_nested,
+        test_schema_nested_with_column_mapping, test_schema_with_array,
         test_schema_with_array_and_column_mapping, test_schema_with_map,
         test_schema_with_map_and_column_mapping, MockProtocolBuilder,
         MockTableConfigurationBuilder,
@@ -2435,59 +2442,35 @@ mod test {
         }
     }
 
-    // A LONG column carrying a classic `delta.identity.highWaterMark` (and no concurrent
-    // sequenceId).
-    fn high_water_mark_field(name: &str) -> StructField {
-        StructField::not_null(name, DataType::LONG).with_metadata(vec![
-            (
-                ColumnMetadataKey::IdentityStart.as_ref().to_string(),
-                MetadataValue::Number(1),
-            ),
-            (
-                ColumnMetadataKey::IdentityStep.as_ref().to_string(),
-                MetadataValue::Number(1),
-            ),
-            (
-                ColumnMetadataKey::IdentityHighWaterMark
-                    .as_ref()
-                    .to_string(),
-                MetadataValue::Number(42),
-            ),
-        ])
-    }
-
-    // A valid concurrent-identity table configuration containing the CIC features and the
-    // `catalogManaged` dependency (and its own `inCommitTimestamp`, enabled via property).
-    #[cfg(feature = "concurrent-identity-columns-in-dev")]
-    fn concurrent_identity_config(schema: StructType) -> TableConfiguration {
-        MockTableConfigurationBuilder::new()
-            .with_schema(schema)
-            .with_properties([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
-            .with_protocol(
-                MockProtocolBuilder::new()
-                    .with_features([
-                        TableFeature::IdentityColumns,
-                        TableFeature::ConcurrentIdentityColumns,
-                        TableFeature::CatalogManaged,
-                        TableFeature::InCommitTimestamp,
-                    ])
-                    .build(),
-            )
-            .build()
-    }
-
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
     #[test]
     fn concurrent_identity_columns_write_supported_when_all_concurrent() {
-        // The full feature set + only a concurrent column (sequenceId, no high-water mark): writes
-        // are supported. `identityColumns` alone would be rejected, but its Custom check passes
-        // because `concurrentIdentityColumns` is also present.
+        // `identityColumns`' custom check passes only because `concurrentIdentityColumns` is
+        // present.
         let schema: StructType = StructType::try_new(vec![concurrent_identity_column(
             "id", "seq-abc", 1, 1, false,
         )])
         .expect("valid schema");
         let config = concurrent_identity_config(schema);
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+    }
+
+    #[cfg(not(feature = "concurrent-identity-columns-in-dev"))]
+    #[test]
+    fn concurrent_identity_columns_write_rejected_without_cargo_feature_scan_allowed() {
+        let schema =
+            StructType::try_new([concurrent_identity_column("id", "seq-abc", 1, 1, false)])
+                .unwrap();
+        let config = concurrent_identity_config(schema);
+        // Which unsupported feature is reported first depends on the writer-feature order.
+        assert!(matches!(
+            config.ensure_operation_supported(Operation::Write),
+            Err(KernelError::Unsupported(_))
+        ));
+        config.ensure_operation_supported(Operation::Scan).unwrap();
+        config
+            .ensure_operation_supported(Operation::SnapshotLoad)
+            .unwrap();
     }
 
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
@@ -2516,33 +2499,16 @@ mod test {
         );
     }
 
-    #[cfg(feature = "concurrent-identity-columns-in-dev")]
-    #[test]
-    fn concurrent_identity_columns_write_rejected_with_surviving_high_water_mark() {
-        // Every identity column on a CIC table must be concurrent; a leftover high-water-mark
-        // column is rejected.
-        let schema = StructType::try_new(vec![
-            concurrent_identity_column("id", "seq-abc", 1, 1, false),
-            high_water_mark_field("legacy_id"),
-        ])
-        .expect("valid schema");
-        let config = concurrent_identity_config(schema);
-        assert_result_error_with_message(
-            config.ensure_operation_supported(Operation::Write),
-            "delta.identity.highWaterMark",
-        );
-    }
-
+    // Every identity column on a CIC table must be concurrent, with or without a high-water mark.
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
     #[rstest]
-    // A classic identity column that never emitted a value (no high-water mark).
     #[case::classic_without_high_water_mark(
-        StructField::not_null("legacy_id", DataType::LONG).with_metadata([
-            (ColumnMetadataKey::IdentityStart.as_ref(), MetadataValue::Number(1)),
-            (ColumnMetadataKey::IdentityStep.as_ref(), MetadataValue::Number(1)),
-            (ColumnMetadataKey::IdentityAllowExplicitInsert.as_ref(), MetadataValue::Boolean(false)),
-        ]),
+        classic_identity_column("legacy_id", None),
         "must be concurrent"
+    )]
+    #[case::surviving_high_water_mark(
+        classic_identity_column("legacy_id", Some(42)),
+        "delta.identity.highWaterMark"
     )]
     #[case::step_zero(concurrent_identity_column("id2", "seq-2", 1, 0, false), "step 0")]
     fn concurrent_identity_columns_write_rejected_but_scan_allowed(
@@ -2581,12 +2547,14 @@ mod test {
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
     }
 
+    // `identityColumns` without `concurrentIdentityColumns` is classic high-water-mark identity,
+    // which kernel does not implement: writes are rejected at the support layer.
     #[test]
-    fn classic_identity_columns_write_rejected_without_concurrent_feature() {
-        // `identityColumns` without `concurrentIdentityColumns` is classic high-water-mark
-        // identity, which kernel does not implement: writes are rejected at the support layer.
+    fn classic_identity_columns_write_rejected_scan_allowed() {
         let config = MockTableConfigurationBuilder::new()
-            .with_schema(StructType::try_new(vec![high_water_mark_field("id")]).unwrap())
+            .with_schema(
+                StructType::try_new(vec![classic_identity_column("id", Some(42))]).unwrap(),
+            )
             .with_protocol(
                 MockProtocolBuilder::new()
                     .with_features([TableFeature::IdentityColumns])
@@ -2597,6 +2565,7 @@ mod test {
             config.ensure_operation_supported(Operation::Write),
             "classic high-water-mark identity",
         );
+        config.ensure_operation_supported(Operation::Scan).unwrap();
     }
 
     #[cfg(not(feature = "geo-type-in-dev"))]
