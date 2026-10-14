@@ -51,6 +51,7 @@ use crate::{
     SnapshotRef, Version,
 };
 
+mod collation_stats;
 pub(crate) mod data_skipping;
 pub(crate) mod field_classifiers;
 pub mod log_replay;
@@ -120,6 +121,9 @@ pub use crate::parallel::parallel_scan_metadata::{
 /// - [`Self::all`] -- both representations.
 /// - [`Self::none`] -- neither, AND disables internal data skipping. Unlike the other four
 ///   constructors, this is the only one that stops kernel from reading stats from parquet at all.
+///
+/// [`Self::with_collation_stats`] adds typed collation bounds to any constructor and enables stats
+/// reading when combined with [`Self::none`].
 #[derive(Clone, Debug)]
 pub struct StatsOptions {
     /// Whether to surface JSON stats on parsed-stats checkpoints (where the
@@ -138,6 +142,8 @@ pub struct StatsOptions {
     /// Whether a VARIANT column's min/max statistic is requested. See
     /// [`Self::with_variant_min_max_stats`].
     pub(crate) variant_min_max: bool,
+    /// Exact collation identifiers and logical STRING paths requested by the connector.
+    pub(crate) collation_stats: Vec<(String, Vec<ColumnName>)>,
 }
 
 /// Controls which struct stats columns appear in `stats_parsed`.
@@ -148,9 +154,10 @@ pub struct StatsOptions {
 /// stats, for example because another writer generated them.
 #[derive(Clone, Debug)]
 pub enum StructStats {
-    /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for
-    /// internal data skipping unless the caller picked [`StatsOptions::none`], which
-    /// disables stats reading entirely.
+    /// Don't emit binary per-column statistics in `stats_parsed`.
+    ///
+    /// Explicit collation bounds may still be returned. Kernel reads predicate-referenced stats
+    /// for internal data skipping unless [`StatsOptions::none`] disables stats reading entirely.
     None,
     /// Emit all indexed columns, plus the `extra_indexed` columns.
     ///
@@ -177,11 +184,43 @@ impl Default for StatsOptions {
             synthesize_json: true,
             struct_stats: StructStats::None,
             variant_min_max: false,
+            collation_stats: Vec::new(),
         }
     }
 }
 
 impl StatsOptions {
+    /// Adds exact `provider.name.version` bounds for the logical STRING paths in `columns`.
+    ///
+    /// Bounds appear under `stats_parsed.statsWithCollation[identifier]`, using physical column
+    /// names. The dotted identifier is one field name. Missing bounds read as null without binary
+    /// or version fallback. Other constructors retain their existing statistics selection.
+    ///
+    /// [`ScanBuilder::build`] rejects malformed identifiers, unresolved paths, partition columns,
+    /// and non-STRING targets. The connector must obtain the version from its execution comparator.
+    pub fn with_collation_stats(
+        mut self,
+        identifier: impl Into<String>,
+        columns: impl IntoIterator<Item = ColumnName>,
+    ) -> Self {
+        let identifier = identifier.into();
+        if let Some((_, existing)) = self
+            .collation_stats
+            .iter_mut()
+            .find(|(requested, _)| requested == &identifier)
+        {
+            for column in columns {
+                if !existing.contains(&column) {
+                    existing.push(column);
+                }
+            }
+        } else {
+            self.collation_stats
+                .push((identifier, columns.into_iter().collect()));
+        }
+        self
+    }
+
     /// JSON only. Equivalent to [`Default::default`].
     pub fn json_only() -> Self {
         Self::default()
@@ -402,6 +441,15 @@ impl ScanBuilder {
     /// A predicate alone enables internal data skipping; kernel does not surface stats
     /// to the engine by default. Use [`with_stats`](Self::with_stats) if the engine
     /// also wants stats in the scan metadata output.
+    ///
+    /// Unannotated string comparisons use UTF-8 binary semantics, independent of `__COLLATIONS`.
+    /// [`Predicate::binary_with_collation`] marks comparisons that binary pruning must defer.
+    /// For native batch pruning, use opaque predicates with explicitly requested
+    /// [`StatsOptions::with_collation_stats`] bounds. The connector applies the complete original
+    /// row filter after reading. Unsupported comparisons must not discard rows through Kernel or
+    /// underlying-reader pushdown; removing an unsupported OR branch or negating a relaxed
+    /// predicate can discard matches.
+    /// See the [connector contract](https://github.com/delta-io/delta-kernel-rs/blob/main/docs/user-guide/src/reading/filter_pushdown.md#collation-aware-queries).
     ///
     /// [`StructType::add_metadata_column`]: crate::schema::StructType::add_metadata_column
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
@@ -819,13 +867,14 @@ fn build_stats_output_schemas(
     table_configuration: &TableConfiguration,
     stats: &StatsOptions,
 ) -> KernelResult<Option<StatsOutputSchemas>> {
-    match &stats.struct_stats {
+    let schemas = match &stats.struct_stats {
         StructStats::None => Ok(None),
         StructStats::AllIndexed { extra_indexed } => table_configuration
             .build_indexed_stats_output_schemas(extra_indexed, stats.variant_min_max),
         StructStats::Columns { requested } => table_configuration
             .build_selected_stats_output_schemas(requested, stats.variant_min_max),
-    }
+    }?;
+    collation_stats::extend_output_schemas(table_configuration, schemas, &stats.collation_stats)
 }
 
 impl std::fmt::Debug for Scan {
@@ -842,7 +891,9 @@ impl std::fmt::Debug for Scan {
 impl Scan {
     /// Whether stats reading is entirely skipped, disabling internal data skipping.
     fn skip_stats(&self) -> bool {
-        !self.stats.synthesize_json && matches!(self.stats.struct_stats, StructStats::None)
+        !self.stats.synthesize_json
+            && matches!(self.stats.struct_stats, StructStats::None)
+            && self.stats.collation_stats.is_empty()
     }
 
     fn checkpoint_read_options(&self) -> (SchemaRef, Option<PredicateRef>, Option<&StructType>) {
@@ -1199,7 +1250,8 @@ impl Scan {
         // needed for output or pruning.
         let plan_executor = engine.require_plan_executor()?;
         let needs_leaf_schema = self.state_info.physical_stats_read_schema().is_some()
-            || self.state_info.physical_partition_schema.is_some();
+            || self.state_info.physical_partition_schema.is_some()
+            || self.stats.synthesize_json;
         let shape = if needs_leaf_schema {
             CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
         } else {

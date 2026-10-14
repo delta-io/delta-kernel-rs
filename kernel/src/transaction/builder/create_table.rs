@@ -21,6 +21,7 @@ use crate::clustering::{create_clustering_domain_metadata, validate_clustering_c
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::metrics::MetricId;
+use crate::schema::collation_utils::schema_has_collations;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
@@ -94,6 +95,7 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // create time is the explicit feature signal
     // `delta.feature.materializePartitionColumns=supported`.
     TableFeature::MaterializePartitionColumns,
+    TableFeature::Collations,
     // IcebergCompatV2 is a writer-only feature that gates Iceberg V2 conversion compatibility.
     // Dependent features (ColumnMapping) are auto-added during create table.
     TableFeature::IcebergCompatV2,
@@ -386,6 +388,17 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
     if schema_contains_timestamp_ntz(schema) {
         add_feature_to_lists(
             TableFeature::TimestampWithoutTimezone,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
+/// Adds the stable collation feature for annotated schemas.
+fn maybe_enable_collations(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    if schema_has_collations(schema) {
+        add_feature_to_lists(
+            TableFeature::Collations,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
@@ -924,7 +937,7 @@ impl TransactionBuilder<CreateTable> {
     /// This method performs validation:
     /// - Checks that the table path is valid
     /// - Verifies the table doesn't already exist
-    /// - Rejects schemas with `delta.invariants` metadata annotations (unsupported by kernel)
+    /// - Validates the schema and metadata annotations
     /// - Validates the data layout is valid
     /// - Validates table properties against the allow list
     ///
@@ -944,8 +957,7 @@ impl TransactionBuilder<CreateTable> {
     /// Returns an error if:
     /// - The table path is invalid
     /// - A table already exists at the given path
-    /// - The schema has `delta.invariants` metadata on any column
-    /// - CDF is enabled and the schema contains a top-level column reserved for CDF
+    /// - Schema or metadata annotation validation fails
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
     /// - Connector commit information does not contain exactly one row
@@ -990,7 +1002,7 @@ impl TransactionBuilder<CreateTable> {
         let (mut effective_schema, column_mapping_mode) =
             maybe_apply_column_mapping_for_table_create(&self.local_state.schema, &mut validated)?;
 
-        // Validate schema (column names, duplicates, no `delta.invariants` metadata).
+        // Validate the schema and metadata annotations.
         // Empty schemas are intentionally allowed.
         validate_schema(
             &effective_schema,
@@ -1021,6 +1033,7 @@ impl TransactionBuilder<CreateTable> {
         // Schema-driven auto-enablement: detect types or annotations that require a feature
         maybe_enable_variant_type(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
+        maybe_enable_collations(&effective_schema, &mut validated);
         maybe_enable_invariants(&effective_schema, &mut validated);
 
         // Property-driven auto-enablement: check enablement properties
@@ -1849,6 +1862,7 @@ mod tests {
     #[case::append_only(TableFeature::AppendOnly, "appendOnly")]
     #[case::change_data_feed(TableFeature::ChangeDataFeed, "changeDataFeed")]
     #[case::type_widening(TableFeature::TypeWidening, "typeWidening")]
+    #[case::collations(TableFeature::Collations, "collations")]
     #[case::variant_type(TableFeature::VariantType, "variantType")]
     #[case::variant_shredding(TableFeature::VariantShredding, "variantShredding")]
     #[case::catalog_managed(TableFeature::CatalogManaged, "catalogManaged")]
@@ -1876,6 +1890,29 @@ mod tests {
                 "{feature:?} is WriterOnly but reader_features is not empty"
             ),
         }
+    }
+
+    #[rstest::rstest]
+    fn test_preview_feature_signals_rejected(
+        #[values(
+            "collations-preview",
+            "typeWidening-preview",
+            "variantType-preview",
+            "variantShredding-preview",
+            "catalogOwned-preview",
+            "adaptiveMetadata-preview",
+            "icebergNativeV4-preview"
+        )]
+        feature_name: &str,
+    ) {
+        let key = format!("delta.feature.{feature_name}");
+        let properties = HashMap::from([(key.clone(), "supported".to_string())]);
+        assert_result_error_with_message(
+            validate_extract_table_features_and_properties(properties),
+            &format!(
+                "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
+            ),
+        );
     }
 
     #[test]

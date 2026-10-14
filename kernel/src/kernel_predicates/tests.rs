@@ -10,6 +10,46 @@ use crate::scan::data_skipping::as_data_skipping_predicate;
 use crate::schema::ArrayType;
 use crate::{DataType, Result};
 
+#[rstest::rstest]
+#[case::comparison(0, None)]
+#[case::and_false(1, Some(false))]
+#[case::or_false(2, None)]
+#[case::not_comparison(3, None)]
+#[case::not_and_false(4, Some(true))]
+#[case::not_or_false(5, None)]
+fn collated_comparisons_defer_with_boolean_structure(
+    #[case] combination: usize,
+    #[case] expected: Option<bool>,
+    #[values(
+        BinaryPredicateOp::Equal,
+        BinaryPredicateOp::LessThan,
+        BinaryPredicateOp::GreaterThan,
+        BinaryPredicateOp::Distinct
+    )]
+    operation: BinaryPredicateOp,
+) {
+    let collated = Pred::binary_with_collation(operation, lit("Alice"), lit("alice"), "test.ci.1");
+    let predicate = match combination {
+        0 => collated,
+        1 => Pred::and(collated, Pred::FALSE),
+        2 => Pred::or(collated, Pred::FALSE),
+        3 => Pred::not(collated),
+        4 => Pred::not(Pred::and(collated, Pred::FALSE)),
+        5 => Pred::not(Pred::or(collated, Pred::FALSE)),
+        _ => unreachable!(),
+    };
+    let evaluator = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
+    assert_eq!(evaluator.eval(&predicate), expected);
+    assert_eq!(evaluator.eval_sql_where(&predicate), expected);
+    let parquet = OneStatsValue(Scalar::from("alice"));
+    assert_eq!(parquet.eval(&predicate), expected);
+    assert_eq!(parquet.eval_sql_where(&predicate), expected);
+    assert_eq!(
+        evaluator.eval(&Pred::eq(lit("Alice"), lit("alice"))),
+        Some(false),
+    );
+}
+
 /// Helper trait to allow expect_eq! to work with both Option<Scalar> and Option<bool>
 trait LogicalEq {
     fn logical_eq(&self, other: &Self) -> bool;

@@ -50,6 +50,10 @@ pub trait ArrowOpaquePredicateOp: DynPartialEq + std::fmt::Debug {
     /// Evaluates this (possibly inverted) predicate over the provided input args, returning `Err`
     /// in case of an incorrect or unsupported invocation (e.g. wrong number and/or types of
     /// arguments.
+    ///
+    /// For rewritten data-skipping predicates, null means unknown and retains the file. The
+    /// result must include unknown positions when adapting an evaluator that only returns TRUE
+    /// positions. Compile schema-dependent native state once and reuse it across batch evaluations.
     fn eval_pred(
         &self,
         args: &[Expression],

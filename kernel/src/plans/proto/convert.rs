@@ -11,12 +11,11 @@ use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
 };
 use crate::expressions::{
-    ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
-    ColumnName, DecimalData, Expression, ExpressionFieldPatch, ExpressionStructPatch,
-    JunctionPredicate, JunctionPredicateOp, MapData, MapToStructExpression, MapToStructOptions,
-    OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate, Scalar, StructData,
-    UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression,
-    VariadicExpressionOp,
+    ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicateOp, ColumnName, DecimalData,
+    Expression, ExpressionFieldPatch, ExpressionStructPatch, JunctionPredicate,
+    JunctionPredicateOp, MapData, MapToStructExpression, MapToStructOptions, OpaqueExpression,
+    OpaquePredicate, ParseJsonExpression, Predicate, Scalar, StructData, UnaryExpression,
+    UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
     Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, RelationRef, ScanFile,
@@ -351,7 +350,14 @@ impl From<&Predicate> for proto_expr::Predicate {
             Predicate::BooleanExpression(expr) => Kind::BooleanExpression(Box::new(expr.into())),
             Predicate::Not(inner) => Kind::Not(Box::new(inner.as_ref().into())),
             Predicate::Unary(unary) => Kind::Unary(Box::new(unary.into())),
-            Predicate::Binary(binary) => Kind::Binary(Box::new(binary.into())),
+            Predicate::Binary(binary) if binary.collation.is_some() => {
+                Kind::Unknown(format!("collated comparison: {pred}"))
+            }
+            Predicate::Binary(binary) => Kind::Binary(Box::new(proto_expr::BinaryPredicate {
+                op: proto_expr::BinaryPredicateOp::from(binary.op) as i32,
+                left: Some(Box::new(binary.left.as_ref().into())),
+                right: Some(Box::new(binary.right.as_ref().into())),
+            })),
             Predicate::Junction(junction) => Kind::Junction(junction.into()),
             Predicate::Opaque(opaque) => Kind::Opaque(opaque.into()),
             Predicate::Unknown(name) => Kind::Unknown(name.clone()),
@@ -436,16 +442,6 @@ impl From<&UnaryPredicate> for proto_expr::UnaryPredicate {
         proto_expr::UnaryPredicate {
             op: proto_expr::UnaryPredicateOp::from(unary.op) as i32,
             expr: Some(Box::new(unary.expr.as_ref().into())),
-        }
-    }
-}
-
-impl From<&BinaryPredicate> for proto_expr::BinaryPredicate {
-    fn from(binary: &BinaryPredicate) -> Self {
-        proto_expr::BinaryPredicate {
-            op: proto_expr::BinaryPredicateOp::from(binary.op) as i32,
-            left: Some(Box::new(binary.left.as_ref().into())),
-            right: Some(Box::new(binary.right.as_ref().into())),
         }
     }
 }
@@ -1835,6 +1831,34 @@ mod tests {
         assert_eq!(binary.op, proto_expr::BinaryPredicateOp::GreaterThan as i32);
         assert!(binary.left.is_some());
         assert!(binary.right.is_some());
+    }
+
+    #[test]
+    fn collated_predicate_export_defers_the_comparison_inside_boolean_structure() {
+        let predicate = Predicate::not(Predicate::and(
+            Predicate::binary_with_collation(
+                BinaryPredicateOp::Equal,
+                col!("name"),
+                lit("alice"),
+                "test.ci.1",
+            ),
+            col!("age").gt(lit(30)),
+        ));
+        let proto_expr::predicate::Kind::Not(negated) = pred_kind_of(predicate) else {
+            panic!("expected NOT");
+        };
+        let Some(proto_expr::predicate::Kind::Junction(junction)) = negated.kind else {
+            panic!("expected a junction");
+        };
+        assert_eq!(junction.op, proto_expr::JunctionPredicateOp::And as i32);
+        assert!(matches!(
+            &junction.preds[0].kind,
+            Some(proto_expr::predicate::Kind::Unknown(_))
+        ));
+        assert!(matches!(
+            &junction.preds[1].kind,
+            Some(proto_expr::predicate::Kind::Binary(_))
+        ));
     }
 
     #[test]

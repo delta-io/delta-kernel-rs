@@ -37,6 +37,21 @@ use crate::unit_test_utils::{geography_type, geometry_type};
 use crate::KernelResult;
 
 #[test]
+fn arrow_evaluation_rejects_collated_binary_comparisons() {
+    let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+    let predicate = Pred::binary_with_collation(
+        BinaryPredicateOp::Equal,
+        lit("Alice"),
+        lit("alice"),
+        "test.ci.1",
+    );
+    assert_result_error_with_message(
+        evaluate_predicate(&predicate, &batch, false),
+        "Collated comparisons require a connector-defined opaque evaluator",
+    );
+}
+
+#[test]
 fn test_array_column() {
     let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
     let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));
