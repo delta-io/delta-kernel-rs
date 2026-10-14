@@ -32,20 +32,19 @@ const ROARING_BITMAP_NATIVE_MAGIC: u32 = 1681511376;
 
 const INLINE_DELETION_VECTOR_MAGIC_SIZE: usize = 4;
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum DeletionVectorStorageType {
-    #[cfg_attr(test, serde(rename = "u"))]
+    #[serde(rename = "u")]
     PersistedRelative,
-    #[cfg_attr(test, serde(rename = "i"))]
+    #[serde(rename = "i")]
     Inline,
-    #[cfg_attr(test, serde(rename = "p"))]
+    #[serde(rename = "p")]
     PersistedAbsolute,
     /// Unlike [`PersistedRelative`](Self::PersistedRelative) (`'u'`), `path_or_inline_dv` stores
     /// the raw path with no base85/UUID encoding; it is percent-encoded only when resolved against
     /// the table root.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[cfg_attr(test, serde(rename = "r"))]
+    #[serde(rename = "r")]
     PersistedUnencodedRelative,
 }
 
@@ -147,8 +146,7 @@ impl DeletionVectorPath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", try_from = "DeletionVectorRaw")]
 pub struct DeletionVectorDescriptor {
     /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'],

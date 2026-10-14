@@ -19,7 +19,7 @@ use crate::utils::require;
 use crate::{Engine, EngineData, ExpressionRef, KernelError, KernelResult, Result};
 
 /// this struct can be used by an engine to materialize a selection vector
-#[derive(Default, Debug, Clone, PartialEq, Eq, From)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, From, serde::Serialize, serde::Deserialize)]
 #[from(DeletionVectorDescriptor)]
 pub struct DvInfo {
     pub(crate) deletion_vector: Option<DeletionVectorDescriptor>,
