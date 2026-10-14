@@ -377,11 +377,11 @@ async fn test_commit_info_records_data_change_and_last_manifest_commit(
 #[case::log_replay("log_replay", "Indeterminate file stats")]
 #[case::checkpoint(
     "checkpoint",
-    "file stats are unknown after an adaptiveMetadata manifest commit"
+    "checkpoint 1 may not list the files of adaptiveMetadata manifest commit 1"
 )]
 #[case::checkpoint_with_tail(
     "checkpoint_with_tail",
-    "file stats are unknown after an adaptiveMetadata manifest commit"
+    "checkpoint 1 may not list the files of adaptiveMetadata manifest commit 1"
 )]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_no_checksum_after_manifest_commit(

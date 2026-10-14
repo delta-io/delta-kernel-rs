@@ -1326,20 +1326,37 @@ async fn test_replay_rejects_last_manifest_commit_newer_than_newest_commit() {
 
 // === On-disk base CRC (exercises serde round-trip) ===
 
-// A carried-forward pointer to a manifest commit at or below the base CRC is already reflected in
-// the base's file stats, so advancing past it keeps them Complete.
+// Replay misses only the file changes a replayed manifest commit records solely in its manifest
+// (`contentRootVersion == version`). A pointer at or below the base is already reflected in the
+// base, and a manifest commit with an older content root logs its own file actions. Each case lists
+// the commits after the base CRC at version 0.
 #[cfg(feature = "adaptive-metadata-in-dev")]
+#[rstest]
+#[case::pointer_at_or_below_base(vec![last_manifest_commit_info(0, 0)], true)]
+#[case::manifest_commit_logs_its_file_actions(vec![last_manifest_commit_info(1, 0)], true)]
+#[case::manifest_commit_hidden_behind_newer_one(
+    vec![
+        last_manifest_commit_info(1, 1),
+        last_manifest_commit_info(1, 1),
+        last_manifest_commit_info(3, 2),
+    ],
+    false
+)]
 #[tokio::test]
-async fn test_manifest_commit_at_or_below_base_keeps_file_stats_complete() {
-    let base = crc_complete_empty_dm_set_txn();
-    let crc = CrcReadTest::new()
-        .commit(0, create_table_actions())
-        .commit(1, vec![last_manifest_commit_info(0, 0)])
+async fn test_manifest_commit_file_stats(
+    #[case] commits: Vec<Value>,
+    #[case] expect_complete: bool,
+) {
+    let mut test = CrcReadTest::new().commit(0, create_table_actions());
+    for (version, commit) in (1..).zip(commits) {
+        test = test.commit(version, vec![commit]);
+    }
+    let crc = test
         .build()
         .await
-        .incrementally_build_crc(&base)
+        .incrementally_build_crc(&crc_complete_empty_dm_set_txn())
         .unwrap();
-    assert!(crc.file_stats_state().is_complete());
+    assert_eq!(crc.file_stats_state().is_complete(), expect_complete);
 }
 
 #[tokio::test]
