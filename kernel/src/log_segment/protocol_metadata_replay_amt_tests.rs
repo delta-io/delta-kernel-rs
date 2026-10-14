@@ -1616,3 +1616,43 @@ async fn put_crc_with_pointer(store: &InMemory, version: u64, pointer: LastManif
         .await
         .unwrap();
 }
+
+// A log with no checkpoint that starts above version 0 has no CRC to write. An adaptiveMetadata
+// log is rooted at a content tree, whose file stats kernel cannot read yet, so writing is
+// unsupported; any other such log is truncated.
+#[rstest]
+#[case::adaptive_metadata(
+    checkpoint_commit(2, &[], one_column_schema()),
+    "the log starts at version 2 above an adaptiveMetadata content root"
+)]
+#[case::classic(
+    format!("{}\n{}", protocol_commit(1, 2), classic_metadata_commit()),
+    "Table version 0 is missing"
+)]
+#[tokio::test]
+async fn write_checksum_on_log_starting_above_zero(
+    #[case] commit_2: String,
+    #[case] expected_error: &str,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    add_commit(table_root.as_str(), store.as_ref(), 2, commit_2)
+        .await
+        .unwrap();
+    let engine = non_plan_engine(store);
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    assert_result_error_with_message(snapshot.write_checksum(&engine), expected_error);
+}
+
+// Builds a top-level `metaData` commit line for a table with no adaptiveMetadata feature.
+fn classic_metadata_commit() -> String {
+    serde_json::json!({ "metaData": {
+        "id": "classic",
+        "format": { "provider": "parquet", "options": {} },
+        "schemaString": r#"{"type":"struct","fields":[{"name":"id","type":"integer","nullable":true,"metadata":{}}]}"#,
+        "partitionColumns": [],
+        "configuration": {},
+        "createdTime": 0,
+    } })
+    .to_string()
+}
