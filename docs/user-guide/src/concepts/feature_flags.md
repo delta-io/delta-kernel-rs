@@ -13,33 +13,18 @@ manifests and stay aligned with each release.
 
 ## Choose an Engine
 
-Most connectors should start with the default engine:
-
-```toml
-[dependencies]
-delta_kernel = "0.29.0"
-delta_kernel_default_engine = { version = "0.29.0", features = ["rustls"] }
-```
+Most connectors should start with the default engine. Follow
+[Installation](../getting_started/installation.md#adding-the-dependency) for dependency setup.
 
 The default engine supplies Arrow data, Tokio execution, expression evaluation, Parquet and JSON
 handling, and `object_store` integration. Its dependencies activate the matching Kernel support
 automatically.
 
 If your connector implements every Engine capability in its own data format, depend on Kernel
-without Arrow features:
+without Arrow features.
 
-```toml
-[dependencies]
-delta_kernel = "0.29.0"
-```
-
-For a custom Engine that still uses Kernel's Arrow conversion and expression modules, enable those
-capabilities directly:
-
-```toml
-[dependencies]
-delta_kernel = { version = "0.29.0", features = ["arrow-conversion", "arrow-expression"] }
-```
+For a custom Engine that still uses Kernel's Arrow conversion and expression modules, enable
+the `arrow-conversion` and `arrow-expression` features.
 
 ## Choose a TLS backend
 
