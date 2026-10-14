@@ -96,23 +96,31 @@ For the full list of supported data types, see [Schemas and Data Types](../conce
 
 To preserve a non-binary collation, attach `ColumnMetadataKey::Collations` to the nearest
 `StructField` with `StructField::with_metadata`. Store its value as `MetadataValue::Other`
-containing a JSON object whose keys identify STRING targets relative to that field:
+containing a JSON object whose keys start with that field's name. A STRING field named `name`
+uses `"name"`:
 
 ```json
 { "name": "ICU.en_US" }
 ```
 
-Array elements and map keys/values use `.element`, `.key`, and `.value` path segments.
+An array field named `tags` uses `"tags.element"`. A map field named `m` uses `"m.key"` or
+`"m.value"`. These container segments can be combined for nested arrays and maps.
 Nested struct children own their annotations. Kernel validates the object, STRING targets,
 and non-default `Provider.Name` identifiers before creating or altering a schema.
 Use unversioned identifiers in schema annotations. Per-file statistics use versioned identifiers.
 
-An annotated schema automatically selects the stable `collations` writer feature unless
-`collations` or `collations-preview` is already requested. You can request either with
-`delta.feature.collations=supported` or `delta.feature.collations-preview=supported`.
-An explicit preview request stays preview. Both features require `domainMetadata`, which
-Kernel adds after feature selection. ALTER requires the feature to be declared already;
-it doesn't automatically upgrade the protocol.
+Snapshot loading applies the same annotation validation, even for binary-only reads.
+Malformed annotations and annotated schemas without a declared collation feature are rejected.
+Logical schemas retain their annotations. Physical schemas rewrite the owning-field prefix to
+the physical column name when column mapping is enabled.
+
+An annotated schema automatically selects the stable `collations` writer feature. You can
+also request it with `delta.feature.collations=supported`. CREATE rejects
+`delta.feature.collations-preview=supported`, consistent with other preview feature signals.
+Existing tables declaring `collations-preview` retain that feature during writes and ALTER.
+Both features share support and dependency rules and require `domainMetadata`, which Kernel
+adds during CREATE. ALTER requires either feature to be declared already; it doesn't
+automatically upgrade the protocol.
 
 Kernel preserves the annotations and existing collation statistics without evaluating
 collations or computing collated bounds. For collation-aware queries, follow the
@@ -382,7 +390,7 @@ Features enabled when specific column types or annotations appear in the schema.
 | `VARIANT` type in schema | `variantType` | — | — |
 | `FILE` type in schema | `fileType-preview` | — | — |
 | `TIMESTAMP_NTZ` type in schema | `timestampNtz` | — | — |
-| `__COLLATIONS` metadata in schema | - | `collations` (or selected `collations-preview`), `domainMetadata` | - |
+| `__COLLATIONS` metadata in schema | - | `collations`, `domainMetadata` | - |
 | Any field with `nullable: false` in schema | — | `invariants` | — |
 
 > [!NOTE]
