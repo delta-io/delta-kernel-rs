@@ -64,15 +64,13 @@ from the `build` directory, and turn `OFF`/uncheckmark `PRINT_DATA`. Then "confi
 
 ## UDT annotation tests
 
-The UDT schema round-trip test requires both the Rust `udt-in-dev` feature and CMake's
-`UDT_IN_DEV=ON` option. The CMake option registers the test; it does not enable the Rust feature.
-Run these commands from the repository root:
+The UDT annotation tests are registered by CMake. Run these commands from the repository root:
 
 ```sh
-cargo build -p delta_kernel_ffi --features tracing,udt-in-dev
+cargo build -p delta_kernel_ffi --features tracing
 mkdir -p ffi/examples/read-table/build
 cd ffi/examples/read-table/build
-cmake .. -DUDT_IN_DEV=ON -DPRINT_DATA=OFF
+cmake .. -DPRINT_DATA=OFF
 cmake --build .
 ctest -R '^udt_annotation_' --output-on-failure
 ```

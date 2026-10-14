@@ -455,7 +455,6 @@ mod apply_schema_validation_tests {
 
     /// Verifies that schema application rejects an Arrow value incompatible with the UDT's
     /// physical type.
-    #[cfg(feature = "udt-in-dev")]
     #[test]
     fn apply_schema_rejects_udt_long_over_utf8() {
         let input: ArrayRef = Arc::new(crate::arrow::array::StringArray::from(vec!["42"]));

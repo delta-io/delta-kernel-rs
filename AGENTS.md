@@ -111,8 +111,11 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
 
 **User-defined types:** `DataType::UserDefined` is available without a cargo or table feature.
 `UserDefinedType` carries a physical `sql_type` and string-or-null annotations. Generic schema
-transforms treat it as a leaf; feature detectors explicitly inspect its physical type. Type
-equality compares only `sql_type`, so annotation-preservation tests must compare serialized schemas.
+transforms treat it as a leaf; feature detectors explicitly inspect its physical type. Logical
+equality compares both the complete `sql_type` and annotations. Use `can_read_as` or
+`can_read_as_without_type_widening` for directional schema compatibility: UDT physical types and
+annotations must match exactly. Both CDF modes enforce this rule for existing UDTs. Physical data
+reads use `sql_type`. Serialization tests also check the JSON shape.
 
 **Snapshot** is the primary entry point for existing-table operations: an immutable view of a
 table at a specific version. From it you build a `Scan` (reads) or `Transaction` (writes).
