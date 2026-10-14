@@ -21,8 +21,8 @@ use delta_kernel::Snapshot;
 use rstest::rstest;
 use serde_json::{json, Value};
 use test_utils::{
-    add_commit, read_add_infos, read_scan, test_table_setup, test_table_setup_mt,
-    write_batch_to_table,
+    add_commit, assert_result_error_with_message, read_add_infos, read_scan, test_table_setup,
+    test_table_setup_mt, write_batch_to_table,
 };
 
 use super::{
@@ -510,7 +510,7 @@ async fn malformed_annotations_rejected_before_create_and_alter(
     )]);
     let create = create_table(&path, schema_ref! { (invalid.clone()) }, "test")
         .build(engine.as_ref(), committer());
-    assert!(create.err().unwrap().to_string().contains(message));
+    assert_result_error_with_message(create, message);
     let snapshot = create_table(&path, schema_ref! { nullable "id": INTEGER }, "test")
         .with_table_properties([("delta.feature.collations", "supported")])
         .build(engine.as_ref(), committer())?
@@ -521,7 +521,7 @@ async fn malformed_annotations_rejected_before_create_and_alter(
         .with_operation(UpdateTableOperation::AlterTable)
         .add_column(invalid)
         .build(engine.as_ref(), committer());
-    assert!(alter.err().unwrap().to_string().contains(message));
+    assert_result_error_with_message(alter, message);
     assert_eq!(
         Snapshot::builder_for(&path)
             .build(engine.as_ref())?
