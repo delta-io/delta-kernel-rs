@@ -279,10 +279,12 @@ impl LogSegment {
         seed_histogram: Option<FileSizeHistogram>,
     ) -> KernelResult<CrcDelta> {
         // Replay newest-first: ICT capture reads from the newest commit only.
-        let newest = ascending_commits.next_back();
-        let locations: Vec<FileMeta> = newest
+        let oldest = ascending_commits.next();
+        let newer = ascending_commits.next_back();
+        let locations: Vec<FileMeta> = newer
             .into_iter()
             .chain(ascending_commits.rev())
+            .chain(oldest)
             .map(|c| c.location.clone())
             .collect();
         let mut acc = CrcReplayAccumulator::new(seed_histogram);
@@ -302,10 +304,24 @@ impl LogSegment {
         // will trigger it.
         acc.process_commit_file_end();
 
-        let delta = acc.into_crc_delta();
+        #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_mut))]
+        let mut delta = acc.into_crc_delta();
+        // A manifest commit records its files in the manifest rather than as add/remove actions.
+        // Every later commit carries `lastManifestCommit` forward, so the newest commit's value
+        // reveals whether one falls inside the replayed range.
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let (Some(newest), Some(last_manifest_commit)) = (newest, &delta.last_manifest_commit) {
+        if let (Some(oldest), Some(newest), Some(last_manifest_commit)) =
+            (oldest, newer.or(oldest), &delta.last_manifest_commit)
+        {
             last_manifest_commit.ensure_at_or_before(newest.version)?;
+            if u64::try_from(last_manifest_commit.version).is_ok_and(|v| v >= oldest.version) {
+                warn!(
+                    "CRC reverse-replay: manifest commit at {} carries files outside the log; \
+                     defaulting to non-incremental-safe",
+                    last_manifest_commit.version
+                );
+                delta.is_incremental_safe = false;
+            }
         }
         Ok(delta)
     }

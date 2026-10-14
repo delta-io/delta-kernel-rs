@@ -155,6 +155,12 @@ impl std::fmt::Debug for Snapshot {
     }
 }
 
+/// Why a CRC cannot be resolved once a manifest commit is in play: kernel counts files from add
+/// and remove actions, but a manifest commit records its files in the manifest.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+const MANIFEST_COMMIT_FILE_STATS_UNKNOWN: &str =
+    "file stats are unknown after an adaptiveMetadata manifest commit";
+
 /// Build a [`KernelError::ChecksumWriteUnsupported`] for a resolution root that could not yield a
 /// writable CRC. `reason` completes the sentence "Cannot resolve a CRC to write: ...".
 fn unresolved_crc(reason: &str) -> KernelError {
@@ -1451,9 +1457,6 @@ impl Snapshot {
                 // A checkpoint carries no ICT or lastManifestCommit (it has no commitInfo). Since
                 // there's no tail delta to carry them either, read them from the commit at the
                 // checkpoint version. adaptiveMetadata requires ICT, so one read yields both.
-                let mut crc = log_segment
-                    .build_crc_from_checkpoint(engine)?
-                    .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 if self
                     .table_configuration()
@@ -1461,10 +1464,17 @@ impl Snapshot {
                 {
                     let (in_commit_timestamp, last_manifest_commit) =
                         self.read_ict_and_last_manifest_commit(engine)?;
+                    // A checkpoint counts only add actions, so it misses the files a manifest
+                    // commit records in its manifest.
+                    require!(
+                        last_manifest_commit.is_none(),
+                        unresolved_crc(MANIFEST_COMMIT_FILE_STATS_UNKNOWN)
+                    );
+                    let mut crc = self.build_crc_from_checkpoint(engine)?;
                     crc.in_commit_timestamp_opt = Some(in_commit_timestamp);
-                    crc.last_manifest_commit_opt = last_manifest_commit;
                     return Ok(Arc::new(crc));
                 }
+                let mut crc = self.build_crc_from_checkpoint(engine)?;
                 crc.in_commit_timestamp_opt = self.get_in_commit_timestamp(engine)?;
                 return Ok(Arc::new(crc));
             }
@@ -1479,9 +1489,14 @@ impl Snapshot {
                 delta.is_incremental_safe,
                 unresolved_crc("commits after the checkpoint are not incremental-safe")
             );
-            let base = log_segment
-                .build_crc_from_checkpoint(engine)?
-                .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
+            // The tail's lastManifestCommit is set iff a manifest commit is at or before `end`,
+            // and a checkpoint at or after it misses that commit's manifest files.
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            require!(
+                delta.last_manifest_commit.is_none(),
+                unresolved_crc(MANIFEST_COMMIT_FILE_STATS_UNKNOWN)
+            );
+            let base = self.build_crc_from_checkpoint(engine)?;
             // The tail delta carries v_end's ICT, which `apply` sets on the result.
             return Ok(Arc::new(base.apply(delta, end)));
         }
@@ -1492,6 +1507,13 @@ impl Snapshot {
             .build_crc_from_version_zero(engine)?
             .ok_or_else(|| unresolved_crc("commit history is missing protocol or metadata"))?;
         Ok(Arc::new(crc))
+    }
+
+    /// Builds the CRC at this snapshot's checkpoint version from its checkpoint files.
+    fn build_crc_from_checkpoint(&self, engine: &dyn Engine) -> KernelResult<Crc> {
+        self.log_segment
+            .build_crc_from_checkpoint(engine)?
+            .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))
     }
 
     /// Performs a complete checkpoint of this snapshot using the provided engine.
