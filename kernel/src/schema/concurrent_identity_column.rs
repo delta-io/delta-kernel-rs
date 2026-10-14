@@ -6,8 +6,11 @@
 //! concurrent iff its metadata carries `delta.identity.concurrent.sequenceId`. On a table that
 //! supports the `concurrentIdentityColumns` feature, every identity column must be concurrent.
 //!
-//! Kernel only parses and validates this metadata; allocating sequence values is the catalog's job.
+//! Kernel only parses and validates this metadata; allocating sequence values is the catalog's
+//! job. The connector write-flow is documented on [`ConcurrentIdentityColumn`].
 
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
@@ -25,11 +28,28 @@ const IDENTITY_KEYS: [ColumnMetadataKey; 5] = [
     ColumnMetadataKey::IdentityConcurrentSequenceId,
 ];
 
-/// The parsed metadata of a top-level Concurrent Identity Column.
+/// A borrowed view of a Concurrent Identity Column, surfaced by
+/// [`Transaction::concurrent_identity_columns`].
+///
+/// A connector writing to a table with Concurrent Identity Columns:
+/// 1. Discovers the columns it must fill via [`Transaction::concurrent_identity_columns`].
+/// 2. Reserves a range per column from the table catalog's sequence service, using
+///    [`sequence_id`](Self::sequence_id) and [`step`](Self::step).
+/// 3. Generates the values (a reserved range enumerates as `range_start + step * i`) and fills them
+///    into its batch, keeping user-supplied values when
+///    [`allow_explicit_insert`](Self::allow_explicit_insert) permits them.
+/// 4. Calls [`Transaction::ack_concurrent_identity_columns`] before requesting write state.
+///
+/// Kernel neither reserves, generates, nor inserts values.
+///
+/// [`Transaction::concurrent_identity_columns`]: crate::transaction::Transaction::concurrent_identity_columns
+/// [`Transaction::ack_concurrent_identity_columns`]: crate::transaction::Transaction::ack_concurrent_identity_columns
 #[derive(Debug, Clone, PartialEq)]
-// `start` and `allow_explicit_insert` are parsed only to validate their types.
-#[allow(dead_code)]
-pub(crate) struct ConcurrentIdentityColumn<'a> {
+#[cfg_attr(
+    not(feature = "concurrent-identity-columns-in-dev"),
+    allow(unreachable_pub, dead_code)
+)]
+pub struct ConcurrentIdentityColumn<'a> {
     field: &'a StructField,
     sequence_id: &'a str,
     start: i64,
@@ -67,6 +87,92 @@ impl<'a> ConcurrentIdentityColumn<'a> {
             )?,
         }))
     }
+}
+
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+impl<'a> ConcurrentIdentityColumn<'a> {
+    /// The schema field of this column, e.g. to resolve its physical name under column mapping.
+    pub fn field(&self) -> &'a StructField {
+        self.field
+    }
+
+    /// The logical column name the connector must fill.
+    pub fn column_name(&self) -> &'a str {
+        self.field.name()
+    }
+
+    /// The catalog sequence id that issues this column's values.
+    pub fn sequence_id(&self) -> &'a str {
+        self.sequence_id
+    }
+
+    /// The first value the sequence issues.
+    pub fn start(&self) -> i64 {
+        self.start
+    }
+
+    /// The increment between successive values (non-zero).
+    pub fn step(&self) -> i64 {
+        self.step
+    }
+
+    /// Whether user-supplied values may be written to this column instead of sequence-issued
+    /// ones. Explicitly inserted values are not drawn from the sequence and may collide with
+    /// generated values.
+    pub fn allow_explicit_insert(&self) -> bool {
+        self.allow_explicit_insert
+    }
+}
+
+/// Builds a Concurrent Identity Column: a non-nullable `LONG` [`StructField`] carrying the
+/// concurrent `sequenceId` and the classic `start`/`step`/`allowExplicitInsert` keys.
+///
+/// This is a convenience over stamping the [`ColumnMetadataKey`] entries by hand. The `sequence_id`
+/// is an identifier provided by the connector (at most 64 characters); `start` is the first value
+/// the sequence issues, `step` the (non-zero) increment, and `allow_explicit_insert` whether
+/// user-supplied values may be written to the column.
+#[cfg(any(test, feature = "concurrent-identity-columns-in-dev"))]
+#[cfg_attr(
+    not(feature = "concurrent-identity-columns-in-dev"),
+    allow(unreachable_pub)
+)]
+pub fn concurrent_identity_column(
+    name: impl Into<String>,
+    sequence_id: impl Into<String>,
+    start: i64,
+    step: i64,
+    allow_explicit_insert: bool,
+) -> StructField {
+    StructField::not_null(name, DataType::LONG).with_metadata(cic_metadata(
+        sequence_id,
+        start,
+        step,
+        allow_explicit_insert,
+    ))
+}
+
+/// Returns every top-level Concurrent Identity Column (CIC) of `schema`, keyed by logical column
+/// name.
+///
+/// Backs the write-path report ([`Transaction::concurrent_identity_columns`]).
+///
+/// # Errors
+///
+/// Returns an error if a detected column is missing a required metadata key or its value is
+/// malformed (see [`ConcurrentIdentityColumn::try_from_field`]).
+///
+/// [`Transaction::concurrent_identity_columns`]: crate::transaction::Transaction::concurrent_identity_columns
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+pub(crate) fn try_collect_concurrent_identity_columns(
+    schema: &StructType,
+) -> KernelResult<HashMap<String, ConcurrentIdentityColumn<'_>>> {
+    let mut result = HashMap::new();
+    for field in schema.fields() {
+        if let Some(cic) = ConcurrentIdentityColumn::try_from_field(field)? {
+            result.insert(field.name().clone(), cic);
+        }
+    }
+    Ok(result)
 }
 
 /// Validates the identity columns of `schema`, returning whether it has any Concurrent Identity
@@ -156,6 +262,31 @@ fn is_identity_column(field: &StructField) -> bool {
     IDENTITY_KEYS
         .iter()
         .any(|key| field.get_config_value(key).is_some())
+}
+
+/// The metadata keys that mark a Concurrent Identity Column: the concurrent sequence id plus the
+/// classic `start`/`step`/`allowExplicitInsert`.
+#[cfg(any(test, feature = "concurrent-identity-columns-in-dev"))]
+pub(crate) fn cic_metadata(
+    sequence_id: impl Into<String>,
+    start: i64,
+    step: i64,
+    allow_explicit_insert: bool,
+) -> [(String, MetadataValue); 4] {
+    use ColumnMetadataKey::*;
+    [
+        (
+            IdentityConcurrentSequenceId,
+            MetadataValue::String(sequence_id.into()),
+        ),
+        (IdentityStart, MetadataValue::from(start)),
+        (IdentityStep, MetadataValue::from(step)),
+        (
+            IdentityAllowExplicitInsert,
+            MetadataValue::from(allow_explicit_insert),
+        ),
+    ]
+    .map(|(k, v)| (k.as_ref().to_string(), v))
 }
 
 /// Validates a single top-level Concurrent Identity Column. See
@@ -296,24 +427,6 @@ fn as_string(value: &MetadataValue) -> Option<&str> {
 
 // === Test helpers ===
 
-/// Builds a Concurrent Identity Column: a non-nullable `LONG` [`StructField`] carrying the
-/// concurrent `sequenceId` and the classic `start`/`step`/`allowExplicitInsert` keys.
-#[cfg(test)]
-pub(crate) fn concurrent_identity_column(
-    name: impl Into<String>,
-    sequence_id: impl Into<String>,
-    start: i64,
-    step: i64,
-    allow_explicit_insert: bool,
-) -> StructField {
-    StructField::not_null(name, DataType::LONG).with_metadata(cic_metadata(
-        sequence_id,
-        start,
-        step,
-        allow_explicit_insert,
-    ))
-}
-
 /// Builds a classic (non-concurrent) identity column: `start`/`step`/`allowExplicitInsert`, no
 /// `sequenceId`, plus a `highWaterMark` if the column has emitted values.
 #[cfg(test)]
@@ -331,31 +444,6 @@ pub(crate) fn classic_identity_column(name: &str, high_water_mark: Option<i64>) 
             .chain(high_water_mark)
             .map(|(k, v)| (k.as_ref().to_string(), v)),
     )
-}
-
-/// The metadata keys that mark a Concurrent Identity Column: the concurrent sequence id plus the
-/// classic `start`/`step`/`allowExplicitInsert`.
-#[cfg(test)]
-pub(crate) fn cic_metadata(
-    sequence_id: impl Into<String>,
-    start: i64,
-    step: i64,
-    allow_explicit_insert: bool,
-) -> [(String, MetadataValue); 4] {
-    use ColumnMetadataKey::*;
-    [
-        (
-            IdentityConcurrentSequenceId,
-            MetadataValue::String(sequence_id.into()),
-        ),
-        (IdentityStart, MetadataValue::from(start)),
-        (IdentityStep, MetadataValue::from(step)),
-        (
-            IdentityAllowExplicitInsert,
-            MetadataValue::from(allow_explicit_insert),
-        ),
-    ]
-    .map(|(k, v)| (k.as_ref().to_string(), v))
 }
 
 #[cfg(test)]
@@ -385,6 +473,45 @@ mod tests {
             field.get_config_value(&ColumnMetadataKey::IdentityAllowExplicitInsert),
             Some(&MetadataValue::Boolean(true))
         );
+    }
+
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    #[test]
+    fn collect_returns_empty_when_no_identity_columns() {
+        let schema = StructType::try_new(vec![
+            StructField::new("id", DataType::LONG, false),
+            StructField::new("name", DataType::STRING, true),
+        ])
+        .unwrap();
+        assert!(try_collect_concurrent_identity_columns(&schema)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    #[test]
+    fn collect_borrows_a_view_of_each_identity_column() {
+        let schema = StructType::try_new(vec![
+            concurrent_identity_column("id", "seq-1", 1, 1, false),
+            StructField::new("payload", DataType::STRING, true),
+            concurrent_identity_column("row_id", "seq-2", 100, 10, true),
+        ])
+        .unwrap();
+        let cols = try_collect_concurrent_identity_columns(&schema).unwrap();
+        assert_eq!(cols.len(), 2);
+        let id = &cols["id"];
+        assert_eq!(id.column_name(), "id");
+        assert_eq!(id.field().data_type(), &DataType::LONG);
+        assert_eq!(id.sequence_id(), "seq-1");
+        assert_eq!(id.start(), 1);
+        assert_eq!(id.step(), 1);
+        assert!(!id.allow_explicit_insert());
+        let row_id = &cols["row_id"];
+        assert_eq!(row_id.column_name(), "row_id");
+        assert_eq!(row_id.sequence_id(), "seq-2");
+        assert_eq!(row_id.start(), 100);
+        assert_eq!(row_id.step(), 10);
+        assert!(row_id.allow_explicit_insert());
     }
 
     #[rstest::rstest]
