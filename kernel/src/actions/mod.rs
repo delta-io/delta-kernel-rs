@@ -1417,6 +1417,10 @@ pub(crate) struct ContentRoot {
     /// version). Distinct from [`CheckpointAction::version`], which is
     /// `checkpointMetadata.version`.
     version: i64,
+    /// When the root manifest was committed, in milliseconds since the Unix epoch: the In-Commit
+    /// Timestamp of the commit that wrote it. Optional, so readers must accept roots without it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamp: Option<i64>,
 }
 
 /// Identifies the latest manifest commit up to a given table version.
@@ -1729,7 +1733,13 @@ impl ContentRoot {
             path,
             size_in_bytes,
             version,
+            timestamp: None,
         }
+    }
+
+    /// Sets when the root manifest was committed, in milliseconds since the Unix epoch.
+    pub(crate) fn with_timestamp(self, timestamp: Option<i64>) -> Self {
+        ContentRoot { timestamp, ..self }
     }
 }
 
@@ -3271,6 +3281,7 @@ mod tests {
                 path: path.to_string(),
                 size_in_bytes,
                 version: 1,
+                timestamp: None,
             },
             protocol: Protocol::new_unchecked(1, 2, None, None),
             metadata: Metadata::default(),
@@ -3306,6 +3317,7 @@ mod tests {
                 path: "s3://bucket/manifest".to_string(),
                 size_in_bytes: 1024,
                 version: 40,
+                timestamp: Some(1_700_000_000_000),
             },
             protocol: Protocol::new_unchecked(1, 2, None, None),
             metadata: Metadata::default(),
@@ -3373,7 +3385,7 @@ mod tests {
             json,
             json!({ "checkpoint": [
                 { "checkpointMetadata": { "version": 42 } },
-                { "contentRoot": { "path": "s3://bucket/manifest", "sizeInBytes": 1024, "version": 40 } },
+                { "contentRoot": { "path": "s3://bucket/manifest", "sizeInBytes": 1024, "version": 40, "timestamp": 1_700_000_000_000_i64 } },
                 { "protocol": { "minReaderVersion": 1, "minWriterVersion": 2 } },
                 { "metaData": {
                     "id": "",
@@ -3418,6 +3430,7 @@ mod tests {
                 path: "s3://bucket/manifest".to_string(),
                 size_in_bytes: 8,
                 version: 8,
+                timestamp: None,
             },
             protocol: Protocol::new_unchecked(1, 2, None, None),
             metadata: Metadata::default(),
