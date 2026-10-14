@@ -739,7 +739,7 @@ impl CheckpointWriter {
             .stats_schema_builder()
             .with_required_physical_columns(physical_clustering_columns.as_deref())
             .build()?;
-        if config.write_stats_as_struct && collation_stats::snapshot_has_collations(snapshot) {
+        if config.write_stats_as_struct && snapshot.table_configuration().has_collations() {
             stats_schema =
                 collation_stats::checkpoint_stats_schema(snapshot, engine, stats_schema)?;
         }

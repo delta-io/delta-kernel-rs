@@ -677,6 +677,22 @@ mod tests {
         plan.nodes.iter().map(|node| node.op.to_string()).collect()
     }
 
+    fn leaf_read_schema<'plan>(plan: &'plan Plan, shape: &CheckpointShape) -> &'plan SchemaRef {
+        plan.nodes
+            .iter()
+            .find_map(|node| match &node.op {
+                Operator::ScanParquet(scan) if shape.checkpoint_type == CheckpointType::Leaf => {
+                    Some(&scan.schema)
+                }
+                Operator::DynamicScan(scan) => {
+                    assert!(scan.dv_column.is_none(), "sidecar scan sets no dv column");
+                    Some(&scan.schema)
+                }
+                _ => None,
+            })
+            .expect("checkpoint leaf scan")
+    }
+
     fn add_struct(schema: &SchemaRef) -> &StructType {
         let DataType::Struct(add_struct) = schema
             .field(ADD_NAME)
@@ -836,20 +852,7 @@ mod tests {
         };
         let plan = scan.build_metadata_scan_plan(&shape)?.expect("non-empty");
 
-        let checkpoint_schema = plan
-            .nodes
-            .iter()
-            .find_map(|node| match &node.op {
-                Operator::ScanParquet(scan) if shape.checkpoint_type == CheckpointType::Leaf => {
-                    Some(&scan.schema)
-                }
-                Operator::DynamicScan(scan) => {
-                    assert!(scan.dv_column.is_none(), "sidecar scan sets no dv column");
-                    Some(&scan.schema)
-                }
-                _ => None,
-            })
-            .expect("checkpoint leaf scan");
+        let checkpoint_schema = leaf_read_schema(&plan, &shape);
         assert_eq!(
             add_struct(checkpoint_schema).field(STATS_PARSED).is_some(),
             parsed_stats.is_some(),
@@ -903,17 +906,7 @@ mod tests {
             .build(&struct_stats_schema())?);
         let shape = shape(checkpoint_type, Some(source));
         let plan = scan.build_metadata_scan_plan(&shape)?.unwrap();
-        let read_schema = plan
-            .nodes
-            .iter()
-            .find_map(|node| match &node.op {
-                Operator::ScanParquet(scan) if shape.checkpoint_type == CheckpointType::Leaf => {
-                    Some(&scan.schema)
-                }
-                Operator::DynamicScan(scan) => Some(&scan.schema),
-                _ => None,
-            })
-            .unwrap();
+        let read_schema = leaf_read_schema(&plan, &shape);
         assert_eq!(source_collation_stats(read_schema).is_some(), preserve_json);
         assert_eq!(
             plan.nodes.iter().any(|node| match &node.op {

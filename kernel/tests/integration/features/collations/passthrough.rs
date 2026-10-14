@@ -3,292 +3,33 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{ArrayRef, RecordBatch, StructArray};
+use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromArrow, TryIntoArrow};
-use delta_kernel::expressions::{col, column_name, lit, ColumnName};
+use delta_kernel::expressions::{col, column_name, lit};
 use delta_kernel::schema::{
-    schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, SchemaRef,
-    StructField, StructType,
+    schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
+    StructType,
 };
 use delta_kernel::snapshot::{CheckpointWriteResult, ChecksumWriteResult};
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::UpdateTableOperation;
-use delta_kernel::{Snapshot, SnapshotRef};
+use delta_kernel::Snapshot;
 use rstest::rstest;
 use serde_json::{json, Value};
-use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
-use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    add_commit, generate_batch, read_add_infos, read_scan, test_table_setup, test_table_setup_mt,
-    write_batch_to_table, IntoArray,
+    add_commit, read_add_infos, read_scan, test_table_setup, test_table_setup_mt,
+    write_batch_to_table,
 };
 
+use super::{
+    annotated_field, assert_rows, committer, create_fixture, generated_table, mapped_bounds,
+    physical_name, physical_path, rewrite_as_preview_table,
+};
 use crate::common::write_utils::{resolve_json_path, rewrite_commit};
-
-mod connector;
-
-struct CollationTable {
-    schema: SchemaRef,
-    files: Vec<(RecordBatch, Value)>,
-    collation_id: &'static str,
-}
-
-fn annotated_field(
-    name: &str,
-    data_type: impl Into<DataType>,
-    path: &str,
-    id: &str,
-) -> StructField {
-    StructField::nullable(name, data_type).with_metadata([(
-        ColumnMetadataKey::Collations.as_ref(),
-        MetadataValue::Other(json!({ path: id })),
-    )])
-}
-
-fn generated_table(nested: bool, collated_fields: &[&str]) -> CollationTable {
-    let annotation = if nested {
-        "spark.UTF8_LCASE"
-    } else {
-        "icu.UNICODE_CI"
-    };
-    let field = |name: &str| {
-        if collated_fields.contains(&name) {
-            annotated_field(name, DataType::STRING, name, annotation)
-        } else {
-            StructField::nullable(name, DataType::STRING)
-        }
-    };
-    let mut fixture = if nested {
-        CollationTable {
-            schema: schema_ref! {
-                nullable "id": INTEGER,
-                nullable "name": { (field("first")), (field("last")) },
-                (field("email")),
-                nullable "department": STRING,
-            },
-            files: vec![
-                (
-                    nested_batch(&[
-                        (
-                            1,
-                            "Alice",
-                            "Johnson",
-                            "Alice.Johnson@example.com",
-                            "Engineering",
-                        ),
-                        (2, "Bob", "Smith", "bob.smith@example.com", "Marketing"),
-                        (3, "Charlie", "Brown", "charlie@example.com", "Engineering"),
-                    ]),
-                    json!({
-                        "minValues": { "name": { "first": "Alice", "last": "Brown" },
-                            "email": "Alice.Johnson@example.com" },
-                        "maxValues": { "name": { "first": "Charlie", "last": "Smith" },
-                            "email": "charlie@example.com" },
-                    }),
-                ),
-                (
-                    nested_batch(&[
-                        (
-                            4,
-                            "alice",
-                            "johnson",
-                            "alice.johnson@example.com",
-                            "Engineering",
-                        ),
-                        (5, "bob", "dylan", "Bob.Dylan@Example.Com", "Sales"),
-                    ]),
-                    json!({
-                        "minValues": { "name": { "first": "alice", "last": "dylan" },
-                            "email": "alice.johnson@example.com" },
-                        "maxValues": { "name": { "first": "bob", "last": "johnson" },
-                            "email": "Bob.Dylan@Example.Com" },
-                    }),
-                ),
-            ],
-            collation_id: "spark.UTF8_LCASE.75.1",
-        }
-    } else {
-        CollationTable {
-            schema: schema_ref! { nullable "id": INTEGER, (field("name")) },
-            files: [(1, "M\u{fc}ller"), (2, "M\u{dc}LLER"), (3, "m\u{fc}ller")]
-                .into_iter()
-                .map(|(id, name)| {
-                    (
-                        simple_batch(vec![id], vec![name]),
-                        json!({ "minValues": { "name": name }, "maxValues": { "name": name } }),
-                    )
-                })
-                .collect(),
-            collation_id: "icu.UNICODE_CI.75.1",
-        }
-    };
-    if collated_fields.is_empty() {
-        for (_, bounds) in &mut fixture.files {
-            *bounds = Value::Null;
-        }
-    }
-    fixture
-}
-
-fn simple_batch(ids: Vec<i32>, names: Vec<&'static str>) -> RecordBatch {
-    generate_batch(vec![
-        ("id", ids.into_arrow_array()),
-        ("name", names.into_arrow_array()),
-    ])
-    .unwrap()
-}
-
-fn nested_batch(
-    rows: &[(i32, &'static str, &'static str, &'static str, &'static str)],
-) -> RecordBatch {
-    let name = generate_batch(vec![
-        (
-            "first",
-            rows.iter()
-                .map(|row| row.1)
-                .collect::<Vec<_>>()
-                .into_arrow_array(),
-        ),
-        (
-            "last",
-            rows.iter()
-                .map(|row| row.2)
-                .collect::<Vec<_>>()
-                .into_arrow_array(),
-        ),
-    ])
-    .unwrap();
-    generate_batch(vec![
-        (
-            "id",
-            rows.iter()
-                .map(|row| row.0)
-                .collect::<Vec<_>>()
-                .into_arrow_array(),
-        ),
-        ("name", Arc::new(StructArray::from(name)) as ArrayRef),
-        (
-            "email",
-            rows.iter()
-                .map(|row| row.3)
-                .collect::<Vec<_>>()
-                .into_arrow_array(),
-        ),
-        (
-            "department",
-            rows.iter()
-                .map(|row| row.4)
-                .collect::<Vec<_>>()
-                .into_arrow_array(),
-        ),
-    ])
-    .unwrap()
-}
-
-fn committer() -> Box<FileSystemCommitter> {
-    Box::new(FileSystemCommitter::new())
-}
-
-fn physical_name(field: &StructField) -> &str {
-    match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
-        Some(MetadataValue::String(name)) => name,
-        _ => field.name(),
-    }
-}
-
-fn physical_bounds(bounds: &Value, schema: &StructType) -> Value {
-    Value::Object(
-        bounds
-            .as_object()
-            .unwrap()
-            .iter()
-            .map(|(name, value)| {
-                let field = schema.field(name).unwrap();
-                let value = match field.data_type() {
-                    DataType::Struct(child) => physical_bounds(value, child),
-                    _ => value.clone(),
-                };
-                (physical_name(field).to_string(), value)
-            })
-            .collect(),
-    )
-}
-
-fn physical_path(snapshot: &Snapshot, logical: &ColumnName) -> Vec<String> {
-    snapshot
-        .schema()
-        .fields_of_path(logical)
-        .unwrap()
-        .iter()
-        .map(|field| physical_name(field).to_string())
-        .collect()
-}
-
-fn mapped_bounds(bounds: &Value, schema: &StructType) -> Value {
-    Value::Object(
-        bounds
-            .as_object()
-            .unwrap()
-            .iter()
-            .map(|(bound, values)| (bound.clone(), physical_bounds(values, schema)))
-            .collect(),
-    )
-}
-
-async fn create_fixture(
-    table_path: &str,
-    engine: &DefaultEngine<impl TaskExecutor>,
-    fixture: &CollationTable,
-    properties: &[(&str, &str)],
-) -> Result<SnapshotRef, Box<dyn std::error::Error>> {
-    let mut snapshot = create_table(table_path, fixture.schema.clone(), "collation-test")
-        .with_table_properties(properties.iter().copied())
-        .build(engine, committer())?
-        .commit(engine)?
-        .unwrap_post_commit_snapshot();
-    for (batch, bounds) in &fixture.files {
-        snapshot = write_batch_to_table(&snapshot, engine, batch.clone(), HashMap::new()).await?;
-        let bounds = (!bounds.is_null()).then(|| mapped_bounds(bounds, &snapshot.schema()));
-        let mut adds = 0;
-        rewrite_commit(table_path, snapshot.version(), |action| {
-            if let Some(commit_info) = action.get_mut("commitInfo") {
-                // CRC replay requires a known operation for file-changing commits.
-                commit_info["operation"] = json!("WRITE");
-            }
-            if let Some(add) = action.get_mut("add") {
-                if let Some(bounds) = &bounds {
-                    // Simulate writer-supplied collation stats; Kernel computes only binary stats.
-                    let mut stats: Value = serde_json::from_str(add["stats"].as_str().unwrap())?;
-                    assert!(stats.get("statsWithCollation").is_none());
-                    stats["statsWithCollation"] = json!({ fixture.collation_id: bounds });
-                    add["stats"] = Value::String(stats.to_string());
-                }
-                adds += 1;
-            }
-            Ok(())
-        })?;
-        assert_eq!(adds, 1);
-        snapshot = Snapshot::builder_for(table_path).build(engine)?;
-    }
-    Ok(snapshot)
-}
-
-fn assert_rows(fixture: &CollationTable, actual: &[RecordBatch]) {
-    let expected: Vec<_> = fixture
-        .files
-        .iter()
-        .map(|(batch, _)| batch.clone())
-        .collect();
-    let expected = pretty_format_batches(&expected).unwrap().to_string();
-    let mut expected: Vec<_> = expected.lines().collect();
-    sort_lines!(expected);
-    assert_batches_sorted_eq!(expected, actual);
-}
 
 fn assert_annotations(logical: &StructType, physical: &StructType, mapped: bool) {
     for (logical, physical) in logical.fields().zip(physical.fields()) {
@@ -300,9 +41,25 @@ fn assert_annotations(logical: &StructType, physical: &StructType, mapped: bool)
                 logical.name()
             }
         );
+        let expected = logical
+            .get_config_value(&ColumnMetadataKey::Collations)
+            .map(|annotation| match annotation {
+                MetadataValue::Other(Value::Object(collations)) if mapped => {
+                    MetadataValue::Other(Value::Object(
+                        collations
+                            .iter()
+                            .map(|(path, identifier)| {
+                                let suffix = path.strip_prefix(logical.name()).unwrap();
+                                (format!("{}{suffix}", physical.name()), identifier.clone())
+                            })
+                            .collect(),
+                    ))
+                }
+                annotation => annotation.clone(),
+            });
         assert_eq!(
-            logical.get_config_value(&ColumnMetadataKey::Collations),
             physical.get_config_value(&ColumnMetadataKey::Collations),
+            expected.as_ref(),
         );
         if let (DataType::Struct(left), DataType::Struct(right)) =
             (logical.data_type(), physical.data_type())
@@ -368,9 +125,10 @@ async fn reads_all_collation_bounds_and_annotations(
             })
             .unwrap();
         assert_eq!(stats["numRecords"], expected.0.num_rows());
+        let collation_stats = expected.1.as_ref().unwrap();
         assert_eq!(
-            stats["statsWithCollation"][fixture.collation_id],
-            mapped_bounds(&expected.1, &snapshot.schema())
+            stats["statsWithCollation"][collation_stats.identifier],
+            mapped_bounds(&collation_stats.bounds, &snapshot.schema())
         );
         if nested && expected.0.num_rows() == 2 {
             let email = physical_path(&snapshot, &column_name!("email"));
@@ -386,6 +144,31 @@ async fn reads_all_collation_bounds_and_annotations(
             );
         }
     }
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test]
+async fn predicates_use_binary_semantics_on_collated_columns(
+    #[values(false, true)] nested: bool,
+    #[values("none", "name", "id")] mapping: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, path, engine) = test_table_setup()?;
+    let fixture = generated_table(
+        nested,
+        if nested {
+            &["first", "last", "email"]
+        } else {
+            &["name"]
+        },
+    );
+    let snapshot = create_fixture(
+        &path,
+        engine.as_ref(),
+        &fixture,
+        &[("delta.columnMapping.mode", mapping)],
+    )
+    .await?;
     let (column, value, expected) = if nested {
         (col!("name.first"), "charlie", 0)
     } else {
@@ -424,13 +207,9 @@ async fn reads_all_collation_bounds_and_annotations(
     TableFeature::Collations,
     TableFeature::CollationsPreview
 )]
-#[case::preview(
-    Some("collations-preview"),
-    TableFeature::CollationsPreview,
-    TableFeature::Collations
-)]
+#[case::existing_preview(None, TableFeature::CollationsPreview, TableFeature::Collations)]
 #[tokio::test]
-async fn create_and_append_preserve_selected_feature(
+async fn create_stable_tables_and_preserve_existing_features_on_append(
     #[case] signal: Option<&str>,
     #[case] feature: TableFeature,
     #[case] absent: TableFeature,
@@ -453,7 +232,11 @@ async fn create_and_append_preserve_selected_feature(
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
-    let snapshot = create_fixture(&path, engine.as_ref(), &fixture, &properties).await?;
+    let mut snapshot = create_fixture(&path, engine.as_ref(), &fixture, &properties).await?;
+    if feature == TableFeature::CollationsPreview {
+        rewrite_as_preview_table(&path)?;
+        snapshot = Snapshot::builder_for(&path).build(engine.as_ref())?;
+    }
     assert!(snapshot
         .table_configuration()
         .is_feature_supported(&feature));
@@ -539,13 +322,17 @@ async fn alter_requires_existing_feature_without_upgrade(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup()?;
     let mut builder = create_table(&path, schema_ref! { nullable "id": INTEGER }, "test");
-    if let Some(signal) = signal {
-        builder = builder.with_table_properties([(format!("delta.feature.{signal}"), "supported")]);
+    if signal.is_some() {
+        builder = builder.with_table_properties([("delta.feature.collations", "supported")]);
     }
-    let snapshot = builder
+    let mut snapshot = builder
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
+    if signal == Some("collations-preview") {
+        rewrite_as_preview_table(&path)?;
+        snapshot = Snapshot::builder_for(&path).build(engine.as_ref())?;
+    }
     let protocol = snapshot.table_configuration().protocol().clone();
     let collated_field = annotated_field("name", DataType::STRING, "name", "test.ASCII_CI");
     let result = snapshot
@@ -745,6 +532,86 @@ async fn malformed_annotations_rejected_before_create_and_alter(
 }
 
 #[rstest]
+#[case::non_object(json!("test.ASCII_CI"), "JSON object")]
+#[case::non_string(json!({ "name": 1 }), "string identifier")]
+#[case::invalid_identifier(json!({ "name": "ASCII_CI" }), "invalid identifier")]
+#[case::versioned_identifier(json!({ "name": "test.ASCII_CI.1" }), "invalid identifier")]
+#[case::default_binary(json!({ "name": "spark.UTF8_BINARY" }), "invalid identifier")]
+#[case::stale_path(json!({ "other": "test.ASCII_CI" }), "STRING target")]
+#[tokio::test]
+async fn snapshot_loading_rejects_malformed_collation_annotations(
+    #[case] annotation: Value,
+    #[case] message: &str,
+    #[values("collations", "collations-preview")] feature: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, path, engine) = test_table_setup()?;
+    create_table(&path, schema_ref! { nullable "name": STRING }, "test")
+        .with_table_properties([("delta.feature.collations", "supported")])
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    if feature == "collations-preview" {
+        rewrite_as_preview_table(&path)?;
+    }
+    let schema = schema_ref! {
+        (StructField::nullable("name", DataType::STRING).with_metadata([(
+            ColumnMetadataKey::Collations.as_ref(),
+            MetadataValue::Other(annotation),
+        )]))
+    };
+    rewrite_commit(&path, 0, |action| {
+        if let Some(metadata) = action.get_mut("metaData") {
+            metadata["schemaString"] = Value::String(serde_json::to_string(&schema)?);
+        }
+        Ok(())
+    })?;
+    let error = Snapshot::builder_for(&path)
+        .build(engine.as_ref())
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains(message), "{error}");
+    Ok(())
+}
+
+#[rstest]
+#[case::legacy(json!({ "minReaderVersion": 1, "minWriterVersion": 2 }))]
+#[case::writer_features(json!({
+    "minReaderVersion": 3, "minWriterVersion": 7,
+    "readerFeatures": [], "writerFeatures": []
+}))]
+#[tokio::test]
+async fn snapshot_loading_requires_collation_feature_for_annotated_schema(
+    #[case] protocol: Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, path, engine) = test_table_setup()?;
+    create_table(&path, schema_ref! { nullable "name": STRING }, "test")
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let schema = schema_ref! {
+        (annotated_field("name", DataType::STRING, "name", "test.ASCII_CI"))
+    };
+    rewrite_commit(&path, 0, |action| {
+        if let Some(target) = action.get_mut("protocol") {
+            *target = protocol.clone();
+        }
+        if let Some(metadata) = action.get_mut("metaData") {
+            metadata["schemaString"] = Value::String(serde_json::to_string(&schema)?);
+        }
+        Ok(())
+    })?;
+    let error = Snapshot::builder_for(&path)
+        .build(engine.as_ref())
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("requires the 'collations'"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[rstest]
 #[case::v1(CheckpointSpec::V1, false)]
 #[case::v2_inline(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar), true)]
 #[case::v2_sidecars(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
@@ -755,12 +622,16 @@ async fn checkpoint_repeatedly_preserves_multiple_identifiers_and_sparse_bounds(
     #[case] spec: CheckpointSpec,
     #[case] v2: bool,
     #[values("none", "name", "id")] mapping: &str,
-    #[values(false, true)] write_json: bool,
+    #[values((true, false), (false, true), (true, true))] stats_mode: (bool, bool),
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup_mt()?;
+    let (write_json, write_struct) = stats_mode;
     let fixture = generated_table(true, &["first", "last", "email"]);
     let mut properties = vec![
-        ("delta.checkpoint.writeStatsAsStruct", "true"),
+        (
+            "delta.checkpoint.writeStatsAsStruct",
+            if write_struct { "true" } else { "false" },
+        ),
         (
             "delta.checkpoint.writeStatsAsJson",
             if write_json { "true" } else { "false" },
