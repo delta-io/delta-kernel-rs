@@ -1361,6 +1361,10 @@ async fn test_adds_and_removes_accumulate() {
 #[case::remove_no_size(vec![commit_info("WRITE", None), remove("orphan", None)])]
 #[case::add_with_unsafe_op(vec![commit_info("ANALYZE STATS", None), add("a", 100)])]
 #[case::add_with_no_commit_info(vec![add("a", 100)])]
+#[cfg_attr(
+    feature = "adaptive-metadata-in-dev",
+    case::manifest_commit(vec![last_manifest_commit_info(1, 1)])
+)]
 #[tokio::test]
 async fn test_trips_indeterminate(#[case] v1_actions: Vec<Value>) {
     // Base carries DM + txn entries so we can verify the indeterminate trip is scoped
@@ -1407,6 +1411,22 @@ async fn test_replay_rejects_last_manifest_commit_newer_than_newest_commit() {
 }
 
 // === On-disk base CRC (exercises serde round-trip) ===
+
+// A carried-forward pointer to a manifest commit at or below the base CRC is already reflected in
+// the base's file stats, so advancing past it keeps them Complete.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[tokio::test]
+async fn test_manifest_commit_at_or_below_base_keeps_file_stats_complete() {
+    let base = crc_complete_empty_dm_set_txn();
+    let crc = CrcReadTest::new()
+        .commit(0, create_table_actions())
+        .commit(1, vec![last_manifest_commit_info(0, 0)])
+        .build()
+        .await
+        .incrementally_build_crc(&base)
+        .unwrap();
+    assert!(crc.file_stats_state().is_complete());
+}
 
 #[tokio::test]
 async fn test_from_disk_advances_file_stats() {
