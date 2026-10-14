@@ -139,7 +139,8 @@ udt-in-dev = []
 # work: identity values allocated from a catalog-hosted sequence instead of the Delta-log
 # high-water mark. Gates `KernelSupport::Supported` for the `concurrentIdentityColumns` writer
 # feature (and the writable-identity branch of `identityColumns`); without it, writes to tables
-# listing the feature and CREATE TABLE with CIC columns are rejected (reads are unaffected).
+# listing the feature are rejected (reads are unaffected). With it, existing CIC tables are
+# validated but data writes are not yet supported. CREATE TABLE with CIC columns is always rejected.
 # TODO(#3586): remove once full CIC support ships.
 concurrent-identity-columns-in-dev = []
 
