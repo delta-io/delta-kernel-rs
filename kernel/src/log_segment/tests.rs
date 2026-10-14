@@ -6090,15 +6090,16 @@ fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> R
 
 // An AMT `_last_checkpoint` hint at version 5 has no checkpoint file. The listing starts at the
 // hinted version as long as the manifest commit carrying the checkpoint action is listed, or, for
-// time travel before the manifest commit, the hint embeds that action. `embedded_action` is the
-// embedded action's version.
+// time travel before the manifest commit, the hint embeds that action. Commit 5 is dropped unless
+// it is the manifest commit or the last listed commit. `embedded_action` is the embedded action's
+// version.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[rstest]
 #[case::manifest_commit_at_hint(5, None, None, &[], None, Ok((None, vec![5, 6, 7])))]
-#[case::manifest_commit_after_hint(6, None, None, &[], None, Ok((None, vec![5, 6, 7])))]
+#[case::manifest_commit_after_hint(6, None, None, &[], None, Ok((None, vec![6, 7])))]
 #[case::hinted_commit_cleaned_up(6, None, None, &[0, 1, 2, 3, 4, 5], None, Ok((None, vec![6, 7])))]
-#[case::time_travel_after_manifest_commit(6, None, None, &[], Some(7), Ok((None, vec![5, 6, 7])))]
-#[case::time_travel_at_manifest_commit(6, None, None, &[], Some(6), Ok((None, vec![5, 6])))]
+#[case::time_travel_after_manifest_commit(6, None, None, &[], Some(7), Ok((None, vec![6, 7])))]
+#[case::time_travel_at_manifest_commit(6, None, None, &[], Some(6), Ok((None, vec![6])))]
 #[case::time_travel_before_manifest_commit(6, Some(5), None, &[], Some(5), Ok((None, vec![5])))]
 #[case::time_travel_before_manifest_commit_without_embedded_action(
     6,
@@ -6132,7 +6133,7 @@ fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> R
     None,
     &[],
     None,
-    Ok((None, vec![5, 6, 7]))
+    Ok((None, vec![6, 7]))
 )]
 #[case::manifest_commit_after_latest_commit_without_embedded_action(
     9,
