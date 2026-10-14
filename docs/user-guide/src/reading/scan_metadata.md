@@ -249,9 +249,9 @@ If the scan has no predicate, this returns `None`.
 ## Typed partition values
 
 Kernel reads each file's partition values from the Delta log and exposes them on its
-`ScanFile` as a raw string map. `transform_to_logical` materializes them as typed columns. A
-connector that assembles output rows itself instead of using that transform would otherwise need
-to parse the string map per file.
+`ScanFile` as a raw string map. Kernel's `transform_to_logical` could materialize them as
+typed columns. If your connector assembles output rows itself instead of using that transform,
+it parses the string map per file.
 
 To have Kernel hand you the typed values directly, opt in with `with_partition_values`:
 
@@ -286,18 +286,17 @@ adds the typed column.
 
 By default, offset-less `TIMESTAMP` partition strings are interpreted in UTC. Use
 `with_timestamp_timezone` with a recognized IANA timezone or a normalized `+HH:MM` or `-HH:MM`
-fixed offset when the reader uses another timezone. An explicit offset in a partition value takes
-precedence. This setting affects typed `scan_metadata` output, partition predicate evaluation after
-log replay. Setting a timezone disables row transforms, so use `scan_metadata` and reconstruct
-logical rows in your connector; `Scan::execute` returns an error. Incremental scans expose the raw
-partition-value map.
+fixed offset to interpret offset-less partition values in another timezone. An explicit offset in a
+partition value takes precedence. This setting affects both partition pruning and returned parsed
+partition values. Kernel doesn't support row transforms with a specified timezone, so
+`with_timestamp_timezone` omits per-file row transforms. Use `scan_metadata` and reconstruct logical
+rows in your connector; `Scan::execute` returns an error.
 `TIMESTAMP_NTZ` remains timezone-independent. For daylight-saving transitions, ambiguous local times
 use the earlier instant, and nonexistent local times use the offset from before the transition.
 
 > [!TIP]
-> Kernel reuses compatible checkpoint `partitionValues_parsed` values for typed output and data
-> skipping, including timestamp predicates. The configured timezone applies only when Kernel parses
-> raw partition values; it does not reinterpret values already parsed in a checkpoint.
+> When the checkpoint already stores typed partition values, Kernel reads that column directly
+> and skips parsing entirely.
 
 ## Cancelling a scan
 

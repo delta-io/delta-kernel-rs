@@ -30,7 +30,6 @@ use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
-use crate::partition_values::TimestampTimezone;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{
@@ -306,12 +305,13 @@ impl StatsOptions {
 /// When the typed struct is requested, scan metadata output gains a top-level
 /// `partitionValues_parsed` struct column with one typed nullable field per partition column
 /// (physical names, table partition-column order). On non-partitioned tables the column is
-/// omitted. Compatible checkpoint values are reused; otherwise the string map is parsed.
+/// omitted. Values come directly from the checkpoint's native `partitionValues_parsed` column
+/// when present, otherwise from parsing the string map.
 #[derive(Clone, Debug, Default)]
 pub struct PartitionValuesOptions {
     /// Whether to emit the typed `partitionValues_parsed` struct column.
     pub(crate) parsed_struct: bool,
-    /// Reader timezone used to interpret offset-less zoned timestamp partition strings.
+    /// Timezone used to interpret offset-less `TIMESTAMP` partition strings.
     pub(crate) timestamp_timezone: Option<String>,
 }
 
@@ -330,19 +330,23 @@ impl PartitionValuesOptions {
         }
     }
 
-    /// Interpret offset-less zoned `TIMESTAMP` partition strings in `timestamp_timezone`.
+    /// Interpret offset-less `TIMESTAMP` values in `add.partitionValues` using
+    /// `timestamp_timezone` when no compatible `add.partitionValues_parsed` exists.
     ///
-    /// `timestamp_timezone` must be an IANA time zone identifier recognized by Kernel or a
+    /// `timestamp_timezone` must be an IANA timezone identifier recognized by Kernel or a
     /// normalized fixed offset in `+HH:MM` or `-HH:MM` form. An explicit offset in a partition
-    /// value takes precedence. This option does not affect `TIMESTAMP_NTZ`. It applies to typed
-    /// scan metadata and partition predicate evaluation when parsing raw partition values.
-    /// Compatible checkpoint `partitionValues_parsed` values are reused without reinterpretation.
+    /// value takes precedence. This option applies to both partition pruning and returned parsed
+    /// partition values. It does not affect `TIMESTAMP_NTZ`.
     ///
-    /// Setting this option disables row transforms, as if
-    /// [`ScanBuilder::without_row_transforms`] were set. The connector must reconstruct logical
-    /// rows itself; [`Scan::execute`] returns an error. Incremental scans continue to expose the
-    /// raw partition-value map. Without this option, Kernel interprets offset-less timestamps as
-    /// UTC. Invalid values are reported when the scan is built.
+    /// For example, if a `TIMESTAMP` partition column `ts` has
+    /// `add.partitionValues["ts"] = "2024-01-15 12:30:45"`, setting `timestamp_timezone` to
+    /// `"America/Los_Angeles"` interprets it as `2024-01-15T20:30:45Z`.
+    ///
+    /// Kernel does not support setting a timezone for row transforms, so this option omits them
+    /// as if [`ScanBuilder::without_row_transforms`] were set. The connector must reconstruct
+    /// logical rows itself; [`Scan::execute`] returns an error. Without this option, Kernel
+    /// interprets offset-less timestamps as UTC. Invalid timezones are reported when partition
+    /// values are parsed.
     pub fn with_timestamp_timezone(mut self, timestamp_timezone: impl Into<String>) -> Self {
         self.timestamp_timezone = Some(timestamp_timezone.into());
         self
@@ -522,10 +526,6 @@ impl ScanBuilder {
     /// perform actual data reads.
     #[tracing::instrument(name = "scan_builder.build", skip_all, fields(enable_call_frame), err)]
     pub fn build(self) -> Result<Scan> {
-        if let Some(timestamp_timezone) = self.partition_values.timestamp_timezone.as_deref() {
-            timestamp_timezone.parse::<TimestampTimezone>()?;
-        }
-
         // Predicates may reference columns outside self.logical_read_schema, so resolve against the
         // full table schema
         let table_schema = self.snapshot.schema();

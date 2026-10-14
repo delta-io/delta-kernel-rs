@@ -7,6 +7,7 @@ use chrono::Utc;
 use itertools::Itertools;
 use tracing::warn;
 
+use super::timestamp_timezone::TimestampTimezone;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
@@ -42,7 +43,6 @@ use crate::expressions::{
     OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
     UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
-use crate::partition_values::TimestampTimezone;
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 use crate::KernelResult;
 

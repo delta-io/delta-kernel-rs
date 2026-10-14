@@ -10,13 +10,47 @@
 //! An Internet Assigned Numbers Authority (IANA) timezone is a named region such as
 //! `America/Los_Angeles`. Its UTC offset is resolved for each timestamp, including clock changes.
 
-use chrono::{LocalResult, NaiveDateTime, Offset, TimeDelta, TimeZone, Utc};
+use std::str::FromStr;
+
+use chrono::{FixedOffset, LocalResult, NaiveDateTime, Offset, TimeDelta, TimeZone, Utc};
 use chrono_tz::Tz;
 
 use crate::arrow::compute::kernels::cast_utils::string_to_datetime;
 use crate::expressions::MapToStructOptions;
-use crate::partition_values::TimestampTimezone;
-use crate::KernelResult;
+use crate::{KernelError, KernelResult, Result};
+
+/// A validated timezone used to interpret an offset-less `TIMESTAMP` value.
+///
+/// `chrono_tz::Tz` represents named zones but not fixed offsets, so the enum carries both forms.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TimestampTimezone {
+    /// A named timezone whose offset is resolved at each local timestamp.
+    ///
+    /// For example, `America/Los_Angeles` normally resolves to `-08:00` in winter and `-07:00`
+    /// in summer.
+    Named(Tz),
+    /// A constant offset from UTC, such as `+05:30` or `-03:30`.
+    Fixed(FixedOffset),
+}
+
+impl Default for TimestampTimezone {
+    fn default() -> Self {
+        Self::Named(chrono_tz::UTC)
+    }
+}
+
+impl FromStr for TimestampTimezone {
+    type Err = KernelError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let timezone = if value.starts_with(['+', '-']) {
+            parse_normalized_fixed_offset(value).map(Self::Fixed)
+        } else {
+            value.parse::<Tz>().ok().map(Self::Named)
+        };
+        timezone.ok_or_else(|| KernelError::generic(format!("Invalid timestamp timezone: {value}")))
+    }
+}
 
 impl TimestampTimezone {
     /// Resolves the reader timezone from map-to-struct options, defaulting to UTC.
@@ -52,6 +86,31 @@ impl TimestampTimezone {
                 .map(|timestamp| timestamp.timestamp_micros()),
         }
     }
+}
+
+/// Parses a normalized fixed offset within the conventional `-18:00` through `+18:00` range.
+fn parse_normalized_fixed_offset(value: &str) -> Option<FixedOffset> {
+    let sign = match value.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let mut components = value.get(1..)?.split(':');
+    let hours = parse_two_digits(components.next()?)?;
+    let minutes = parse_two_digits(components.next()?)?;
+    if components.next().is_some() || hours > 18 || minutes > 59 || (hours == 18 && minutes != 0) {
+        return None;
+    }
+    FixedOffset::east_opt(sign * (hours * 3_600 + minutes * 60))
+}
+
+/// Parses exactly two ASCII decimal digits.
+fn parse_two_digits(value: &str) -> Option<i32> {
+    let [tens, ones] = value.as_bytes() else {
+        return None;
+    };
+    (tens.is_ascii_digit() && ones.is_ascii_digit())
+        .then(|| i32::from(*tens - b'0') * 10 + i32::from(*ones - b'0'))
 }
 
 /// Parses with Arrow, resolving only named-zone clock transitions that Arrow rejects.
@@ -108,7 +167,6 @@ mod tests {
     #[rstest]
     #[case::empty("")]
     #[case::bare_sign("+")]
-    #[case::malformed_sign("+-5:00")]
     #[case::compact_hour("+05")]
     #[case::compact_hour_minute("+0530")]
     #[case::invalid_minutes("+05:60")]

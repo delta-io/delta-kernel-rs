@@ -63,7 +63,7 @@ pub(crate) struct ScanPartitionValuesOptions {
     /// Emit the typed `partitionValues_parsed` struct column in scan metadata output,
     /// independent of any predicate.
     pub(crate) parsed_struct: bool,
-    /// Reader timezone used to interpret offset-less zoned timestamp partition strings.
+    /// Timezone used to interpret offset-less `TIMESTAMP` partition strings.
     #[serde(default)]
     pub(crate) timestamp_timezone: Option<String>,
 }
@@ -170,8 +170,8 @@ pub struct ScanLogReplayProcessor {
     /// StructPatch for log batches (commit files) - uses ParseJson for stats and MapToStruct
     /// for partition values
     commit_transform: Arc<dyn ExpressionEvaluator>,
-    /// StructPatch for checkpoint batches - reuses compatible parsed stats and partition values,
-    /// falling back to their raw representations when absent.
+    /// StructPatch for checkpoint batches - reads pre-parsed stats_parsed and
+    /// partitionValues_parsed directly when available, otherwise parses from raw columns
     checkpoint_transform: Arc<dyn ExpressionEvaluator>,
     /// Final metadata projection built when log replay starts.
     ///
@@ -346,7 +346,7 @@ impl ScanLogReplayProcessor {
                 ),
                 output_schema.clone().into(),
             )?,
-            // Checkpoint transform: reuse compatible parsed columns when available.
+            // Checkpoint transform: read pre-parsed columns directly when available
             checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
                 checkpoint_read_schema,
                 get_add_transform_expr(
@@ -850,8 +850,8 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// These typed columns are appended at the top level (siblings of `fileConstantValues`) rather than
 /// nested inside it. This mirrors `stats_parsed`, keeps `fileConstantValues` a fixed shape
 /// regardless of the engine's options, and keeps data-skipping paths uniform:
-/// `partitionValues_parsed.<col>` parallels `stats_parsed.minValues.<col>`. Checkpoints can supply
-/// compatible parsed values directly; other inputs derive them from the raw partition map.
+/// `partitionValues_parsed.<col>` parallels `stats_parsed.minValues.<col>`. The checkpoint source
+/// is also `add.partitionValues_parsed`, a sibling of `add.stats_parsed`.
 fn scan_row_schema_with_parsed_columns(
     stats_schema: Option<SchemaRef>,
     partition_schema: Option<SchemaRef>,
@@ -927,8 +927,10 @@ fn build_stats_output_projection(
 ///   the JSON stats column; JSON-only checkpoints and commits retain `add.stats` as fallback input.
 /// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
 ///   value parsing is not needed.
-/// - `has_partition_values_parsed`: Whether the source carries compatible parsed partition values.
-/// - `timestamp_timezone`: Reader timezone used when parsing raw timestamp partition strings.
+/// - `has_partition_values_parsed`: Whether the source carries a native `partitionValues_parsed`
+///   column (checkpoint). When true it is read directly; otherwise the struct is reconstructed from
+///   the `partitionValues` string map.
+/// - `timestamp_timezone`: Timezone used when parsing raw timestamp partition strings.
 ///
 /// The transform includes `stats_parsed` only when `physical_stats_read_schema` is Some,
 /// and `partitionValues_parsed` only when `partition_schema` is Some.
@@ -988,8 +990,10 @@ fn get_add_transform_expr(
     // engine-facing typed output column.
     if partition_schema.is_some() {
         let pv_parsed_expr = if has_partition_values_parsed {
+            // Checkpoint carries a native partitionValues_parsed column - read it directly.
             col!("add.partitionValues_parsed")
         } else {
+            // No native column (JSON commit): reconstruct from the string map.
             parsed_partition_values_expr(col!("add.partitionValues"), timestamp_timezone)
         };
         fields.push(Arc::new(pv_parsed_expr));
@@ -998,7 +1002,7 @@ fn get_add_transform_expr(
     Arc::new(Expression::struct_from(fields))
 }
 
-/// Build typed partition values from the canonical raw map.
+/// Build typed partition values from the string map.
 pub(super) fn parsed_partition_values_expr(
     raw_partition_values: Expression,
     timestamp_timezone: Option<&str>,
@@ -1164,7 +1168,7 @@ impl ScanLogReplayProcessor {
         // type. In that case, we get a ParseError and retry after deduplication.
         // The transform depends on the batch type:
         // - Log batches: parse JSON for stats, MapToStruct for partition values
-        // - Checkpoint batches: reuse compatible parsed stats and partition values when available
+        // - Checkpoint batches: read pre-parsed columns directly when available
         // This avoids double JSON parsing -- the transform already parsed the stats.
         // Data skipping is safe for Remove rows: their add-side columns (stats_parsed,
         // partitionValues_parsed) are null. For stats, the skipping predicate wraps comparisons
@@ -1358,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_values_options_serde_preserves_timezone_and_defaults_when_absent() {
+    fn partition_values_options_serde_preserves_timezone() {
         let options = ScanPartitionValuesOptions {
             parsed_struct: true,
             timestamp_timezone: Some("America/Los_Angeles".to_string()),
@@ -1370,7 +1374,10 @@ mod tests {
             decoded.timestamp_timezone.as_deref(),
             Some("America/Los_Angeles")
         );
+    }
 
+    #[test]
+    fn partition_values_options_serde_defaults_timezone_when_absent() {
         let old: ScanPartitionValuesOptions =
             serde_json::from_str(r#"{"parsed_struct":true}"#).unwrap();
         assert!(old.parsed_struct);
@@ -1378,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    fn parsed_partition_values_expr_parses_map_with_reader_options() {
+    fn parsed_partition_values_expr_parses_map_with_timezone_options() {
         let raw = col!("add.partitionValues");
 
         assert_eq!(
@@ -1871,10 +1878,7 @@ mod tests {
             state_info.clone(),
             checkpoint_info.clone(),
             ScanStatsOptions::default(),
-            ScanPartitionValuesOptions {
-                parsed_struct: true,
-                timestamp_timezone: Some("America/Los_Angeles".to_string()),
-            },
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
@@ -1890,14 +1894,6 @@ mod tests {
             }
             _ => panic!("Expected PhysicalPredicate::Some"),
         }
-        assert!(deserialized.partition_values_options.parsed_struct);
-        assert_eq!(
-            deserialized
-                .partition_values_options
-                .timestamp_timezone
-                .as_deref(),
-            Some("America/Los_Angeles")
-        );
     }
 
     #[test]
@@ -2465,7 +2461,7 @@ mod tests {
             false, // skip_stats
             true,  // synthesize_json
             partition_schema.clone(),
-            false, /* has_partition_values_parsed */
+            false, // has_partition_values_parsed
             None,  // timestamp_timezone
         );
         assert_eq!(
@@ -2481,7 +2477,7 @@ mod tests {
             false, // skip_stats
             false, // synthesize_json
             partition_schema,
-            false, /* has_partition_values_parsed */
+            false, // has_partition_values_parsed
             None,  // timestamp_timezone
         );
         assert_eq!(

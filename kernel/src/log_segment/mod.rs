@@ -66,8 +66,8 @@ pub(crate) struct CheckpointReadInfo {
     #[allow(unused)]
     pub has_stats_parsed: bool,
     /// Whether the checkpoint has compatible pre-parsed partition values.
-    /// When `true`, checkpoint readers and scan output reuse `partitionValues_parsed` without
-    /// parsing the raw `partitionValues` map.
+    /// When `true`, checkpoint batches can read typed partition values directly from
+    /// `partitionValues_parsed` instead of parsing strings from `partitionValues`.
     #[serde(default)]
     #[allow(unused)]
     pub has_partition_values_parsed: bool,

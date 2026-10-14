@@ -18,9 +18,9 @@ use crate::schema::{MetadataColumnSpec, SchemaRef};
 use crate::utils::FoldWithOption as _;
 use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult, PredicateRef, Result};
 
+// TODO(#3609): Support session timezone in CDF scans.
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
-/// data feed from the table. Offset-less zoned timestamp partition values are interpreted as UTC;
-/// reader-timezone configuration is available only on snapshot scans.
+/// data feed from the table.
 #[derive(Debug)]
 pub struct TableChangesScan {
     // The [`TableChanges`] that specifies this scan's start and end versions
