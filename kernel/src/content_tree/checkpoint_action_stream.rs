@@ -4,44 +4,77 @@ use std::iter;
 
 use super::action_projector::ActionProjector;
 use super::reader::{read_add_actions_from_amt, ReadContext};
-use crate::actions::{CheckpointAction, ADD_NAME, LOG_ADD_SCHEMA, REMOVE_NAME};
+use crate::actions::{
+    CheckpointAction, ADD_NAME, LOG_ADD_SCHEMA, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA,
+    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+};
+use crate::expressions::Scalar;
 use crate::log_replay::ActionsBatch;
 use crate::path::LogRoot;
 use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{Engine, KernelError, KernelResult, KernelResultIterator};
 
+/// The action kinds a read schema may ask a checkpoint action for.
+const CHECKPOINT_ACTION_KINDS: &[&str] = &[ADD_NAME, PROTOCOL_NAME, METADATA_NAME, REMOVE_NAME];
+
 /// Reads the actions `read_schema` asks for from `checkpoint`, as checkpoint batches
 /// (`is_log_batch = false`) matching `read_schema`. `log_root` resolves the action's file
 /// references.
 ///
-/// `add` rows come from the action's content tree. A checkpoint holds reconciled state, so `remove`
-/// rows are never produced.
+/// `add` rows come from the action's content tree, and `protocol` / `metaData` from the action
+/// itself. A checkpoint holds reconciled state, so `remove` rows are never produced.
 pub(crate) fn read_checkpoint_action(
     engine: &dyn Engine,
     checkpoint: &CheckpointAction,
     log_root: &LogRoot,
     read_schema: SchemaRef,
 ) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
-    let mut reads_adds = false;
+    if let Some(other) = read_schema
+        .fields()
+        .map(|field| field.name().as_str())
+        .find(|name| !CHECKPOINT_ACTION_KINDS.contains(name))
+    {
+        return Err(KernelError::unsupported(format!(
+            "reading `{other}` actions from an adaptiveMetadata checkpoint action is not yet \
+             supported"
+        )));
+    }
+    let mut streams = Vec::new();
     for field in read_schema.fields() {
-        match field.name().as_str() {
-            ADD_NAME => reads_adds = true,
-            // With adaptiveMetadata, a `remove` is applied during replay and then dropped, so no
-            // checkpoint or reconciled state holds one. Change data feed reads removes from the
-            // log commits instead.
-            REMOVE_NAME => {}
-            other => {
-                return Err(KernelError::unsupported(format!(
-                    "reading `{other}` actions from an adaptiveMetadata checkpoint action is not \
-                     yet supported"
-                )))
-            }
-        }
+        let stream = match field.name().as_str() {
+            ADD_NAME => read_tree_adds(engine, checkpoint, log_root, read_schema.clone())?,
+            PROTOCOL_NAME => inline_actions(
+                engine,
+                PROTOCOL_NAME,
+                LOG_PROTOCOL_SCHEMA.clone(),
+                vec![checkpoint.protocol().clone().into()],
+                read_schema.clone(),
+            )?,
+            METADATA_NAME => inline_actions(
+                engine,
+                METADATA_NAME,
+                LOG_METADATA_SCHEMA.clone(),
+                vec![checkpoint.metadata().clone().into()],
+                read_schema.clone(),
+            )?,
+            // `remove`: with adaptiveMetadata, a remove is applied during replay and then dropped,
+            // so no checkpoint or reconciled state holds one. Change data feed reads removes from
+            // the log commits instead.
+            _ => continue,
+        };
+        streams.push(stream);
     }
-    if !reads_adds {
-        return Ok(Box::new(iter::empty()));
-    }
+    Ok(Box::new(streams.into_iter().flatten()))
+}
+
+/// The `add` actions of `checkpoint`'s content tree, projected onto `read_schema`.
+fn read_tree_adds(
+    engine: &dyn Engine,
+    checkpoint: &CheckpointAction,
+    log_root: &LogRoot,
+    read_schema: SchemaRef,
+) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
     // TODO(#3320): the content tree does not yet carry partition values, so its adds would read
     // with empty `partitionValues`.
     let partition_columns = checkpoint.metadata().partition_columns();
@@ -52,7 +85,6 @@ pub(crate) fn read_checkpoint_action(
              supported; partition columns: {partition_columns:?}"
         ))
     );
-
     let ctx = ReadContext {
         table_root: log_root.table_root().clone(),
         // TODO(#2866): inherit each file's commit timestamp instead of a non-zero constant.
@@ -74,6 +106,25 @@ pub(crate) fn read_checkpoint_action(
     })))
 }
 
+/// One batch of the `action` rows `rows` (each a value of `source`'s single `action` field),
+/// projected onto `read_schema`, or no batch when there are no rows.
+fn inline_actions(
+    engine: &dyn Engine,
+    action: &str,
+    source: SchemaRef,
+    rows: Vec<Scalar>,
+    read_schema: SchemaRef,
+) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
+    if rows.is_empty() {
+        return Ok(Box::new(iter::empty()));
+    }
+    let projector = ActionProjector::try_new(engine, action, source.clone(), read_schema)?;
+    let rows = rows.into_iter().map(|row| vec![row]).collect();
+    let data = engine.evaluation_handler().create_many(source, rows)?;
+    let batch = ActionsBatch::new(projector.project(data.as_ref())?, false);
+    Ok(Box::new(iter::once(Ok(batch))))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -83,8 +134,8 @@ mod tests {
 
     use super::*;
     use crate::actions::{
-        get_commit_schema, Add, ContentRoot, ADD_SCHEMA, LOG_TXN_SCHEMA, REMOVE_FIELD,
-        SET_TRANSACTION_NAME,
+        get_commit_schema, Add, ContentRoot, Metadata, Protocol, ADD_SCHEMA, LOG_TXN_SCHEMA,
+        REMOVE_FIELD, SET_TRANSACTION_NAME,
     };
     use crate::arrow::array::{AsArray as _, RecordBatch};
     use crate::arrow::datatypes::Int64Type;
@@ -491,6 +542,35 @@ mod tests {
             ),
             "partitioned adaptiveMetadata checkpoint action is not yet supported; partition \
              columns: [\"id\"]",
+        );
+    }
+
+    #[test]
+    fn protocol_and_metadata_come_from_the_checkpoint_action() {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        // The root manifest does not exist, so reading it would fail.
+        let checkpoint = checkpoint_action_with_root(ROOT_PATH, 1, 1).unwrap();
+        let read_schema = get_commit_schema()
+            .project(&[PROTOCOL_NAME, METADATA_NAME])
+            .unwrap();
+
+        let batches: Vec<_> =
+            read_checkpoint_action(&engine, &checkpoint, &log_root(), read_schema)
+                .unwrap()
+                .map(|batch| batch.unwrap())
+                .collect();
+
+        let [protocol, metadata] = batches.as_slice() else {
+            panic!("expected two batches, got {}", batches.len());
+        };
+        assert!(!protocol.is_log_batch && !metadata.is_log_batch);
+        assert_eq!(
+            Protocol::try_new_from_data(protocol.actions.as_ref()).unwrap(),
+            Some(checkpoint.protocol().clone())
+        );
+        assert_eq!(
+            Metadata::try_new_from_data(metadata.actions.as_ref()).unwrap(),
+            Some(checkpoint.metadata().clone())
         );
     }
 
