@@ -6,7 +6,7 @@
 //! concurrent iff its metadata carries `delta.identity.concurrent.sequenceId`. On a table that
 //! supports the `concurrentIdentityColumns` feature, every identity column must be concurrent.
 //!
-//! Kernel owns only the protocol metadata.
+//! Kernel only parses and validates this metadata; allocating sequence values is the catalog's job.
 
 use std::collections::HashSet;
 
@@ -67,29 +67,6 @@ impl<'a> ConcurrentIdentityColumn<'a> {
             )?,
         }))
     }
-}
-
-/// Builds a Concurrent Identity Column: a non-nullable `LONG` [`StructField`] carrying the
-/// concurrent `sequenceId` and the classic `start`/`step`/`allowExplicitInsert` keys.
-///
-/// This is a convenience over stamping the [`ColumnMetadataKey`] entries by hand. The `sequence_id`
-/// is an identifier provided by the connector (at most 64 characters); `start` is the first value
-/// the sequence issues, `step` the (non-zero) increment, and `allow_explicit_insert` whether
-/// user-supplied values may be written to the column.
-#[cfg(test)]
-pub(crate) fn concurrent_identity_column(
-    name: impl Into<String>,
-    sequence_id: impl Into<String>,
-    start: i64,
-    step: i64,
-    allow_explicit_insert: bool,
-) -> StructField {
-    StructField::not_null(name, DataType::LONG).with_metadata(cic_metadata(
-        sequence_id,
-        start,
-        step,
-        allow_explicit_insert,
-    ))
 }
 
 /// Validates the identity columns of `schema`, returning whether it has any Concurrent Identity
@@ -179,39 +156,6 @@ fn is_identity_column(field: &StructField) -> bool {
     IDENTITY_KEYS
         .iter()
         .any(|key| field.get_config_value(key).is_some())
-}
-
-/// The metadata keys that mark a Concurrent Identity Column: the concurrent sequence id plus the
-/// classic `start`/`step`/`allowExplicitInsert`.
-#[cfg(test)]
-pub(crate) fn cic_metadata(
-    sequence_id: impl Into<String>,
-    start: i64,
-    step: i64,
-    allow_explicit_insert: bool,
-) -> Vec<(String, MetadataValue)> {
-    vec![
-        (
-            ColumnMetadataKey::IdentityConcurrentSequenceId
-                .as_ref()
-                .to_string(),
-            MetadataValue::String(sequence_id.into()),
-        ),
-        (
-            ColumnMetadataKey::IdentityStart.as_ref().to_string(),
-            MetadataValue::Number(start),
-        ),
-        (
-            ColumnMetadataKey::IdentityStep.as_ref().to_string(),
-            MetadataValue::Number(step),
-        ),
-        (
-            ColumnMetadataKey::IdentityAllowExplicitInsert
-                .as_ref()
-                .to_string(),
-            MetadataValue::Boolean(allow_explicit_insert),
-        ),
-    ]
 }
 
 /// Validates a single top-level Concurrent Identity Column. See
@@ -350,6 +294,70 @@ fn as_string(value: &MetadataValue) -> Option<&str> {
     }
 }
 
+// === Test helpers ===
+
+/// Builds a Concurrent Identity Column: a non-nullable `LONG` [`StructField`] carrying the
+/// concurrent `sequenceId` and the classic `start`/`step`/`allowExplicitInsert` keys.
+#[cfg(test)]
+pub(crate) fn concurrent_identity_column(
+    name: impl Into<String>,
+    sequence_id: impl Into<String>,
+    start: i64,
+    step: i64,
+    allow_explicit_insert: bool,
+) -> StructField {
+    StructField::not_null(name, DataType::LONG).with_metadata(cic_metadata(
+        sequence_id,
+        start,
+        step,
+        allow_explicit_insert,
+    ))
+}
+
+/// Builds a classic (non-concurrent) identity column: `start`/`step`/`allowExplicitInsert`, no
+/// `sequenceId`, plus a `highWaterMark` if the column has emitted values.
+#[cfg(test)]
+pub(crate) fn classic_identity_column(name: &str, high_water_mark: Option<i64>) -> StructField {
+    use ColumnMetadataKey::*;
+    let high_water_mark = high_water_mark.map(|v| (IdentityHighWaterMark, MetadataValue::from(v)));
+    let metadata = [
+        (IdentityStart, MetadataValue::Number(1)),
+        (IdentityStep, MetadataValue::Number(1)),
+        (IdentityAllowExplicitInsert, MetadataValue::Boolean(false)),
+    ];
+    StructField::not_null(name, DataType::LONG).with_metadata(
+        metadata
+            .into_iter()
+            .chain(high_water_mark)
+            .map(|(k, v)| (k.as_ref().to_string(), v)),
+    )
+}
+
+/// The metadata keys that mark a Concurrent Identity Column: the concurrent sequence id plus the
+/// classic `start`/`step`/`allowExplicitInsert`.
+#[cfg(test)]
+pub(crate) fn cic_metadata(
+    sequence_id: impl Into<String>,
+    start: i64,
+    step: i64,
+    allow_explicit_insert: bool,
+) -> [(String, MetadataValue); 4] {
+    use ColumnMetadataKey::*;
+    [
+        (
+            IdentityConcurrentSequenceId,
+            MetadataValue::String(sequence_id.into()),
+        ),
+        (IdentityStart, MetadataValue::from(start)),
+        (IdentityStep, MetadataValue::from(step)),
+        (
+            IdentityAllowExplicitInsert,
+            MetadataValue::from(allow_explicit_insert),
+        ),
+    ]
+    .map(|(k, v)| (k.as_ref().to_string(), v))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,25 +453,6 @@ mod tests {
     fn cic_field(name: &str, data_type: DataType, nullable: bool, step: i64) -> StructField {
         StructField::new(name, data_type, nullable)
             .with_metadata(cic_metadata("seq", 1, step, false))
-    }
-
-    // A classic identity column that has never emitted a value: `start`/`step` but no
-    // `sequenceId` and no `highWaterMark`.
-    fn classic_identity_field(name: &str) -> StructField {
-        StructField::not_null(name, DataType::LONG).with_metadata([
-            (
-                ColumnMetadataKey::IdentityStart.as_ref(),
-                MetadataValue::Number(1),
-            ),
-            (
-                ColumnMetadataKey::IdentityStep.as_ref(),
-                MetadataValue::Number(1),
-            ),
-            (
-                ColumnMetadataKey::IdentityAllowExplicitInsert.as_ref(),
-                MetadataValue::Boolean(false),
-            ),
-        ])
     }
 
     fn nested(field: StructField) -> StructField {
@@ -562,22 +551,35 @@ mod tests {
         false,
         Err("nested"),
     )]
+    #[case::nested_in_map_key(
+        vec![StructField::nullable(
+            "wrapper",
+            MapType::new(
+                StructType::try_new(vec![cic_field("id", DataType::LONG, false, 1)]).unwrap(),
+                DataType::STRING,
+                true,
+            ),
+        )],
+        &[],
+        false,
+        Err("nested"),
+    )]
     // Every identity column must be concurrent once the schema has a CIC or the table supports the
     // feature, including a classic column that never emitted a value (no high-water mark).
     #[case::classic_next_to_cic(
-        vec![cic_field("id", DataType::LONG, false, 1), classic_identity_field("classic")],
+        vec![cic_field("id", DataType::LONG, false, 1), classic_identity_column("classic", None)],
         &[],
         false,
         Err("must be concurrent"),
     )]
     #[case::nested_classic_next_to_cic(
-        vec![cic_field("id", DataType::LONG, false, 1), nested(classic_identity_field("classic"))],
+        vec![cic_field("id", DataType::LONG, false, 1), nested(classic_identity_column("classic", None))],
         &[],
         false,
         Err("must be concurrent"),
     )]
-    #[case::classic_on_cic_supported_table(vec![classic_identity_field("classic")], &[], true, Err("must be concurrent"))]
-    #[case::classic_without_cic(vec![classic_identity_field("classic")], &[], false, Ok(false))]
+    #[case::classic_on_cic_supported_table(vec![classic_identity_column("classic", None)], &[], true, Err("must be concurrent"))]
+    #[case::classic_without_cic(vec![classic_identity_column("classic", None)], &[], false, Ok(false))]
     fn validate_enforces_each_rule(
         #[case] fields: Vec<StructField>,
         #[case] partition_columns: &[&str],
@@ -596,13 +598,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn schema_has_concurrent_sequence_id_finds_nested_ids() {
-        let plain =
-            StructType::try_new(vec![StructField::nullable("v", DataType::STRING)]).unwrap();
-        assert!(!schema_has_concurrent_sequence_id(&plain));
-        let nested_cic =
-            StructType::try_new(vec![nested(cic_field("id", DataType::LONG, false, 1))]).unwrap();
-        assert!(schema_has_concurrent_sequence_id(&nested_cic));
+    #[rstest::rstest]
+    #[case::plain(StructField::nullable("v", DataType::STRING), false)]
+    #[case::top_level(cic_field("id", DataType::LONG, false, 1), true)]
+    #[case::struct_field(StructField::nullable("v", cic_struct()), true)]
+    #[case::array_element(StructField::nullable("v", ArrayType::new(cic_struct(), true)), true)]
+    #[case::map_key(
+        StructField::nullable("v", MapType::new(cic_struct(), DataType::STRING, true)),
+        true
+    )]
+    #[case::map_value(
+        StructField::nullable("v", MapType::new(DataType::STRING, cic_struct(), true)),
+        true
+    )]
+    fn schema_has_concurrent_sequence_id_at_any_depth(
+        #[case] field: StructField,
+        #[case] expected: bool,
+    ) {
+        let schema = StructType::try_new(vec![field]).unwrap();
+        assert_eq!(schema_has_concurrent_sequence_id(&schema), expected);
+    }
+
+    fn cic_struct() -> DataType {
+        StructType::try_new(vec![cic_field("id", DataType::LONG, false, 1)])
+            .unwrap()
+            .into()
     }
 }

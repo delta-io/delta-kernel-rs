@@ -32,13 +32,11 @@ pub(crate) mod column_default;
 pub use column_default::ColumnDefault;
 pub(crate) use column_default::{try_collect_column_defaults, validate_column_defaults_metadata};
 pub(crate) mod concurrent_identity_column;
-#[cfg(test)]
-pub(crate) use concurrent_identity_column::concurrent_identity_column;
 #[cfg(feature = "concurrent-identity-columns-in-dev")]
 pub(crate) use concurrent_identity_column::has_concurrent_sequence_id;
-pub(crate) use concurrent_identity_column::{
-    schema_has_concurrent_sequence_id, validate_concurrent_identity_columns,
-};
+pub(crate) use concurrent_identity_column::schema_has_concurrent_sequence_id;
+#[cfg(test)]
+pub(crate) use concurrent_identity_column::{classic_identity_column, concurrent_identity_column};
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
@@ -266,6 +264,8 @@ pub enum ColumnMetadataKey {
     IdentityStep,
     IdentityHighWaterMark,
     IdentityAllowExplicitInsert,
+    /// Catalog sequence id of a Concurrent Identity Column; its presence marks the column as
+    /// concurrent. Only valid on tables supporting `concurrentIdentityColumns`.
     IdentityConcurrentSequenceId,
     InternalColumn,
     Invariants,
