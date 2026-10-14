@@ -489,21 +489,30 @@ async fn plan_replay_skips_pointed_commit_when_pm_is_newer() {
 
 // The plan path reads the checkpoint action from the commit `lastManifestCommit` points at, so a
 // pointed commit without a matching action (none at all, or one whose content root is at another
-// version) fails the build rather than silently dropping the action's P&M.
+// version) fails the build rather than silently dropping the action's P&M. A pointer past its own
+// commit fails too.
 #[cfg(feature = "declarative-plans")]
 #[rstest]
-#[case::pointed_commit_has_no_checkpoint_action(vec![
-    standalone_pm_commit(one_column_schema()),
-    commit_info(Some((0, 0))),
-])]
-#[case::pointed_action_has_other_content_root(vec![
-    standalone_pm_commit(one_column_schema()),
-    checkpoint_action(0, &[], one_column_schema()),
-    commit_info(Some((1, 1))),
-])]
+#[case::pointed_commit_has_no_checkpoint_action(
+    vec![standalone_pm_commit(one_column_schema()), commit_info(Some((0, 0)))],
+    "carries no matching checkpoint action"
+)]
+#[case::pointed_action_has_other_content_root(
+    vec![
+        standalone_pm_commit(one_column_schema()),
+        checkpoint_action(0, &[], one_column_schema()),
+        commit_info(Some((1, 1))),
+    ],
+    "carries no matching checkpoint action"
+)]
+#[case::pointer_newer_than_its_commit(
+    vec![standalone_pm_commit(one_column_schema()), commit_info(Some((5, 5)))],
+    "lastManifestCommit version 5 exceeds commit version 1"
+)]
 #[tokio::test]
-async fn plan_replay_errors_when_pointed_commit_lacks_matching_action(
+async fn plan_replay_errors_on_invalid_pointer(
     #[case] commits: Vec<String>,
+    #[case] expected_error: &str,
 ) {
     let store = Arc::new(InMemory::new());
     let table_root = url::Url::parse("memory:///").unwrap();
@@ -515,7 +524,7 @@ async fn plan_replay_errors_when_pointed_commit_lacks_matching_action(
 
     let engine = SyncEngine::new_with_store(store);
     let result = Snapshot::builder_for(table_root).build(&engine);
-    assert_result_error_with_message(result, "carries no matching checkpoint action");
+    assert_result_error_with_message(result, expected_error);
 }
 
 // An incremental update resolves the latest checkpoint action for the updated snapshot: a new

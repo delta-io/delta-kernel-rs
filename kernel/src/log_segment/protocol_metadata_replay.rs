@@ -50,7 +50,8 @@ impl LogSegment {
     ///
     /// Under `adaptive-metadata-in-dev`, the result's `checkpoint_action` is a
     /// [`CheckpointActionResolution`] describing how the latest AMT checkpoint action was resolved
-    /// (captured by replay, named by the CRC, or unresolved), for the caller to store on the
+    /// (captured by replay, located by a manifest-commit pointer, or unresolved), for the caller
+    /// to store on the
     /// [`Snapshot`](crate::Snapshot).
     #[instrument(name = "log_seg.load_p_m", skip_all, fields(enable_call_frame), err)]
     pub(crate) fn read_protocol_metadata_opt(
@@ -210,16 +211,20 @@ impl LogSegment {
     /// `read_checkpoint`.
     ///
     /// # Errors
-    /// Returns an error if the pointed commit cannot be read or lacks a matching checkpoint action.
+    /// Returns an error if `lastManifestCommit` points past the commit that carries it, or if the
+    /// pointed commit cannot be read or lacks a matching checkpoint action.
     #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
     fn merge_pointed_checkpoint_action(
         &self,
         candidate: PmCandidate,
         read_checkpoint: impl FnOnce(&ParsedLogPath) -> KernelResult<Option<CheckpointAction>>,
     ) -> KernelResult<PmCandidate> {
-        let Some((_, pointer)) = candidate.last_manifest_commit.clone() else {
+        let Some((commit_version, pointer)) = candidate.last_manifest_commit.clone() else {
             return Ok(candidate);
         };
+        pointer.ensure_not_after(Version::try_from(commit_version).map_err(|_| {
+            KernelError::internal_error(format!("negative commit version {commit_version}"))
+        })?)?;
         // The pointed action's P&M is at or below `pointer.version`, so it can't replace newer P&M.
         let is_newer = |v: Option<i64>| v.is_some_and(|v| v > pointer.version);
         if is_newer(candidate.protocol.as_ref().map(|(v, _)| *v))
@@ -276,13 +281,11 @@ impl LogSegment {
                 a.max_non_null_by(checkpoint(), checkpoint(), column_name!("version"))
             })?
             .build()?;
-        let result = executor.execute_op(Operation::QueryPlan(plan))?;
-        for batch in result.into_data()? {
-            if let Some(checkpoint) = CheckpointAction::try_new_from_data(batch?.as_ref())? {
-                return Ok(Some(checkpoint));
-            }
-        }
-        Ok(None)
+        first_checkpoint_action(
+            executor
+                .execute_op(Operation::QueryPlan(plan))?
+                .into_data()?,
+        )
     }
 
     /// Builds the declarative plan that selects the latest Protocol and Metadata actions.
@@ -521,8 +524,8 @@ pub(crate) struct PmResolution {
     pub(crate) protocol: Option<Protocol>,
     /// How the Protocol and Metadata were resolved.
     pub(crate) source: ProtocolMetadataSource,
-    /// How the latest AMT `checkpoint` action was resolved: captured during replay, named by the
-    /// CRC's `lastManifestCommit`, or unresolved. See [`CheckpointActionResolution`].
+    /// How the latest AMT `checkpoint` action was resolved: captured during replay, located by a
+    /// manifest-commit pointer, or unresolved. See [`CheckpointActionResolution`].
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub(crate) checkpoint_action: CheckpointActionResolution,
     /// How the segment's `lastManifestCommit` was resolved. See [`LastManifestCommitResolution`].
@@ -569,8 +572,9 @@ struct PmCandidate {
 }
 
 impl PmCandidate {
-    /// Folds `other`, parsed from a batch replay reached later, into this result. Every field
-    /// keeps the same value whichever order batches merge in.
+    /// Folds `other`, parsed from a batch replay reached later, into this result. Each field keeps
+    /// its higher-versioned value, so the order batches merge in only matters on a version tie,
+    /// where `other` wins.
     fn merge(self, other: PmCandidate) -> Self {
         PmCandidate {
             protocol: newer(self.protocol, other.protocol),
@@ -623,8 +627,8 @@ fn resolve_pm_batches(
             #[cfg(feature = "adaptive-metadata-in-dev")]
             newest_commit_version,
         )?);
-        // The newest commit comes first, so merging its pointer here lets replay stop at the
-        // pointed action instead of reading past it.
+        // Merge the newest commit's pointer as soon as replay sees it, so the pointed action's P&M
+        // count toward `is_final` for the remaining batches.
         #[cfg(feature = "adaptive-metadata-in-dev")]
         if resolved.last_manifest_commit.is_some() {
             if let Some(merge_pointer) = merge_pointer.take() {
@@ -693,6 +697,19 @@ fn checkpoint_pm(checkpoint: &CheckpointAction) -> ((i64, Protocol), (i64, Metad
         (version, checkpoint.protocol().clone()),
         (version, checkpoint.metadata().clone()),
     )
+}
+
+/// The first checkpoint action in `batches`, or `None` if they carry none.
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+fn first_checkpoint_action(
+    batches: impl Iterator<Item = KernelResult<Box<dyn EngineData>>>,
+) -> KernelResult<Option<CheckpointAction>> {
+    for batch in batches {
+        if let Some(checkpoint) = CheckpointAction::try_new_from_data(batch?.as_ref())? {
+            return Ok(Some(checkpoint));
+        }
+    }
+    Ok(None)
 }
 
 /// The higher-versioned of `a` and `b`; on a tie, `b` wins.
