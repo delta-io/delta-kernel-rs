@@ -327,6 +327,8 @@ fn try_new_update_table<MODE: ExecutionMode>(
         data_change: true,
         infer_data_change: false,
         column_defaults_acknowledged: false,
+        #[cfg(feature = "concurrent-identity-columns-in-dev")]
+        concurrent_identity_columns_acknowledged: false,
         row_tracking_preservation_acknowledged: false,
         engine_commit_info: None,
         is_blind_append,

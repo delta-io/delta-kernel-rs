@@ -314,6 +314,10 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     // handling. Whether the connector acknowledged responsibility for applying column
     // defaults.
     column_defaults_acknowledged: bool,
+    // Whether the connector acknowledged responsibility for filling Concurrent Identity Column
+    // values before writing data files.
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    concurrent_identity_columns_acknowledged: bool,
     // Whether the connector acknowledged responsibility for preserving Row IDs and Row Commit
     // Versions.
     row_tracking_preservation_acknowledged: bool,
@@ -606,6 +610,23 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         self.column_defaults_acknowledged = true;
     }
 
+    /// Acknowledges that the connector generates and fills Concurrent Identity Column values
+    /// before writing data files.
+    ///
+    /// Call this before requesting write state for a table that has any CIC column (discover them
+    /// via [`concurrent_identity_columns`](Self::concurrent_identity_columns)). The connector
+    /// reserves ranges from its sequence service and fills every identity column itself. This
+    /// method records that responsibility but generates no values. Without this acknowledgement,
+    /// write-state creation fails.
+    ///
+    /// The acknowledgement is a contract marker, checked only by
+    /// [`write_state`](Self::write_state): kernel does not inspect the identity values in the
+    /// data files.
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    pub fn ack_concurrent_identity_columns(&mut self) {
+        self.concurrent_identity_columns_acknowledged = true;
+    }
+
     /// Returns the expected schema for file statistics.
     ///
     /// The schema structure is derived from table configuration:
@@ -701,6 +722,28 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         Ok(defaults)
     }
 
+    /// Returns every top-level Concurrent Identity Column (CIC) of this table's logical schema,
+    /// keyed by logical column name.
+    ///
+    /// A CIC column's values are issued by a catalog-hosted sequence, not stored in the Delta log,
+    /// so the connector must fill them and then call
+    /// [`ack_concurrent_identity_columns`](Self::ack_concurrent_identity_columns) before requesting
+    /// write state. See [`ConcurrentIdentityColumn`](crate::schema::ConcurrentIdentityColumn) for
+    /// the full connector write-flow.
+    ///
+    /// # Errors
+    ///
+    /// Propagates malformed CIC metadata errors (a detected column missing a required
+    /// `delta.identity.*` key or carrying a malformed value).
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    pub fn concurrent_identity_columns(
+        &self,
+    ) -> KernelResult<HashMap<String, crate::schema::ConcurrentIdentityColumn<'_>>> {
+        crate::schema::try_collect_concurrent_identity_columns(
+            self.effective_table_config.logical_schema_ref(),
+        )
+    }
+
     /// Validates that the table's logical schema supports data writes.
     ///
     /// Called by [`write_state`](Self::write_state), before any Parquet is written, so connectors
@@ -728,13 +771,12 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// configuration.
     ///
     /// Returns an error if the table has an empty or unsupported schema, or if the table declares
-    /// column defaults that the connector has not acknowledged, or if the table has Concurrent
-    /// Identity Columns (writing data to them is not yet supported).
+    /// column defaults or Concurrent Identity Columns that the connector has not acknowledged.
     pub fn write_state(&self) -> Result<Arc<WriteState>> {
         self.ensure_schema_non_empty_for_write_state()?;
         self.ensure_column_defaults_acknowledged()?;
         #[cfg(feature = "concurrent-identity-columns-in-dev")]
-        self.ensure_no_concurrent_identity_columns()?;
+        self.ensure_concurrent_identity_columns_acknowledged()?;
         self.validate_for_data_write()?;
         // The effective table configuration can change while building a transaction, so this
         // state must be derived on demand rather than cached on the transaction. TODO(#3149):
@@ -1003,14 +1045,16 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         Ok(())
     }
 
-    /// Rejects write-state creation when the table has Concurrent Identity Columns.
-    // TODO(#3586): surface the CIC columns to the connector instead of rejecting.
+    /// Rejects write-state creation when the table has Concurrent Identity Columns and the
+    /// connector has not acknowledged filling them.
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
-    fn ensure_no_concurrent_identity_columns(&self) -> KernelResult<()> {
+    fn ensure_concurrent_identity_columns_acknowledged(&self) -> KernelResult<()> {
         require!(
-            !self.effective_table_config.has_concurrent_identity_column(),
-            KernelError::unsupported(
-                "Writing data to a table with Concurrent Identity Columns is not yet supported",
+            self.concurrent_identity_columns_acknowledged
+                || !self.effective_table_config.has_concurrent_identity_column(),
+            KernelError::invalid_transaction_state(
+                "Writing data to a table with Concurrent Identity Columns requires calling \
+                 Transaction::ack_concurrent_identity_columns() first.",
             )
         );
         Ok(())
@@ -2105,7 +2149,11 @@ mod tests {
     use crate::object_store::ObjectStoreExt as _;
     use crate::scan::log_replay::PATH_NAME;
     use crate::scan::state_info::tests::RowTrackingState;
-    use crate::schema::{concurrent_identity_column, schema, schema_ref, MapType};
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    use crate::schema::concurrent_identity_column;
+    use crate::schema::{schema, schema_ref, MapType};
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    use crate::schema::{ColumnMetadataKey, MetadataValue};
     use crate::table_features::{ColumnMappingMode, TableFeature};
     use crate::table_properties::{APPEND_ONLY, ENABLE_CHANGE_DATA_FEED, ENABLE_ROW_TRACKING};
     use crate::transaction::create_table::create_table;
@@ -2607,7 +2655,7 @@ mod tests {
         /// Like [`txn_with_schema`] but with an explicit writer-feature list, so a test can
         /// exercise a table that does *not* enable `allowColumnDefaults`. Panics if the table
         /// configuration fails to construct; use [`try_table_config`] to assert that error.
-        pub(super) fn txn_with_schema_and_writer_features(
+        fn txn_with_schema_and_writer_features(
             schema: StructType,
             writer_features: impl IntoIterator<Item = TableFeature>,
         ) -> Transaction {
@@ -2723,37 +2771,124 @@ mod tests {
         }
     }
 
-    // CREATE does not enable `concurrentIdentityColumns`, so a `sequenceId` is orphaned.
-    #[test]
-    fn create_table_rejects_concurrent_identity_columns() {
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    fn create_cic_table(
+        fields: Vec<StructField>,
+        catalog_managed: bool,
+        data_layout: DataLayout,
+    ) -> KernelResult<Transaction<CreateTable>> {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
-        let schema =
-            StructType::try_new([concurrent_identity_column("id", "seq-abc", 1, 1, false)]);
-        let result = create_table("memory:///", Arc::new(schema.unwrap()), "test-engine")
-            .with_table_properties([
-                ("io.unitycatalog.tableId", "cic-test"),
-                ("delta.feature.catalogManaged", "supported"),
-            ])
-            .build(&engine, Box::new(MockCatalogCommitter));
-        assert_result_error_with_message(
-            result,
-            "does not support the 'concurrentIdentityColumns' feature",
-        );
+        let mut properties = vec![("io.unitycatalog.tableId", "cic-test")];
+        if catalog_managed {
+            properties.push(("delta.feature.catalogManaged", "supported"));
+        }
+        create_table(
+            "memory:///",
+            Arc::new(StructType::try_new(fields)?),
+            "test-engine",
+        )
+        .with_table_properties(properties)
+        .with_data_layout(data_layout)
+        .build(&engine, Box::new(MockCatalogCommitter))
     }
 
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
     #[test]
-    fn write_state_rejects_concurrent_identity_columns() {
-        let schema =
-            StructType::try_new([concurrent_identity_column("id", "seq-abc", 1, 1, false)]);
-        let txn = column_defaults::txn_with_schema_and_writer_features(
-            schema.unwrap(),
-            [
-                TableFeature::IdentityColumns,
-                TableFeature::ConcurrentIdentityColumns,
+    fn write_state_requires_concurrent_identity_columns_ack() {
+        let mut txn = create_cic_table(
+            vec![
+                concurrent_identity_column("id", "seq-abc", 10, 5, false),
+                StructField::nullable("v", DataType::STRING),
             ],
+            true,
+            DataLayout::None,
+        )
+        .unwrap();
+
+        let cols = txn.concurrent_identity_columns().unwrap();
+        assert_eq!(cols.len(), 1);
+        let id = &cols["id"];
+        assert_eq!(
+            (id.sequence_id(), id.start(), id.step()),
+            ("seq-abc", 10, 5)
         );
-        assert_result_error_with_message(txn.write_state(), "not yet supported");
+        drop(cols);
+
+        assert!(matches!(
+            txn.write_state(),
+            Err(KernelError::InvalidTransactionState(_))
+        ));
+        txn.ack_concurrent_identity_columns();
+        txn.write_state().unwrap();
+    }
+
+    // A classic identity column: `start`/`step`, no `sequenceId`, optionally a high-water mark.
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    fn classic_identity_field(high_water_mark: Option<i64>) -> StructField {
+        let field = StructField::not_null("legacy_id", DataType::LONG).with_metadata([
+            (
+                ColumnMetadataKey::IdentityStart.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::IdentityStep.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::IdentityAllowExplicitInsert.as_ref(),
+                MetadataValue::Boolean(false),
+            ),
+        ]);
+        match high_water_mark {
+            Some(hwm) => field.add_metadata([(
+                ColumnMetadataKey::IdentityHighWaterMark.as_ref(),
+                MetadataValue::Number(hwm),
+            )]),
+            None => field,
+        }
+    }
+
+    // CREATE validates the configuration it is about to commit, so it never commits a CIC table
+    // that kernel would then refuse to write.
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    #[rstest]
+    #[case::classic_without_high_water_mark(
+        vec![concurrent_identity_column("id", "seq-abc", 1, 1, false), classic_identity_field(None)],
+        true,
+        DataLayout::None,
+        "must be concurrent"
+    )]
+    #[case::classic_with_high_water_mark(
+        vec![concurrent_identity_column("id", "seq-abc", 1, 1, false), classic_identity_field(Some(5))],
+        true,
+        DataLayout::None,
+        "must be concurrent"
+    )]
+    #[case::without_catalog_managed(
+        vec![concurrent_identity_column("id", "seq-abc", 1, 1, false)],
+        false,
+        DataLayout::None,
+        "requires 'catalogManaged'"
+    )]
+    #[case::partitioned_on_cic(
+        vec![
+            concurrent_identity_column("id", "seq-abc", 1, 1, false),
+            StructField::nullable("v", DataType::STRING),
+        ],
+        true,
+        DataLayout::partitioned(["id"]),
+        "cannot also be a partition column"
+    )]
+    fn create_table_rejects_invalid_concurrent_identity_columns(
+        #[case] fields: Vec<StructField>,
+        #[case] catalog_managed: bool,
+        #[case] data_layout: DataLayout,
+        #[case] expected_error: &str,
+    ) {
+        assert_result_error_with_message(
+            create_cic_table(fields, catalog_managed, data_layout),
+            expected_error,
+        );
     }
 
     #[test]
