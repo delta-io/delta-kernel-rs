@@ -135,6 +135,14 @@ adaptive-metadata-in-dev = []
 geo-type-in-dev = []
 # Enables experimental user-defined schema types.
 udt-in-dev = []
+# Experimental, temporary feature flag guarding the in-progress Concurrent Identity Columns (CIC)
+# work: identity values allocated from a catalog-hosted sequence instead of the Delta-log
+# high-water mark. Gates `KernelSupport::Supported` for the `concurrentIdentityColumns` writer
+# feature (and the writable-identity branch of `identityColumns`); without it, writes to tables
+# listing the feature and CREATE TABLE with CIC columns are rejected (reads are unaffected).
+# TODO(#3586): remove once full CIC support ships.
+concurrent-identity-columns-in-dev = []
+
 # Enables shared Arrow-based engine support modules (arrow_data, arrow_expression,
 # ensure_data_types, parquet_row_group_skipping). Used by the delta_kernel_default_engine crate
 # and the SyncEngine. Keeps `reqwest` only for the gated `KernelError::Reqwest` variant.
