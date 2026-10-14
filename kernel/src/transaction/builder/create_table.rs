@@ -1091,6 +1091,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
                  CREATE TABLE",
             ));
         }
+        table_configuration.validate_concurrent_identity_columns()?;
 
         // Create Transaction<CreateTable> with the effective table configuration
         let transaction = try_new_create_table(

@@ -296,7 +296,12 @@ pub(crate) fn evolve_table_config(
         });
 
     // Validates the evolved metadata against the protocol.
-    TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)
+    let evolved_table_config =
+        TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)?;
+    // The evolved columns must still satisfy the CIC rules (e.g. `set_nullable` must not make a
+    // CIC nullable, and an added identity column must be concurrent).
+    evolved_table_config.validate_concurrent_identity_columns()?;
+    Ok(evolved_table_config)
 }
 
 #[cfg(test)]
