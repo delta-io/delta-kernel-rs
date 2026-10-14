@@ -1084,6 +1084,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
 
         // Build TableConfiguration directly for the new table
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
+        table_configuration.validate_concurrent_identity_columns()?;
 
         // Create Transaction<CreateTable> with the effective table configuration
         let transaction = try_new_create_table(
