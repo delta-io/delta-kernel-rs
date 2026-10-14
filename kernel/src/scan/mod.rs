@@ -306,7 +306,7 @@ impl StatsOptions {
 /// When the typed struct is requested, scan metadata output gains a top-level
 /// `partitionValues_parsed` struct column with one typed nullable field per partition column
 /// (physical names, table partition-column order). On non-partitioned tables the column is
-/// omitted. Values are parsed from the canonical string map for both commits and checkpoints.
+/// omitted. Compatible checkpoint values are reused; otherwise the string map is parsed.
 #[derive(Clone, Debug, Default)]
 pub struct PartitionValuesOptions {
     /// Whether to emit the typed `partitionValues_parsed` struct column.
@@ -335,12 +335,14 @@ impl PartitionValuesOptions {
     /// `timestamp_timezone` must be an IANA time zone identifier recognized by Kernel or a
     /// normalized fixed offset in `+HH:MM` or `-HH:MM` form. An explicit offset in a partition
     /// value takes precedence. This option does not affect `TIMESTAMP_NTZ`. It applies to typed
-    /// scan metadata and final partition predicate evaluation. Partition-column row transforms
-    /// used by [`Scan::execute`] retain UTC parsing. Native checkpoint pruning remains enabled for
-    /// timezone-independent fields but defers zoned `TIMESTAMP` predicates until after reparsing.
-    /// Incremental scans continue to expose the raw partition-value map. Without this option,
-    /// Kernel interprets offset-less timestamps as UTC. Invalid values are reported when the scan
-    /// is built.
+    /// scan metadata and partition predicate evaluation when parsing raw partition values.
+    /// Compatible checkpoint `partitionValues_parsed` values are reused without reinterpretation.
+    ///
+    /// Setting this option disables row transforms, as if
+    /// [`ScanBuilder::without_row_transforms`] were set. The connector must reconstruct logical
+    /// rows itself; [`Scan::execute`] returns an error. Incremental scans continue to expose the
+    /// raw partition-value map. Without this option, Kernel interprets offset-less timestamps as
+    /// UTC. Invalid values are reported when the scan is built.
     pub fn with_timestamp_timezone(mut self, timestamp_timezone: impl Into<String>) -> Self {
         self.timestamp_timezone = Some(timestamp_timezone.into());
         self
@@ -559,7 +561,8 @@ impl ScanBuilder {
 
         // Retain the transform spec but skip building per-file expressions, which also skips the
         // per-row partition-value parse done only to build them.
-        state_info.skip_row_transforms = self.without_row_transforms;
+        state_info.skip_row_transforms =
+            self.without_row_transforms || self.partition_values.timestamp_timezone.is_some();
 
         let commits_since_checkpoint = self.snapshot.log_segment().commits_since_checkpoint();
         if self.snapshot.skipped_new_checkpoints() && commits_since_checkpoint > 0 {
@@ -1294,13 +1297,6 @@ impl Scan {
         let mut floating_partition_columns = HashSet::new();
         if let Some(schema) = self.state_info.physical_partition_schema.as_ref() {
             for field in schema.fields() {
-                // Native checkpoint values may encode a different instant than reader-timezone
-                // parsing, so they cannot safely prune zoned timestamp partitions.
-                if self.partition_values.timestamp_timezone.is_some()
-                    && field.data_type() == &DataType::TIMESTAMP
-                {
-                    continue;
-                }
                 let column = ColumnName::new([field.name()]);
                 if field.data_type() == &DataType::FLOAT || field.data_type() == &DataType::DOUBLE {
                     floating_partition_columns.insert(column.clone());
@@ -1432,8 +1428,9 @@ impl Scan {
     /// final table data. Generally connectors/engines will want to use [`Scan::scan_metadata`] so
     /// they can have more control over the execution of the scan.
     ///
-    /// Returns an error if the scan was built with [`ScanBuilder::without_row_transforms`]; use
-    /// [`Scan::scan_metadata`] instead.
+    /// Returns an error if row transforms were disabled through
+    /// [`ScanBuilder::without_row_transforms`] or [`PartitionValuesOptions::with_timestamp_timezone`];
+    /// use [`Scan::scan_metadata`] instead.
     // This calls [`Scan::scan_metadata`] to get an iterator of `ScanMetadata` actions for the scan,
     // and then uses the `engine`'s [`crate::ParquetHandler`] to read the actual table data.
     pub fn execute(
@@ -1442,9 +1439,9 @@ impl Scan {
     ) -> Result<impl Iterator<Item = Result<Box<dyn EngineData>>>> {
         if self.state_info.skip_row_transforms {
             return Err(KernelError::unsupported(
-                "Scan::execute is not supported when the scan was built with \
-                 without_row_transforms; use scan_metadata for listing and read data with your \
-                 own reader",
+                "Scan::execute is not supported when row transforms are disabled by \
+                 without_row_transforms or with_timestamp_timezone; use scan_metadata for listing \
+                 and read data with your own reader",
             ));
         }
 

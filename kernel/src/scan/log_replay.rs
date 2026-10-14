@@ -170,8 +170,8 @@ pub struct ScanLogReplayProcessor {
     /// StructPatch for log batches (commit files) - uses ParseJson for stats and MapToStruct
     /// for partition values
     commit_transform: Arc<dyn ExpressionEvaluator>,
-    /// StructPatch for checkpoint batches - reuses compatible parsed stats and parses partition
-    /// values from the canonical raw map.
+    /// StructPatch for checkpoint batches - reuses compatible parsed stats and partition values,
+    /// falling back to their raw representations when absent.
     checkpoint_transform: Arc<dyn ExpressionEvaluator>,
     /// Final metadata projection built when log replay starts.
     ///
@@ -256,7 +256,7 @@ impl ScanLogReplayProcessor {
     ) -> KernelResult<Self> {
         let CheckpointReadInfo {
             has_stats_parsed,
-            has_partition_values_parsed: _,
+            has_partition_values_parsed,
             checkpoint_read_schema,
         } = checkpoint_info.clone();
         let ScanStatsOptions {
@@ -341,12 +341,12 @@ impl ScanLogReplayProcessor {
                     skip_stats,
                     synthesize_json,
                     partition_schema_for_transform.clone(),
+                    false, /* has_partition_values_parsed */
                     timestamp_timezone_name,
                 ),
                 output_schema.clone().into(),
             )?,
-            // Checkpoint transform: reuse compatible parsed stats and parse partition values from
-            // the canonical raw map.
+            // Checkpoint transform: reuse compatible parsed columns when available.
             checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
                 checkpoint_read_schema,
                 get_add_transform_expr(
@@ -355,6 +355,7 @@ impl ScanLogReplayProcessor {
                     skip_stats,
                     synthesize_json,
                     partition_schema_for_transform,
+                    has_partition_values_parsed,
                     timestamp_timezone_name,
                 ),
                 output_schema.into(),
@@ -849,8 +850,8 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// These typed columns are appended at the top level (siblings of `fileConstantValues`) rather than
 /// nested inside it. This mirrors `stats_parsed`, keeps `fileConstantValues` a fixed shape
 /// regardless of the engine's options, and keeps data-skipping paths uniform:
-/// `partitionValues_parsed.<col>` parallels `stats_parsed.minValues.<col>`. Both commit and
-/// checkpoint inputs derive it from the canonical raw partition map.
+/// `partitionValues_parsed.<col>` parallels `stats_parsed.minValues.<col>`. Checkpoints can supply
+/// compatible parsed values directly; other inputs derive them from the raw partition map.
 fn scan_row_schema_with_parsed_columns(
     stats_schema: Option<SchemaRef>,
     partition_schema: Option<SchemaRef>,
@@ -926,7 +927,8 @@ fn build_stats_output_projection(
 ///   the JSON stats column; JSON-only checkpoints and commits retain `add.stats` as fallback input.
 /// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
 ///   value parsing is not needed.
-/// - `timestamp_timezone`: Reader timezone for offset-less zoned timestamp partition strings.
+/// - `has_partition_values_parsed`: Whether the source carries compatible parsed partition values.
+/// - `timestamp_timezone`: Reader timezone used when parsing raw timestamp partition strings.
 ///
 /// The transform includes `stats_parsed` only when `physical_stats_read_schema` is Some,
 /// and `partitionValues_parsed` only when `partition_schema` is Some.
@@ -937,6 +939,7 @@ fn get_add_transform_expr(
     skip_stats: bool,
     synthesize_json: bool,
     partition_schema: Option<SchemaRef>,
+    has_partition_values_parsed: bool,
     timestamp_timezone: Option<&str>,
 ) -> ExpressionRef {
     let stats_expr = if skip_stats {
@@ -984,8 +987,11 @@ fn get_add_transform_expr(
     // Add partitionValues_parsed when partition columns are needed for data skipping or for the
     // engine-facing typed output column.
     if partition_schema.is_some() {
-        let pv_parsed_expr =
-            parsed_partition_values_expr(col!("add.partitionValues"), timestamp_timezone);
+        let pv_parsed_expr = if has_partition_values_parsed {
+            col!("add.partitionValues_parsed")
+        } else {
+            parsed_partition_values_expr(col!("add.partitionValues"), timestamp_timezone)
+        };
         fields.push(Arc::new(pv_parsed_expr));
     }
 
@@ -993,7 +999,7 @@ fn get_add_transform_expr(
 }
 
 /// Build typed partition values from the canonical raw map.
-fn parsed_partition_values_expr(
+pub(super) fn parsed_partition_values_expr(
     raw_partition_values: Expression,
     timestamp_timezone: Option<&str>,
 ) -> Expression {
@@ -1158,7 +1164,7 @@ impl ScanLogReplayProcessor {
         // type. In that case, we get a ParseError and retry after deduplication.
         // The transform depends on the batch type:
         // - Log batches: parse JSON for stats, MapToStruct for partition values
-        // - Checkpoint batches: reuse compatible parsed stats and parse raw partition values
+        // - Checkpoint batches: reuse compatible parsed stats and partition values when available
         // This avoids double JSON parsing -- the transform already parsed the stats.
         // Data skipping is safe for Remove rows: their add-side columns (stats_parsed,
         // partitionValues_parsed) are null. For stats, the skipping predicate wraps comparisons
@@ -2459,7 +2465,8 @@ mod tests {
             false, // skip_stats
             true,  // synthesize_json
             partition_schema.clone(),
-            None, // timestamp_timezone
+            false, /* has_partition_values_parsed */
+            None,  // timestamp_timezone
         );
         assert_eq!(
             count_to_json(&with_synthesis),
@@ -2474,7 +2481,8 @@ mod tests {
             false, // skip_stats
             false, // synthesize_json
             partition_schema,
-            None, // timestamp_timezone
+            false, /* has_partition_values_parsed */
+            None,  // timestamp_timezone
         );
         assert_eq!(
             count_to_json(&without_synthesis),

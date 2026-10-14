@@ -288,16 +288,16 @@ By default, offset-less `TIMESTAMP` partition strings are interpreted in UTC. Us
 `with_timestamp_timezone` with a recognized IANA timezone or a normalized `+HH:MM` or `-HH:MM`
 fixed offset when the reader uses another timezone. An explicit offset in a partition value takes
 precedence. This setting affects typed `scan_metadata` output, partition predicate evaluation after
-log replay. Partition-column row transforms used by `Scan::execute` retain UTC parsing. Native
-checkpoint pruning remains enabled for timezone-independent fields but defers configured-timezone
-`TIMESTAMP` predicates until after reparsing. Incremental scans expose the raw partition-value map.
+log replay. Setting a timezone disables row transforms, so use `scan_metadata` and reconstruct
+logical rows in your connector; `Scan::execute` returns an error. Incremental scans expose the raw
+partition-value map.
 `TIMESTAMP_NTZ` remains timezone-independent. For daylight-saving transitions, ambiguous local times
 use the earlier instant, and nonexistent local times use the offset from before the transition.
 
 > [!TIP]
-> Kernel reparses surviving commit and checkpoint rows from the raw map for typed output and final
-> predicate evaluation. Checkpoint footer pruning happens first, but it does not evaluate zoned
-> `TIMESTAMP` partition predicates against native values when a timezone is configured.
+> Kernel reuses compatible checkpoint `partitionValues_parsed` values for typed output and data
+> skipping, including timestamp predicates. The configured timezone applies only when Kernel parses
+> raw partition values; it does not reinterpret values already parsed in a checkpoint.
 
 ## Cancelling a scan
 

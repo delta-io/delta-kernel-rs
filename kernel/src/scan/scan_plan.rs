@@ -17,11 +17,13 @@ use crate::actions::{
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
     col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, ExpressionRef,
-    MapToStructOptions, Predicate,
+    Predicate,
 };
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
-use crate::scan::log_replay::{PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME};
+use crate::scan::log_replay::{
+    parsed_partition_values_expr, PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME,
+};
 use crate::schema::{
     lazy_schema_ref, schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder, StructField,
 };
@@ -180,7 +182,10 @@ impl Scan {
             .project_patch(|patch| {
                 patch
                     .with_parsed_add_stats(physical_stats)
-                    .with_parsed_add_partition_values(physical_partitions)
+                    .with_parsed_add_partition_values(
+                        physical_partitions,
+                        self.partition_values.timestamp_timezone.as_deref(),
+                    )
                     .append(
                         StructField::not_null(IS_ADD, DataType::BOOLEAN),
                         Expr::from(col!("add.path").is_not_null()),
@@ -222,6 +227,7 @@ impl Scan {
                     .with_parsed_add_stats(self.state_info.physical_stats_read_schema())
                     .with_parsed_add_partition_values(
                         self.state_info.physical_partition_schema.as_ref(),
+                        self.partition_values.timestamp_timezone.as_deref(),
                     )
                     .append(
                         StructField::not_null(IS_ADD, DataType::BOOLEAN),
@@ -469,7 +475,11 @@ trait ProjectionStructPatchBuilderExt<'a> {
     fn with_parsed_add_stats(self, physical_stats: Option<&SchemaRef>) -> Self;
 
     /// Parses add partition values when a compatible parsed field is not already present.
-    fn with_parsed_add_partition_values(self, physical_partitions: Option<&SchemaRef>) -> Self;
+    fn with_parsed_add_partition_values(
+        self,
+        physical_partitions: Option<&SchemaRef>,
+        timestamp_timezone: Option<&str>,
+    ) -> Self;
 }
 
 impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a> {
@@ -492,7 +502,11 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
         }
     }
 
-    fn with_parsed_add_partition_values(self, physical_partitions: Option<&SchemaRef>) -> Self {
+    fn with_parsed_add_partition_values(
+        self,
+        physical_partitions: Option<&SchemaRef>,
+        timestamp_timezone: Option<&str>,
+    ) -> Self {
         let has_partition_values_parsed = self
             .input_schema()
             .contains_col([ADD_NAME, PARTITION_VALUES_PARSED_NAME]);
@@ -501,10 +515,7 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
             (Some(schema), false) => self.append_at(
                 add,
                 StructField::nullable(PARTITION_VALUES_PARSED, schema.as_ref().clone()),
-                Expr::map_to_struct(
-                    col!(ADD_NAME, PARTITION_VALUES),
-                    MapToStructOptions::default(),
-                ),
+                parsed_partition_values_expr(col!(ADD_NAME, PARTITION_VALUES), timestamp_timezone),
             ),
             (Some(_), true) | (None, _) => self,
         }
@@ -795,9 +806,13 @@ mod tests {
         #[case] expect_native_partitions: bool,
         #[values(None, Some(struct_stats_schema()))] parsed_stats: Option<SchemaRef>,
         #[values(CheckpointType::Leaf, CheckpointType::Manifest)] checkpoint_type: CheckpointType,
+        #[values(None, Some("America/Los_Angeles"))] timestamp_timezone: Option<&str>,
     ) -> Result<()> {
         let stats = StatsOptions::all();
-        let partition_values = PartitionValuesOptions::with_struct();
+        let partition_values = timestamp_timezone
+            .map_or_else(PartitionValuesOptions::with_struct, |timezone| {
+                PartitionValuesOptions::with_struct().with_timestamp_timezone(timezone)
+            });
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
         let scan = mock_snapshot(segment)?
             .scan_builder()
@@ -852,6 +867,10 @@ mod tests {
         assert_eq!(
             normalization.contains("MAP_TO_STRUCT"),
             !expect_native_partitions
+        );
+        assert_eq!(
+            normalization.contains("timestamp_timezone=\"America/Los_Angeles\""),
+            timestamp_timezone.is_some() && !expect_native_partitions,
         );
         assert!(!normalization.contains("COALESCE"));
         Ok(())

@@ -5,7 +5,7 @@ use std::str::FromStr;
 use chrono::FixedOffset;
 use chrono_tz::Tz;
 
-use crate::{DeltaResult, Error};
+use crate::{KernelError, KernelResult};
 
 /// A validated timezone used to interpret an offset-less `TIMESTAMP` value.
 ///
@@ -30,15 +30,15 @@ impl Default for TimestampTimezone {
 }
 
 impl FromStr for TimestampTimezone {
-    type Err = Error;
+    type Err = KernelError;
 
-    fn from_str(value: &str) -> DeltaResult<Self> {
+    fn from_str(value: &str) -> KernelResult<Self> {
         let timezone = if value.starts_with(['+', '-']) {
             parse_normalized_fixed_offset(value).map(Self::Fixed)
         } else {
             value.parse::<Tz>().ok().map(Self::Named)
         };
-        timezone.ok_or_else(|| Error::generic(format!("Invalid timestamp timezone: {value}")))
+        timezone.ok_or_else(|| KernelError::generic(format!("Invalid timestamp timezone: {value}")))
     }
 }
 

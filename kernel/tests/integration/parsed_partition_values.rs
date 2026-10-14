@@ -10,7 +10,7 @@ use delta_kernel::arrow::array::{
 };
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{col, lit, ColumnName, Predicate};
+use delta_kernel::expressions::{col, lit, ColumnName, Predicate, Scalar};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::parquet::arrow::ArrowWriter;
@@ -515,42 +515,54 @@ fn timestamp_micros(value: &str) -> i64 {
 }
 
 #[rstest]
-#[case::utc(None, "2024-01-15 12:30:45.123456", "2024-01-15T12:30:45.123456Z")]
+#[case::utc(
+    None,
+    "2024-01-15 12:30:45.123456",
+    "2024-01-15T12:30:45.123456Z",
+    "2024-01-15T12:30:45.123456Z"
+)]
 #[case::los_angeles_winter(
     Some("America/Los_Angeles"),
     "2024-01-15 12:30:45.123456",
-    "2024-01-15T20:30:45.123456Z"
+    "2024-01-15T20:30:45.123456Z",
+    "2024-01-15T12:30:45.123456Z"
 )]
 #[case::los_angeles_summer(
     Some("America/Los_Angeles"),
     "2024-06-15 08:00:00.500500",
-    "2024-06-15T15:00:00.500500Z"
+    "2024-06-15T15:00:00.500500Z",
+    "2024-06-15T08:00:00.500500Z"
 )]
 #[case::fixed_offset_minutes(
     Some("+12:45"),
     "2024-01-15 12:30:45.123456",
-    "2024-01-14T23:45:45.123456Z"
+    "2024-01-14T23:45:45.123456Z",
+    "2024-01-15T12:30:45.123456Z"
 )]
 #[case::explicit_offset_wins(
     Some("America/Los_Angeles"),
     "2024-01-15T12:30:45+02:00",
+    "2024-01-15T10:30:45Z",
     "2024-01-15T10:30:45Z"
 )]
 #[case::dst_overlap_uses_earlier_instant(
     Some("America/Los_Angeles"),
     "2024-11-03 01:30:00",
-    "2024-11-03T08:30:00Z"
+    "2024-11-03T08:30:00Z",
+    "2024-11-03T01:30:00Z"
 )]
 #[case::dst_gap_uses_pre_transition_offset(
     Some("America/Los_Angeles"),
     "2024-03-10 02:30:00",
-    "2024-03-10T10:30:00Z"
+    "2024-03-10T10:30:00Z",
+    "2024-03-10T02:30:00Z"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn timezone_aware_parsed_partition_values_across_json_and_checkpoint(
     #[case] timestamp_timezone: Option<&str>,
     #[case] raw_timestamp: &str,
     #[case] expected_timestamp: &str,
+    #[case] expected_checkpoint_timestamp: &str,
     #[values(false, true)] native_checkpoint: bool,
 ) {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -577,7 +589,11 @@ async fn timezone_aware_parsed_partition_values_across_json_and_checkpoint(
         .unwrap();
     let mut rows = 0;
     for metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
-        let (data, selection) = metadata.unwrap().scan_files.into_parts();
+        let metadata = metadata.unwrap();
+        if timestamp_timezone.is_some() {
+            assert!(metadata.scan_file_transforms.iter().all(Option::is_none));
+        }
+        let (data, selection) = metadata.scan_files.into_parts();
         let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
         let batch = filter_record_batch(&batch, &BooleanArray::from(selection)).unwrap();
         if batch.num_rows() == 0 {
@@ -602,7 +618,12 @@ async fn timezone_aware_parsed_partition_values_across_json_and_checkpoint(
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        assert_eq!(timestamp.value(0), timestamp_micros(expected_timestamp));
+        let expected = if native_checkpoint {
+            expected_checkpoint_timestamp
+        } else {
+            expected_timestamp
+        };
+        assert_eq!(timestamp.value(0), timestamp_micros(expected));
         assert_eq!(
             timestamp_ntz.value(0),
             timestamp_micros("2024-01-15T12:30:45.123456Z"),
@@ -674,11 +695,74 @@ async fn timezone_aware_partition_values_use_physical_column_names(
             .unwrap();
         assert_eq!(
             timestamp.value(0),
-            timestamp_micros("2024-01-15T20:30:45.123456Z")
+            timestamp_micros(if checkpoint {
+                "2024-01-15T12:30:45.123456Z"
+            } else {
+                "2024-01-15T20:30:45.123456Z"
+            })
         );
         rows += batch.num_rows();
     }
     assert_eq!(rows, 1);
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timestamp_partition_pruning_reuses_checkpoint_values(
+    #[values(
+        ColumnMappingMode::None,
+        ColumnMappingMode::Id,
+        ColumnMappingMode::Name
+    )]
+    column_mapping_mode: ColumnMappingMode,
+    #[values(false, true)] native_checkpoint: bool,
+    #[values(false, true)] before_threshold: bool,
+) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let url = write_timezone_partition_table(
+        temp_dir.path(),
+        "2024-01-15 12:30:45.123456",
+        column_mapping_mode,
+    )
+    .await;
+    let engine = create_default_engine_mt_executor(&url).unwrap();
+    if native_checkpoint {
+        Snapshot::builder_for(url.clone())
+            .build(engine.as_ref())
+            .unwrap()
+            .checkpoint(engine.as_ref(), None)
+            .unwrap();
+    }
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    // The checkpoint timestamp is before this threshold; parsing in the reader timezone is after it.
+    let threshold = lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")));
+    let predicate = if before_threshold {
+        col!("p_ts").lt(threshold)
+    } else {
+        col!("p_ts").gt(threshold)
+    };
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .with_partition_values(
+            PartitionValuesOptions::string_map_only()
+                .with_timestamp_timezone("America/Los_Angeles"),
+        )
+        .build()
+        .unwrap();
+    let mut paths = Vec::new();
+    for metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+        paths = metadata
+            .unwrap()
+            .visit_scan_files(paths, |paths, file| paths.push(file.path))
+            .unwrap();
+    }
+    let expected = if before_threshold == native_checkpoint {
+        vec!["part.parquet".to_string()]
+    } else {
+        vec![]
+    };
+    assert_eq!(paths, expected);
 }
 
 #[rstest]
