@@ -1882,6 +1882,96 @@ async fn snapshot_before_manifest_commit_lists_from_last_manifest_commit(
     assert_eq!(action.map(|action| action.version()), expected_action);
 }
 
+// An incremental update of a snapshot listed from an AMT `_last_checkpoint` hint at version 2
+// (manifest commit 3) lists only after the hint's version. Listing from version 0 would adopt a
+// classic checkpoint from before the table enabled AMT, which drops the hint and leaves a gap up to
+// the hint's commits.
+#[rstest]
+#[tokio::test]
+async fn incremental_update_lists_after_amt_hint_version(
+    #[values(true, false)] pre_amt_checkpoint: bool,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = Url::parse("memory:///").unwrap();
+    for (version, commit) in [
+        (2, commit_info(None)),
+        (3, manifest_commit(3, 2, one_column_schema())),
+    ] {
+        add_commit(table_root.as_str(), store.as_ref(), version, commit)
+            .await
+            .unwrap();
+    }
+    if pre_amt_checkpoint {
+        store
+            .put(
+                &Path::from("_delta_log/00000000000000000001.checkpoint.parquet"),
+                "never read".into(),
+            )
+            .await
+            .unwrap();
+    }
+    put_amt_last_checkpoint_hint(&store, 2, 3, true).await;
+    let engine = non_plan_engine(store.clone());
+    let base = Snapshot::builder_for(table_root.clone())
+        .build(&engine)
+        .unwrap();
+
+    add_commit(table_root.as_str(), store.as_ref(), 4, commit_info(None))
+        .await
+        .unwrap();
+    let updated = Snapshot::builder_from(base).build(&engine).unwrap();
+
+    let log_segment = updated.log_segment();
+    assert_eq!(updated.version(), 4);
+    assert_eq!(log_segment.checkpoint_version, None);
+    assert_eq!(log_segment.amt_base().map(|base| base.version), Some(2));
+    let commits: Vec<_> = log_segment
+        .listed
+        .ascending_commit_files
+        .iter()
+        .map(|commit| commit.version)
+        .collect();
+    assert_eq!(commits, vec![3, 4]);
+}
+
+// An incremental update between two snapshots before the manifest commit (hint at content root 2,
+// manifest commit 5, update 3 -> 4) keeps the hint's embedded action as the latest checkpoint
+// action and as the source of protocol and metadata.
+#[tokio::test]
+async fn incremental_update_before_manifest_commit_keeps_hint_checkpoint_action() {
+    let store = Arc::new(InMemory::new());
+    let table_root = Url::parse("memory:///").unwrap();
+    for (version, commit) in [
+        (2, commit_info(None)),
+        (3, commit_info(None)),
+        (4, commit_info(None)),
+        (5, manifest_commit(5, 2, one_column_schema())),
+    ] {
+        add_commit(table_root.as_str(), store.as_ref(), version, commit)
+            .await
+            .unwrap();
+    }
+    put_amt_last_checkpoint_hint(&store, 2, 5, true).await;
+    let engine = non_plan_engine(store);
+    let base = Snapshot::builder_for(table_root)
+        .at_version(3)
+        .build(&engine)
+        .unwrap();
+
+    let updated = Snapshot::builder_from(base)
+        .at_version(4)
+        .build(&engine)
+        .unwrap();
+
+    assert_eq!(updated.version(), 4);
+    assert!(updated.schema().field("id").is_some());
+    let action = updated
+        .latest_checkpoint_action(&engine)
+        .unwrap()
+        .expect("checkpoint action present");
+    assert_eq!(action.version(), 2);
+}
+
 // Writes an AMT `_last_checkpoint` hint at `version` naming `manifest_commit_version` as the
 // manifest commit that added its checkpoint action, embedding that action if `embeds_action`.
 async fn put_amt_last_checkpoint_hint(
