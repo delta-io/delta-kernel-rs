@@ -46,21 +46,6 @@ newest version supported by your Kernel release.
 [Feature flags](../concepts/feature_flags.md) explains these choices and links to the exhaustive
 feature inventories generated from the published crate manifests.
 
-## Example `Cargo.toml`
-
-A typical project using Kernel:
-
-```toml
-[package]
-name = "my-delta-reader"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-delta_kernel = "0.29.0"
-delta_kernel_default_engine = { version = "0.29.0", features = ["rustls"] }
-```
-
 ## What's next
 
 With the dependencies added, head to [Quick Start: Reading a Table](./quick_start_read.md) to

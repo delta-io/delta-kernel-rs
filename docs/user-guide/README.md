@@ -3,8 +3,12 @@
 This book teaches connector workflows and explains how Kernel APIs fit together. Exact public API
 contracts live in [rustdoc], while repository workflows and conventions live in the agent docs.
 
-Update a page in the same PR as a user-visible change to the workflow it teaches. Release-time
-validation is a backstop, not the guide's update cadence.
+## Maintenance
+
+Update a guide page in the same PR as a user-visible change to the workflow it teaches, including
+fixing examples affected by API changes. Release-time audits catch omissions; they do not replace
+change-time maintenance. Update `LAST_VALIDATED.md` only after auditing all changes since its
+recorded commit.
 
 ## prerequisites
 

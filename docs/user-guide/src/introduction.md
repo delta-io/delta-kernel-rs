@@ -68,12 +68,8 @@ without writing any Rust. See the [FFI overview](./ffi/overview.md) for details.
 
 ## Getting started
 
-For Rust projects, add to `Cargo.toml`:
-
-```toml
-delta_kernel = "0.29.0"
-delta_kernel_default_engine = { version = "0.29.0", features = ["rustls"] }
-```
+For Rust projects, follow [Installation](./getting_started/installation.md#adding-the-dependency)
+to configure your dependencies.
 
 For C/C++ projects, build the FFI crate and link against it. See the
 [FFI overview](./ffi/overview.md).

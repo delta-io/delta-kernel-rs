@@ -298,7 +298,7 @@ use delta_kernel::CancellationTokenRef;
 
 // `token` is your connector's cancellation handle, implementing `CancellationToken`.
 // It is commonly a thin wrapper over your runtime's primitive (e.g.
-// `tokio_util::sync::CancellationToken`). See "Cancellation-aware reads" in
+// `tokio_util::sync::CancellationToken`). See "Support cancellation" in
 // Implementing the Engine Trait for how to build one.
 let token: CancellationTokenRef = my_request_token();
 

@@ -11,17 +11,23 @@ internals. Kernel never does I/O directly: it defines _what_ to do via its APIs
 
 Keep each fact in the documentation surface whose audience needs it:
 
-- **Rustdoc** owns public API contracts: parameters, return values, errors, safety requirements,
-  and focused examples. Update rustdoc in the same PR as a public API change.
-- **The user guide** owns connector workflows and explanations that span APIs. It links to rustdoc
-  for exact signatures and method-level contracts. Update the relevant guide page in the same PR
-  as a user-visible workflow change; release audits are a backstop, not the update cadence.
+- **Rustdoc** explains public APIs at module, type, and method level. Module docs explain how types
+  work together; type docs explain how methods work together; method docs specify parameters,
+  return values, errors, and safety requirements. Doctests should teach usage and test behavior,
+  as the `ColumnName` and column-name macro examples do. Update rustdoc with API changes.
+- **The user guide** provides introductions, longer examples, and broader connector workflows
+  that would make everyday API navigation harder if included in rustdoc. It links to rustdoc for
+  API details. Follow the [guide maintenance policy](docs/user-guide/README.md#maintenance).
+- **Source comments** own implementation gotchas, pitfalls, invariants, and low-level design
+  decisions. Keep them next to the code they explain.
 - **Agent docs** own repository workflows, test helpers, code conventions, source navigation, and
-  hard-to-discover implementation gotchas. Do not copy API summaries, capability lists, crate
-  inventories, feature inventories, or protocol reference material into agent docs.
+  broader design considerations. Link to source comments for implementation details.
+  Do not copy API summaries, capability lists, crate inventories, feature inventories, or protocol
+  reference material into agent docs.
 
-Before adding documentation, find its owner and link there from other surfaces. If the destination
-does not answer the question, improve the owner instead of copying an incomplete answer elsewhere.
+Before adding documentation, find its owner and link there from other surfaces. Brief context is
+useful when it helps readers follow a page; detailed contracts and inventories need one authoritative
+home. If the destination does not answer the question, improve it.
 
 For example, `Snapshot::checkpoint` rustdoc explains how to call the method, its requirements,
 return value, and errors, with a focused usage example. The user guide explains when to checkpoint
@@ -332,9 +338,9 @@ Read these when relevant to the task at hand:
 
 - `CLAUDE/architecture.md`: task-oriented source navigation for kernel internals
 - `docs/user-guide/CLAUDE.md`: writing standards for the mdBook user guide
-- [Delta Kernel user guide](https://docs.delta.io/kernel/rust/): connector workflows and
-  cross-API explanations
-- [delta_kernel rustdoc](https://docs.rs/delta_kernel/latest/delta_kernel/): public API contracts
+- [Delta Kernel user guide](https://docs.delta.io/kernel/rust/): introductions and connector workflows
+- [delta_kernel rustdoc](https://docs.rs/delta_kernel/latest/delta_kernel/): API explanations,
+  contracts, and executable examples
 - Always cross-check protocol behavior against the
   [Delta protocol spec](https://raw.githubusercontent.com/delta-io/delta/master/PROTOCOL.md)
 

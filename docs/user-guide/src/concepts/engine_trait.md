@@ -31,17 +31,17 @@ internally, as the default engine does, without requiring every Kernel caller to
 
 An Engine supplies these handler capabilities:
 
-| Handler | Responsibility | API contract |
-|---------|----------------|--------------|
-| `StorageHandler` | List objects and read or write raw bytes | [`StorageHandler` rustdoc] |
-| `JsonHandler` | Translate Delta JSON files and strings to and from `EngineData` | [`JsonHandler` rustdoc] |
-| `ParquetHandler` | Read and write data files and checkpoints | [`ParquetHandler` rustdoc] |
-| `EvaluationHandler` | Evaluate Kernel expressions and predicates | [`EvaluationHandler` rustdoc] |
+| Handler | Responsibility |
+|---------|----------------|
+| [`StorageHandler`] | List objects and read or write raw bytes |
+| [`JsonHandler`] | Translate Delta JSON files and strings to and from `EngineData` |
+| [`ParquetHandler`] | Read and write data files and checkpoints |
+| [`EvaluationHandler`] | Evaluate Kernel expressions and predicates |
 
-[`StorageHandler` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.StorageHandler.html
-[`JsonHandler` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.JsonHandler.html
-[`ParquetHandler` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.ParquetHandler.html
-[`EvaluationHandler` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.EvaluationHandler.html
+[`StorageHandler`]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.StorageHandler.html
+[`JsonHandler`]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.JsonHandler.html
+[`ParquetHandler`]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.ParquetHandler.html
+[`EvaluationHandler`]: https://docs.rs/delta_kernel/latest/delta_kernel/trait.EvaluationHandler.html
 
 With the experimental `declarative-plans` feature, your Engine can also provide a [`PlanExecutor`].
 Kernel describes data work as a plan that your executor can run using your compute engine's
@@ -63,12 +63,6 @@ explains how that abstraction works.
 
 A connector can attach a cancellation token to a scan so long-running reads stop when their caller
 goes away. Kernel carries that token to cancellation-aware storage, JSON, and Parquet operations.
-The default implementations stop before new work but cannot interrupt I/O already started by a
-non-aware handler.
-
-Override the cancellation-aware operations when one slow request would otherwise dominate
-cancellation latency. Check the token before starting I/O and before an iterator pull that may
-start more I/O. A request that is already in flight may still complete.
 
 See the [Engine operation cancellation contract] for exact behavior and
 [Implementing the Engine trait](../connector/implementing_engine.md#support-cancellation) for the

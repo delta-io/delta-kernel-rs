@@ -42,9 +42,11 @@ and merge group event. See `.github/workflows/user-guide.yml`.
 
 ## Purpose and scope
 
-This guide teaches developers **how to use Kernel to build a connector**. It owns end-to-end
-workflows and explanations that span multiple APIs. Rustdoc owns exact signatures, method-level
-contracts, parameters, return values, and errors. Link to rustdoc instead of copying those details.
+This guide teaches developers **how to use Kernel to build a connector** through introductions,
+longer examples, and broader workflows. Follow the repository's
+[documentation ownership guidance](../../AGENTS.md#documentation-ownership) when deciding where an
+explanation belongs. Module and type rustdoc also explain how APIs work together, with doctests
+that teach usage and test behavior. Link to those explanations and contracts from the guide.
 
 The guide is not a Delta protocol reference. The whole point of Kernel is that connector authors
 do not need to understand protocol internals.
@@ -381,10 +383,7 @@ interest (Google developer style guide). Reserve for genuinely important info:
 
 ## Update cadence
 
-- Update a guide page in the same PR as a user-visible change to the workflow it teaches.
-- Do not wait for a release to correct a workflow or example. Release-time audits catch omissions;
-  they do not replace change-time maintenance.
-- Update `LAST_VALIDATED.md` only after auditing all changes since its recorded commit.
+Follow the [guide maintenance policy](README.md#maintenance).
 
 ## SUMMARY.md structure
 
