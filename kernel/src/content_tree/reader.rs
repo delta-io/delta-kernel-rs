@@ -103,16 +103,17 @@ impl LeafRef {
                 getters.len()
             )));
         }
-        let location: &str = getters[0].get(row, LOCATION)?;
-        let size: i64 = getters[1].get(row, FILE_SIZE_IN_BYTES)?;
-        let manifest_dv: Option<&[u8]> = getters[2].get_opt(row, MANIFEST_DV)?;
+        let (fields, tracking) = getters.split_at(tracking_start(getters));
+        let location: &str = fields[0].get(row, LOCATION)?;
+        let size: i64 = fields[1].get(row, FILE_SIZE_IN_BYTES)?;
+        let manifest_dv: Option<&[u8]> = fields[2].get_opt(row, MANIFEST_DV)?;
         let context = format!("AMT leaf manifest '{location}'");
         Ok(Self {
             file_meta: amt_manifest_filemeta(location, size, table_root, &context)?,
-            tracking: TrackingInfo::try_from_getters(row, &getters[5..])?,
+            tracking: TrackingInfo::try_from_getters(row, tracking)?,
             manifest_dv: manifest_dv.map(Bytes::copy_from_slice),
-            manifest_dv_cardinality: getters[3].get_opt(row, MANIFEST_DV_CARDINALITY)?,
-            format_version: getters[4].get(row, FORMAT_VERSION)?,
+            manifest_dv_cardinality: fields[3].get_opt(row, MANIFEST_DV_CARDINALITY)?,
+            format_version: fields[4].get(row, FORMAT_VERSION)?,
         })
     }
 }
@@ -293,6 +294,13 @@ impl LeafReadContext {
 }
 
 // === Helpers ===
+
+/// Index of the first of the [`TRACKING_COLUMNS`] getters that end `getters`.
+fn tracking_start(getters: &[&dyn GetData<'_>]) -> usize {
+    getters
+        .len()
+        .saturating_sub(TRACKING_COLUMNS.as_ref().0.len())
+}
 
 /// Shared constructor for [`EntryConverter`]: builds the entry->`Add` transform (with the caller's
 /// [`AddFieldSources`]) and its evaluator.
@@ -504,15 +512,14 @@ impl RowVisitor for LeafRefVisitor<'_> {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
+        // `tracking.status` is the first tracking column; check it before parsing the rest of the
+        // row.
+        let status_index = tracking_start(getters);
         for row in 0..row_count {
             let content_type = DataContentType::try_from_repr(getters[0].get(row, CONTENT_TYPE)?)?;
             if content_type != DataContentType::DataManifest {
                 continue;
             }
-            // Check liveness before parsing the rest of the row: `tracking.status` is the first
-            // tracking column, which ends `LEAF_REF_COLUMNS`.
-            let status_index =
-                1 + LEAF_REF_COLUMNS.as_ref().0.len() - TRACKING_COLUMNS.as_ref().0.len();
             let status = getters[status_index].get(row, TRACKING_STATUS)?;
             if !TrackingStatus::try_from_repr(status)?.is_live() {
                 continue;
