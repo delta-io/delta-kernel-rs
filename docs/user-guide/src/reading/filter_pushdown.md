@@ -179,8 +179,7 @@ let scan = snapshot
 To execute a collation-aware query, your connector owns the string comparison rules and
 the original row filter. Kernel preserves `__COLLATIONS` schema annotations. Existing
 `statsWithCollation` bounds reach your connector when you request JSON statistics.
-Structured statistics omit these bounds. `StatsOptions::all_struct()` disables JSON synthesis,
-although existing JSON stats from commits still pass through.
+Structured statistics omit these bounds. `StatsOptions::all_struct()` disables JSON synthesis.
 Kernel's predicates and internal data skipping use UTF-8 binary semantics.
 An ordinary equality predicate for `"alice"` can skip a file containing `"Alice"`.
 Evaluating a case-insensitive comparison later cannot recover that file.
