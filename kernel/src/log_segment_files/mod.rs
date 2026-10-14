@@ -700,7 +700,8 @@ impl LogSegmentFiles {
         log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
     ) -> KernelResult<Self> {
-        let listed_files = Self::list(
+        #[allow(unused_mut)]
+        let mut listed_files = Self::list(
             storage,
             log_root,
             log_tail,
@@ -720,6 +721,23 @@ impl LogSegmentFiles {
                     manifest_commit_version,
                     end_version,
                 )?;
+                // The checkpoint action holds the table state through the hinted version, so only
+                // later commits need replay. The hinted commit stays when it is the manifest
+                // commit, whose checkpoint action replay reads, or when no later commit is listed.
+                let hinted_version = checkpoint_metadata.version;
+                if manifest_commit_version > hinted_version
+                    && listed_files
+                        .ascending_commit_files
+                        .last()
+                        .is_some_and(|commit| commit.version > hinted_version)
+                {
+                    listed_files
+                        .ascending_commit_files
+                        .retain(|commit| commit.version > hinted_version);
+                    listed_files
+                        .ascending_compaction_files
+                        .retain(|compaction| compaction.version > hinted_version);
+                }
                 return Ok(listed_files);
             }
             // The hint names a checkpoint that no longer exists, and because the listing started
