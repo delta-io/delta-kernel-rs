@@ -99,6 +99,12 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   in development). Gates `KernelSupport` for the `geospatial` reader+writer feature: with the
   cargo feature off, any table listing it is rejected; with it on, scans and CDF are supported
   but writes are still blocked.
+- `concurrent-identity-columns-in-dev`: Concurrent Identity Columns (CIC) support (experimental,
+  in development). Gates `KernelSupport::Supported` for the `concurrentIdentityColumns` writer
+  feature (and the writable-identity branch of `identityColumns`): with the cargo feature off,
+  writes to a table listing the feature and CREATE TABLE with CIC columns are rejected (reads are
+  unaffected); with it on, CIC tables can be created and written (the connector fills the
+  identity values and acknowledges via `Transaction::ack_concurrent_identity_columns`).
 - `internal-api`: unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `declarative-plans`: experimental declarative-plan IR (`kernel/src/plans/`) and the prost
@@ -293,9 +299,9 @@ is the source of truth. Key concepts:
 **Table features**:
 
 - Writer: `allowColumnDefaults`, `appendOnly`, `changeDataFeed`, `checkConstraints`,
-  `clustering`, `domainMetadata`, `generatedColumns`, `icebergCompatV1`, `icebergCompatV2`,
-  `icebergCompatV3`, `identityColumns`, `inCommitTimestamp`, `invariants`,
-  `materializePartitionColumns`, `rowTracking`
+  `clustering`, `concurrentIdentityColumns`, `domainMetadata`, `generatedColumns`,
+  `icebergCompatV1`, `icebergCompatV2`, `icebergCompatV3`, `identityColumns`, `inCommitTimestamp`,
+  `invariants`, `materializePartitionColumns`, `rowTracking`
 - Reader + writer: `adaptiveMetadata-preview`, `catalogManaged`, `catalogOwned-preview`,
   `columnMapping`, `deletionVectors`, `geospatial`, `timestampNtz`,
   `typeWidening`, `typeWidening-preview`, `v2Checkpoint`, `vacuumProtocolCheck`,

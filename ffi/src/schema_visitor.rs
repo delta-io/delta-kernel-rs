@@ -24,6 +24,8 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+use delta_kernel::schema::concurrent_identity_column;
 use delta_kernel::schema::{
     ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
     StructType,
@@ -958,11 +960,50 @@ fn create_variant_data_type(
     Ok(DataType::Variant(variant_struct))
 }
 
+/// Visit a Concurrent Identity Column (CIC) field: a non-nullable `LONG` whose values are issued by
+/// a catalog sequence rather than stored in the Delta log.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` and `sequence_id` slices with valid
+/// UTF-8 data, and `allocate_error` function pointer.
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_cic(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    sequence_id: KernelStringSlice,
+    start: i64,
+    step: i64,
+    allow_explicit_insert: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    let sequence_id = unsafe { TryFromStringSlice::try_from_slice(&sequence_id) };
+    visit_field_cic_impl(state, name, sequence_id, start, step, allow_explicit_insert)
+        .into_extern_result(&allocate_error)
+}
+
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+fn visit_field_cic_impl(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelResult<&str>,
+    sequence_id: KernelResult<&str>,
+    start: i64,
+    step: i64,
+    allow_explicit_insert: bool,
+) -> KernelResult<usize> {
+    let field = concurrent_identity_column(name?, sequence_id?, start, step, allow_explicit_insert);
+    Ok(wrap_field(state, field))
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::c_void;
     use std::ptr::{null, NonNull};
 
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    use delta_kernel::schema::ColumnMetadataKey;
     use delta_kernel::schema::{DataType, MetadataValue, PrimitiveType};
     use rstest::rstest;
 
@@ -2067,6 +2108,45 @@ mod tests {
             "Mismatch on inner field type"
         );
         assert_eq!(inner_fields[0].is_nullable(), inner_is_nullable);
+    }
+
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    #[test]
+    fn visit_field_cic_builds_a_long_field_with_identity_metadata() {
+        // Schema: struct<id: cic(seq-1, start=5, step=2), name: string>
+        let mut state = KernelSchemaVisitorState::default();
+
+        let id = ok_or_panic(unsafe {
+            visit_field_cic(
+                &mut state,
+                KernelStringSlice::new_unsafe("id"),
+                KernelStringSlice::new_unsafe("seq-1"),
+                5,
+                2,
+                true,
+                allocate_err,
+            )
+        });
+        let name = visit_field!(string, state, "name", true, null());
+        let schema_id = visit_struct_field!(state, "schema", false, [id, name], null());
+        let schema = extract_kernel_schema(&mut state, schema_id).unwrap();
+
+        let id_field = schema.field("id").unwrap();
+        // A CIC column is a non-nullable LONG that carries the sequence-id marker plus start/step.
+        assert_eq!(id_field.data_type(), &DataType::LONG);
+        assert!(!id_field.is_nullable());
+        assert_eq!(
+            id_field.get_config_value(&ColumnMetadataKey::IdentityConcurrentSequenceId),
+            Some(&MetadataValue::String("seq-1".to_string()))
+        );
+        assert_eq!(
+            id_field.get_config_value(&ColumnMetadataKey::IdentityStart),
+            Some(&MetadataValue::Number(5))
+        );
+        assert_eq!(
+            id_field.get_config_value(&ColumnMetadataKey::IdentityStep),
+            Some(&MetadataValue::Number(2))
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@ pub(crate) mod http;
 #[cfg(test)]
 mod tests;
 
-pub use clients::{UCDeltaTableClient, UCUpdateTableRestClient};
+pub use clients::{UCDeltaTableClient, UCSequenceRestClient, UCUpdateTableRestClient};
 pub use config::{ClientConfig, ClientConfigBuilder};
 pub use error::{Error, Result};
 pub use unity_catalog_delta_client_api as api;

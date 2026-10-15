@@ -38,11 +38,9 @@ use crate::table_features::{
     ColumnMappingMode, FeatureType, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
     TABLE_FEATURES_MIN_WRITER_VERSION,
 };
-use crate::table_properties::COLUMN_MAPPING_MODE;
+use crate::table_properties::{COLUMN_MAPPING_MODE, ENABLE_IN_COMMIT_TIMESTAMPS};
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::table_properties::{
-    ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
-};
+use crate::table_properties::{ENABLE_DELETION_VECTORS, ENABLE_ROW_TRACKING};
 use crate::transaction::create_table::create_table;
 use crate::transaction::{CreateTable, Transaction, BASE_ADD_FILES_SCHEMA};
 use crate::{
@@ -566,6 +564,25 @@ pub(crate) fn adaptive_metadata_table_configuration(
         .with_protocol(
             MockProtocolBuilder::new()
                 .with_features(features.iter().chain(extra_features))
+                .build(),
+        )
+        .build()
+}
+
+/// Builds a valid Concurrent Identity Columns table configuration over `schema`: the CIC features
+/// plus the `catalogManaged` dependency (and its `inCommitTimestamp`, enabled via property).
+pub(crate) fn concurrent_identity_config(schema: StructType) -> TableConfiguration {
+    MockTableConfigurationBuilder::new()
+        .with_schema(schema)
+        .with_properties([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
+        .with_protocol(
+            MockProtocolBuilder::new()
+                .with_features([
+                    TableFeature::IdentityColumns,
+                    TableFeature::ConcurrentIdentityColumns,
+                    TableFeature::CatalogManaged,
+                    TableFeature::InCommitTimestamp,
+                ])
                 .build(),
         )
         .build()
