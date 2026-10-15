@@ -223,8 +223,10 @@ fn add_action(path: &str, p_str: &str, p_bin: &str, p_int: &str) -> String {
 /// reconstructs `partitionValues_parsed` with the empty-string cast: "" stays "" for string,
 /// becomes empty bytes for binary, and becomes null for every other type.
 ///
-/// The result is identical before and after checkpointing because scans parse the canonical raw
-/// map in both cases.
+/// The result is identical whether the value is reconstructed from the `partitionValues` map (JSON
+/// commit) or read from a kernel-written checkpoint's native `partitionValues_parsed` column: the
+/// checkpoint reconstructs that column with the same cast, so a checkpoint never changes the value
+/// a scan surfaces. The `native_checkpoint` axis exercises both sources.
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parsed_partition_values_read_foreign_empty_string(
@@ -430,10 +432,16 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
     #[case] timestamp: &str,
     #[values("none", "id", "name")] cm_mode: &str,
     #[case] expected_ts: &str,
+    #[values(false, true)] write_parsed_partition: bool,
 ) {
     // === Init a table with one file in a checkpoint and one in JSON ===
     let (_temp_dir, table_path, engine) = test_table_setup_mt().unwrap();
-    let snapshot = create_timestamp_partition_table(&table_path, engine.as_ref(), cm_mode);
+    let snapshot = create_timestamp_partition_table_with_parsed_partition(
+        &table_path,
+        engine.as_ref(),
+        cm_mode,
+        write_parsed_partition,
+    );
 
     insert_raw_timestamp_partitions(
         &snapshot,
@@ -473,7 +481,7 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
 
     // === Assert results ===
     // Checkpoint writes interpret offset-less timestamps in UTC.
-    let checkpoint_ts = DateTime::parse_from_rfc3339(timestamp)
+    let checkpoint_parsed_ts = DateTime::parse_from_rfc3339(timestamp)
         .map(|value| value.timestamp_micros())
         .or_else(|_| {
             NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S%.f")
@@ -504,8 +512,8 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
         for row in 0..batch.num_rows() {
             let path = file_paths.value(row);
             let expected = match path {
-                "file1.parquet" => checkpoint_ts,
-                "file2.parquet" => expected_ts,
+                "file1.parquet" if write_parsed_partition => checkpoint_parsed_ts,
+                "file1.parquet" | "file2.parquet" => expected_ts,
                 _ => panic!("unexpected file: {path}"),
             };
             assert_eq!(timestamps.value(row), expected, "{path}");
@@ -526,32 +534,48 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
 #[case::utc_before(
     col!("p_ts").lt(lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))),
     None,
-    2
+    2 /* expected_file_num */,
+    true /* write_parsed_partition */
 )]
 #[case::utc_after(
     col!("p_ts").gt(lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))),
     None,
-    2
+    2 /* expected_file_num */,
+    true /* write_parsed_partition */
 )]
 #[case::los_angeles_before(
     col!("p_ts").lt(lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))),
     Some("America/Los_Angeles"),
-    1
+    1 /* expected_file_num */,
+    true /* write_parsed_partition */
 )]
 #[case::los_angeles_after(
     col!("p_ts").gt(lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))),
     Some("America/Los_Angeles"),
-    3
+    3 /* expected_file_num */,
+    true /* write_parsed_partition */
+)]
+#[case::los_angeles_before_without_parsed(
+    col!("p_ts").lt(lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))),
+    Some("America/Los_Angeles"),
+    0 /* expected_file_num */,
+    false /* write_parsed_partition */
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offset_less_timestamp_partition_predicates_with_json_and_checkpoint(
     #[case] predicate: Predicate,
     #[case] tz: Option<&str>,
     #[case] expected_file_num: usize,
+    #[case] write_parsed_partition: bool,
 ) {
     for cm_mode in ["none", "id", "name"] {
         let (_temp_dir, table_path, engine) = test_table_setup_mt().unwrap();
-        let snapshot = create_timestamp_partition_table(&table_path, engine.as_ref(), cm_mode);
+        let snapshot = create_timestamp_partition_table_with_parsed_partition(
+            &table_path,
+            engine.as_ref(),
+            cm_mode,
+            write_parsed_partition,
+        );
 
         insert_raw_timestamp_partitions(
             &snapshot,
@@ -611,7 +635,7 @@ async fn offset_less_timestamp_partition_predicates_with_json_and_checkpoint(
 }
 
 #[rstest]
-fn parallel_scan_metadata_rejects_timestamp_timezone(
+fn parallel_and_declarative_scans_reject_timestamp_timezone(
     #[values("UTC", "America/Los_Angeles", "+05:30")] tz: &str,
     #[values(false, true)] parsed_struct: bool,
 ) {
@@ -633,9 +657,14 @@ fn parallel_scan_metadata_rejects_timestamp_timezone(
         .build()
         .unwrap();
 
+    #[cfg(feature = "declarative-plans")]
+    assert_result_error_with_message(
+        scan.declarative_metadata_scan_plan(&engine),
+        "with_timestamp_timezone in declarative_metadata_scan_plan",
+    );
     assert_result_error_with_message(
         scan.parallel_scan_metadata(Arc::new(engine)),
-        "with_timestamp_timezone is not supported by parallel_scan_metadata; use scan_metadata",
+        "with_timestamp_timezone in parallel_scan_metadata",
     );
 }
 
@@ -715,6 +744,17 @@ fn create_timestamp_partition_table(
     engine: &dyn Engine,
     cm_mode: &str,
 ) -> SnapshotRef {
+    create_timestamp_partition_table_with_parsed_partition(
+        table_path, engine, cm_mode, true, /* write_parsed_partition */
+    )
+}
+
+fn create_timestamp_partition_table_with_parsed_partition(
+    table_path: &str,
+    engine: &dyn Engine,
+    cm_mode: &str,
+    write_parsed_partition: bool,
+) -> SnapshotRef {
     let schema = schema_ref! {
         nullable "p_ts": TIMESTAMP,
         nullable "p_ntz": TIMESTAMP_NTZ,
@@ -725,7 +765,14 @@ fn create_timestamp_partition_table(
         .with_data_layout(DataLayout::partitioned(["p_ts", "p_ntz", "p_int"]))
         .with_table_properties([
             ("delta.columnMapping.mode", cm_mode),
-            ("delta.checkpoint.writeStatsAsStruct", "true"),
+            (
+                "delta.checkpoint.writeStatsAsStruct",
+                if write_parsed_partition {
+                    "true"
+                } else {
+                    "false"
+                },
+            ),
         ])
         .build(engine, Box::new(FileSystemCommitter::new()))
         .unwrap()

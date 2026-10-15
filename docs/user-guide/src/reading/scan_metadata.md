@@ -286,8 +286,9 @@ By default, offset-less `TIMESTAMP` partition strings are interpreted in UTC. Us
 An explicit offset in a partition value takes precedence. This setting affects both partition
 pruning and returned parsed partition values. Kernel doesn't support row transforms with a specified
 timezone, so `PartitionValuesOptions::with_timestamp_timezone` omits per-file row transforms.
-As a result, `Scan::execute` returns an error when you set this option. You can use `scan_metadata`
-and reconstruct logical rows in your connector.
+As a result, `Scan::execute` returns an error when you set this option.
+`Scan::parallel_scan_metadata` and `Scan::declarative_metadata_scan_plan` also return errors with this
+option. You can use `scan_metadata` and reconstruct logical rows in your connector.
 `TIMESTAMP_NTZ` remains timezone-independent. For daylight-saving transitions, ambiguous local times
 use the earlier instant, and nonexistent local times use the offset from before the transition.
 

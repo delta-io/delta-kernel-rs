@@ -1212,7 +1212,8 @@ impl Scan {
     ///
     /// # Errors
     ///
-    /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
+    /// Returns an error if [`PartitionValuesOptions::with_timestamp_timezone`] was set,
+    /// if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
     /// or if log discovery, checkpoint inspection, or plan construction fails.
     #[tracing::instrument(
         name = "scan.declarative_metadata_scan_plan",
@@ -1221,6 +1222,14 @@ impl Scan {
         err
     )]
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> Result<Option<Plan>> {
+        // TODO(#3609): Support session timezone in declarative metadata scans.
+        require!(
+            self.partition_values.timestamp_timezone.is_none(),
+            KernelError::unsupported(
+                "Kernel does not yet support with_timestamp_timezone in \
+                 declarative_metadata_scan_plan; use scan_metadata instead"
+            )
+        );
         // Resolve the checkpoint shape once. Retain the leaf schema only when parsed metadata is
         // needed for output or pruning.
         let plan_executor = engine.require_plan_executor()?;
@@ -1393,10 +1402,11 @@ impl Scan {
                  use scan_metadata for a cancellable scan",
             ));
         }
+        // TODO(#3609): Support session timezone in parallel metadata scans.
         require!(
             self.partition_values.timestamp_timezone.is_none(),
             KernelError::unsupported(
-                "with_timestamp_timezone is not supported by parallel_scan_metadata; \
+                "Kernel does not yet support with_timestamp_timezone in parallel_scan_metadata; \
                  use scan_metadata"
             )
         );
