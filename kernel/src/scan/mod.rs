@@ -1022,6 +1022,11 @@ impl Scan {
         _existing_predicate: Option<PredicateRef>,
     ) -> Result<ResultIteratorStatic<ScanMetadata>> {
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
+        let existing_data = existing_data.into_iter();
+        // Cached metadata bypasses engine handlers, so kernel must poll cancellation while
+        // consuming it.
+        let existing_data =
+            CancellableIterator::new(existing_data.map(Ok), self.cancellation_token.clone());
 
         if existing_version > self.snapshot.version() {
             return Err(KernelError::Generic(format!(
@@ -1041,8 +1046,10 @@ impl Scan {
             get_scan_metadata_transform_expr(),
             restored_add_schema().clone().into(),
         )?;
-        let apply_transform = move |data: Box<dyn EngineData>| {
-            Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))
+        let apply_transform = move |data: Result<Box<dyn EngineData>>| {
+            let data = data?;
+            let data = transform.evaluate(data.as_ref())?;
+            Ok(ActionsBatch::new(data, false))
         };
 
         let log_segment = self.snapshot.log_segment();
@@ -1052,12 +1059,7 @@ impl Scan {
         // Since we're only processing existing data (no checkpoint), we use the base schema
         // and no stats_parsed optimization.
         if existing_version == self.snapshot.version() {
-            // Cached metadata bypasses engine handlers, so kernel must poll cancellation while
-            // consuming it.
-            let actions = CancellableIterator::new(
-                existing_data.into_iter().map(apply_transform),
-                self.cancellation_token.clone(),
-            );
+            let actions = existing_data.map(apply_transform);
             let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
                 actions,
                 checkpoint_info: CheckpointReadInfo {
@@ -1110,10 +1112,7 @@ impl Scan {
         )?;
         // Only the cached suffix needs a kernel-side check. The engine owns cancellation for the
         // newly read action prefix.
-        let existing_actions = CancellableIterator::new(
-            existing_data.into_iter().map(apply_transform),
-            self.cancellation_token.clone(),
-        );
+        let existing_actions = existing_data.map(apply_transform);
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
             actions: result.actions.chain(existing_actions),
             checkpoint_info: CheckpointReadInfo {

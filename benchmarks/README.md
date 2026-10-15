@@ -121,17 +121,50 @@ The bench job fails if any benchmark is at least 15% slower than the base branch
 comment is still posted so you can see which benchmark regressed. To merge anyway (for an
 expected or noise-driven regression), add the `ignore-benchmark-failure` label to the PR.
 
+A `bench-results` artifact is uploaded automatically when a benchmark reaches the existing failure
+band (a displayed slowdown of at least `1.15x`), including when `ignore-benchmark-failure` overrides
+the gate. This policy applies to both automatic PR runs and `/bench` comments. Successful faster,
+unchanged, and warning-band runs do not upload it unless `/bench --archive` requests archival.
+
+The artifact contains separate `base/criterion/` and `changes/criterion/` trees with all generated
+Criterion files, including raw samples, statistical estimates, benchmark metadata, outlier fences,
+and HTML/SVG reports. Output is isolated from build caches. Benchmark or comparison failures upload
+available partial output; canceled runs do so when cancellation allows the upload step to finish.
+Artifacts are retained for 7 days and ZIP-compressed by the upload action at its default zlib level 6.
+
+The job logs include the measured commit SHAs, runner details, and per-benchmark `[io]` summaries.
+Retrieve source/configuration from those commits; the workload release tag, asset name, and checksum
+are pinned in `benchmarks/build.rs`. These are available through GitHub and are not duplicated in the
+artifact. To download and reproduce the comparison using the same critcmp version as CI:
+
+```bash
+cargo install critcmp --version 0.1.8 --locked
+gh run download RUN_ID --repo delta-io/delta-kernel-rs --name bench-results --dir bench-results
+critcmp --target-dir bench-results/base --export base > /tmp/base.json
+critcmp --target-dir bench-results/changes --export changes > /tmp/changes.json
+critcmp /tmp/base.json /tmp/changes.json
+```
+
+The script tests run in build CI, including on draft PRs. They use mocked benchmark tools and do
+not require installing critcmp. Run them locally with:
+
+```bash
+python3 -m unittest discover --start-directory benchmarks/ci --pattern 'test_*.py'
+```
+
 To trigger benchmarks on a pull request manually, post a comment using the following syntax:
 
 ```
-/bench [--tags <comma separated list of tags>] [--filter <regex>]
+/bench [--tags <comma separated list of tags>] [--filter <regex>] [--archive]
 ```
 
 - `--tags` sets `BENCH_TAGS` (comma-separated), controlling which table groupings run.
 - `--filter` is a single-token Criterion regex matched against benchmark names.
-- Both flags are optional and independent; they can be given in any order.
-- When both are specified, they apply as AND: only benchmarks from tables that match the tag filter AND whose name matches the regex are run.
-- Running just `/bench` (with no flags) defaults to `BENCH_TAGS=base`. If neither flag is parsed, the same default applies.
+- `--archive` forces a `bench-results` upload regardless of the regression band.
+- All flags are optional and can be given in any order.
+- When tags and filter are specified, they apply as AND: only benchmarks from tables that match the
+  tag filter AND whose name matches the regex are run.
+- If neither tags nor filter is supplied, `BENCH_TAGS` defaults to `base`, including with `--archive`.
 
 Examples:
 ```
@@ -140,6 +173,7 @@ Examples:
 /bench --filter snapshotLatest                          # no BENCH_TAGS set, only snapshot-construction benchmarks
 /bench --tags base --filter crcVeryStale.*snapshotLatest  # only snapshot-construction benchmarks from tables tagged "base"
 /bench --filter crcVeryStale|crcLatest                    # no BENCH_TAGS set, OR two table names
+/bench --archive                                       # BENCH_TAGS=base, force Criterion archival
 ```
 
 See [By tag (`BENCH_TAGS`)](#by-tag-bench_tags) for how tags work and [By benchmark name](#by-benchmark-name) for regex pattern examples. Results are posted automatically as a PR comment, comparing the PR branch against the base branch.

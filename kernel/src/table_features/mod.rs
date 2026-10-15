@@ -914,8 +914,7 @@ pub(crate) fn add_feature_to_lists(
 /// Enable each `allowed_table_features` entry whose [`EnablementCheck::EnabledIf`] check is
 /// satisfied by `table_properties`, appending it to `reader_features`/`writer_features`
 /// (deduplicated). Features with [`EnablementCheck::AlwaysIfSupported`] are skipped since they need
-/// no property-driven enablement. `RowTracking` additionally pulls in its `DomainMetadata`
-/// dependency.
+/// no property-driven enablement. Dependency resolution is separate from feature selection.
 pub(crate) fn auto_enable_property_driven_features(
     allowed_table_features: &[TableFeature],
     table_properties: &TableProperties,
@@ -926,15 +925,37 @@ pub(crate) fn auto_enable_property_driven_features(
         if let EnablementCheck::EnabledIf(check) = table_feature.info().enablement_check {
             if check(table_properties) {
                 add_feature_to_lists(table_feature.clone(), reader_features, writer_features);
-                if *table_feature == TableFeature::RowTracking {
-                    add_feature_to_lists(
-                        TableFeature::DomainMetadata,
-                        reader_features,
-                        writer_features,
-                    );
-                }
             }
         }
+    }
+}
+
+/// Adds `domainMetadata` when a selected feature requires `Supported(DomainMetadata)`.
+pub(crate) fn ensure_domain_metadata_dependency(
+    reader_features: &mut Vec<TableFeature>,
+    writer_features: &mut Vec<TableFeature>,
+) {
+    let required = reader_features
+        .iter()
+        .chain(writer_features.iter())
+        .any(|feature| {
+            feature
+                .info()
+                .feature_requirements
+                .iter()
+                .any(|requirement| {
+                    matches!(
+                        requirement,
+                        FeatureRequirement::Supported(TableFeature::DomainMetadata)
+                    )
+                })
+        });
+    if required {
+        add_feature_to_lists(
+            TableFeature::DomainMetadata,
+            reader_features,
+            writer_features,
+        );
     }
 }
 

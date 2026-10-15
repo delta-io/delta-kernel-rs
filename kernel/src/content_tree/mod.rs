@@ -6,6 +6,7 @@
 
 mod builder;
 mod dv_conversion;
+mod reader;
 pub(crate) mod stats;
 
 use std::collections::HashMap;
@@ -15,10 +16,10 @@ use delta_kernel_derive::ToSchema;
 use url::Url;
 
 use crate::engine_data::EngineData;
-use crate::expressions::{Scalar, StructData};
+use crate::expressions::{null_lit, Expression, Scalar, StructData};
 use crate::schema::derive_macro_utils::ToDataType;
-use crate::schema::DataType;
-use crate::Version;
+use crate::schema::{DataType, StructType};
+use crate::{KernelError, KernelResult, Version};
 
 /// Field names in the [`ContentTreeNodeEntry`] schema.
 pub(crate) const CONTENT_TYPE: &str = "contentType";
@@ -39,9 +40,10 @@ pub(crate) const EQUALITY_IDS: &str = "equalityIds";
 pub(crate) const FORMAT_VERSION: &str = "formatVersion";
 pub(crate) const TAGS: &str = "tags";
 
-/// Field names within the [`TrackingInfo`] sub-struct that the write path populates.
+/// Field names within the [`TrackingInfo`] sub-struct, shared by the AMT write and read paths.
 pub(crate) const TRACKING_STATUS: &str = "status";
 pub(crate) const TRACKING_SNAPSHOT_ID: &str = "snapshotId";
+pub(crate) const DV_SNAPSHOT_ID: &str = "dvSnapshotId";
 pub(crate) const SEQUENCE_NUMBER: &str = "sequenceNumber";
 pub(crate) const FILE_SEQUENCE_NUMBER: &str = "fileSequenceNumber";
 pub(crate) const FIRST_ROW_ID: &str = "firstRowId";
@@ -53,7 +55,7 @@ pub(crate) const TIGHT_BOUNDS: &str = "tight_bounds";
 pub(crate) const VALUE_COUNT: &str = "value_count";
 pub(crate) const NULL_VALUE_COUNT: &str = "null_value_count";
 pub(crate) const NAN_VALUE_COUNT: &str = "nan_value_count";
-pub(crate) const AVG_VALUE_SIZE_IN_BYTES: &str = "avg_value_size_in_bytes";
+pub(crate) const TOTAL_BYTES: &str = "total_bytes";
 
 /// In memory reprsentation of a node in the Adaptive Metadata Tree (AMT) format.
 ///
@@ -111,7 +113,9 @@ pub struct TrackingInfo {
     #[field_id = 1]
     pub snapshot_id: Option<i64>,
 
-    /// Snapshot ID in which this entry's deletion vector last changed.
+    /// Snapshot ID in which this entry's deletion vector last changed. May predate this entry's
+    /// own snapshot for a carried-forward entry, so it can be set on any live status, not just
+    /// `Modified`.
     #[field_id = 5]
     pub(crate) dv_snapshot_id: Option<i64>,
 
@@ -254,6 +258,22 @@ pub enum DataContentType {
     DeleteManifest = 4, // kept for backwards compat reading only
 }
 
+impl DataContentType {
+    /// Maps the on-disk integer representation to the enum, erroring on unknown values.
+    pub(crate) fn try_from_repr(value: i32) -> KernelResult<Self> {
+        match value {
+            0 => Ok(Self::Data),
+            1 => Ok(Self::PositionDeletes),
+            2 => Ok(Self::EqualityDeletes),
+            3 => Ok(Self::DataManifest),
+            4 => Ok(Self::DeleteManifest),
+            other => Err(KernelError::generic(format!(
+                "Invalid AMT content type value: {other}"
+            ))),
+        }
+    }
+}
+
 impl ToDataType for DataContentType {
     fn to_data_type() -> DataType {
         DataType::INTEGER
@@ -281,12 +301,19 @@ impl ToDataType for DataFileFormat {
     }
 }
 
+impl DataFileFormat {
+    /// The on-disk name of this format.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Parquet => "parquet",
+            Self::Puffin => "puffin",
+        }
+    }
+}
+
 impl From<DataFileFormat> for Scalar {
     fn from(value: DataFileFormat) -> Self {
-        match value {
-            DataFileFormat::Parquet => Scalar::String("parquet".to_string()),
-            DataFileFormat::Puffin => Scalar::String("puffin".to_string()),
-        }
+        Scalar::String(value.name().to_string())
     }
 }
 
@@ -296,6 +323,29 @@ pub enum TrackingStatus {
     Added = 1,
     Deleted = 2,
     Replaced = 3,
+    Modified = 4,
+}
+
+impl TrackingStatus {
+    /// Maps the on-disk integer representation to the enum, erroring on unknown values.
+    pub(crate) fn try_from_repr(value: i32) -> KernelResult<Self> {
+        match value {
+            0 => Ok(Self::Existing),
+            1 => Ok(Self::Added),
+            2 => Ok(Self::Deleted),
+            3 => Ok(Self::Replaced),
+            4 => Ok(Self::Modified),
+            other => Err(KernelError::generic(format!(
+                "Invalid AMT tracking status value: {other}"
+            ))),
+        }
+    }
+
+    /// Whether this entry contributes rows to reads. Live entries (`Existing`, `Added`,
+    /// `Modified`) are surfaced as `Add` actions; not-live entries (`Deleted`, `Replaced`) are not.
+    pub(crate) fn is_live(self) -> bool {
+        self == Self::Existing || self == Self::Added || self == Self::Modified
+    }
 }
 
 impl ToDataType for TrackingStatus {
@@ -353,10 +403,97 @@ pub(crate) struct ManifestInfo {
     pub(crate) dv_cardinality: Option<i64>,
 }
 
+// === Helpers ===
+
+/// Builds a struct expression matching `schema` field-for-field. `project` supplies the expression
+/// for a named field; an unmatched nullable field (one returning `None`) becomes a typed null
+/// literal, so the result matches the schema in field order and type.
+///
+/// # Errors
+/// Returns an error if a non-nullable field has no projection: falling back to a typed null there
+/// would silently emit a null in a non-nullable column.
+fn struct_expr_from_schema(
+    schema: &StructType,
+    project: impl Fn(&str) -> Option<Expression>,
+) -> KernelResult<Expression> {
+    let fields = schema
+        .fields()
+        .map(|field| match project(field.name().as_str()) {
+            Some(expr) => Ok(expr),
+            None if field.is_nullable() => Ok(null_lit(field.data_type().clone())),
+            None => Err(KernelError::generic(format!(
+                "struct_expr_from_schema: no projection for required field '{}'",
+                field.name()
+            ))),
+        })
+        .collect::<KernelResult<Vec<_>>>()?;
+    Ok(Expression::struct_from(fields))
+}
+
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
-    use crate::schema::{ColumnMetadataKey, MetadataValue, ToSchema};
+    use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, ToSchema};
+    use crate::unit_test_utils::assert_result_error_with_message;
+
+    #[test]
+    fn struct_expr_from_schema_errors_on_missing_required_field() {
+        let schema = StructType::new_unchecked([StructField::not_null("req", DataType::INTEGER)]);
+        assert_result_error_with_message(struct_expr_from_schema(&schema, |_| None), "req");
+    }
+
+    #[test]
+    fn struct_expr_from_schema_fills_missing_nullable_field_with_typed_null() {
+        let schema = StructType::new_unchecked([StructField::nullable("opt", DataType::INTEGER)]);
+        let expr = struct_expr_from_schema(&schema, |_| None).unwrap();
+        assert_eq!(expr, Expression::struct_from([null_lit(DataType::INTEGER)]));
+    }
+
+    #[rstest]
+    #[case(0, TrackingStatus::Existing)]
+    #[case(1, TrackingStatus::Added)]
+    #[case(2, TrackingStatus::Deleted)]
+    #[case(3, TrackingStatus::Replaced)]
+    #[case(4, TrackingStatus::Modified)]
+    fn tracking_status_try_from_repr_roundtrips(
+        #[case] repr: i32,
+        #[case] expected: TrackingStatus,
+    ) {
+        assert_eq!(TrackingStatus::try_from_repr(repr).unwrap(), expected);
+        assert_eq!(expected as i32, repr);
+    }
+
+    #[rstest]
+    #[case(5)]
+    #[case(-1)]
+    #[case(i32::MAX)]
+    fn tracking_status_try_from_repr_rejects_unknown(#[case] repr: i32) {
+        assert!(TrackingStatus::try_from_repr(repr).is_err());
+    }
+
+    #[rstest]
+    #[case(0, DataContentType::Data)]
+    #[case(1, DataContentType::PositionDeletes)]
+    #[case(2, DataContentType::EqualityDeletes)]
+    #[case(3, DataContentType::DataManifest)]
+    #[case(4, DataContentType::DeleteManifest)]
+    fn data_content_type_try_from_repr_roundtrips(
+        #[case] repr: i32,
+        #[case] expected: DataContentType,
+    ) {
+        assert_eq!(DataContentType::try_from_repr(repr).unwrap(), expected);
+        assert_eq!(expected as i32, repr);
+    }
+
+    #[rstest]
+    #[case(5)]
+    #[case(-1)]
+    #[case(i32::MAX)]
+    fn data_content_type_try_from_repr_rejects_unknown(#[case] repr: i32) {
+        assert!(DataContentType::try_from_repr(repr).is_err());
+    }
 
     /// The `ContentTreeNodeEntry` Parquet field IDs and nullability are a protocol contract. This
     /// pins the name, field ID, and nullability of every field in `to_schema()` so an accidental

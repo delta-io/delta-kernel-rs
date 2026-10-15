@@ -5,7 +5,7 @@ use delta_kernel::engine_data::FilteredEngineData;
 use super::committed::commit_result_to_committed_handle;
 use super::*;
 
-/// A handle for an existing-table transaction (`Transaction<ExistingTable>`).
+/// A handle for an update-table transaction (`Transaction<UpdateTable>`).
 ///
 /// Returned by an update-table builder's build function. Supports all transaction
 /// operations including existing-table-only operations like blind append and file removal.

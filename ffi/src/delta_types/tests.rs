@@ -352,6 +352,13 @@ fn typed_components_construct_rich_snapshot_state() {
     FfiDeletionVectorStorageType::PersistedAbsolute,
     DeletionVectorStorageType::PersistedAbsolute
 )]
+#[cfg_attr(
+    feature = "adaptive-metadata-in-dev",
+    case::persisted_unencoded_relative(
+        FfiDeletionVectorStorageType::PersistedUnencodedRelative,
+        DeletionVectorStorageType::PersistedUnencodedRelative
+    )
+)]
 fn deletion_vector_storage_type_maps_all_variants(
     #[case] ffi_type: FfiDeletionVectorStorageType,
     #[case] kernel_type: DeletionVectorStorageType,

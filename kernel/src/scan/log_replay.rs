@@ -3,7 +3,9 @@ use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use super::data_skipping::DataSkippingFilter;
 use super::metrics::ScanMetrics;
@@ -17,7 +19,7 @@ use crate::expressions::{
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
-    ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor,
+    ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector,
     ParallelLogReplayProcessor,
 };
 use crate::log_segment::CheckpointReadInfo;
@@ -95,6 +97,9 @@ struct InternalScanState {
     #[serde(default)]
     is_catalog_managed: bool,
     skip_row_transforms: bool,
+    /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
+    #[serde(default)]
+    dv_normalization_root: Option<Url>,
 }
 
 /// Serializable processor state for distributed processing. This can be serialized using the
@@ -152,11 +157,10 @@ pub struct SerializableScanState {
 ///   those derived from projection or filters) are preserved and passed through to the engine,
 ///   which applies them as part of its scan execution logic.
 ///
-/// As an implementation of [`LogReplayProcessor`], [`ScanLogReplayProcessor`] provides the
-/// `process_actions_batch` method, which applies these steps to each batch of log actions and
-/// produces a [`ScanMetadata`] result. This result includes the transformed batch, a selection
-/// vector indicating which rows are valid, and any row-level transformation expressions that need
-/// to be applied to the selected rows.
+/// [`ScanLogReplayProcessor::process_actions_batch_sequential`] applies these steps to each batch
+/// of log actions and produces a [`ScanMetadata`] result. This result includes the transformed
+/// batch, a selection vector indicating which rows are valid, and any row-level transformation
+/// expressions that need to be applied to the selected rows.
 #[allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
 pub struct ScanLogReplayProcessor {
     data_skipping_filter: Option<DataSkippingFilter>,
@@ -401,6 +405,7 @@ impl ScanLogReplayProcessor {
             requested_physical_stats_columns,
             is_catalog_managed,
             skip_row_transforms,
+            dv_normalization_root,
         } = self.state_info.as_ref().clone();
 
         // Extract predicate from PhysicalPredicate
@@ -424,6 +429,7 @@ impl ScanLogReplayProcessor {
             requested_physical_stats_columns,
             is_catalog_managed,
             skip_row_transforms,
+            dv_normalization_root,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state).map_err(|e| {
             KernelError::generic(format!("Failed to serialize internal state: {e}"))
@@ -488,6 +494,7 @@ impl ScanLogReplayProcessor {
             requested_physical_stats_columns: internal_state.requested_physical_stats_columns,
             is_catalog_managed: internal_state.is_catalog_managed,
             skip_row_transforms: internal_state.skip_row_transforms,
+            dv_normalization_root: internal_state.dv_normalization_root,
         });
 
         Self::new_with_seen_files(
@@ -802,6 +809,10 @@ pub(crate) static DEFAULT_ROW_COMMIT_VERSION_NAME: &str = "defaultRowCommitVersi
 pub(crate) static CLUSTERING_PROVIDER_NAME: &str = "clusteringProvider";
 pub(crate) static PARTITION_VALUES_NAME: &str = "partitionValues";
 pub(crate) static SIZE_NAME: &str = "size";
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) static MODIFICATION_TIME_NAME: &str = "modificationTime";
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) static DATA_CHANGE_NAME: &str = "dataChange";
 pub(crate) static TAGS_NAME: &str = "tags";
 pub(crate) static STATS_NAME: &str = "stats";
 pub(crate) static STATS_PARSED_NAME: &str = "stats_parsed";
@@ -1007,21 +1018,19 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
 }
 
 impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
-    type Output = <ScanLogReplayProcessor as LogReplayProcessor>::Output;
+    type Output = ScanMetadata;
 
-    // WARNING: This function performs all the same operations as [`<ScanLogReplayProcessor as
-    // LogReplayProcessor>::process_actions_batch`]! (See trait impl block below) Any changes
-    // performed to this function probably also need to be applied to the other copy of the
-    // function. The copy exists because [`LogReplayProcessor`] requires a `&mut self`, while
-    // [`ParallelLogReplayProcessor`] requires `&self`. Presently, the different in mutabilities
-    // cannot easily be unified.
+    // WARNING: This function performs all the same operations as
+    // [`ScanLogReplayProcessor::process_actions_batch_sequential`]! Any changes performed to this
+    // function probably also need to be applied to the other copy. The copy exists because
+    // parallel processing requires `&self`, while sequential processing requires `&mut self`.
     #[tracing::instrument(
-        name = "scan_log_replay.process_actions_batch",
+        name = "scan_log_replay.process_actions_batch_parallel",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> Result<Self::Output> {
+    fn process_actions_batch_parallel(&self, actions_batch: ActionsBatch) -> Result<Self::Output> {
         let ActionsBatch {
             actions,
             is_log_batch,
@@ -1057,6 +1066,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             Self::ADD_PATH_INDEX,
             Self::ADD_SIZE_INDEX,
             Self::ADD_DV_START_INDEX,
+            self.state_info.dv_normalization_root.clone(),
         )?;
         let (dedup_selection, row_transform_exprs, active_add_file_sizes) = {
             let mut visitor = AddRemoveDedupVisitor::new(
@@ -1107,21 +1117,22 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
     }
 }
 
-impl LogReplayProcessor for ScanLogReplayProcessor {
-    type Output = ScanMetadata;
-
-    // WARNING: This function performs all the same operations as [`<ScanLogReplayProcessor as
-    // ParallelLogReplayProcessor>::process_actions_batch`]! Any changes performed to this function
-    // probably also need to be applied to the other copy. The copy exists because
-    // [`LogReplayProcessor`] requires a `&mut self`, while [`ParallelLogReplayProcessor`] requires
-    // `&self`. Presently, the different in mutabilities cannot easily be unified.
+impl ScanLogReplayProcessor {
+    // WARNING: This function performs all the same operations as
+    // [`<ScanLogReplayProcessor as ParallelLogReplayProcessor>::process_actions_batch_parallel`]!
+    // Any changes performed to this function probably also need to be applied to the other copy.
+    // The copy exists because this method requires `&mut self`, while parallel processing requires
+    // `&self`.
     #[tracing::instrument(
-        name = "scan_log_replay.process_actions_batch",
+        name = "scan_log_replay.process_actions_batch_sequential",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> Result<Self::Output> {
+    pub(crate) fn process_actions_batch_sequential(
+        &mut self,
+        actions_batch: ActionsBatch,
+    ) -> Result<ScanMetadata> {
         let ActionsBatch {
             actions,
             is_log_batch,
@@ -1163,6 +1174,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             Self::REMOVE_PATH_INDEX,
             Self::ADD_DV_START_INDEX,
             Self::REMOVE_DV_START_INDEX,
+            self.state_info.dv_normalization_root.clone(),
         );
         let (dedup_selection, row_transform_exprs, active_add_file_sizes) = {
             let mut visitor = AddRemoveDedupVisitor::new(
@@ -1212,8 +1224,11 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         Ok(scan_metadata)
     }
 
-    fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
-        self.data_skipping_filter.as_ref()
+    fn build_selection_vector(&self, batch: &dyn EngineData) -> Result<Vec<bool>> {
+        match &self.data_skipping_filter {
+            Some(filter) => filter.apply(batch),
+            None => Ok(vec![true; batch.len()]),
+        }
     }
 }
 
@@ -1243,7 +1258,7 @@ pub(crate) fn scan_action_iter(
     impl Iterator<Item = KernelResult<ScanMetadata>>,
     Arc<ScanMetrics>,
 )> {
-    let processor = ScanLogReplayProcessor::new(
+    let mut processor = ScanLogReplayProcessor::new(
         engine,
         state_info,
         checkpoint_info,
@@ -1251,7 +1266,10 @@ pub(crate) fn scan_action_iter(
         partition_values_options,
     )?;
     let metrics = processor.metrics.clone();
-    Ok((processor.process_actions_iter(action_iter), metrics))
+    let action_iter = action_iter
+        .map(move |batch| processor.process_actions_batch_sequential(batch?))
+        .filter_ok(HasSelectionVector::has_selected_rows);
+    Ok((action_iter, metrics))
 }
 
 #[cfg(test)]
@@ -1262,6 +1280,7 @@ mod tests {
     use std::time::Duration;
 
     use rstest::rstest;
+    use url::Url;
 
     use super::{
         get_add_transform_expr, scan_action_iter, InternalScanState, ScanLogReplayProcessor,
@@ -1276,7 +1295,7 @@ mod tests {
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
         IndirectDataSkippingPredicateEvaluator,
     };
-    use crate::log_replay::{ActionsBatch, LogReplayProcessor};
+    use crate::log_replay::ActionsBatch;
     use crate::log_segment::CheckpointReadInfo;
     use crate::metrics::{MetricId, ScanType};
     use crate::scan::state::ScanFile;
@@ -1424,11 +1443,8 @@ mod tests {
         });
 
         // Process one batch; the injected parse error must trigger one successful retry.
-        LogReplayProcessor::process_actions_batch(
-            &mut processor,
-            ActionsBatch::new(add_batch_simple(COMMIT_READ_SCHEMA.clone()), true),
-        )
-        .unwrap();
+        let batch = ActionsBatch::new(add_batch_simple(COMMIT_READ_SCHEMA.clone()), true);
+        processor.process_actions_batch_sequential(batch).unwrap();
 
         // Confirm both attempts ran and their deterministic delays were accumulated in the event.
         assert_eq!(calls.load(Ordering::Relaxed), 2);
@@ -1458,6 +1474,7 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
+            dv_normalization_root: None,
         });
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
@@ -1889,6 +1906,7 @@ mod tests {
                 requested_physical_stats_columns: Vec::new(),
                 is_catalog_managed: false,
                 skip_row_transforms: false,
+                dv_normalization_root: None,
             });
             let checkpoint_info = test_checkpoint_info();
             let processor = ScanLogReplayProcessor::new(
@@ -1926,6 +1944,7 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
+            dv_normalization_root: None,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,
@@ -1959,6 +1978,7 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: true,
             skip_row_transforms: false,
+            dv_normalization_root: None,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,
@@ -1992,6 +2012,7 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: skip,
+            dv_normalization_root: None,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,
@@ -2007,6 +2028,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(deserialized.state_info.skip_row_transforms, skip);
+    }
+
+    fn processor_with_dv_normalization_root(
+        engine: &SyncEngine,
+        dv_normalization_root: Option<Url>,
+    ) -> ScanLogReplayProcessor {
+        let schema: SchemaRef = schema_ref! { nullable "id": INTEGER };
+        let state_info = Arc::new(StateInfo {
+            logical_schema: schema.clone(),
+            physical_schema: schema,
+            physical_predicate: PhysicalPredicate::None,
+            transform_spec: None,
+            column_mapping_mode: ColumnMappingMode::None,
+            physical_stats_schemas: None,
+            physical_partition_schema: None,
+            eligible_physical_stats_columns: HashSet::new(),
+            requested_physical_stats_columns: Vec::new(),
+            is_catalog_managed: false,
+            skip_row_transforms: false,
+            dv_normalization_root,
+        });
+        ScanLogReplayProcessor::new(
+            engine,
+            state_info,
+            test_checkpoint_info(),
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
+        )
+        .unwrap()
+    }
+
+    #[rstest]
+    fn test_serialization_round_trips_dv_normalization_root(
+        #[values(None, Some("s3://bucket/table/"))] root: Option<&str>,
+    ) {
+        let engine = SyncEngine::new();
+        let root = root.map(|r| Url::parse(r).unwrap());
+        let processor = processor_with_dv_normalization_root(&engine, root.clone());
+        let deserialized = ScanLogReplayProcessor::from_serializable_state(
+            &engine,
+            processor.into_serializable_state().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(deserialized.state_info.dv_normalization_root, root);
+    }
+
+    #[test]
+    fn test_deserialize_blob_without_dv_normalization_root_defaults_to_none() {
+        let engine = SyncEngine::new();
+        let root = Url::parse("s3://bucket/table/").unwrap();
+        let mut state = processor_with_dv_normalization_root(&engine, Some(root))
+            .into_serializable_state()
+            .unwrap();
+        let mut blob: serde_json::Value =
+            serde_json::from_slice(&state.internal_state_blob).unwrap();
+        assert!(blob
+            .as_object_mut()
+            .unwrap()
+            .remove("dv_normalization_root")
+            .is_some());
+        state.internal_state_blob = serde_json::to_vec(&blob).unwrap();
+        let deserialized = ScanLogReplayProcessor::from_serializable_state(&engine, state).unwrap();
+        assert_eq!(deserialized.state_info.dv_normalization_root, None);
     }
 
     #[test]
@@ -2043,6 +2127,7 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
+            dv_normalization_root: None,
         };
         let predicate = Arc::new(crate::expressions::column_pred!("id"));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
@@ -2076,6 +2161,7 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
+            dv_normalization_root: None,
         };
         let blob = serde_json::to_string(&invalid_internal_state).unwrap();
         let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();

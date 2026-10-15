@@ -901,6 +901,13 @@ reuses `ScanMetadataArrowResult` with null `transforms`.
 
 ## Write Flow
 
+Rust builders are aliases for `TransactionBuilder<CreateTable>` and
+`TransactionBuilder<UpdateTable>`. Keep their concrete opaque FFI descriptors and explicit
+`create_table_txn_builder_*` / `update_table_txn_builder_*` exports. Shared Rust setters do not imply
+a universal C handle; custom setters are exposed only for their applicable builder descriptor.
+Rust-only builder aliases carry `cbindgen:ignore` so header generation uses the descriptors rather
+than monomorphizing builder state.
+
 ```
 get_default_engine() -> get_snapshot_builder() -> snapshot_builder_build()
   -> new_update_table_txn_builder() -> update_table_txn_builder_with_engine_info()

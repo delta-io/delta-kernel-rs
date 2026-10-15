@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use tracing::{debug, enabled, warn, Level};
+use url::Url;
 
 use crate::actions::NULL_COUNT;
 use crate::expressions::ColumnName;
@@ -136,6 +137,8 @@ pub(crate) struct StateInfo {
     /// so the scan can still describe the transform structurally. Set by
     /// [`ScanBuilder::without_row_transforms`](crate::scan::ScanBuilder::without_row_transforms).
     pub(crate) skip_row_transforms: bool,
+    /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
+    pub(crate) dv_normalization_root: Option<Url>,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -634,6 +637,7 @@ impl StateInfo {
             requested_physical_stats_columns,
             is_catalog_managed: table_configuration.is_catalog_managed(),
             skip_row_transforms: false,
+            dv_normalization_root: table_configuration.dv_normalization_root(),
         })
     }
 

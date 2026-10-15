@@ -189,6 +189,11 @@ pub(crate) static CHECKPOINT_ACTION_FIELD: LazyLock<StructField> = LazyLock::new
     )
 });
 
+/// The `lastManifestCommit` field as nested in commitInfo actions and CRC files.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) static LAST_MANIFEST_COMMIT_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable("lastManifestCommit", LastManifestCommit::to_schema()));
+
 /// The `checkpoint` action field, present only under the `adaptive-metadata-in-dev` feature;
 /// otherwise an empty iterator.
 fn checkpoint_action_field() -> impl IntoIterator<Item = &'static StructField> {
@@ -1411,9 +1416,9 @@ impl LastManifestCommit {
     /// Builds a reference to the manifest commit at `version` whose checkpoint action's content
     /// root reflects `content_root_version`.
     ///
-    /// Enforces the adaptiveMetadata invariant that the referenced content root version never
-    /// exceeds the manifest commit version, so an invalid pair can never be constructed. Mirrors
-    /// the validation on `CheckpointAction`.
+    /// Enforces the adaptiveMetadata invariants that both versions are non-negative and the
+    /// referenced content root version never exceeds the manifest commit version, so an invalid
+    /// pair can never be constructed. Mirrors the validation on `CheckpointAction`.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn new(version: i64, content_root_version: i64) -> Result<Self> {
@@ -1425,10 +1430,18 @@ impl LastManifestCommit {
         Ok(last_manifest_commit)
     }
 
-    /// Enforce the adaptiveMetadata invariant that `contentRootVersion` never exceeds the manifest
-    /// commit `version`. Because [`LastManifestCommit`] derives [`Deserialize`], values parsed from
-    /// JSON bypass [`Self::new`], so callers that deserialize must invoke this explicitly.
+    /// Enforce the adaptiveMetadata invariants that `contentRootVersion` is non-negative and never
+    /// exceeds the manifest commit `version`. Because [`LastManifestCommit`] derives
+    /// [`Deserialize`], values parsed from JSON bypass [`Self::new`], so callers that deserialize
+    /// must invoke this explicitly.
     pub(crate) fn validate(&self) -> KernelResult<()> {
+        require!(
+            self.content_root_version >= 0,
+            KernelError::generic(format!(
+                "lastManifestCommit contentRootVersion {} must be non-negative",
+                self.content_root_version
+            ))
+        );
         require!(
             self.content_root_version <= self.version,
             KernelError::generic(format!(

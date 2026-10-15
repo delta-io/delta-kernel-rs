@@ -9,11 +9,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 use url::Url;
 use uuid::Uuid;
 
 use super::state::TransactionBuilderState;
+use super::TransactionBuilder;
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
@@ -28,11 +30,12 @@ use crate::schema::{
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
-    find_max_column_id_in_schema, get_any_level_column_physical_name,
-    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz,
-    strip_stray_column_mapping_metadata, validate_iceberg_compat_if_needed, ColumnMappingMode,
-    IcebergCompatValidationContext, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
-    SET_TABLE_FEATURE_SUPPORTED_VALUE, V2_VALIDATOR,
+    ensure_domain_metadata_dependency, find_max_column_id_in_schema,
+    get_any_level_column_physical_name, get_column_mapping_mode_from_properties,
+    schema_contains_timestamp_ntz, strip_stray_column_mapping_metadata,
+    validate_iceberg_compat_if_needed, ColumnMappingMode, IcebergCompatValidationContext,
+    TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    V2_VALIDATOR,
 };
 use crate::table_properties::{
     strip_check_constraint_prefix, CheckpointPolicy, TableProperties, APPEND_ONLY,
@@ -48,9 +51,9 @@ use crate::table_properties::{
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
-use crate::transaction::{CommitOperation, Transaction};
+use crate::transaction::{CommitOperation, CreateTable, ExecutionMode, Transaction};
 use crate::utils::{current_time_ms, try_parse_uri, PhantomType};
-use crate::{Engine, EngineData, KernelError, KernelResult, Result, StorageHandler};
+use crate::{Engine, KernelError, KernelResult, Result, StorageHandler};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
 ///
@@ -165,9 +168,9 @@ fn ensure_table_does_not_exist(
             // - Some(Err(other)) means real error -> propagate
             // - None means empty iterator -> OK for new table
             match files.next() {
-                Some(Ok(_)) => Err(KernelError::generic(format!(
-                    "Table already exists at path: {table_path}"
-                ))),
+                Some(Ok(_)) => Err(KernelError::TableAlreadyExistsAtPath(
+                    table_path.to_string(),
+                )),
                 Some(Err(KernelError::FileNotFound(_))) | None => {
                     // Path doesn't exist or empty - OK for new table
                     Ok(())
@@ -210,8 +213,8 @@ impl ValidatedTableProperties {
 
 /// Test-only helper for clustering support during table creation.
 ///
-/// Validates clustering columns, adds the `DomainMetadata` and `ClusteredTable` features
-/// directly, and creates the domain metadata action.
+/// Validates clustering columns, selects `ClusteredTable` and its `DomainMetadata` dependency,
+/// and creates the domain metadata action.
 #[cfg(test)]
 fn validate_clustering_and_make_domain_metadata(
     logical_schema: &SchemaRef,
@@ -221,17 +224,12 @@ fn validate_clustering_and_make_domain_metadata(
 ) -> KernelResult<DomainMetadata> {
     validate_clustering_columns(logical_schema, logical_columns)?;
 
-    // Add required features
-    add_feature_to_lists(
-        TableFeature::DomainMetadata,
-        reader_features,
-        writer_features,
-    );
     add_feature_to_lists(
         TableFeature::ClusteredTable,
         reader_features,
         writer_features,
     );
+    ensure_domain_metadata_dependency(reader_features, writer_features);
 
     Ok(create_clustering_domain_metadata(logical_columns))
 }
@@ -316,7 +314,7 @@ fn validate_partition_columns(
 ///
 /// - **None**: Returns defaults (no domain metadata, no clustering/partition columns).
 /// - **Clustered**: Validates clustering columns, resolves to physical names, adds the
-///   `DomainMetadata` and `ClusteredTable` features, creates clustering domain metadata.
+///   `ClusteredTable` feature, creates clustering domain metadata.
 /// - **Partitioned**: Validates partition columns and stores logical names. No domain metadata or
 ///   special features are needed (partitioning is a core Delta feature).
 fn apply_data_layout(
@@ -342,11 +340,6 @@ fn apply_data_layout(
                 })
                 .try_collect()?;
 
-            add_feature_to_lists(
-                TableFeature::DomainMetadata,
-                &mut validated.reader_features,
-                &mut validated.writer_features,
-            );
             add_feature_to_lists(
                 TableFeature::ClusteredTable,
                 &mut validated.reader_features,
@@ -756,14 +749,6 @@ fn validate_extract_table_features_and_properties(
             )));
         }
 
-        // RowTracking requires DomainMetadata as a dependency
-        if feature == TableFeature::RowTracking {
-            add_feature_to_lists(
-                TableFeature::DomainMetadata,
-                &mut reader_features,
-                &mut writer_features,
-            );
-        }
         // VariantShredding requires VariantType as a dependency
         if feature == TableFeature::VariantShredding {
             add_feature_to_lists(
@@ -806,26 +791,38 @@ fn validate_extract_table_features_and_properties(
 /// If the table build fails, no transaction will be created.
 ///
 /// Created via [`create_table()`](super::super::create_table::create_table).
-pub struct CreateTableTransactionBuilder {
+///
+/// cbindgen:ignore
+pub type CreateTableTransactionBuilder = TransactionBuilder<CreateTable>;
+
+/// Opaque state collected by create-table-specific builder setters.
+#[doc(hidden)]
+pub struct CreateTableBuilderState {
     path: String,
     schema: SchemaRef,
     table_properties: HashMap<String, String>,
     data_layout: DataLayout,
-    state: TransactionBuilderState,
 }
 
-impl CreateTableTransactionBuilder {
+impl TransactionBuilder<CreateTable> {
     /// Creates a new CreateTableTransactionBuilder.
     ///
     /// This is typically called via
     /// [`create_table()`](super::super::create_table::create_table) rather than directly.
-    pub fn new(path: impl AsRef<str>, schema: SchemaRef, engine_info: impl Into<String>) -> Self {
+    #[internal_api]
+    pub(crate) fn new(
+        path: impl AsRef<str>,
+        schema: SchemaRef,
+        engine_info: impl Into<String>,
+    ) -> Self {
         Self {
-            path: path.as_ref().to_string(),
-            schema,
-            table_properties: HashMap::new(),
-            data_layout: DataLayout::None,
-            state: TransactionBuilderState::for_create_table(engine_info.into()),
+            common_state: TransactionBuilderState::for_create_table(engine_info.into()),
+            local_state: CreateTableBuilderState {
+                path: path.as_ref().to_string(),
+                schema,
+                table_properties: HashMap::new(),
+                data_layout: DataLayout::None,
+            },
         }
     }
 
@@ -861,13 +858,15 @@ impl CreateTableTransactionBuilder {
     /// ```
     ///
     /// [`build()`]: CreateTableTransactionBuilder::build
-    pub fn with_table_properties<I, K, V>(mut self, properties: I) -> Self
+    #[internal_api]
+    pub(crate) fn with_table_properties<I, K, V>(mut self, properties: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
         K: Into<String>,
         V: Into<String>,
     {
-        self.table_properties
+        self.local_state
+            .table_properties
             .extend(properties.into_iter().map(|(k, v)| (k.into(), v.into())));
         self
     }
@@ -908,18 +907,9 @@ impl CreateTableTransactionBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn with_data_layout(mut self, layout: DataLayout) -> Self {
-        self.data_layout = layout;
-        self
-    }
-
-    /// Sets whether files added during creation represent a logical data change.
-    ///
-    /// `data_change` defaults to `true`. `false` indicates no logical change to the table's data.
-    /// Returns the updated builder. Consecutive calls replace the previous value. The configured
-    /// value is preserved through commit, including when no files are added.
-    pub fn with_data_change(mut self, data_change: bool) -> Self {
-        self.state.data_change = Some(data_change);
+    #[internal_api]
+    pub(crate) fn with_data_layout(mut self, layout: DataLayout) -> Self {
+        self.local_state.data_layout = layout;
         self
     }
 
@@ -927,81 +917,7 @@ impl CreateTableTransactionBuilder {
     ///
     /// The caller must ensure that AddFile paths are unique. Other validations remain enabled.
     pub fn without_dedup_validation(mut self) -> Self {
-        self.state.skip_dedup_validation = true;
-        self
-    }
-
-    /// Adds an application transaction identifier to emit as a `txn` action.
-    ///
-    /// The action's `lastUpdated` value uses the transaction's commit timestamp.
-    /// An application id may occur only once. Duplicate ids are rejected by [`build`](Self::build).
-    pub fn with_transaction_id(mut self, app_id: impl Into<String>, version: i64) -> Self {
-        self.state = self.state.with_transaction_id(app_id, version);
-        self
-    }
-
-    /// Adds user-controlled domain metadata.
-    ///
-    /// Each domain may occur only once. Duplicates are rejected by [`build`](Self::build).
-    pub fn with_domain_metadata(
-        mut self,
-        domain: impl Into<String>,
-        configuration: impl Into<String>,
-    ) -> Self {
-        self.state = self.state.with_domain_metadata(domain, configuration);
-        self
-    }
-
-    /// Attach an opaque, caller-supplied correlation id for joining the create-table commit's
-    /// metric events to the caller's own request or operation id. An empty id is treated as unset.
-    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
-        self.state = self.state.with_correlation_id(correlation_id);
-        self
-    }
-
-    /// Replaces the operation parameters recorded in `commitInfo`.
-    ///
-    /// Values must already be stringified as expected in table history. `None` writes a null map
-    /// value. This map replaces rather than merges with an earlier map, and the last value wins
-    /// when a key occurs more than once. Dedicated parameters take precedence over a same-named
-    /// nested field supplied by [`with_commit_info`](Self::with_commit_info).
-    pub fn with_operation_parameters<I, K, V>(mut self, parameters: I) -> Self
-    where
-        I: IntoIterator<Item = (K, Option<V>)>,
-        K: Into<String>,
-        V: Into<String>,
-    {
-        self.state = self.state.with_operation_parameters(parameters);
-        self
-    }
-
-    /// Replaces the operation metrics recorded in `commitInfo`.
-    ///
-    /// Values must already be stringified as expected in table history. `None` writes a null map
-    /// value. This map replaces rather than merges with an earlier map, and the last value wins
-    /// when a key occurs more than once. Metrics supplied to the built transaction replace these
-    /// values. Dedicated metrics take precedence over a same-named nested field supplied by
-    /// [`with_commit_info`](Self::with_commit_info).
-    pub fn with_operation_metrics<I, K, V>(mut self, metrics: I) -> Self
-    where
-        I: IntoIterator<Item = (K, Option<V>)>,
-        K: Into<String>,
-        V: Into<String>,
-    {
-        self.state = self.state.with_operation_metrics(metrics);
-        self
-    }
-
-    /// Supplies one arbitrary connector-provided `commitInfo` row.
-    ///
-    /// Consecutive calls replace the previous row. Kernel-owned fields and dedicated operation
-    /// parameter or metric maps take precedence over same-named fields in this row.
-    pub fn with_commit_info(
-        mut self,
-        commit_info: Box<dyn EngineData>,
-        commit_info_schema: SchemaRef,
-    ) -> Self {
-        self.state = self.state.with_commit_info(commit_info, commit_info_schema);
+        self.common_state.skip_dedup_validation = true;
         self
     }
 
@@ -1010,6 +926,8 @@ impl CreateTableTransactionBuilder {
     /// The returned [`CreateTableTransaction`] only exposes operations that are valid for
     /// table creation. Operations like removing files, removing domain metadata, or updating
     /// deletion vectors are not available, preventing misuse at compile time.
+    ///
+    /// If [`with_data_change`](Self::with_data_change) is not set, creation defaults to `true`.
     ///
     /// This method performs validation:
     /// - Checks that the table path is valid
@@ -1040,26 +958,28 @@ impl CreateTableTransactionBuilder {
     /// - Unsupported delta properties or feature flags are specified
     /// - Connector commit information does not contain exactly one row
     /// - An application transaction identifier occurs more than once
-    pub fn build(
+    #[internal_api]
+    pub(crate) fn build(
         self,
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
     ) -> Result<CreateTableTransaction> {
-        self.state.validate()?;
+        self.common_state.validate()?;
 
         // Validate path
-        let table_url = try_parse_uri(&self.path)?;
+        let table_url = try_parse_uri(&self.local_state.path)?;
 
         // Check if table already exists by looking for _delta_log directory
         let delta_log_url = table_url.join("_delta_log/")?;
         let storage = engine.storage_handler();
-        ensure_table_does_not_exist(storage.as_ref(), &delta_log_url, &self.path)?;
+        ensure_table_does_not_exist(storage.as_ref(), &delta_log_url, &self.local_state.path)?;
 
         // Validate and transform table properties
         // - Extracts and validates feature signals
         // - Removes feature signals from properties (they shouldn't be stored in metadata)
         // - Returns reader/writer features to add to protocol
-        let mut validated = validate_extract_table_features_and_properties(self.table_properties)?;
+        let mut validated =
+            validate_extract_table_features_and_properties(self.local_state.table_properties)?;
 
         // When IcebergCompatV2 is enabled, fill in / validate required dependencies before column
         // mapping is applied so the CM mode is in place. This must run before
@@ -1076,7 +996,7 @@ impl CreateTableTransactionBuilder {
 
         // Apply column mapping if mode is name or id (must happen BEFORE data layout)
         let (mut effective_schema, column_mapping_mode) =
-            maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated)?;
+            maybe_apply_column_mapping_for_table_create(&self.local_state.schema, &mut validated)?;
 
         // Validate schema (column names, duplicates, no `delta.invariants` metadata).
         // Empty schemas are intentionally allowed.
@@ -1100,7 +1020,7 @@ impl CreateTableTransactionBuilder {
         // Validate data layout and resolve column names (physical for clustering, logical
         // for partitioning). Adds required table features for clustering.
         let data_layout_result = apply_data_layout(
-            &self.data_layout,
+            &self.local_state.data_layout,
             &effective_schema,
             column_mapping_mode,
             &mut validated,
@@ -1123,6 +1043,10 @@ impl CreateTableTransactionBuilder {
         // Set materialized row tracking column names when row tracking is enabled.
         maybe_set_materialized_row_tracking_column_name_properties(&mut validated);
 
+        ensure_domain_metadata_dependency(
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
         // Create Protocol action with table features support
         let protocol =
             Protocol::try_new_modern(validated.reader_features, validated.writer_features)?;
@@ -1153,18 +1077,18 @@ impl CreateTableTransactionBuilder {
             committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
-            self.state,
+            self.common_state,
         )
     }
 }
 
-fn try_new_create_table(
+fn try_new_create_table<MODE: ExecutionMode>(
     effective_table_config: TableConfiguration,
     committer: Box<dyn Committer>,
     system_domain_metadata: Vec<DomainMetadata>,
     clustering_columns: Option<Vec<ColumnName>>,
-    state: TransactionBuilderState,
-) -> KernelResult<CreateTableTransaction> {
+    common_state: TransactionBuilderState,
+) -> KernelResult<Transaction<CreateTable, MODE>> {
     validate_iceberg_compat_if_needed(
         &effective_table_config,
         &V2_VALIDATOR,
@@ -1176,7 +1100,7 @@ fn try_new_create_table(
         path = %effective_table_config.table_root(),
         operation = "CREATE",
     );
-    let transaction = state.apply_to_transaction(Transaction {
+    let transaction = common_state.apply_to_transaction(Transaction {
         span,
         operation_id: MetricId::new(),
         correlation_id: None,
@@ -1189,8 +1113,7 @@ fn try_new_create_table(
         operation_parameters: None,
         operation_metrics: None,
         engine_info: None,
-        add_files_metadata: vec![],
-        remove_files_metadata: vec![],
+        staged_data_changes: Default::default(),
         dedup_validation_enabled: true,
         set_transactions: vec![],
         commit_timestamp: current_time_ms()?,
@@ -1204,8 +1127,6 @@ fn try_new_create_table(
         row_tracking_preservation_acknowledged: false,
         engine_commit_info: None,
         is_blind_append: false,
-        dv_matched_files: vec![],
-        num_dv_updates: 0,
         #[cfg(feature = "adaptive-metadata-in-dev")]
         manifest_write: None,
         physical_clustering_columns: clustering_columns,
@@ -1256,9 +1177,12 @@ mod tests {
         let builder =
             CreateTableTransactionBuilder::new("/path/to/table", schema.clone(), "TestApp/1.0");
 
-        assert_eq!(builder.path, "/path/to/table");
-        assert_eq!(builder.state.engine_info.as_deref(), Some("TestApp/1.0"));
-        assert!(builder.table_properties.is_empty());
+        assert_eq!(builder.local_state.path, "/path/to/table");
+        assert_eq!(
+            builder.common_state.engine_info.as_deref(),
+            Some("TestApp/1.0")
+        );
+        assert!(builder.local_state.table_properties.is_empty());
     }
 
     #[rstest]
@@ -1441,7 +1365,7 @@ mod tests {
             "TestApp/1.0",
         );
 
-        assert_eq!(builder.path, "/path/to/table/nested");
+        assert_eq!(builder.local_state.path, "/path/to/table/nested");
     }
 
     #[test]
@@ -1452,7 +1376,7 @@ mod tests {
             .with_table_properties([("key1", "value1")]);
 
         assert_eq!(
-            builder.table_properties.get("key1"),
+            builder.local_state.table_properties.get("key1"),
             Some(&"value1".to_string())
         );
     }
@@ -1466,11 +1390,11 @@ mod tests {
             .with_table_properties([("key2", "value2")]);
 
         assert_eq!(
-            builder.table_properties.get("key1"),
+            builder.local_state.table_properties.get("key1"),
             Some(&"value1".to_string())
         );
         assert_eq!(
-            builder.table_properties.get("key2"),
+            builder.local_state.table_properties.get("key2"),
             Some(&"value2".to_string())
         );
     }
@@ -1772,8 +1696,14 @@ mod tests {
         let builder = CreateTableTransactionBuilder::new("/path/to/table", schema, "TestApp/1.0")
             .with_data_layout(layout);
 
-        assert_eq!(builder.data_layout.is_clustered(), expect_clustered);
-        assert_eq!(builder.data_layout.is_partitioned(), expect_partitioned);
+        assert_eq!(
+            builder.local_state.data_layout.is_clustered(),
+            expect_clustered
+        );
+        assert_eq!(
+            builder.local_state.data_layout.is_partitioned(),
+            expect_partitioned
+        );
     }
 
     #[rstest::rstest]
@@ -2013,7 +1943,7 @@ mod tests {
         has_domain_metadata: true,
         has_clustering_columns: true,
         expected_partition_columns: None,
-        expected_writer_features: vec![TableFeature::DomainMetadata, TableFeature::ClusteredTable],
+        expected_writer_features: vec![TableFeature::ClusteredTable],
     })]
     #[case::partitioned_single(DataLayoutExpectation {
         layout: DataLayout::partitioned(["date"]),
@@ -2218,9 +2148,6 @@ mod tests {
         );
     }
 
-    /// Verifies that both activation paths add `RowTracking` and `DomainMetadata` to
-    /// `writer_features`. For the feature-signal path, `delta.enableRowTracking` must NOT
-    /// be present in the properties (signal grants support, not enablement).
     #[rstest::rstest]
     #[case::enablement_property(
         HashMap::from([(ENABLE_ROW_TRACKING.to_string(), "true".to_string())]),
@@ -2230,7 +2157,7 @@ mod tests {
         HashMap::from([("delta.feature.rowTracking".to_string(), "supported".to_string())]),
         false, // enablement property is NOT set
     )]
-    fn test_row_tracking_activation_adds_required_features(
+    fn test_row_tracking_activation_selects_feature(
         #[case] properties: HashMap<String, String>,
         #[case] expect_enablement_property: bool,
     ) {
@@ -2244,10 +2171,10 @@ mod tests {
             "Expected RowTracking in writer_features"
         );
         assert!(
-            validated
+            !validated
                 .writer_features
                 .contains(&TableFeature::DomainMetadata),
-            "Expected DomainMetadata in writer_features"
+            "Feature selection must leave domain dependency resolution to build"
         );
         assert_eq!(
             validated.properties.contains_key(ENABLE_ROW_TRACKING),
@@ -2315,7 +2242,7 @@ mod tests {
     }
 
     /// V3 create-table flow with the same schema for minimum and maximum feature sets.
-    /// Validates final features, CM id assignments, and nested-id JSON contents.
+    /// Validates selected features, CM id assignments, and nested-id JSON contents.
     #[rstest]
     #[case::v3_only(
         /* extra_props */ &[],
@@ -2323,7 +2250,6 @@ mod tests {
             TableFeature::IcebergCompatV3,
             TableFeature::ColumnMapping,
             TableFeature::RowTracking,
-            TableFeature::DomainMetadata,
         ],
     )]
     #[case::v3_with_cross_features(
@@ -2338,7 +2264,6 @@ mod tests {
             TableFeature::IcebergCompatV3,
             TableFeature::ColumnMapping,
             TableFeature::RowTracking,
-            TableFeature::DomainMetadata,
             TableFeature::DeletionVectors,
             TableFeature::InCommitTimestamp,
             TableFeature::TypeWidening,

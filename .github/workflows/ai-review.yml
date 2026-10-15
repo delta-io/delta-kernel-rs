@@ -829,9 +829,13 @@ jobs:
           review_marker = os.environ["REVIEW_MARKER"]
           start_marker = f"<!-- AI_REVIEW_START_{review_marker} -->"
           end_marker = f"<!-- AI_REVIEW_END_{review_marker} -->"
-          inline_instructions = ""
+          output_contract = (
+              f"Begin your response with the exact marker {start_marker} on its own "
+              f"line, then the review. End with the exact marker {end_marker} on its "
+              "own line."
+          )
           if output_mode == "inline":
-              inline_instructions = inline_prompt_instructions(review_marker)
+              output_contract = inline_prompt_instructions(review_marker)
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
           history_path = pathlib.Path("/tmp/pr_history.json")
           history_document = json.loads(history_path.read_text())
@@ -940,9 +944,8 @@ jobs:
 
           IMPORTANT: your output is published verbatim to the selected review
           destination. Output ONLY the final consolidated review, with no
-          narration or status updates. Begin your response with the exact marker
-          {start_marker} on its own line, then the review. End with the exact
-          marker {end_marker} on its own line.{inline_instructions}
+          narration or status updates.
+          {output_contract}
 
           Track every dispatched reviewer by name. An empty inbox does not
           prove that all in-flight reviewers have completed. Do not emit a

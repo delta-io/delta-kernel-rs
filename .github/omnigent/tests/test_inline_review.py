@@ -149,6 +149,54 @@ class InlineReviewTest(unittest.TestCase):
         self.assertIn(self.inline_review._FINDING_ID.pattern, prompt)
         for side in self.inline_review.INLINE_FINDING_SIDES:
             self.assertIn(side, prompt)
+        normalized_prompt = " ".join(prompt.split())
+        self.assertIn(
+            "For a completed review, use this complete response layout",
+            normalized_prompt,
+        )
+        self.assertIn(
+            "For a completed review, the outer review end marker must be the final "
+            "line of your response.",
+            normalized_prompt,
+        )
+
+    def test_inline_prompt_template_round_trips_through_publication_parsers(self) -> None:
+        marker = "a" * 32
+        prompt = self.inline_review.inline_prompt_instructions(marker)
+
+        body = self.review_publish.extract_marked_review(prompt, marker)
+        review, findings = self.inline_review.extract_inline_findings(body, marker)
+
+        self.assertIn("human-readable review", review)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["id"], "Nit1")
+        self.assertNotIn("AI_REVIEW_INLINE_", review)
+
+    def test_inline_publication_requires_findings_inside_review_markers(self) -> None:
+        marker = "a" * 32
+        start = f"<!-- AI_REVIEW_START_{marker} -->"
+        end = f"<!-- AI_REVIEW_END_{marker} -->"
+        inline_block = (
+            f"<!-- AI_REVIEW_INLINE_START_{marker} -->\n"
+            '{"findings":[]}\n'
+            f"<!-- AI_REVIEW_INLINE_END_{marker} -->"
+        )
+        outputs = (
+            ("inside", f"{start}\nReview\n{inline_block}\n{end}"),
+            ("before", f"{inline_block}\n{start}\nReview\n{end}"),
+            ("after", f"{start}\nReview\n{end}\n{inline_block}"),
+        )
+
+        for position, raw in outputs:
+            with self.subTest(position=position):
+                body = self.review_publish.extract_marked_review(raw, marker)
+                if position == "inside":
+                    review, findings = self.inline_review.extract_inline_findings(body, marker)
+                    self.assertEqual(review, "Review")
+                    self.assertEqual(findings, [])
+                else:
+                    with self.assertRaisesRegex(ValueError, "one location block"):
+                        self.inline_review.extract_inline_findings(body, marker)
 
     def test_reviewer_contract_matches_configured_prompt(self) -> None:
         reviewer_dir = Path(__file__).parents[1] / "reviewer"

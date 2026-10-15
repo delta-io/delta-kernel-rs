@@ -85,6 +85,14 @@ file listing without re-scanning the table.
 `Snapshot` -> `UpdateTableTransactionBuilder` -> `Transaction` -> (`WriteState` ->
 `BoundWriteContextBuilder` -> `BoundWriteContext`) -> commit
 
+`TransactionBuilder<T>` shares configuration setters across transaction types. The sealed
+`TransactionType` trait selects `T::BuilderState`; each type supplies its own constructors, custom
+setters, and build validation. `UpdateTableTransactionBuilder` aliases
+`TransactionBuilder<UpdateTable>` and builds `Transaction<UpdateTable>`, the default transaction
+type. `CreateTableTransactionBuilder` aliases `TransactionBuilder<CreateTable>` and builds
+`Transaction<CreateTable>`. Schema changes use `UpdateTable`, including the
+`UpdateTableOperation::AlterTable` operation.
+
 Kernel captures table-wide configuration in a transportable `WriteState`. Each writer binds
 partition values and any logical materialized row-tracking columns to create a `BoundWriteContext`
 containing validated partition values, data schemas, statistics columns, and the recommended write

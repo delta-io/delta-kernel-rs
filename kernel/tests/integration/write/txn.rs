@@ -6,13 +6,19 @@ use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::{KernelError, Snapshot};
 use itertools::Itertools;
+use rstest::rstest;
 use serde_json::{json, Deserializer};
-use test_utils::{set_json_value, setup_test_tables};
+use test_utils::{assert_result_error_with_message, set_json_value, setup_test_tables};
 
 use crate::common::write_utils::{get_simple_int_schema, validate_txn_id, ZERO_UUID};
 
+#[rstest]
+#[case::builder(false)]
+#[case::transaction(true)]
 #[tokio::test]
-async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_write_txn_actions(
+    #[case] after_build: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -33,16 +39,35 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             Err(KernelError::InvalidTransactionState(msg)) if msg.contains("app_id app_id1")
         ));
 
-        let txn = snapshot
+        if after_build {
+            let txn = snapshot
+                .clone()
+                .transaction_builder()
+                .with_operation(UpdateTableOperation::Write)
+                .with_transaction_id("app_id1".to_string(), 0)
+                .build(&engine, Box::new(FileSystemCommitter::new()))?
+                .with_transaction_id("app_id1".to_string(), 1);
+            assert_result_error_with_message(txn.commit(&engine), "app_id app_id1");
+        }
+
+        let builder = snapshot
             .transaction_builder()
             .with_operation(UpdateTableOperation::Write)
-            .with_engine_info("default engine")
-            .with_transaction_id("app_id1".to_string(), 1)
-            .with_transaction_id("app_id2".to_string(), 2)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .with_engine_info("default engine");
+        let txn = if after_build {
+            builder
+                .build(&engine, Box::new(FileSystemCommitter::new()))?
+                .with_transaction_id("app_id1".to_string(), 1)
+                .with_transaction_id("app_id2".to_string(), 2)
+        } else {
+            builder
+                .with_transaction_id("app_id1".to_string(), 1)
+                .with_transaction_id("app_id2".to_string(), 2)
+                .build(&engine, Box::new(FileSystemCommitter::new()))?
+        };
 
         // commit!
-        assert!(txn.commit(&engine)?.is_committed());
+        txn.commit(&engine)?.unwrap_committed();
 
         let snapshot = Snapshot::builder_for(table_url.clone())
             .at_version(1)

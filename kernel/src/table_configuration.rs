@@ -879,6 +879,12 @@ impl TableConfiguration {
         &self.table_root
     }
 
+    /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
+    pub(crate) fn dv_normalization_root(&self) -> Option<Url> {
+        self.is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+            .then(|| self.table_root.clone())
+    }
+
     /// The [`Version`] which this [`TableConfiguration`] belongs to.
     #[internal_api]
     pub(crate) fn version(&self) -> Version {
@@ -2148,6 +2154,18 @@ mod test {
             .build();
         assert!(!config.is_feature_supported(&feature));
         assert!(!config.is_feature_enabled(&feature));
+    }
+
+    #[rstest]
+    fn test_dv_normalization_root_is_some_iff_adaptive_metadata_enabled(
+        #[values(false, true)] adaptive_metadata: bool,
+    ) {
+        let features = adaptive_metadata.then_some(TableFeature::AdaptiveMetadataPreview);
+        let config = MockTableConfigurationBuilder::new()
+            .with_protocol(MockProtocolBuilder::new().with_features(features).build())
+            .build();
+        let expected = adaptive_metadata.then(|| config.table_root().clone());
+        assert_eq!(config.dv_normalization_root(), expected);
     }
 
     #[test]

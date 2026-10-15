@@ -38,6 +38,11 @@ schema changes use `update_table_txn_builder_add_column_at` and
 by `committed_transaction_post_commit_snapshot` is independently owned and must be released with
 `free_snapshot`.
 
+The Rust builders share a generic `TransactionBuilder<T>` implementation, but the C API uses
+distinct create-table and update-table handles and function families. Shared setters call the
+common Rust implementation; custom setters remain specific to their transaction type. No generic
+type parameters or builder state cross the C boundary.
+
 ## Building
 
 ### Building Kernel and Headers

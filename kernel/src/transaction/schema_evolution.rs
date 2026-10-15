@@ -197,9 +197,9 @@ pub(crate) fn apply_schema_operations(
                     // <https://github.com/delta-io/delta-kernel-rs/issues/2492>
                     try_assign_flat_column_mapping_info(&field, id)?
                 } else {
-                    // Stray CM metadata on a mapping-disabled table is handled by the AlterTable
-                    // builder, which strips annotations this ALTER newly introduces from the
-                    // evolved schema.
+                    // `evolve_table_config` strips column-mapping annotations introduced into a
+                    // mapping-disabled table whose original schema had none. Existing residual
+                    // annotations are preserved.
                     field
                 };
                 let parent_path = parent.as_ref().map_or(&[][..], ColumnName::path);

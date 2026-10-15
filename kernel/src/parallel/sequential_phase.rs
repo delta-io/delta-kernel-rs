@@ -15,9 +15,10 @@ use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
 use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
-use crate::log_replay::{ActionsBatch, LogReplayProcessor};
+use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
-use crate::scan::COMMIT_READ_SCHEMA;
+use crate::scan::log_replay::ScanLogReplayProcessor;
+use crate::scan::{ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{Engine, FileMeta, KernelError, KernelResultIteratorStatic, Result};
@@ -31,9 +32,6 @@ use crate::{Engine, FileMeta, KernelError, KernelResultIteratorStatic, Result};
 /// After exhaustion, call `finish()` to extract:
 /// - The processor (for serialization and distribution)
 /// - Files (sidecars or multi-part checkpoint parts) for parallel processing
-///
-/// # Type Parameters
-/// - `P`: A [`LogReplayProcessor`] implementation that processes action batches
 ///
 /// # Example
 ///
@@ -66,9 +64,9 @@ use crate::{Engine, FileMeta, KernelError, KernelResultIteratorStatic, Result};
 /// ```
 /// cbindgen:ignore
 #[internal_api]
-pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
+pub(crate) struct SequentialPhase {
     // The processor that will be used to process the action batches
-    processor: P,
+    processor: ScanLogReplayProcessor,
     // Commit action batches, exhausted before the checkpoint manifest
     commit_phase: Option<KernelResultIteratorStatic<ActionsBatch>>,
     // The checkpoint manifest reader that will be used to read the checkpoint manifest files.
@@ -83,14 +81,17 @@ pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
 /// Result of sequential log replay processing.
 /// cbindgen:ignore
 #[internal_api]
-pub(crate) enum AfterSequential<P: LogReplayProcessor> {
+pub(crate) enum AfterSequential {
     /// All processing complete sequentially - no parallel phase needed.
-    Done(P),
+    Done(ScanLogReplayProcessor),
     /// Parallel phase needed - distribute files for parallel processing.
-    Parallel { processor: P, files: Vec<FileMeta> },
+    Parallel {
+        processor: ScanLogReplayProcessor,
+        files: Vec<FileMeta>,
+    },
 }
 
-impl<P: LogReplayProcessor> SequentialPhase<P> {
+impl SequentialPhase {
     /// Create a new sequential phase log replay.
     ///
     /// # Parameters
@@ -100,7 +101,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     /// - `checkpoint_read_schema`: Schema for checkpoint manifests and leaf files
     #[internal_api]
     pub(crate) fn try_new(
-        processor: P,
+        processor: ScanLogReplayProcessor,
         log_segment: &LogSegment,
         engine: Arc<dyn Engine>,
         checkpoint_read_schema: SchemaRef,
@@ -148,7 +149,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     /// # Errors
     /// Returns an error if called before iterator exhaustion.
     #[internal_api]
-    pub(crate) fn finish(self) -> Result<AfterSequential<P>> {
+    pub(crate) fn finish(self) -> Result<AfterSequential> {
         if !self.is_finished {
             return Err(KernelError::generic(
                 "Must exhaust iterator before calling finish()",
@@ -182,8 +183,8 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     }
 }
 
-impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
-    type Item = Result<P::Output>;
+impl Iterator for SequentialPhase {
+    type Item = Result<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let next = self
@@ -200,7 +201,7 @@ impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
             return None;
         };
 
-        Some(result.and_then(|batch| self.processor.process_actions_batch(batch)))
+        Some(result.and_then(|batch| self.processor.process_actions_batch_sequential(batch)))
     }
 }
 

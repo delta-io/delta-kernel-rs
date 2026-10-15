@@ -4,6 +4,8 @@
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
+use url::Url;
+
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
 use crate::expressions::{column_name, ColumnName};
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
@@ -158,6 +160,10 @@ impl IncrementalScanBuilder {
             live_adds: HashSet::new(),
             removes: HashSet::new(),
             errored: false,
+            dv_normalization_root: self
+                .target_snapshot
+                .table_configuration()
+                .dv_normalization_root(),
         }))
     }
 
@@ -233,6 +239,8 @@ pub struct IncrementalScanStream {
     live_adds: HashSet<FileActionKey>,
     removes: HashSet<FileActionKey>,
     errored: bool,
+    /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
+    dv_normalization_root: Option<Url>,
 }
 
 impl Iterator for IncrementalScanStream {
@@ -254,6 +262,7 @@ impl Iterator for IncrementalScanStream {
                     &mut self.seen_file_keys,
                     &mut self.live_adds,
                     &mut self.removes,
+                    self.dv_normalization_root.clone(),
                 ) {
                     Ok(Some(filtered)) => return Some(Ok(filtered)),
                     Ok(None) => continue,
@@ -561,6 +570,7 @@ fn process_batch(
     seen_file_keys: &mut HashSet<FileActionKey>,
     live_adds: &mut HashSet<FileActionKey>,
     removes: &mut HashSet<FileActionKey>,
+    dv_normalization_root: Option<Url>,
 ) -> KernelResult<Option<FilteredEngineData>> {
     let row_count = batch.len();
     let mut adds_sel = vec![false; row_count];
@@ -583,6 +593,7 @@ fn process_batch(
         REMOVE_PATH_INDEX,
         ADD_DV_START_INDEX,
         REMOVE_DV_START_INDEX,
+        dv_normalization_root,
     );
     let mut visitor = IncrementalDedupVisitor {
         deduplicator,

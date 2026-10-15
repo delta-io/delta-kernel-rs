@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use super::Transaction;
+use super::{Imperative, Transaction};
 use crate::actions::{CommitInfo, COMMIT_INFO_NAME, LOG_COMMIT_INFO_SCHEMA};
 use crate::engine_data::{GetData, MapItem, RowVisitor, TypedGetData as _};
 use crate::expressions::{lit, null_lit, MapData, Scalar};
@@ -11,6 +11,18 @@ use crate::utils::require;
 use crate::{
     create_row, DataType, Engine, EngineData, Expression, ExpressionRef, KernelError, KernelResult,
 };
+
+pub(super) fn collect_operation_metadata<I, K, V>(entries: I) -> HashMap<String, Option<String>>
+where
+    I: IntoIterator<Item = (K, Option<V>)>,
+    K: Into<String>,
+    V: Into<String>,
+{
+    entries
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.map(Into::into)))
+        .collect()
+}
 
 /// Builds a list of `(field_name, literal_expression)` pairs covering every [`CommitInfo`]
 /// field. Field names match the camelCase schema names produced by the `ToSchema` derive macro.
@@ -73,7 +85,7 @@ fn string_map_literal_expr(
     Ok(Arc::new(expression))
 }
 
-impl<S> Transaction<S> {
+impl<STATE> Transaction<STATE, Imperative> {
     pub(super) fn generate_commit_info(
         &self,
         engine: &dyn Engine,

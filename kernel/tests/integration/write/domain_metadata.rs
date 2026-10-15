@@ -6,6 +6,7 @@ use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::Snapshot;
 use itertools::Itertools;
+use rstest::rstest;
 use serde_json::Deserializer;
 use test_utils::{
     assert_result_error_with_message, begin_transaction, begin_transaction_with, create_table,
@@ -316,6 +317,65 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         .to_string()
         .contains("Cannot modify domains that start with 'delta.' as those are system controlled"));
 
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_builder_domain_metadata_with_late_operation(
+    #[values(false, true)] remove: bool,
+    #[values("app.config", "app.other")] late_domain: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (store, engine, table_location) =
+        engine_store_setup("test_builder_domain_metadata_with_late_operation", None);
+    let table_url = create_table(
+        store,
+        table_location,
+        get_simple_int_schema(),
+        &[],
+        true,
+        vec![],
+        vec!["domainMetadata"],
+    )
+    .await?;
+    let snapshot = load_and_begin_transaction_with(table_url.clone(), &engine, |builder| {
+        builder.with_domain_metadata("app.other", "original")
+    })?
+    .commit(&engine)?
+    .unwrap_post_commit_snapshot();
+    let transaction = begin_transaction_with(snapshot.clone(), &engine, |builder| {
+        builder.with_domain_metadata("app.config", "builder")
+    })?;
+    let transaction = if remove {
+        transaction.with_domain_metadata_removed(late_domain.to_string())
+    } else {
+        transaction.with_domain_metadata(late_domain.to_string(), "late".to_string())
+    };
+    let result = transaction.commit(&engine);
+
+    if late_domain == "app.config" {
+        assert_result_error_with_message(result, "already specified in this transaction");
+        let latest = Snapshot::builder_for(table_url).build(&engine)?;
+        assert_eq!(latest.version(), snapshot.version());
+        assert_eq!(latest.get_domain_metadata("app.config", &engine)?, None);
+        assert_eq!(
+            latest.get_domain_metadata("app.other", &engine)?.as_deref(),
+            Some("original")
+        );
+    } else {
+        let latest = result?.unwrap_post_commit_snapshot();
+        assert_eq!(latest.version(), snapshot.version() + 1);
+        assert_eq!(
+            latest
+                .get_domain_metadata("app.config", &engine)?
+                .as_deref(),
+            Some("builder")
+        );
+        assert_eq!(
+            latest.get_domain_metadata("app.other", &engine)?.as_deref(),
+            (!remove).then_some("late")
+        );
+    }
     Ok(())
 }
 

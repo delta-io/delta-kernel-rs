@@ -11,7 +11,18 @@ use syn::{
     Fields, Item, ItemMacro, Lit, Meta, PathArguments, Token, Type, Visibility,
 };
 
+mod expr_macro;
 mod schema_macro;
+
+/// Backend for `delta_kernel::expressions::expr!`. Input is a Kernel crate path, a semicolon,
+/// and an expression; invalid syntax or constructors produce a compile error.
+#[doc(hidden)]
+#[proc_macro]
+pub fn expr(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    expr_macro::expand(input.into())
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
 
 // Builds a `StructType`; see `delta_kernel::schema::schema` re-export for details.
 #[doc(hidden)]

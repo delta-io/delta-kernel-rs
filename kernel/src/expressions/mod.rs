@@ -14,6 +14,8 @@ pub use self::column_names::{
     col, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
     ColumnName,
 };
+#[doc(inline)]
+pub use self::macros::expr;
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -26,6 +28,7 @@ use crate::utils::CollectInto;
 use crate::{DataType, DynPartialEq, KernelError, Result};
 
 mod column_names;
+mod macros;
 mod scalars;
 mod sql;
 pub(crate) use self::sql::parse_sql;

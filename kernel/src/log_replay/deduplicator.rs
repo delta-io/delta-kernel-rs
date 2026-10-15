@@ -13,6 +13,7 @@
 use std::collections::HashSet;
 
 use tracing::warn;
+use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
@@ -93,6 +94,8 @@ pub(crate) struct CheckpointDeduplicator<'a> {
     add_path_index: usize,
     add_size_index: usize,
     add_dv_start_index: usize,
+    /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
+    dv_normalization_root: Option<Url>,
 }
 
 impl<'a> CheckpointDeduplicator<'a> {
@@ -102,12 +105,14 @@ impl<'a> CheckpointDeduplicator<'a> {
         add_path_index: usize,
         add_size_index: usize,
         add_dv_start_index: usize,
+        dv_normalization_root: Option<Url>,
     ) -> KernelResult<Self> {
         Ok(CheckpointDeduplicator {
             seen_file_keys,
             add_path_index,
             add_size_index,
             add_dv_start_index,
+            dv_normalization_root,
         })
     }
 }
