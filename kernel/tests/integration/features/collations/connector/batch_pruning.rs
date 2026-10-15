@@ -25,7 +25,7 @@ use rstest::rstest;
 use test_utils::{begin_transaction_with, into_record_batch, read_scan, test_table_setup_mt};
 
 use super::{rows, simple_batch, synthetic_fixture, CollationStats, Operation, SYNTHETIC_ID};
-use crate::features::collations::{create_fixture, generated_table, physical_path};
+use crate::features::collations::{create_fixture, generated_table, mapped_bounds, physical_path};
 
 #[rstest]
 #[case::matching(Some(SYNTHETIC_ID), true)]
@@ -205,8 +205,13 @@ async fn opaque_batch_pruning_does_not_resurrect_removed_matching_files(
 }
 
 #[rstest]
+#[case::typed_only(StatsOptions::none(), false)]
+#[case::json_and_typed(StatsOptions::json_only(), true)]
+#[case::all(StatsOptions::all(), true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nested_mapped_collation_bounds_are_projected_by_exact_identifier(
+async fn nested_mapped_collation_bounds_preserve_full_json_and_match_exact_identifiers(
+    #[case] stats_options: StatsOptions,
+    #[case] expect_json: bool,
     #[values("none", "name", "id")] mapping: &str,
     #[values(false, true)] checkpoint: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -230,8 +235,13 @@ async fn nested_mapped_collation_bounds_are_projected_by_exact_identifier(
     let snapshot = Snapshot::builder_for(&path).build(engine.as_ref())?;
     let selected_path = physical_path(&snapshot, &column_name!("name.first"));
     let unselected_path = physical_path(&snapshot, &column_name!("name.last"));
+    let expected_bounds: Vec<_> = fixture
+        .files
+        .iter()
+        .map(|(_, stats)| mapped_bounds(&stats.as_ref().unwrap().bounds, &snapshot.schema()))
+        .collect();
     let builder = snapshot.scan_builder().with_stats(
-        StatsOptions::none()
+        stats_options
             .with_collation_stats(collation_id, [column_name!("name.first")])
             .with_collation_stats("spark.UTF8_LCASE.99.0", [column_name!("name.first")]),
     );
@@ -259,6 +269,7 @@ async fn nested_mapped_collation_bounds_are_projected_by_exact_identifier(
     let read = ColumnName::new(["stats_parsed"]).join(&expected);
     let scan = builder.build()?;
     let mut names = Vec::new();
+    let mut json_bounds = Vec::new();
     for metadata in scan.scan_metadata(engine.as_ref())? {
         let batch = into_record_batch(metadata?.scan_files.apply_selection_vector()?);
         let values = evaluate_expression(&Expression::Column(read.clone()), &batch, None)?;
@@ -273,9 +284,30 @@ async fn nested_mapped_collation_bounds_are_projected_by_exact_identifier(
         );
         let missing = evaluate_expression(&Expression::Column(missing.clone()), &batch, None)?;
         assert_eq!(missing.null_count(), batch.num_rows());
+        if expect_json {
+            let json_values = evaluate_expression(&col!("stats"), &batch, None)?;
+            for json in json_values
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+            {
+                let stats: serde_json::Value = serde_json::from_str(json.unwrap())?;
+                json_bounds.push(stats["statsWithCollation"][collation_id].clone());
+            }
+        }
     }
     names.sort();
     assert_eq!(names, ["Alice", "alice"]);
+    if expect_json {
+        assert_eq!(json_bounds.len(), expected_bounds.len());
+        for bounds in expected_bounds {
+            assert!(
+                json_bounds.contains(&bounds),
+                "missing full collation bounds: {bounds}"
+            );
+        }
+    }
     Ok(())
 }
 
