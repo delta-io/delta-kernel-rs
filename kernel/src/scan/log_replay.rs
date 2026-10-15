@@ -930,7 +930,7 @@ fn build_stats_output_projection(
 /// - `has_partition_values_parsed`: Whether the source carries a native `partitionValues_parsed`
 ///   column (checkpoint). When true it is read directly; otherwise the struct is reconstructed from
 ///   the `partitionValues` string map.
-/// - `timestamp_timezone`: Timezone used when parsing raw timestamp partition strings.
+/// - `timestamp_timezone`: Timezone used to interpret offset-less `TIMESTAMP` partition strings.
 ///
 /// The transform includes `stats_parsed` only when `physical_stats_read_schema` is Some,
 /// and `partitionValues_parsed` only when `partition_schema` is Some.

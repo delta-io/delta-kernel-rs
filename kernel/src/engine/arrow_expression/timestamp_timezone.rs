@@ -175,6 +175,8 @@ mod tests {
     #[case::past_limit_minutes("+18:30")]
     #[case::invalid_hours("+19:00")]
     #[case::extra_component("+05:00:00:00")]
+    #[case::nondigit_hours("+/0:00")]
+    #[case::nondigit_minutes("+00:/0")]
     #[case::unknown_name("Not/AZone")]
     fn rejects_noncanonical_reader_timezones(#[case] timezone: &str) {
         assert!(TimestampTimezone::try_from_options(&options(timezone)).is_err());

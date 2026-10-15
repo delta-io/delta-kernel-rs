@@ -1,5 +1,6 @@
 //! Integration tests for parsed partition-value output (`partitionValues_parsed`).
 
+use std::fs::File;
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDateTime};
@@ -9,10 +10,12 @@ use delta_kernel::arrow::array::{
 };
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{col, lit, ColumnName, Predicate, Scalar};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::parquet::arrow::ArrowWriter;
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::PartitionValuesOptions;
 use delta_kernel::schema::schema_ref;
@@ -22,7 +25,9 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Engine, Snapshot, SnapshotRef};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
-use test_utils::table_builder::{partitioned, version_latest, FeatureSet, LogState, TableConfig};
+use test_utils::table_builder::{
+    partitioned, unpartitioned, version_latest, FeatureSet, LogState, TableConfig,
+};
 use test_utils::{
     add_commit, create_default_engine_mt_executor, get_column,
     install_thread_local_metrics_reporter, test_context, test_table_setup_mt, CountingReporter,
@@ -420,36 +425,43 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
     "2024-03-10T10:30:00Z"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn timestamp_partition_read_reuses_checkpoint_values(
+async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
     #[case] tz: Option<&str>,
     #[case] timestamp: &str,
     #[values("none", "id", "name")] cm_mode: &str,
     #[case] expected_ts: &str,
 ) {
+    // === Init a table with one file in a checkpoint and one in JSON ===
     let (_temp_dir, table_path, engine) = test_table_setup_mt().unwrap();
-    let snapshot = create_timezone_partition_table(&table_path, engine.as_ref(), cm_mode);
+    let snapshot = create_timestamp_partition_table(&table_path, engine.as_ref(), cm_mode);
 
-    insert_raw_timestamp_partitions(&snapshot, &[("checkpoint.parquet", timestamp)]).await;
+    insert_raw_timestamp_partitions(
+        &snapshot,
+        &[TimestampPartitionFile {
+            filename: "file1.parquet",
+            timestamp,
+        }],
+    )
+    .await;
     let snapshot = Snapshot::builder_for(&table_path)
         .build(engine.as_ref())
         .unwrap();
     snapshot.checkpoint(engine.as_ref(), None).unwrap();
 
-    insert_raw_timestamp_partitions(&snapshot, &[("commit.parquet", timestamp)]).await;
+    insert_raw_timestamp_partitions(
+        &snapshot,
+        &[TimestampPartitionFile {
+            filename: "file2.parquet",
+            timestamp,
+        }],
+    )
+    .await;
     let snapshot = Snapshot::builder_for(&table_path)
         .build(engine.as_ref())
         .unwrap();
     let physical_names = physical_timestamp_partition_names(&snapshot);
 
-    // Checkpoint writes interpret offset-less timestamps in UTC.
-    let checkpoint_ts = DateTime::parse_from_rfc3339(timestamp)
-        .map(|value| value.timestamp_micros())
-        .or_else(|_| {
-            NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S%.f")
-                .map(|value| value.and_utc().timestamp_micros())
-        })
-        .unwrap();
-    let expected_ts = timestamp_micros(expected_ts);
+    // === Build a scan with the timezone ===
     let options = tz.map_or_else(PartitionValuesOptions::with_struct, |tz| {
         PartitionValuesOptions::with_struct().with_timestamp_timezone(tz)
     });
@@ -459,6 +471,16 @@ async fn timestamp_partition_read_reuses_checkpoint_values(
         .build()
         .unwrap();
 
+    // === Assert results ===
+    // Checkpoint writes interpret offset-less timestamps in UTC.
+    let checkpoint_ts = DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.timestamp_micros())
+        .or_else(|_| {
+            NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S%.f")
+                .map(|value| value.and_utc().timestamp_micros())
+        })
+        .unwrap();
+    let expected_ts = timestamp_micros(expected_ts);
     let mut paths = Vec::new();
     for metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
         let metadata = metadata.unwrap();
@@ -482,8 +504,8 @@ async fn timestamp_partition_read_reuses_checkpoint_values(
         for row in 0..batch.num_rows() {
             let path = file_paths.value(row);
             let expected = match path {
-                "checkpoint.parquet" => checkpoint_ts,
-                "commit.parquet" => expected_ts,
+                "file1.parquet" => checkpoint_ts,
+                "file2.parquet" => expected_ts,
                 _ => panic!("unexpected file: {path}"),
             };
             assert_eq!(timestamps.value(row), expected, "{path}");
@@ -497,7 +519,7 @@ async fn timestamp_partition_read_reuses_checkpoint_values(
         }
     }
     paths.sort();
-    assert_eq!(paths, ["checkpoint.parquet", "commit.parquet"]);
+    assert_eq!(paths, ["file1.parquet", "file2.parquet"]);
 }
 
 #[rstest]
@@ -522,20 +544,26 @@ async fn timestamp_partition_read_reuses_checkpoint_values(
     3
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn timestamp_partition_predicates_reuse_checkpoint_values(
+async fn offset_less_timestamp_partition_predicates_with_json_and_checkpoint(
     #[case] predicate: Predicate,
     #[case] tz: Option<&str>,
     #[case] expected_file_num: usize,
 ) {
     for cm_mode in ["none", "id", "name"] {
         let (_temp_dir, table_path, engine) = test_table_setup_mt().unwrap();
-        let snapshot = create_timezone_partition_table(&table_path, engine.as_ref(), cm_mode);
+        let snapshot = create_timestamp_partition_table(&table_path, engine.as_ref(), cm_mode);
 
         insert_raw_timestamp_partitions(
             &snapshot,
             &[
-                ("checkpoint-local.parquet", "2024-01-15 12:30:45.123456"),
-                ("checkpoint-utc.parquet", "2024-01-15T18:30:45.123456Z"),
+                TimestampPartitionFile {
+                    filename: "offset-less-in-checkpoint.parquet",
+                    timestamp: "2024-01-15 12:30:45.123456",
+                },
+                TimestampPartitionFile {
+                    filename: "utc-in-checkpoint.parquet",
+                    timestamp: "2024-01-15T18:30:45.123456Z",
+                },
             ],
         )
         .await;
@@ -547,8 +575,14 @@ async fn timestamp_partition_predicates_reuse_checkpoint_values(
         insert_raw_timestamp_partitions(
             &snapshot,
             &[
-                ("commit-local.parquet", "2024-01-15 12:30:45.123456"),
-                ("commit-utc.parquet", "2024-01-15T18:30:45.123456Z"),
+                TimestampPartitionFile {
+                    filename: "offset-less-in-json.parquet",
+                    timestamp: "2024-01-15 12:30:45.123456",
+                },
+                TimestampPartitionFile {
+                    filename: "utc-in-json.parquet",
+                    timestamp: "2024-01-15T18:30:45.123456Z",
+                },
             ],
         )
         .await;
@@ -576,6 +610,33 @@ async fn timestamp_partition_predicates_reuse_checkpoint_values(
     }
 }
 
+#[test]
+fn scan_metadata_ignores_invalid_timestamp_timezone_for_unpartitioned_table() {
+    let (engine, snapshot, _table) = test_context!(
+        LogState::with_latest_version(1),
+        FeatureSet::empty(),
+        unpartitioned(),
+        TableConfig::new(),
+        version_latest(),
+    );
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(
+            PartitionValuesOptions::with_struct().with_timestamp_timezone("Not/AZone"),
+        )
+        .build()
+        .unwrap();
+
+    let mut file_count = 0;
+    for metadata in scan.scan_metadata(&engine).unwrap() {
+        file_count = metadata
+            .unwrap()
+            .visit_scan_files(file_count, |count, _| *count += 1)
+            .unwrap();
+    }
+    assert_eq!(file_count, 1);
+}
+
 #[rstest]
 #[case::invalid_zone("2024-01-15 12:30:45", "Not/AZone", "Not/AZone")]
 #[case::invalid_timestamp("not a timestamp", "America/Los_Angeles", "not a timestamp")]
@@ -586,8 +647,15 @@ async fn timezone_aware_parsed_partition_values_report_invalid_input(
     #[case] expected_error: &str,
 ) {
     let (_temp_dir, table_path, engine) = test_table_setup_mt().unwrap();
-    let snapshot = create_timezone_partition_table(&table_path, engine.as_ref(), "none");
-    insert_raw_timestamp_partitions(&snapshot, &[("part.parquet", raw_timestamp)]).await;
+    let snapshot = create_timestamp_partition_table(&table_path, engine.as_ref(), "none");
+    insert_raw_timestamp_partitions(
+        &snapshot,
+        &[TimestampPartitionFile {
+            filename: "part.parquet",
+            timestamp: raw_timestamp,
+        }],
+    )
+    .await;
     let snapshot = Snapshot::builder_for(&table_path)
         .build(engine.as_ref())
         .unwrap();
@@ -613,7 +681,7 @@ async fn timezone_aware_parsed_partition_values_report_invalid_input(
     assert!(error.to_string().contains(expected_error), "{error}");
 }
 
-fn create_timezone_partition_table(
+fn create_timestamp_partition_table(
     table_path: &str,
     engine: &dyn Engine,
     cm_mode: &str,
@@ -637,22 +705,44 @@ fn create_timezone_partition_table(
         .unwrap_post_commit_snapshot()
 }
 
-// Raw Add actions preserve foreign-writer strings that Kernel's writer would normalize to UTC.
-async fn insert_raw_timestamp_partitions(snapshot: &Snapshot, files: &[(&str, &str)]) {
+struct TimestampPartitionFile<'a> {
+    filename: &'a str,
+    timestamp: &'a str,
+}
+
+// Write Parquet and commit Add actions with the specified serialized timestamp in partitionValues.
+// This allows offset-less timestamps in addFile.partitionValues which kernel doesn't write.
+async fn insert_raw_timestamp_partitions(
+    snapshot: &SnapshotRef,
+    files: &[TimestampPartitionFile<'_>],
+) {
     let physical_names = physical_timestamp_partition_names(snapshot);
+    let scan = snapshot.clone().scan_builder().build().unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(scan.physical_schema().as_ref().try_into_arrow().unwrap()),
+        vec![Arc::new(Int32Array::from(vec![42]))],
+    )
+    .unwrap();
+    let table_path = snapshot.table_root().to_file_path().unwrap();
     let actions: Vec<_> = files
         .iter()
-        .map(|(path, timestamp)| {
+        .map(|file| {
+            let path = table_path.join(file.filename);
+            let mut writer =
+                ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let file_size = std::fs::metadata(path).unwrap().len();
             let partition_values: serde_json::Map<_, _> = physical_names
                 .iter()
-                .zip([*timestamp, "2024-01-15 12:30:45.123456", "7"])
+                .zip([file.timestamp, "2024-01-15 12:30:45.123456", "7"])
                 .map(|(name, value)| (name.clone(), serde_json::Value::String(value.to_string())))
                 .collect();
             serde_json::json!({
                 "add": {
-                    "path": path,
+                    "path": file.filename,
                     "partitionValues": partition_values,
-                    "size": 100,
+                    "size": file_size,
                     "modificationTime": 1700000000000_i64,
                     "dataChange": true,
                     "stats": "{\"numRecords\":1}",
