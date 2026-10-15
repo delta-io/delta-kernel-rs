@@ -1428,8 +1428,9 @@ impl Scan {
     /// they can have more control over the execution of the scan.
     ///
     /// Returns an error if row transforms were disabled through
-    /// [`ScanBuilder::without_row_transforms`] or [`PartitionValuesOptions::with_timestamp_timezone`];
-    /// use [`Scan::scan_metadata`] instead.
+    /// [`ScanBuilder::without_row_transforms`] or
+    /// [`PartitionValuesOptions::with_timestamp_timezone`]; use [`Scan::scan_metadata`]
+    /// instead.
     // This calls [`Scan::scan_metadata`] to get an iterator of `ScanMetadata` actions for the scan,
     // and then uses the `engine`'s [`crate::ParquetHandler`] to read the actual table data.
     pub fn execute(
