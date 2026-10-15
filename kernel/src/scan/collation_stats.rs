@@ -60,16 +60,15 @@ pub(super) fn extend_output_schemas(
         Some(schemas) => (Some(schemas.logical), Some(schemas.physical)),
         None => (None, None),
     };
-    Ok(Some(StatsOutputSchemas {
-        logical: append_collation_stats(
-            logical_schema,
-            StructField::nullable(COLLATION_STATS, StructType::try_new(logical)?),
-        )?,
-        physical: append_collation_stats(
-            physical_schema,
-            StructField::nullable(COLLATION_STATS, StructType::try_new(physical)?),
-        )?,
-    }))
+    let logical = append_collation_stats(
+        logical_schema,
+        StructField::nullable(COLLATION_STATS, StructType::try_new(logical)?),
+    )?;
+    let physical = append_collation_stats(
+        physical_schema,
+        StructField::nullable(COLLATION_STATS, StructType::try_new(physical)?),
+    )?;
+    Ok(Some(StatsOutputSchemas::try_new(logical, physical)?))
 }
 
 /// Adds the output's collation bounds to `read`, returning an error for an invalid schema patch.
@@ -84,18 +83,12 @@ pub(super) fn extend_read_schema(
 }
 
 fn identifier_field(identifier: &str, bounds: &SchemaRef) -> KernelResult<StructField> {
-    let fields = [MIN_VALUES, MAX_VALUES]
-        .into_iter()
-        .map(|name| {
-            bounds.field(name).cloned().ok_or_else(|| {
-                KernelError::internal_error("Requested STRING bounds are missing from stats schema")
-            })
-        })
-        .collect::<KernelResult<Vec<_>>>()?;
-    Ok(StructField::nullable(
-        identifier,
-        StructType::try_new(fields)?,
-    ))
+    let fields = bounds
+        .project_as_struct(&[MIN_VALUES, MAX_VALUES])
+        .map_err(|_| {
+            KernelError::internal_error("Requested STRING bounds are missing from stats schema")
+        })?;
+    Ok(StructField::nullable(identifier, fields))
 }
 
 fn append_collation_stats(

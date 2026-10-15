@@ -342,7 +342,8 @@ pub struct BinaryPredicate {
     pub left: Box<Expression>,
     /// The right-hand side of the operation.
     pub right: Box<Expression>,
-    /// String comparison identifier. Binary evaluators defer annotated comparisons.
+    /// Optional string comparison identifier. Binary pruning defers annotated comparisons;
+    /// Arrow predicate evaluation rejects them without a connector-defined opaque evaluator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collation: Option<String>,
 }
