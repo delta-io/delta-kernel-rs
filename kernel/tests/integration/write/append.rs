@@ -82,6 +82,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
                 "commitInfo": {
                     "timestamp": 0,
                     "operation": "WRITE",
+                    "engineInfo": "test-engine",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
                     "txnId": ZERO_UUID
@@ -133,9 +134,13 @@ async fn test_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     {
-        let txn = load_and_begin_transaction_with(table_url.clone(), &engine, |builder| {
-            builder.with_engine_info("default engine")
-        })?;
+        let txn = load_and_begin_transaction_with(
+            table_url.clone(),
+            &engine,
+            UpdateTableOperation::Write,
+            "default engine",
+            |builder| builder,
+        )?;
 
         // Commit without adding any add files
         assert!(txn.commit(&engine)?.is_committed());
@@ -210,11 +215,13 @@ async fn test_append_partitioned(
     for (table_url, engine, store, table_name) in
         setup_test_tables(table_schema.clone(), &[partition_col], None, "test_table").await?
     {
-        let mut txn = load_and_begin_transaction_with(table_url.clone(), &engine, |builder| {
-            builder
-                .with_engine_info("default engine")
-                .with_data_change(false)
-        })?;
+        let mut txn = load_and_begin_transaction_with(
+            table_url.clone(),
+            &engine,
+            UpdateTableOperation::Write,
+            "default engine",
+            |builder| builder.with_data_change(false),
+        )?;
 
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> Result<_> {
@@ -359,9 +366,13 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(table_schema, &[], None, "test_table").await?
     {
-        let txn = load_and_begin_transaction_with(table_url.clone(), &engine, |builder| {
-            builder.with_engine_info("default engine")
-        })?;
+        let txn = load_and_begin_transaction_with(
+            table_url.clone(),
+            &engine,
+            UpdateTableOperation::Write,
+            "default engine",
+            |builder| builder,
+        )?;
 
         // create two new arrow record batches to append
         let append_data = [["a", "b"], ["c", "d"]].map(|data| -> Result<_> {
@@ -414,9 +425,13 @@ async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::
                 .next()
                 .expect("at least one test table");
         let engine = Arc::new(engine);
-        let mut txn = load_and_begin_transaction_with(table_url, engine.as_ref(), |builder| {
-            builder.with_data_change(true)
-        })?;
+        let mut txn = load_and_begin_transaction_with(
+            table_url,
+            engine.as_ref(),
+            UpdateTableOperation::Write,
+            "test-engine",
+            |builder| builder.with_data_change(true),
+        )?;
 
         let data = ArrowEngineData::new(RecordBatch::try_new(
             Arc::new(schema.as_ref().try_into_arrow()?),
@@ -549,8 +564,7 @@ async fn commit_rejects_add_with_invalid_partition_keys(
         })
         .collect();
     let mut txn = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .with_data_change(true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let write_state = txn.write_state()?;

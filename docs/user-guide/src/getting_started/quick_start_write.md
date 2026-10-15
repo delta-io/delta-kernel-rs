@@ -69,9 +69,7 @@ async fn main() -> Result<()> {
     let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
 
     let mut txn = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
-        .with_engine_info("quick-start/1.0")
+        .update_table(UpdateTableOperation::Custom("INSERT".to_string()), "quick-start/1.0")
         .with_data_change(true)
         .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
@@ -156,8 +154,7 @@ The write flow has four parts:
 **Start a transaction:**
 ```rust,ignore
 let mut txn = snapshot
-    .transaction_builder()
-    .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
+    .update_table(UpdateTableOperation::Custom("INSERT".to_string()), "quick-start/1.0")
     .with_data_change(true)
     .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```

@@ -2418,6 +2418,21 @@ impl DataType {
         }
     }
 
+    /// Returns the storage type used to represent this data type.
+    ///
+    /// A UDT is stored as its `sqlType`; every other type is stored as itself.
+    #[cfg_attr(
+        not(any(feature = "arrow-conversion", feature = "arrow-expression")),
+        allow(dead_code)
+    )]
+    pub(crate) fn physical_type(&self) -> &DataType {
+        match self {
+            #[cfg(feature = "udt-in-dev")]
+            Self::UserDefined(udt) => udt.sql_type(),
+            data_type => data_type,
+        }
+    }
+
     /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> Result<Self> {
         Ok(PrimitiveType::decimal(precision, scale)?.into())

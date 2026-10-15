@@ -31,8 +31,7 @@ async fn test_write_txn_actions(
         // can't have duplicate app_id in same transaction
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         assert!(matches!(
-            snapshot.clone().transaction_builder()
-                .with_operation(UpdateTableOperation::Write)
+            snapshot.clone().update_table(UpdateTableOperation::Write, "test-engine")
                 .with_transaction_id("app_id1".to_string(), 0)
                 .with_transaction_id("app_id1".to_string(), 1)
                 .build(&engine, Box::new(FileSystemCommitter::new())),
@@ -42,18 +41,14 @@ async fn test_write_txn_actions(
         if after_build {
             let txn = snapshot
                 .clone()
-                .transaction_builder()
-                .with_operation(UpdateTableOperation::Write)
+                .update_table(UpdateTableOperation::Write, "test-engine")
                 .with_transaction_id("app_id1".to_string(), 0)
                 .build(&engine, Box::new(FileSystemCommitter::new()))?
                 .with_transaction_id("app_id1".to_string(), 1);
             assert_result_error_with_message(txn.commit(&engine), "app_id app_id1");
         }
 
-        let builder = snapshot
-            .transaction_builder()
-            .with_operation(UpdateTableOperation::Write)
-            .with_engine_info("default engine");
+        let builder = snapshot.update_table(UpdateTableOperation::Write, "default engine");
         let txn = if after_build {
             builder
                 .build(&engine, Box::new(FileSystemCommitter::new()))?

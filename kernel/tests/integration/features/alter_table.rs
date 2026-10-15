@@ -66,8 +66,7 @@ async fn schema_evolution_while_writing_round_trips_new_column(
     assert_eq!(old_max_id.is_some(), cm_mode != "none");
     let mut transaction = before
         .clone()
-        .transaction_builder()
-        .with_operation(operation)
+        .update_table(operation, "test-engine")
         .add_column(StructField::nullable("country", DataType::STRING))
         .build(engine.as_ref(), committer())?;
 
@@ -214,8 +213,7 @@ async fn add_column_validates_cdf_column_names(
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &properties)?;
     let result = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(StructField::nullable(column_name, DataType::STRING))
         .build(engine.as_ref(), committer());
 
@@ -258,8 +256,7 @@ async fn add_column_validates_cdf_physical_column_names(
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &properties)?;
     let result = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(
             StructField::nullable("value", DataType::STRING).with_metadata([(
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -301,8 +298,7 @@ async fn alter_table_commit_info_includes_operation_maps() -> Result<(), Box<dyn
     let table_url = snapshot.table_root().clone();
 
     snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(StructField::nullable("added", DataType::STRING))
         .with_operation_parameters([("columns", Some(r#"["added"]"#))])
         .with_operation_metrics([("numAddedColumns", Some("1"))])
@@ -359,8 +355,7 @@ async fn add_columns_lifecycle(
     let mut current = snapshot;
     for name in &new_col_names {
         let committed = current
-            .transaction_builder()
-            .with_operation(UpdateTableOperation::AlterTable)
+            .update_table(UpdateTableOperation::AlterTable, "test-engine")
             .add_column(StructField::nullable(name, DataType::STRING))
             .build(engine.as_ref(), committer())?
             .commit(engine.as_ref())?
@@ -543,8 +538,7 @@ async fn add_complex_type_column(
     let expected_type = field.data_type().clone();
 
     snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(field)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -601,8 +595,7 @@ async fn add_column_failures(
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), properties)?;
 
     let err = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(field)
         .build(engine.as_ref(), committer());
     assert!(err.is_err());
@@ -626,8 +619,7 @@ async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error:
 
     // v1: add column "a".
     let v1 = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(StructField::nullable("a", DataType::STRING))
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -641,8 +633,7 @@ async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error:
 
     // v2: add column "b" on top of the checkpointed snapshot.
     let v2 = v1_ckpt
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(StructField::nullable("b", DataType::INTEGER))
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -724,8 +715,7 @@ async fn add_column_at_round_trip(
         create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &properties)?;
 
     snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column_at(
             column_name!("parent"),
             StructField::nullable("added", DataType::STRING),
@@ -780,8 +770,7 @@ async fn add_column_at_nested_struct_with_column_mapping(
     let original_max = max_column_id(&snapshot).expect("CM table must have maxColumnId");
 
     snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column_at(
             column_name!("address"),
             StructField::nullable("zip", DataType::STRING),
@@ -841,8 +830,7 @@ async fn add_column_at_containers_round_trip(
         create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &properties)?;
 
     snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column_at(
             column_name!("items.element"),
             StructField::nullable("added", DataType::STRING),
@@ -905,8 +893,7 @@ async fn add_column_at_struct_fields_named_like_container_segments() -> Result<(
     let snapshot = create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &[])?;
 
     snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column_at(
             column_name!("address.element"),
             StructField::nullable("added", DataType::STRING),
@@ -954,8 +941,7 @@ async fn add_column_at_rejects_duplicate_field_in_same_builder() -> Result<()> {
     let snapshot = create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &[])?;
 
     let result = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column_at(
             column_name!("address"),
             StructField::nullable("dup", DataType::STRING),
@@ -977,8 +963,7 @@ async fn add_column_at_rejects_non_struct_parent() -> Result<()> {
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
 
     let result = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column_at(
             column_name!("id"),
             StructField::nullable("added", DataType::STRING),
@@ -1026,20 +1011,17 @@ async fn empty_create_then_add_column(
     );
     let write_state_err = v0
         .clone()
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
-        .with_engine_info("EmptySchemaApp/0.1.0")
+        .update_table(UpdateTableOperation::Write, "EmptySchemaApp/0.1.0")
         .build(engine.as_ref(), committer())?
         .write_state()
         .expect_err("write_state() must reject empty-schema snapshots");
     assert!(
         write_state_err.to_string().contains("empty schema")
-            && write_state_err.to_string().contains("transaction_builder"),
-        "write_state error must point at transaction_builder, got: {write_state_err}"
+            && write_state_err.to_string().contains("update_table"),
+        "write_state error must point at update_table, got: {write_state_err}"
     );
 
-    v0.transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+    v0.update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(StructField::nullable("id", DataType::INTEGER))
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -1140,8 +1122,7 @@ async fn set_nullable_succeeds(
     let before = snapshot.schema().field_at_path(column.path()).clone();
 
     snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .set_nullable(column.clone())
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -1230,8 +1211,7 @@ async fn set_nullable_on_layout_column_with_checkpoint(
 
     // v2: ALTER TABLE -- set the layout column nullable.
     let v2 = v1
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .set_nullable(ColumnName::new([col_name]))
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -1270,8 +1250,7 @@ async fn set_nullable_nonexistent_column_fails() -> Result<()> {
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
 
     let err = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .set_nullable(column_name!("nonexistent"))
         .build(engine.as_ref(), committer());
     assert!(err.is_err());
@@ -1318,8 +1297,7 @@ async fn chain_add_column_and_set_nullable(
 
     // Two alter+checkpoint cycles: (add email + nullable id), (add age + nullable name).
     let v1 = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(StructField::nullable("email", DataType::STRING))
         .set_nullable(column_name!("id"))
         .build(engine.as_ref(), committer())?
@@ -1330,8 +1308,7 @@ async fn chain_add_column_and_set_nullable(
         .expect("post-commit snapshot at v1");
     let (_, v1_ckpt) = v1_snap.clone().checkpoint(engine.as_ref(), None)?;
     let v2 = v1_ckpt
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(StructField::nullable("age", DataType::INTEGER))
         .set_nullable(column_name!("name"))
         .build(engine.as_ref(), committer())?
@@ -1418,8 +1395,7 @@ async fn add_column_with_stray_cm_metadata_on_non_cm_table_is_stripped(
     };
 
     snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(field)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -1461,8 +1437,7 @@ async fn add_column_strip_is_none_mode_only(
     // A well-formed id+physicalName pair so enabled modes have valid metadata to preserve.
     let field = fixtures::cm_field("added", 99, "phys-added", DataType::STRING);
     snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(field)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -1482,9 +1457,15 @@ async fn add_column_strip_is_none_mode_only(
 #[case::v2("delta.enableIcebergCompatV2", "icebergCompatV2")]
 #[case::v3("delta.enableIcebergCompatV3", "icebergCompatV3")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn alter_blocked_when_iceberg_compat_enabled(
+async fn schema_changes_blocked_when_iceberg_compat_enabled(
     #[case] enablement_property: &str,
     #[case] feature_name: &str,
+    #[values(
+        UpdateTableOperation::Write,
+        UpdateTableOperation::AlterTable,
+        UpdateTableOperation::Custom("UNKNOWN".to_string())
+    )]
+    operation: UpdateTableOperation,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let snapshot = create_table_and_load_snapshot(
@@ -1495,8 +1476,7 @@ async fn alter_blocked_when_iceberg_compat_enabled(
     )?;
 
     let msg = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(operation, "test-engine")
         .add_column(StructField::nullable("new_col", DataType::STRING))
         .build(engine.as_ref(), committer())
         .unwrap_err()
@@ -1522,8 +1502,7 @@ async fn add_column_with_orphan_default_metadata_succeeds() -> Result<()> {
     )]);
 
     snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(field)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -1539,8 +1518,7 @@ async fn add_column_with_orphan_default_metadata_succeeds() -> Result<()> {
     assert_eq!(default.raw_sql(), "42");
 
     let txn = reloaded
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .build(engine.as_ref(), committer())?;
     assert!(
         txn.top_level_column_defaults()?.is_empty(),
@@ -1550,9 +1528,14 @@ async fn add_column_with_orphan_default_metadata_succeeds() -> Result<()> {
     Ok(())
 }
 
+#[rstest]
+#[case(UpdateTableOperation::Write)]
+#[case(UpdateTableOperation::AlterTable)]
+#[case(UpdateTableOperation::Custom("UNKNOWN".to_string()))]
 #[tokio::test]
-async fn alter_blocked_when_allow_column_defaults_enabled() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn schema_changes_blocked_when_allow_column_defaults_enabled(
+    #[case] operation: UpdateTableOperation,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (store, engine, table_url) = engine_store_setup("alter_column_defaults", None);
     let table_url = create_test_table(
         store,
@@ -1567,8 +1550,7 @@ async fn alter_blocked_when_allow_column_defaults_enabled() -> Result<(), Box<dy
     let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
 
     let msg = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(operation, "test-engine")
         .add_column(StructField::nullable("new_col", DataType::STRING))
         .build(&engine, committer())
         .unwrap_err()
@@ -1629,8 +1611,7 @@ async fn add_column_preserves_complete_cm_metadata(
     );
 
     snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(field)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -1669,8 +1650,7 @@ async fn add_column_with_only_physical_name_allocates_id(
         fixtures::cm_field_physical_name_only("named_only", "phys-named-only", DataType::STRING);
 
     snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(field)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -1708,8 +1688,7 @@ async fn add_column_with_only_id_fills_physical_name(
     let field = fixtures::cm_field_id_only("id_only", supplied_id, DataType::STRING);
 
     snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(field)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -1759,8 +1738,7 @@ async fn add_column_with_id_below_max_column_id_succeeds() -> Result<()> {
     let field = fixtures::cm_field("inserted_below_max", 50, "phys-inserted", DataType::STRING);
 
     snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(field)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -1803,8 +1781,7 @@ async fn add_column_with_id_colliding_existing_field_is_rejected() -> Result<()>
     let field = fixtures::cm_field("colliding", existing_id, "phys-colliding", DataType::STRING);
 
     let err = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(field)
         .build(engine.as_ref(), committer())
         .unwrap_err()
@@ -1858,8 +1835,7 @@ async fn add_column_on_stale_table_leaves_schema_untouched(
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test-engine")
         .add_column(added_field)
         .build(&engine, committer())?
         .commit(&engine)?

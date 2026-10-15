@@ -1000,10 +1000,13 @@ async fn test_materialized_partition_columns_excluded_from_stats(
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
-    let mut txn =
-        test_utils::load_and_begin_transaction_with(&table_path, engine.as_ref(), |builder| {
-            builder.with_engine_info("default engine")
-        })?;
+    let mut txn = test_utils::load_and_begin_transaction_with(
+        &table_path,
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "default engine",
+        |builder| builder,
+    )?;
 
     // Data batch must not contain the partition column.
     let data_schema = schema_ref! { nullable "number": INTEGER };
@@ -1110,9 +1113,7 @@ async fn test_materialize_partition_columns_e2e(
 
     // A single commit writing two distinct partitions.
     let mut txn = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
-        .with_engine_info("default engine")
+        .update_table(UpdateTableOperation::Write, "default engine")
         .with_data_change(true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let write_state = txn.write_state()?;
@@ -1260,10 +1261,13 @@ async fn test_input_data_with_partition_column_errors(
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
-    let txn =
-        test_utils::load_and_begin_transaction_with(&table_path, engine.as_ref(), |builder| {
-            builder.with_engine_info("default engine")
-        })?;
+    let txn = test_utils::load_and_begin_transaction_with(
+        &table_path,
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "default engine",
+        |builder| builder,
+    )?;
 
     // Contract violation: the batch includes the `partition` column.
     let arrow_schema = Arc::new(table_schema.as_ref().try_into_arrow()?);
@@ -1364,9 +1368,13 @@ async fn test_partition_null_validation(
         .commit(engine.as_ref())?;
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
 
-    let txn = test_utils::begin_transaction_with(snapshot, engine.as_ref(), |builder| {
-        builder.with_engine_info("default engine")
-    })?;
+    let txn = test_utils::begin_transaction_with(
+        snapshot,
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "default engine",
+        |builder| builder,
+    )?;
     let write_state = txn.write_state()?;
     let result = write_state
         .write_context_builder()
@@ -1423,9 +1431,13 @@ async fn test_partition_null_validation_mixed_nullability(
         false, // write_partition_values_parsed; unused, no checkpoint in this test
     )?;
 
-    let txn = test_utils::begin_transaction_with(snapshot, engine.as_ref(), |builder| {
-        builder.with_engine_info("default engine")
-    })?;
+    let txn = test_utils::begin_transaction_with(
+        snapshot,
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "default engine",
+        |builder| builder,
+    )?;
     let write_state = txn.write_state()?;
 
     write_state

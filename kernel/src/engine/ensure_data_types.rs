@@ -74,6 +74,7 @@ impl EnsureDataTypes {
         kernel_type: &DataType,
         arrow_type: &ArrowDataType,
     ) -> KernelResult<DataTypeCompat> {
+        let kernel_type = kernel_type.physical_type();
         match (kernel_type, arrow_type) {
             (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)

@@ -78,9 +78,13 @@ fn test_at_timestamp_resolves_to_intermediate_version() -> Result<()> {
 
     // v1..=4: noop commits (each writes a metaData-free, add-free commit JSON).
     for _ in 1..=4 {
-        snap = test_utils::begin_transaction_with(snap.clone(), engine.as_ref(), |builder| {
-            builder.with_engine_info("AtTimestampTest")
-        })?
+        snap = test_utils::begin_transaction_with(
+            snap.clone(),
+            engine.as_ref(),
+            delta_kernel::transaction::UpdateTableOperation::Write,
+            "AtTimestampTest",
+            |builder| builder,
+        )?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
     }

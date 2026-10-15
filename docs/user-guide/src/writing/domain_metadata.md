@@ -34,14 +34,11 @@ while writing to a built transaction before committing it.
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let txn = snapshot
-    .transaction_builder()
+    .update_table(UpdateTableOperation::Custom("UPDATE METADATA".to_string()), "my-app/1.0")
     .with_domain_metadata(
         "myConnector.settings".to_string(),
         r#"{"version": 1, "compress": true}"#.to_string(),
     )
-    .with_operation(UpdateTableOperation::Custom(
-        "UPDATE METADATA".to_string(),
-    ))
     .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 txn.commit(&engine)?;
@@ -94,10 +91,7 @@ that does not exist yet.
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let txn = snapshot
-    .transaction_builder()
-    .with_operation(UpdateTableOperation::Custom(
-        "REMOVE METADATA".to_string(),
-    ))
+    .update_table(UpdateTableOperation::Custom("REMOVE METADATA".to_string()), "my-app/1.0")
     .with_domain_metadata_removed("myConnector.settings")
     .build(&engine, Box::new(FileSystemCommitter::new()))?;
 

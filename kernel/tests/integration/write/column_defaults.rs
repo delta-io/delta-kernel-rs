@@ -110,8 +110,7 @@ fn assert_top_level_default(
 ) -> Result<()> {
     let txn = snapshot
         .clone()
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .build(engine, Box::new(FileSystemCommitter::new()))?;
     assert_eq!(
         txn.top_level_column_defaults()?[column].to_scalar()?,
@@ -291,8 +290,7 @@ async fn write_state_acknowledgement_depends_on_column_defaults(
 
     let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
     let mut txn = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
     let defaults = txn.top_level_column_defaults()?;
@@ -378,8 +376,7 @@ async fn assert_materialized_column_default_round_trips(
     let scalar = {
         let txn = snapshot
             .clone()
-            .transaction_builder()
-            .with_operation(UpdateTableOperation::Write)
+            .update_table(UpdateTableOperation::Write, "test-engine")
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
         let defaults = txn.top_level_column_defaults()?;
         defaults["c"]
@@ -461,8 +458,7 @@ async fn test_transaction_top_level_column_defaults_excludes_nested_defaults(
 
     let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
     let txn = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
     let defaults = txn.top_level_column_defaults()?;
@@ -525,8 +521,7 @@ async fn test_load_and_write_tolerate_v3_unverifiable_default(
 
     let logging = LoggingTest::new();
     snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .build(&engine, Box::new(FileSystemCommitter::new()))?;
     assert!(
         logging.logs().contains(warning_text),
@@ -578,8 +573,7 @@ async fn test_load_and_write_allow_orphan_default() -> Result<(), Box<dyn std::e
 
     // Write: a write state and context build without error.
     let txn = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .build(&engine, Box::new(FileSystemCommitter::new()))?;
     assert!(
         txn.top_level_column_defaults()?.is_empty(),
@@ -627,8 +621,7 @@ async fn test_variant_column_default_validation_at_snapshot_load(
         None => {
             let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
             let txn = snapshot
-                .transaction_builder()
-                .with_operation(UpdateTableOperation::Write)
+                .update_table(UpdateTableOperation::Write, "test-engine")
                 .build(&engine, Box::new(FileSystemCommitter::new()))?;
             let defaults = txn.top_level_column_defaults()?;
             let column_default = &defaults["v"];
@@ -671,8 +664,7 @@ async fn test_load_tolerates_unmaterializable_default(
 
     let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
     let txn = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .build(&engine, Box::new(FileSystemCommitter::new()))?;
     let defaults = txn.top_level_column_defaults()?;
 
@@ -979,8 +971,7 @@ async fn test_column_default_with_iceberg_compat_v3_e2e() -> Result<(), Box<dyn 
     // The default is still keyed by the logical name `c` and parses to its literal.
     let txn = snapshot
         .clone()
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let defaults = txn.top_level_column_defaults()?;
     assert_eq!(defaults["c"].to_scalar()?, Some(Scalar::Integer(42)));

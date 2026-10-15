@@ -127,8 +127,7 @@ async fn append_with_defaults(
     // 1. Start the transaction.
     let table_schema = snapshot.schema();
     let mut txn = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "my-app/1.0")
         .build(engine, Box::new(FileSystemCommitter::new()))?;
 
     // 2. Build one reusable mapping from input columns or parsed defaults.

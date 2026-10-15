@@ -72,7 +72,7 @@ For full details on working with `scan_metadata()`, see
 [Advanced Reads with scan_metadata()](../reading/scan_metadata.md).
 
 > [!NOTE]
-> If your scan was built with a partition predicate (`Scan::with_predicate`), the
+> If your scan was built with a partition predicate (`ScanBuilder::with_predicate`), the
 > scan-row schema also includes a `partitionValues_parsed` field. Kernel drops that
 > field internally when transforming the rows for `remove_files()`, so you don't need
 > to handle it.
@@ -150,8 +150,7 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 // 2. Create a transaction
 let mut txn = snapshot
     .clone()
-    .transaction_builder()
-    .with_operation(UpdateTableOperation::Delete)
+    .update_table(UpdateTableOperation::Delete, "my-app/1.0")
     .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 // 3. Build a scan and get file metadata

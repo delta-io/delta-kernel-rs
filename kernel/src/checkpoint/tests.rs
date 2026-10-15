@@ -855,8 +855,7 @@ async fn test_checkpoint_preserves_domain_metadata() -> Result<()> {
     let commit_domain_metadata = |domain: &str, value: &str| -> Result<()> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
-            .transaction_builder()
-            .with_operation(UpdateTableOperation::Write)
+            .update_table(UpdateTableOperation::Write, "test-engine")
             .with_domain_metadata(domain, value)
             .build(&engine, Box::new(FileSystemCommitter::new()))?;
         let result = txn.commit(&engine)?;
@@ -933,8 +932,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> Result<()> {
     // ===== Commit domain metadata for "foo" =====
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let txn = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .with_domain_metadata("foo", "bar")
         .build(&engine, Box::new(FileSystemCommitter::new()))?;
     let result = txn.commit(&engine)?;
@@ -950,8 +948,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> Result<()> {
     // ===== Remove domain metadata for "foo" (tombstone) =====
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let result = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .with_domain_metadata_removed("foo")
         .build(&engine, Box::new(FileSystemCommitter::new()))?
         .commit(&engine)?;

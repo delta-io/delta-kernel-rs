@@ -20,7 +20,6 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
-use crate::metrics::MetricId;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
@@ -52,7 +51,7 @@ use crate::table_properties::{
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
 use crate::transaction::{CommitOperation, CreateTable, ExecutionMode, Transaction};
-use crate::utils::{current_time_ms, try_parse_uri, PhantomType};
+use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{Engine, KernelError, KernelResult, Result, StorageHandler};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
@@ -1072,13 +1071,15 @@ impl TransactionBuilder<CreateTable> {
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
 
         // Create Transaction<CreateTable> with the effective table configuration
-        try_new_create_table(
+        let transaction = try_new_create_table(
             table_configuration,
             committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
             self.common_state,
-        )
+        )?;
+        transaction.validate_domain_metadata_operations()?;
+        Ok(transaction)
     }
 }
 
@@ -1100,40 +1101,21 @@ fn try_new_create_table<MODE: ExecutionMode>(
         path = %effective_table_config.table_root(),
         operation = "CREATE",
     );
-    let transaction = common_state.apply_to_transaction(Transaction {
-        span,
-        operation_id: MetricId::new(),
-        correlation_id: None,
-        read_snapshot_opt: None,
-        effective_table_config,
+    let commit_timestamp = current_time_ms()?;
+    Ok(Transaction {
         should_emit_protocol: true,
         should_emit_metadata: true,
-        committer,
-        operation: Some(CommitOperation::CreateTable),
-        operation_parameters: None,
-        operation_metrics: None,
-        engine_info: None,
-        staged_data_changes: Default::default(),
-        dedup_validation_enabled: true,
-        set_transactions: vec![],
-        commit_timestamp: current_time_ms()?,
-        user_domain_metadata_additions: vec![],
         system_domain_metadata_additions: system_domain_metadata,
-        provided_row_tracking_high_water_mark: None,
-        user_domain_removals: vec![],
-        data_change: true,
-        infer_data_change: false,
-        column_defaults_acknowledged: false,
-        row_tracking_preservation_acknowledged: false,
-        engine_commit_info: None,
-        is_blind_append: false,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        manifest_write: None,
         physical_clustering_columns: clustering_columns,
-        _state: PhantomType::default(),
-    });
-    transaction.validate_domain_metadata_operations()?;
-    Ok(transaction)
+        ..Transaction::new(
+            common_state,
+            effective_table_config,
+            committer,
+            CommitOperation::CreateTable,
+            span,
+            commit_timestamp,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1178,10 +1160,7 @@ mod tests {
             CreateTableTransactionBuilder::new("/path/to/table", schema.clone(), "TestApp/1.0");
 
         assert_eq!(builder.local_state.path, "/path/to/table");
-        assert_eq!(
-            builder.common_state.engine_info.as_deref(),
-            Some("TestApp/1.0")
-        );
+        assert_eq!(builder.common_state.engine_info, "TestApp/1.0");
         assert!(builder.local_state.table_properties.is_empty());
     }
 
@@ -1220,7 +1199,7 @@ mod tests {
         let mut transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
 
         assert_eq!(transaction.dedup_validation_enabled, !skip_dedup_validation);
-        assert_eq!(transaction.engine_info.as_deref(), Some("test-engine"));
+        assert_eq!(transaction.engine_info, "test-engine");
         assert_eq!(
             transaction.correlation_id.as_deref(),
             Some("test-correlation")
@@ -1231,6 +1210,10 @@ mod tests {
         );
         assert_eq!(transaction.set_transactions[0].app_id, "app");
         assert_eq!(transaction.set_transactions[0].version, 7);
+        assert_eq!(
+            transaction.set_transactions[0].last_updated,
+            Some(transaction.commit_timestamp)
+        );
         assert_eq!(transaction.data_change, expected_data_change);
         assert!(!transaction.infer_data_change);
         transaction.resolve_data_change();

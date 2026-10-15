@@ -5,8 +5,7 @@
 //! write flow from C is:
 //!
 //! ```text
-//! new_update_table_txn_builder(snapshot)
-//! update_table_txn_builder_with_operation(builder, KernelUpdateTableOperation::Write)
+//! new_update_table_txn_builder(snapshot, KernelUpdateTableOperation::Write, engine_info, engine)
 //! update_table_txn_builder_build(builder, engine)
 //! update_table_txn_visit_top_level_column_defaults(txn, engine, ctx, visitor)
 //!         // one callback per column with a default; the connector evaluates its raw SQL itself

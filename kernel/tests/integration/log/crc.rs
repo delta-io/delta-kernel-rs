@@ -96,9 +96,13 @@ async fn test_get_file_stats_stale_crc_advances_via_safe_commit_serves_stats() -
 
     // ===== WHEN =====
     // Safe (WRITE) commit with no file actions advances to version 1 (no new CRC written).
-    begin_transaction_with(snapshot, engine.as_ref(), |builder| {
-        builder.with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
-    })?
+    begin_transaction_with(
+        snapshot,
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "test-engine",
+        |builder| builder,
+    )?
     .commit(engine.as_ref())?
     .unwrap_committed();
 
@@ -182,9 +186,13 @@ async fn test_get_all_files_none_when_crc_advanced_via_safe_commit() -> Result<(
 
     // ===== WHEN =====
     // Safe (WRITE) commit with no file actions advances to version 1 (no new CRC written).
-    begin_transaction_with(snapshot, engine.as_ref(), |builder| {
-        builder.with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
-    })?
+    begin_transaction_with(
+        snapshot,
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "test-engine",
+        |builder| builder,
+    )?
     .commit(engine.as_ref())?
     .unwrap_committed();
 
@@ -476,11 +484,13 @@ async fn test_post_commit_crc_chains_only_if_read_snapshot_has_crc(
         use_post_commit_snapshot
     );
 
-    let committed = begin_transaction_with(read_snapshot, engine.as_ref(), |builder| {
-        builder
-            .with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
-            .with_domain_metadata("zip", "zap1")
-    })?
+    let committed = begin_transaction_with(
+        read_snapshot,
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "test-engine",
+        |builder| builder.with_domain_metadata("zip", "zap1"),
+    )?
     .commit(engine.as_ref())?
     .unwrap_committed();
 
@@ -557,11 +567,13 @@ async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> Result<()> {
 
     // ===== WHEN: Remove all files =====
     let scan = snapshot_v2.clone().scan_builder().build()?;
-    let mut txn = begin_transaction_with(snapshot_v2.clone(), engine.as_ref(), |builder| {
-        builder
-            .with_operation(delta_kernel::transaction::UpdateTableOperation::Delete)
-            .with_data_change(true)
-    })?;
+    let mut txn = begin_transaction_with(
+        snapshot_v2.clone(),
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Delete,
+        "test-engine",
+        |builder| builder.with_data_change(true),
+    )?;
     for sm in scan.scan_metadata(engine.as_ref())? {
         txn.remove_files(sm?.scan_files);
     }
@@ -592,12 +604,17 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> Result<()> {
     assert_eq!(dms["zip"].configuration(), "zap0");
 
     // ===== WHEN: update zip -> zap1, add foo -> bar =====
-    let txn = begin_transaction_with(snapshot_v0.clone(), engine.as_ref(), |builder| {
-        builder
-            .with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
-            .with_domain_metadata("zip", "zap1") // <-- set to zap1
-            .with_domain_metadata("foo", "bar") // <-- add foo
-    })?;
+    let txn = begin_transaction_with(
+        snapshot_v0.clone(),
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "test-engine",
+        |builder| {
+            builder
+                .with_domain_metadata("zip", "zap1") // <-- set to zap1
+                .with_domain_metadata("foo", "bar") // <-- add foo
+        },
+    )?;
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
 
     // ===== THEN: should have CRC at v1 with zip -> zap1, foo -> bar =====
@@ -610,8 +627,7 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> Result<()> {
     // ===== WHEN: remove zip, keep foo =====
     let txn = snapshot_v1
         .clone()
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .with_domain_metadata_removed("zip")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
@@ -641,11 +657,13 @@ async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate(
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
 
     // ===== WHEN: Commit a non-incremental operation (ANALYZE STATS) =====
-    let committed = begin_transaction_with(snapshot_v1.clone(), engine.as_ref(), |builder| {
-        builder.with_operation(delta_kernel::transaction::UpdateTableOperation::Custom(
-            "ANALYZE STATS".to_string(),
-        ))
-    })?
+    let committed = begin_transaction_with(
+        snapshot_v1.clone(),
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Custom("ANALYZE STATS".to_string()),
+        "test-engine",
+        |builder| builder,
+    )?
     .commit(engine.as_ref())?
     .unwrap_committed();
 
@@ -773,8 +791,7 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
         )
         .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
         let mut txn = snap
-            .transaction_builder()
-            .with_operation(UpdateTableOperation::Write)
+            .update_table(UpdateTableOperation::Write, "test-engine")
             .with_data_change(true)
             .with_domain_metadata(format!("d{v}"), format!("cfg{v}"))
             .with_transaction_id(format!("app{v}"), v);
@@ -879,9 +896,13 @@ async fn test_disabled_load_retains_stale_crc_as_base() -> Result<()> {
 
     // Safe WRITE commit advances to v1 without writing a new CRC; the newest on-disk CRC stays v0.
     let snap0 = Snapshot::builder_for(table_path.clone()).build(engine.as_ref())?;
-    begin_transaction_with(snap0, engine.as_ref(), |builder| {
-        builder.with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
-    })?
+    begin_transaction_with(
+        snap0,
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "test-engine",
+        |builder| builder,
+    )?
     .commit(engine.as_ref())?
     .unwrap_committed();
 
@@ -920,9 +941,13 @@ async fn test_write_checksum_after_checkpoint_with_stale_base_resolves_from_chec
 
     // v0 has CRC@0; a safe WRITE commit advances to v1 with no new CRC.
     let snap0 = Snapshot::builder_for(table_path.clone()).build(engine.as_ref())?;
-    begin_transaction_with(snap0, engine.as_ref(), |builder| {
-        builder.with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
-    })?
+    begin_transaction_with(
+        snap0,
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "test-engine",
+        |builder| builder,
+    )?
     .commit(engine.as_ref())?
     .unwrap_committed();
 
@@ -967,8 +992,7 @@ async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
         )
         .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
         let mut txn = snap
-            .transaction_builder()
-            .with_operation(UpdateTableOperation::Write)
+            .update_table(UpdateTableOperation::Write, "test-engine")
             .with_data_change(true)
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
         let write_context = txn.write_state()?.write_context_builder().build()?;
@@ -1107,11 +1131,13 @@ async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupporte
     .unwrap_post_commit_snapshot();
     let (_, snap) = snap.checkpoint(engine.as_ref(), None)?;
     // Non-incremental operation in the tail dooms file stats regardless of the checkpoint.
-    begin_transaction_with(snap, engine.as_ref(), |builder| {
-        builder.with_operation(delta_kernel::transaction::UpdateTableOperation::Custom(
-            "ANALYZE STATS".to_string(),
-        ))
-    })?
+    begin_transaction_with(
+        snap,
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Custom("ANALYZE STATS".to_string()),
+        "test-engine",
+        |builder| builder,
+    )?
     .commit(engine.as_ref())?
     .unwrap_committed();
 
@@ -1337,12 +1363,17 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> Result<()> {
     let snapshot_v0 = committed.post_commit_snapshot().unwrap();
 
     // v1: update zip -> zap1, add foo -> bar
-    let committed = begin_transaction_with(snapshot_v0.clone(), engine.as_ref(), |builder| {
-        builder
-            .with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
-            .with_domain_metadata("zip", "zap1")
-            .with_domain_metadata("foo", "bar")
-    })?
+    let committed = begin_transaction_with(
+        snapshot_v0.clone(),
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "test-engine",
+        |builder| {
+            builder
+                .with_domain_metadata("zip", "zap1")
+                .with_domain_metadata("foo", "bar")
+        },
+    )?
     .commit(engine.as_ref())?
     .unwrap_committed();
 
@@ -1438,11 +1469,13 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> Result<()
     );
 
     // v1: post-commit chain accumulates DM into `Partial(map)`.
-    let committed = begin_transaction_with(snapshot_v0.clone(), engine.as_ref(), |builder| {
-        builder
-            .with_operation(delta_kernel::transaction::UpdateTableOperation::Write)
-            .with_domain_metadata("foo", "bar")
-    })?
+    let committed = begin_transaction_with(
+        snapshot_v0.clone(),
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "test-engine",
+        |builder| builder.with_domain_metadata("foo", "bar"),
+    )?
     .commit(engine.as_ref())?
     .unwrap_committed();
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
@@ -1527,8 +1560,7 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> Result<()> {
     // -- v1: commit with my-app=1 --
     let committed = snapshot_v0
         .clone()
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .with_transaction_id("my-app", 1)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
@@ -1573,8 +1605,7 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> Result<()> {
     // -- v2: commit with my-app=2 (upsert) + other-app=1 (new) --
     let committed = snapshot_v1
         .clone()
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .with_transaction_id("my-app", 2)
         .with_transaction_id("other-app", 1)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -1628,8 +1659,7 @@ async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> Resu
     let snapshot_v0 = committed.post_commit_snapshot().unwrap();
     let committed = snapshot_v0
         .clone()
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .with_transaction_id("v1-app", 1)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
@@ -1652,8 +1682,7 @@ async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> Resu
     // v2: commit with my-app=1; post-commit CRC accumulates into Partial.
     let committed = snapshot_v1_reloaded
         .clone()
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .with_transaction_id("my-app", 1)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
@@ -1732,8 +1761,7 @@ async fn test_set_txn_expiration_via_crc_fast_path(
     // v1: commit a set transaction for "my-app" (lastUpdated = now)
     let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
     let committed = snapshot_v0
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .with_transaction_id("my-app", 1)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
@@ -1781,8 +1809,7 @@ async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> Result
     // v1: commit my-app=1, write CRC at v1.
     let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
     let committed = snapshot_v0
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .with_transaction_id("my-app", 1)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
@@ -1798,8 +1825,7 @@ async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> Result
 
     // v2: commit my-app=2 from the Partial base; post-commit CRC is Partial(map) containing my-app.
     let committed = snapshot_v1_reloaded
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .with_transaction_id("my-app", 2)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
@@ -2068,11 +2094,13 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> Result<()>
 
     // ===== v3: remove all files =====
     let scan = snapshot.clone().scan_builder().build()?;
-    let mut txn = begin_transaction_with(snapshot.clone(), engine.as_ref(), |builder| {
-        builder
-            .with_operation(delta_kernel::transaction::UpdateTableOperation::Delete)
-            .with_data_change(true)
-    })?;
+    let mut txn = begin_transaction_with(
+        snapshot.clone(),
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Delete,
+        "test-engine",
+        |builder| builder.with_data_change(true),
+    )?;
     for sm in scan.scan_metadata(engine.as_ref())? {
         txn.remove_files(sm?.scan_files);
     }
@@ -2212,11 +2240,13 @@ async fn test_file_histogram_with_bin_type_and_operation_type(
         assert_eq!(committed.commit_version(), 2);
         committed.post_commit_snapshot().unwrap().clone()
     } else {
-        let committed = begin_transaction_with(fresh_v1, engine.as_ref(), |builder| {
-            builder.with_operation(delta_kernel::transaction::UpdateTableOperation::Custom(
-                "ANALYZE STATS".to_string(),
-            ))
-        })?
+        let committed = begin_transaction_with(
+            fresh_v1,
+            engine.as_ref(),
+            delta_kernel::transaction::UpdateTableOperation::Custom("ANALYZE STATS".to_string()),
+            "test-engine",
+            |builder| builder,
+        )?
         .commit(engine.as_ref())?
         .unwrap_committed();
         assert_eq!(committed.commit_version(), 2);
@@ -2294,8 +2324,7 @@ async fn commit_data<E: TaskExecutor>(
     )
     .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
     let builder = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .with_data_change(true);
     let mut txn =
         customize(builder).build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
@@ -2492,11 +2521,13 @@ async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate() -> 
     .unwrap_post_commit_snapshot();
 
     // ===== WHEN: a non-incremental operation (ANALYZE STATS) commits at v2 =====
-    begin_transaction_with(snap, engine.as_ref(), |builder| {
-        builder.with_operation(delta_kernel::transaction::UpdateTableOperation::Custom(
-            "ANALYZE STATS".to_string(),
-        ))
-    })?
+    begin_transaction_with(
+        snap,
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Custom("ANALYZE STATS".to_string()),
+        "test-engine",
+        |builder| builder,
+    )?
     .commit(engine.as_ref())?
     .unwrap_committed();
 

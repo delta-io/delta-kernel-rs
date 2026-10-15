@@ -634,8 +634,7 @@ async fn setup_table_with_dms_and_set_txns(write_crc: bool) -> Result<(Url, temp
         .unwrap_post_commit_snapshot();
 
     let snap_v1 = snap_v0
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .with_domain_metadata("myapp.config".to_string(), "v1".to_string())
         .with_transaction_id("my-app", 1)
         .build(engine.as_ref(), committer())?

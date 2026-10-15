@@ -45,8 +45,7 @@ The pattern for partitioned writes is: **group your data by partition values, cr
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let mut txn = snapshot
-    .transaction_builder()
-    .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
+    .update_table(UpdateTableOperation::Custom("INSERT".to_string()), "my-app/1.0")
     .with_data_change(true)
     .build(&engine, Box::new(FileSystemCommitter::new()))?;
 

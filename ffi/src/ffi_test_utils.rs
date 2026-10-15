@@ -19,8 +19,7 @@ use crate::{
     snapshot_builder_build,
     transaction::{
         new_update_table_txn_builder, update_table_txn_builder_build,
-        update_table_txn_builder_with_operation, ExclusiveUpdateTableTransaction,
-        KernelUpdateTableOperation,
+        ExclusiveUpdateTableTransaction, KernelUpdateTableOperation,
     },
     ExternEngine, SharedExternEngine, SharedSnapshot,
 };
@@ -133,9 +132,14 @@ pub(crate) unsafe fn build_update_table_txn(
     engine: crate::handle::Handle<SharedExternEngine>,
 ) -> ExternResult<crate::handle::Handle<ExclusiveUpdateTableTransaction>> {
     let snapshot = unsafe { build_snapshot(path, engine.shallow_copy()) };
-    let builder = unsafe { new_update_table_txn_builder(snapshot.shallow_copy()) };
+    let engine_info = "test-engine/1.0";
     let builder = unsafe {
-        update_table_txn_builder_with_operation(builder, KernelUpdateTableOperation::Write)
+        ok_or_panic(new_update_table_txn_builder(
+            snapshot.shallow_copy(),
+            KernelUpdateTableOperation::Write,
+            kernel_string_slice!(engine_info),
+            engine.shallow_copy(),
+        ))
     };
     unsafe { free_snapshot(snapshot) };
     unsafe { update_table_txn_builder_build(builder, engine) }

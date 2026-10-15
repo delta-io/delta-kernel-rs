@@ -169,18 +169,17 @@ int main(int argc, char* argv[]) {
   snapshot = snapshot_res.ok;
 
   // === Configure and build transaction intent ===
-  ExclusiveUpdateTableTransactionBuilder* txn_builder = new_update_table_txn_builder(snapshot);
   const char* engine_info = "update_dv_example";
   KernelStringSlice engine_info_slice = { engine_info, strlen(engine_info) };
-  ExternResultHandleExclusiveUpdateTableTransactionBuilder with_info_res =
-      update_table_txn_builder_with_engine_info(txn_builder, engine_info_slice, engine);
-  if (with_info_res.tag != OkHandleExclusiveUpdateTableTransactionBuilder) {
-    err = (Error*)with_info_res.err;
-    print_error("setting builder engine info failed.", err);
+  ExternResultHandleExclusiveUpdateTableTransactionBuilder builder_res =
+      new_update_table_txn_builder(
+          snapshot, KernelUpdateTableOperationUpdate, engine_info_slice, engine);
+  if (builder_res.tag != OkHandleExclusiveUpdateTableTransactionBuilder) {
+    err = (Error*)builder_res.err;
+    print_error("Failed to create transaction builder.", err);
     goto cleanup;
   }
-  txn_builder = update_table_txn_builder_with_operation(
-      with_info_res.ok, KernelUpdateTableOperationUpdate);
+  ExclusiveUpdateTableTransactionBuilder* txn_builder = builder_res.ok;
   ExternResultHandleExclusiveUpdateTableTransaction txn_res =
       update_table_txn_builder_build(txn_builder, engine);
   if (txn_res.tag != OkHandleExclusiveUpdateTableTransaction) {

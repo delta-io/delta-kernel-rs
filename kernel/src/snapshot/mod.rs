@@ -42,7 +42,7 @@ use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{physical_to_logical_column_name_and_type, Operation, TableFeature};
 use crate::table_properties::TableProperties;
-use crate::transaction::UpdateTableTransactionBuilder;
+use crate::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
 use crate::utils::require;
 use crate::{Engine, KernelError, KernelResult, LogCompactionWriter, Result, Version};
 
@@ -102,17 +102,18 @@ pub struct Snapshot {
     /// Whether the last applicable incremental build requested ignoring new checkpoints.
     skipped_new_checkpoints: bool,
     /// How this snapshot's latest AMT `checkpoint` action was resolved at build time: captured
-    /// during P&M replay, hinted by the CRC's manifest-commit pointer, or unresolved (see
+    /// during P&M replay, named by the CRC's `lastManifestCommit`, or unresolved (see
     /// [`CheckpointActionResolution`]). [`Snapshot::latest_checkpoint_action`] serves `Captured`
-    /// directly; for `Hint`/`Unresolved` it scans the log and memoizes the result in
-    /// [`Self::checkpoint_action`].
+    /// directly; for `Located` it reads the named commit, for `Unresolved` it scans the log, and
+    /// memoizes the result in [`Self::checkpoint_action`].
     #[cfg(feature = "adaptive-metadata-in-dev")]
     checkpoint_action_resolution: CheckpointActionResolution,
-    /// Memoized scan result backing [`Self::checkpoint_action_resolution`]'s `Hint`/`Unresolved`
-    /// path, filled after the first successful scan so later calls do not re-scan (a failed scan
-    /// is not cached and is retried); unused for a `Captured` resolution, which serves
-    /// its action directly. `None` means the scan found no checkpoint action in this snapshot's
-    /// log segment (a classic non-AMT table, or an AMT table that has none yet).
+    /// Memoized lookup result backing [`Self::checkpoint_action_resolution`]'s
+    /// `Located`/`Unresolved` path, filled after the first successful lookup so later calls do
+    /// not re-read (a failed lookup is not cached and is retried); unused for a `Captured`
+    /// resolution, which serves its action directly. `None` means the lookup found no checkpoint
+    /// action in this snapshot's log segment (a classic non-AMT table, or an AMT table that
+    /// has none yet).
     ///
     /// Safe to memoize: the snapshot's `log_segment` is frozen and Delta log files are immutable,
     /// so the scanned result cannot change for this snapshot. A checkpoint written later belongs
@@ -272,34 +273,33 @@ impl Snapshot {
 
     /// The latest AMT `checkpoint` action this snapshot covers, or `None` when this snapshot's log
     /// segment has no checkpoint action (a classic non-AMT table, or an AMT table that has none
-    /// yet). Serves the action captured during P&M replay directly; otherwise (a CRC hint, or an
-    /// unresolved build) scans the log once and memoizes a successful scan, so later calls do not
-    /// re-scan (a failed scan is not cached and is retried). Memoizing is correct because the
-    /// snapshot's `log_segment` is frozen and Delta log files are immutable.
+    /// yet). Serves the action captured during P&M replay directly; otherwise reads it from the
+    /// manifest commit the CRC names (erroring if the CRC and the log disagree), or scans the log
+    /// when there is no CRC pointer, and memoizes a successful result so
+    /// later calls do not re-read (a failure is not cached and is retried). Memoizing is correct
+    /// because the snapshot's `log_segment` is frozen and Delta log files are immutable.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub(crate) fn latest_checkpoint_action(
         &self,
         engine: &dyn Engine,
     ) -> Result<Option<Arc<CheckpointAction>>> {
-        match &self.checkpoint_action_resolution {
+        let pointer = match &self.checkpoint_action_resolution {
             // Captured during replay: serve it directly (cheap `Arc` clone).
-            CheckpointActionResolution::Captured(action) => Ok(Some(action.clone())),
-            // TODO(#3495): when a `Hint` is present, resolve the action from the single manifest
-            // commit it names instead of scanning the whole log. For now both scan, memoizing the
-            // result. A concurrent caller may win the race to fill the cell; both compute the same
-            // action, so either value is correct.
-            CheckpointActionResolution::Hint(_) | CheckpointActionResolution::Unresolved => {
-                if let Some(cached) = self.checkpoint_action.get() {
-                    return Ok(cached.clone());
-                }
-                let found = self
-                    .log_segment
-                    .find_last_checkpoint_action(engine)?
-                    .map(Arc::new);
-                let _ = self.checkpoint_action.set(found.clone());
-                Ok(found)
-            }
+            CheckpointActionResolution::Captured(action) => return Ok(Some(action.clone())),
+            CheckpointActionResolution::Located(pointer) => Some(pointer),
+            CheckpointActionResolution::Unresolved => None,
+        };
+        // A concurrent caller may win the race to fill the cell; both compute the same action, so
+        // either value is correct.
+        if let Some(cached) = self.checkpoint_action.get() {
+            return Ok(cached.clone());
         }
+        let found = self
+            .log_segment
+            .find_last_checkpoint_action(engine, pointer)?
+            .map(Arc::new);
+        let _ = self.checkpoint_action.set(found.clone());
+        Ok(found)
     }
 
     /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`]. Takes Protocol and Metadata
@@ -1121,12 +1121,45 @@ impl Snapshot {
         IncrementalScanBuilder::new(self, base_version)
     }
 
-    /// Creates a builder for a transaction against this snapshot.
+    /// Creates a builder with the given `operation` and connector name/version `engine_info`.
     ///
-    /// The builder supports both data-changing transactions and schema changes. Configuration is
-    /// validated when [`UpdateTableTransactionBuilder::build`] is called.
-    pub fn transaction_builder(self: Arc<Self>) -> UpdateTableTransactionBuilder {
-        UpdateTableTransactionBuilder::new(self)
+    /// Returns a builder supporting both data-changing transactions and schema changes.
+    /// Both values are recorded in `commitInfo` and cannot be changed on the builder or
+    /// transaction. Invalid custom names and incompatible configuration are rejected by
+    /// [`UpdateTableTransactionBuilder::build`].
+    ///
+    /// An operation and engine info are required:
+    ///
+    /// ```compile_fail,E0061
+    /// # use delta_kernel::snapshot::SnapshotRef;
+    /// # use delta_kernel::transaction::UpdateTableOperation;
+    /// fn configure(snapshot: SnapshotRef) {
+    ///     let _ = snapshot.clone().update_table();
+    ///     let _ = snapshot.update_table(UpdateTableOperation::Write);
+    /// }
+    /// ```
+    ///
+    /// Neither value can be replaced with a setter:
+    ///
+    /// ```compile_fail,E0599
+    /// # use delta_kernel::transaction::Transaction;
+    /// fn configure(transaction: Transaction) {
+    ///     let _ = transaction.with_engine_info("my-app/1.0");
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail,E0599
+    /// # use delta_kernel::transaction::UpdateTableTransactionBuilder;
+    /// fn configure(builder: UpdateTableTransactionBuilder) {
+    ///     let _ = builder.with_engine_info("my-app/1.0");
+    /// }
+    /// ```
+    pub fn update_table(
+        self: Arc<Self>,
+        operation: UpdateTableOperation,
+        engine_info: impl Into<String>,
+    ) -> UpdateTableTransactionBuilder {
+        UpdateTableTransactionBuilder::new(self, operation, engine_info.into())
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.

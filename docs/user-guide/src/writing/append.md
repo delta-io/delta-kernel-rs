@@ -42,9 +42,7 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
 // 2. Create a transaction
 let mut txn = snapshot
-    .transaction_builder()
-    .with_operation(UpdateTableOperation::Write)
-    .with_engine_info("my-app/1.0")
+    .update_table(UpdateTableOperation::Write, "my-app/1.0")
     .with_data_change(true)
     .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
@@ -93,19 +91,19 @@ writing against:
 
 ```rust,ignore
 let mut txn = snapshot
-    .transaction_builder()
-    .with_operation(UpdateTableOperation::Write)
-    .with_engine_info("my-app/1.0")
+    .update_table(UpdateTableOperation::Write, "my-app/1.0")
     .with_data_change(true)
     .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
 
-The builder methods:
+Pass the operation and connector name/version to `snapshot.update_table(operation, engine_info)`.
+Kernel records both in the commit log. Use `UpdateTableOperation::Custom` for connector-specific
+operation names. You can't change either value on the returned builder or transaction.
+
+The optional builder methods:
 
 | Method | Purpose |
 |--------|---------|
-| `with_operation(UpdateTableOperation)` | Required before `build()`. Sets the typed operation stored in the commit log. Use `UpdateTableOperation::Custom` for connector-specific names |
-| `with_engine_info(impl Into<String>)` | Supplies the connector name and version recorded in commit information |
 | `with_data_change(bool)` | Whether this commit materially changes data (`true`) or just reorganizes it (`false`, e.g. OPTIMIZE) |
 
 ## WriteState and BoundWriteContext
@@ -249,8 +247,7 @@ construction:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction_builder()
-    .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
+    .update_table(UpdateTableOperation::Custom("INSERT".to_string()), "my-app/1.0")
     .with_blind_append()
     .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
@@ -282,8 +279,7 @@ that action, call `with_commit_info()` with your custom data and its schema:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction_builder()
-    .with_operation(UpdateTableOperation::Custom("INSERT".to_string()))
+    .update_table(UpdateTableOperation::Custom("INSERT".to_string()), "my-app/1.0")
     .with_operation_parameters([("mode", Some("Append")), ("predicate", None)])
     .with_operation_metrics([("numFiles", Some("1"))])
     .build(&engine, Box::new(FileSystemCommitter::new()))?
@@ -306,7 +302,7 @@ these fields in your custom commit info:
 | `operationMetrics` | Metrics recorded for the operation | The value from `with_operation_metrics()`. Omitted when unset. An explicitly empty map is written as `{}` |
 | `kernelVersion` | The Kernel library version | Current Kernel version |
 | `isBlindAppend` | Whether the commit is a blind append | `true` after `with_blind_append()`. Omitted (`false`) otherwise |
-| `engineInfo` | The engine identifier | Omitted for existing-table transactions when unset. Required by create table |
+| `engineInfo` | The engine identifier | Always written using the connector name and version required by the transaction constructor |
 | `txnId` | A unique transaction identifier | A new UUID generated for the commit |
 
 Kernel ignores reserved fields in custom commit info. Use `with_operation_parameters()` and

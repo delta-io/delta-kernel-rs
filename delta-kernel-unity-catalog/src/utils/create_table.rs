@@ -428,8 +428,7 @@ mod tests {
             .build(&engine)
             .unwrap();
         let result = v0_snapshot
-            .transaction_builder()
-            .with_operation(UpdateTableOperation::Write)
+            .update_table(UpdateTableOperation::Write, "test-engine")
             .build(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
             .commit(&engine)

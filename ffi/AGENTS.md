@@ -910,8 +910,8 @@ than monomorphizing builder state.
 
 ```
 get_default_engine() -> get_snapshot_builder() -> snapshot_builder_build()
-  -> new_update_table_txn_builder() -> update_table_txn_builder_with_engine_info()
-  -> update_table_txn_builder_with_operation() -> update_table_txn_builder_build()
+  -> new_update_table_txn_builder(snapshot, operation, engine_info, engine)
+  -> update_table_txn_builder_build()
   -> update_table_txn_add_files() -> update_table_txn_commit()
                     |
                     v
@@ -920,6 +920,12 @@ get_default_engine() -> get_snapshot_builder() -> snapshot_builder_build()
                                                                                   v
                                                                   free_committed_transaction
 ```
+
+Update operations and engine info are required at construction and cannot be changed.
+`new_update_table_txn_builder` accepts a typed operation;
+`new_update_table_txn_builder_with_custom_operation` accepts a connector-defined name.
+Both accept engine info and an engine for UTF-8 errors, borrow all inputs, and retain their own
+snapshot reference only after decoding the strings. Custom-name restrictions are validated at build.
 
 `update_table_txn_commit()` and `create_table_txn_commit()` return a `Handle<ExclusiveCommittedTransaction>` that the caller can read via `committed_transaction_version` and `committed_transaction_post_commit_snapshot`, then must release with `free_committed_transaction`. The post-commit snapshot, when present, is a separate `SharedSnapshot` handle that must be freed with `free_snapshot`.
 
@@ -947,8 +953,7 @@ Column defaults (`allowColumnDefaults`) live in `ffi/src/column_default.rs`. The
 defaults but never materializes them, so the connector fills every omitted column itself:
 
 ```
-new_update_table_txn_builder()
-  -> update_table_txn_builder_with_operation()
+new_update_table_txn_builder(snapshot, operation, engine_info, engine)
   -> update_table_txn_builder_build()
   -> update_table_txn_visit_top_level_column_defaults(txn, engine, ctx, visitor)
   -> update_table_txn_ack_column_defaults(txn)   // REQUIRED, else the write context errors with
@@ -961,8 +966,7 @@ new_update_table_txn_builder()
 Deletion vector update flow:
 
 ```
-new_update_table_txn_builder()
-  -> update_table_txn_builder_with_operation()
+new_update_table_txn_builder(snapshot, operation, engine_info, engine)
   -> update_table_txn_builder_build()
   -> dv_descriptor_map_new()
   -> dv_descriptor_new()

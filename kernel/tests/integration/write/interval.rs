@@ -61,10 +61,13 @@ mod supported {
             .unwrap_post_commit_snapshot();
         let table_url = snapshot.table_root().clone();
 
-        let mut txn =
-            load_and_begin_transaction_with(table_url.clone(), engine.as_ref(), |builder| {
-                builder.with_engine_info("default engine")
-            })?;
+        let mut txn = load_and_begin_transaction_with(
+            table_url.clone(),
+            engine.as_ref(),
+            delta_kernel::transaction::UpdateTableOperation::Write,
+            "default engine",
+            |builder| builder,
+        )?;
         let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
         let arrow_schema = Arc::new(arrow_schema);
         let nested_fields = match arrow_schema.field_with_name("nested").unwrap().data_type() {

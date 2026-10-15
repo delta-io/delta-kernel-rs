@@ -108,9 +108,13 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let mut txn = load_and_begin_transaction_with(table_url.clone(), &engine, |builder| {
-        builder.with_engine_info("ict test")
-    })?;
+    let mut txn = load_and_begin_transaction_with(
+        table_url.clone(),
+        &engine,
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "ict test",
+        |builder| builder,
+    )?;
 
     // Add some data
     generate_and_add_data_file(&mut txn, &engine, schema.clone(), vec![1, 2, 3]).await?;
@@ -154,9 +158,13 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let mut txn2 = load_and_begin_transaction_with(table_url.clone(), &engine, |builder| {
-        builder.with_engine_info("ict test 2")
-    })?;
+    let mut txn2 = load_and_begin_transaction_with(
+        table_url.clone(),
+        &engine,
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "ict test 2",
+        |builder| builder,
+    )?;
 
     // Add more data
     generate_and_add_data_file(&mut txn2, &engine, schema, vec![4, 5, 6]).await?;

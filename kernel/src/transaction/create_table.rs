@@ -39,17 +39,18 @@ use crate::transaction::{CreateTable, Transaction};
 /// A type alias for create-table transactions.
 ///
 /// This provides a restricted API surface that only exposes operations valid during table
-/// creation. Operations like removing files, removing domain metadata, updating deletion
-/// vectors, and setting blind append are not available at compile time.
+/// creation. Operations like removing files, removing domain metadata, and updating deletion
+/// vectors are not available at compile time.
+///
+/// Create-table transactions always record `"CREATE TABLE"` as their operation.
+/// Create-table builders do not support blind append.
 ///
 /// # Operations NOT available on create-table transactions
 ///
 /// - **`with_domain_metadata_removed()`** — Cannot remove domain metadata from a table that doesn't
 ///   exist yet.
 /// - **`remove_files()`** — Cannot remove files from a table that has no files.
-/// - **`with_blind_append()`** — Blind append semantics don't apply to table creation.
 /// - **`update_deletion_vectors()`** — Deletion vectors require an existing table.
-/// - **`with_operation()`** — The operation is fixed to `"CREATE TABLE"`.
 ///
 /// # Example
 ///
@@ -83,6 +84,16 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 /// * `path` - The file system path where the Delta table will be created
 /// * `schema` - The schema for the new table
 /// * `engine_info` - Information about the engine creating the table (e.g., "MyApp/1.0")
+///
+/// Engine info is required at construction:
+///
+/// ```compile_fail,E0061
+/// # use delta_kernel::schema::SchemaRef;
+/// # use delta_kernel::transaction::create_table::create_table;
+/// fn configure(schema: SchemaRef) {
+///     let _ = create_table("/path/to/table", schema);
+/// }
+/// ```
 ///
 /// # Example
 ///

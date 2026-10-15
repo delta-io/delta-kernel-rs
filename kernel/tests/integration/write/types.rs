@@ -46,10 +46,13 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let mut txn =
-        test_utils::load_and_begin_transaction_with(table_url.clone(), &engine, |builder| {
-            builder.with_engine_info("default engine")
-        })?;
+    let mut txn = test_utils::load_and_begin_transaction_with(
+        table_url.clone(),
+        &engine,
+        UpdateTableOperation::Write,
+        "default engine",
+        |builder| builder,
+    )?;
 
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
     // These are microseconds since Unix epoch
@@ -135,10 +138,13 @@ async fn test_append_timestamp_stats_are_millisecond_truncated(
     )
     .await?;
 
-    let mut txn =
-        test_utils::load_and_begin_transaction_with(table_url.clone(), &engine, |builder| {
-            builder.with_engine_info("default engine")
-        })?;
+    let mut txn = test_utils::load_and_begin_transaction_with(
+        table_url.clone(),
+        &engine,
+        UpdateTableOperation::Write,
+        "default engine",
+        |builder| builder,
+    )?;
 
     // Spans [.298677, .307735]; a conforming writer floors the stats to [.298, .307].
     let timestamp_values = vec![1_783_007_755_298_677i64, 1_783_007_755_307_735i64];
@@ -232,10 +238,13 @@ async fn test_append_variant(
     )
     .await?;
 
-    let mut txn =
-        test_utils::load_and_begin_transaction_with(table_url.clone(), &engine, |builder| {
-            builder.with_data_change(true)
-        })?;
+    let mut txn = test_utils::load_and_begin_transaction_with(
+        table_url.clone(),
+        &engine,
+        UpdateTableOperation::Write,
+        "test-engine",
+        |builder| builder.with_data_change(true),
+    )?;
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -427,10 +436,13 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     )
     .await?;
 
-    let mut txn =
-        test_utils::load_and_begin_transaction_with(table_url.clone(), &engine, |builder| {
-            builder.with_data_change(true)
-        })?;
+    let mut txn = test_utils::load_and_begin_transaction_with(
+        table_url.clone(),
+        &engine,
+        UpdateTableOperation::Write,
+        "test-engine",
+        |builder| builder.with_data_change(true),
+    )?;
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -566,9 +578,13 @@ async fn test_not_null_data_column_rejects_null_in_batch(
         "non-null schema must auto-enable the `invariants` writer feature",
     );
 
-    let txn = test_utils::begin_transaction_with(snapshot, engine.as_ref(), |builder| {
-        builder.with_engine_info("default engine")
-    })?;
+    let txn = test_utils::begin_transaction_with(
+        snapshot,
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "default engine",
+        |builder| builder,
+    )?;
     let write_context = txn.write_state()?.write_context_builder().build()?;
 
     // Use the connector-facing physical schema (not the logical one); the logical schema
@@ -612,8 +628,7 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         .build(engine.as_ref())
         .expect("snapshot should build");
     let mut txn = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
         .expect("transaction should create");
 
@@ -752,8 +767,7 @@ async fn write_state_creation_fails_fast_on_invalid_void_schema(
         .build(engine.as_ref())
         .expect("snapshot should build");
     let txn = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
         .expect("transaction should create");
 
@@ -787,8 +801,7 @@ async fn write_context_excludes_void_from_physical_schema() -> Result<(), Box<dy
     }
 
     let txn = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
     let wc = txn.write_state()?.write_context_builder().build()?;
@@ -817,8 +830,7 @@ async fn metadata_only_commit_with_void_in_array_succeeds() -> Result<(), Box<dy
     let engine = Arc::new(engine);
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let txn = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
     // Commit with NO add_files — this is a metadata-only operation and should succeed
@@ -864,8 +876,7 @@ async fn write_context_excludes_nested_void_from_physical_schema(
     }
 
     let txn = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let wc = txn.write_state()?.write_context_builder().build()?;
     let physical = wc.physical_data_schema();
@@ -905,8 +916,7 @@ async fn write_transform_drops_nested_void_fields() -> Result<(), Box<dyn std::e
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
     let txn = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::Write)
+        .update_table(UpdateTableOperation::Write, "test-engine")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let wc = txn.write_state()?.write_context_builder().build()?;
 

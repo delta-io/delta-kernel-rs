@@ -15,7 +15,7 @@ $ cargo build -p delta_kernel_ffi [--release] --features tracing
 $ cargo build [--release] --features tracing
 ```
 
-There are two configurations that can currently be configured in cmake:
+Available CMake options include:
 ```bash
 # turn on VERBOSE mode (default is off) - print more diagnostics
 $ cmake -DVERBOSE=yes ..
@@ -61,5 +61,25 @@ brew install apache-arrow-glib
 If you don't want to have to install this, you can run `ccmake ..` (`cmake-gui.exe ..` on windows)
 from the `build` directory, and turn `OFF`/uncheckmark `PRINT_DATA`. Then "configure" and
 "generate" and follow the above instructions again.
+
+## UDT annotation tests
+
+The UDT schema round-trip test requires both the Rust `udt-in-dev` feature and CMake's
+`UDT_IN_DEV=ON` option. The CMake option registers the test; it does not enable the Rust feature.
+Run these commands from the repository root:
+
+```sh
+cargo build -p delta_kernel_ffi --features tracing,udt-in-dev
+mkdir -p ffi/examples/read-table/build
+cd ffi/examples/read-table/build
+cmake .. -DUDT_IN_DEV=ON -DPRINT_DATA=OFF
+cmake --build .
+ctest -R '^udt_annotation_' --output-on-failure
+```
+
+`PRINT_DATA=OFF` avoids the Arrow GLib dependency for these schema tests. The C example owns
+annotation keys and values as C strings, with a null value pointer representing JSON `null`.
+Embedded NUL bytes in annotation strings are rejected. The tests check that rejection and the
+schema round trip, including annotation lifetimes after the source Rust schemas are released.
 
 [cmake]: https://cmake.org/

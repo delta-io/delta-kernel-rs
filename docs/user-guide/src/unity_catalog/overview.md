@@ -135,8 +135,8 @@ connector reads or writes a UC-managed table.
  │  1. UCClient::load_table("cat", "schema", "table")        │
  │  2. UCClient::get_table_credentials(.., ReadWrite)        │
  │  3. snapshot_builder_from_load_table(&resp)?.build(..)    │
- │  4. snapshot.transaction_builder()                        │
- │       .with_operation(UpdateTableOperation::Write)        │
+ │  4. snapshot.update_table(                                │
+ │       UpdateTableOperation::Write, engine_info)           │
  │       .build(&engine, Box::new(UCCommitter::new(...)))?   │
  │       .commit(&engine)?                                   │
  └──────┬─────────────────────────┬──────────────────────────┘

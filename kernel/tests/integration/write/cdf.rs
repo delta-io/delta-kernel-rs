@@ -57,9 +57,13 @@ async fn write_data_to_table(
     schema: SchemaRef,
     values: Vec<i32>,
 ) -> Result<Version, Box<dyn std::error::Error>> {
-    let mut txn = load_and_begin_transaction_with(table_url.clone(), engine.as_ref(), |builder| {
-        builder.with_engine_info("test")
-    })?;
+    let mut txn = load_and_begin_transaction_with(
+        table_url.clone(),
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "test",
+        |builder| builder,
+    )?;
 
     add_files_to_transaction(&mut txn, engine, schema, values).await?;
 
@@ -122,11 +126,13 @@ async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error:
 
     // Now remove the files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction_with(snapshot.clone(), engine.as_ref(), |builder| {
-        builder
-            .with_engine_info("cdf remove test")
-            .with_data_change(true)
-    })?;
+    let mut txn = begin_transaction_with(
+        snapshot.clone(),
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "cdf remove test",
+        |builder| builder.with_data_change(true),
+    )?;
 
     let scan = snapshot.scan_builder().build()?;
     let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
@@ -162,11 +168,13 @@ async fn test_cdf_write_mixed_no_data_change_succeeds() -> Result<(), Box<dyn st
 
     // Now create a transaction with both add AND remove files, but dataChange=false
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction_with(snapshot.clone(), engine.as_ref(), |builder| {
-        builder
-            .with_engine_info("cdf mixed test")
-            .with_data_change(false)
-    })?; // dataChange=false is key here
+    let mut txn = begin_transaction_with(
+        snapshot.clone(),
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "cdf mixed test",
+        |builder| builder.with_data_change(false),
+    )?; // dataChange=false is key here
 
     // Add new files
     add_files_to_transaction(&mut txn, &engine, schema, vec![4, 5, 6]).await?;
@@ -205,11 +213,13 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
 
     // Now create a transaction with both add AND remove files with dataChange=true
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction_with(snapshot.clone(), engine.as_ref(), |builder| {
-        builder
-            .with_engine_info("cdf mixed fail test")
-            .with_data_change(true)
-    })?; // dataChange=true - this should fail
+    let mut txn = begin_transaction_with(
+        snapshot.clone(),
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "cdf mixed fail test",
+        |builder| builder.with_data_change(true),
+    )?; // dataChange=true - this should fail
 
     // Add new files
     add_files_to_transaction(&mut txn, &engine, schema, vec![4, 5, 6]).await?;
@@ -269,17 +279,26 @@ async fn test_file_rewrite_resolves_data_change_before_cdf_validation(
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 
-    let mut txn = begin_transaction_with(before.clone(), engine.as_ref(), |mut builder| {
-        if schema_change {
-            builder = builder
-                .with_operation(UpdateTableOperation::AlterTable)
-                .add_column(StructField::nullable("added", DataType::INTEGER));
-        }
-        if let Some(data_change) = explicit_data_change {
-            builder = builder.with_data_change(data_change);
-        }
-        builder
-    })?;
+    let operation = if schema_change {
+        UpdateTableOperation::AlterTable
+    } else {
+        UpdateTableOperation::Write
+    };
+    let mut txn = begin_transaction_with(
+        before.clone(),
+        engine.as_ref(),
+        operation,
+        "test-engine",
+        |mut builder| {
+            if schema_change {
+                builder = builder.add_column(StructField::nullable("added", DataType::INTEGER));
+            }
+            if let Some(data_change) = explicit_data_change {
+                builder = builder.with_data_change(data_change);
+            }
+            builder
+        },
+    )?;
     let new_file = create_add_files_metadata(
         txn.add_files_schema(),
         vec![(

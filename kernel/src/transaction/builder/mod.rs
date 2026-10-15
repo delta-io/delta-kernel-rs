@@ -11,7 +11,7 @@ pub mod update_table;
 
 use std::sync::Arc;
 
-use self::state::TransactionBuilderState;
+pub(super) use self::state::TransactionBuilderState;
 use crate::actions::DomainMetadata;
 use crate::schema::SchemaRef;
 use crate::transaction::commit_info::collect_operation_metadata;
@@ -33,14 +33,14 @@ pub trait TransactionType: private::Sealed {
 /// Shared setters preserve the transaction type. Constructors, type-specific setters, and
 /// `build` are provided by the specialized implementations for [`CreateTable`] and [`UpdateTable`].
 /// Use [`create_table`](super::create_table::create_table) or
-/// [`Snapshot::transaction_builder`](crate::Snapshot::transaction_builder) to obtain a builder.
+/// [`Snapshot::update_table`](crate::Snapshot::update_table) to obtain a builder.
 ///
-/// Create-table builders cannot configure existing-table operations:
+/// The operation cannot be changed on a builder:
 ///
 /// ```compile_fail,E0599
-/// use delta_kernel::transaction::{CreateTable, TransactionBuilder, UpdateTableOperation};
+/// use delta_kernel::transaction::{TransactionBuilder, UpdateTableOperation};
 ///
-/// fn configure(builder: TransactionBuilder<CreateTable>) {
+/// fn configure(builder: TransactionBuilder) {
 ///     let _ = builder.with_operation(UpdateTableOperation::Write);
 /// }
 /// ```
@@ -189,9 +189,11 @@ mod tests {
     }
 
     impl TransactionBuilder<CustomType> {
-        fn with_test_engine_info(mut self, engine_info: &str) -> Self {
-            self.common_state.engine_info = Some(engine_info.into());
-            self
+        fn new(engine_info: &str) -> Self {
+            Self {
+                common_state: TransactionBuilderState::for_update_table(engine_info.into()),
+                local_state: (),
+            }
         }
     }
 
@@ -212,17 +214,11 @@ mod tests {
     }
 
     #[test]
-    fn custom_type_supports_shared_and_specialized_setters_without_custom_state() {
-        let builder = TransactionBuilder::<CustomType> {
-            common_state: TransactionBuilderState::default(),
-            local_state: (),
-        };
-        let builder = configure_shared_setters(builder).with_test_engine_info("test-engine");
+    fn custom_type_supports_shared_setters_without_custom_state() {
+        let builder = TransactionBuilder::<CustomType>::new("test-engine");
+        let builder = configure_shared_setters(builder);
 
-        assert_eq!(
-            builder.common_state.engine_info.as_deref(),
-            Some("test-engine")
-        );
+        assert_eq!(builder.common_state.engine_info, "test-engine");
         assert_eq!(
             builder.common_state.correlation_id.as_deref(),
             Some("correlation")

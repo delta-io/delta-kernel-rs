@@ -313,8 +313,10 @@ mod tests {
     ) -> KernelResult<(Arc<dyn Engine>, Transaction)> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let txn = snapshot
-            .transaction_builder()
-            .with_operation(crate::transaction::UpdateTableOperation::Write)
+            .update_table(
+                crate::transaction::UpdateTableOperation::Write,
+                "test-engine",
+            )
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .fold_with(engine_commit_info, |txn, (data, schema)| {
                 txn.with_commit_info(data, schema)

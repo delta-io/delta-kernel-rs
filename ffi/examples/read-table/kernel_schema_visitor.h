@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include <inttypes.h>
 #include <sys/time.h>
 
 /*
@@ -124,6 +125,35 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
     int scale;
     sscanf(item->type, "decimal(%u)(%d)", &precision, &scale);
     visit_res = visit_field_decimal(state, name, precision, scale, item->is_nullable, &metadata, allocate_error);
+  } else if (strcmp(item->type, "udt") == 0) {
+    SchemaItemList child_list = cschema->builder->lists[item->children];
+    if (child_list.len != 1) {
+      printf("[ERROR] Invalid UDT child list length: %" PRIu32 "\n", child_list.len);
+      return 0;
+    }
+    uintptr_t child_id = visit_schema_item(&child_list.list[0], state, cschema);
+    if (child_id == 0) {
+      return 0;
+    }
+    FfiNullableStringMapEntry* entries =
+      calloc(item->udt_annotation.len, sizeof(FfiNullableStringMapEntry));
+    if (item->udt_annotation.len && !entries) {
+      fprintf(stderr, "Could not allocate UDT annotation view\n");
+      exit(EXIT_FAILURE);
+    }
+    for (size_t i = 0; i < item->udt_annotation.len; i++) {
+      UdtAnnotationEntry* entry = &item->udt_annotation.entries[i];
+      entries[i].key = (KernelStringSlice){ entry->key, strlen(entry->key) };
+      entries[i].value.tag = entry->value ? SomeKernelStringSlice : NoneKernelStringSlice;
+      if (entry->value) {
+        entries[i].value.some = (KernelStringSlice){ entry->value, strlen(entry->value) };
+      }
+    }
+    // Rust copies the borrowed annotation before returning.
+    FfiNullableStringMap annotation = { entries, item->udt_annotation.len };
+    visit_res = visit_field_user_defined(
+      state, name, child_id, annotation, item->is_nullable, &metadata, allocate_error);
+    free(entries);
   } else if (strcmp(item->type, "array") == 0) {
     SchemaItemList child_list = cschema->builder->lists[item->children];
     // an array should always have 1 child

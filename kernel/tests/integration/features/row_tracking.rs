@@ -92,9 +92,13 @@ async fn write_data_to_table(
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     data: Vec<ArrowEngineData>,
 ) -> Result<CommitResult> {
-    let mut txn = load_and_begin_transaction_with(table_url.clone(), engine.as_ref(), |builder| {
-        builder.with_data_change(true)
-    })?;
+    let mut txn = load_and_begin_transaction_with(
+        table_url.clone(),
+        engine.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "test-engine",
+        |builder| builder.with_data_change(true),
+    )?;
 
     // Write data out by spawning async tasks to simulate executors
     let write_context = Arc::new(txn.write_state()?.write_context_builder().build()?);
@@ -668,16 +672,20 @@ async fn test_row_tracking_parallel_transactions_conflict() -> Result<()> {
     let snapshot2 = Snapshot::builder_for(table_url.clone()).build(engine2.as_ref())?;
 
     // Create two transactions from the same snapshot (simulating parallel transactions)
-    let mut txn1 = begin_transaction_with(snapshot1, engine1.as_ref(), |builder| {
-        builder
-            .with_engine_info("transaction 1")
-            .with_data_change(true)
-    })?;
-    let mut txn2 = begin_transaction_with(snapshot2, engine2.as_ref(), |builder| {
-        builder
-            .with_engine_info("transaction 2")
-            .with_data_change(true)
-    })?;
+    let mut txn1 = begin_transaction_with(
+        snapshot1,
+        engine1.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "transaction 1",
+        |builder| builder.with_data_change(true),
+    )?;
+    let mut txn2 = begin_transaction_with(
+        snapshot2,
+        engine2.as_ref(),
+        delta_kernel::transaction::UpdateTableOperation::Write,
+        "transaction 2",
+        |builder| builder.with_data_change(true),
+    )?;
 
     // Prepare data for both transactions
     let data1 = RecordBatch::try_new(

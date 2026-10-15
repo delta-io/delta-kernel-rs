@@ -479,7 +479,10 @@ async fn test_create_table_rejects_delta_invariants_metadata() -> Result<()> {
 #[case::builder_metrics(false)]
 #[case::transaction_metrics_replace_builder_metrics(true)]
 #[tokio::test]
-async fn test_create_table_log_actions(#[case] replace_metrics_after_build: bool) -> Result<()> {
+async fn test_create_table_log_actions(
+    #[case] replace_metrics_after_build: bool,
+    #[values("AuditService/2.1.0", "")] engine_info: &str,
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema
@@ -487,8 +490,6 @@ async fn test_create_table_log_actions(#[case] replace_metrics_after_build: bool
         nullable "user_id": LONG,
         nullable "action": STRING,
     };
-
-    let engine_info = "AuditService/2.1.0";
 
     // Create table
     let mut txn = create_table(&table_path, schema, engine_info)

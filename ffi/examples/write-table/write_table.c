@@ -61,25 +61,20 @@ int main(int argc, char* argv[]) {
     return 1;
   }
   SharedSnapshot* snapshot = snapshot_res.ok;
-  ExclusiveUpdateTableTransactionBuilder* txn_builder = new_update_table_txn_builder(snapshot);
-  txn_builder = update_table_txn_builder_with_operation(
-      txn_builder, KernelUpdateTableOperationWrite);
-
-  // This empty commit does not add data.
-  txn_builder = update_table_txn_builder_with_data_change(txn_builder, false);
-
   const char* engine_info = "write_table_example";
   KernelStringSlice engine_info_slice = { engine_info, strlen(engine_info) };
-  ExternResultHandleExclusiveUpdateTableTransactionBuilder with_info_res =
-      update_table_txn_builder_with_engine_info(txn_builder, engine_info_slice, engine);
-  if (with_info_res.tag != OkHandleExclusiveUpdateTableTransactionBuilder) {
-    print_error("setting builder engine info failed.", (Error*)with_info_res.err);
-    free_error((Error*)with_info_res.err);
+  ExternResultHandleExclusiveUpdateTableTransactionBuilder builder_res =
+      new_update_table_txn_builder(
+          snapshot, KernelUpdateTableOperationWrite, engine_info_slice, engine);
+  if (builder_res.tag != OkHandleExclusiveUpdateTableTransactionBuilder) {
+    print_error("Failed to create transaction builder.", (Error*)builder_res.err);
+    free_error((Error*)builder_res.err);
     free_snapshot(snapshot);
     free_engine(engine);
     return 1;
   }
-  txn_builder = with_info_res.ok;
+  ExclusiveUpdateTableTransactionBuilder* txn_builder =
+      update_table_txn_builder_with_data_change(builder_res.ok, false);
   ExternResultHandleExclusiveUpdateTableTransaction txn_res =
       update_table_txn_builder_build(txn_builder, engine);
   if (txn_res.tag != OkHandleExclusiveUpdateTableTransaction) {
