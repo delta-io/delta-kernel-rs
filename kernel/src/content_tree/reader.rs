@@ -20,10 +20,10 @@ use crate::actions::{
 };
 use crate::content_tree::{
     struct_expr_from_schema, ColumnFile, ContentTreeNodeEntry, DataContentType, DataFileFormat,
-    TrackingInfo, TrackingStatus, COLUMN_FILES, CONTENT_TYPE, DV_INFO, FILE_FORMAT,
-    FILE_SIZE_IN_BYTES, FIRST_ROW_ID, FORMAT_VERSION, LOCATION, MANIFEST_DV, MANIFEST_INFO,
-    MODIFIED_SNAPSHOT_ID, PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER, TRACKING,
-    TRACKING_COLUMNS, TRACKING_STATUS,
+    TrackingInfo, TrackingStatus, AMT_FORMAT_VERSION, COLUMN_FILES, CONTENT_TYPE, DV_INFO,
+    FILE_FORMAT, FILE_SIZE_IN_BYTES, FIRST_ROW_ID, FORMAT_VERSION, LOCATION, MANIFEST_DV,
+    MANIFEST_INFO, MODIFIED_SNAPSHOT_ID, PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER,
+    TRACKING, TRACKING_COLUMNS, TRACKING_STATUS,
 };
 use crate::engine_data::{EngineData, FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{lit, ArrayData, ColumnName, Expression, MapData, Scalar};
@@ -165,25 +165,29 @@ impl LeafRef {
         })
     }
 
-    /// Rejects a parent manifest deletion vector, which the read path cannot yet apply to the
-    /// leaf's entries.
+    /// Rejects a leaf the read path cannot yet read: one written before Iceberg v4, or one whose
+    /// parent has a manifest deletion vector, which the read path cannot yet apply to the leaf's
+    /// entries.
     ///
     /// # Errors
-    /// Returns an unsupported error if the parent has a manifest deletion vector, or an invalid
-    /// checkpoint error if it sets only one of `manifestInfo.dv` and `dvCardinality`.
-    fn check_manifest_dv(&self) -> KernelResult<()> {
+    /// Returns an unsupported error if the parent's `manifestInfo.formatVersion` is not
+    /// [`AMT_FORMAT_VERSION`] or the parent has a manifest deletion vector.
+    fn check_readable(&self) -> KernelResult<()> {
         let location = &self.file_meta.location;
-        match (&self.manifest_dv, self.manifest_dv_cardinality) {
-            (None, None) => Ok(()),
-            (Some(_), Some(_)) => Err(KernelError::unsupported(format!(
+        if self.format_version != AMT_FORMAT_VERSION {
+            return Err(KernelError::unsupported(format!(
+                "AMT content-tree read path only supports format version {AMT_FORMAT_VERSION} leaf \
+                 manifests; DataManifest entry '{location}' has {MANIFEST_INFO}.{FORMAT_VERSION} {}",
+                self.format_version
+            )));
+        }
+        if self.manifest_dv.is_some() {
+            return Err(KernelError::unsupported(format!(
                 "AMT content-tree read path does not yet support manifest deletion vectors; \
                  DataManifest entry '{location}' has {MANIFEST_INFO}.{MANIFEST_DV} set"
-            ))),
-            _ => Err(KernelError::invalid_checkpoint(format!(
-                "AMT DataManifest entry '{location}' must set both or neither of \
-                 {MANIFEST_INFO}.{MANIFEST_DV} and {MANIFEST_INFO}.{MANIFEST_DV_CARDINALITY}"
-            ))),
+            )));
         }
+        Ok(())
     }
 }
 
@@ -367,8 +371,7 @@ impl LeafReadContext {
     /// [`EntryConverter::convert`]. Batches must be passed in manifest order, since null
     /// `firstRowId`s are assigned sequentially across them.
     ///
-    /// Parents with a manifest deletion vector are rejected before the leaf is read (see
-    /// [`LeafRef::check_manifest_dv`]).
+    /// Unreadable leaves are rejected before they are read (see [`LeafRef::check_readable`]).
     ///
     /// # Errors
     /// Returns an error if an entry is malformed for a leaf (see [`FirstRowIdVisitor`]), or any
@@ -417,7 +420,7 @@ impl LeafActions {
     ///
     /// # Errors
     /// Returns an error if two leaves share a location (their batches could not be told apart), if
-    /// a parent has a manifest deletion vector (see [`LeafRef::check_manifest_dv`]), if a leaf's
+    /// a leaf cannot yet be read (see [`LeafRef::check_readable`]), if a leaf's
     /// context cannot be built (see [`LeafReadContext::new`]), or if the engine fails to start the
     /// read.
     fn try_new(
@@ -436,7 +439,7 @@ impl LeafActions {
         let pending = leaves
             .iter()
             .map(|leaf| {
-                leaf.check_manifest_dv()?;
+                leaf.check_readable()?;
                 let location = leaf.file_meta.location.to_string();
                 let context =
                     LeafReadContext::new(engine, &leaf.tracking, ctx).map_err(|e| match e {
@@ -1505,19 +1508,22 @@ mod tests {
     }
 
     #[rstest]
-    #[case::manifest_dv(true, true, "does not yet support manifest deletion vectors")]
-    #[case::dv_without_cardinality(true, false, "both or neither")]
-    #[case::cardinality_without_dv(false, true, "both or neither")]
-    fn read_actions_from_amt_rejects_parent_manifest_dv(
+    #[case::manifest_dv(
+        AMT_FORMAT_VERSION,
+        true,
+        "does not yet support manifest deletion vectors"
+    )]
+    #[case::pre_v4_leaf(0, false, "has manifestInfo.formatVersion 0")]
+    fn read_actions_from_amt_rejects_unreadable_leaf(
+        #[case] format_version: i32,
         #[case] dv: bool,
-        #[case] cardinality: bool,
         #[case] message: &str,
     ) {
         let engine = memory_engine();
         let mut leaf = write_leaf(&engine, "metadata/leaf.parquet", &[], 5, 100);
         leaf.manifest_info = Some(ManifestInfo {
+            format_version,
             dv: dv.then(|| Bytes::from_static(b"dv")),
-            dv_cardinality: cardinality.then_some(1),
             ..Default::default()
         });
         let checkpoint = write_root(&engine, &[leaf]);
