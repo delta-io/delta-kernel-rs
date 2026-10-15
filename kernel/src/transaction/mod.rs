@@ -3353,6 +3353,30 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_ctas_rejected_on_iceberg_native_v4_table() -> KernelResult<()> {
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join("table");
+        std::fs::create_dir(&table_path)?;
+        let engine = SyncEngine::new();
+        let mut txn = create_table(
+            table_path.to_string_lossy(),
+            schema_ref! { nullable "id": INTEGER },
+            "test-engine",
+        )
+        .with_table_properties([("delta.enableIcebergNativeV4", "true")])
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        add_dummy_file(&mut txn);
+
+        assert_result_error_with_message(
+            txn.commit(&engine),
+            "commits to icebergNativeV4-preview tables cannot include file actions",
+        );
+        assert!(!table_path.join("_delta_log").exists());
+        Ok(())
+    }
+
     #[rstest]
     #[case::create_without_operation(
         true,

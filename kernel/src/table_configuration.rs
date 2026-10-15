@@ -28,6 +28,8 @@ use crate::schema::{
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::table_features::validate_geospatial_feature_support;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::table_features::V4_VALIDATOR;
 use crate::table_features::{
     check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
     get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
@@ -427,6 +429,12 @@ impl TableConfiguration {
         validate_iceberg_compat_if_needed(
             &table_config,
             &V3_VALIDATOR,
+            IcebergCompatValidationContext::TableConfiguration,
+        )?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        validate_iceberg_compat_if_needed(
+            &table_config,
+            &V4_VALIDATOR,
             IcebergCompatValidationContext::TableConfiguration,
         )?;
 
@@ -1261,6 +1269,8 @@ mod test {
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
         TABLE_FEATURES_MIN_WRITER_VERSION,
     };
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::table_properties::ENABLE_ICEBERG_NATIVE_V4;
     use crate::table_properties::{
         TableProperties, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1,
         ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
@@ -3328,6 +3338,14 @@ mod test {
         ],
         Some("requires 'invariants' to not be enabled")
     )]
+    #[case::non_allow_listed_writer_feature(
+        vec![
+            TableFeature::AdaptiveMetadataPreview,
+            TableFeature::IcebergNativeV4Preview,
+            TableFeature::AllowColumnDefaults,
+        ],
+        Some("requires 'allowColumnDefaults' to not be supported")
+    )]
     fn test_iceberg_native_v4_feature_requirements(
         #[case] features: Vec<TableFeature>,
         #[case] expected_error_substring: Option<&str>,
@@ -3340,6 +3358,33 @@ mod test {
             Some(msg) => assert_result_error_with_message(result, msg),
             None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
         }
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::unset(None, false)]
+    #[case::true_(Some("true"), true)]
+    #[case::false_(Some("false"), false)]
+    fn test_iceberg_native_v4_enablement_follows_table_property(
+        #[case] property_value: Option<&str>,
+        #[case] expected_enabled: bool,
+    ) {
+        let properties = property_value
+            .map(|v| vec![(ENABLE_ICEBERG_NATIVE_V4, v)])
+            .unwrap_or_default();
+        let config = MockTableConfigurationBuilder::new()
+            .with_properties(&properties)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::IcebergNativeV4Preview])
+                    .build(),
+            )
+            .build();
+        assert!(config.is_feature_supported(&TableFeature::IcebergNativeV4Preview));
+        assert_eq!(
+            config.is_feature_enabled(&TableFeature::IcebergNativeV4Preview),
+            expected_enabled,
+        );
     }
 
     // IcebergCompatV1/V2/V3 are pairwise mutually exclusive.

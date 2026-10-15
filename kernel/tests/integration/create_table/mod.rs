@@ -4,6 +4,7 @@ mod clustering;
 mod column_mapping;
 mod ctas;
 mod iceberg_compat;
+mod iceberg_native_v4;
 mod ict;
 mod interval;
 mod partitioned;
