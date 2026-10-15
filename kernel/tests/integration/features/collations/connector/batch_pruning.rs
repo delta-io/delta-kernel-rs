@@ -43,7 +43,10 @@ async fn opaque_batch_pruning_matches_unpruned_execution(
     #[values(
         None,
         Some(CheckpointSpec::V1),
-        Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
+        Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar)),
+        Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+            file_actions_per_sidecar_hint: Some(1),
+        }))
     )]
     checkpoint: Option<CheckpointSpec>,
 ) -> Result<(), Box<dyn std::error::Error>> {
