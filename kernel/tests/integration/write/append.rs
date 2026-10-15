@@ -85,7 +85,8 @@ async fn test_append() -> KernelResult<(), Box<dyn std::error::Error>> {
                     "engineInfo": "test-engine",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
-                    "txnId": ZERO_UUID
+                    "txnId": ZERO_UUID,
+                    "dataChange": true
                 }
             }),
             json!({
@@ -321,7 +322,8 @@ async fn test_append_partitioned(
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
                     "engineInfo": "default engine",
-                    "txnId": ZERO_UUID
+                    "txnId": ZERO_UUID,
+                    "dataChange": false
                 }
             }),
             json!({

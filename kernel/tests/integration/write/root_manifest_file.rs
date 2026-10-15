@@ -38,22 +38,36 @@ async fn setup_adaptive_metadata_table(
     table_name: &str,
 ) -> std::result::Result<(impl Engine + use<>, TempDir, Url, SnapshotRef), Box<dyn std::error::Error>>
 {
+    setup_table(table_name, true).await
+}
+
+/// Like [`setup_adaptive_metadata_table`], but creates a table without any table features when
+/// `adaptive_metadata` is false.
+async fn setup_table(
+    table_name: &str,
+    adaptive_metadata: bool,
+) -> std::result::Result<(impl Engine + use<>, TempDir, Url, SnapshotRef), Box<dyn std::error::Error>>
+{
     let temp_dir = tempfile::tempdir()?;
     let dir_url = Url::from_directory_path(temp_dir.path()).expect("valid directory url");
     let (store, engine, table_url) = engine_store_setup(table_name, Some(&dir_url));
     let schema = schema_ref! { nullable "id": INTEGER };
 
-    create_table_with_column_mapping_mode(
-        store,
-        table_url.clone(),
-        schema,
-        &[],
-        true,
-        READER_FEATURES.to_vec(),
-        WRITER_FEATURES.to_vec(),
-        "id",
-    )
-    .await?;
+    if adaptive_metadata {
+        create_table_with_column_mapping_mode(
+            store,
+            table_url.clone(),
+            schema,
+            &[],
+            true,
+            READER_FEATURES.to_vec(),
+            WRITER_FEATURES.to_vec(),
+            "id",
+        )
+        .await?;
+    } else {
+        create_table(store, table_url.clone(), schema, &[], true, vec![], vec![]).await?;
+    }
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     Ok((engine, temp_dir, table_url, snapshot))
@@ -271,15 +285,20 @@ fn begin_with_data_change(
     )
 }
 
-/// `commitInfo.dataChange` records the transaction's value with or without a root manifest.
+/// `commitInfo.dataChange` records the transaction's value on every table, with or without a
+/// root manifest.
 #[rstest]
+#[case::plain_table(false, false)]
+#[case::adaptive_metadata(true, false)]
+#[case::root_manifest(true, true)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_commit_info_data_change(
     #[values(false, true)] data_change: bool,
-    #[values(false, true)] root_manifest: bool,
+    #[case] adaptive_metadata: bool,
+    #[case] root_manifest: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
-        setup_adaptive_metadata_table("commit_info_data_change").await?;
+        setup_table("commit_info_data_change", adaptive_metadata).await?;
 
     let mut txn = begin_transaction_with(
         snapshot,
@@ -299,6 +318,9 @@ async fn test_commit_info_data_change(
     txn.commit(&engine)?.unwrap_committed();
     let commit_info = commit_info_at(&table_url, 1)?;
     assert_eq!(commit_info["dataChange"], json!(data_change));
+    if !adaptive_metadata {
+        assert!(commit_info.get("lastManifestCommit").is_none());
+    }
     Ok(())
 }
 
@@ -373,26 +395,6 @@ async fn test_commit_info_records_data_change_and_last_manifest_commit(
         .join("_delta_log/00000000000000000004.crc");
     let crc: Value = serde_json::from_str(&std::fs::read_to_string(crc_path)?)?;
     assert_eq!(crc["lastManifestCommit"], expected_last_manifest_commit);
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_commit_info_omits_adaptive_metadata_fields_without_the_feature()
--> std::result::Result<(), Box<dyn std::error::Error>> {
-    let temp_dir = tempfile::tempdir()?;
-    let dir_url = Url::from_directory_path(temp_dir.path()).expect("valid directory url");
-    let (store, engine, table_url) =
-        engine_store_setup("commit_info_no_adaptive_metadata", Some(&dir_url));
-    let schema = schema_ref! { nullable "id": INTEGER };
-    create_table(store, table_url.clone(), schema, &[], true, vec![], vec![]).await?;
-
-    test_utils::load_and_begin_transaction(table_url.as_str(), &engine)?
-        .commit(&engine)?
-        .unwrap_committed();
-
-    let commit_info = commit_info_at(&table_url, 1)?;
-    assert!(commit_info.get("dataChange").is_none());
-    assert!(commit_info.get("lastManifestCommit").is_none());
     Ok(())
 }
 
