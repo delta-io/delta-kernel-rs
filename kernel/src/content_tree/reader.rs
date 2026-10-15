@@ -56,9 +56,8 @@ struct LeafRef {
     tracking: TrackingInfo,
     /// The root entry's `manifestInfo.dv`: a deletion vector over the leaf's entry positions.
     manifest_dv: Option<Bytes>,
-    /// The root entry's `manifestInfo.dvCardinality`.
-    manifest_dv_cardinality: Option<i64>,
-    /// The root entry's `formatVersion`.
+    /// The root entry's `manifestInfo.formatVersion`: the format version the leaf was written
+    /// with.
     format_version: i32,
 }
 
@@ -70,14 +69,12 @@ static LEAF_REF_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
         ColumnName::new([LOCATION]),
         ColumnName::new([FILE_SIZE_IN_BYTES]),
         ColumnName::new([MANIFEST_INFO, MANIFEST_DV]),
-        ColumnName::new([MANIFEST_INFO, MANIFEST_DV_CARDINALITY]),
-        ColumnName::new([FORMAT_VERSION]),
+        ColumnName::new([MANIFEST_INFO, FORMAT_VERSION]),
     ];
     let types = [
         DataType::STRING,
         DataType::LONG,
         DataType::BINARY,
-        DataType::LONG,
         DataType::INTEGER,
     ];
     let names = names.into_iter().chain(tracking_names.iter().cloned());
@@ -112,8 +109,7 @@ impl LeafRef {
             file_meta: amt_manifest_filemeta(location, size, table_root, &context)?,
             tracking: TrackingInfo::try_from_getters(row, tracking)?,
             manifest_dv: manifest_dv.map(Bytes::copy_from_slice),
-            manifest_dv_cardinality: fields[3].get_opt(row, MANIFEST_DV_CARDINALITY)?,
-            format_version: fields[4].get(row, FORMAT_VERSION)?,
+            format_version: fields[3].get(row, FORMAT_VERSION)?,
         })
     }
 }
@@ -831,10 +827,9 @@ mod tests {
     #[rstest]
     fn leaf_ref_carries_parent_fields(#[values(false, true)] with_dv: bool) {
         let mut entry = data_manifest_entry("leaf.parquet", 1, TrackingStatus::Existing);
-        entry.format_version = 9;
         entry.manifest_info = Some(ManifestInfo {
+            format_version: 9,
             dv: with_dv.then(|| Bytes::from_static(b"dv")),
-            dv_cardinality: with_dv.then_some(4),
             ..Default::default()
         });
         let leaf = collect_leaf_refs(&[&[entry.clone()]])
@@ -843,7 +838,6 @@ mod tests {
             .unwrap();
         assert_eq!(leaf.tracking, entry.tracking);
         assert_eq!(leaf.manifest_dv, with_dv.then(|| Bytes::from_static(b"dv")));
-        assert_eq!(leaf.manifest_dv_cardinality, with_dv.then_some(4));
         assert_eq!(leaf.format_version, 9);
     }
 
