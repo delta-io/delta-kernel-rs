@@ -877,7 +877,8 @@ fn test_create_table_with_checkpoint_stats_properties(
 #[case::lz4("lz4", Some(ParquetCompressionCodec::Lz4))]
 #[case::lz4_raw("lz4_raw", Some(ParquetCompressionCodec::Lz4Raw))]
 #[case::mixed_case("zStD", Some(ParquetCompressionCodec::Zstd))]
-#[case::unknown("brotli", None)]
+#[case::brotli("brotli", None)]
+#[case::lzo("lzo", None)]
 fn create_table_compression_codec_round_trips(
     #[case] codec: &str,
     #[case] expected: Option<ParquetCompressionCodec>,
@@ -917,6 +918,22 @@ fn create_table_compression_codec_round_trips(
         expected.is_none().then_some(&value)
     );
 
+    Ok(())
+}
+
+#[rstest]
+fn create_table_rejects_invalid_compression_codec(
+    #[values("foobar", "FOOBAR", "", " zstd", "zstd ")] codec: &str,
+) -> Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let result = create_table(&table_path, simple_schema()?, "test")
+        .with_table_properties([("delta.parquet.compression.codec", codec)])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert_result_error_with_message(
+        result,
+        &format!("Invalid value '{codec}' for 'delta.parquet.compression.codec'"),
+    );
     Ok(())
 }
 

@@ -146,6 +146,19 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     CHECKPOINT_POLICY,
 ];
 
+// CREATE validates codec names independently of the tolerant snapshot property parser.
+const ALLOWED_PARQUET_COMPRESSION_CODECS: &[&str] = &[
+    "none",
+    "uncompressed",
+    "snappy",
+    "gzip",
+    "lzo",
+    "brotli",
+    "lz4",
+    "lz4_raw",
+    "zstd",
+];
+
 /// Ensures that no Delta table exists at the given path.
 ///
 /// This function checks the `_delta_log` directory to determine if a table already exists.
@@ -782,7 +795,7 @@ fn validate_extract_table_features_and_properties(
     }
 
     // Validate remaining delta.* properties against the allow list
-    for key in properties.keys() {
+    for (key, value) in &properties {
         if strip_check_constraint_prefix(key).is_some() {
             return Err(KernelError::generic(format!(
                 "Setting CHECK constraint property '{key}' is not supported during CREATE TABLE"
@@ -793,6 +806,16 @@ fn validate_extract_table_features_and_properties(
         {
             return Err(KernelError::generic(format!(
                 "Setting delta property '{key}' is not supported during CREATE TABLE"
+            )));
+        }
+        if key == PARQUET_COMPRESSION_CODEC
+            && !ALLOWED_PARQUET_COMPRESSION_CODECS
+                .iter()
+                .any(|codec| codec.eq_ignore_ascii_case(value))
+        {
+            return Err(KernelError::generic(format!(
+                "Invalid value '{value}' for '{key}'. Expected one of: {}",
+                ALLOWED_PARQUET_COMPRESSION_CODECS.join(", ")
             )));
         }
     }
@@ -972,6 +995,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
     /// - Schema or metadata annotation validation fails
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
+    /// - The Parquet compression codec name is invalid
     /// - Connector commit information does not contain exactly one row
     /// - An application transaction identifier occurs more than once
     #[internal_api]
