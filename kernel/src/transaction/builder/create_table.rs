@@ -47,7 +47,8 @@ use crate::table_properties::{
     ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
     ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION,
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
-    PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED, SET_TRANSACTION_RETENTION_DURATION,
+    PARQUET_COMPRESSION_CODEC, PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED,
+    SET_TRANSACTION_RETENTION_DURATION,
     TableProperties, strip_check_constraint_prefix,
 };
 use crate::transaction::create_table::CreateTableTransaction;
@@ -128,6 +129,8 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     SET_TRANSACTION_RETENTION_DURATION,
     // Parquet format version: controls the Parquet writer version for data files
     PARQUET_FORMAT_VERSION,
+    // Advisory compression setting for the connector's Parquet writer.
+    PARQUET_COMPRESSION_CODEC,
     // IcebergCompatV2 enablement: triggers auto-enablement of ColumnMapping.
     ENABLE_ICEBERG_COMPAT_V2,
     // IcebergCompatV3 enablement: triggers auto-enablement of ColumnMapping,
