@@ -397,13 +397,19 @@ async fn commit_validates_file_action_uniqueness(
         .collect::<Result<Vec<_>>>()?;
     let batch = concat_batches(&batches[0].schema(), &batches)?;
     let base_row = batch.slice(0, 1);
-    let mut txn = begin_transaction_with(snapshot, engine.as_ref(), |builder| {
-        if case.dedup_validation_enabled {
-            builder
-        } else {
-            builder.without_dedup_validation()
-        }
-    })?;
+    let mut txn = begin_transaction_with(
+        snapshot,
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "test-engine",
+        |builder| {
+            if case.dedup_validation_enabled {
+                builder
+            } else {
+                builder.without_dedup_validation()
+            }
+        },
+    )?;
 
     // === Stage AddFiles ===
     txn.add_files(create_add_files_metadata(
