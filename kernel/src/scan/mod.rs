@@ -1,4 +1,38 @@
-//! Functionality to create and execute scans (reads) over data stored in a delta table
+//! Build and execute reads over a Delta table snapshot.
+//!
+//! Start with [`Snapshot::scan_builder`](crate::Snapshot::scan_builder) to create a
+//! [`ScanBuilder`]. Configure the projected
+//! columns with [`ScanBuilder::with_schema`] and optional data skipping with
+//! [`ScanBuilder::with_predicate`], then call [`ScanBuilder::build`] to obtain a [`Scan`].
+//! The scan reads the table version captured by the snapshot.
+//!
+//! Choose an execution path based on who will read the data files:
+//!
+//! - [`Scan::execute`] reads files through the supplied [`Engine`], applies the per-file transforms
+//!   and deletion vectors, and returns batches of logical table data.
+//! - [`Scan::scan_metadata`] returns [`ScanMetadata`] for connectors that schedule their own reads.
+//!   Use [`ScanMetadata::visit_scan_files`] to consume file metadata. The connector handles file
+//!   reads, physical-to-logical transforms, and deletion vectors as described in [`state`].
+//!
+//! # Example
+//!
+//! Read every column using an existing snapshot and engine:
+//!
+//! ```no_run
+//! # use std::sync::Arc;
+//! # use delta_kernel::{Engine, Result, SnapshotRef};
+//! # fn read(snapshot: SnapshotRef, engine: Arc<dyn Engine>) -> Result<()> {
+//! let scan = snapshot.scan_builder().build()?;
+//! for batch in scan.execute(engine)? {
+//!     let batch = batch?;
+//!     println!("Read {} rows", batch.len());
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The [scan guide](https://docs.delta.io/kernel/rust/reading/building_a_scan.html) develops the
+//! connector workflow with projection, predicates, and execution examples.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};

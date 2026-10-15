@@ -9,12 +9,13 @@ internals. Kernel never does I/O directly: it defines _what_ to do via its APIs
 
 ## Documentation Ownership
 
-Keep each fact in the documentation surface whose audience needs it:
+Choose where to document something by the reader's task and the scope of the explanation:
 
-- **Rustdoc** explains public APIs at module, type, and method level. Module docs explain how types
-  work together; type docs explain how methods work together; method docs specify parameters,
-  return values, errors, and safety requirements. Doctests should teach usage and test behavior,
-  as the `ColumnName` and column-name macro examples do. Update rustdoc with API changes.
+- **Rustdoc** explains public APIs at crate, module, type, and method level. Crate and module docs
+  explain the mental model, how APIs work together, and how to choose between them. Type and trait
+  docs explain purpose, lifecycle, and usage; method docs specify behavior, requirements, return
+  values, errors, and safety. Keep enough context here for readers to use the API without first
+  reading the guide. Update rustdoc with API changes.
 - **The user guide** provides introductions, longer examples, and broader connector workflows
   that would make everyday API navigation harder if included in rustdoc. It links to rustdoc for
   API details. Follow the [guide maintenance policy](docs/user-guide/README.md#maintenance).
@@ -25,15 +26,16 @@ Keep each fact in the documentation surface whose audience needs it:
   Do not copy API summaries, capability lists, crate inventories, feature inventories, or protocol
   reference material into agent docs.
 
-Before adding documentation, find its owner and link there from other surfaces. Brief context is
-useful when it helps readers follow a page; detailed contracts and inventories need one authoritative
-home. If the destination does not answer the question, improve it.
+Keep API behavior authoritative in rustdoc. Explain enough in each location for its readers to
+proceed, and link to deeper detail. Avoid independently maintained copies of contracts and
+inventories. An explanation involving several APIs can still belong in module or type rustdoc;
+neither the number of APIs nor the length alone determines its home.
 
-For example, `Snapshot::checkpoint` rustdoc explains how to call the method, its requirements,
-return value, and errors, with a focused usage example. The user guide explains when to checkpoint
-and how checkpointing fits into a connector's maintenance workflow, linking to rustdoc for method
-details. A signature change requires a rustdoc update and corresponding fixes to guide examples
-that call it. A change to the connector workflow also requires updating the guide's explanation.
+For example, `Snapshot::checkpoint` rustdoc explains when the method is useful, how to call it,
+its requirements, return value, and errors. The checkpoint module docs explain how its APIs work
+together. The user guide develops a connector's maintenance workflow, including scheduling and
+operational choices, and links to rustdoc for API details. A signature change requires a rustdoc
+update and fixes to examples that call it. A workflow change also requires updating the guide.
 
 ## Build & Test Commands
 
@@ -293,7 +295,7 @@ and update this section in your PR. The same pattern works for
 
 ## Comment & Doc Style
 
-- MUST include doc comments for all public functions, structs, enums, and methods.
+- MUST document public modules, types, traits, macros, functions, and methods.
 - MUST document function parameters, return values, and errors.
 - Doc comments focus on "what" (contract with caller) more than "how" (implementation),
   unless the "how" meaningfully impacts the "what".
@@ -302,8 +304,8 @@ and update this section in your PR. The same pattern works for
   verbose comments are worse than none.
 - Say each thing once, in the right place: don't repeat the same idea across
   doc comment and inline comment.
-- Comments earn their place only for hidden invariants, real-bug workarounds, or
-  constraints the reader can't see from the code itself.
+- Implementation comments explain hidden invariants, real-bug workarounds, or constraints the
+  reader can't see from the code itself. Rustdoc also teaches purpose, usage, and API relationships.
 - Don't enumerate what grep can answer. Lists like `// Used by a, b, c` rot the
   moment `d` lands. Describe the shape; let the reader grep.
 - No stale-prone anchors in durable docs or source comments: counts ("the 10
@@ -312,11 +314,18 @@ and update this section in your PR. The same pattern works for
 - Comments MUST NOT include temporal references: only refer to current code and
   design, not past iterations.
 - Keep comments up-to-date with code changes.
-- Include examples in doc comments for complex functions only.
+- Include examples where they teach a useful behavior, choice, or composition, even for simple
+  APIs. Link to a shared example when it already covers the item; avoid examples that only repeat
+  the signature. See the [Rust API Guidelines].
+- Prefer runnable doctests with meaningful assertions, as in `ColumnName`'s formatting and parsing
+  examples. Use `no_run` when execution needs external resources and `compile_fail` to demonstrate
+  invalid usage. Doctests provide behavioral coverage; keep exhaustive cases in dedicated tests.
 - Use `==` as a visual section divider in comments (e.g. `// === Helpers ===` or
   `// ============`).
 - NEVER use emoji or unicode in comments that emulates emoji (e.g. special arrows,
   checkmarks). Use ASCII equivalents (`->`, `=>`, etc.) instead.
+
+[Rust API Guidelines]: https://rust-lang.github.io/api-guidelines/documentation.html#c-example
 
 ## Pull Requests
 
