@@ -1309,7 +1309,9 @@ mod tests {
         ScanLogReplayProcessor, ScanPartitionValuesOptions, ScanStatsOptions,
         SerializableScanState,
     };
-    use crate::arrow::array::{cast::AsArray, types::TimestampMicrosecondType, StringArray};
+    use crate::arrow::array::cast::AsArray;
+    use crate::arrow::array::types::TimestampMicrosecondType;
+    use crate::arrow::array::StringArray;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
