@@ -1927,22 +1927,7 @@ async fn check_hint_checkpoint_action<E: Engine>(
             .await
             .unwrap();
     }
-    let hint = serde_json::json!({
-        "version": 2,
-        "size": -1,
-        "checkpointType": "AdaptiveMetadataTree",
-        "amtCheckpoint": {
-            "manifestCommitVersion": 4,
-            "checkpoint": new_checkpoint_action(2, "metadata/root.parquet", &[], one_column_schema()),
-        },
-    });
-    store
-        .put(
-            &Path::from("_delta_log/_last_checkpoint"),
-            hint.to_string().into(),
-        )
-        .await
-        .unwrap();
+    put_amt_last_checkpoint_hint(&store, 2, 4, true).await;
     if crc_at_target {
         let config = adaptive_metadata_table_configuration(one_column_schema(), &[]);
         let crc = serde_json::json!({
@@ -2021,19 +2006,7 @@ async fn snapshot_before_manifest_commit_without_hint_action_lists_from_last_man
             .await
             .unwrap();
     }
-    let hint = serde_json::json!({
-        "version": 2,
-        "size": -1,
-        "checkpointType": "AdaptiveMetadataTree",
-        "amtCheckpoint": { "manifestCommitVersion": 4 },
-    });
-    store
-        .put(
-            &Path::from("_delta_log/_last_checkpoint"),
-            hint.to_string().into(),
-        )
-        .await
-        .unwrap();
+    put_amt_last_checkpoint_hint(&store, 2, 4, false).await;
 
     let engine = non_plan_engine(store);
     let builder = Snapshot::builder_for(table_root);
@@ -2059,4 +2032,38 @@ async fn snapshot_before_manifest_commit_without_hint_action_lists_from_last_man
     assert_eq!(commit_versions, expected_commits);
     let action = snapshot.latest_checkpoint_action(&engine).unwrap();
     assert_eq!(action.map(|action| action.version()), expected_action);
+}
+
+// Writes an AMT `_last_checkpoint` hint at `version` naming `manifest_commit_version` as the
+// manifest commit that added its checkpoint action, embedding that action if `embeds_action`.
+async fn put_amt_last_checkpoint_hint(
+    store: &InMemory,
+    version: i64,
+    manifest_commit_version: i64,
+    embeds_action: bool,
+) {
+    let mut amt_checkpoint =
+        serde_json::json!({ "manifestCommitVersion": manifest_commit_version });
+    if embeds_action {
+        amt_checkpoint["checkpoint"] = serde_json::to_value(new_checkpoint_action(
+            version,
+            "metadata/root.parquet",
+            &[],
+            one_column_schema(),
+        ))
+        .unwrap();
+    }
+    let hint = serde_json::json!({
+        "version": version,
+        "size": -1,
+        "checkpointType": "AdaptiveMetadataTree",
+        "amtCheckpoint": amt_checkpoint,
+    });
+    store
+        .put(
+            &Path::from("_delta_log/_last_checkpoint"),
+            hint.to_string().into(),
+        )
+        .await
+        .unwrap();
 }
