@@ -1650,14 +1650,18 @@ async fn last_checkpoint_hint_applies_iff_it_names_the_selected_checkpoint(
     )
     .await;
 
-    let listed = LogSegmentFiles::list_with_checkpoint_hint(
+    // Without `adaptive-metadata-in-dev`, `Listed` is the only variant.
+    #[allow(irrefutable_let_patterns)]
+    let HintListing::Listed(listed) = LogSegmentFiles::list_with_checkpoint_hint(
         &hint,
         storage.as_ref(),
         &log_root,
         vec![],
         None,
     )
-    .unwrap();
+    .unwrap() else {
+        panic!("a classic hint always bounds the listing");
+    };
 
     // The winner is the same no matter what the hint names.
     assert_eq!(listed.checkpoint_parts.len(), 1);
@@ -1931,4 +1935,42 @@ fn listing_without_token_is_unchanged() {
         .map(KernelResult::unwrap)
         .collect();
     assert_eq!(listed.len(), 5);
+}
+
+// The commits and compactions an AMT checkpoint action at version 5 covers are dropped, keeping
+// the hinted commit only when it is the manifest commit or the newest listed commit.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[rstest]
+#[case::manifest_commit_after_checkpoint(6, 7, vec![6, 7], vec![6])]
+#[case::manifest_commit_at_checkpoint(5, 7, vec![5, 6, 7], vec![5, 6])]
+#[case::checkpoint_commit_is_newest(6, 5, vec![5], vec![])]
+fn trim_to_latest_checkpoint_drops_covered_files(
+    #[case] manifest_commit_version: Version,
+    #[case] newest_commit: Version,
+    #[case] expected_commits: Vec<Version>,
+    #[case] expected_compaction_starts: Vec<Version>,
+) {
+    let path = |version, file_type| {
+        make_parsed_log_path_with_source(version, file_type, CommitSource::Filesystem)
+    };
+    let mut files = LogSegmentFiles {
+        ascending_commit_files: (5..=newest_commit)
+            .map(|v| path(v, LogPathFileType::Commit))
+            .collect(),
+        ascending_compaction_files: [(5, 6), (6, 7)]
+            .into_iter()
+            .filter(|&(_, hi)| hi <= newest_commit)
+            .map(|(lo, hi)| path(lo, LogPathFileType::CompactedCommit { hi }))
+            .collect(),
+        ..Default::default()
+    };
+
+    files.trim_to_latest_checkpoint(5, manifest_commit_version);
+
+    let versions = |paths: &[ParsedLogPath]| paths.iter().map(|p| p.version).collect_vec();
+    assert_eq!(versions(&files.ascending_commit_files), expected_commits);
+    assert_eq!(
+        versions(&files.ascending_compaction_files),
+        expected_compaction_starts
+    );
 }

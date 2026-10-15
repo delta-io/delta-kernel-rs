@@ -31,6 +31,7 @@ use crate::content_tree::{AmtStatsRequest, read_checkpoint_action};
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
+use crate::log_segment_files::HintListing;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{
@@ -159,6 +160,21 @@ pub(crate) struct LogSegment {
     /// [`Self::checkpoint_hint_sidecars`] accessors built on it). Read this field directly only
     /// when the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
     pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
+}
+
+/// The AMT checkpoint a [`LogSegment`]'s commits build on in place of a checkpoint file. See
+/// [`LogSegment::amt_base`].
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AmtBase<'a> {
+    /// The version of the checkpoint action's content root. The segment's commits follow it.
+    #[allow(dead_code)]
+    pub(crate) version: Version,
+    /// The version of the manifest commit that added the checkpoint action.
+    pub(crate) manifest_commit_version: Version,
+    /// The checkpoint action, when the `_last_checkpoint` hint embeds it. Otherwise the manifest
+    /// commit that added it is in the segment and replay reads it from there.
+    pub(crate) checkpoint_action: Option<&'a CheckpointAction>,
 }
 
 /// Validate the invariants shared by catalog-managed snapshot and commit-range log tails.
@@ -425,23 +441,29 @@ impl LogSegment {
             .filter(|hint| hint.applies_to(&self.listed.checkpoint_parts))
     }
 
-    /// The checkpoint action embedded in this segment's AMT `_last_checkpoint` hint, when the
-    /// segment was listed from that hint but ends before the hint's manifest commit, so the action
-    /// is in no listed commit. For example, a hint at version 5 written by manifest commit 8
-    /// applies to a snapshot at 5 through 7, but not at 8 or later, where commit 8 itself is
-    /// listed. Content roots never decrease across manifest commits, so this is then the
-    /// segment's latest checkpoint action.
+    /// The AMT checkpoint this segment's commits build on in place of a checkpoint file, or `None`
+    /// if the segment has a checkpoint file or was not listed from an AMT `_last_checkpoint` hint.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub(crate) fn unlisted_amt_checkpoint_action(&self) -> Option<&CheckpointAction> {
+    pub(crate) fn amt_base(&self) -> Option<AmtBase<'_>> {
         if self.checkpoint_version.is_some() {
             return None;
         }
         let hint = self.last_checkpoint_metadata.as_ref()?;
         let manifest_commit_version = hint.amt_manifest_commit_version()?;
-        if hint.version > self.end_version || manifest_commit_version <= self.end_version {
+        let checkpoint_action = hint.amt_checkpoint_action();
+        // Mirrors when listing accepts the hint as the base (`validate_amt_listing`, which also
+        // checks the embedded action's version). Otherwise listing either ignored the hint or
+        // started from the newest commit's `lastManifestCommit`, which this segment does not keep.
+        if hint.version > self.end_version
+            || (checkpoint_action.is_none() && manifest_commit_version > self.end_version)
+        {
             return None;
         }
-        hint.amt_checkpoint.as_ref()?.checkpoint.as_ref()
+        Some(AmtBase {
+            version: hint.version,
+            manifest_commit_version,
+            checkpoint_action,
+        })
     }
 
     /// The checkpoint schema from the `_last_checkpoint` hint, when the hint describes the selected
@@ -534,7 +556,7 @@ impl LogSegment {
         err
     )]
     pub(crate) fn for_snapshot(
-        storage: &dyn StorageHandler,
+        engine: &dyn Engine,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
@@ -542,10 +564,12 @@ impl LogSegment {
     ) -> Result<Self> {
         let time_travel_version = time_travel_version.into();
         let start = std::time::Instant::now();
+        let storage = engine.storage_handler();
         let build = || {
-            let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
-            Self::for_snapshot_impl(
-                storage,
+            let checkpoint_hint = LastCheckpointHint::try_read(storage.as_ref(), &log_root)?;
+            Self::for_snapshot_with_engine(
+                storage.as_ref(),
+                Some(engine),
                 log_root,
                 log_tail,
                 checkpoint_hint,
@@ -571,8 +595,31 @@ impl LogSegment {
     }
 
     // factored out for testing
+    #[cfg(test)]
     pub(crate) fn for_snapshot_impl(
         storage: &dyn StorageHandler,
+        log_root: Url,
+        log_tail: Vec<ParsedLogPath>,
+        checkpoint_hint: Option<LastCheckpointHint>,
+        time_travel_version: Option<Version>,
+    ) -> Result<Self> {
+        Self::for_snapshot_with_engine(
+            storage,
+            None,
+            log_root,
+            log_tail,
+            checkpoint_hint,
+            time_travel_version,
+        )
+    }
+
+    /// Builds the segment as [`Self::for_snapshot_impl`] does. `engine` reads the snapshot's
+    /// newest commit when an AMT hint cannot supply the snapshot's base; without it, that case is
+    /// an error.
+    #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_variables))]
+    fn for_snapshot_with_engine(
+        storage: &dyn StorageHandler,
+        engine: Option<&dyn Engine>,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
@@ -602,13 +649,36 @@ impl LogSegment {
 
         let listed_files = match (usable_hint, end_version) {
             // Cases 1 and 2
-            (Some(cp), end_version) => LogSegmentFiles::list_with_checkpoint_hint(
-                cp,
-                storage,
-                &log_root,
-                log_tail,
-                end_version,
-            )?,
+            (Some(cp), end_version) => {
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                let relist_log_tail = log_tail.clone();
+                match LogSegmentFiles::list_with_checkpoint_hint(
+                    cp,
+                    storage,
+                    &log_root,
+                    log_tail,
+                    end_version,
+                )? {
+                    HintListing::Listed(listed_files) => listed_files,
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    HintListing::AmtBaseMissing(hinted_files) => {
+                        let engine = engine.ok_or_else(|| {
+                            KernelError::invalid_checkpoint(format!(
+                                "_last_checkpoint AMT hint at version {} embeds no checkpoint \
+                                 action and its manifest commit is after the snapshot",
+                                cp.version
+                            ))
+                        })?;
+                        Self::list_without_amt_base(
+                            engine,
+                            storage,
+                            &log_root,
+                            relist_log_tail,
+                            &hinted_files,
+                        )?
+                    }
+                }
+            }
             // Case 3
             (None, Some(end)) => LogSegmentFiles::list_with_backward_checkpoint_scan(
                 storage, &log_root, log_tail, end,
@@ -672,6 +742,41 @@ impl LogSegment {
                 Error::Kernel(error)
             }
         })
+    }
+
+    /// Lists a snapshot whose AMT `_last_checkpoint` hint cannot supply its base (see
+    /// [`HintListing::AmtBaseMissing`]). The newest commit in `hinted_files` is the snapshot's,
+    /// and its `commitInfo.lastManifestCommit` names the manifest commit carrying the snapshot's
+    /// latest checkpoint action, so listing starts from that action's content root. With no
+    /// `lastManifestCommit`, no manifest commit precedes the snapshot, so it is listed as if there
+    /// were no hint.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn list_without_amt_base(
+        engine: &dyn Engine,
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
+        hinted_files: &LogSegmentFiles,
+    ) -> KernelResult<LogSegmentFiles> {
+        let newest_commit = hinted_files.ascending_commit_files.last().ok_or_else(|| {
+            KernelError::internal_error("AMT hint listing without a base has no commits")
+        })?;
+        let (_, last_manifest_commit) = newest_commit.read_ict_and_last_manifest_commit(engine)?;
+        match last_manifest_commit {
+            Some(last_manifest_commit) => LogSegmentFiles::list_from_last_manifest_commit(
+                storage,
+                log_root,
+                log_tail,
+                &last_manifest_commit,
+                newest_commit.version,
+            ),
+            None => LogSegmentFiles::list_with_backward_checkpoint_scan(
+                storage,
+                log_root,
+                log_tail,
+                newest_commit.version,
+            ),
+        }
     }
 
     /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between
