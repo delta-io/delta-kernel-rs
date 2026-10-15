@@ -22,8 +22,6 @@ use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
 use crate::unit_test_utils::adaptive_metadata_fixtures::last_manifest_commit_info;
-#[cfg(feature = "declarative-plans")]
-use crate::unit_test_utils::assert_result_error_with_message;
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
 };
@@ -97,7 +95,9 @@ fn commit_info(last_manifest_commit: Option<(i64, i64)>) -> String {
         Some((version, content_root_version)) => {
             last_manifest_commit_info(version, content_root_version)
         }
-        None => serde_json::json!({ "commitInfo": { "operation": "WRITE" } }),
+        None => {
+            serde_json::json!({ "commitInfo": { "operation": "WRITE", "inCommitTimestamp": 1 } })
+        }
     }
     .to_string()
 }
@@ -924,13 +924,13 @@ async fn snapshot_on_checkpoint_reads_last_manifest_commit_from_commit_file(
     #[case] delete_commit_file: bool,
 ) {
     // The checkpoint writer needs top-level P&M, so v0 carries them standalone alongside its
-    // checkpoint action.
+    // checkpoint action. commitInfo stays first, as In-Commit Timestamps require.
     let store = Arc::new(InMemory::new());
     let table_root = url::Url::parse("memory:///").unwrap();
     let commit = format!(
         "{}\n{}",
-        standalone_pm_commit(one_column_schema()),
-        checkpoint_commit(0, &[], one_column_schema())
+        checkpoint_commit(0, &[], one_column_schema()),
+        standalone_pm_commit(one_column_schema())
     );
     add_commit(table_root.as_str(), store.as_ref(), 0, commit)
         .await

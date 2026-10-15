@@ -401,10 +401,13 @@ pub(crate) mod adaptive_metadata_fixtures {
         version: i64,
         content_root_version: i64,
     ) -> serde_json::Value {
-        serde_json::json!({ "commitInfo": { "lastManifestCommit": {
-            "version": version,
-            "contentRootVersion": content_root_version,
-        }}})
+        serde_json::json!({ "commitInfo": {
+            "inCommitTimestamp": 1,
+            "lastManifestCommit": {
+                "version": version,
+                "contentRootVersion": content_root_version,
+            },
+        }})
     }
 
     fn write_commit_batches(

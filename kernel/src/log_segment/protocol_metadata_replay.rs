@@ -96,7 +96,7 @@ impl LogSegment {
                 .map(|(_, p)| p);
             // The pruned replay only reads commits after the CRC version, but a hit there is still
             // the latest action: any action at or below the CRC is older. A miss stays `Unresolved`
-            // (or a `Hint` when the newest commit carries `lastManifestCommit`) because the latest
+            // (or `Located` when the newest commit carries `lastManifestCommit`) because the latest
             // action may sit at or below the CRC, which this replay never reads.
             #[cfg(feature = "adaptive-metadata-in-dev")]
             let checkpoint_action = CheckpointActionResolution::from_replay(
@@ -428,10 +428,11 @@ impl LogSegment {
 pub(crate) enum CheckpointActionResolution {
     /// The latest `checkpoint` action, captured during replay.
     Captured(Arc<CheckpointAction>),
-    /// Not captured, but the CRC carries a [`LastManifestCommit`] naming the commit that emitted
-    /// the latest checkpoint action. The CRC is authoritative: a consumer reads that one commit
-    /// and never scans the log, and a commit that is missing from the segment or does not
-    /// carry the described action is an error (the CRC and the log are inconsistent).
+    /// Not captured, but the CRC or the newest replayed commit carries a [`LastManifestCommit`]
+    /// naming the commit that emitted the latest checkpoint action. The pointer is authoritative:
+    /// a consumer reads that one commit and never scans the log, and a commit that is missing
+    /// from the segment or does not carry the described action is an error (the pointer and
+    /// the log are inconsistent).
     Located(LastManifestCommit),
     /// Replay did not settle it and no pointer is available -- a miss, which does not prove
     /// absence since replay can stop early. Consumers fall back to a log scan.
@@ -444,7 +445,7 @@ impl CheckpointActionResolution {
     /// highest `checkpointMetadata.version` across the batches it reaches, and checkpoint versions
     /// strictly increase, so an earlier-stopping replay can only skip older actions. A miss does
     /// not prove absence (the action may sit in a batch the replay stopped before, or at/below a
-    /// seeding CRC version), so it becomes a [`Hint`](Self::Hint) if replay found a
+    /// seeding CRC version), so it becomes [`Located`](Self::Located) if replay found a
     /// `lastManifestCommit`, else [`Unresolved`](Self::Unresolved).
     fn from_replay(
         checkpoint: Option<CheckpointAction>,
@@ -452,7 +453,7 @@ impl CheckpointActionResolution {
     ) -> Self {
         match (checkpoint, last_manifest_commit) {
             (Some(action), _) => Self::Captured(Arc::new(action)),
-            (None, Some(pointer)) => Self::Hint(pointer.clone()),
+            (None, Some(pointer)) => Self::Located(pointer.clone()),
             (None, None) => Self::Unresolved,
         }
     }

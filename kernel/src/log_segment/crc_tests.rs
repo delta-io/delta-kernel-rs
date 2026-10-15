@@ -900,11 +900,11 @@ async fn test_crc_seeded_replay_without_checkpoint_action_is_unresolved() {
 }
 
 // A CRC-seeded pruned replay whose newest commit points at a manifest commit at or below the CRC
-// version cannot capture that action (the pruned replay never reads it), so the pointer becomes a
-// `Hint` for the accessor.
+// version cannot capture that action (the pruned replay never reads it), so the pointer becomes
+// `Located` for the accessor.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[tokio::test]
-async fn test_crc_seeded_replay_with_pointer_at_or_below_crc_is_hint() {
+async fn test_crc_seeded_replay_with_pointer_at_or_below_crc_is_located() {
     let config = adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
     let resolution = CrcReadTest::new()
         .commit(
@@ -925,8 +925,8 @@ async fn test_crc_seeded_replay_with_pointer_at_or_below_crc_is_hint() {
         .await
         .checkpoint_action_resolution();
     assert!(
-        matches!(&resolution, CheckpointActionResolution::Hint(p) if p.version == 0),
-        "expected a Hint at version 0, got {resolution:?}"
+        matches!(&resolution, CheckpointActionResolution::Located(p) if p.version == 0),
+        "expected Located at version 0, got {resolution:?}"
     );
 }
 
