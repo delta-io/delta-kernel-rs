@@ -649,10 +649,11 @@ pub fn evaluate_predicate(
             Ok(eval_op_fn(&arr)?)
         }
         Binary(BinaryPredicate {
-            collation: Some(_), ..
-        }) => Err(KernelError::unsupported(
-            "Collated comparisons require a connector-defined opaque evaluator",
-        )),
+            collation: Some(collation),
+            ..
+        }) => Err(KernelError::unsupported(format!(
+            "Collated comparison '{collation}' requires a connector-defined opaque evaluator"
+        ))),
         Binary(BinaryPredicate {
             op, left, right, ..
         }) => {

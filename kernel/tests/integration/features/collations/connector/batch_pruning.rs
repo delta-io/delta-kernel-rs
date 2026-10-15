@@ -24,7 +24,7 @@ use delta_kernel::{KernelError, Result, Snapshot};
 use rstest::rstest;
 use test_utils::{begin_transaction_with, into_record_batch, read_scan, test_table_setup_mt};
 
-use super::{rows, synthetic_fixture, Operation, SYNTHETIC_ID};
+use super::{rows, simple_batch, synthetic_fixture, CollationStats, Operation, SYNTHETIC_ID};
 use crate::features::collations::{create_fixture, generated_table, physical_path};
 
 #[rstest]
@@ -48,7 +48,7 @@ async fn opaque_batch_pruning_matches_unpruned_execution(
     checkpoint: Option<CheckpointSpec>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup_mt()?;
-    let fixture = synthetic_fixture(stats_id);
+    let fixture = synthetic_fixture(stats_id, operation);
     let mut properties = vec![
         ("delta.columnMapping.mode", mapping),
         ("delta.dataSkippingNumIndexedCols", "0"),
@@ -110,9 +110,15 @@ async fn opaque_batch_pruning_retains_files_with_missing_required_bounds(
     #[values(false, true)] checkpoint: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup_mt()?;
-    let mut fixture = synthetic_fixture(Some(SYNTHETIC_ID));
-    for (_, bounds) in &mut fixture.files {
-        bounds.as_object_mut().unwrap().remove(missing_bound);
+    let mut fixture = synthetic_fixture(Some(SYNTHETIC_ID), Operation::Equal);
+    for (_, stats) in &mut fixture.files {
+        stats
+            .as_mut()
+            .unwrap()
+            .bounds
+            .as_object_mut()
+            .unwrap()
+            .remove(missing_bound);
     }
     let snapshot = create_fixture(
         &path,
@@ -157,7 +163,7 @@ async fn opaque_batch_pruning_does_not_resurrect_removed_matching_files(
     let snapshot = create_fixture(
         &path,
         engine.as_ref(),
-        &synthetic_fixture(Some(SYNTHETIC_ID)),
+        &synthetic_fixture(Some(SYNTHETIC_ID), Operation::Equal),
         &[],
     )
     .await?;
@@ -203,6 +209,7 @@ async fn nested_mapped_collation_bounds_are_projected_by_exact_identifier(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup_mt()?;
     let fixture = generated_table(true, &["first", "last", "email"]);
+    let collation_id = fixture.files[0].1.as_ref().unwrap().identifier;
     let snapshot = create_fixture(
         &path,
         engine.as_ref(),
@@ -222,21 +229,21 @@ async fn nested_mapped_collation_bounds_are_projected_by_exact_identifier(
     let unselected_path = physical_path(&snapshot, &column_name!("name.last"));
     let builder = snapshot.scan_builder().with_stats(
         StatsOptions::none()
-            .with_collation_stats(fixture.collation_id, [column_name!("name.first")])
+            .with_collation_stats(collation_id, [column_name!("name.first")])
             .with_collation_stats("spark.UTF8_LCASE.99.0", [column_name!("name.first")]),
     );
     let schemas = builder.stats_output_schemas()?.unwrap();
-    let expected = ColumnName::new(["statsWithCollation", fixture.collation_id, "minValues"])
+    let expected = ColumnName::new(["statsWithCollation", collation_id, "minValues"])
         .join(&ColumnName::new(selected_path.clone()));
     assert!(schemas.physical.field_at(&expected).is_ok());
     assert!(schemas.logical.contains_col([
         "statsWithCollation",
-        fixture.collation_id,
+        collation_id,
         "minValues",
         "name",
         "first"
     ]));
-    let unselected = ColumnName::new(["statsWithCollation", fixture.collation_id, "minValues"])
+    let unselected = ColumnName::new(["statsWithCollation", collation_id, "minValues"])
         .join(&ColumnName::new(unselected_path));
     assert!(schemas.physical.field_at(&unselected).is_err());
     let missing = ColumnName::new([
@@ -285,7 +292,7 @@ async fn unsupported_collated_comparisons_defer_without_losing_boolean_structure
     let snapshot = create_fixture(
         &path,
         engine.as_ref(),
-        &synthetic_fixture((!opaque).then_some(SYNTHETIC_ID)),
+        &synthetic_fixture((!opaque).then_some(SYNTHETIC_ID), Operation::Equal),
         &[],
     )
     .await?;
@@ -327,6 +334,108 @@ async fn unsupported_collated_comparisons_defer_without_losing_boolean_structure
     Ok(())
 }
 
+#[rstest]
+#[case::and(false, false, &[])]
+#[case::or(true, false, &[1, 3, 4])]
+#[case::not_and(false, true, &[1, 2, 3, 4])]
+#[case::not_or(true, true, &[2])]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supported_collated_boolean_pruning_preserves_rows_in_mixed_intervals(
+    #[case] disjunction: bool,
+    #[case] inverted: bool,
+    #[case] expected_ids: &[i32],
+    #[values(None, Some("minValues"), Some("maxValues"))] missing_bound: Option<&str>,
+    #[values(false, true)] checkpoint: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, path, engine) = test_table_setup_mt()?;
+    let mut fixture = synthetic_fixture(Some(SYNTHETIC_ID), Operation::Equal);
+    let mut bounds = serde_json::json!({
+        "minValues": { "name": "Alice" },
+        "maxValues": { "name": "Zoe" },
+    });
+    if let Some(missing_bound) = missing_bound {
+        bounds.as_object_mut().unwrap().remove(missing_bound);
+    }
+    fixture.files[0] = (
+        simple_batch(vec![1, 2], vec!["Alice", "Zoe"]),
+        Some(CollationStats {
+            identifier: SYNTHETIC_ID,
+            bounds,
+        }),
+    );
+    fixture.files.remove(1);
+    let snapshot = create_fixture(
+        &path,
+        engine.as_ref(),
+        &fixture,
+        &[
+            ("delta.checkpoint.writeStatsAsStruct", "true"),
+            ("delta.checkpoint.writeStatsAsJson", "false"),
+        ],
+    )
+    .await?;
+    if checkpoint {
+        snapshot.checkpoint(engine.as_ref(), Some(&CheckpointSpec::V1))?;
+    }
+    let snapshot = Snapshot::builder_for(&path).build(engine.as_ref())?;
+    let collated = Predicate::arrow_opaque(
+        AsciiCaseInsensitiveOp {
+            operation: Operation::Equal,
+            stats_inverted: None,
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        [col!("name"), lit("alice")],
+    );
+    let numeric = col!("id").ge(lit(4));
+    let mut predicate = if disjunction {
+        Predicate::or(collated, numeric)
+    } else {
+        Predicate::and(collated, numeric)
+    };
+    if inverted {
+        predicate = Predicate::not(predicate);
+    }
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_stats(
+            StatsOptions::struct_columns(vec![column_name!("id")])
+                .with_collation_stats(SYNTHETIC_ID, [column_name!("name")]),
+        )
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+    let full_filter = |(id, name): &(i32, String)| {
+        let collated = Operation::Equal.matches(name, "alice");
+        let numeric = *id >= 4;
+        let matches = if disjunction {
+            collated || numeric
+        } else {
+            collated && numeric
+        };
+        matches != inverted
+    };
+    let actual: Vec<_> = rows(&read_scan(&scan, engine.clone())?)
+        .into_iter()
+        .filter(full_filter)
+        .collect();
+    let oracle: Vec<_> = rows(&read_scan(
+        &snapshot
+            .scan_builder()
+            .with_stats(StatsOptions::none())
+            .build()?,
+        engine,
+    )?)
+    .into_iter()
+    .filter(full_filter)
+    .collect();
+    assert_eq!(
+        oracle.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        expected_ids
+    );
+    assert_eq!(actual, oracle);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cached_columnar_collation_bounds_support_multiple_predicates_without_log_replay(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -334,7 +443,7 @@ async fn cached_columnar_collation_bounds_support_multiple_predicates_without_lo
     let snapshot = create_fixture(
         &path,
         engine.as_ref(),
-        &synthetic_fixture(Some(SYNTHETIC_ID)),
+        &synthetic_fixture(Some(SYNTHETIC_ID), Operation::Equal),
         &[],
     )
     .await?;

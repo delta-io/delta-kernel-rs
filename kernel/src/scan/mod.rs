@@ -122,8 +122,9 @@ pub use crate::parallel::parallel_scan_metadata::{
 /// - [`Self::none`] -- neither, AND disables internal data skipping. Unlike the other four
 ///   constructors, this is the only one that stops kernel from reading stats from parquet at all.
 ///
-/// [`Self::with_collation_stats`] adds typed collation bounds to any constructor and enables stats
-/// reading when combined with [`Self::none`].
+/// [`Self::with_collation_stats`] adds typed collation bounds to any constructor. With
+/// [`Self::none`], it re-enables stats reading and predicate-based data and partition pruning.
+/// Binary per-column stats output and JSON synthesis stay disabled.
 #[derive(Clone, Debug)]
 pub struct StatsOptions {
     /// Whether to surface JSON stats on parsed-stats checkpoints (where the
@@ -444,11 +445,16 @@ impl ScanBuilder {
     ///
     /// Unannotated string comparisons use UTF-8 binary semantics, independent of `__COLLATIONS`.
     /// [`Predicate::binary_with_collation`] marks comparisons that binary pruning must defer.
-    /// For native batch pruning, use opaque predicates with explicitly requested
+    /// For native Arrow batch pruning, import
+    /// `engine::arrow_expression::opaque::ArrowOpaquePredicate` and use `Predicate::arrow_opaque`
+    /// with an operation whose skipping rewrite returns a separate opaque predicate. Request
     /// [`StatsOptions::with_collation_stats`] bounds. The connector applies the complete original
     /// row filter after reading. Unsupported comparisons must not discard rows through Kernel or
     /// underlying-reader pushdown; removing an unsupported OR branch or negating a relaxed
     /// predicate can discard matches.
+    /// The rewritten predicate reads physical bounds at
+    /// `stats_parsed.statsWithCollation[identifier].minValues` and `maxValues`.
+    /// Use [`ColumnName::new`] to keep the dotted identifier in one path segment.
     /// See the [connector contract](https://github.com/delta-io/delta-kernel-rs/blob/main/docs/user-guide/src/reading/filter_pushdown.md#collation-aware-queries).
     ///
     /// [`StructType::add_metadata_column`]: crate::schema::StructType::add_metadata_column

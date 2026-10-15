@@ -47,7 +47,7 @@ fn arrow_evaluation_rejects_collated_binary_comparisons() {
     );
     assert_result_error_with_message(
         evaluate_predicate(&predicate, &batch, false),
-        "Collated comparisons require a connector-defined opaque evaluator",
+        "Collated comparison 'test.ci.1' requires a connector-defined opaque evaluator",
     );
 }
 

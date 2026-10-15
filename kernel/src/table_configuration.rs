@@ -61,7 +61,8 @@ pub struct StatsOutputSchemas {
 }
 
 impl StatsOutputSchemas {
-    fn try_new(logical: SchemaRef, physical: SchemaRef) -> KernelResult<Self> {
+    /// Returns aligned logical and physical stats schemas, or an error if their fields differ.
+    pub(crate) fn try_new(logical: SchemaRef, physical: SchemaRef) -> KernelResult<Self> {
         validate_stats_schema_alignment(&logical, &physical, "stats")?;
         Ok(Self { logical, physical })
     }

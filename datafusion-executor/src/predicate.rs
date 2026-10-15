@@ -23,10 +23,10 @@ use crate::scalar::to_df_scalar;
 /// [`Expr`](DFExpr), checking column references against `input_schema`.
 ///
 /// # Errors
-/// Returns [`KernelError::unsupported`] for engine-defined (`Opaque`) or `Unknown` predicates, and
-/// for an `IN` whose right side is neither a literal array nor an array-typed column. Also
-/// propagates errors from child expressions, such as an unresolved column or an interval literal
-/// (which has no Arrow equivalent).
+/// Returns [`KernelError::unsupported`] for collated, engine-defined (`Opaque`), or `Unknown`
+/// predicates, and for an `IN` whose right side is neither a literal array nor an array-typed
+/// column. Also propagates errors from child expressions, such as an unresolved column or an
+/// interval literal (which has no Arrow equivalent).
 pub fn to_df_predicate_expr(pred: &KernelPredicate, input_schema: &StructType) -> Result<DFExpr> {
     match pred {
         KernelPredicate::BooleanExpression(expr) => to_df_expr(expr, input_schema, None),
@@ -64,6 +64,11 @@ fn binary_to_df_predicate_expr(
     binary: &KernelBinaryPredicate,
     input_schema: &StructType,
 ) -> KernelResult<DFExpr> {
+    if let Some(collation) = &binary.collation {
+        return Err(KernelError::unsupported(format!(
+            "Collated comparison '{collation}' requires a connector-defined opaque evaluator"
+        )));
+    }
     let op = match binary.op {
         KernelBinaryPredicateOp::In => {
             return in_to_df_predicate_expr(&binary.left, &binary.right, input_schema)
@@ -273,6 +278,45 @@ mod tests {
     }
 
     // === Tests ===
+
+    #[rstest]
+    fn collated_comparisons_are_rejected_without_changing_binary_lowering(
+        #[values(
+            KernelBinaryPredicateOp::Equal,
+            KernelBinaryPredicateOp::LessThan,
+            KernelBinaryPredicateOp::GreaterThan,
+            KernelBinaryPredicateOp::Distinct,
+            KernelBinaryPredicateOp::In
+        )]
+        operation: KernelBinaryPredicateOp,
+        #[values(false, true)] annotated: bool,
+        #[values(false, true)] inverted: bool,
+    ) {
+        let input_schema = schema! {
+            nullable "name": STRING,
+            nullable "names": [nullable STRING],
+        };
+        let (left, right) = if operation == KernelBinaryPredicateOp::In {
+            (lit("alice"), col!("names"))
+        } else {
+            (col!("name"), lit("alice"))
+        };
+        let mut predicate = if annotated {
+            KernelPred::binary_with_collation(operation, left, right, "test.ASCII_CI.1")
+        } else {
+            KernelPred::binary(operation, left, right)
+        };
+        if inverted {
+            predicate = KernelPred::not(predicate);
+        }
+        let result = to_df_predicate_expr(&predicate, &input_schema);
+        if annotated {
+            let error = result.expect_err("Annotated comparison must not become binary");
+            assert!(error.to_string().contains("test.ASCII_CI.1"));
+        } else {
+            result.unwrap();
+        }
+    }
 
     #[rstest]
     // Primitive comparisons lower to a native binary op.
