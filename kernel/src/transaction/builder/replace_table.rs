@@ -31,6 +31,7 @@ use crate::{Engine, FilteredEngineData, KernelError, KernelResult};
 
 /// Metadata changes to apply while replacing all data files.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct MetadataPatch {
     schema: Option<SchemaRef>,
 }
@@ -49,7 +50,9 @@ impl MetadataPatch {
 pub enum MetadataPolicy {
     /// Retains the existing table identity, properties, protocol, and column-mapping mode while
     /// applying the specified changes. An empty patch leaves metadata unchanged. Retained fields
-    /// keep their mapping IDs and physical names, even when their types change.
+    /// keep their mapping IDs and physical names even for incompatible type changes, unlike Spark
+    /// overwrite. Historical files may therefore have different physical types under the same
+    /// path; readers must use the schema of each table version. New fields get unique paths.
     Patch(MetadataPatch),
 }
 
@@ -86,9 +89,14 @@ impl std::fmt::Debug for TransactionBuilder<ReplaceTable> {
 }
 
 impl TransactionBuilder<ReplaceTable> {
-    pub(crate) fn new(snapshot: SnapshotRef, metadata_policy: MetadataPolicy) -> Self {
+    pub(crate) fn new(
+        snapshot: SnapshotRef,
+        metadata_policy: MetadataPolicy,
+        engine_info: String,
+    ) -> Self {
         Self {
             common_state: TransactionBuilderState {
+                engine_info,
                 data_change: Some(true),
                 ..TransactionBuilderState::default()
             },
@@ -104,12 +112,6 @@ impl TransactionBuilder<ReplaceTable> {
     #[internal_api]
     pub(crate) fn with_data_layout(mut self, data_layout: DataLayout) -> Self {
         self.local_state.data_layout = Some(data_layout);
-        self
-    }
-
-    /// Records the connector name and version in commit info.
-    pub fn with_engine_info(mut self, engine_info: impl Into<String>) -> Self {
-        self.common_state.engine_info = Some(engine_info.into());
         self
     }
 
@@ -162,9 +164,10 @@ impl TransactionBuilder<ReplaceTable> {
             })
             .collect::<KernelResult<Vec<_>>>()?;
         // Reuse Write's source validation and commit setup, then replace its operation and config.
-        let mut builder = snapshot
-            .transaction_builder()
-            .with_operation(UpdateTableOperation::Write);
+        let mut builder = snapshot.update_table(
+            UpdateTableOperation::Write,
+            self.common_state.engine_info.clone(),
+        );
         builder.common_state = self.common_state;
         let transaction = builder.build(engine, committer)?.with_table_replacement(
             config,
@@ -479,7 +482,7 @@ mod tests {
 
         let txn = snapshot
             .clone()
-            .replace_table(MetadataPolicy::patch_schema(snapshot.schema()))
+            .replace_table(MetadataPolicy::patch_schema(snapshot.schema()), "test")
             .build(&engine, Box::new(FileSystemCommitter::new()))?;
         assert_eq!(
             txn.staged_data_changes

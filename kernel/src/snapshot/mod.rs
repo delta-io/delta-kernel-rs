@@ -1326,6 +1326,8 @@ impl Snapshot {
 
     /// Creates a builder that replaces all active data files and changes the table definition.
     ///
+    /// `engine_info` records the connector name and version in `commitInfo`.
+    ///
     /// [`MetadataPolicy::Patch`] preserves unspecified metadata, including properties and
     /// protocol. An empty patch replaces only the data files, without emitting a metadata action.
     /// Properties referencing dropped columns remain unchanged; schemas requiring a new table
@@ -1335,8 +1337,9 @@ impl Snapshot {
     pub fn replace_table(
         self: Arc<Self>,
         metadata_policy: MetadataPolicy,
+        engine_info: impl Into<String>,
     ) -> ReplaceTableTransactionBuilder {
-        ReplaceTableTransactionBuilder::new(self, metadata_policy)
+        ReplaceTableTransactionBuilder::new(self, metadata_policy, engine_info.into())
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.

@@ -658,7 +658,8 @@ impl Transaction<UpdateTable> {
     ) -> Self {
         self.effective_table_config = config;
         self.should_emit_metadata = emit_metadata;
-        self.operation = Some(CommitOperation::Replace);
+        self.operation = CommitOperation::Replace;
+        self.staged_data_changes.replace_removal_batches = removals.len();
         self.staged_data_changes.remove_files_metadata = removals;
         // Replacing every row leaves no old row IDs or commit versions to preserve.
         self.row_tracking_preservation_acknowledged = true;
@@ -1360,8 +1361,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             .iter()
             .find(|t| !app_ids.insert(&t.app_id))
         {
-            return Err(KernelError::invalid_transaction_state(format!(
-                "app_id {} appears more than once",
+            return Err(KernelError::generic(format!(
+                "app_id {} already exists in transaction",
                 dup.app_id
             )));
         }
@@ -1625,6 +1626,16 @@ impl<STATE> Transaction<STATE, Imperative> {
 
     /// Validates the rows and required fields in staged addFile, removeFile, and dv updates.
     fn validate_file_actions(&self) -> KernelResult<()> {
+        if self.operation == CommitOperation::Replace {
+            require!(
+                self.staged_data_changes.remove_files_metadata.len()
+                    == self.staged_data_changes.replace_removal_batches
+                    && self.staged_data_changes.dv_matched_files.is_empty(),
+                KernelError::invalid_transaction_state(
+                    "REPLACE TABLE cannot stage additional removals or deletion-vector updates"
+                )
+            );
+        }
         self.validate_append_only_semantics()?;
 
         // Validate protocol-required add-file statistics.
@@ -2377,6 +2388,7 @@ mod tests {
                 Imperative {
                     add_files_metadata,
                     remove_files_metadata,
+                    replace_removal_batches,
                     dv_matched_files,
                     num_dv_updates,
                 },
@@ -2413,6 +2425,7 @@ mod tests {
         assert!(engine_commit_info.is_none());
         assert!(add_files_metadata.is_empty());
         assert!(remove_files_metadata.is_empty());
+        assert_eq!(replace_removal_batches, 0);
         assert!(set_transactions.is_empty());
         assert_eq!(commit_timestamp, expected_commit_timestamp);
         assert!(user_domain_metadata_additions.is_empty());
