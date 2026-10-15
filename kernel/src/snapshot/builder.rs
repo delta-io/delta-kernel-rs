@@ -443,7 +443,7 @@ impl<Mode> SnapshotBuilder<Mode> {
                 let table_url = try_parse_uri(&table_root)
                     .map_err(|error| classify_table_root_error(&table_root, error))?;
                 let log_segment = LogSegment::for_snapshot(
-                    engine.storage_handler().as_ref(),
+                    engine,
                     table_url
                         .join(DELTA_LOG_DIR_WITH_SLASH)
                         .map_err(KernelError::from)?,

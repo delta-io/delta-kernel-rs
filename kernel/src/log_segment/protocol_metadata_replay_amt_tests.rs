@@ -1790,6 +1790,7 @@ async fn check_hint_checkpoint_action<E: Engine>(
             "numProtocol": 1,
             "metadata": config.metadata(),
             "protocol": config.protocol(),
+            "inCommitTimestampOpt": 0,
         });
         store
             .put(
@@ -1815,4 +1816,85 @@ async fn check_hint_checkpoint_action<E: Engine>(
         .unwrap()
         .expect("checkpoint action present");
     assert_eq!(action.version(), 2);
+}
+
+// A snapshot at version 3 on a log whose AMT `_last_checkpoint` hint (content root 2, manifest
+// commit 4) embeds no checkpoint action, so the hint cannot supply the base. Listing instead starts
+// from the content root that commit 3's `lastManifestCommit` names, or, with none, as if there were
+// no hint. `commits` are the commits before 3; `expected_action` is the latest checkpoint action's
+// version.
+#[rstest]
+#[case::last_manifest_commit_names_earlier_root(
+    vec![(1, manifest_commit(1, 0, one_column_schema())), (2, commit_info(None))],
+    commit_info(Some(pointer(1, 0))),
+    Ok((vec![1, 2, 3], Some(0)))
+)]
+#[case::no_last_manifest_commit(
+    vec![
+        (0, protocol_and_metadata_lines(one_column_schema(), &[])),
+        (1, commit_info(None)),
+        (2, commit_info(None)),
+    ],
+    commit_info(None),
+    Ok((vec![0, 1, 2, 3], None))
+)]
+#[case::history_after_root_missing(
+    vec![(2, commit_info(None))],
+    commit_info(Some(pointer(1, 0))),
+    Err("AMT checkpoint at version 0 requires commits starting at or before version 1, but the first listed commit is Some(2)")
+)]
+#[tokio::test]
+async fn snapshot_before_manifest_commit_without_hint_action_lists_from_last_manifest_commit(
+    #[case] commits: Vec<(u64, String)>,
+    #[case] commit_3: String,
+    #[case] expected: KernelResult<(Vec<u64>, Option<i64>), &str>,
+    #[values(true, false)] time_travel: bool,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = Url::parse("memory:///").unwrap();
+    let manifest = time_travel.then(|| (4, manifest_commit(4, 2, one_column_schema())));
+    let all_commits = commits.into_iter().chain([(3, commit_3)]).chain(manifest);
+    for (version, commit) in all_commits {
+        add_commit(table_root.as_str(), store.as_ref(), version, commit)
+            .await
+            .unwrap();
+    }
+    let hint = serde_json::json!({
+        "version": 2,
+        "size": -1,
+        "checkpointType": "AdaptiveMetadataTree",
+        "amtCheckpoint": { "manifestCommitVersion": 4 },
+    });
+    store
+        .put(
+            &Path::from("_delta_log/_last_checkpoint"),
+            hint.to_string().into(),
+        )
+        .await
+        .unwrap();
+
+    let engine = non_plan_engine(store);
+    let builder = Snapshot::builder_for(table_root);
+    let builder = if time_travel {
+        builder.at_version(3)
+    } else {
+        builder
+    };
+    let snapshot = builder.build(&engine);
+    let (expected_commits, expected_action) = match expected {
+        Ok(expected) => expected,
+        Err(message) => return assert_result_error_with_message(snapshot, message),
+    };
+    let snapshot = snapshot.unwrap();
+    assert_eq!(snapshot.version(), 3);
+    let commit_versions: Vec<_> = snapshot
+        .log_segment()
+        .listed
+        .ascending_commit_files
+        .iter()
+        .map(|commit| commit.version)
+        .collect();
+    assert_eq!(commit_versions, expected_commits);
+    let action = snapshot.latest_checkpoint_action(&engine).unwrap();
+    assert_eq!(action.map(|action| action.version()), expected_action);
 }

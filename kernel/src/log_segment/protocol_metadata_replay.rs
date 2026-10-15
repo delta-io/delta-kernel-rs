@@ -66,24 +66,6 @@ impl LogSegment {
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
     ) -> KernelResult<PmResolution> {
-        #[allow(unused_mut)]
-        let mut resolution = self.resolve_protocol_metadata(engine, crc)?;
-        // The hint's checkpoint action is in no listed commit, yet it is the latest one, so replay
-        // and the CRC cannot supply it. Say hint 5, manifest commit 8, snapshot at 7: commit 7 may
-        // carry an older manifest commit's checkpoint action, but content roots never decrease, so
-        // that action describes a root at or before 5 and the hint's action still wins.
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some(action) = self.unlisted_amt_checkpoint_action() {
-            resolution.captured_checkpoint_action = Some(Arc::new(action.clone()));
-        }
-        Ok(resolution)
-    }
-
-    fn resolve_protocol_metadata(
-        &self,
-        engine: &dyn Engine,
-        crc: Option<&Arc<Crc>>,
-    ) -> KernelResult<PmResolution> {
         // Case 1: If CRC at target version, use it directly and exit early.
         if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
             info!("P&M from CRC at target version {}", self.end_version);
@@ -154,17 +136,22 @@ impl LogSegment {
             PmReplaySegment::WholeSegment,
             PmCandidate::default(),
         )?;
-        Ok(self.seed_with_unlisted_amt_checkpoint(candidate))
+        self.seed_with_amt_base(candidate)
     }
 
-    /// Seeds `candidate` with the P&M of the hint's checkpoint action, which is in no listed
-    /// commit. Say hint 5, manifest commit 8, snapshot at 7: if commits 5 to 7 change no protocol
-    /// or metadata, the hint's action at 5 is the only source, while a metadata change in commit 6
-    /// is newer and still wins.
+    /// Seeds `candidate` with the checkpoint action embedded in the segment's AMT base, as a
+    /// checkpoint file's actions would be. Say hint 5, manifest commit 8, snapshot at 7: commits 6
+    /// and 7 are replayed, and the action at 5 supplies protocol and metadata unless they change a
+    /// newer value. Content roots never decrease across manifest commits, so any checkpoint action
+    /// in commits 6 or 7 comes from an earlier manifest commit with a root at or before 5, and the
+    /// base action stays latest. The action ranks at the manifest commit that added it, as an
+    /// action read from that commit would.
     #[allow(unused_mut)]
-    fn seed_with_unlisted_amt_checkpoint(&self, mut candidate: PmCandidate) -> PmCandidate {
+    fn seed_with_amt_base(&self, mut candidate: PmCandidate) -> KernelResult<PmCandidate> {
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some(action) = self.unlisted_amt_checkpoint_action() {
+        if let Some(base) = self.amt_base()
+            && let Some(action) = base.checkpoint_action
+        {
             let version = action.version();
             candidate.protocol = newer(
                 Some((version, action.protocol().clone())),
@@ -174,8 +161,15 @@ impl LogSegment {
                 Some((version, action.metadata().clone())),
                 candidate.metadata,
             );
+            candidate.checkpoint = newer(
+                Some((
+                    version_as_i64(base.manifest_commit_version)?,
+                    action.clone(),
+                )),
+                candidate.checkpoint,
+            );
         }
-        candidate
+        Ok(candidate)
     }
 
     /// [`Self::replay_for_pm`] for a segment that no CRC or checkpoint file bounds, whose P&M may
@@ -189,7 +183,7 @@ impl LogSegment {
             let reader = PmReader::for_engine(engine);
             if reader.reads_newest_commit_first(self) {
                 let candidate = self.replay_newest_commit_first(engine, &reader)?;
-                return Ok(self.seed_with_unlisted_amt_checkpoint(candidate));
+                return self.seed_with_amt_base(candidate);
             }
         }
         self.replay_for_pm(engine)
