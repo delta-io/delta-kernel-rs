@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::content_tree::builder::AMT_FORMAT_VERSION;
 use crate::content_tree::{
-    ContentTreeNodeEntry, DataContentType, DataFileFormat, TrackingInfo, TrackingStatus,
+    ContentTreeNodeEntry, DataContentType, DataFileFormat, ManifestInfo, TrackingInfo,
+    TrackingStatus, AMT_FORMAT_VERSION,
 };
 use crate::expressions::{Scalar, StructData};
 use crate::schema::ToSchema as _;
@@ -28,7 +28,7 @@ pub(crate) fn added_data_entry(
         tracking: TrackingInfo {
             status: TrackingStatus::Added,
             snapshot_id: Some(1),
-            dv_snapshot_id: None,
+            modified_snapshot_id: None,
             sequence_number: Some(commit_version),
             file_sequence_number: Some(commit_version),
             first_row_id: Some(base_row_id),
@@ -45,8 +45,7 @@ pub(crate) fn added_data_entry(
         manifest_info: None,
         key_metadata: None,
         split_offsets: None,
-        equality_ids: None,
-        format_version: AMT_FORMAT_VERSION,
+        column_files: None,
         tags: None,
     }
 }
@@ -61,6 +60,10 @@ pub(crate) fn data_manifest_entry(
     let mut entry = added_data_entry(location, size, 0, 0, 1);
     entry.content_type = DataContentType::DataManifest;
     entry.tracking.status = status;
+    entry.manifest_info = Some(ManifestInfo {
+        format_version: AMT_FORMAT_VERSION,
+        ..Default::default()
+    });
     entry
 }
 

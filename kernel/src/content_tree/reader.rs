@@ -12,10 +12,10 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::{ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA};
 use crate::content_tree::{
-    struct_expr_from_schema, ContentTreeNodeEntry, DataContentType, DataFileFormat, TrackingInfo,
-    TrackingStatus, CONTENT_TYPE, DV_INFO, DV_SNAPSHOT_ID, FILE_FORMAT, FILE_SIZE_IN_BYTES,
-    FIRST_ROW_ID, LOCATION, PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER, TRACKING,
-    TRACKING_STATUS,
+    struct_expr_from_schema, ColumnFile, ContentTreeNodeEntry, DataContentType, DataFileFormat,
+    TrackingInfo, TrackingStatus, COLUMN_FILES, CONTENT_TYPE, DV_INFO, FILE_FORMAT,
+    FILE_SIZE_IN_BYTES, FIRST_ROW_ID, LOCATION, MODIFIED_SNAPSHOT_ID, PARTITION_SPEC_ID,
+    RECORD_COUNT, SEQUENCE_NUMBER, TRACKING, TRACKING_STATUS,
 };
 use crate::engine_data::{EngineData, FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{lit, ArrayData, ColumnName, Expression, MapData, Scalar};
@@ -327,7 +327,8 @@ fn partition_values_map_type() -> KernelResult<MapType> {
 ///   read the rows it deletes back as live;
 /// - a selected entry that is not Parquet or has a non-zero partition spec id;
 /// - a selected entry that carries a deletion vector: the read path does not yet populate
-///   `Add.deletionVector`, so a DV-less `Add` would read its logically deleted rows back as live.
+///   `Add.deletionVector`, so a DV-less `Add` would read its logically deleted rows back as live;
+/// - a selected entry that carries column files, whose updated values a plain `Add` would drop.
 #[derive(Default)]
 struct AddSelectionVisitor {
     selection: Vec<bool>,
@@ -346,7 +347,8 @@ impl RowVisitor for AddSelectionVisitor {
                     // `deletionVector.location` is a required field of the DV sub-struct, so it
                     // reads null iff the `deletionVector` struct itself is null.
                     ColumnName::new([DV_INFO, LOCATION]),
-                    ColumnName::new([TRACKING, DV_SNAPSHOT_ID]),
+                    ColumnName::new([TRACKING, MODIFIED_SNAPSHOT_ID]),
+                    ColumnName::new([COLUMN_FILES]),
                 ],
                 vec![
                     DataType::INTEGER,
@@ -356,6 +358,7 @@ impl RowVisitor for AddSelectionVisitor {
                     DataType::INTEGER,
                     DataType::STRING,
                     DataType::LONG,
+                    ArrayType::new(ColumnFile::to_schema(), false).into(),
                 ],
             )
                 .into()
@@ -416,14 +419,18 @@ fn check_selected_entry<'a>(
         )));
     }
     let dv_location: Option<&str> = getters[5].get_opt(row, LOCATION)?;
-    let dv_snapshot_id: Option<i64> = getters[6].get_opt(row, DV_SNAPSHOT_ID)?;
+    let column_files = getters[7].get_struct_list(row, COLUMN_FILES)?;
+    // A modification (deletion vector or column files) is the only reason to set
+    // `modifiedSnapshotId`, so reject it too in case the modification itself went unrecognized.
+    let modified_snapshot_id: Option<i64> = getters[6].get_opt(row, MODIFIED_SNAPSHOT_ID)?;
     if let Some(field) = dv_location
         .map(|_| DV_INFO)
-        .or_else(|| dv_snapshot_id.map(|_| DV_SNAPSHOT_ID))
+        .or_else(|| column_files.map(|_| COLUMN_FILES))
+        .or_else(|| modified_snapshot_id.map(|_| MODIFIED_SNAPSHOT_ID))
     {
         return Err(KernelError::unsupported(format!(
             "AMT content-tree read path does not yet support a live entry with a deletion vector \
-             (entry '{location}' has non-null '{field}')"
+             or column files (entry '{location}' has non-null '{field}')"
         )));
     }
     Ok(())
@@ -599,6 +606,18 @@ mod tests {
             offset: 0,
             size_in_bytes: 1,
             cardinality: 1,
+            key_metadata: None,
+        }
+    }
+
+    /// A column file descriptor for tests that attach one to an entry.
+    fn test_column_file() -> ColumnFile {
+        ColumnFile {
+            location: "cols.parquet".to_string(),
+            field_ids: vec![1],
+            file_format: DataFileFormat::Parquet,
+            file_size_in_bytes: 1,
+            key_metadata: None,
         }
     }
 
@@ -809,11 +828,13 @@ mod tests {
         let mut entry = added_data_entry("dropped.parquet", 1, 1, 0, 0);
         entry.content_type = content_type;
         entry.tracking.status = status;
-        entry.file_format = DataFileFormat::Puffin;
         entry.spec_id = Some(7);
         entry.deletion_vector = Some(test_dv());
-        entry.tracking.dv_snapshot_id = Some(1);
-        assert_eq!(selection_of(&[entry]), [false]);
+        entry.tracking.modified_snapshot_id = Some(1);
+        entry.column_files = Some(vec![test_column_file()]);
+        let entry = with_field(&entry.into(), &[FILE_FORMAT], Scalar::from("orc"));
+        let selection = convert_struct(entry).unwrap().selection_vector().to_vec();
+        assert_eq!(selection, [false]);
     }
 
     #[rstest]
@@ -837,39 +858,50 @@ mod tests {
     }
 
     #[rstest]
-    #[case::puffin_file_format(DataFileFormat::Puffin, Some(0), "has file format 'puffin'")]
-    #[case::non_zero_spec_id(DataFileFormat::Parquet, Some(1), "has specId 1")]
+    #[case::orc_file_format("orc", Some(0), "has file format 'orc'")]
+    #[case::non_zero_spec_id("parquet", Some(1), "has specId 1")]
     fn live_data_entry_with_unsupported_field_errors(
-        #[case] file_format: DataFileFormat,
+        #[case] file_format: &str,
         #[case] spec_id: Option<i32>,
         #[case] message: &str,
     ) {
         let mut entry = added_data_entry("f.parquet", 1, 1, 0, 0);
-        entry.file_format = file_format;
         entry.spec_id = spec_id;
-        let result = convert(&[entry]);
-        assert_result_error_with_message(result, message);
+        let entry = with_field(&entry.into(), &[FILE_FORMAT], Scalar::from(file_format));
+        assert_result_error_with_message(convert_struct(entry), message);
     }
 
     #[rstest]
-    #[case::added_dv_struct(TrackingStatus::Added, true, false)]
-    #[case::added_dv_snapshot_id(TrackingStatus::Added, false, true)]
-    #[case::modified_dv_struct(TrackingStatus::Modified, true, false)]
-    fn live_entry_with_deletion_vector_errors(
+    #[case::added_dv_struct(TrackingStatus::Added, true, false, false, DV_INFO)]
+    #[case::added_modified_snapshot_id(
+        TrackingStatus::Added,
+        false,
+        false,
+        true,
+        MODIFIED_SNAPSHOT_ID
+    )]
+    #[case::modified_dv_struct(TrackingStatus::Modified, true, false, false, DV_INFO)]
+    #[case::modified_column_files(TrackingStatus::Modified, false, true, true, COLUMN_FILES)]
+    fn live_entry_with_modification_errors(
         #[case] status: TrackingStatus,
         #[case] set_deletion_vector: bool,
-        #[case] set_dv_snapshot_id: bool,
+        #[case] set_column_files: bool,
+        #[case] set_modified_snapshot_id: bool,
+        #[case] field: &str,
     ) {
         let mut entry = added_data_entry("f.parquet", 10, 5, 0, 1);
         entry.tracking.status = status;
         if set_deletion_vector {
             entry.deletion_vector = Some(test_dv());
         }
-        if set_dv_snapshot_id {
-            entry.tracking.dv_snapshot_id = Some(1);
+        if set_column_files {
+            entry.column_files = Some(vec![test_column_file()]);
+        }
+        if set_modified_snapshot_id {
+            entry.tracking.modified_snapshot_id = Some(1);
         }
         let result = convert(&[entry]);
-        assert_result_error_with_message(result, "deletion vector");
+        assert_result_error_with_message(result, &format!("has non-null '{field}'"));
     }
 
     #[test]
@@ -924,7 +956,7 @@ mod tests {
         TrackingInfo {
             status: TrackingStatus::Added,
             snapshot_id,
-            dv_snapshot_id: None,
+            modified_snapshot_id: None,
             sequence_number,
             file_sequence_number,
             first_row_id,
@@ -1150,12 +1182,7 @@ mod tests {
     fn leaf_live_entry_with_deletion_vector_errors() {
         let engine = SyncEngine::new();
         let mut entry = leaf_entry("f.parquet", 10, 5, None, None, None);
-        entry.deletion_vector = Some(DeletionVectorInfo {
-            location: "dv.bin".to_string(),
-            offset: 0,
-            size_in_bytes: 1,
-            cardinality: 1,
-        });
+        entry.deletion_vector = Some(test_dv());
         let mut ctx = LeafReadContext::new(&engine, &valid_parent(), &read_ctx()).unwrap();
         let result =
             ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &[entry]).as_ref());
