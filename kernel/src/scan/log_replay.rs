@@ -1309,6 +1309,8 @@ mod tests {
         ScanLogReplayProcessor, ScanPartitionValuesOptions, ScanStatsOptions,
         SerializableScanState,
     };
+    use crate::arrow::array::{cast::AsArray, types::TimestampMicrosecondType, StringArray};
+    use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
         col, column_name, lit, null_lit, BinaryExpressionOp, Expression, MapToStructOptions,
@@ -1334,9 +1336,10 @@ mod tests {
     use crate::scan::{PhysicalPredicate, StatsOptions, COMMIT_READ_SCHEMA};
     use crate::schema::{schema_ref, DataType, MetadataColumnSpec, SchemaRef};
     use crate::table_features::ColumnMappingMode;
-    use crate::unit_test_utils::assert_result_error_with_message;
+    use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{
-        EngineData, Expression as Expr, ExpressionEvaluator, ExpressionRef, KernelError, Result,
+        Engine, EngineData, Expression as Expr, ExpressionEvaluator, ExpressionRef, KernelError,
+        Result,
     };
 
     /// Test evaluator that fails once before delegating, exposing both timed transform attempts.
@@ -1894,6 +1897,68 @@ mod tests {
             }
             _ => panic!("Expected PhysicalPredicate::Some"),
         }
+    }
+
+    #[test]
+    fn test_serialization_with_timezone() -> Result<()> {
+        let engine = SyncEngine::new();
+        let schema = schema_ref! {
+            nullable "ts": TIMESTAMP,
+            nullable "value": INTEGER,
+        };
+        // Keep timestamps after 2024-01-15 16:00 UTC.
+        let predicate = Arc::new(col!("ts").gt(lit(Scalar::Timestamp(1_705_334_400_000_000))));
+        let mut state_info = get_state_info(
+            schema,
+            vec!["ts".to_string()],
+            Some(predicate),
+            &[],
+            HashMap::new(),
+            vec![],
+        )?;
+        state_info.skip_row_transforms = true;
+
+        let processor = ScanLogReplayProcessor::new(
+            &engine,
+            Arc::new(state_info),
+            test_checkpoint_info(),
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions {
+                parsed_struct: true,
+                timestamp_timezone: Some("America/Los_Angeles".to_string()),
+            },
+        )?;
+        let mut deserialized = ScanLogReplayProcessor::from_serializable_state(
+            &engine,
+            processor.into_serializable_state()?,
+        )?;
+
+        let actions = engine.json_handler().parse_json(
+            string_array_to_engine_data(StringArray::from(vec![concat!(
+                r#"{"add":{"path":"f.parquet","partitionValues":{"ts":"2024-01-15 12:30:00"},"#,
+                r#""size":1,"modificationTime":0,"dataChange":true}}"#,
+            )])),
+            COMMIT_READ_SCHEMA.clone(),
+        )?;
+        let metadata =
+            deserialized.process_actions_batch_sequential(ActionsBatch::new(actions, true))?;
+
+        let (data, selection) = metadata.scan_files.into_parts();
+        assert_eq!(selection, vec![true]);
+
+        let batch = data.try_into_record_batch()?;
+        let parsed = batch
+            .column_by_name("partitionValues_parsed")
+            .unwrap()
+            .as_struct();
+        let timestamps = parsed
+            .column_by_name("ts")
+            .unwrap()
+            .as_primitive::<TimestampMicrosecondType>();
+
+        // 12:30 in Los Angeles is 20:30 UTC, so the file survives pruning.
+        assert_eq!(timestamps.value(0), 1_705_350_600_000_000);
+        Ok(())
     }
 
     #[test]

@@ -1327,6 +1327,10 @@ impl Scan {
     /// [`ScanBuilder::with_cancellation_token`], rather than silently running to completion.
     /// Only [`scan_metadata`](Self::scan_metadata) honors the token today.
     ///
+    /// Returns an error if [`PartitionValuesOptions::with_timestamp_timezone`] was set,
+    /// since parallel scan metadata does not currently support timestamp timezone.
+    /// Use [`scan_metadata`](Self::scan_metadata) for scans with a timestamp timezone.
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -1389,6 +1393,13 @@ impl Scan {
                  use scan_metadata for a cancellable scan",
             ));
         }
+        require!(
+            self.partition_values.timestamp_timezone.is_none(),
+            KernelError::unsupported(
+                "with_timestamp_timezone is not supported by parallel_scan_metadata; \
+                 use scan_metadata"
+            )
+        );
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
         // currently support stats_parsed optimization.

@@ -29,7 +29,7 @@ use test_utils::table_builder::{
     partitioned, unpartitioned, version_latest, FeatureSet, LogState, TableConfig,
 };
 use test_utils::{
-    add_commit, create_default_engine_mt_executor, get_column,
+    add_commit, assert_result_error_with_message, create_default_engine_mt_executor, get_column,
     install_thread_local_metrics_reporter, test_context, test_table_setup_mt, CountingReporter,
 };
 use url::Url;
@@ -608,6 +608,35 @@ async fn offset_less_timestamp_partition_predicates_with_json_and_checkpoint(
         }
         assert_eq!(file_num, expected_file_num, "tz={tz:?}, cm={cm_mode}");
     }
+}
+
+#[rstest]
+fn parallel_scan_metadata_rejects_timestamp_timezone(
+    #[values("UTC", "America/Los_Angeles", "+05:30")] tz: &str,
+    #[values(false, true)] parsed_struct: bool,
+) {
+    let (engine, snapshot, _table) = test_context!(
+        LogState::with_latest_version(1).with_checkpoint_at([1]),
+        FeatureSet::empty(),
+        partitioned(),
+        TableConfig::new().write_stats_as_struct(true),
+        version_latest(),
+    );
+    let options = if parsed_struct {
+        PartitionValuesOptions::with_struct()
+    } else {
+        PartitionValuesOptions::string_map_only()
+    };
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(options.with_timestamp_timezone(tz))
+        .build()
+        .unwrap();
+
+    assert_result_error_with_message(
+        scan.parallel_scan_metadata(Arc::new(engine)),
+        "with_timestamp_timezone is not supported by parallel_scan_metadata; use scan_metadata",
+    );
 }
 
 #[test]
