@@ -9,7 +9,7 @@ use crc::{Crc, CRC_32_ISO_HDLC};
 use delta_kernel::schema::derive_macro_utils::ToDataType;
 use delta_kernel_derive::{internal_api, IntoStructData, ToSchema};
 use roaring::RoaringTreemap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -32,7 +32,7 @@ const ROARING_BITMAP_NATIVE_MAGIC: u32 = 1681511376;
 
 const INLINE_DELETION_VECTOR_MAGIC_SIZE: usize = 4;
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
 pub enum DeletionVectorStorageType {
     #[serde(rename = "u")]
     PersistedRelative,
@@ -146,7 +146,7 @@ impl DeletionVectorPath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", try_from = "DeletionVectorRaw")]
 pub struct DeletionVectorDescriptor {
     /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'],

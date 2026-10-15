@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 
 use derive_more::From;
 use roaring::RoaringTreemap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::log_replay::SCAN_ROW_SCHEMA;
@@ -19,7 +19,7 @@ use crate::utils::require;
 use crate::{Engine, EngineData, ExpressionRef, KernelError, KernelResult, Result};
 
 /// this struct can be used by an engine to materialize a selection vector
-#[derive(Default, Debug, Clone, PartialEq, Eq, From, serde::Serialize, serde::Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, From, Serialize, Deserialize)]
 #[from(DeletionVectorDescriptor)]
 pub struct DvInfo {
     pub(crate) deletion_vector: Option<DeletionVectorDescriptor>,
