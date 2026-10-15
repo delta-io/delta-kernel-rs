@@ -872,6 +872,44 @@ mod tests {
     }
 
     #[test]
+    fn storage_type_serializes_as_a_string_and_round_trips() {
+        // In JSON the renamed enum serializes to its protocol string ("u"/"i"/"p"/"r") both ways.
+        for (variant, json) in [
+            (DeletionVectorStorageType::PersistedRelative, "\"u\""),
+            (DeletionVectorStorageType::Inline, "\"i\""),
+            (DeletionVectorStorageType::PersistedAbsolute, "\"p\""),
+        ] {
+            assert_eq!(serde_json::to_string(&variant).unwrap(), json);
+            assert_eq!(serde_json::from_str::<DeletionVectorStorageType>(json).unwrap(), variant);
+        }
+
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            let variant = DeletionVectorStorageType::PersistedUnencodedRelative;
+            assert_eq!(serde_json::to_string(&variant).unwrap(), "\"r\"");
+            assert_eq!(
+                serde_json::from_str::<DeletionVectorStorageType>("\"r\"").unwrap(),
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_serde_json_round_trips() {
+        for descriptor in [dv_relative(), dv_absolute(), dv_inline()] {
+            let json = serde_json::to_string(&descriptor).unwrap();
+            // In JSON storageType serializes as the renamed enum string ("u"/"i"/"p").
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert!(
+                value["storageType"].is_string(),
+                "storageType must serialize as a string: {json}"
+            );
+            let round_tripped: DeletionVectorDescriptor = serde_json::from_str(&json).unwrap();
+            assert_eq!(round_tripped, descriptor);
+        }
+    }
+
+    #[test]
     fn test_deletion_vector_absolute_path() {
         let parent = Url::parse("s3://mytable/").unwrap();
 

@@ -267,6 +267,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dv_info_serde_json_round_trips() {
+        // The absent case serializes as a `deletion_vector: null` wrapper and round-trips to None.
+        let empty = DvInfo::default();
+        let empty_json = serde_json::to_string(&empty).unwrap();
+        assert_eq!(empty_json, r#"{"deletion_vector":null}"#);
+        assert_eq!(serde_json::from_str::<DvInfo>(&empty_json).unwrap(), empty);
+
+        // The present case wraps a descriptor whose storageType is a string.
+        let dv_info = DvInfo::from(DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedAbsolute,
+            path_or_inline_dv:
+                "s3://mytable/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin".to_string(),
+            offset: Some(4),
+            size_in_bytes: 40,
+            cardinality: 6,
+        });
+        let json = serde_json::to_string(&dv_info).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value["deletion_vector"]["storageType"].is_string(), "{json}");
+        assert_eq!(serde_json::from_str::<DvInfo>(&json).unwrap(), dv_info);
+    }
+
     #[derive(Clone)]
     struct TestContext {
         id: usize,
