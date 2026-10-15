@@ -23,13 +23,7 @@ pub(super) fn extend_output_schemas(
     let mut logical = Vec::with_capacity(requests.len());
     let mut physical = Vec::with_capacity(requests.len());
     for (identifier, columns) in requests {
-        let mut parts = identifier.splitn(3, '.');
-        if !parts.next().is_some_and(|part| !part.is_empty())
-            || !parts.next().is_some_and(|part| !part.is_empty())
-            || !parts
-                .next()
-                .is_some_and(|version| version.split('.').all(|part| !part.is_empty()))
-        {
+        if !is_versioned_collation_identifier(identifier) {
             return Err(KernelError::schema(format!(
                 "Collation statistics require provider.name.version, got '{identifier}'"
             )));
@@ -82,6 +76,13 @@ pub(super) fn extend_read_schema(
     }
 }
 
+fn is_versioned_collation_identifier(identifier: &str) -> bool {
+    let mut parts = identifier.splitn(3, '.');
+    parts.next().is_some_and(|provider| !provider.is_empty())
+        && parts.next().is_some_and(|name| !name.is_empty())
+        && parts.next().is_some_and(|version| !version.is_empty())
+}
+
 fn identifier_field(identifier: &str, bounds: &SchemaRef) -> KernelResult<StructField> {
     let fields = bounds
         .project_as_struct(&[MIN_VALUES, MAX_VALUES])
@@ -120,8 +121,12 @@ mod tests {
     use crate::scan::StatsOptions;
     use crate::schema::ArrayType;
 
-    #[test]
-    fn collation_read_and_output_schemas_select_exact_bounds_without_predicate_only_fields() {
+    #[rstest]
+    #[case::dotted_version("test.ci.75.1")]
+    #[case::consecutive_dots_in_version("test.ci.75..1")]
+    fn collation_read_and_output_schemas_select_exact_bounds_without_predicate_only_fields(
+        #[case] identifier: &str,
+    ) {
         let state = get_state_info_with_stats(
             schema_ref! {
                 nullable "id": LONG,
@@ -135,8 +140,8 @@ mod tests {
             HashMap::new(),
             vec![],
             StatsOptions::struct_columns(vec![column_name!("id")])
-                .with_collation_stats("test.ci.75.1", [column_name!("name")])
-                .with_collation_stats("test.ci.75.1", [column_name!("nested.child")]),
+                .with_collation_stats(identifier, [column_name!("name")])
+                .with_collation_stats(identifier, [column_name!("nested.child")]),
         )
         .unwrap();
         let read = state.physical_stats_read_schema().unwrap();
@@ -145,16 +150,16 @@ mod tests {
         assert!(!output.contains_col(["minValues", "other"]));
         for schema in [read, output] {
             for bound in [MIN_VALUES, MAX_VALUES] {
-                assert!(schema.contains_col([COLLATION_STATS, "test.ci.75.1", bound, "name"]));
+                assert!(schema.contains_col([COLLATION_STATS, identifier, bound, "name"]));
                 assert!(schema.contains_col([
                     COLLATION_STATS,
-                    "test.ci.75.1",
+                    identifier,
                     bound,
                     "nested",
                     "child"
                 ]));
                 assert!(!schema.contains_col([COLLATION_STATS, "test.ci.75", bound, "name"]));
-                assert!(!schema.contains_col([COLLATION_STATS, "test.ci.75.1", bound, "id"]));
+                assert!(!schema.contains_col([COLLATION_STATS, identifier, bound, "id"]));
             }
         }
     }
@@ -163,7 +168,6 @@ mod tests {
     #[case::unversioned("test.ci", column_name!("name"), vec![])]
     #[case::empty_provider(".ci.1", column_name!("name"), vec![])]
     #[case::empty_version("test.ci.", column_name!("name"), vec![])]
-    #[case::empty_version_segment("test.ci.75..1", column_name!("name"), vec![])]
     #[case::unresolved("test.ci.1", column_name!("missing"), vec![])]
     #[case::numeric("test.ci.1", column_name!("id"), vec![])]
     #[case::array("test.ci.1", column_name!("array"), vec![])]
