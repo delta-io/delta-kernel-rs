@@ -8,8 +8,8 @@ use std::sync::{Arc, LazyLock};
 
 use serde_json::Value;
 
-use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
-use crate::engine_data::{GetData, RowVisitor, TypedGetData};
+use crate::action_reconciliation::log_replay::ActionReconciliationBatch;
+use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData};
 use crate::expressions::{
     col, column_name, ColumnName, Expression, ExpressionRef, UnaryExpressionOp,
 };
@@ -17,7 +17,7 @@ use crate::schema::{
     schema, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
 };
 use crate::struct_patch::ProjectionStructPatchBuilder;
-use crate::{Engine, KernelError, KernelResult, Result, Snapshot};
+use crate::{KernelError, KernelResult, Snapshot};
 
 const COLLATION_STATS: &str = "statsWithCollation";
 
@@ -99,40 +99,38 @@ pub(crate) fn build_collation_stats_read_transform(
 
 /// Extends `binary_stats` with identifiers sampled from the first active Add.
 ///
-/// The writer needs a fixed schema before emitting data, so discovery rereads the log up to the
-/// first active Add. If its stats have no collation identifiers, `binary_stats` is unchanged.
+/// Consumes reconciled `batches` through the first active Add and returns them for writing before
+/// the remaining stream. If its stats have no collation identifiers, `binary_stats` is unchanged.
 /// Both bounds include all current physical STRING columns outside partitions, so sparse samples
 /// do not limit same-version bounds in later files.
 /// Collation bounds are optional: unsampled identifiers are omitted from structured stats.
 /// JSON stats retain all source identifiers when enabled.
-/// Returns an error for unreadable log data or an invalid derived schema.
+/// Returns an error from replay, visiting selected rows, or building the derived schema.
 pub(super) fn checkpoint_stats_schema(
     snapshot: &Snapshot,
-    engine: &dyn Engine,
     binary_stats: SchemaRef,
-) -> KernelResult<SchemaRef> {
+    batches: &mut impl Iterator<Item = KernelResult<ActionReconciliationBatch>>,
+) -> KernelResult<(SchemaRef, Vec<ActionReconciliationBatch>)> {
     let bound_schema = string_bound_schema(
         &snapshot
             .table_configuration()
             .physical_data_schema_without_partition_columns(),
     )?;
     if bound_schema.num_fields() == 0 {
-        return Ok(binary_stats);
+        return Ok((binary_stats, Vec::new()));
     }
     let mut visitor = CollationStatsVisitor::default();
-    let actions = snapshot
-        .log_segment()
-        .read_actions(engine, super::CHECKPOINT_ACTIONS_SCHEMA_V1.clone())?;
-    let mut processor = ActionReconciliationProcessor::new(i64::MAX, None);
-    for batch in actions {
-        let batch = processor.process_actions_batch(batch?)?;
-        visitor.visit_rows_of(batch.filtered_data.apply_selection_vector()?.as_ref())?;
+    let mut buffered = Vec::new();
+    for batch in batches {
+        let batch = batch?;
+        visitor.visit_rows_of(&batch.filtered_data)?;
+        buffered.push(batch);
         if visitor.found_add {
             break;
         }
     }
     if visitor.identifiers.is_empty() {
-        return Ok(binary_stats);
+        return Ok((binary_stats, buffered));
     }
     let bounds = schema! {
         nullable "minValues": (bound_schema.clone()),
@@ -144,10 +142,13 @@ pub(super) fn checkpoint_stats_schema(
             .into_iter()
             .map(|identifier| StructField::nullable(identifier, bounds.clone())),
     )?;
-    Ok(Arc::new(
-        SchemaStructPatchBuilder::new()
-            .append(StructField::nullable(COLLATION_STATS, collations))
-            .build(&binary_stats)?,
+    Ok((
+        Arc::new(
+            SchemaStructPatchBuilder::new()
+                .append(StructField::nullable(COLLATION_STATS, collations))
+                .build(&binary_stats)?,
+        ),
+        buffered,
     ))
 }
 
@@ -157,15 +158,19 @@ struct CollationStatsVisitor {
     identifiers: Vec<String>,
 }
 
-impl RowVisitor for CollationStatsVisitor {
+impl FilteredRowVisitor for CollationStatsVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static COLUMNS: LazyLock<[ColumnName; 2]> =
             LazyLock::new(|| [column_name!("add.path"), column_name!("add.stats")]);
         (&*COLUMNS, &[DataType::STRING, DataType::STRING])
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
-        for row in 0..row_count {
+    fn visit_filtered<'a>(
+        &mut self,
+        getters: &[&'a dyn GetData<'a>],
+        rows: RowIndexIterator<'_>,
+    ) -> KernelResult<()> {
+        for row in rows {
             let path: Option<&str> = getters[0].get_opt(row, "add.path")?;
             if path.is_none() {
                 continue;
@@ -218,12 +223,11 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
     use crate::actions::{Metadata, Protocol};
     use crate::arrow::array::{StringArray, StructArray};
-    use crate::checkpoint::checkpoint_transform::{
-        build_checkpoint_read_schema, build_checkpoint_transform, StatsTransformConfig,
-    };
-    use crate::checkpoint::CHECKPOINT_ACTIONS_SCHEMA_V1;
+    use crate::checkpoint::checkpoint_transform::build_checkpoint_read_schema;
+    use crate::checkpoint::{CheckpointWriter, CHECKPOINT_ACTIONS_SCHEMA_V1};
     use crate::engine::arrow_data::EngineDataArrowExt;
     use crate::engine::arrow_utils::to_json_bytes;
     use crate::engine::sync::SyncEngine;
@@ -232,6 +236,7 @@ mod tests {
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use crate::schema::{schema, schema_ref, ColumnMetadataKey, MetadataValue};
+    use crate::{version_as_i64, Engine};
 
     #[rstest]
     #[case::missing(None, vec![])]
@@ -266,7 +271,9 @@ mod tests {
             schema_ref! { nullable "add": { nullable "path": STRING, nullable "stats": STRING } },
         ).unwrap();
         let mut visitor = CollationStatsVisitor::default();
-        visitor.visit_rows_of(data.as_ref()).unwrap();
+        visitor
+            .visit_rows_of(&FilteredEngineData::with_all_rows_selected(data))
+            .unwrap();
         assert!(visitor.found_add);
         assert_eq!(visitor.identifiers, expected);
     }
@@ -278,7 +285,7 @@ mod tests {
     async fn checkpoint_samples_only_first_add_and_preserves_selected_bounds(
         #[case] write_json: bool,
         #[values(false, true)] sample_has_collations: bool,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
         let table_root = "memory:///";
@@ -376,11 +383,20 @@ mod tests {
         .await
         .unwrap();
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-        let binary_stats = snapshot
-            .table_configuration()
-            .stats_schema_builder()
-            .build()?;
-        let stats_schema = checkpoint_stats_schema(&snapshot, &engine, binary_stats.clone())?;
+        let schema_context = CheckpointWriter::checkpoint_schema_context(&snapshot, &engine)?;
+        let binary_stats = schema_context.stats_schema.clone();
+        let read_schema = build_checkpoint_read_schema(
+            &schema_context.checkpoint_base_schema,
+            &binary_stats,
+            schema_context.partition_schema.as_deref(),
+        )?;
+        let writer = CheckpointWriter {
+            version: version_as_i64(snapshot.version())?,
+            snapshot: snapshot.clone(),
+            schema_context,
+            read_schema: read_schema.clone(),
+        };
+        let (batches, output_schema) = writer.checkpoint_data_with_schema(&engine)?;
         let bounds = schema! {
             nullable "physical.with.dot": { nullable "a": STRING, nullable "b": STRING },
         };
@@ -399,26 +415,15 @@ mod tests {
         } else {
             binary_stats.clone()
         };
-        assert_eq!(stats_schema, expected);
-
-        let read_schema =
-            build_checkpoint_read_schema(&CHECKPOINT_ACTIONS_SCHEMA_V1, &stats_schema, None)?;
-        let config = StatsTransformConfig::from_table_properties(snapshot.table_properties());
-        let (output_schema, expression) =
-            build_checkpoint_transform(&config, &read_schema, &stats_schema, None)?;
-        let evaluator = engine.evaluation_handler().new_expression_evaluator(
-            read_schema.clone(),
-            expression,
-            output_schema.as_ref().clone().into(),
-        )?;
-        let mut processor = ActionReconciliationProcessor::new(i64::MAX, None);
+        assert_eq!(
+            output_schema
+                .field_at(&column_name!("add.stats_parsed"))?
+                .data_type(),
+            &DataType::from(expected.as_ref().clone()),
+        );
         let mut output = HashMap::new();
-        for batch in snapshot.log_segment().read_actions(&engine, read_schema)? {
-            let batch = processor
-                .process_actions_batch(batch?)?
-                .filtered_data
-                .apply_selection_vector()?;
-            let data = evaluator.evaluate(batch.as_ref())?;
+        for batch in batches {
+            let data = batch?.apply_selection_vector()?;
             let bytes = to_json_bytes(std::iter::once(Ok(
                 FilteredEngineData::with_all_rows_selected(data),
             )))?;
@@ -464,9 +469,14 @@ mod tests {
         store
             .delete(&Path::from("_delta_log/00000000000000000000.json"))
             .await?;
+        let mut processor = ActionReconciliationProcessor::new(i64::MAX, None, None);
+        let mut batches = snapshot
+            .log_segment()
+            .read_actions(&engine, read_schema)?
+            .map(move |batch| processor.process_actions_batch(batch?));
         assert_eq!(
-            checkpoint_stats_schema(&snapshot, &engine, binary_stats)?,
-            stats_schema
+            checkpoint_stats_schema(&snapshot, binary_stats, &mut batches)?.0,
+            expected
         );
         Ok(())
     }
@@ -479,7 +489,7 @@ mod tests {
         #[case] replace_dv: bool,
         #[values(false, true)] earlier_checkpoint: bool,
         #[values(false, true)] write_json: bool,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
         let table_root = "memory:///";
@@ -632,9 +642,14 @@ mod tests {
                 },
             },
         };
+        let mut processor = ActionReconciliationProcessor::new(i64::MAX, None, None);
+        let mut batches = snapshot
+            .log_segment()
+            .read_actions(&engine, CHECKPOINT_ACTIONS_SCHEMA_V1.clone())?
+            .map(move |batch| processor.process_actions_batch(batch?));
         assert_eq!(
-            checkpoint_stats_schema(&snapshot, &engine, binary_stats)?,
-            expected,
+            checkpoint_stats_schema(&snapshot, binary_stats, &mut batches)?.0,
+            expected
         );
         Ok(())
     }
