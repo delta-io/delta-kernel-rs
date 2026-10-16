@@ -13,6 +13,10 @@ use crate::schema::{DataType, StructType};
 use crate::table_properties::ParseIntervalError;
 use crate::Version;
 
+mod delta_error_condition;
+
+pub use delta_error_condition::DeltaErrorCondition;
+
 /// An error returned by a Delta Kernel operation.
 #[derive(Debug, thiserror::Error)]
 // TODO(#2630): Remove non_exhaustive once Delta and Engine variants are introduced.
