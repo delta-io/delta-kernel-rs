@@ -1007,8 +1007,15 @@ async fn assert_compacted_replay<E: Engine>(
 ) {
     let (store, table_root) = manifest_commit_table(later_commits).await;
     let engine = make_engine(store.clone());
-    let log_segment =
-        segment_with_newest_two_compacted(&store, &table_root, &engine, later_commits.len()).await;
+    let newest_version = later_commits.len() as u64;
+    let log_segment = segment_with_compaction(
+        &store,
+        &table_root,
+        &engine,
+        (newest_version - 1, newest_version),
+        &txn_commit(),
+    )
+    .await;
 
     let resolution = log_segment
         .read_protocol_metadata_opt(&engine, None)
@@ -1018,17 +1025,20 @@ async fn assert_compacted_replay<E: Engine>(
     assert_last_manifest_commit_resolution(&resolution.last_manifest_commit, expected_pointer);
 }
 
-// Writes a log compaction covering the newest two commits and returns a segment that uses it.
+// Writes `contents` as a log compaction over versions `lo..=hi` and returns a segment that uses it.
 // Compaction listing is disabled, so the compaction is added to the segment by hand.
-async fn segment_with_newest_two_compacted(
+async fn segment_with_compaction(
     store: &InMemory,
     table_root: &url::Url,
     engine: &impl Engine,
-    newest_version: usize,
+    (lo, hi): (u64, u64),
+    contents: &str,
 ) -> LogSegment {
-    let newest_version = newest_version as u64;
-    let compaction = compacted_log_path_for_versions(newest_version - 1, newest_version, "json");
-    store.put(&compaction, txn_commit().into()).await.unwrap();
+    let compaction = compacted_log_path_for_versions(lo, hi, "json");
+    store
+        .put(&compaction, contents.to_string().into())
+        .await
+        .unwrap();
 
     let mut log_segment = latest_log_segment(table_root, engine);
     let compaction_location = table_root.join(compaction.as_ref()).unwrap();
@@ -1040,6 +1050,78 @@ async fn segment_with_newest_two_compacted(
         .ascending_compaction_files
         .push(compaction);
     log_segment
+}
+
+// A log compaction holds the P&M in effect at its last version, so replay ranks it there. A
+// compaction that hides the pointed commit and a later Metadata change beats the pointed action's
+// older Metadata, while one without Metadata leaves the pointed action's Metadata in place.
+#[rstest]
+#[case::later_metadata_in_compaction_wins(
+    one_column_schema(),
+    metadata_commit(test_schema_flat_with_column_mapping()),
+    test_schema_flat_with_column_mapping()
+)]
+#[case::compaction_without_metadata_keeps_pointed_metadata(
+    test_schema_flat_with_column_mapping(),
+    txn_commit(),
+    one_column_schema()
+)]
+#[tokio::test]
+async fn replay_ranks_compaction_at_its_last_version(
+    #[case] first_schema: SchemaRef,
+    #[case] compacted_commit: String,
+    #[case] expected_schema: SchemaRef,
+) {
+    let commits = [
+        standalone_pm_commit(first_schema),
+        txn_commit(),
+        checkpoint_commit(2, &[], one_column_schema()),
+        compacted_commit.clone(),
+        commit_info(Some((2, 2))),
+    ];
+    assert_compaction_ranked(
+        &commits,
+        &compacted_commit,
+        &expected_schema,
+        non_plan_engine,
+    )
+    .await;
+    #[cfg(feature = "declarative-plans")]
+    assert_compaction_ranked(&commits, &compacted_commit, &expected_schema, |store| {
+        SyncEngine::new_with_store(store)
+    })
+    .await;
+}
+
+// Writes `commits` as versions 0.., compacts versions 1..=3 into `compaction`, and asserts the
+// replayed Metadata has `expected_schema`.
+async fn assert_compaction_ranked<E: Engine>(
+    commits: &[String],
+    compaction: &str,
+    expected_schema: &SchemaRef,
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    for (version, commit) in commits.iter().enumerate() {
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            version as u64,
+            commit.clone(),
+        )
+        .await
+        .unwrap();
+    }
+    let engine = make_engine(store.clone());
+    let log_segment =
+        segment_with_compaction(&store, &table_root, &engine, (1, 3), compaction).await;
+
+    let resolution = log_segment
+        .read_protocol_metadata_opt(&engine, None)
+        .unwrap();
+    let schema = resolution.metadata.unwrap().parse_schema().unwrap();
+    assert_eq!(&schema, expected_schema.as_ref());
 }
 
 // Replay merges the pointed checkpoint action as soon as it reads the newest commit, so it stops at
@@ -1061,7 +1143,8 @@ async fn replay_stops_at_pointed_checkpoint_action_covered_by_compaction() {
             .unwrap();
     }
     let engine = non_plan_engine(store.clone());
-    let log_segment = segment_with_newest_two_compacted(&store, &table_root, &engine, 2).await;
+    let log_segment =
+        segment_with_compaction(&store, &table_root, &engine, (1, 2), &txn_commit()).await;
 
     let resolution = log_segment
         .read_protocol_metadata_opt(&engine, None)

@@ -354,10 +354,13 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         }
     }
 
-    /// Convenience wrapper around [`version_as_i64`] for this parsed path's `version`.
-    #[cfg(feature = "declarative-plans")]
-    pub(crate) fn version_as_i64(&self) -> KernelResult<i64> {
-        crate::version_as_i64(self.version)
+    /// The newest version this file covers: the end of a log compaction's range, else
+    /// [`Self::version`].
+    pub(crate) fn last_version(&self) -> Version {
+        match self.file_type {
+            LogPathFileType::CompactedCommit { hi } => hi,
+            _ => self.version,
+        }
     }
 
     #[internal_api]

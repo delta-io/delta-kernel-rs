@@ -38,7 +38,7 @@ use crate::utils::require;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::EngineData;
 #[cfg(feature = "declarative-plans")]
-use crate::Scalar;
+use crate::{version_as_i64, Scalar};
 use crate::{
     Engine, FileMeta, KernelError, KernelResult, Predicate, PredicateRef, RowVisitor,
     StorageHandler, Version,
@@ -996,12 +996,22 @@ impl LogSegment {
     fn version_tagged_scan_files<'a>(
         paths: impl IntoIterator<Item = &'a ParsedLogPath>,
     ) -> KernelResult<Vec<ScanFile>> {
+        Self::scan_files_tagged_with(paths, |path| path.version)
+    }
+
+    /// Returns `paths` as scan files, each tagged with file-constant `version` set to
+    /// `version(path)`.
+    #[cfg(feature = "declarative-plans")]
+    fn scan_files_tagged_with<'a>(
+        paths: impl IntoIterator<Item = &'a ParsedLogPath>,
+        version: impl Fn(&ParsedLogPath) -> Version,
+    ) -> KernelResult<Vec<ScanFile>> {
         paths
             .into_iter()
             .map(|path| {
                 Ok(ScanFile {
                     meta: path.location.clone(),
-                    file_constants: vec![Scalar::Long(path.version_as_i64()?)],
+                    file_constants: vec![Scalar::Long(version_as_i64(version(path))?)],
                 })
             })
             .collect()
