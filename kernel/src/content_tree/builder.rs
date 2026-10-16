@@ -27,7 +27,7 @@ use crate::transaction::augmented_write_metadata_schema;
 use crate::{Engine, KernelError, KernelResult};
 
 /// The Iceberg format version stamped onto each written entry: 4 (the V4 adaptive metadata tree).
-const AMT_FORMAT_VERSION: i32 = 4;
+pub(super) const AMT_FORMAT_VERSION: i32 = 4;
 
 /// Dotted path of the `stats.numRecords` leaf column, used for column selection and error messages.
 const STATS_NUM_RECORDS: &str = "stats.numRecords";

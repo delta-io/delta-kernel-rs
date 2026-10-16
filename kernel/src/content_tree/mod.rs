@@ -8,6 +8,8 @@ mod builder;
 mod dv_conversion;
 mod reader;
 pub(crate) mod stats;
+#[cfg(test)]
+pub(crate) mod test_utils;
 
 use std::collections::HashMap;
 
