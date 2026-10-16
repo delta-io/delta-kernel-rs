@@ -469,14 +469,22 @@ fn test_without_row_transforms_retains_spec_and_sets_skip(#[case] table: &str) {
 /// Under `without_row_transforms`, `scan_metadata` still lists files and surfaces the partition
 /// values a connector needs to reconstruct rows itself, while every per-file transform is `None`.
 /// Deletion vectors are covered by the sibling test.
-#[test]
-fn test_without_row_transforms_scan_metadata_lists_files_with_partition_values() {
+#[rstest]
+#[case::explicit(None)]
+#[case::utc(Some("UTC"))]
+#[case::named(Some("America/Los_Angeles"))]
+#[case::fixed(Some("+05:30"))]
+fn disabled_row_transforms_preserve_partition_metadata(#[case] timezone: Option<&str>) {
     let (engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
-    let scan = snapshot
-        .scan_builder()
-        .without_row_transforms()
-        .build()
-        .unwrap();
+    let builder = snapshot.scan_builder();
+    let scan = match timezone {
+        Some(timezone) => builder.with_partition_values(
+            PartitionValuesOptions::string_map_only().with_timestamp_timezone(timezone),
+        ),
+        None => builder.without_row_transforms(),
+    }
+    .build()
+    .unwrap();
 
     // (saw a file, saw non-empty partition values)
     fn collect(acc: &mut (bool, bool), scan_file: ScanFile) {
@@ -536,14 +544,22 @@ fn test_without_row_transforms_scan_metadata_lists_files_column_mapping() {
     );
 }
 
-#[test]
-fn test_without_row_transforms_rejects_execute() {
+#[rstest]
+#[case::explicit(None)]
+#[case::utc(Some("UTC"))]
+#[case::named(Some("America/Los_Angeles"))]
+#[case::fixed(Some("+05:30"))]
+fn disabled_row_transforms_reject_execute(#[case] timezone: Option<&str>) {
     let (engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
-    let scan = snapshot
-        .scan_builder()
-        .without_row_transforms()
-        .build()
-        .unwrap();
+    let builder = snapshot.scan_builder();
+    let scan = match timezone {
+        Some(timezone) => builder.with_partition_values(
+            PartitionValuesOptions::with_struct().with_timestamp_timezone(timezone),
+        ),
+        None => builder.without_row_transforms(),
+    }
+    .build()
+    .unwrap();
     let err = scan
         .execute(engine)
         .err()
