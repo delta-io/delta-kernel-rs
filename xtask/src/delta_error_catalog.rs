@@ -322,9 +322,10 @@ fn render(source: &Source, conditions: &[Condition]) -> Result<String, std::fmt:
     writeln!(out, "impl DeltaErrorCondition {{")?;
     writeln!(
         out,
-        "    /// Every condition in the catalog, ordered by name."
+        "    // Lets invariant tests check metadata for every condition in the catalog."
     )?;
-    writeln!(out, "    pub const ALL: &'static [Self] = &[")?;
+    writeln!(out, "    #[cfg(test)]")?;
+    writeln!(out, "    pub(super) const ALL: &'static [Self] = &[")?;
     for c in conditions {
         writeln!(out, "        Self::{},", c.variant)?;
     }

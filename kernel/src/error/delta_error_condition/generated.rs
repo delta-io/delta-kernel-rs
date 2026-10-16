@@ -1185,8 +1185,9 @@ pub enum DeltaErrorCondition {
 }
 
 impl DeltaErrorCondition {
-    /// Every condition in the catalog, ordered by name.
-    pub const ALL: &'static [Self] = &[
+    // Lets invariant tests check metadata for every condition in the catalog.
+    #[cfg(test)]
+    pub(super) const ALL: &'static [Self] = &[
         Self::Deltav2TransactionsInconsistentConfigCatalogMismatch,
         Self::Deltav2TransactionsInconsistentConfigRequiresV2Connector,
         Self::DeltaActiveSparkSessionNotFound,
