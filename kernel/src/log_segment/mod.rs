@@ -60,6 +60,19 @@ mod protocol_metadata_replay_amt_tests;
 #[cfg(test)]
 mod tests;
 
+/// Statistics for the commit files selected to replay a snapshot's log segment.
+///
+/// Includes published and staged commits, and selected log compactions in place of the commits
+/// they cover. Excludes checkpoints, sidecars, CRCs, and commits retained only for timestamp
+/// lookup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogSegmentStats {
+    /// Number of selected commit files, counting each selected compaction as one file.
+    pub num_commit_files: u64,
+    /// Sum of the selected commit file sizes in bytes.
+    pub total_commit_file_bytes: u64,
+}
+
 /// Information about checkpoint reading for data skipping optimization.
 ///
 /// Returned alongside the actions iterator from checkpoint reading functions.
@@ -252,6 +265,27 @@ fn combine_checkpoint_predicates(
 }
 
 impl LogSegment {
+    /// Returns selected replay commit file statistics, failing if the byte sum overflows.
+    pub(crate) fn stats(&self) -> KernelResult<LogSegmentStats> {
+        let selected;
+        let paths = if self.listed.ascending_compaction_files.is_empty() {
+            &self.listed.ascending_commit_files
+        } else {
+            selected = self.find_commit_cover_paths();
+            &selected
+        };
+        paths
+            .iter()
+            .try_fold(LogSegmentStats::default(), |mut stats, path| {
+                stats.total_commit_file_bytes = stats
+                    .total_commit_file_bytes
+                    .checked_add(path.location.size)
+                    .ok_or_else(|| KernelError::generic("Log segment commit file size overflow"))?;
+                stats.num_commit_files += 1;
+                Ok(stats)
+            })
+    }
+
     /// Creates a LogSegment for a newly created table at version 0 from a single commit file.
     ///
     /// Normal log segments are built by listing files from storage and replaying them. For CREATE
