@@ -1,13 +1,8 @@
 //! Builder for transactions against an existing table.
 
-use delta_kernel_derive::internal_api;
-
-use super::alter_table::Modifying;
 use super::state::TransactionBuilderState;
 use super::{TransactionBuilder, TransactionType};
 use crate::committer::Committer;
-use crate::expressions::ColumnName;
-use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
@@ -17,9 +12,9 @@ use crate::table_features::{
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
 use crate::transaction::{
-    AlterTable, CommitOperation, ExecutionMode, Transaction, UpdateTable, UpdateTableOperation,
+    CommitOperation, ExecutionMode, Transaction, UpdateTable, UpdateTableOperation,
 };
-use crate::utils::{current_time_ms, require};
+use crate::utils::current_time_ms;
 use crate::{Engine, KernelError, KernelResult, Result};
 
 /// Configures data writes and schema evolution against an existing table.
@@ -59,23 +54,6 @@ pub struct ExistingTableBuilderState {
     pub(super) schema_changes: Option<Vec<SchemaOperation>>,
     pub(super) domain_metadata_removals: Vec<String>,
     pub(super) is_blind_append: bool,
-}
-
-/// A transaction type that accepts schema changes against an existing table.
-///
-/// Schema setters share their implementation and preserve transaction metadata while selecting
-/// the builder state in which a schema operation has been queued.
-pub trait SupportsSchemaChanges: TransactionType<BuilderState = ExistingTableBuilderState> {
-    /// Transaction type after adding at least one schema operation.
-    type WithSchemaChanges: TransactionType<BuilderState = ExistingTableBuilderState>;
-}
-
-impl SupportsSchemaChanges for UpdateTable {
-    type WithSchemaChanges = UpdateTable;
-}
-
-impl<S> SupportsSchemaChanges for AlterTable<S> {
-    type WithSchemaChanges = AlterTable<Modifying>;
 }
 
 impl std::fmt::Debug for TransactionBuilder<UpdateTable> {
@@ -118,97 +96,6 @@ impl TransactionBuilder<UpdateTable> {
     pub fn with_blind_append(mut self) -> Self {
         self.local_state.is_blind_append = true;
         self
-    }
-}
-
-impl<T: SupportsSchemaChanges> TransactionBuilder<T> {
-    /// Adds schema changes to validate and apply when building the transaction.
-    ///
-    /// Appends `changes` in call order and returns the updated builder. Each change observes the
-    /// result of prior changes. Empty input is rejected immediately.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `changes` is empty.
-    #[internal_api]
-    pub(crate) fn with_schema_changes(
-        mut self,
-        changes: impl IntoIterator<Item = SchemaOperation>,
-    ) -> Result<TransactionBuilder<T::WithSchemaChanges>> {
-        let mut changes = changes.into_iter().peekable();
-        require!(
-            changes.peek().is_some(),
-            KernelError::generic("with_schema_changes requires at least one schema operation")
-        );
-        self.local_state
-            .schema_changes
-            .get_or_insert_with(Vec::new)
-            .extend(changes);
-        Ok(self.transition())
-    }
-
-    /// Add a new top-level column to the table schema.
-    ///
-    /// The field must not already exist in the schema (case-insensitive). The field must be
-    /// nullable because existing data files do not contain this column and will read NULL for it.
-    /// On column-mapping tables, Kernel assigns or preserves column-mapping IDs and physical names
-    /// for the added field.
-    ///
-    /// Schema changes are applied in call order and validated when building the transaction.
-    pub fn add_column(mut self, field: StructField) -> TransactionBuilder<T::WithSchemaChanges> {
-        self.local_state
-            .schema_changes
-            .get_or_insert_with(Vec::new)
-            .push(SchemaOperation::add_column(None, field));
-        self.transition()
-    }
-
-    /// Add a new column or nested field to the table schema.
-    ///
-    /// `parent` identifies the struct that will contain `field`. An empty parent targets the
-    /// table's root schema; segments may traverse nested structs, array elements, map keys, and
-    /// map values.
-    ///
-    /// The added field must be nullable (existing data files lack the column and will read NULL),
-    /// must not be a metadata column and must not collide case-insensitively with a
-    /// sibling in the target struct. `parent` must resolve to a struct.
-    ///
-    /// With column mapping enabled, existing IDs and physical names are preserved and missing
-    /// annotations are assigned.
-    ///
-    /// Schema changes are applied in call order and validated when building the transaction.
-    pub fn add_column_at(
-        mut self,
-        parent: ColumnName,
-        field: StructField,
-    ) -> TransactionBuilder<T::WithSchemaChanges> {
-        self.local_state
-            .schema_changes
-            .get_or_insert_with(Vec::new)
-            .push(SchemaOperation::add_column(parent, field));
-        self.transition()
-    }
-
-    /// Change a column's nullability from NOT NULL to nullable. If the column is already
-    /// nullable, the op is a no-op but still generates a commit.
-    ///
-    /// Note: this matches Spark's behavior.
-    pub fn set_nullable(mut self, column: ColumnName) -> TransactionBuilder<T::WithSchemaChanges> {
-        self.local_state
-            .schema_changes
-            .get_or_insert_with(Vec::new)
-            .push(SchemaOperation::SetNullable { column });
-        self.transition()
-    }
-
-    // Reconstructs the builder with a different transaction type, changing which methods
-    // are available at compile time (e.g. Ready -> Modifying enables `build()`). All real
-    // fields are moved as-is; only the zero-sized type state changes.
-    fn transition(self) -> TransactionBuilder<T::WithSchemaChanges> {
-        TransactionBuilder {
-            common_state: self.common_state,
-            local_state: self.local_state,
-        }
     }
 }
 
