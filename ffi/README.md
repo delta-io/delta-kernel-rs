@@ -119,8 +119,7 @@ cmake -DPRINT_DATA=no ..
 and the example will only print out the schema of the table, not the data.
 
 The [UDT annotation test instructions](examples/read-table/README.md#udt-annotation-tests) describe
-building the Rust library with `udt-in-dev` and enabling CMake's `UDT_IN_DEV=ON` option to run the
-schema round-trip test.
+building the Rust library and running the schema round-trip test.
 
 ### 2. Visit Expression Example (`examples/visit-expression`)
 

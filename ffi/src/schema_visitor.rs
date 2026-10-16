@@ -857,11 +857,10 @@ fn visit_field_map_impl(
 /// Visit a UDT field with the physical type referenced by `sql_type_id` and a borrowed annotation.
 ///
 /// Copies the annotation and returns a new field ID. After decoding the name and annotation and
-/// visiting metadata, consumes `sql_type_id` even if UDT validation fails. Earlier errors and
-/// disabled UDT support leave the ID available. The physical field's name, nullability, and
-/// metadata are ignored. Returns an error for invalid IDs, invalid UTF-8, duplicate or reserved
-/// annotation keys, failed metadata callbacks, physical types containing UDTs or metadata columns,
-/// or disabled UDT support.
+/// visiting metadata, consumes `sql_type_id` even if UDT validation fails. Earlier errors leave the
+/// ID available. The physical field's name, nullability, and metadata are ignored. Returns an error
+/// for invalid IDs, invalid UTF-8, duplicate or reserved annotation keys, failed metadata
+/// callbacks, or physical types containing UDTs or metadata columns.
 ///
 /// # Safety
 ///
@@ -880,7 +879,6 @@ pub unsafe extern "C" fn visit_field_user_defined(
     metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    #[cfg(feature = "udt-in-dev")]
     let result = (|| -> Result<usize> {
         let name = unsafe { name.try_to_string() }?;
         let annotation = unsafe { annotation.try_to_hash_map() }?;
@@ -894,13 +892,6 @@ pub unsafe extern "C" fn visit_field_user_defined(
             StructField::new(name, udt, nullable).with_metadata(metadata),
         ))
     })();
-    #[cfg(not(feature = "udt-in-dev"))]
-    let result: Result<usize> = {
-        let _ = (state, name, sql_type_id, annotation, nullable, metadata);
-        Err(KernelError::unsupported(
-            "UDT schema construction requires udt-in-dev",
-        ))
-    };
     result.into_extern_result(&allocate_error)
 }
 
@@ -976,7 +967,6 @@ mod tests {
     use crate::{KernelStringSlice, NullableCvoid};
 
     /// Verifies annotation validation and ownership of parent and physical-field attributes.
-    #[cfg(feature = "udt-in-dev")]
     #[rstest]
     #[case("class", true)]
     #[case("type", false)]
@@ -1041,7 +1031,6 @@ mod tests {
 
     /// Verifies that invalid and consumed physical IDs return schema errors without disturbing
     /// unrelated fields.
-    #[cfg(feature = "udt-in-dev")]
     #[rstest]
     fn udt_schema_visit_rejects_invalid_or_consumed_id(#[values(false, true)] consumed: bool) {
         let mut state = KernelSchemaVisitorState::default();
@@ -1091,7 +1080,6 @@ mod tests {
     }
 
     /// Verifies that failures before physical-ID resolution leave the child available for retry.
-    #[cfg(feature = "udt-in-dev")]
     #[rstest]
     #[case::name(0)]
     #[case::annotation_key(1)]
@@ -1137,7 +1125,6 @@ mod tests {
     }
 
     /// Verifies that validation after physical-ID resolution consumes the child field.
-    #[cfg(feature = "udt-in-dev")]
     #[rstest]
     #[case::nested_udt(
         DataType::from(delta_kernel::schema::UserDefinedType::try_new(DataType::LONG, HashMap::new()).unwrap()),
@@ -1173,36 +1160,6 @@ mod tests {
         assert_extern_result_error_contains(result, FFIKernelError::SchemaError, message);
         assert!(!state.elements.contains(physical));
         assert!(state.elements.contains(unrelated));
-    }
-
-    /// Verifies that disabled UDT support rejects before visiting metadata or consuming the child.
-    #[cfg(not(feature = "udt-in-dev"))]
-    #[test]
-    fn udt_schema_visit_disabled_preserves_child_and_skips_metadata() {
-        let mut state = KernelSchemaVisitorState::default();
-        let physical = wrap_field(&mut state, StructField::nullable("sqlType", DataType::LONG));
-        let mut metadata = TestMetadata::default();
-        let result = unsafe {
-            visit_field_user_defined(
-                &mut state,
-                KernelStringSlice::new_unsafe("value"),
-                physical,
-                FfiNullableStringMap {
-                    ptr: null(),
-                    len: 0,
-                },
-                true,
-                &test_engine_metadata(&mut metadata),
-                allocate_err,
-            )
-        };
-        assert_extern_result_error_contains(
-            result,
-            FFIKernelError::UnsupportedError,
-            "requires udt-in-dev",
-        );
-        assert!(state.elements.contains(physical));
-        assert!(!metadata.visited);
     }
 
     /// Metadata fixture that records callback invocation and the values supplied to Kernel.

@@ -9,6 +9,7 @@ mod interval;
 mod partitioned;
 mod row_tracking;
 mod timestamp_ntz;
+mod user_defined;
 mod variant;
 
 use std::sync::Arc;

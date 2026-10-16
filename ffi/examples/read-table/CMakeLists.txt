@@ -2,7 +2,6 @@ cmake_minimum_required(VERSION 3.12)
 project(read_table)
 option(PRINT_DATA "Print out the table data. Requires arrow-glib" ON)
 option(VERBOSE "Enable for more diagnostics messages." OFF)
-option(UDT_IN_DEV "Test UDT schema round trips. Requires delta_kernel_ffi with udt-in-dev." OFF)
 option(
   GEO_TYPE_IN_DEV
   "Register the geometry/geography schema test. Requires delta_kernel_ffi built with --features geo-type-in-dev."
@@ -16,8 +15,7 @@ target_link_directories(read_table PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../../
 target_link_libraries(read_table PUBLIC delta_kernel_ffi)
 target_compile_options(read_table PUBLIC)
 
-# The C string model rejects embedded NULs. UDT_IN_DEV enables the engine-backed annotation
-# round trip against the schema-only Delta fixture.
+# Tests C string rejection of embedded NULs and the engine-backed annotation round trip.
 include(CTest)
 add_executable(udt_annotation_test udt_annotation_test.c ../common/kernel_utils.c)
 target_compile_definitions(udt_annotation_test PUBLIC DEFINE_DEFAULT_ENGINE_BASE)
@@ -28,10 +26,8 @@ target_link_directories(udt_annotation_test PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/
 target_link_libraries(udt_annotation_test PUBLIC delta_kernel_ffi)
 add_test(NAME udt_annotation_rejects_embedded_nul COMMAND udt_annotation_test --embedded-nul)
 set_tests_properties(udt_annotation_rejects_embedded_nul PROPERTIES WILL_FAIL TRUE)
-if(UDT_IN_DEV)
-  add_test(NAME udt_annotation_round_trip COMMAND udt_annotation_test
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/udt-annotations/")
-endif()
+add_test(NAME udt_annotation_round_trip COMMAND udt_annotation_test
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/udt-annotations/")
 set(TestRunner "../../../tests/read-table-testing/run_test.sh")
 set(DatPath "../../../../acceptance/tests/dat/out/reader_tests/generated")
 set(ExpectedPath "../../../tests/read-table-testing/expected-data")

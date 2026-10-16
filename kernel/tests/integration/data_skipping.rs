@@ -12,6 +12,8 @@
 //!   checkpoint parquet row-group filter)
 
 use std::collections::HashMap;
+mod user_defined;
+
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Array, BooleanArray, Int64Array, RecordBatch, StructArray};

@@ -19,3 +19,4 @@ mod row_tracking;
 mod stats;
 mod txn;
 mod types;
+mod user_defined;
