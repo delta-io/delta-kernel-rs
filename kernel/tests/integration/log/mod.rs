@@ -2,6 +2,7 @@
 
 mod checkpoint_transform;
 mod crc;
+mod crc_validation;
 mod empty_log_files;
 mod history_manager;
 mod log_compaction;

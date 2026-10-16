@@ -31,16 +31,18 @@
 //!      counts of actions selected
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
+use tracing::error;
 use url::Url;
 
+use crate::crc::{Crc, FileStatsState};
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector};
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, KernelResultIteratorStatic, Result};
+use crate::{KernelError, KernelResult, KernelResultIteratorStatic, Result, Version};
 
 /// Filters log segment actions for action reconciliation.
 pub(crate) struct ActionReconciliationProcessor {
@@ -81,6 +83,7 @@ pub(crate) struct ActionReconciliationBatch {
     pub(crate) actions_count: i64,
     /// The number of add actions in the batch.
     pub(crate) add_actions_count: i64,
+    pub(crate) table_size_bytes: Option<i64>,
 }
 
 impl HasSelectionVector for ActionReconciliationBatch {
@@ -95,6 +98,7 @@ pub struct ActionReconciliationIteratorState {
     actions_count: AtomicI64,
     add_actions_count: AtomicI64,
     is_exhausted: AtomicBool,
+    crc: OnceLock<Crc>,
 }
 
 impl ActionReconciliationIteratorState {
@@ -113,6 +117,10 @@ impl ActionReconciliationIteratorState {
         self.is_exhausted.load(Ordering::Acquire)
     }
 
+    pub(crate) fn into_crc(self) -> Option<Crc> {
+        self.crc.into_inner()
+    }
+
     /// Test helper that produces a state with the given counts and marked exhausted.
     #[cfg(test)]
     pub(crate) fn new_exhausted(actions_count: i64, add_actions_count: i64) -> Self {
@@ -120,6 +128,7 @@ impl ActionReconciliationIteratorState {
             actions_count: AtomicI64::new(actions_count),
             add_actions_count: AtomicI64::new(add_actions_count),
             is_exhausted: AtomicBool::new(true),
+            crc: OnceLock::new(),
         }
     }
 }
@@ -131,6 +140,7 @@ impl ActionReconciliationIteratorState {
 pub struct ActionReconciliationIterator {
     inner: KernelResultIteratorStatic<ActionReconciliationBatch>,
     state: Arc<ActionReconciliationIteratorState>,
+    crc: Option<Crc>,
 }
 
 impl ActionReconciliationIterator {
@@ -139,6 +149,7 @@ impl ActionReconciliationIterator {
         Self {
             inner,
             state: Arc::new(ActionReconciliationIteratorState::default()),
+            crc: None,
         }
     }
 
@@ -147,16 +158,47 @@ impl ActionReconciliationIterator {
         Arc::clone(&self.state)
     }
 
+    /// Accumulates only file counts and bytes in a CRC for `version`.
+    pub(crate) fn with_crc_tracking(mut self, version: Version) -> Self {
+        self.crc = Some(Crc {
+            version,
+            ..Default::default()
+        });
+        self
+    }
+
     /// Helper to transform a batch: update metrics and extract filtered data
     fn transform_batch(
         &mut self,
         batch: Option<KernelResult<ActionReconciliationBatch>>,
     ) -> Option<KernelResult<FilteredEngineData>> {
         let Some(batch) = batch else {
+            if let Some(crc) = self.crc.take() {
+                let _ = self.state.crc.set(crc);
+            }
             self.state.is_exhausted.store(true, Ordering::Release);
             return None;
         };
-        Some(batch.map(|batch| {
+        Some(batch.inspect_err(|_| self.crc = None).map(|batch| {
+            if let Some(crc) = self.crc.as_mut() {
+                if let FileStatsState::Complete(stats) = &mut crc.file_stats_state {
+                    let num_files = stats.num_files.checked_add(batch.add_actions_count);
+                    let table_size_bytes = batch
+                        .table_size_bytes
+                        .and_then(|bytes| stats.table_size_bytes.checked_add(bytes));
+                    if let (Some(num_files), Some(table_size_bytes)) = (num_files, table_size_bytes)
+                    {
+                        stats.num_files = num_files;
+                        stats.table_size_bytes = table_size_bytes;
+                    } else {
+                        crc.file_stats_state = FileStatsState::Indeterminate;
+                        error!(
+                            version = crc.version,
+                            "Checkpoint CRC file totals overflowed i64"
+                        );
+                    }
+                }
+            }
             self.state
                 .actions_count
                 .fetch_add(batch.actions_count, Ordering::Release);
@@ -229,6 +271,7 @@ impl ActionReconciliationProcessor {
             filtered_data,
             actions_count: visitor.actions_count,
             add_actions_count: visitor.add_actions_count,
+            table_size_bytes: visitor.table_size_bytes,
         })
     }
 
@@ -304,6 +347,7 @@ pub(crate) struct ActionReconciliationVisitor<'seen> {
     actions_count: i64,
     // i64 to match the `_last_checkpoint` file schema
     add_actions_count: i64,
+    table_size_bytes: Option<i64>,
     // i64 for comparison with remove.deletionTimestamp
     minimum_file_retention_timestamp: i64,
     // Flag to track if we've seen a protocol action so we can keep only the first protocol action
@@ -394,6 +438,7 @@ impl ActionReconciliationVisitor<'_> {
             selection_vector,
             actions_count: 0,
             add_actions_count: 0,
+            table_size_bytes: Some(0),
             minimum_file_retention_timestamp,
             seen_protocol,
             seen_metadata,
@@ -447,7 +492,7 @@ impl ActionReconciliationVisitor<'_> {
         let Some(FileActionInfo {
             key: file_key,
             is_add,
-            ..
+            size,
         }) = self.deduplicator.extract_file_action(i, getters, false)?
         else {
             return Ok(None); // No file action found, continue checking other types
@@ -458,6 +503,9 @@ impl ActionReconciliationVisitor<'_> {
             false // duplicate!
         } else if is_add {
             self.add_actions_count += 1;
+            self.table_size_bytes = self
+                .table_size_bytes
+                .and_then(|bytes| bytes.checked_add(i64::try_from(size).ok()?));
             true
         } else {
             // Expired remove actions are not valid
@@ -703,6 +751,88 @@ mod tests {
     fn create_batch(json_strings: Vec<&str>) -> Result<ActionsBatch> {
         let actions = parse_json_batch(StringArray::from(json_strings));
         Ok(ActionsBatch::new(actions, true))
+    }
+
+    #[test]
+    fn checkpoint_crc_counts_only_live_adds_across_batches() -> Result<()> {
+        let batches = vec![
+            create_batch(vec![
+                r#"{"add":{"path":"live","size":10,"partitionValues":{},
+                    "modificationTime":0,"dataChange":true}}"#,
+                r#"{"remove":{"path":"deleted","deletionTimestamp":100,"dataChange":true}}"#,
+            ])?,
+            create_batch(vec![
+                r#"{"add":{"path":"live","size":99,"partitionValues":{},
+                    "modificationTime":0,"dataChange":true}}"#,
+                r#"{"add":{"path":"deleted","size":88,"partitionValues":{},
+                    "modificationTime":0,"dataChange":true}}"#,
+                r#"{"add":{"path":"other","size":20,"partitionValues":{},
+                    "modificationTime":0,"dataChange":true}}"#,
+                r#"{"add":{"path":"empty","size":0,"partitionValues":{},
+                    "modificationTime":0,"dataChange":true}}"#,
+            ])?,
+        ];
+        let mut processor = ActionReconciliationProcessor::new(0, None, None);
+        let mut iter = ActionReconciliationIterator::new(Box::new(
+            batches
+                .into_iter()
+                .map(move |batch| processor.process_actions_batch(batch)),
+        ))
+        .with_crc_tracking(42);
+        let state = iter.state();
+        iter.next().unwrap()?;
+        assert!(state.crc.get().is_none());
+        iter.try_for_each(|batch| batch.map(|_| ()))?;
+        let crc = state.crc.get().unwrap();
+        assert_eq!(crc.version, 42);
+        let stats = crc.file_stats().unwrap();
+        assert_eq!(stats.num_files(), 3);
+        assert_eq!(stats.table_size_bytes(), 30);
+        assert!(stats.file_size_histogram().is_none());
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    fn checkpoint_crc_overflow_does_not_fail_reconciliation(
+        #[values(false, true)] separate_batches: bool,
+    ) -> Result<()> {
+        let adds = vec![
+            r#"{"add":{"path":"large","size":9223372036854775807,"partitionValues":{},
+                "modificationTime":0,"dataChange":true}}"#,
+            r#"{"add":{"path":"small","size":1,"partitionValues":{},
+                "modificationTime":0,"dataChange":true}}"#,
+        ];
+        let batches = if separate_batches {
+            adds.into_iter()
+                .map(|add| create_batch(vec![add]))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![create_batch(adds)?]
+        };
+        let mut processor = ActionReconciliationProcessor::new(0, None, None);
+        let mut iter = ActionReconciliationIterator::new(Box::new(
+            batches
+                .into_iter()
+                .map(move |batch| processor.process_actions_batch(batch)),
+        ))
+        .with_crc_tracking(42);
+        let state = iter.state();
+        iter.try_for_each(|batch| batch.map(|_| ()))?;
+        assert_eq!(state.add_actions_count(), 2);
+        assert!(state.crc.get().unwrap().file_stats().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_crc_is_unavailable_after_reconciliation_error() {
+        let mut iter = ActionReconciliationIterator::new(Box::new(std::iter::once(Err(
+            KernelError::checkpoint_write("test read failure"),
+        ))))
+        .with_crc_tracking(42);
+        let state = iter.state();
+        assert!(iter.next().unwrap().is_err());
+        assert!(iter.next().is_none());
+        assert!(state.crc.get().is_none());
     }
 
     /// Helper function which applies the [`ActionReconciliationProcessor`] to a set of

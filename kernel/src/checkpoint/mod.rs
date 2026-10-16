@@ -102,7 +102,7 @@
 use std::sync::{Arc, LazyLock, Mutex};
 
 use itertools::Itertools;
-use tracing::info;
+use tracing::{error, info};
 use url::Url;
 
 use crate::action_reconciliation::log_replay::{
@@ -116,10 +116,12 @@ use crate::actions::{
     DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
     SIDECAR_FIELD,
 };
+use crate::crc::Crc;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, Scalar};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::HasSelectionVector;
+use crate::metrics::events::emit_crc_validation_failure;
 use crate::path::{self, ParsedLogPath};
 use crate::schema::{lazy_schema_ref, SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
@@ -173,6 +175,8 @@ pub struct LastCheckpointHintStats {
     size_in_bytes: i64,
     /// The number of Add-file actions in the checkpoint.
     num_of_add_files: i64,
+    /// Only the version and file totals are populated; this CRC is never persisted.
+    crc: Option<Crc>,
 }
 
 impl LastCheckpointHintStats {
@@ -221,6 +225,7 @@ impl LastCheckpointHintStats {
             num_actions,
             size_in_bytes,
             num_of_add_files: state.add_actions_count(),
+            crc: state.into_crc(),
         })
     }
 }
@@ -487,6 +492,7 @@ impl CheckpointWriter {
                 filtered_data: FilteredEngineData::try_new(transformed, sv)?,
                 actions_count: batch.actions_count,
                 add_actions_count: batch.add_actions_count,
+                table_size_bytes: batch.table_size_bytes,
             })
         });
 
@@ -497,12 +503,18 @@ impl CheckpointWriter {
             .is_v2
             .then(|| self.create_checkpoint_metadata_batch(engine, &self.output_schema));
 
-        Ok(ActionReconciliationIterator::new(Box::new(
-            transformed.chain(checkpoint_metadata),
-        )))
+        Ok(
+            ActionReconciliationIterator::new(Box::new(transformed.chain(checkpoint_metadata)))
+                .with_crc_tracking(self.snapshot.version()),
+        )
     }
 
     /// Finalizes checkpoint creation by saving metadata about the checkpoint.
+    ///
+    /// Compares `numFiles` and `tableSizeBytes` with the cached CRC at the snapshot's version,
+    /// when both have complete file totals. A mismatch emits a
+    /// [`CrcValidationFailure`](crate::metrics::MetricEvent::CrcValidationFailure) metric and an
+    /// error log without failing finalization. Other CRC fields are not compared.
     ///
     /// # Important
     /// This method **must** be called only after:
@@ -523,6 +535,8 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         last_checkpoint_stats: &LastCheckpointHintStats,
     ) -> Result<()> {
+        self.validate_crc(last_checkpoint_stats.crc.as_ref());
+
         // Skip writing `_last_checkpoint` if the existing hint already points to a newer
         // checkpoint, to avoid regressing the hint.
         let checkpoint_version = self.snapshot.version();
@@ -715,7 +729,35 @@ impl CheckpointWriter {
             filtered_data,
             actions_count: 1,
             add_actions_count: 0,
+            table_size_bytes: Some(0),
         })
+    }
+
+    fn validate_crc(&self, checkpoint_crc: Option<&Crc>) {
+        let Some(expected) = self
+            .snapshot
+            .crc_at_version()
+            .and_then(|crc| crc.file_stats())
+        else {
+            return;
+        };
+        let Some(actual) = checkpoint_crc.and_then(Crc::file_stats) else {
+            return;
+        };
+        if expected.num_files() != actual.num_files()
+            || expected.table_size_bytes() != actual.table_size_bytes()
+        {
+            emit_crc_validation_failure();
+            error!(
+                table_root = %self.snapshot.table_root(),
+                version = self.snapshot.version(),
+                expected_num_files = expected.num_files(),
+                actual_num_files = actual.num_files(),
+                expected_table_size_bytes = expected.table_size_bytes(),
+                actual_table_size_bytes = actual.table_size_bytes(),
+                "Checkpoint CRC mismatch in numFiles or tableSizeBytes"
+            );
+        }
     }
 
     /// Helper for computing the checkpoint schema context from the snapshot and engine.

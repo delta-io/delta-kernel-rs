@@ -1417,6 +1417,10 @@ impl Snapshot {
     ///
     /// Note: There is currently no public api for callers to determine whether a table supports V2
     /// checkpoints directly. Tracked in <https://github.com/delta-io/delta-kernel-rs/issues/2450>.
+    /// After writing the checkpoint, compares `numFiles` and `tableSizeBytes` with the cached CRC
+    /// at this snapshot's version, if available. Mismatches emit a
+    /// [`CrcValidationFailure`](crate::metrics::MetricEvent::CrcValidationFailure) metric and an
+    /// error log without failing the checkpoint write.
     #[instrument(parent = &self.span, name = "snap.checkpoint", skip_all, err)]
     pub fn checkpoint(
         self: &SnapshotRef,

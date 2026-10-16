@@ -365,6 +365,8 @@ pub enum MetricEvent {
     StorageListCompleted(StorageListCompleted),
     StorageReadCompleted(StorageReadCompleted),
     StorageCopyCompleted(StorageCopyCompleted),
+    /// Checkpoint file totals disagree with the cached CRC at the same version.
+    CrcValidationFailure,
 }
 
 /// Borrow the caller-supplied correlation id as a [`KernelStringSlice`], or an empty slice when
@@ -550,6 +552,7 @@ impl MetricEvent {
                 duration_ns: ns(*duration),
             }),
             K::CrcReadFailure => Self::CrcReadFailure,
+            K::CrcValidationFailure => Self::CrcValidationFailure,
             K::JsonReadCompleted(kernel::JsonReadCompleted {
                 num_files,
                 bytes_read,
