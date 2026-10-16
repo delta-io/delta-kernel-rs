@@ -1,7 +1,8 @@
 //! Log-replay batches read from an adaptiveMetadata (AMT) `checkpoint` action.
 
+use std::borrow::Cow;
 use std::iter;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use url::Url;
 
@@ -10,12 +11,16 @@ use crate::actions::{
     LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_TXN_SCHEMA, METADATA_NAME, PROTOCOL_NAME,
     REMOVE_NAME, SET_TRANSACTION_NAME,
 };
+use crate::amt_path_util::amt_location_to_add_path;
 use crate::content_tree::{read_actions_from_amt, struct_expr_from_schema, ReadContext};
-use crate::expressions::{Expression, Scalar};
+use crate::engine_data::{GetData, TypedGetData as _};
+use crate::expressions::{column_name, ArrayData, ColumnName, Expression, Scalar};
 use crate::log_replay::ActionsBatch;
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::scan::log_replay::PATH_NAME;
+use crate::schema::{ArrayType, ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType};
 use crate::{
     Engine, EngineData, ExpressionEvaluator, KernelError, KernelResult, KernelResultIteratorStatic,
+    RowVisitor,
 };
 
 /// The action kinds a read schema may ask a checkpoint action for.
@@ -124,17 +129,38 @@ fn read_tree_adds(
         modification_time: checkpoint.content_root.timestamp().unwrap_or(0),
         data_change: false,
     };
-    let projector =
-        ActionProjector::try_new(engine, ADD_NAME, LOG_ADD_SCHEMA.clone(), read_schema)?;
+    let projector = ActionProjector::try_new(
+        engine,
+        ADD_NAME,
+        LOG_ADD_SCHEMA.clone(),
+        read_schema.clone(),
+    )?;
+    // Entry locations are raw paths, but `add.path` is RFC 2396 encoded. Batches whose paths all
+    // encode to themselves skip the rebuilt column.
+    let encoding_projector = ActionProjector::try_new_with(
+        engine,
+        ADD_NAME,
+        ENCODED_PATH_INPUT_SCHEMA.clone(),
+        read_schema,
+        |name| (name == PATH_NAME).then(|| Expression::column([ENCODED_PATH_HELPER])),
+    )?;
     let adds = read_actions_from_amt(engine, checkpoint, table_root, &ctx)?;
     // The tree marks the rows that are not live files only in the selection vector, but replay
     // reads every row whose `add.path` is non-null, so only the selected rows are passed on.
     Ok(Box::new(adds.map(move |batch| {
         let selected = batch?.apply_selection_vector()?;
-        Ok(ActionsBatch::new(
-            projector.project(selected.as_ref())?,
-            false,
-        ))
+        let mut encoder = AddPathEncoder::default();
+        encoder.visit_rows_of(selected.as_ref())?;
+        let actions = match encoder.encoded_paths {
+            None => projector.project(selected.as_ref())?,
+            Some(paths) => {
+                let helper = ArrayData::try_new(ArrayType::new(DataType::STRING, false), paths)?;
+                let augmented =
+                    selected.append_columns(ENCODED_PATH_HELPER_SCHEMA.clone(), vec![helper])?;
+                encoding_projector.project(augmented.as_ref())?
+            }
+        };
+        Ok(ActionsBatch::new(actions, false))
     })))
 }
 
@@ -177,12 +203,29 @@ impl ActionProjector {
         source: SchemaRef,
         read_schema: SchemaRef,
     ) -> KernelResult<Self> {
+        Self::try_new_with(engine, action, source, read_schema, |_| None)
+    }
+
+    /// Like [`Self::try_new`], but `field_expr` supplies the expression for the
+    /// `read_schema.<action>` fields it names, instead of copying them from `source`.
+    ///
+    /// # Errors
+    /// See [`Self::try_new`].
+    fn try_new_with(
+        engine: &dyn Engine,
+        action: &str,
+        source: SchemaRef,
+        read_schema: SchemaRef,
+        field_expr: impl Fn(&str) -> Option<Expression>,
+    ) -> KernelResult<Self> {
         let source_fields = action_struct(&source, action)?;
         let action_expr = struct_expr_from_schema(action_struct(&read_schema, action)?, |name| {
-            source_fields
-                .field(name)
-                .is_some()
-                .then(|| Expression::column([action, name]))
+            field_expr(name).or_else(|| {
+                source_fields
+                    .field(name)
+                    .is_some()
+                    .then(|| Expression::column([action, name]))
+            })
         })?;
         let expr = struct_expr_from_schema(&read_schema, |name| {
             (name == action).then(|| action_expr.clone())
@@ -197,6 +240,53 @@ impl ActionProjector {
 
     fn project(&self, data: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
         self.evaluator.evaluate(data)
+    }
+}
+
+/// Name of the helper column holding each `add`'s encoded path.
+const ENCODED_PATH_HELPER: &str = "_encodedPath";
+
+/// Schema of the appended [`ENCODED_PATH_HELPER`] column.
+static ENCODED_PATH_HELPER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new_unchecked([StructField::not_null(
+        ENCODED_PATH_HELPER,
+        DataType::STRING,
+    )]))
+});
+
+/// [`LOG_ADD_SCHEMA`] plus [`ENCODED_PATH_HELPER`].
+static ENCODED_PATH_INPUT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new_unchecked(
+        LOG_ADD_SCHEMA
+            .fields()
+            .chain(ENCODED_PATH_HELPER_SCHEMA.fields())
+            .cloned(),
+    ))
+});
+
+/// Encodes each row's raw `add.path` (see [`amt_location_to_add_path`]), keeping the result only
+/// when some row's path changes.
+#[derive(Default)]
+struct AddPathEncoder {
+    /// Every row's encoded path, or `None` when every path encodes to itself.
+    encoded_paths: Option<Vec<String>>,
+}
+
+impl RowVisitor for AddPathEncoder {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| (vec![column_name!("add.path")], vec![DataType::STRING]).into());
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
+        let encoded = (0..row_count)
+            .map(|row| Ok(amt_location_to_add_path(getters[0].get(row, "add.path")?)))
+            .collect::<KernelResult<Vec<Cow<'a, str>>>>()?;
+        if encoded.iter().any(|path| matches!(path, Cow::Owned(_))) {
+            self.encoded_paths = Some(encoded.into_iter().map(Cow::into_owned).collect());
+        }
+        Ok(())
     }
 }
 
@@ -248,7 +338,6 @@ mod tests {
     use crate::schema::{schema_ref, StructType};
     use crate::unit_test_utils::adaptive_metadata_fixtures::checkpoint_action_with_root;
     use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::RowVisitor as _;
 
     const TABLE_ROOT: &str = "memory:///";
     const ROOT_PATH: &str = "metadata/root.parquet";
@@ -389,6 +478,41 @@ mod tests {
                 (false, strings(&["a.parquet", "b.parquet"]), vec![]),
             ]
         );
+    }
+
+    #[rstest]
+    #[case::mixed(
+        &["plain.parquet", "a b.parquet", "a%b.parquet", "M\u{fc}nchen.parquet", "s3://bucket/t/c d.parquet"],
+        &["plain.parquet", "a%20b.parquet", "a%25b.parquet", "M%C3%BCnchen.parquet", "s3://bucket/t/c%20d.parquet"],
+    )]
+    #[case::all_plain(
+        &["plain.parquet", "dir/other.parquet"],
+        &["plain.parquet", "dir/other.parquet"],
+    )]
+    fn tree_add_paths_are_url_encoded(#[case] locations: &[&str], #[case] expected: &[&str]) {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let entries: Vec<_> = locations
+            .iter()
+            .enumerate()
+            .map(|(i, location)| added_data_entry(location, 1, 1, i as i64, 0))
+            .collect();
+        let root = write_manifest(&engine, table_root().join(ROOT_PATH).unwrap(), &entries);
+        let checkpoint = checkpoint_action_with_root(ROOT_PATH, root.size as i64, 1).unwrap();
+
+        let paths: Vec<_> = read_checkpoint_action(
+            &engine,
+            &checkpoint,
+            &table_root(),
+            CHECKPOINT_READ_SCHEMA.clone(),
+        )
+        .unwrap()
+        .flat_map(|batch| {
+            let batch = batch.unwrap().actions.try_into_record_batch().unwrap();
+            action_paths(&batch, ADD_NAME)
+        })
+        .collect();
+
+        assert_eq!(paths, strings(expected));
     }
 
     #[rstest]
