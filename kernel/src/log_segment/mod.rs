@@ -938,7 +938,6 @@ impl LogSegment {
     /// Returns an error if the action's version is negative, `checkpoint_read_schema` asks for an
     /// action kind the checkpoint action cannot supply, or a read fails.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_checkpoint_action(
         &self,

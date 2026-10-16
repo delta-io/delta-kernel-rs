@@ -341,6 +341,31 @@ pub(crate) mod adaptive_metadata_fixtures {
         )
     }
 
+    /// The metadata of [`adaptive_metadata_protocol_and_metadata`], partitioned by
+    /// `partition_columns`.
+    pub(crate) fn adaptive_metadata_partitioned_by(partition_columns: &[&str]) -> Metadata {
+        let (_, metadata) = adaptive_metadata_protocol_and_metadata();
+        let mut json = serde_json::to_value(metadata).unwrap();
+        json["partitionColumns"] = serde_json::json!(partition_columns);
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// Commit lines holding the protocol and metadata of an adaptiveMetadata table partitioned by
+    /// `partition_columns`.
+    pub(crate) fn protocol_and_metadata_lines(partition_columns: &[&str]) -> String {
+        let (protocol, _) = adaptive_metadata_protocol_and_metadata();
+        format!(
+            "{}\n{}",
+            serde_json::json!({ "protocol": protocol }),
+            serde_json::json!({ "metaData": adaptive_metadata_partitioned_by(partition_columns) }),
+        )
+    }
+
+    /// A commit line holding `checkpoint`.
+    pub(crate) fn checkpoint_line(checkpoint: &CheckpointAction) -> String {
+        serde_json::json!({ "checkpoint": checkpoint }).to_string()
+    }
+
     /// A minimal `checkpoint` action referencing `path` as the content root at `version`.
     pub(crate) fn minimal_checkpoint_action(
         path: &str,
