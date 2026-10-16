@@ -3,11 +3,10 @@
 
 use std::collections::HashMap;
 
-use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::schema::{schema_ref, DataType, StructField};
+use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use delta_kernel::transaction::UpdateTableOperation;
-use delta_kernel::{Engine, FileMeta, KernelError};
+use delta_kernel::{Engine, FileMeta};
 use rstest::rstest;
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -113,33 +112,6 @@ async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_actio
         .iter()
         .any(|f| f["name"] == json!("id") && f["type"] == json!("integer")));
 
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn alter_table_commit_rejects_root_manifest() -> Result<(), Box<dyn std::error::Error>> {
-    let (engine, _temp_dir, table_url, before) =
-        setup_adaptive_metadata_table("alter_table_root_manifest").await?;
-    let file = FileMeta {
-        location: table_url.join("metadata/root-v1.parquet")?,
-        last_modified: 0,
-        size: 1024,
-    };
-    let txn = before
-        .clone()
-        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
-        .add_column(StructField::nullable("fresh_column", DataType::INTEGER))
-        .build(&engine, Box::new(FileSystemCommitter::new()))?
-        .with_root_manifest_file(file)?;
-
-    let error = txn.commit(&engine).unwrap_err();
-    assert!(
-        matches!(&error, KernelError::InvalidTransactionState(message)
-        if message == "ALTER TABLE cannot include manifest writes")
-    );
-    let fresh = Snapshot::builder_for(table_url).build(&engine)?;
-    assert_eq!(fresh.version(), before.version());
-    assert_eq!(fresh.schema(), before.schema());
     Ok(())
 }
 

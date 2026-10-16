@@ -5,6 +5,7 @@
 // and for tests. Also allow dead_code since these are used by integration tests.
 #![allow(unreachable_pub, dead_code)]
 
+pub mod alter_table;
 pub mod create_table;
 mod state;
 pub mod update_table;
@@ -15,7 +16,7 @@ pub(super) use self::state::TransactionBuilderState;
 use crate::actions::DomainMetadata;
 use crate::schema::SchemaRef;
 use crate::transaction::commit_info::collect_operation_metadata;
-use crate::transaction::{CreateTable, UpdateTable};
+use crate::transaction::{AlterTable, CreateTable, UpdateTable};
 use crate::EngineData;
 
 /// A transaction type supported by [`TransactionBuilder`].
@@ -31,9 +32,11 @@ pub trait TransactionType: private::Sealed {
 /// Configures a transaction of type `T`.
 ///
 /// Shared setters preserve the transaction type. Constructors, type-specific setters, and
-/// `build` are provided by the specialized implementations for [`CreateTable`] and [`UpdateTable`].
+/// `build` are provided by the specialized implementations for [`CreateTable`], [`UpdateTable`],
+/// and [`AlterTable`].
 /// Use [`create_table`](super::create_table::create_table) or
-/// [`Snapshot::update_table`](crate::Snapshot::update_table) to obtain a builder.
+/// [`Snapshot::update_table`](crate::Snapshot::update_table), or
+/// [`Snapshot::alter_table`](crate::Snapshot::alter_table) to obtain a builder.
 ///
 /// The operation cannot be changed on a builder:
 ///
@@ -149,11 +152,16 @@ impl TransactionType for CreateTable {
 }
 
 impl TransactionType for UpdateTable {
-    type BuilderState = update_table::UpdateTableBuilderState;
+    type BuilderState = update_table::ExistingTableBuilderState;
+}
+
+impl<S> TransactionType for AlterTable<S> {
+    type BuilderState = update_table::ExistingTableBuilderState;
 }
 
 impl private::Sealed for CreateTable {}
 impl private::Sealed for UpdateTable {}
+impl<S> private::Sealed for AlterTable<S> {}
 
 mod private {
     pub trait Sealed {}
@@ -164,6 +172,7 @@ mod tests {
     use super::{private, TransactionBuilder, TransactionBuilderState, TransactionType};
     use crate::arrow::array::StringArray;
     use crate::schema::schema_ref;
+    use crate::transaction::SupportsDataFiles;
     use crate::unit_test_utils::string_array_to_engine_data;
 
     struct CustomType;
@@ -174,6 +183,8 @@ mod tests {
         type BuilderState = ();
     }
 
+    impl SupportsDataFiles for CustomType {}
+
     impl TransactionBuilder<CustomType> {
         fn new(engine_info: &str) -> Self {
             Self {
@@ -183,7 +194,7 @@ mod tests {
         }
     }
 
-    fn configure_shared_setters<T: TransactionType>(
+    fn configure_shared_setters<T: SupportsDataFiles>(
         builder: TransactionBuilder<T>,
     ) -> TransactionBuilder<T> {
         builder

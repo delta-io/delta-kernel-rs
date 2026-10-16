@@ -7,8 +7,8 @@ use crate::crc::is_incremental_safe_operation;
 /// Identifies an operation supported by [`UpdateTableTransactionBuilder`].
 ///
 /// Typed variants provide compiler-checked names. [`Custom`](Self::Custom) preserves the protocol's
-/// extensibility. Create-table transactions fix their operation internally. Replace-table
-/// operations are not supported.
+/// extensibility. Create-table and alter-table transactions fix their operation internally.
+/// Replace-table operations are not supported.
 ///
 /// [`UpdateTableTransactionBuilder`]: super::UpdateTableTransactionBuilder
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
@@ -18,14 +18,6 @@ pub enum UpdateTableOperation {
     Write,
     /// A streaming write.
     StreamingUpdate,
-    /// A standalone schema-changing operation.
-    ///
-    /// Requires at least one schema operation and `dataChange = false` at build time. Commit
-    /// validation retains the data-change check and rejects any staged data-file batches or
-    /// manifest writes, including empty or fully unselected data-file batches.
-    /// See the builder's
-    /// [schema-change workflows](super::UpdateTableTransactionBuilder#schema-changes).
-    AlterTable,
     /// A row deletion.
     Delete,
     /// A row update.
@@ -37,7 +29,7 @@ pub enum UpdateTableOperation {
     /// An operation name recorded verbatim in commit history and successful transaction metrics.
     ///
     /// The name must be nonempty and must not exactly match a typed operation's name or a reserved
-    /// create/replace-table name. This comparison is case-sensitive. Kernel does not infer
+    /// create/alter/replace-table name. This comparison is case-sensitive. Kernel does not infer
     /// built-in operation semantics from the name, but all other transaction and protocol
     /// checks still apply. Custom operations do not qualify for incremental version checksum
     /// construction.
@@ -55,7 +47,6 @@ impl UpdateTableOperation {
         match self {
             Self::Write => "WRITE",
             Self::StreamingUpdate => "STREAMING UPDATE",
-            Self::AlterTable => "ALTER TABLE",
             Self::Delete => "DELETE",
             Self::Update => "UPDATE",
             Self::Merge => "MERGE",
@@ -86,8 +77,10 @@ impl fmt::Display for UpdateTableOperation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum CommitOperation {
     CreateTable,
+    AlterTable,
     UpdateTable(UpdateTableOperation),
 }
 
@@ -95,6 +88,7 @@ impl CommitOperation {
     pub(crate) fn as_str(&self) -> &str {
         match self {
             Self::CreateTable => "CREATE TABLE",
+            Self::AlterTable => "ALTER TABLE",
             Self::UpdateTable(operation) => operation.as_str(),
         }
     }
@@ -102,13 +96,13 @@ impl CommitOperation {
     pub(crate) fn validate(&self) -> Result<(), String> {
         match self {
             Self::UpdateTable(operation) => operation.validate(),
-            Self::CreateTable => Ok(()),
+            Self::CreateTable | Self::AlterTable => Ok(()),
         }
     }
 
     pub(crate) fn is_incremental_safe(&self) -> bool {
         match self {
-            Self::CreateTable => is_incremental_safe_operation(self.as_str()),
+            Self::CreateTable | Self::AlterTable => is_incremental_safe_operation(self.as_str()),
             Self::UpdateTable(operation) => operation.is_incremental_safe(),
         }
     }
@@ -127,6 +121,7 @@ impl From<UpdateTableOperation> for CommitOperation {
 }
 
 const RESERVED_TABLE_OPERATION_NAMES: &[&str] = &[
+    "ALTER TABLE",
     "CREATE TABLE",
     "REPLACE TABLE",
     "CREATE TABLE AS SELECT",
@@ -163,7 +158,6 @@ mod tests {
                 UpdateTableOperation::StreamingUpdate,
                 true,
             ),
-            ("ALTER TABLE", UpdateTableOperation::AlterTable, false),
             ("DELETE", UpdateTableOperation::Delete, true),
             ("UPDATE", UpdateTableOperation::Update, true),
             ("MERGE", UpdateTableOperation::Merge, true),
@@ -197,6 +191,7 @@ mod tests {
             .map(|operation| operation.as_str().to_owned())
             .chain(
                 [
+                    "ALTER TABLE",
                     "CREATE TABLE",
                     "REPLACE TABLE",
                     "CREATE TABLE AS SELECT",

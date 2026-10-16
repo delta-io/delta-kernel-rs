@@ -155,7 +155,7 @@ mod row_tracking_preservation {
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
         let commit_version = snapshot
-            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .alter_table("test-engine")
             .add_column(StructField::nullable("added", DataType::INTEGER))
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .commit(engine.as_ref())?

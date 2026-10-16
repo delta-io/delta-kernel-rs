@@ -42,7 +42,9 @@ use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{physical_to_logical_column_name_and_type, Operation, TableFeature};
 use crate::table_properties::TableProperties;
-use crate::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
+use crate::transaction::{
+    AlterTableTransactionBuilder, UpdateTableOperation, UpdateTableTransactionBuilder,
+};
 use crate::utils::require;
 use crate::{Engine, KernelError, KernelResult, LogCompactionWriter, Result, Version};
 
@@ -1187,6 +1189,25 @@ impl Snapshot {
         data_change: bool,
     ) -> UpdateTableTransactionBuilder {
         UpdateTableTransactionBuilder::new(self, operation, engine_info.into(), data_change)
+    }
+
+    /// Creates a builder for altering this table's metadata. Currently supports schema change
+    /// operations.
+    ///
+    /// The returned builder allows chaining operations before building an
+    /// [`AlterTableTransaction`] that can be committed.
+    ///
+    /// `engine_info` identifies the connector in commit history. The transaction fixes its
+    /// operation to `ALTER TABLE` and `dataChange` to `false`.
+    ///
+    /// Use [`Self::update_table`] to evolve the schema together with data writes.
+    ///
+    /// [`AlterTableTransaction`]: crate::transaction::AlterTableTransaction
+    pub fn alter_table(
+        self: Arc<Self>,
+        engine_info: impl Into<String>,
+    ) -> AlterTableTransactionBuilder {
+        AlterTableTransactionBuilder::new(self, engine_info.into())
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.

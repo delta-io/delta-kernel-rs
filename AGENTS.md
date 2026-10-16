@@ -126,9 +126,11 @@ provide constructors, custom setters, and build validation.
 construction; create-table constructors require the path, schema, engine info, and `data_change`
 and fix the operation to `CREATE TABLE`. These inputs cannot be changed on builders or built
 transactions. `data_change` is never inferred from staged files, including for empty commits.
-`build()` rejects ALTER with `true` and blind append with `false`; `commit()` retains operation and
-staged-file checks. `UpdateTableOperation::AlterTable` records schema-changing DDL without
-introducing a separate transaction type.
+`build()` rejects blind append with `false`. `Snapshot::alter_table(engine_info)` returns an
+`AlterTableTransactionBuilder<S>` alias for `TransactionBuilder<AlterTable<S>>`. Its `Ready` state
+has no `build()`; schema operations transition to `Modifying`. It fixes operation to `ALTER TABLE`
+and `dataChange` to false, with no data-file or manifest APIs. ALTER and UPDATE share schema setters,
+existing-table validation, and the common transaction setters.
 Writers configure transaction intent before `build()`, then call
 `Transaction::write_state`, then bind partition values through the returned `WriteState` to get a
 `BoundWriteContext`. Distributed writers can encode and transport the state before binding it.

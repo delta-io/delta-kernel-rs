@@ -1230,7 +1230,6 @@ pub async fn insert_data_with<E: TaskExecutor>(
     let operation = match operation {
         "WRITE" => UpdateTableOperation::Write,
         "STREAMING UPDATE" => UpdateTableOperation::StreamingUpdate,
-        "ALTER TABLE" => UpdateTableOperation::AlterTable,
         "DELETE" => UpdateTableOperation::Delete,
         "UPDATE" => UpdateTableOperation::Update,
         "MERGE" => UpdateTableOperation::Merge,

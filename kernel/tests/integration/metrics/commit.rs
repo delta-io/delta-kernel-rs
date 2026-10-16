@@ -250,7 +250,7 @@ async fn alter_table_builder_carries_correlation_id(
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let mut builder = snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
+    let mut builder = snapshot.alter_table("test-engine");
     if let Some(id) = correlation_id {
         builder = builder.with_correlation_id(id);
     }

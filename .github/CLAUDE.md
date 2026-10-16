@@ -68,6 +68,12 @@ run: |
     echo "Comment: $COMMENT_BODY"
 ```
 
+## Transaction API checks
+
+Keep the all-features doctest run when changing transaction builders. ALTER capability checks
+cover internal deletion-vector and adaptive-metadata manifest APIs; testing only default features
+does not establish that these APIs are restricted by transaction type.
+
 ## Release tooling checks
 
 The `release-tooling` job in `build.yml` fetches full history and tags because release branches

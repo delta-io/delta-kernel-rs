@@ -904,9 +904,11 @@ reuses `ScanMetadataArrowResult` with null `transforms`.
 ## Write Flow
 
 Rust builders are aliases for `TransactionBuilder<CreateTable>` and
-`TransactionBuilder<UpdateTable>`. Keep their concrete opaque FFI descriptors and explicit
-`create_table_txn_builder_*` / `update_table_txn_builder_*` exports. Shared Rust setters do not imply
-a universal C handle; custom setters are exposed only for their applicable builder descriptor.
+`TransactionBuilder<UpdateTable>`; metadata-only ALTER uses `TransactionBuilder<AlterTable<S>>`.
+Keep their concrete opaque FFI descriptors and explicit
+`create_table_txn_builder_*` / `update_table_txn_builder_*` / `alter_table_txn_builder_*` exports.
+Shared Rust setters do not imply a universal C handle; custom setters are exposed only for their
+applicable builder descriptor.
 Rust-only builder aliases carry `cbindgen:ignore` so header generation uses the descriptors rather
 than monomorphizing builder state.
 
@@ -931,7 +933,19 @@ after decoding the strings. Custom-name restrictions are validated at build. Cre
 constructors likewise require engine info and `data_change`, with the operation fixed to
 `CREATE TABLE`.
 
-`update_table_txn_commit()` and `create_table_txn_commit()` return a `Handle<ExclusiveCommittedTransaction>` that the caller can read via `committed_transaction_version` and `committed_transaction_post_commit_snapshot`, then must release with `free_committed_transaction`. The post-commit snapshot, when present, is a separate `SharedSnapshot` handle that must be freed with `free_snapshot`.
+`new_alter_table_txn_builder(snapshot, engine_info, engine)` fixes the operation to ALTER TABLE
+and data-change intent to false. Schema setters transition its opaque builder from Ready to
+Modifying; building without a schema operation returns an error. The resulting
+`ExclusiveAlterTableTransaction` supports late-bound commit information, operation metrics, and
+user domain additions before commit. It has no file, manifest, or write-context operations.
+Common setters use the shared Rust implementation. Build consumes its builder and any supplied
+committer on success and error; transaction setters consume the transaction and return its
+replacement on success, dropping consumed inputs on error.
+
+The transaction commit functions return a `Handle<ExclusiveCommittedTransaction>` that the caller
+can read via `committed_transaction_version` and `committed_transaction_post_commit_snapshot`, then
+must release with `free_committed_transaction`. The post-commit snapshot, when present, is a separate
+`SharedSnapshot` handle that must be freed with `free_snapshot`.
 
 Write context: `update_table_txn_get_unpartitioned_write_context` covers unpartitioned tables. For partitioned tables, build a `PartitionValueMap` (`partition_value_map_new` + the typed `partition_value_map_insert_*` functions, one entry per partition column keyed by logical name) and pass it to `update_table_txn_get_partitioned_write_context` (consumes the map). Then use `get_write_dir` for the partition's target directory (Hive-style prefix or random prefix), `visit_partition_values` to read the physical `partitionValues` to record in each Add action, and `resolve_file_path` to turn a written file's URL into its relative `add.path`. The `create_table_*` variants apply the same flow to a create-table transaction whose partition columns were declared with `create_table_txn_builder_with_partition_columns`.
 
