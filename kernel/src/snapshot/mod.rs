@@ -16,7 +16,7 @@ use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::visitors::SetTransactionMap;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::CheckpointAction;
-use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
+use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
 };
@@ -31,7 +31,9 @@ use crate::incremental_scan::IncrementalScanBuilder;
 use crate::log_replay::ActionsBatch;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::log_segment::CheckpointActionResolution;
-use crate::log_segment::{DomainMetadataMap, LogSegment, PmResolution};
+use crate::log_segment::{
+    scan_domain_metadata_actions, DomainMetadataMap, LogSegment, PmResolution,
+};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::{
     emit_protocol_metadata_load, emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
@@ -1006,7 +1008,10 @@ impl Snapshot {
         //       miss search could skip that range and only scan the older commits, then
         //       union those results with the Partial cache's entries to produce the final
         //       answer.
-        let replayed = self.log_segment().scan_domain_metadatas(domains, engine)?;
+        let replayed = scan_domain_metadata_actions(
+            self.read_log_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())?,
+            domains,
+        )?;
         record_metric(false, replayed.len());
         Ok(replayed)
     }
