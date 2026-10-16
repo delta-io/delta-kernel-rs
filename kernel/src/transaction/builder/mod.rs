@@ -172,7 +172,6 @@ mod tests {
     use super::{private, TransactionBuilder, TransactionBuilderState, TransactionType};
     use crate::arrow::array::StringArray;
     use crate::schema::schema_ref;
-    use crate::transaction::SupportsDataFiles;
     use crate::unit_test_utils::string_array_to_engine_data;
 
     struct CustomType;
@@ -183,8 +182,6 @@ mod tests {
         type BuilderState = ();
     }
 
-    impl SupportsDataFiles for CustomType {}
-
     impl TransactionBuilder<CustomType> {
         fn new(engine_info: &str) -> Self {
             Self {
@@ -194,7 +191,7 @@ mod tests {
         }
     }
 
-    fn configure_shared_setters<T: SupportsDataFiles>(
+    fn configure_shared_setters<T: TransactionType>(
         builder: TransactionBuilder<T>,
     ) -> TransactionBuilder<T> {
         builder

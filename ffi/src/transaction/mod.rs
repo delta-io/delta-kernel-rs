@@ -4448,8 +4448,10 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
     #[tokio::test]
     async fn test_alter_table_txn_builder_applies_nested_schema_changes(
+        #[values(false, true)] nullable_first: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (store, kernel_engine, table_url) =
             test_utils::engine_store_setup("test_nested_schema_changes", None);
@@ -4491,15 +4493,6 @@ mod tests {
             schema: &added_fields as *const Vec<StructField> as *mut c_void,
             visitor: visit_test_schema,
         };
-        builder = ok_or_panic(unsafe {
-            alter_table_txn_builder_add_column_at(
-                builder,
-                &parent,
-                &added_field,
-                engine.shallow_copy(),
-            )
-        });
-
         let nullable_parts = [
             kernel_string_slice!(profile_name),
             kernel_string_slice!(required_name),
@@ -4507,9 +4500,24 @@ mod tests {
         let nullable_column = FfiColumnName {
             path: unsafe { crate::delta_types::FfiStringArray::new_unsafe(&nullable_parts) },
         };
-        builder = ok_or_panic(unsafe {
-            alter_table_txn_builder_set_nullable(builder, &nullable_column, engine.shallow_copy())
-        });
+        for make_nullable in [nullable_first, !nullable_first] {
+            builder = ok_or_panic(unsafe {
+                if make_nullable {
+                    alter_table_txn_builder_set_nullable(
+                        builder,
+                        &nullable_column,
+                        engine.shallow_copy(),
+                    )
+                } else {
+                    alter_table_txn_builder_add_column_at(
+                        builder,
+                        &parent,
+                        &added_field,
+                        engine.shallow_copy(),
+                    )
+                }
+            });
+        }
 
         let txn =
             ok_or_panic(unsafe { alter_table_txn_builder_build(builder, engine.shallow_copy()) });

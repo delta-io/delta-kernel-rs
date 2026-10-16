@@ -537,19 +537,40 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn builder_debug_summarizes_intent() -> Result<()> {
+    #[rstest]
+    #[case::update(true, "UpdateTableTransactionBuilder")]
+    #[case::alter(false, "AlterTableTransactionBuilder")]
+    fn builder_debug_summarizes_intent(
+        #[case] update: bool,
+        #[case] builder_name: &str,
+    ) -> Result<()> {
         let (_engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let debug = format!(
-            "{:?}",
-            snapshot
-                .update_table(UpdateTableOperation::Write, "test-engine", true)
-                .add_column(StructField::nullable("new_column", DataType::STRING))
-        );
+        let version = snapshot.version();
+        let field = StructField::nullable("new_column", DataType::STRING);
+        let (initial, modifying) = if update {
+            let builder = snapshot.update_table(UpdateTableOperation::Write, "test-engine", true);
+            let initial = format!("{builder:?}");
+            let builder = builder
+                .add_column(field)
+                .set_nullable(column_name!("new_column"));
+            (initial, format!("{builder:?}"))
+        } else {
+            let builder = snapshot.alter_table("test-engine");
+            let initial = format!("{builder:?}");
+            let builder = builder
+                .add_column(field)
+                .set_nullable(column_name!("new_column"));
+            (initial, format!("{builder:?}"))
+        };
 
-        assert!(debug.contains("UpdateTableTransactionBuilder"));
-        assert!(debug.contains("operation: UpdateTable(Write)"));
-        assert!(debug.contains("schema_change_count: 1"));
+        for (debug, count) in [(initial, 0), (modifying, 2)] {
+            assert!(debug.contains(builder_name));
+            assert!(debug.contains(&format!("snapshot_version: {version}")));
+            assert!(debug.contains(&format!("schema_change_count: {count}")));
+            if update {
+                assert!(debug.contains("operation: UpdateTable(Write)"));
+            }
+        }
         Ok(())
     }
 
