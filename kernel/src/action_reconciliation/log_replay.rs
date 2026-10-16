@@ -33,8 +33,6 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use itertools::Itertools;
-
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector};
@@ -184,19 +182,6 @@ impl Iterator for ActionReconciliationIterator {
 }
 
 impl ActionReconciliationProcessor {
-    /// Lazily reconciles newest-to-oldest action batches, omitting batches with no selected rows.
-    ///
-    /// Yields input and reconciliation errors unchanged, preserving selection vectors and action
-    /// counts in retained batches.
-    pub(crate) fn process_actions_iter(
-        mut self,
-        actions: impl Iterator<Item = Result<ActionsBatch>>,
-    ) -> impl Iterator<Item = Result<ActionReconciliationBatch>> {
-        actions
-            .map(move |batch| self.process_actions_batch(batch?))
-            .filter_ok(HasSelectionVector::has_selected_rows)
-    }
-
     /// Processes a batch of actions read from the log during reverse chronological replay
     /// and returns a [`ActionReconciliationBatch`], which contains the filtered actions,
     /// along with statistics about the included actions.
@@ -696,7 +681,6 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::collections::HashSet;
 
     use itertools::Itertools;
@@ -717,8 +701,11 @@ mod tests {
     fn run_action_reconciliation_test(
         input_batches: Vec<ActionsBatch>,
     ) -> Result<(Vec<FilteredEngineData>, i64, i64)> {
-        let processed_batches: Vec<_> = ActionReconciliationProcessor::new(0, None)
-            .process_actions_iter(input_batches.into_iter().map(Ok))
+        let mut processor = ActionReconciliationProcessor::new(0, None);
+        let processed_batches: Vec<_> = input_batches
+            .into_iter()
+            .map(move |batch| processor.process_actions_batch(batch))
+            .filter_ok(HasSelectionVector::has_selected_rows)
             .try_collect()?;
         let total_count: i64 = processed_batches.iter().map(|b| b.actions_count).sum();
         let add_count: i64 = processed_batches.iter().map(|b| b.add_actions_count).sum();
@@ -729,45 +716,6 @@ mod tests {
 
         Ok((filtered_data, total_count, add_count))
     }
-
-    #[test]
-    fn action_reconciliation_iter_is_lazy_and_preserves_errors_and_state() -> Result<()> {
-        let input_batches = [
-            Ok(create_batch(vec![r#"{"add":{"path":"a"}}"#])?),
-            Err(KernelError::generic("input error")),
-            Ok(create_batch(vec![r#"{"add":{"path":"a"}}"#])?),
-            Ok(create_batch(vec![
-                r#"{"add":{"path":"a"}}"#,
-                r#"{"add":{"path":"b"}}"#,
-            ])?),
-        ];
-        let consumed_batches = Cell::new(0);
-        let actions = input_batches
-            .into_iter()
-            .inspect(|_| consumed_batches.set(consumed_batches.get() + 1));
-        let mut reconciled =
-            ActionReconciliationProcessor::new(0, None).process_actions_iter(actions);
-        assert_eq!(consumed_batches.get(), 0);
-
-        let first = reconciled.next().unwrap()?;
-        assert_eq!(consumed_batches.get(), 1);
-        assert_eq!(first.filtered_data.selection_vector(), vec![true]);
-        assert_eq!(first.actions_count, 1);
-        assert_eq!(first.add_actions_count, 1);
-
-        let error = reconciled.next().unwrap().err().unwrap();
-        assert!(error.to_string().contains("input error"));
-        assert_eq!(consumed_batches.get(), 2);
-
-        let last = reconciled.next().unwrap()?;
-        assert_eq!(consumed_batches.get(), 4);
-        assert_eq!(last.filtered_data.selection_vector(), vec![false, true]);
-        assert_eq!(last.actions_count, 1);
-        assert_eq!(last.add_actions_count, 1);
-        assert!(reconciled.next().is_none());
-        Ok(())
-    }
-
     #[test]
     fn test_action_reconciliation_visitor() -> Result<()> {
         let data = action_batch();
@@ -1228,8 +1176,11 @@ mod tests {
         let input_batches = vec![create_batch(batch1)?, create_batch(batch2)?];
 
         // Create processor with txn expiration timestamp
-        let results: Vec<_> = ActionReconciliationProcessor::new(0, Some(1000))
-            .process_actions_iter(input_batches.into_iter().map(Ok))
+        let mut processor = ActionReconciliationProcessor::new(0, Some(1000));
+        let results: Vec<_> = input_batches
+            .into_iter()
+            .map(move |batch| processor.process_actions_batch(batch))
+            .filter_ok(HasSelectionVector::has_selected_rows)
             .try_collect()?;
 
         // Verify results

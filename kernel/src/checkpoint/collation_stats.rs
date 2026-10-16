@@ -1,7 +1,8 @@
 //! Preserves source collation bounds independently of the binary data-skipping schema.
 //!
 //! Reads serialize the complete source stats before projecting parsed columns. Structured writes
-//! discover the identifier and bound trees from existing stats without evaluating collations.
+//! sample versioned identifiers from the first active Add and derive STRING bound columns
+//! from the table schema. Later identifiers may be omitted from structured stats.
 
 use std::sync::{Arc, LazyLock};
 
@@ -33,19 +34,21 @@ pub(crate) fn source_collation_stats(schema: &StructType) -> Option<&StructType>
 }
 
 /// Read and output schemas plus a projection that restores JSON before narrowing parsed stats.
-pub(crate) struct StatsNormalization {
+pub(crate) struct CollationStatsReadTransform {
     pub(crate) read_schema: SchemaRef,
     pub(crate) output_schema: SchemaRef,
     pub(crate) expression: ExpressionRef,
 }
 
-/// Builds a normalization for JSON-requesting reads; absent extensions leave the read unchanged.
+/// Builds a read schema and projection that preserve collation bounds in `add.stats`.
 ///
+/// Fills missing JSON stats from the complete source struct before projecting parsed stats.
+/// Returns `None` when JSON stats are not requested or source collation stats are unavailable.
 /// Returns an error if the requested Add schema cannot be patched.
-pub(crate) fn normalize_collation_stats(
+pub(crate) fn build_collation_stats_read_transform(
     requested: &StructType,
     source: Option<&StructType>,
-) -> KernelResult<Option<StatsNormalization>> {
+) -> KernelResult<Option<CollationStatsReadTransform>> {
     if !requested.contains_col(["add", "stats"]) {
         return Ok(None);
     }
@@ -87,48 +90,71 @@ pub(crate) fn normalize_collation_stats(
         None => patch.drop_at(["add"], "stats_parsed"),
     };
     let (output_schema, expression) = patch.build()?;
-    Ok(Some(StatsNormalization {
+    Ok(Some(CollationStatsReadTransform {
         read_schema,
         output_schema,
         expression,
     }))
 }
 
-/// Extends the checkpoint stats schema with identifiers and bounds from active Adds.
+/// Extends `binary_stats` with identifiers sampled from the first active Add.
 ///
-/// Returns an error for unreadable log data or non-STRING collation bounds.
+/// The writer needs a fixed schema before emitting data, so discovery rereads the log up to the
+/// first active Add. If its stats have no collation identifiers, `binary_stats` is unchanged.
+/// Both bounds include all current physical STRING columns outside partitions, so sparse samples
+/// do not limit same-version bounds in later files.
+/// Collation bounds are optional: unsampled identifiers are omitted from structured stats.
+/// JSON stats retain all source identifiers when enabled.
+/// Returns an error for unreadable log data or an invalid derived schema.
 pub(super) fn checkpoint_stats_schema(
     snapshot: &Snapshot,
     engine: &dyn Engine,
     binary_stats: SchemaRef,
 ) -> KernelResult<SchemaRef> {
+    let bound_schema = string_bound_schema(
+        &snapshot
+            .table_configuration()
+            .physical_data_schema_without_partition_columns(),
+    )?;
+    if bound_schema.num_fields() == 0 {
+        return Ok(binary_stats);
+    }
     let mut visitor = CollationStatsVisitor::default();
     let actions = snapshot
         .log_segment()
         .read_actions(engine, super::CHECKPOINT_ACTIONS_SCHEMA_V1.clone())?;
-    let reconciled =
-        ActionReconciliationProcessor::new(i64::MAX, None).process_actions_iter(actions);
-    for batch in reconciled {
-        visitor.visit_rows_of(batch?.filtered_data.apply_selection_vector()?.as_ref())?;
+    let mut processor = ActionReconciliationProcessor::new(i64::MAX, None);
+    for batch in actions {
+        let batch = processor.process_actions_batch(batch?)?;
+        visitor.visit_rows_of(batch.filtered_data.apply_selection_vector()?.as_ref())?;
+        if visitor.found_add {
+            break;
+        }
     }
-    if visitor.schema.num_fields() == 0 {
+    if visitor.identifiers.is_empty() {
         return Ok(binary_stats);
     }
+    let bounds = schema! {
+        nullable "minValues": (bound_schema.clone()),
+        nullable "maxValues": (bound_schema),
+    };
+    let collations = StructType::try_new(
+        visitor
+            .identifiers
+            .into_iter()
+            .map(|identifier| StructField::nullable(identifier, bounds.clone())),
+    )?;
     Ok(Arc::new(
         SchemaStructPatchBuilder::new()
-            .append(StructField::nullable(COLLATION_STATS, visitor.schema))
+            .append(StructField::nullable(COLLATION_STATS, collations))
             .build(&binary_stats)?,
     ))
 }
 
+#[derive(Default)]
 struct CollationStatsVisitor {
-    schema: StructType,
-}
-
-impl Default for CollationStatsVisitor {
-    fn default() -> Self {
-        Self { schema: schema! {} }
-    }
+    found_add: bool,
+    identifiers: Vec<String>,
 }
 
 impl RowVisitor for CollationStatsVisitor {
@@ -144,77 +170,39 @@ impl RowVisitor for CollationStatsVisitor {
             if path.is_none() {
                 continue;
             }
+            self.found_add = true;
             let json: Option<&str> = getters[1].get_opt(row, "add.stats")?;
             let Some(json) = json else {
-                continue;
+                break;
             };
-            // Malformed optional JSON stats cannot supply a structured schema.
+            // Malformed optional JSON stats cannot supply collation identifiers.
             let Ok(stats) = serde_json::from_str::<Value>(json) else {
-                continue;
+                break;
             };
             if let Some(Value::Object(identifiers)) = stats.get(COLLATION_STATS) {
-                for (identifier, stats) in identifiers {
-                    let mut bounds = serde_json::Map::new();
-                    for name in ["minValues", "maxValues"] {
-                        if let Some(value @ Value::Object(_)) = stats.get(name) {
-                            bounds.insert(name.to_string(), value.clone());
-                        }
-                    }
-                    if bounds.is_empty() {
-                        continue;
-                    }
-                    self.schema = merge_bound_schema(
-                        &self.schema,
-                        &serde_json::json!({ identifier: bounds }),
-                    )?;
-                }
+                self.identifiers.extend(identifiers.keys().cloned());
             }
+            break;
         }
         Ok(())
     }
 }
 
-fn merge_bound_schema(schema: &StructType, bounds: &Value) -> KernelResult<StructType> {
-    let Value::Object(bounds) = bounds else {
-        return Err(KernelError::schema("Collation bounds must be objects"));
-    };
-    let mut fields: Vec<_> = schema.fields().cloned().collect();
-    for (name, value) in bounds {
-        let existing = fields.iter().position(|field| field.name() == name);
-        let data_type = match value {
-            Value::Null => continue,
-            Value::Object(_) => {
-                let empty = schema! {};
-                let child = match existing.map(|index| fields[index].data_type()) {
-                    Some(DataType::Struct(child)) => child.as_ref(),
-                    None => &empty,
-                    Some(_) => {
-                        return Err(KernelError::schema("Conflicting collation bound types"))
-                    }
-                };
-                let child = merge_bound_schema(child, value)?;
+fn string_bound_schema(schema: &StructType) -> KernelResult<StructType> {
+    let mut fields = Vec::new();
+    for field in schema.fields() {
+        let data_type = match field.data_type() {
+            DataType::Struct(child) => {
+                let child = string_bound_schema(child)?;
                 if child.num_fields() == 0 {
                     continue;
                 }
                 DataType::from(child)
             }
-            Value::String(_) => {
-                if existing.is_some_and(|index| fields[index].data_type() != &DataType::STRING) {
-                    return Err(KernelError::schema("Conflicting collation bound types"));
-                }
-                DataType::STRING
-            }
-            _ => {
-                return Err(KernelError::schema(
-                    "Collation bounds must have STRING leaves",
-                ))
-            }
+            data_type if data_type == &DataType::STRING => DataType::STRING,
+            _ => continue,
         };
-        let field = StructField::nullable(name, data_type);
-        match existing {
-            Some(index) => fields[index] = field,
-            None => fields.push(field),
-        }
+        fields.push(StructField::nullable(field.name(), data_type));
     }
     StructType::try_new(fields)
 }
@@ -232,70 +220,255 @@ mod tests {
     use super::*;
     use crate::actions::{Metadata, Protocol};
     use crate::arrow::array::{StringArray, StructArray};
+    use crate::checkpoint::checkpoint_transform::{
+        build_checkpoint_read_schema, build_checkpoint_transform, StatsTransformConfig,
+    };
     use crate::checkpoint::CHECKPOINT_ACTIONS_SCHEMA_V1;
     use crate::engine::arrow_data::EngineDataArrowExt;
+    use crate::engine::arrow_utils::to_json_bytes;
     use crate::engine::sync::SyncEngine;
+    use crate::engine_data::FilteredEngineData;
     use crate::object_store::memory::InMemory;
-    use crate::object_store::DynObjectStore;
+    use crate::object_store::path::Path;
+    use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use crate::schema::{schema, schema_ref, ColumnMetadataKey, MetadataValue};
 
-    #[test]
-    fn discovers_literal_identifiers_and_sparse_nested_bounds() {
-        let first = json!({
-            "ICU.en_US.72": { "minValues": { "physical.with.dot": { "leaf": "B" } } },
-            "spark.UTF8_LCASE.75.1": { "maxValues": { "other": "a" } },
-        });
-        let schema = merge_bound_schema(&schema! {}, &first).unwrap();
-        let schema = merge_bound_schema(
-            &schema,
-            &json!({ "ICU.en_US.73": { "maxValues": { "physical.with.dot": { "leaf": "Z" } } } }),
-        )
-        .unwrap();
-        for identifier in ["ICU.en_US.72", "ICU.en_US.73", "spark.UTF8_LCASE.75.1"] {
-            assert!(schema.contains(identifier));
-        }
-        assert_eq!(
-            schema
-                .field_at(&ColumnName::new([
-                    "ICU.en_US.72",
-                    "minValues",
-                    "physical.with.dot",
-                    "leaf"
-                ]))
-                .unwrap()
-                .data_type(),
-            &DataType::STRING
-        );
+    #[rstest]
+    #[case::missing(None, vec![])]
+    #[case::malformed(Some("{".into()), vec![])]
+    #[case::binary_only(Some(json!({ "numRecords": 2 }).to_string()), vec![])]
+    #[case::empty_collations(Some(json!({ COLLATION_STATS: {} }).to_string()), vec![])]
+    #[case::empty_bounds(Some(json!({
+        COLLATION_STATS: { "ICU.en_US.72": { "minValues": {} } },
+    }).to_string()), vec!["ICU.en_US.72"])]
+    #[case::literal_identifiers(Some(json!({ COLLATION_STATS: {
+        "ICU.en_US.72": { "minValues": { "physical.with.dot": { "leaf": "B" } } },
+        "spark.UTF8_LCASE.75.1": { "maxValues": { "other": "a" } },
+    } }).to_string()), vec!["ICU.en_US.72", "spark.UTF8_LCASE.75.1"])]
+    fn first_add_selects_its_identifiers_and_ignores_later_rows(
+        #[case] stats: Option<String>,
+        #[case] expected: Vec<&str>,
+    ) {
+        let inputs = [
+            json!({ "add": { "stats": json!({
+                COLLATION_STATS: { "ICU.en_US.71": { "minValues": { "other": "a" } } },
+            }).to_string() } }),
+            json!({ "add": { "path": "first", "stats": stats } }),
+            json!({ "add": { "path": "later", "stats": json!({
+                COLLATION_STATS: { "ICU.en_US.73": { "minValues": { "other": "a" } } },
+            }).to_string() } }),
+        ];
+        let engine = SyncEngine::new();
+        let data = engine.json_handler().parse_json(
+            crate::unit_test_utils::string_array_to_engine_data(StringArray::from(
+                inputs.iter().map(Value::to_string).collect::<Vec<_>>(),
+            )),
+            schema_ref! { nullable "add": { nullable "path": STRING, nullable "stats": STRING } },
+        ).unwrap();
+        let mut visitor = CollationStatsVisitor::default();
+        visitor.visit_rows_of(data.as_ref()).unwrap();
+        assert!(visitor.found_add);
+        assert_eq!(visitor.identifiers, expected);
     }
 
     #[rstest]
-    #[case::struct_bound(json!({ "leaf": "Alice" }), schema! { nullable "leaf": STRING }.into())]
-    #[case::string_bound(json!("Alice"), DataType::STRING)]
-    fn null_bounds_do_not_infer_or_replace_types(
-        #[case] value: Value,
-        #[case] data_type: DataType,
-        #[values(true, false)] null_first: bool,
-        #[values("minValues", "maxValues")] bound: &str,
-    ) {
-        let null = json!({ "ICU.en_US.72": { bound: { "nested": null } } });
-        let populated = json!({ "ICU.en_US.72": { bound: { "nested": value } } });
-        let empty = schema! {};
-        let values = if null_first {
-            [&null, &populated]
-        } else {
-            [&populated, &null]
+    #[case::structured_only(false)]
+    #[case::json_and_structured(true)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_samples_only_first_add_and_preserves_selected_bounds(
+        #[case] write_json: bool,
+        #[values(false, true)] sample_has_collations: bool,
+    ) -> Result<()> {
+        let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let table_root = "memory:///";
+        let leaf = StructField::not_null("a", DataType::STRING).with_metadata([(
+            ColumnMetadataKey::Collations.as_ref(),
+            MetadataValue::Other(json!({ "a": "ICU.en_US" })),
+        )]);
+        let table_schema = schema_ref! {
+            not_null "physical.with.dot": { (leaf), not_null "b": STRING },
+            nullable "id": LONG,
+            nullable "numbers": { nullable "count": LONG },
+            nullable "array": [ nullable STRING ],
+            nullable "map": { STRING => nullable STRING },
+            nullable "partition": STRING,
         };
-        let discovered = values.iter().fold(empty, |schema, value| {
-            merge_bound_schema(&schema, value).unwrap()
-        });
+        let metadata = Metadata::try_new(
+            Some("test-table".into()),
+            None,
+            table_schema,
+            vec!["partition".into()],
+            0,
+            HashMap::from([
+                ("delta.dataSkippingNumIndexedCols".into(), "0".into()),
+                (
+                    "delta.checkpoint.writeStatsAsJson".into(),
+                    write_json.to_string(),
+                ),
+                ("delta.checkpoint.writeStatsAsStruct".into(), "true".into()),
+            ]),
+        )?;
+        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), ["collations"])?;
+        let samples = [
+            (
+                "old.parquet",
+                json!({ "ICU.en_US.71": {
+                    "minValues": { "physical.with.dot": { "a": "Old" } },
+                } }),
+            ),
+            (
+                "sample.parquet",
+                if sample_has_collations {
+                    json!({ "ICU.en_US.72": {
+                        "minValues": { "physical.with.dot": { "a": "B", "b": null } },
+                    } })
+                } else {
+                    json!({})
+                },
+            ),
+            (
+                "other-version.parquet",
+                json!({ "ICU.en_US.73": {
+                    "minValues": { "physical.with.dot": { "a": "A" } },
+                    "maxValues": { "physical.with.dot": { "a": "Z" } },
+                } }),
+            ),
+            (
+                "same-version.parquet",
+                json!({ "ICU.en_US.72": {
+                    "minValues": { "physical.with.dot": { "b": "Alice" } },
+                    "maxValues": { "physical.with.dot": { "b": "Zoey" } },
+                } }),
+            ),
+        ];
+        let adds: Vec<_> = samples
+            .iter()
+            .map(|(path, bounds)| {
+                json!({ "add": {
+                    "path": path, "partitionValues": { "partition": "p" }, "size": 10,
+                    "modificationTime": 0, "dataChange": true,
+                    "stats": json!({ "numRecords": 2, COLLATION_STATS: bounds }).to_string(),
+                } })
+            })
+            .collect();
+        add_commit(
+            table_root,
+            &store,
+            0,
+            [
+                json!({ "protocol": protocol }),
+                json!({ "metaData": metadata }),
+                adds[0].clone(),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .join("\n"),
+        )
+        .await
+        .unwrap();
+        add_commit(
+            table_root,
+            &store,
+            1,
+            adds[1..].iter().map(Value::to_string).join("\n"),
+        )
+        .await
+        .unwrap();
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        let binary_stats = snapshot
+            .table_configuration()
+            .stats_schema_builder()
+            .build()?;
+        let stats_schema = checkpoint_stats_schema(&snapshot, &engine, binary_stats.clone())?;
+        let bounds = schema! {
+            nullable "physical.with.dot": { nullable "a": STRING, nullable "b": STRING },
+        };
+        let expected = if sample_has_collations {
+            Arc::new(
+                SchemaStructPatchBuilder::new()
+                    .append(StructField::nullable(
+                        COLLATION_STATS,
+                        schema! { nullable "ICU.en_US.72": {
+                            nullable "minValues": (bounds.clone()),
+                            nullable "maxValues": (bounds),
+                        } },
+                    ))
+                    .build(&binary_stats)?,
+            )
+        } else {
+            binary_stats.clone()
+        };
+        assert_eq!(stats_schema, expected);
+
+        let read_schema =
+            build_checkpoint_read_schema(&CHECKPOINT_ACTIONS_SCHEMA_V1, &stats_schema, None)?;
+        let config = StatsTransformConfig::from_table_properties(snapshot.table_properties());
+        let (output_schema, expression) =
+            build_checkpoint_transform(&config, &read_schema, &stats_schema, None)?;
+        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+            read_schema.clone(),
+            expression,
+            output_schema.as_ref().clone().into(),
+        )?;
+        let mut processor = ActionReconciliationProcessor::new(i64::MAX, None);
+        let mut output = HashMap::new();
+        for batch in snapshot.log_segment().read_actions(&engine, read_schema)? {
+            let batch = processor
+                .process_actions_batch(batch?)?
+                .filtered_data
+                .apply_selection_vector()?;
+            let data = evaluator.evaluate(batch.as_ref())?;
+            let bytes = to_json_bytes(std::iter::once(Ok(
+                FilteredEngineData::with_all_rows_selected(data),
+            )))?;
+            for action in serde_json::Deserializer::from_slice(&bytes).into_iter::<Value>() {
+                let action = action?;
+                if let Some(path) = action["add"]["path"].as_str() {
+                    output.insert(path.to_string(), action["add"].clone());
+                }
+            }
+        }
+        assert_eq!(output.len(), samples.len());
+        for (path, bounds) in &samples {
+            let add = &output[*path];
+            assert_eq!(add["stats_parsed"]["numRecords"], 2);
+            let parsed = &add["stats_parsed"][COLLATION_STATS];
+            assert!(parsed.get("ICU.en_US.71").is_none());
+            assert!(parsed.get("ICU.en_US.73").is_none());
+            if !sample_has_collations {
+                assert!(parsed.is_null());
+            }
+            if !bounds.as_object().unwrap().contains_key("ICU.en_US.72") {
+                assert!(parsed["ICU.en_US.72"].is_null());
+            }
+            if write_json {
+                let json: Value = serde_json::from_str(add["stats"].as_str().unwrap())?;
+                assert_eq!(&json[COLLATION_STATS], bounds);
+            } else {
+                assert!(add.get("stats").is_none());
+            }
+        }
+        if sample_has_collations {
+            let sample = &output["sample.parquet"]["stats_parsed"][COLLATION_STATS]["ICU.en_US.72"];
+            assert_eq!(sample["minValues"]["physical.with.dot"]["a"], "B");
+            assert!(sample["minValues"]["physical.with.dot"]["b"].is_null());
+            assert!(sample["maxValues"].is_null());
+            let same_version =
+                &output["same-version.parquet"]["stats_parsed"][COLLATION_STATS]["ICU.en_US.72"];
+            assert_eq!(same_version["minValues"]["physical.with.dot"]["b"], "Alice");
+            assert_eq!(same_version["maxValues"]["physical.with.dot"]["b"], "Zoey");
+        }
+
+        // An unreadable older commit proves discovery stops before requesting the next batch.
+        store
+            .delete(&Path::from("_delta_log/00000000000000000000.json"))
+            .await?;
         assert_eq!(
-            discovered
-                .field_at(&ColumnName::new(["ICU.en_US.72", bound, "nested"]))
-                .unwrap()
-                .data_type(),
-            &data_type,
+            checkpoint_stats_schema(&snapshot, &engine, binary_stats)?,
+            stats_schema
         );
-        assert_eq!(merge_bound_schema(&schema! {}, &null).unwrap(), schema! {});
+        Ok(())
     }
 
     #[rstest]
@@ -374,9 +547,10 @@ mod tests {
         if earlier_checkpoint {
             let parsed_stats = schema! {
                 nullable "numRecords": LONG,
-                nullable COLLATION_STATS: (
-                    merge_bound_schema(&schema! {}, &old_stats[COLLATION_STATS])?
-                ),
+                nullable COLLATION_STATS: {
+                    nullable "ICU.en_US.71": { nullable "minValues": { nullable "nested": STRING } },
+                    nullable "ICU.en_US.72": { nullable "minValues": { nullable "nested": STRING } },
+                },
             };
             let mut patch = SchemaStructPatchBuilder::new()
                 .append_at(["add"], StructField::nullable("stats_parsed", parsed_stats));
@@ -444,9 +618,19 @@ mod tests {
             earlier_checkpoint.then_some(0)
         );
         let binary_stats = schema_ref! { nullable "numRecords": LONG };
+        let bounds = if replace_dv {
+            schema! { nullable "nested": STRING }
+        } else {
+            schema! { nullable "nested": { nullable "leaf": STRING } }
+        };
         let expected = schema_ref! {
             nullable "numRecords": LONG,
-            nullable COLLATION_STATS: (merge_bound_schema(&schema! {}, &active_bounds)?),
+            nullable COLLATION_STATS: {
+                nullable "ICU.en_US.72": {
+                    nullable "minValues": (bounds.clone()),
+                    nullable "maxValues": (bounds),
+                },
+            },
         };
         assert_eq!(
             checkpoint_stats_schema(&snapshot, &engine, binary_stats)?,
@@ -458,7 +642,7 @@ mod tests {
     #[rstest]
     #[case::json_only(false)]
     #[case::json_and_parsed(true)]
-    fn normalization_preserves_source_before_projecting(#[case] parsed: bool) {
+    fn read_transform_preserves_source_before_projecting(#[case] parsed: bool) {
         let binary = schema! { nullable "numRecords": LONG };
         let mut requested = schema! { nullable "stats": STRING };
         if parsed {
@@ -474,21 +658,23 @@ mod tests {
                 nullable "ICU.en_US.72": { nullable "minValues": { nullable "col-a": STRING } },
             },
         };
-        let normalized = normalize_collation_stats(&requested, Some(&source))
+        let read_transform = build_collation_stats_read_transform(&requested, Some(&source))
             .unwrap()
             .unwrap();
-        assert_eq!(normalized.output_schema, requested);
+        assert_eq!(read_transform.output_schema, requested);
         assert_eq!(
-            source_collation_stats(&normalized.read_schema),
+            source_collation_stats(&read_transform.read_schema),
             Some(&source)
         );
-        assert!(normalize_collation_stats(&requested, None)
+        assert!(build_collation_stats_read_transform(&requested, None)
             .unwrap()
             .is_none());
         let struct_only = schema! { nullable "add": { nullable "stats_parsed": (source.clone()) } };
-        assert!(normalize_collation_stats(&struct_only, Some(&source))
-            .unwrap()
-            .is_none());
+        assert!(
+            build_collation_stats_read_transform(&struct_only, Some(&source))
+                .unwrap()
+                .is_none()
+        );
     }
     #[rstest]
     #[case::struct_only_source(false)]
@@ -501,7 +687,17 @@ mod tests {
         });
         let source = schema! {
             nullable "numRecords": LONG,
-            nullable COLLATION_STATS: (merge_bound_schema(&schema! {}, &bounds).unwrap()),
+            nullable COLLATION_STATS: {
+                nullable "ICU.en_US.72": {
+                    nullable "minValues": { nullable "col.with.dot": { nullable "leaf": STRING } },
+                },
+                nullable "ICU.en_US.73": {
+                    nullable "maxValues": { nullable "col.with.dot": { nullable "leaf": STRING } },
+                },
+                nullable "spark.UTF8_LCASE.75.1": {
+                    nullable "minValues": { nullable "other": STRING },
+                },
+            },
         };
         let requested = schema_ref! {
             nullable "add": {
@@ -509,7 +705,7 @@ mod tests {
                 nullable "stats_parsed": { nullable "numRecords": LONG },
             },
         };
-        let normalization = normalize_collation_stats(&requested, Some(&source))
+        let read_transform = build_collation_stats_read_transform(&requested, Some(&source))
             .unwrap()
             .unwrap();
         let source_stats = json!({ "numRecords": 2, COLLATION_STATS: bounds });
@@ -529,15 +725,15 @@ mod tests {
                 crate::unit_test_utils::string_array_to_engine_data(StringArray::from(vec![
                     input.to_string()
                 ])),
-                normalization.read_schema.clone(),
+                read_transform.read_schema.clone(),
             )
             .unwrap();
         let output = engine
             .evaluation_handler()
             .new_expression_evaluator(
-                normalization.read_schema,
-                normalization.expression,
-                normalization.output_schema.as_ref().clone().into(),
+                read_transform.read_schema,
+                read_transform.expression,
+                read_transform.output_schema.as_ref().clone().into(),
             )
             .unwrap()
             .evaluate(data.as_ref())

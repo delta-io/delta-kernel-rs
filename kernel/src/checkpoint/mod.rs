@@ -101,6 +101,7 @@
 //! [`Snapshot::create_checkpoint_writer`]: crate::Snapshot::create_checkpoint_writer
 use std::sync::{Arc, LazyLock, Mutex};
 
+use itertools::Itertools;
 use tracing::info;
 use url::Url;
 
@@ -118,6 +119,7 @@ use crate::actions::{
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, Scalar};
 use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::log_replay::HasSelectionVector;
 use crate::path::{self, ParsedLogPath};
 use crate::schema::{lazy_schema_ref, SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
@@ -460,11 +462,13 @@ impl CheckpointWriter {
             .read_actions(engine, self.read_schema.clone())?;
 
         // Process actions through reconciliation
-        let checkpoint_data = ActionReconciliationProcessor::new(
+        let mut processor = ActionReconciliationProcessor::new(
             self.deleted_file_retention_timestamp()?,
             self.get_transaction_expiration_timestamp()?,
-        )
-        .process_actions_iter(actions);
+        );
+        let checkpoint_data = actions
+            .map(move |batch| processor.process_actions_batch(batch?))
+            .filter_ok(HasSelectionVector::has_selected_rows);
 
         // Create the expression evaluator for the checkpoint transform.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).
@@ -739,14 +743,7 @@ impl CheckpointWriter {
             .stats_schema_builder()
             .with_required_physical_columns(physical_clustering_columns.as_deref())
             .build()?;
-        let has_collations =
-            crate::schema::collation_utils::schema_has_collations(snapshot.schema().as_ref())
-                || tc.protocol().writer_features().is_some_and(|features| {
-                    features.iter().any(|feature| {
-                        matches!(feature.as_ref(), "collations" | "collations-preview")
-                    })
-                });
-        if config.write_stats_as_struct && has_collations {
+        if config.write_stats_as_struct && tc.has_collations() {
             stats_schema =
                 collation_stats::checkpoint_stats_schema(snapshot, engine, stats_schema)?;
         }

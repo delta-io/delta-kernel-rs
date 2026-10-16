@@ -16,7 +16,9 @@ use crate::actions::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{CheckpointAction, CHECKPOINT_ACTION_FIELD};
 use crate::cancellation::CancellationTokenRef;
-use crate::checkpoint::collation_stats::{normalize_collation_stats, source_collation_stats};
+use crate::checkpoint::collation_stats::{
+    build_collation_stats_read_transform, source_collation_stats,
+};
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
@@ -1276,25 +1278,25 @@ impl LogSegment {
             .iter()
             .map(|f| f.location.clone())
             .collect();
-        let normalization = normalize_collation_stats(
+        let read_transform = build_collation_stats_read_transform(
             &augmented_checkpoint_read_schema,
             file_actions_schema
                 .as_deref()
                 .and_then(source_collation_stats)
                 .filter(|_| action_schema.contains_col(["add", "stats"])),
         )?;
-        let read_schema = normalization
+        let read_schema = read_transform
             .as_ref()
-            .map_or(&augmented_checkpoint_read_schema, |normalization| {
-                &normalization.read_schema
+            .map_or(&augmented_checkpoint_read_schema, |read_transform| {
+                &read_transform.read_schema
             });
-        let evaluator = normalization
+        let evaluator = read_transform
             .as_ref()
-            .map(|normalization| {
+            .map(|read_transform| {
                 engine.evaluation_handler().new_expression_evaluator(
-                    normalization.read_schema.clone(),
-                    normalization.expression.clone(),
-                    normalization.output_schema.as_ref().clone().into(),
+                    read_transform.read_schema.clone(),
+                    read_transform.expression.clone(),
+                    read_transform.output_schema.as_ref().clone().into(),
                 )
             })
             .transpose()?;
@@ -1363,9 +1365,9 @@ impl LogSegment {
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed,
             has_partition_values_parsed,
-            checkpoint_read_schema: normalization
-                .map_or(augmented_checkpoint_read_schema, |normalization| {
-                    normalization.output_schema
+            checkpoint_read_schema: read_transform
+                .map_or(augmented_checkpoint_read_schema, |read_transform| {
+                    read_transform.output_schema
                 }),
         };
         Ok(ActionsWithCheckpointInfo {
