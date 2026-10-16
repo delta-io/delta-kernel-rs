@@ -9,7 +9,7 @@ use crc::{Crc, CRC_32_ISO_HDLC};
 use delta_kernel::schema::derive_macro_utils::ToDataType;
 use delta_kernel_derive::{internal_api, IntoStructData, ToSchema};
 use roaring::RoaringTreemap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -32,20 +32,19 @@ const ROARING_BITMAP_NATIVE_MAGIC: u32 = 1681511376;
 
 const INLINE_DELETION_VECTOR_MAGIC_SIZE: usize = 4;
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
 pub enum DeletionVectorStorageType {
-    #[cfg_attr(test, serde(rename = "u"))]
+    #[serde(rename = "u")]
     PersistedRelative,
-    #[cfg_attr(test, serde(rename = "i"))]
+    #[serde(rename = "i")]
     Inline,
-    #[cfg_attr(test, serde(rename = "p"))]
+    #[serde(rename = "p")]
     PersistedAbsolute,
     /// Unlike [`PersistedRelative`](Self::PersistedRelative) (`'u'`), `path_or_inline_dv` stores
     /// the raw path with no base85/UUID encoding; it is percent-encoded only when resolved against
     /// the table root.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[cfg_attr(test, serde(rename = "r"))]
+    #[serde(rename = "r")]
     PersistedUnencodedRelative,
 }
 
@@ -147,9 +146,8 @@ impl DeletionVectorPath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize)]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[serde(rename_all = "camelCase", try_from = "DeletionVectorRaw")]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", try_from = "DeletionVectorRaw", into = "DeletionVectorRaw")]
 pub struct DeletionVectorDescriptor {
     /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'],
     /// plus 'r' when built with the `adaptive-metadata-in-dev` cargo feature.
@@ -185,11 +183,12 @@ pub struct DeletionVectorDescriptor {
     pub cardinality: i64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DeletionVectorRaw {
     storage_type: String,
     path_or_inline_dv: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     offset: Option<i32>,
     size_in_bytes: i32,
     cardinality: i64,
@@ -206,6 +205,21 @@ impl TryFrom<DeletionVectorRaw> for DeletionVectorDescriptor {
             raw.size_in_bytes,
             raw.cardinality,
         )
+    }
+}
+
+/// Mirror of [`TryFrom<DeletionVectorRaw>`] for serialization: routing through the raw struct
+/// emits `storage_type` as its protocol string in every format, keeping serialize symmetric with
+/// deserialize rather than relying on the self-describing enum representation.
+impl From<DeletionVectorDescriptor> for DeletionVectorRaw {
+    fn from(descriptor: DeletionVectorDescriptor) -> Self {
+        Self {
+            storage_type: descriptor.storage_type.to_string(),
+            path_or_inline_dv: descriptor.path_or_inline_dv,
+            offset: descriptor.offset,
+            size_in_bytes: descriptor.size_in_bytes,
+            cardinality: descriptor.cardinality,
+        }
     }
 }
 
@@ -879,6 +893,71 @@ mod tests {
         }"#;
         let error = serde_json::from_str::<DeletionVectorDescriptor>(invalid).unwrap_err();
         assert!(error.to_string().contains("must not carry an offset"));
+    }
+
+    #[test]
+    fn storage_type_serializes_as_a_string_and_round_trips() {
+        // In JSON the renamed enum serializes to its protocol string ("u"/"i"/"p"/"r") both ways.
+        for (variant, json) in [
+            (DeletionVectorStorageType::PersistedRelative, "\"u\""),
+            (DeletionVectorStorageType::Inline, "\"i\""),
+            (DeletionVectorStorageType::PersistedAbsolute, "\"p\""),
+        ] {
+            assert_eq!(serde_json::to_string(&variant).unwrap(), json);
+            assert_eq!(serde_json::from_str::<DeletionVectorStorageType>(json).unwrap(), variant);
+            // Keep the serde wire string in sync with Display/FromStr, which define the same
+            // "u"/"i"/"p"/"r" strings in a second place.
+            assert_eq!(serde_json::to_string(&variant).unwrap(), format!("\"{variant}\""));
+        }
+
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            let variant = DeletionVectorStorageType::PersistedUnencodedRelative;
+            assert_eq!(serde_json::to_string(&variant).unwrap(), "\"r\"");
+            assert_eq!(
+                serde_json::from_str::<DeletionVectorStorageType>("\"r\"").unwrap(),
+                variant
+            );
+            assert_eq!(serde_json::to_string(&variant).unwrap(), format!("\"{variant}\""));
+        }
+    }
+
+    #[test]
+    fn descriptor_serde_json_round_trips() {
+        for descriptor in [dv_relative(), dv_absolute(), dv_inline()] {
+            let json = serde_json::to_string(&descriptor).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            // storageType serializes as the renamed enum string ("u"/"i"/"p"), not a nested enum.
+            assert!(
+                value["storageType"].is_string(),
+                "storageType must serialize as a string: {json}"
+            );
+            // A present offset serializes as a number; an absent one is omitted entirely (not
+            // `null`), matching the protocol JSON shape (inline DVs never carry an offset).
+            match descriptor.offset {
+                Some(offset) => assert_eq!(value["offset"].as_i64(), Some(i64::from(offset))),
+                None => assert!(value.get("offset").is_none(), "offset must be omitted: {json}"),
+            }
+            let round_tripped: DeletionVectorDescriptor = serde_json::from_str(&json).unwrap();
+            assert_eq!(round_tripped, descriptor);
+        }
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn descriptor_serde_json_round_trips_unencoded_relative() {
+        let descriptor = DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::PersistedUnencodedRelative,
+            "data/deletion_vector_x.bin",
+            Some(1),
+            4,
+            2,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&descriptor).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["storageType"].as_str(), Some("r"), "{json}");
+        assert_eq!(serde_json::from_str::<DeletionVectorDescriptor>(&json).unwrap(), descriptor);
     }
 
     #[test]

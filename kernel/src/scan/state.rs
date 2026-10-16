@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 
 use derive_more::From;
 use roaring::RoaringTreemap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::log_replay::SCAN_ROW_SCHEMA;
@@ -19,7 +19,7 @@ use crate::utils::require;
 use crate::{Engine, EngineData, ExpressionRef, KernelError, KernelResult};
 
 /// this struct can be used by an engine to materialize a selection vector
-#[derive(Default, Debug, Clone, PartialEq, Eq, From)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, From, Serialize, Deserialize)]
 #[from(DeletionVectorDescriptor)]
 pub struct DvInfo {
     pub(crate) deletion_vector: Option<DeletionVectorDescriptor>,
@@ -265,6 +265,55 @@ mod tests {
             error.to_string(),
             "Deletion Vector error: cardinality must be non-negative"
         );
+    }
+
+    #[test]
+    fn dv_info_serde_json_round_trips() {
+        // The absent case serializes as a `deletion_vector: null` wrapper and round-trips to None.
+        let empty = DvInfo::default();
+        let empty_json = serde_json::to_string(&empty).unwrap();
+        assert_eq!(empty_json, r#"{"deletion_vector":null}"#);
+        assert_eq!(serde_json::from_str::<DvInfo>(&empty_json).unwrap(), empty);
+
+        // The present case pins the exact wire shape: snake_case wrapper, camelCase descriptor.
+        let dv_info = DvInfo::from(DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedAbsolute,
+            path_or_inline_dv:
+                "s3://mytable/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin".to_string(),
+            offset: Some(4),
+            size_in_bytes: 40,
+            cardinality: 6,
+        });
+        let json = serde_json::to_string(&dv_info).unwrap();
+        assert_eq!(
+            json,
+            r#"{"deletion_vector":{"storageType":"p","pathOrInlineDv":"s3://mytable/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin","offset":4,"sizeInBytes":40,"cardinality":6}}"#
+        );
+        assert_eq!(serde_json::from_str::<DvInfo>(&json).unwrap(), dv_info);
+    }
+
+    #[test]
+    fn dv_info_deserialize_rejects_invalid_nested_descriptor() {
+        // Validation runs through `DeletionVectorDescriptor::try_from`, so an inline descriptor
+        // carrying an offset (forbidden by the protocol) must fail to deserialize.
+        let invalid = r#"{"deletion_vector":{"storageType":"i","pathOrInlineDv":"","offset":1,"sizeInBytes":0,"cardinality":0}}"#;
+        assert!(serde_json::from_str::<DvInfo>(invalid).is_err());
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn dv_info_serde_json_round_trips_unencoded_relative() {
+        let descriptor = DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::PersistedUnencodedRelative,
+            "data/deletion_vector_x.bin",
+            Some(1),
+            4,
+            2,
+        )
+        .unwrap();
+        let dv_info = DvInfo::from(descriptor);
+        let json = serde_json::to_string(&dv_info).unwrap();
+        assert_eq!(serde_json::from_str::<DvInfo>(&json).unwrap(), dv_info);
     }
 
     #[derive(Clone)]
