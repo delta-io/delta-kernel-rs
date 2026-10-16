@@ -13,6 +13,8 @@
 use std::collections::hash_map::Entry;
 use std::sync::{Arc, LazyLock};
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use tracing::debug;
 use tracing::{instrument, warn};
 
 use super::LogSegment;
@@ -319,7 +321,7 @@ impl LogSegment {
             // commits and manifest commits with an older content root log theirs.
             if let (Some(oldest), Some(version)) = (oldest, newest_files_only_in_manifest) {
                 if u64::try_from(version).is_ok_and(|v| v >= oldest.version) {
-                    warn!(
+                    debug!(
                         "CRC reverse-replay: manifest commit at {version} may record files only \
                          in its manifest; defaulting to non-incremental-safe"
                     );
