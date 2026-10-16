@@ -275,7 +275,7 @@ mod tests {
         assert_eq!(empty_json, r#"{"deletion_vector":null}"#);
         assert_eq!(serde_json::from_str::<DvInfo>(&empty_json).unwrap(), empty);
 
-        // The present case wraps a descriptor whose storageType is a string.
+        // The present case pins the exact wire shape: snake_case wrapper, camelCase descriptor.
         let dv_info = DvInfo::from(DeletionVectorDescriptor {
             storage_type: DeletionVectorStorageType::PersistedAbsolute,
             path_or_inline_dv:
@@ -285,8 +285,34 @@ mod tests {
             cardinality: 6,
         });
         let json = serde_json::to_string(&dv_info).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(value["deletion_vector"]["storageType"].is_string(), "{json}");
+        assert_eq!(
+            json,
+            r#"{"deletion_vector":{"storageType":"p","pathOrInlineDv":"s3://mytable/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin","offset":4,"sizeInBytes":40,"cardinality":6}}"#
+        );
+        assert_eq!(serde_json::from_str::<DvInfo>(&json).unwrap(), dv_info);
+    }
+
+    #[test]
+    fn dv_info_deserialize_rejects_invalid_nested_descriptor() {
+        // Validation runs through `DeletionVectorDescriptor::try_from`, so an inline descriptor
+        // carrying an offset (forbidden by the protocol) must fail to deserialize.
+        let invalid = r#"{"deletion_vector":{"storageType":"i","pathOrInlineDv":"","offset":1,"sizeInBytes":0,"cardinality":0}}"#;
+        assert!(serde_json::from_str::<DvInfo>(invalid).is_err());
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn dv_info_serde_json_round_trips_unencoded_relative() {
+        let descriptor = DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::PersistedUnencodedRelative,
+            "data/deletion_vector_x.bin",
+            Some(1),
+            4,
+            2,
+        )
+        .unwrap();
+        let dv_info = DvInfo::from(descriptor);
+        let json = serde_json::to_string(&dv_info).unwrap();
         assert_eq!(serde_json::from_str::<DvInfo>(&json).unwrap(), dv_info);
     }
 

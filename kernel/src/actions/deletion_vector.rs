@@ -188,6 +188,7 @@ pub struct DeletionVectorDescriptor {
 struct DeletionVectorRaw {
     storage_type: String,
     path_or_inline_dv: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     offset: Option<i32>,
     size_in_bytes: i32,
     cardinality: i64,
@@ -896,6 +897,9 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_string(&variant).unwrap(), json);
             assert_eq!(serde_json::from_str::<DeletionVectorStorageType>(json).unwrap(), variant);
+            // Keep the serde wire string in sync with Display/FromStr, which define the same
+            // "u"/"i"/"p"/"r" strings in a second place.
+            assert_eq!(serde_json::to_string(&variant).unwrap(), format!("\"{variant}\""));
         }
 
         #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -906,6 +910,7 @@ mod tests {
                 serde_json::from_str::<DeletionVectorStorageType>("\"r\"").unwrap(),
                 variant
             );
+            assert_eq!(serde_json::to_string(&variant).unwrap(), format!("\"{variant}\""));
         }
     }
 
@@ -913,15 +918,38 @@ mod tests {
     fn descriptor_serde_json_round_trips() {
         for descriptor in [dv_relative(), dv_absolute(), dv_inline()] {
             let json = serde_json::to_string(&descriptor).unwrap();
-            // In JSON storageType serializes as the renamed enum string ("u"/"i"/"p").
             let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            // storageType serializes as the renamed enum string ("u"/"i"/"p"), not a nested enum.
             assert!(
                 value["storageType"].is_string(),
                 "storageType must serialize as a string: {json}"
             );
+            // A present offset serializes as a number; an absent one is omitted entirely (not
+            // `null`), matching the protocol JSON shape (inline DVs never carry an offset).
+            match descriptor.offset {
+                Some(offset) => assert_eq!(value["offset"].as_i64(), Some(i64::from(offset))),
+                None => assert!(value.get("offset").is_none(), "offset must be omitted: {json}"),
+            }
             let round_tripped: DeletionVectorDescriptor = serde_json::from_str(&json).unwrap();
             assert_eq!(round_tripped, descriptor);
         }
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn descriptor_serde_json_round_trips_unencoded_relative() {
+        let descriptor = DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::PersistedUnencodedRelative,
+            "data/deletion_vector_x.bin",
+            Some(1),
+            4,
+            2,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&descriptor).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["storageType"].as_str(), Some("r"), "{json}");
+        assert_eq!(serde_json::from_str::<DeletionVectorDescriptor>(&json).unwrap(), descriptor);
     }
 
     #[test]
