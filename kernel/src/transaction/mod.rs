@@ -288,6 +288,7 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     engine_info: String,
     engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
     staged_data_changes: MODE,
+    dedup_validation_enabled: bool,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
     // HashSet::insert drops the to-be-inserted value without returning the existing one, which
@@ -803,6 +804,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             engine_info: common_state.engine_info,
             engine_commit_info: common_state.engine_commit_info,
             staged_data_changes: MODE::default(),
+            dedup_validation_enabled: !common_state.skip_dedup_validation,
             set_transactions,
             commit_timestamp,
             user_domain_metadata_additions: common_state.domain_metadata_additions,
@@ -1454,20 +1456,27 @@ impl<STATE> Transaction<STATE, Imperative> {
         // return a static projection. It therefore uses dynamic per-column visitors.
         self.validate_add_files_stats(&self.staged_data_changes.add_files_metadata)?;
 
-        // Validate required fields for addFile.
-        write_validation::StagedDataValidator::staged_add_file(
+        // Share the tracker across validations to detect cross-source conflicts.
+        // TODO(#3545): Pre-size the tracker maps.
+        let mut staged_file_actions = self
+            .dedup_validation_enabled
+            .then(write_validation::FileActionTracker::default);
+        write_validation::validate_add_files(
+            &self.staged_data_changes.add_files_metadata,
             self.effective_table_config.physical_partition_columns(),
-        )
-        .validate(&self.staged_data_changes.add_files_metadata)?;
+            staged_file_actions.as_mut(),
+        )?;
 
-        write_validation::StagedDataValidator::staged_dv_matched_file(
+        write_validation::validate_dv_matched_files(
+            &self.staged_data_changes.dv_matched_files,
             self.effective_table_config.physical_partition_columns(),
-        )?
-        .validate_filtered(&self.staged_data_changes.dv_matched_files)?;
+            staged_file_actions.as_mut(),
+        )?;
 
-        // Validate required fields for RemoveFile.
-        write_validation::StagedDataValidator::staged_remove_file()
-            .validate_filtered(&self.staged_data_changes.remove_files_metadata)?;
+        write_validation::validate_remove_files(
+            &self.staged_data_changes.remove_files_metadata,
+            staged_file_actions.as_mut(),
+        )?;
 
         Ok(())
     }
@@ -2196,6 +2205,7 @@ mod tests {
                     dv_matched_files,
                     num_dv_updates,
                 },
+            dedup_validation_enabled,
             set_transactions,
             commit_timestamp,
             user_domain_metadata_additions,
@@ -2228,6 +2238,7 @@ mod tests {
         assert!(engine_commit_info.is_none());
         assert!(add_files_metadata.is_empty());
         assert!(remove_files_metadata.is_empty());
+        assert!(dedup_validation_enabled);
         assert!(set_transactions.is_empty());
         assert_eq!(commit_timestamp, expected_commit_timestamp);
         assert!(user_domain_metadata_additions.is_empty());
@@ -2292,6 +2303,7 @@ mod tests {
                 transaction_ids: vec![("app-one".into(), 7), ("app-two".into(), 8)],
                 domain_metadata_additions: expected_domains.clone(),
                 data_change: Some(false),
+                skip_dedup_validation: true,
             },
             snapshot.table_configuration().clone(),
             Box::new(MockCatalogCommitter),
@@ -2323,6 +2335,7 @@ mod tests {
         assert_eq!(commit_info_schema, expected_commit_info_schema);
         assert!(!transaction.data_change);
         assert!(!transaction.infer_data_change);
+        assert!(!transaction.dedup_validation_enabled);
         Ok(())
     }
 
