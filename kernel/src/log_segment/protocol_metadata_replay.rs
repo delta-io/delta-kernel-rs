@@ -115,6 +115,7 @@ impl LogSegment {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             let last_manifest_commit = LastManifestCommitResolution::from_replay(
                 candidate.last_manifest_commit.map(|(_, p)| p),
+                pruned.newest_commit().is_some(),
             );
 
             if metadata_opt.is_some() && protocol_opt.is_some() {
@@ -159,6 +160,7 @@ impl LogSegment {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit: LastManifestCommitResolution::from_replay(
                 candidate.last_manifest_commit.map(|(_, p)| p),
+                self.newest_commit().is_some(),
             ),
         })
     }
@@ -574,12 +576,13 @@ pub(crate) enum LastManifestCommitResolution {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl LastManifestCommitResolution {
-    /// Resolves the `lastManifestCommit` that P&M replay read from the newest commit. A miss is
-    /// `Unresolved` because replay may not have read that commit (e.g. the segment ends on a
-    /// checkpoint).
-    fn from_replay(captured: Option<LastManifestCommit>) -> Self {
+    /// Resolves the `lastManifestCommit` that P&M replay read from the newest commit. Replay always
+    /// reads that commit when the segment lists it, so a miss is `Resolved(None)` then, else
+    /// `Unresolved` (e.g. the segment ends on a checkpoint).
+    fn from_replay(captured: Option<LastManifestCommit>, newest_commit_listed: bool) -> Self {
         match captured {
             Some(pointer) => Self::Resolved(Some(pointer)),
+            None if newest_commit_listed => Self::Resolved(None),
             None => Self::Unresolved,
         }
     }

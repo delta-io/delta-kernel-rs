@@ -903,7 +903,8 @@ async fn post_commit_snapshot_resolves_latest_checkpoint_action(
 
 // Replay takes `lastManifestCommit` from the newest commit only: a manifest commit records itself,
 // a later log commit carries it forward, and a newest commit without one is not back-filled from an
-// older commit, so that miss stays `Unresolved`. The same holds when a CRC at v0 seeds the replay.
+// older commit. Replay always reads the newest commit, so it resolves that miss as
+// `Resolved(None)`. The same holds when a CRC at v0 seeds the replay.
 #[rstest]
 #[case::manifest_commit_records_itself(vec![], false, Some((0, 0)))]
 #[case::log_commit_carries_it_forward(vec![commit_info(Some((0, 0)))], false, Some((0, 0)))]
@@ -943,24 +944,21 @@ async fn assert_replay_last_manifest_commit<E: Engine>(
     assert_last_manifest_commit_resolution(&resolution.last_manifest_commit, expected);
 }
 
-// Asserts that replay found `expected`, or left a miss `Unresolved`.
+// Asserts that replay resolved `expected`, including a miss.
 fn assert_last_manifest_commit_resolution(
     resolution: &LastManifestCommitResolution,
     expected: &Option<LastManifestCommit>,
 ) {
-    match (resolution, expected) {
-        (LastManifestCommitResolution::Resolved(Some(resolved)), Some(expected)) => {
-            assert_eq!(resolved, expected)
-        }
-        (LastManifestCommitResolution::Unresolved, None) => {}
-        (resolution, expected) => panic!("expected {expected:?}, got {resolution:?}"),
-    }
+    assert!(
+        matches!(resolution, LastManifestCommitResolution::Resolved(resolved) if resolved == expected),
+        "expected {expected:?}, got {resolution:?}"
+    );
 }
 
 // Log compaction files drop commitInfo and checkpoint actions, so when a compaction covers the
 // newest commit replay still reads that commit: it follows a `lastManifestCommit` to the checkpoint
-// action that carries the latest P&M (here also covered by the compaction), and leaves a missing
-// one `Unresolved`, including a newest commit with no commitInfo at all.
+// action that carries the latest P&M (here also covered by the compaction), and resolves a missing
+// one, including a newest commit with no commitInfo at all, as `Resolved(None)`.
 #[rstest]
 #[case::follows_pointer(
     vec![checkpoint_commit(1, &[], test_schema_flat_with_column_mapping()), commit_info(Some((1, 1)))],
@@ -1082,9 +1080,10 @@ async fn replay_stops_at_pointed_checkpoint_action_covered_by_compaction() {
 }
 
 // A replayed snapshot serves `lastManifestCommit` from build-time state: it still resolves after
-// the newest commit file is deleted.
+// the newest commit file is deleted, including a missing pointer.
 #[rstest]
 #[case::carried_pointer(commit_info(Some((0, 0))), Some((0, 0)))]
+#[case::no_pointer(pointerless_pm_commit(), None)]
 #[tokio::test]
 async fn replayed_snapshot_serves_last_manifest_commit_without_reading_the_log(
     #[case] newest_commit: String,
