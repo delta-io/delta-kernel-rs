@@ -165,6 +165,7 @@ mod tests {
     use std::sync::Arc;
 
     use rstest::rstest;
+    use serde_json::json;
 
     use super::*;
     use crate::actions::{Sidecar, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA};
@@ -176,8 +177,8 @@ mod tests {
     use crate::snapshot::Snapshot;
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
-        adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table,
-        write_commit,
+        adaptive_metadata_protocol_and_metadata, checkpoint_line, minimal_checkpoint_action,
+        setup_adaptive_metadata_table, setup_table, write_commit, write_ict_commit,
     };
     use crate::unit_test_utils::{assert_result_error_with_message, MockTableConfigurationBuilder};
     use crate::{create_row, Result};
@@ -519,8 +520,9 @@ mod tests {
 
     #[test]
     fn scan_non_content_metadata_uses_crc_fast_path_with_existing_checkpoint() -> Result<()> {
-        let (engine, table_root) = setup_table()?;
-        let write = |version, data| write_commit(&engine, &table_root, version, data);
+        let (engine, table_root) = setup_adaptive_metadata_table();
+        // Writing a CRC needs each commit's In-Commit Timestamp.
+        let write = |version, line: String| write_ict_commit(&engine, &table_root, version, &line);
 
         // Checksum validation checks protocol continuity, so this uses the table's real
         // protocol/metadata.
@@ -533,14 +535,11 @@ mod tests {
             vec![],
             vec![],
         );
-        write(1, checkpoint.into_engine_data(&engine)?)?;
+        write(1, checkpoint_line(&checkpoint));
         let domain_metadata = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
-        write(
-            2,
-            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)?,
-        )?;
+        write(2, json!({ "domainMetadata": domain_metadata }).to_string());
         let transaction = SetTransaction::new("app-1".to_string(), 5, None);
-        write(3, create_row(&engine, LOG_TXN_SCHEMA.clone(), transaction)?)?;
+        write(3, json!({ "txn": transaction }).to_string());
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let (_, snapshot) = snapshot.write_checksum(&engine)?;
@@ -596,7 +595,7 @@ mod tests {
         #[case] dm_changes: Vec<DomainMetadata>,
         #[case] domain_kept: bool,
     ) -> Result<()> {
-        let (engine, table_root) = setup_table()?;
+        let (engine, table_root) = setup_adaptive_metadata_table();
         let config = Snapshot::builder_for(table_root.clone())
             .build(&engine)?
             .table_configuration()

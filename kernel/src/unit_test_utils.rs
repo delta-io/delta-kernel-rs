@@ -328,6 +328,8 @@ pub(crate) mod adaptive_metadata_fixtures {
     use super::*;
     use crate::actions::{get_commit_schema, CheckpointAction, ContentRoot, Sidecar};
     use crate::arrow::array::{Array as _, AsArray as _};
+    use crate::content_tree::test_utils::write_manifest;
+    use crate::content_tree::ContentTreeNodeEntry;
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::Scalar;
     use crate::path::LogRoot;
@@ -362,6 +364,11 @@ pub(crate) mod adaptive_metadata_fixtures {
             serde_json::json!({ "protocol": protocol }),
             serde_json::json!({ "metaData": adaptive_metadata_partitioned_by(partition_columns) }),
         )
+    }
+
+    /// A commit line holding `checkpoint`.
+    pub(crate) fn checkpoint_line(checkpoint: &CheckpointAction) -> String {
+        serde_json::json!({ "checkpoint": checkpoint }).to_string()
     }
 
     /// A minimal `checkpoint` action referencing `path` as the content root at `version`.
@@ -494,6 +501,15 @@ pub(crate) mod adaptive_metadata_fixtures {
         write_commit(engine, table_root, version, data).unwrap();
     }
 
+    /// Creates an in-memory adaptiveMetadata table at version 0 and returns its engine and
+    /// table-root URL.
+    pub(crate) fn setup_adaptive_metadata_table() -> (SyncEngine, Url) {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let table_root = Url::parse("memory:///").unwrap();
+        create_adaptive_metadata_table(&engine, &table_root, &[]);
+        (engine, table_root)
+    }
+
     /// Commits a transaction on the latest snapshot of the table at `table_root` that adds a
     /// 1-byte file at each path of `adds` and removes each live file of `removes`, returning the
     /// commit version.
@@ -556,6 +572,37 @@ pub(crate) mod adaptive_metadata_fixtures {
             );
         }
         txn.commit(engine)
+            .unwrap()
+            .unwrap_committed()
+            .commit_version()
+    }
+
+    /// Writes `entries` as the root manifest at `path` (relative to `table_root`) and commits it
+    /// as the content root of the table's latest snapshot, returning the commit version.
+    pub(crate) fn commit_root_manifest(
+        engine: &SyncEngine,
+        table_root: &Url,
+        path: &str,
+        entries: &[ContentTreeNodeEntry],
+    ) -> Version {
+        let file = write_manifest(engine, table_root.join(path).unwrap(), entries);
+        commit_root_manifest_file(engine, table_root, file)
+    }
+
+    /// Commits `file`, which need not exist, as the content root of the latest snapshot of the
+    /// table at `table_root`, returning the commit version.
+    pub(crate) fn commit_root_manifest_file(
+        engine: &SyncEngine,
+        table_root: &Url,
+        file: FileMeta,
+    ) -> Version {
+        let snapshot = Snapshot::builder_for(table_root.clone())
+            .build(engine)
+            .unwrap();
+        write_transaction(engine, snapshot)
+            .with_root_manifest_file(file)
+            .unwrap()
+            .commit(engine)
             .unwrap()
             .unwrap_committed()
             .commit_version()

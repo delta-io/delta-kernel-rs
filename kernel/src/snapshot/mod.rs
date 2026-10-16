@@ -271,18 +271,25 @@ impl Snapshot {
         }
     }
 
-    /// The latest AMT `checkpoint` action this snapshot covers, or `None` when this snapshot's log
-    /// segment has no checkpoint action (a classic non-AMT table, or an AMT table that has none
-    /// yet). Serves the action captured during P&M replay directly; otherwise reads it from the
-    /// manifest commit the CRC names (erroring if the CRC and the log disagree), or scans the log
-    /// when there is no CRC pointer, and memoizes a successful result so
-    /// later calls do not re-read (a failure is not cached and is retried). Memoizing is correct
-    /// because the snapshot's `log_segment` is frozen and Delta log files are immutable.
+    /// The latest AMT `checkpoint` action this snapshot covers, or `None` when the table does not
+    /// enable `adaptiveMetadata-preview` (the log is then not searched) or this snapshot's log
+    /// segment has no checkpoint action yet. Serves the action captured during P&M replay directly;
+    /// otherwise reads it from the manifest commit the CRC names (erroring if the CRC and the
+    /// log disagree), or scans the log when there is no CRC pointer, and memoizes a successful
+    /// result so later calls do not re-read (a failure is not cached and is retried). Memoizing
+    /// is correct because the snapshot's `log_segment` is frozen and Delta log files are
+    /// immutable.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub(crate) fn latest_checkpoint_action(
         &self,
         engine: &dyn Engine,
     ) -> Result<Option<Arc<CheckpointAction>>> {
+        if !self
+            .table_configuration()
+            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+        {
+            return Ok(None);
+        }
         let pointer = match &self.checkpoint_action_resolution {
             // Captured during replay: serve it directly (cheap `Arc` clone).
             CheckpointActionResolution::Captured(action) => return Ok(Some(action.clone())),

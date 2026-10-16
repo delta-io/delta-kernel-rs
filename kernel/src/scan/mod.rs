@@ -47,8 +47,8 @@ use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::{require, FoldWithOption as _, IteratorExt};
 use crate::{
-    Engine, EngineData, FileMeta, KernelError, KernelResult, Result, ResultIteratorStatic,
-    SnapshotRef, Version,
+    Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIteratorStatic, Result,
+    ResultIteratorStatic, SnapshotRef, Version,
 };
 
 pub(crate) mod data_skipping;
@@ -1130,6 +1130,14 @@ impl Scan {
         if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
             return Ok(Box::new(self.scan_metadata(engine)?));
         }
+        // Likewise for an AMT checkpoint action: commits at or below its version may no longer be
+        // listed, so a hint from before it cannot be advanced commit by commit.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)? {
+            if Version::try_from(checkpoint.version()).is_ok_and(|v| v > existing_version) {
+                return Ok(Box::new(self.scan_metadata(engine)?));
+            }
+        }
 
         // create a new log segment containing only the commits added after the version hint.
         let mut ascending_commit_files = log_segment.listed.ascending_commit_files.clone();
@@ -1261,27 +1269,59 @@ impl Scan {
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<
-        ActionsWithCheckpointInfo<impl Iterator<Item = KernelResult<ActionsBatch>> + Send>,
-    > {
+    ) -> KernelResult<ActionsWithCheckpointInfo<KernelResultIteratorStatic<ActionsBatch>>> {
         let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
-        // Checkpoints already represent reconciled state, so scans project only Add actions. This
-        // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
-        self.snapshot
-            .log_segment()
-            .read_actions_with_projected_checkpoint_actions(
+        let partition_schema = self
+            .state_info
+            .physical_partition_schema
+            .as_ref()
+            .map(|s| s.as_ref());
+        let log_segment = self.snapshot.log_segment();
+
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)? {
+            // TODO(#3320): the content tree does not yet carry partition values.
+            let partition_columns = self
+                .snapshot
+                .table_configuration()
+                .metadata()
+                .partition_columns();
+            require!(
+                partition_columns.is_empty(),
+                KernelError::unsupported(format!(
+                    "scanning a partitioned adaptiveMetadata table is not yet supported; \
+                     partition columns: {partition_columns:?}"
+                ))
+            );
+            return log_segment.read_actions_with_checkpoint_action(
                 engine,
+                &checkpoint,
+                self.snapshot.table_root(),
                 COMMIT_READ_SCHEMA.clone(),
                 checkpoint_schema,
                 meta_predicate,
                 physical_stats_read_schema,
-                self.state_info
-                    .physical_partition_schema
-                    .as_ref()
-                    .map(|s| s.as_ref()),
+                partition_schema,
                 self.cancellation_token.as_ref(),
-            )
+            );
+        }
+
+        // Checkpoints already represent reconciled state, so scans project only Add actions. This
+        // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
+        let result = log_segment.read_actions_with_projected_checkpoint_actions(
+            engine,
+            COMMIT_READ_SCHEMA.clone(),
+            checkpoint_schema,
+            meta_predicate,
+            physical_stats_read_schema,
+            partition_schema,
+            self.cancellation_token.as_ref(),
+        )?;
+        Ok(ActionsWithCheckpointInfo {
+            actions: Box::new(result.actions),
+            checkpoint_info: result.checkpoint_info,
+        })
     }
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.

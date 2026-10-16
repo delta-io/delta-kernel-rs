@@ -940,7 +940,6 @@ impl LogSegment {
     /// `partition_schema` apply only to a classic checkpoint: manifests are read without them, and
     /// the actions they carry have no pre-parsed stats or partition values.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_checkpoint_action(
         &self,
