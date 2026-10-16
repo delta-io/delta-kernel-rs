@@ -39,6 +39,8 @@ use crate::{
     KernelResult, ParquetFooter, ParquetHandler, PredicateRef, ResultIteratorStatic, Snapshot,
 };
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod adaptive_metadata;
 #[cfg(feature = "geo-type-in-dev")]
 mod geometry_stats;
 mod variant_stats;
