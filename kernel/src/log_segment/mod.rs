@@ -46,6 +46,8 @@ use crate::{
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 mod action_projector;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod checkpoint_sidecar;
 mod crc_replay;
 mod domain_metadata_replay;
 mod protocol_metadata_replay;
