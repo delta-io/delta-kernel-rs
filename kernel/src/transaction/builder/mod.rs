@@ -14,15 +14,13 @@ use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
-use self::alter_table::Modifying;
 pub(super) use self::state::TransactionBuilderState;
-use self::update_table::ExistingTableBuilderState;
 use crate::actions::DomainMetadata;
 use crate::expressions::ColumnName;
 use crate::schema::{SchemaRef, StructField};
 use crate::transaction::commit_info::collect_operation_metadata;
 use crate::transaction::schema_evolution::SchemaOperation;
-use crate::transaction::{AlterTable, CreateTable, UpdateTable};
+use crate::transaction::{AlterTable, CreateTable, SupportsSchemaChanges, UpdateTable};
 use crate::utils::require;
 use crate::{EngineData, KernelError, Result};
 
@@ -34,15 +32,6 @@ pub trait TransactionType: private::Sealed {
     /// Builder state specific to this transaction type. Use `()` when no extra state is needed.
     #[doc(hidden)]
     type BuilderState: Send;
-}
-
-/// A transaction type that accepts schema changes against an existing table.
-///
-/// Schema setters share their implementation and preserve transaction metadata while selecting
-/// the builder state in which a schema operation has been queued.
-pub trait SupportsSchemaChanges: TransactionType<BuilderState = ExistingTableBuilderState> {
-    /// Transaction type after adding at least one schema operation.
-    type WithSchemaChanges: TransactionType<BuilderState = ExistingTableBuilderState>;
 }
 
 /// Configures a transaction of type `T`.
@@ -264,14 +253,6 @@ impl TransactionType for UpdateTable {
 
 impl<S> TransactionType for AlterTable<S> {
     type BuilderState = update_table::ExistingTableBuilderState;
-}
-
-impl SupportsSchemaChanges for UpdateTable {
-    type WithSchemaChanges = UpdateTable;
-}
-
-impl<S> SupportsSchemaChanges for AlterTable<S> {
-    type WithSchemaChanges = AlterTable<Modifying>;
 }
 
 impl private::Sealed for CreateTable {}

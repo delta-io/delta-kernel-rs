@@ -71,6 +71,8 @@ pub mod data_layout;
 pub(crate) mod data_layout;
 
 pub use builder::alter_table::AlterTableTransactionBuilder;
+use builder::alter_table::Modifying;
+use builder::update_table::ExistingTableBuilderState;
 pub use builder::update_table::UpdateTableTransactionBuilder;
 use builder::TransactionBuilderState;
 pub use builder::{TransactionBuilder, TransactionType};
@@ -212,8 +214,25 @@ pub struct AlterTable<S = builder::alter_table::Modifying>(PhantomType<S>);
 /// only perform metadata-only commits.
 pub trait SupportsDataFiles: TransactionType {}
 
+/// A transaction type that accepts schema changes against an existing table.
+///
+/// Schema setters share their implementation and preserve transaction metadata while selecting
+/// the builder state in which a schema operation has been queued.
+pub trait SupportsSchemaChanges: TransactionType<BuilderState = ExistingTableBuilderState> {
+    /// Transaction type after adding at least one schema operation.
+    type WithSchemaChanges: TransactionType<BuilderState = ExistingTableBuilderState>;
+}
+
 impl SupportsDataFiles for CreateTable {}
 impl SupportsDataFiles for UpdateTable {}
+
+impl SupportsSchemaChanges for UpdateTable {
+    type WithSchemaChanges = UpdateTable;
+}
+
+impl<S> SupportsSchemaChanges for AlterTable<S> {
+    type WithSchemaChanges = AlterTable<Modifying>;
+}
 
 /// A type alias for alter-table transactions.
 ///
