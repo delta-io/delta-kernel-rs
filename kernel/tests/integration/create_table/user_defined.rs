@@ -13,6 +13,7 @@ use delta_kernel::schema::{
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::{Result as KernelResult, Snapshot};
 use rstest::rstest;
 use test_utils::{
@@ -55,7 +56,7 @@ async fn create_and_read_vector_udt(
         .build(Cursor::new(rows))?
         .next()
         .unwrap()?;
-    let mut txn = create_table(&table_path, schema, "test")
+    let mut txn = create_table(&table_path, schema, "test", true)
         .with_table_properties([("delta.columnMapping.mode", mapping_mode)])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let context = txn.write_state()?.write_context_builder().build()?;
@@ -95,7 +96,7 @@ fn create_udt_rejects_data_layout(
     let (_temp, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! { nullable "id": LONG, nullable "value": (udt(DataType::LONG)) };
     assert_result_error_with_message(
-        create_table(&table_path, schema, "test")
+        create_table(&table_path, schema, "test", true)
             .with_data_layout(layout)
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
         error,
@@ -131,7 +132,7 @@ fn create_udt_rejects_column_metadata(
         _ => unreachable!(),
     };
     assert_result_error_with_message(
-        create_table(&table_path, schema_ref! { (field), }, "test")
+        create_table(&table_path, schema_ref! { (field), }, "test", true)
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
         error,
     );
@@ -162,6 +163,7 @@ fn create_udt_rejects_iceberg_compat(
             &table_path,
             schema_ref! { nullable "value": (value) },
             "test",
+            true,
         )
         .with_table_properties([(property, "true")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
@@ -176,13 +178,13 @@ fn alter_udt_rejects_changes_inside_physical_type() -> KernelResult<()> {
     let schema = schema_ref! {
         nullable "value": (udt(schema! { nullable "inner": INTEGER }.into())),
     };
-    let snapshot = create_table(&table_path, schema, "test")
+    let snapshot = create_table(&table_path, schema, "test", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
     assert_result_error_with_message(
         snapshot
-            .alter_table()
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
             .add_column_at(
                 column_name!("value"),
                 StructField::nullable("added", DataType::LONG),
