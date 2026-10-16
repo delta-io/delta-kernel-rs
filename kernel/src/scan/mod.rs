@@ -1248,13 +1248,20 @@ impl Scan {
         // needed for output or pruning.
         let plan_executor = engine.require_plan_executor()?;
         let needs_leaf_schema = self.state_info.physical_stats_read_schema().is_some()
-            || self.state_info.physical_partition_schema.is_some();
+            || self.state_info.physical_partition_schema.is_some()
+            || self.needs_collation_stats_schema();
         let shape = if needs_leaf_schema {
             CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
         } else {
             CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?
         };
         self.build_metadata_scan_plan(&shape)
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    /// Whether JSON stats synthesis requires the checkpoint's collation stats schema.
+    fn needs_collation_stats_schema(&self) -> bool {
+        self.stats.synthesize_json && self.snapshot.table_configuration().has_collations()
     }
 
     // Factored out to facilitate testing

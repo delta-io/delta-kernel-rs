@@ -16,6 +16,9 @@ use crate::actions::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{CheckpointAction, LastManifestCommit, LOG_CHECKPOINT_SCHEMA};
 use crate::cancellation::CancellationTokenRef;
+use crate::checkpoint::collation_stats::{
+    build_collation_stats_read_transform, source_collation_stats,
+};
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
@@ -1284,6 +1287,28 @@ impl LogSegment {
             .iter()
             .map(|f| f.location.clone())
             .collect();
+        let read_transform = build_collation_stats_read_transform(
+            &augmented_checkpoint_read_schema,
+            file_actions_schema
+                .as_deref()
+                .and_then(source_collation_stats)
+                .filter(|_| action_schema.contains_col(["add", "stats"])),
+        )?;
+        let read_schema = read_transform
+            .as_ref()
+            .map_or(&augmented_checkpoint_read_schema, |read_transform| {
+                &read_transform.read_schema
+            });
+        let evaluator = read_transform
+            .as_ref()
+            .map(|read_transform| {
+                engine.evaluation_handler().new_expression_evaluator(
+                    read_transform.read_schema.clone(),
+                    read_transform.expression.clone(),
+                    read_transform.output_schema.as_ref().clone().into(),
+                )
+            })
+            .transpose()?;
 
         // Historically, we had a shared file reader trait for JSON and Parquet handlers,
         // but it was removed to avoid unnecessary coupling. This is a concrete case
@@ -1293,7 +1318,7 @@ impl LogSegment {
             Some(parsed_log_path) if parsed_log_path.extension == "json" => {
                 engine.json_handler().read_json_files_with_cancellation(
                     &checkpoint_file_meta,
-                    augmented_checkpoint_read_schema.clone(),
+                    read_schema.clone(),
                     meta_predicate.clone(),
                     cancellation_token.cloned(),
                 )?
@@ -1302,7 +1327,7 @@ impl LogSegment {
                 .parquet_handler()
                 .read_parquet_files_with_cancellation(
                     &checkpoint_file_meta,
-                    augmented_checkpoint_read_schema.clone(),
+                    read_schema.clone(),
                     meta_predicate.clone(),
                     cancellation_token.cloned(),
                 )?,
@@ -1326,7 +1351,7 @@ impl LogSegment {
                 .parquet_handler()
                 .read_parquet_files_with_cancellation(
                     &sidecar_files,
-                    augmented_checkpoint_read_schema.clone(),
+                    read_schema.clone(),
                     meta_predicate,
                     cancellation_token.cloned(),
                 )?
@@ -1337,14 +1362,22 @@ impl LogSegment {
         // Chain checkpoint batches with sidecar batches.
         // The boolean flag indicates whether the batch originated from a commit file
         // (true) or a checkpoint file (false).
-        let actions_iter = actions
-            .map_ok(|batch| ActionsBatch::new(batch, false))
-            .chain(sidecar_batches.map_ok(|batch| ActionsBatch::new(batch, false)));
+        let actions_iter = actions.chain(sidecar_batches).map(move |batch| {
+            let batch = batch?;
+            let batch = match &evaluator {
+                Some(evaluator) => evaluator.evaluate(batch.as_ref())?,
+                None => batch,
+            };
+            Ok(ActionsBatch::new(batch, false))
+        });
 
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed,
             has_partition_values_parsed,
-            checkpoint_read_schema: augmented_checkpoint_read_schema,
+            checkpoint_read_schema: read_transform
+                .map_or(augmented_checkpoint_read_schema, |read_transform| {
+                    read_transform.output_schema
+                }),
         };
         Ok(ActionsWithCheckpointInfo {
             actions: actions_iter,
