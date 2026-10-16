@@ -326,10 +326,12 @@ pub(crate) mod adaptive_metadata_fixtures {
     use std::iter;
 
     use super::*;
-    use crate::actions::{CheckpointAction, ContentRoot, Sidecar};
+    use crate::actions::{get_commit_schema, CheckpointAction, ContentRoot, Sidecar};
+    use crate::arrow::array::{Array as _, AsArray as _};
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::Scalar;
     use crate::path::LogRoot;
+    use crate::transaction::UpdateTableOperation;
     use crate::version_as_i64;
 
     /// The protocol and metadata of a minimal adaptiveMetadata table.
@@ -339,6 +341,26 @@ pub(crate) mod adaptive_metadata_fixtures {
         (
             table_config.protocol().clone(),
             table_config.metadata().clone(),
+        )
+    }
+
+    /// The metadata of [`adaptive_metadata_protocol_and_metadata`], partitioned by
+    /// `partition_columns`.
+    pub(crate) fn adaptive_metadata_partitioned_by(partition_columns: &[&str]) -> Metadata {
+        let (_, metadata) = adaptive_metadata_protocol_and_metadata();
+        let mut json = serde_json::to_value(metadata).unwrap();
+        json["partitionColumns"] = serde_json::json!(partition_columns);
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// Commit lines holding the protocol and metadata of an adaptiveMetadata table partitioned by
+    /// `partition_columns`.
+    pub(crate) fn protocol_and_metadata_lines(partition_columns: &[&str]) -> String {
+        let (protocol, _) = adaptive_metadata_protocol_and_metadata();
+        format!(
+            "{}\n{}",
+            serde_json::json!({ "protocol": protocol }),
+            serde_json::json!({ "metaData": adaptive_metadata_partitioned_by(partition_columns) }),
         )
     }
 
@@ -426,6 +448,141 @@ pub(crate) mod adaptive_metadata_fixtures {
             false,
         )?;
         Ok(())
+    }
+
+    // === Building adaptiveMetadata tables through transactions ===
+
+    /// Commits the protocol and metadata of an adaptiveMetadata table partitioned by
+    /// `partition_columns` as version 0 of the table at `table_root`. They are written directly
+    /// because `create_table` cannot enable `adaptiveMetadata-preview`.
+    pub(crate) fn create_adaptive_metadata_table(
+        engine: &SyncEngine,
+        table_root: &Url,
+        partition_columns: &[&str],
+    ) {
+        write_ict_commit(
+            engine,
+            table_root,
+            0,
+            &protocol_and_metadata_lines(partition_columns),
+        );
+    }
+
+    /// Writes `actions` (one JSON action per line) as the commit at `version`, after a
+    /// `commitInfo` carrying the In-Commit Timestamp adaptiveMetadata tables require.
+    pub(crate) fn write_ict_commit(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        actions: &str,
+    ) {
+        let commit_info = format!(
+            r#"{{"commitInfo":{{"inCommitTimestamp":{ts},"timestamp":{ts},"operation":"WRITE"}}}}"#,
+            ts = version + 1
+        );
+        let lines: StringArray = iter::once(commit_info.as_str())
+            .chain(actions.lines())
+            .collect::<Vec<_>>()
+            .into();
+        let data = engine
+            .json_handler()
+            .parse_json(
+                string_array_to_engine_data(lines),
+                get_commit_schema().clone(),
+            )
+            .unwrap();
+        write_commit(engine, table_root, version, data).unwrap();
+    }
+
+    /// Commits a transaction on the latest snapshot of the table at `table_root` that adds a
+    /// 1-byte file at each path of `adds` and removes each live file of `removes`, returning the
+    /// commit version.
+    pub(crate) fn commit_files(
+        engine: &SyncEngine,
+        table_root: &Url,
+        adds: &[&str],
+        removes: &[&str],
+    ) -> Version {
+        let adds = (!adds.is_empty()).then(|| {
+            let paths: ArrayRef = Arc::new(StringArray::from(adds.to_vec()));
+            let batch = replace_column(&nullable_add_files(adds.len()), "path", paths);
+            let batch = replace_column(&batch, "stats", one_record_stats(&batch));
+            Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>
+        });
+        commit_file_changes(engine, table_root, adds, removes)
+    }
+
+    /// Like [`commit_files`], but adds the files `adds` describes, a batch of the transaction's
+    /// add-file write metadata.
+    pub(crate) fn commit_file_changes(
+        engine: &SyncEngine,
+        table_root: &Url,
+        adds: Option<Box<dyn EngineData>>,
+        removes: &[&str],
+    ) -> Version {
+        let snapshot = Snapshot::builder_for(table_root.clone())
+            .build(engine)
+            .unwrap();
+        let mut txn = write_transaction(engine, snapshot.clone());
+        if let Some(adds) = adds {
+            txn.add_files(adds);
+        }
+        if !removes.is_empty() {
+            // The removed files are not rewritten, so there are no row IDs to preserve.
+            txn.ack_row_tracking_preservation();
+            let mut removed = 0;
+            let scan = snapshot.scan_builder().build().unwrap();
+            for metadata in scan.scan_metadata(engine).unwrap() {
+                let (data, selection) = metadata.unwrap().scan_files.into_parts();
+                let batch = ArrowEngineData::try_from_engine_data(data).unwrap();
+                let paths = batch
+                    .record_batch()
+                    .column_by_name("path")
+                    .unwrap()
+                    .as_string::<i32>();
+                let selection: Vec<bool> = (0..paths.len())
+                    .map(|row| {
+                        selection.get(row).copied().unwrap_or(true)
+                            && removes.contains(&paths.value(row))
+                    })
+                    .collect();
+                removed += selection.iter().filter(|selected| **selected).count();
+                txn.remove_files(FilteredEngineData::try_new(batch, selection).unwrap());
+            }
+            assert_eq!(
+                removed,
+                removes.len(),
+                "not every file in {removes:?} is live"
+            );
+        }
+        txn.commit(engine)
+            .unwrap()
+            .unwrap_committed()
+            .commit_version()
+    }
+
+    /// A `stats` column for `batch` recording one record per file, which row tracking requires.
+    fn one_record_stats(batch: &RecordBatch) -> ArrayRef {
+        let schema = batch.schema();
+        let DataType::Struct(fields) = schema.field_with_name("stats").unwrap().data_type() else {
+            panic!("add-file stats must be a struct");
+        };
+        let rows = batch.num_rows();
+        let columns = fields
+            .iter()
+            .map(|field| match field.name().as_str() {
+                "numRecords" => Arc::new(Int64Array::from(vec![1; rows])) as ArrayRef,
+                _ => new_null_array(field.data_type(), rows),
+            })
+            .collect();
+        Arc::new(StructArray::try_new(fields.clone(), columns, None).unwrap())
+    }
+
+    fn write_transaction(engine: &SyncEngine, snapshot: SnapshotRef) -> Transaction {
+        snapshot
+            .update_table(UpdateTableOperation::Write, "test", true)
+            .build(engine, Box::new(FileSystemCommitter::new()))
+            .unwrap()
     }
 }
 

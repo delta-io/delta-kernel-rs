@@ -16,6 +16,7 @@ use std::sync::LazyLock;
 
 use bytes::Bytes;
 use delta_kernel_derive::ToSchema;
+pub(crate) use reader::{read_actions_from_amt, ReadContext};
 use url::Url;
 
 use crate::engine_data::{EngineData, GetData, TypedGetData as _};

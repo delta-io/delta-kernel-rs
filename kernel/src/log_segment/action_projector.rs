@@ -13,12 +13,10 @@ use crate::{Engine, EngineData, ExpressionEvaluator, KernelError, KernelResult};
 /// action; `txn` and `domainMetadata` also from sidecar files), and each source yields batches
 /// holding only its own action. A projector fills the read schema's other top-level actions with
 /// nulls.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ActionProjector {
     evaluator: Arc<dyn ExpressionEvaluator>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ActionProjector {
     /// Builds a projector from `source`, the schema of the batches to project, onto `read_schema`.
     /// Fields of `read_schema.<action>` that `source.<action>` has are copied; every other nullable
