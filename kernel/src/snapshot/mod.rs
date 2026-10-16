@@ -1489,7 +1489,6 @@ impl Snapshot {
         if let Some(checkpoint_version) = log_segment.checkpoint_version {
             span.record("root", "checkpoint");
             if checkpoint_version == end {
-                let mut crc = self.build_crc_from_checkpoint(engine)?;
                 // A checkpoint carries no ICT or lastManifestCommit (it has no commitInfo). Since
                 // there's no tail delta to carry them either, read them from the commit at the
                 // checkpoint version. adaptiveMetadata requires ICT, so one read yields both.
@@ -1504,9 +1503,12 @@ impl Snapshot {
                         checkpoint_version,
                         last_manifest_commit.as_ref(),
                     )?;
+                    let mut crc = self.build_crc_from_checkpoint(engine)?;
                     crc.in_commit_timestamp_opt = Some(in_commit_timestamp);
+                    crc.last_manifest_commit_opt = last_manifest_commit;
                     return Ok(Arc::new(crc));
                 }
+                let mut crc = self.build_crc_from_checkpoint(engine)?;
                 crc.in_commit_timestamp_opt = self.get_in_commit_timestamp(engine)?;
                 return Ok(Arc::new(crc));
             }

@@ -1410,40 +1410,51 @@ async fn test_replay_rejects_last_manifest_commit_newer_than_newest_commit() {
     );
 }
 
-// === On-disk base CRC (exercises serde round-trip) ===
-
 // Replay misses only the file changes a replayed manifest commit records solely in its manifest
 // (`contentRootVersion == version`). A pointer at or below the base is already reflected in the
-// base, and a manifest commit with an older content root logs its own file actions. Each case lists
-// the commits after the base CRC at version 0.
+// base, and a manifest commit with an older content root logs its own file actions, which replay
+// counts. Each case lists the commits after the base CRC at version 0.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[rstest]
-#[case::pointer_at_or_below_base(vec![last_manifest_commit_info(0, 0)], true)]
-#[case::manifest_commit_logs_its_file_actions(vec![last_manifest_commit_info(1, 0)], true)]
+#[case::pointer_at_or_below_base(vec![vec![last_manifest_commit_info(0, 0)]], Some(0))]
+#[case::manifest_commit_logs_its_file_actions(
+    vec![vec![write_with_last_manifest_commit(1, 0), add("a", 100)]],
+    Some(1)
+)]
 #[case::manifest_commit_hidden_behind_newer_one(
     vec![
-        last_manifest_commit_info(1, 1),
-        last_manifest_commit_info(1, 1),
-        last_manifest_commit_info(3, 2),
+        vec![last_manifest_commit_info(1, 1)],
+        vec![last_manifest_commit_info(1, 1)],
+        vec![last_manifest_commit_info(3, 2)],
     ],
-    false
+    None
 )]
 #[tokio::test]
 async fn test_manifest_commit_file_stats(
-    #[case] commits: Vec<Value>,
-    #[case] expect_complete: bool,
+    #[case] commits: Vec<Vec<Value>>,
+    #[case] expected_num_files: Option<i64>,
 ) {
     let mut test = CrcReadTest::new().commit(0, create_table_actions());
     for (version, commit) in (1..).zip(commits) {
-        test = test.commit(version, vec![commit]);
+        test = test.commit(version, commit);
     }
     let crc = test
         .build()
         .await
         .incrementally_build_crc(&crc_complete_empty_dm_set_txn())
         .unwrap();
-    assert_eq!(crc.file_stats_state().is_complete(), expect_complete);
+    assert_eq!(crc.file_stats().map(|s| s.num_files()), expected_num_files);
 }
+
+// A WRITE commitInfo carrying `lastManifestCommit`, so replay counts the commit's file actions.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn write_with_last_manifest_commit(version: i64, content_root_version: i64) -> Value {
+    let mut commit_info = last_manifest_commit_info(version, content_root_version);
+    commit_info["commitInfo"]["operation"] = json!("WRITE");
+    commit_info
+}
+
+// === On-disk base CRC (exercises serde round-trip) ===
 
 #[tokio::test]
 async fn test_from_disk_advances_file_stats() {
