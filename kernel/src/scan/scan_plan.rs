@@ -14,7 +14,9 @@ use super::{PhysicalPredicate, Scan};
 use crate::actions::{
     ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
 };
-use crate::checkpoint::collation_stats::{normalize_collation_stats, source_collation_stats};
+use crate::checkpoint::collation_stats::{
+    build_collation_stats_read_transform, source_collation_stats,
+};
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
     col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, ExpressionRef,
@@ -150,7 +152,7 @@ impl Scan {
         let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
         let parquet_schema =
             parquet_read_schema(source_physical_stats, source_physical_partitions)?;
-        let normalization = normalize_collation_stats(
+        let read_transform = build_collation_stats_read_transform(
             &parquet_schema,
             shape
                 .leaf_checkpoint_schema
@@ -158,9 +160,11 @@ impl Scan {
                 .and_then(source_collation_stats)
                 .filter(|_| self.stats.synthesize_json),
         )?;
-        let read_schema = normalization
+        let read_schema = read_transform
             .as_ref()
-            .map_or(&parquet_schema, |normalization| &normalization.read_schema);
+            .map_or(&parquet_schema, |read_transform| {
+                &read_transform.read_schema
+            });
 
         let actions = match (&shape.checkpoint_type, checkpoint) {
             (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
@@ -191,9 +195,9 @@ impl Scan {
                 PlanBuilder::values(json_read_schema(/* include_remove */ false), vec![])
             }
         }?;
-        let actions = match normalization {
-            Some(normalization) => {
-                actions.project(normalization.expression, normalization.output_schema)?
+        let actions = match read_transform {
+            Some(read_transform) => {
+                actions.project(read_transform.expression, read_transform.output_schema)?
             }
             None => actions,
         };
