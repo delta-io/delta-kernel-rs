@@ -222,7 +222,7 @@ impl LogSegment {
         let Some((commit_version, pointer)) = candidate.last_manifest_commit.clone() else {
             return Ok(candidate);
         };
-        pointer.ensure_not_after(Version::try_from(commit_version).map_err(|_| {
+        pointer.ensure_at_or_before(Version::try_from(commit_version).map_err(|_| {
             KernelError::internal_error(format!("negative commit version {commit_version}"))
         })?)?;
         // The pointed action's P&M is at or below `pointer.version`, so it can't replace newer P&M.
