@@ -12,7 +12,7 @@ use delta_kernel::schema::{
     schema, schema_ref, ArrayType, DataType, MapType, StructField, UserDefinedType,
 };
 use delta_kernel::table_features::{assign_column_mapping_metadata, ColumnMappingMode};
-use delta_kernel::transaction::WriteState;
+use delta_kernel::transaction::{UpdateTableOperation, WriteState};
 use delta_kernel::Snapshot;
 use rstest::rstest;
 use serde_json::json;
@@ -153,7 +153,7 @@ async fn write_udt_preserves_annotation_across_metadata_and_checkpoints(
     test_read(&ArrowEngineData::new(batch), &table_root, engine.clone())?;
 
     let snapshot = snapshot
-        .alter_table()
+        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(StructField::nullable("added", DataType::LONG))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
