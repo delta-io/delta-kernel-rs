@@ -147,7 +147,7 @@ impl DeletionVectorPath {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", try_from = "DeletionVectorRaw")]
+#[serde(rename_all = "camelCase", try_from = "DeletionVectorRaw", into = "DeletionVectorRaw")]
 pub struct DeletionVectorDescriptor {
     /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'],
     /// plus 'r' when built with the `adaptive-metadata-in-dev` cargo feature.
@@ -183,7 +183,7 @@ pub struct DeletionVectorDescriptor {
     pub cardinality: i64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DeletionVectorRaw {
     storage_type: String,
@@ -204,6 +204,21 @@ impl TryFrom<DeletionVectorRaw> for DeletionVectorDescriptor {
             raw.size_in_bytes,
             raw.cardinality,
         )
+    }
+}
+
+/// Mirror of [`TryFrom<DeletionVectorRaw>`] for serialization: routing through the raw struct
+/// emits `storage_type` as its protocol string in every format, keeping serialize symmetric with
+/// deserialize rather than relying on the self-describing enum representation.
+impl From<DeletionVectorDescriptor> for DeletionVectorRaw {
+    fn from(descriptor: DeletionVectorDescriptor) -> Self {
+        Self {
+            storage_type: descriptor.storage_type.to_string(),
+            path_or_inline_dv: descriptor.path_or_inline_dv,
+            offset: descriptor.offset,
+            size_in_bytes: descriptor.size_in_bytes,
+            cardinality: descriptor.cardinality,
+        }
     }
 }
 
