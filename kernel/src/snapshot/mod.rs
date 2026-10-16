@@ -302,6 +302,23 @@ impl Snapshot {
         Ok(found)
     }
 
+    /// The AMT `checkpoint` action log replay reads as this snapshot's checkpoint: the latest
+    /// one (see [`Self::latest_checkpoint_action`]), or `None` when the table does not enable
+    /// `adaptiveMetadata-preview`, in which case the log is not searched for one.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn replay_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+    ) -> Result<Option<Arc<CheckpointAction>>> {
+        if !self
+            .table_configuration()
+            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+        {
+            return Ok(None);
+        }
+        self.latest_checkpoint_action(engine)
+    }
+
     /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`]. Takes Protocol and Metadata
     /// from the latest on-disk CRC, advanced to the segment's end version when `incremental_replay`
     /// permits, or used to root Protocol and Metadata log replay otherwise. Falls back to full log
