@@ -11,8 +11,8 @@ use crate::actions::NUM_RECORDS;
 use crate::content_tree::{
     struct_expr_from_schema, ContentTreeNodeEntry, DataContentType, DataFileFormat, TrackingInfo,
     TrackingStatus, CONTENT_TYPE, FILE_FORMAT, FILE_SEQUENCE_NUMBER, FILE_SIZE_IN_BYTES,
-    FIRST_ROW_ID, FORMAT_VERSION, LOCATION, PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER,
-    TRACKING, TRACKING_SNAPSHOT_ID, TRACKING_STATUS,
+    FIRST_ROW_ID, LOCATION, PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER, TRACKING,
+    TRACKING_SNAPSHOT_ID, TRACKING_STATUS,
 };
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{lit, ColumnName, Expression};
@@ -25,9 +25,6 @@ use crate::schema::{
 };
 use crate::transaction::augmented_write_metadata_schema;
 use crate::{Engine, KernelError, KernelResult};
-
-/// The Iceberg format version stamped onto each written entry: 4 (the V4 adaptive metadata tree).
-const AMT_FORMAT_VERSION: i32 = 4;
 
 /// Dotted path of the `stats.numRecords` leaf column, used for column selection and error messages.
 const STATS_NUM_RECORDS: &str = "stats.numRecords";
@@ -217,7 +214,6 @@ fn build_content_tree_entry_expression(
         PARTITION_SPEC_ID => Some(lit(0i32)),
         RECORD_COUNT => Some(projections.record_count.clone()),
         FILE_SIZE_IN_BYTES => Some(projections.file_size_in_bytes.clone()),
-        FORMAT_VERSION => Some(lit(AMT_FORMAT_VERSION)),
         _ => None,
     })
 }
@@ -373,7 +369,7 @@ mod tests {
             tracking: TrackingInfo {
                 status: TrackingStatus::Added,
                 snapshot_id: Some(snapshot_id),
-                dv_snapshot_id: None,
+                modified_snapshot_id: None,
                 sequence_number: Some(commit_version),
                 file_sequence_number: Some(commit_version),
                 first_row_id: Some(base_row_id),
@@ -390,8 +386,7 @@ mod tests {
             manifest_info: None,
             key_metadata: None,
             split_offsets: None,
-            equality_ids: None,
-            format_version: AMT_FORMAT_VERSION,
+            column_files: None,
             tags: None,
         }
     }
