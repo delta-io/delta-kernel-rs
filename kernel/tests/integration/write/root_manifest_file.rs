@@ -2,6 +2,7 @@
 #![cfg(feature = "adaptive-metadata-in-dev")]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
@@ -418,6 +419,64 @@ async fn test_no_checksum_after_manifest_commit(
     assert!(snapshot.get_file_stats_if_present().is_none());
     assert_result_error_with_message(snapshot.write_checksum(&engine), expected_error);
     Ok(())
+}
+
+/// `lastManifestCommit` round-trips through a CRC: a fresh snapshot reads it from the CRC at the
+/// manifest commit, the next log commit carries it forward, and that commit's checksum records it.
+/// Kernel cannot write a CRC after a manifest commit, so the one at the manifest commit is written
+/// by hand from the CRC of the commit before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_last_manifest_commit_carried_through_crc() -> Result<(), Box<dyn std::error::Error>> {
+    let (engine, _temp_dir, table_url, snapshot) =
+        setup_adaptive_metadata_table("last_manifest_commit_through_crc").await?;
+    begin_with_data_change(snapshot, &engine, true)?
+        .commit(&engine)?
+        .unwrap_post_commit_snapshot()
+        .write_checksum(&engine)?;
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let file = FileMeta {
+        location: table_url.join("metadata/root-v2.parquet")?,
+        last_modified: 0,
+        size: 1024,
+    };
+    begin_with_data_change(snapshot, &engine, true)?
+        .with_root_manifest_file(file)?
+        .commit(&engine)?
+        .unwrap_committed();
+
+    let expected_last_manifest_commit = json!({ "version": 2, "contentRootVersion": 2 });
+    let mut crc = read_crc(&table_url, 1)?;
+    crc["lastManifestCommit"] = expected_last_manifest_commit.clone();
+    crc["inCommitTimestampOpt"] = commit_info_at(&table_url, 2)?["inCommitTimestamp"].clone();
+    std::fs::write(crc_path(&table_url, 2), serde_json::to_string(&crc)?)?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    begin_with_data_change(snapshot, &engine, true)?
+        .commit(&engine)?
+        .unwrap_post_commit_snapshot()
+        .write_checksum(&engine)?;
+    assert_eq!(
+        commit_info_at(&table_url, 3)?["lastManifestCommit"],
+        expected_last_manifest_commit
+    );
+    assert_eq!(
+        read_crc(&table_url, 3)?["lastManifestCommit"],
+        expected_last_manifest_commit
+    );
+    Ok(())
+}
+
+fn crc_path(table_url: &Url, version: u64) -> PathBuf {
+    table_url
+        .to_file_path()
+        .expect("file url")
+        .join(format!("_delta_log/{version:020}.crc"))
+}
+
+fn read_crc(table_url: &Url, version: u64) -> Result<Value, Box<dyn std::error::Error>> {
+    Ok(serde_json::from_str(&std::fs::read_to_string(crc_path(
+        table_url, version,
+    ))?)?)
 }
 
 #[tokio::test]
