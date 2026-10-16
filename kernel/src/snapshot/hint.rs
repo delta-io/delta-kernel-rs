@@ -424,13 +424,14 @@ mod tests {
     use super::*;
     use crate::cancellation::CancellationTokenRef;
     use crate::engine::sync::SyncEngine;
-    use crate::metrics::{MetricEvent, SnapshotLoadType};
+    use crate::metrics::{MeteredDeltaEngine, MetricEvent, SnapshotLoadType};
     use crate::schema::schema_ref;
     use crate::snapshot::builder::tests::catalog_managed_tests::{
         create_log_path as create_catalog_log_path, setup_catalog_managed_test,
     };
     use crate::snapshot::builder::tests::{create_table, measuring_reporter, setup_test};
     use crate::snapshot::{FromTableRoot, SnapshotBuilder};
+    use crate::table_features::TableFeature;
     use crate::unit_test_utils::{
         create_log_path, create_log_path_with_size, TestCancellationToken,
     };
@@ -1505,19 +1506,74 @@ mod tests {
         Ok(())
     }
 
-    #[test_log::test(tokio::test)]
-    async fn snapshot_hint_accepts_staged_commit_with_catalog_version(
+    #[rstest::rstest]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn snapshot_hint_accepts_staged_commit_with_catalog_version_without_io(
+        #[values(false, true)] downgrade: bool,
+        #[values(false, true)] published: bool,
+        #[values(false, true)] checkpointed: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_catalog_managed_test().await;
-        let actions = actions_to_string(vec![TestAction::Add("file_1.parquet".to_string())]);
-        let staged_path = add_staged_commit(&table_root, store.as_ref(), 1, actions).await?;
+        let engine = Arc::new(MeteredDeltaEngine::new(engine));
+        if checkpointed {
+            SnapshotBuilder::new_for(&table_root)
+                .with_max_catalog_version(0)
+                .build(engine.as_ref())?
+                .checkpoint(engine.as_ref(), None)?;
+        }
+        let actions = if downgrade {
+            serde_json::json!({
+                "protocol": Protocol::try_new_modern(
+                    std::iter::empty::<TableFeature>(),
+                    [TableFeature::InCommitTimestamp],
+                )?
+            })
+            .to_string()
+        } else {
+            actions_to_string(vec![TestAction::Add("file_1.parquet".to_string())])
+        };
+        let staged_path =
+            add_staged_commit(&table_root, store.as_ref(), 1, actions.clone()).await?;
+        if published {
+            add_commit(&table_root, store.as_ref(), 1, actions).await?;
+        }
         let source = SnapshotBuilder::new_for(&table_root)
             .with_log_tail(vec![create_catalog_log_path(&table_root, staged_path)])
             .with_max_catalog_version(1)
             .build(engine.as_ref())?;
+        let (reporter, _guard) = measuring_reporter();
         let hint = source.to_snapshot_hint()?;
         assert_eq!(hint.log_segment_files, source.log_segment().listed);
 
+        assert_result_error_with_message(
+            SnapshotBuilder::new_for(&table_root)
+                .with_snapshot_hint(hint.clone())
+                .build(engine.as_ref()),
+            "Max catalog version is required",
+        );
+        for max_catalog_version in [0, 2] {
+            assert_hint_error(
+                SnapshotBuilder::new_for(&table_root)
+                    .with_max_catalog_version(max_catalog_version),
+                hint.clone(),
+                engine.as_ref(),
+                &format!(
+                    "Max catalog version {max_catalog_version} does not match snapshot hint version 1"
+                ),
+            );
+        }
+        let mut historical_hint = hint.clone();
+        historical_hint.freshness = SnapshotHintFreshness::Unverified;
+        let historical = SnapshotBuilder::new_for(&table_root)
+            .at_version(1)
+            .with_max_catalog_version(2)
+            .with_snapshot_hint(historical_hint)
+            .build(engine.as_ref());
+        if downgrade {
+            assert!(matches!(historical, Err(KernelError::MaxCatalogVersion(_))));
+        } else {
+            assert_eq!(historical?.version(), 1);
+        }
         let hinted = SnapshotBuilder::new_for(table_root)
             .with_max_catalog_version(1)
             .with_snapshot_hint(hint)
@@ -1525,7 +1581,18 @@ mod tests {
 
         assert_eq!(hinted.version(), 1);
         assert!(hinted.is_built_as_latest());
+        assert_eq!(
+            hinted.table_configuration().is_catalog_managed(),
+            !downgrade
+        );
         assert_eq!(hinted.log_segment().listed, source.log_segment().listed);
+        assert!(!reporter.events().iter().any(|event| matches!(
+            event,
+            MetricEvent::StorageListCompleted(_)
+                | MetricEvent::StorageReadCompleted(_)
+                | MetricEvent::JsonReadCompleted(_)
+                | MetricEvent::ParquetReadCompleted(_)
+        )));
         Ok(())
     }
 }
