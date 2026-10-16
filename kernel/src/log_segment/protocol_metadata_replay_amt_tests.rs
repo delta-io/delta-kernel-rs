@@ -7,6 +7,7 @@ use rstest::rstest;
 #[cfg(feature = "declarative-plans")]
 use test_utils::compacted_log_path_for_versions;
 use test_utils::{add_commit, assert_result_error_with_message, delta_path_for_version};
+use url::Url;
 
 use super::{CheckpointActionResolution, LastManifestCommitResolution, LogSegment};
 use crate::actions::LastManifestCommit;
@@ -120,6 +121,13 @@ async fn manifest_commit_table(later_commits: &[String]) -> (Arc<InMemory>, url:
         .unwrap();
     }
     (store, table_root)
+}
+
+// Lists the log segment for the latest version of the table at `table_root`.
+fn latest_log_segment(table_root: &Url, engine: &impl Engine) -> LogSegment {
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let storage = engine.storage_handler();
+    LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None).unwrap()
 }
 
 // Removes SyncEngine's plan executor so replay uses the non-plan path even when
@@ -371,11 +379,7 @@ async fn latest_checkpoint_action_scans_when_resolution_unknown() {
     .unwrap();
 
     let engine = non_plan_engine(store);
-    let storage = engine.storage_handler();
-    let log_root = table_root.join("_delta_log/").unwrap();
-    let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
-            .unwrap();
+    let log_segment = latest_log_segment(&table_root, &engine);
     let table_configuration = adaptive_metadata_table_configuration(one_column_schema(), &[]);
     let snapshot = Snapshot::new(log_segment, table_configuration).unwrap();
 
@@ -446,11 +450,7 @@ async fn assert_replay_resolution<E: Engine>(
     }
 
     let engine = make_engine(store);
-    let storage = engine.storage_handler();
-    let log_root = table_root.join("_delta_log/").unwrap();
-    let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
-            .unwrap();
+    let log_segment = latest_log_segment(&table_root, &engine);
 
     let resolution = log_segment
         .read_protocol_metadata_opt(&engine, None)
@@ -668,12 +668,7 @@ async fn find_last_checkpoint_action_errors_when_manifest_commit_is_not_listed(
     }
 
     let engine = non_plan_engine(store);
-    let storage = engine.storage_handler();
-    let log_root = table_root.join("_delta_log/").unwrap();
-    let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
-            .unwrap()
-            .segment_after_version(0);
+    let log_segment = latest_log_segment(&table_root, &engine).segment_after_version(0);
 
     let pointer = LastManifestCommit::new(pointer_version, pointer_version).unwrap();
     let result = log_segment.find_last_checkpoint_action(&engine, Some(&pointer));
@@ -766,11 +761,7 @@ async fn assert_replay_last_manifest_commit<E: Engine>(
 ) {
     let (store, table_root) = manifest_commit_table(later_commits).await;
     let engine = make_engine(store);
-    let storage = engine.storage_handler();
-    let log_root = table_root.join("_delta_log/").unwrap();
-    let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
-            .unwrap();
+    let log_segment = latest_log_segment(&table_root, &engine);
 
     let resolution = log_segment
         .read_protocol_metadata_opt(&engine, None)
@@ -801,11 +792,7 @@ async fn plan_replay_reads_pointer_from_newest_commit_covered_by_compaction() {
     store.put(&compaction, txn.into()).await.unwrap();
 
     let engine = SyncEngine::new_with_store(store);
-    let storage = engine.storage_handler();
-    let log_root = table_root.join("_delta_log/").unwrap();
-    let mut log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
-            .unwrap();
+    let mut log_segment = latest_log_segment(&table_root, &engine);
     let compaction_location = table_root.join(compaction.as_ref()).unwrap();
     let compaction = ParsedLogPath::try_from(FileMeta::new(compaction_location, 0, 100))
         .unwrap()
@@ -850,11 +837,7 @@ async fn replayed_snapshot_serves_last_manifest_commit_without_reading_the_log()
 async fn unresolved_snapshot_reads_last_manifest_commit_from_commit_file_once() {
     let (store, table_root) = manifest_commit_table(&[commit_info(Some((0, 0)))]).await;
     let engine = non_plan_engine(store.clone());
-    let storage = engine.storage_handler();
-    let log_root = table_root.join("_delta_log/").unwrap();
-    let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
-            .unwrap();
+    let log_segment = latest_log_segment(&table_root, &engine);
     let table_configuration = adaptive_metadata_table_configuration(one_column_schema(), &[]);
     let snapshot = Snapshot::new(log_segment, table_configuration).unwrap();
     let expected = Some(LastManifestCommit::new(0, 0).unwrap());
