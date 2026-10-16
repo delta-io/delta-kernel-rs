@@ -223,6 +223,97 @@ mod tests {
         assert!(result.next().is_none());
     }
 
+    /// The Parquet `FILE` type lets a group define only the fields it uses. Reading such a file as
+    /// the canonical six-field `file` fills the fields the group omits with null.
+    #[test]
+    fn test_read_file_column_with_partial_group() {
+        use crate::arrow::array::StructArray;
+        use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
+        use crate::schema::{DataType, StructField};
+
+        // A group that defines only `uri` and `size`: an external whole-or-ranged reference.
+        let group = StructArray::from(vec![
+            (
+                Arc::new(Field::new("uri", ArrowDataType::Utf8, true)),
+                Arc::new(StringArray::from(vec![Some("s3://b/a.png"), None])) as Arc<dyn Array>,
+            ),
+            (
+                Arc::new(Field::new("size", ArrowDataType::Int64, true)),
+                Arc::new(Int64Array::from(vec![Some(10), None])) as Arc<dyn Array>,
+            ),
+        ]);
+        let batch =
+            RecordBatch::try_from_iter(vec![("f", Arc::new(group) as Arc<dyn Array>)]).unwrap();
+
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("partial_group.parquet");
+        let mut writer =
+            ArrowWriter::try_new(File::create(&file_path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let file_meta = FileMeta {
+            location: Url::from_file_path(&file_path).unwrap(),
+            last_modified: 0,
+            size: std::fs::metadata(&file_path).unwrap().len(),
+        };
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "f",
+            DataType::file_type(),
+        )]));
+
+        let mut result = SyncParquetHandler::new(None)
+            .read_parquet_files(&[file_meta], schema, None)
+            .unwrap();
+        let engine_data = result.next().unwrap().unwrap();
+        let batch = ArrowEngineData::try_from_engine_data(engine_data).unwrap();
+        let record_batch = batch.record_batch();
+
+        let f = record_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let names: Vec<_> = f
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "uri",
+                "offset",
+                "size",
+                "content_type",
+                "checksum",
+                "inline"
+            ]
+        );
+        let uri = f
+            .column_by_name("uri")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(uri.value(0), "s3://b/a.png");
+        assert!(uri.is_null(1));
+        let size = f
+            .column_by_name("size")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(size.value(0), 10);
+        for omitted in ["offset", "content_type", "checksum", "inline"] {
+            assert_eq!(
+                f.column_by_name(omitted).unwrap().null_count(),
+                2,
+                "omitted field {omitted} must read as null"
+            );
+        }
+    }
+
     #[test]
     fn test_sync_write_parquet_file_multiple_batches() {
         let handler = SyncParquetHandler::new(None);

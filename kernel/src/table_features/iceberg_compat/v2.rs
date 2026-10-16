@@ -136,6 +136,13 @@ mod tests {
         assert!(!is_v2_supported_type(&DataType::VOID));
     }
 
+    #[test]
+    fn is_v2_supported_type_rejects_file() {
+        // Iceberg has no equivalent of the `file` type in released versions, so it is not on the
+        // V2 allowlist.
+        assert!(!is_v2_supported_type(&DataType::file_type()));
+    }
+
     fn table_config_with_schema_and_features(
         schema: StructType,
         features: impl IntoIterator<Item = TableFeature>,

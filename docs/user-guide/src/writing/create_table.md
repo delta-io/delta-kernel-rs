@@ -353,8 +353,18 @@ Features enabled when specific column types or annotations appear in the schema.
 | Trigger | Reader/Writer feature | Writer feature | Properties set |
 |---------|-----------------------|----------------|----------------|
 | `VARIANT` type in schema | `variantType` | — | — |
+| `FILE` type in schema | `fileType-preview` | — | — |
 | `TIMESTAMP_NTZ` type in schema | `timestampNtz` | — | — |
 | Any field with `nullable: false` in schema | — | `invariants` | — |
+
+> [!NOTE]
+> Support for the `FILE` type is a preview. Kernel creates the table and carries a `FILE` column
+> as the struct of its six fields, but it does not yet write the Parquet `FILE` logical-type
+> annotation, does not yet write the Parquet `field_id` of the sub-fields under column mapping,
+> does not collect statistics for the column, and does not resolve the bytes a value refers to.
+> Data files that Kernel writes to such a table are therefore not yet fully conforming to the
+> `FILE` protocol proposal. Do not rely on them from engines that require the annotation or the
+> field ids.
 
 ### Feature-signal only
 

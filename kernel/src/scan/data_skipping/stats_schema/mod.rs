@@ -342,6 +342,14 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
     fn transform_variant(&mut self, vtype: &'a StructType) -> Option<Cow<'a, StructType>> {
         self.include_leaf().then_some(Cow::Borrowed(vtype))
     }
+
+    /// A `file` column is excluded from statistics for now. Its statistics are per-leaf (null
+    /// counts on all six fields, min/max on four), which is not implemented yet, and the stats
+    /// shape must not be fixed before it is. Omitting statistics for a column is always valid.
+    /// The inner fields are protocol-defined, not user columns, so they are not recursed into.
+    fn transform_file(&mut self, _stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+        None
+    }
 }
 
 // removes all fields with non eligible data types
@@ -896,6 +904,39 @@ mod tests {
                     nullable "v": unshredded_variant(),
                 },
             ),
+        );
+    }
+
+    /// A `file` column has no statistics yet, and must not use up a slot of the indexed-column
+    /// limit, so the columns around it keep theirs.
+    #[test]
+    fn test_stats_schema_excludes_file_columns() {
+        let properties: TableProperties = [(
+            "delta.dataSkippingNumIndexedCols".to_string(),
+            "2".to_string(),
+        )]
+        .into();
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("f", DataType::file_type()),
+            StructField::nullable("name", DataType::STRING),
+        ]);
+
+        let stats_schema = expected_stats_schema(
+            &file_schema,
+            &stats_config_from_table_properties(&properties),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // With a limit of 2, both `id` and `name` get statistics; `f` takes no slot and has none.
+        assert_eq!(
+            stats_schema,
+            expected_stats(
+                schema! { nullable "id": LONG, nullable "name": LONG },
+                schema! { nullable "id": LONG, nullable "name": STRING },
+            )
         );
     }
 
