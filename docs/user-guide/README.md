@@ -1,7 +1,14 @@
 # delta kernel mdbook
 
-This book serves as a user guide + developer guide + overall docs for the kernel. In addition to our
-docs.rs and top-level README, the three provide comprehensive documentation for the project.
+This book teaches connector workflows and explains how Kernel APIs fit together. Exact public API
+contracts live in [rustdoc], while repository workflows and conventions live in the agent docs.
+
+## Maintenance
+
+Update a guide page in the same PR as a user-visible change to the workflow it teaches, including
+fixing examples affected by API changes. Release-time audits catch omissions; they do not replace
+change-time maintenance. Update `LAST_VALIDATED.md` only after auditing all changes since its
+recorded commit.
 
 ## prerequisites
 
@@ -17,3 +24,4 @@ mdbook serve # from docs/user-guide to serve the book on localhost:3000
 ```
 
 [`mdbook`]: https://github.com/rust-lang/mdBook
+[rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/
