@@ -727,10 +727,13 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// configuration.
     ///
     /// Returns an error if the table has an empty or unsupported schema, or if the table declares
-    /// column defaults that the connector has not acknowledged.
+    /// column defaults that the connector has not acknowledged, or if the table has Concurrent
+    /// Identity Columns (writing data to them is not yet supported).
     pub fn write_state(&self) -> Result<Arc<WriteState>> {
         self.ensure_schema_non_empty_for_write_state()?;
         self.ensure_column_defaults_acknowledged()?;
+        #[cfg(feature = "concurrent-identity-columns-in-dev")]
+        self.ensure_no_concurrent_identity_columns()?;
         self.validate_for_data_write()?;
         // The effective table configuration can change while building a transaction, so this
         // state must be derived on demand rather than cached on the transaction. TODO(#3149):
@@ -1046,6 +1049,19 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             KernelError::invalid_transaction_state(
                 "Writing data to a table with column defaults requires calling \
                  Transaction::ack_column_defaults() first",
+            )
+        );
+        Ok(())
+    }
+
+    /// Rejects write-state creation when the table has Concurrent Identity Columns.
+    // TODO(#3586): surface the CIC columns to the connector instead of rejecting.
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    fn ensure_no_concurrent_identity_columns(&self) -> KernelResult<()> {
+        require!(
+            !self.effective_table_config.has_concurrent_identity_column(),
+            KernelError::unsupported(
+                "Writing data to a table with Concurrent Identity Columns is not yet supported",
             )
         );
         Ok(())
@@ -2130,7 +2146,7 @@ mod tests {
     use crate::object_store::ObjectStoreExt as _;
     use crate::scan::log_replay::PATH_NAME;
     use crate::scan::state_info::tests::RowTrackingState;
-    use crate::schema::{schema, schema_ref, MapType};
+    use crate::schema::{concurrent_identity_column, schema, schema_ref, MapType};
     use crate::table_features::{ColumnMappingMode, TableFeature};
     use crate::table_properties::{APPEND_ONLY, ENABLE_CHANGE_DATA_FEED, ENABLE_ROW_TRACKING};
     use crate::transaction::create_table::create_table;
@@ -2800,7 +2816,7 @@ mod tests {
         /// Like [`txn_with_schema`] but with an explicit writer-feature list, so a test can
         /// exercise a table that does *not* enable `allowColumnDefaults`. Panics if the table
         /// configuration fails to construct; use [`try_table_config`] to assert that error.
-        fn txn_with_schema_and_writer_features(
+        pub(super) fn txn_with_schema_and_writer_features(
             schema: StructType,
             writer_features: impl IntoIterator<Item = TableFeature>,
         ) -> Transaction {
@@ -2912,6 +2928,39 @@ mod tests {
             let txn = txn_with_schema_and_writer_features(schema, []);
             assert!(txn.top_level_column_defaults().unwrap().is_empty());
         }
+    }
+
+    // CREATE does not enable `concurrentIdentityColumns`, so a `sequenceId` is orphaned.
+    #[test]
+    fn create_table_rejects_concurrent_identity_columns() {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let schema =
+            StructType::try_new([concurrent_identity_column("id", "seq-abc", 1, 1, false)]);
+        let result = create_table("memory:///", Arc::new(schema.unwrap()), "test-engine")
+            .with_table_properties([
+                ("io.unitycatalog.tableId", "cic-test"),
+                ("delta.feature.catalogManaged", "supported"),
+            ])
+            .build(&engine, Box::new(MockCatalogCommitter));
+        assert_result_error_with_message(
+            result,
+            "does not support the 'concurrentIdentityColumns' feature",
+        );
+    }
+
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    #[test]
+    fn write_state_rejects_concurrent_identity_columns() {
+        let schema =
+            StructType::try_new([concurrent_identity_column("id", "seq-abc", 1, 1, false)]);
+        let txn = column_defaults::txn_with_schema_and_writer_features(
+            schema.unwrap(),
+            [
+                TableFeature::IdentityColumns,
+                TableFeature::ConcurrentIdentityColumns,
+            ],
+        );
+        assert_result_error_with_message(txn.write_state(), "not yet supported");
     }
 
     #[test]
