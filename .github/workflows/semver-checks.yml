@@ -20,6 +20,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  SEMVER_CHECKS_VERSION: "0.50.0"
+  # Share dependency builds between both revisions and crates. The conventional target layout
+  # also lets rust-cache retain dependencies while removing workspace and rustdoc outputs.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target/semver-cache
 
 jobs:
   check_if_pr_breaks_semver:
@@ -34,20 +38,27 @@ jobs:
             ${{ github.event_name == 'merge_group'
                 && github.event.merge_group.head_sha
                 || github.event.pull_request.head.sha }}
-      - name: Install minimal stable
+      # Keep the toolchain, checker, cache inputs, and Cargo/Rust environment in sync with
+      # semver-cache.yml so PRs and merge queues can restore the cache populated on main.
+      - name: Install Rust for semver checks
         uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
+          # rustdoc's JSON format is unstable; cargo-semver-checks must support this compiler.
+          # Validate the pair when updating either version.
+          toolchain: "1.99.0"
       # See build.yml top-level comment for why save-if is restricted to main and why
       # cache-bin is disabled.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          workspaces: ". -> target/semver-cache"
+          shared-key: semver-checks-${{ env.SEMVER_CHECKS_VERSION }}
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Install cargo-semver-checks
         uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
         with:
-          tool: cargo-semver-checks@0.50.0
+          tool: cargo-semver-checks@${{ env.SEMVER_CHECKS_VERSION }}
       - name: Compute baseline revision
         id: baseline
         shell: bash
