@@ -3,6 +3,8 @@
 //!
 //! [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
 
+use std::borrow::Cow;
+
 use url::{ParseError, Url};
 
 use crate::path_encoding::uri_encode_path;
@@ -34,6 +36,22 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult
             })
         }
         None => encode_and_join(path, table_root),
+    }
+}
+
+/// Converts a raw AMT data-file `location` into the RFC 2396 form `add.path` uses: the path
+/// component is percent-encoded as in [`resolve_amt_location`], while a scheme and authority are
+/// kept as-is, and a relative location stays relative. Returns [`Cow::Borrowed`] when nothing
+/// needs encoding.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn amt_location_to_add_path(location: &str) -> Cow<'_, str> {
+    let (prefix, raw_path) = match scheme_len(location) {
+        Some(scheme_len) => split_authority(location, scheme_len),
+        None => ("", location),
+    };
+    match uri_encode_path(raw_path) {
+        Cow::Borrowed(_) => Cow::Borrowed(location),
+        Cow::Owned(encoded) => Cow::Owned(format!("{prefix}{encoded}")),
     }
 }
 
@@ -171,6 +189,24 @@ mod tests {
     use test_utils::assert_result_error_with_message;
 
     use super::*;
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::plain_relative("data/a.parquet", "data/a.parquet", false)]
+    #[case::spaced_relative("data/a b.parquet", "data/a%20b.parquet", true)]
+    #[case::percent_relative("data/a%b.parquet", "data/a%25b.parquet", true)]
+    #[case::non_ascii_relative("data/M\u{fc}nchen.parquet", "data/M%C3%BCnchen.parquet", true)]
+    #[case::plain_absolute("s3://bucket/t/a.parquet", "s3://bucket/t/a.parquet", false)]
+    #[case::spaced_absolute("s3://bucket/t/a b.parquet", "s3://bucket/t/a%20b.parquet", true)]
+    fn test_amt_location_to_add_path(
+        #[case] location: &str,
+        #[case] expected: &str,
+        #[case] encoded: bool,
+    ) {
+        let path = amt_location_to_add_path(location);
+        assert_eq!(path, expected);
+        assert_eq!(matches!(path, Cow::Owned(_)), encoded);
+    }
 
     #[rstest]
     #[case::relative_path(

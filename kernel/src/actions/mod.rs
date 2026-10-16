@@ -1417,6 +1417,10 @@ pub(crate) struct ContentRoot {
     /// version). Distinct from [`CheckpointAction::version`], which is
     /// `checkpointMetadata.version`.
     version: i64,
+    /// When the root manifest was committed, in milliseconds since the Unix epoch: the In-Commit
+    /// Timestamp of the commit that wrote it. Optional, so readers must accept roots without it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamp: Option<i64>,
 }
 
 /// Identifies the latest manifest commit up to a given table version.
@@ -1729,7 +1733,18 @@ impl ContentRoot {
             path,
             size_in_bytes,
             version,
+            timestamp: None,
         }
+    }
+
+    /// Sets when the root manifest was committed, in milliseconds since the Unix epoch.
+    pub(crate) fn with_timestamp(self, timestamp: Option<i64>) -> Self {
+        ContentRoot { timestamp, ..self }
+    }
+
+    /// When the root manifest was committed, in milliseconds since the Unix epoch, if recorded.
+    pub(crate) fn timestamp(&self) -> Option<i64> {
+        self.timestamp
     }
 }
 
@@ -1892,11 +1907,12 @@ impl CheckpointAction {
     #[internal_api]
     pub(crate) fn root_filemeta(&self, table_root: &Url) -> Result<FileMeta> {
         let content_root = &self.content_root;
-        Ok(FileMeta {
-            location: resolve_amt_location(&content_root.path, table_root)?,
-            last_modified: i64::MAX,
-            size: to_file_size(content_root.size_in_bytes, "checkpoint contentRoot")?,
-        })
+        amt_manifest_filemeta(
+            &content_root.path,
+            content_root.size_in_bytes,
+            table_root,
+            "checkpoint contentRoot",
+        )
     }
 
     /// The table protocol embedded in this checkpoint action (at [`Self::version`]).
@@ -1938,6 +1954,27 @@ pub(crate) struct Sidecar {
     /// A map containing any additional metadata about the logical file. Values can be null.
     #[allow_null_container_values]
     pub tags: Option<HashMap<String, String>>,
+}
+
+/// Builds the [`FileMeta`] of an AMT manifest file referenced by `path` (absolute, or relative to
+/// `table_root`) with `size_in_bytes`. AMT references carry no modification time, so
+/// `last_modified` is `i64::MAX`.
+///
+/// # Errors
+/// Returns an error if `path` cannot be resolved (see [`resolve_amt_location`]), or if
+/// `size_in_bytes` is negative (the error names `context`).
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn amt_manifest_filemeta(
+    path: &str,
+    size_in_bytes: i64,
+    table_root: &Url,
+    context: &str,
+) -> KernelResult<FileMeta> {
+    Ok(FileMeta {
+        location: resolve_amt_location(path, table_root)?,
+        last_modified: i64::MAX,
+        size: to_file_size(size_in_bytes, context)?,
+    })
 }
 
 /// Convert an `i64` byte count from a log action into a [`FileSize`], erroring with `context` (a
@@ -3249,6 +3286,7 @@ mod tests {
                 path: path.to_string(),
                 size_in_bytes,
                 version: 1,
+                timestamp: None,
             },
             protocol: Protocol::new_unchecked(1, 2, None, None),
             metadata: Metadata::default(),
@@ -3284,6 +3322,7 @@ mod tests {
                 path: "s3://bucket/manifest".to_string(),
                 size_in_bytes: 1024,
                 version: 40,
+                timestamp: Some(1_700_000_000_000),
             },
             protocol: Protocol::new_unchecked(1, 2, None, None),
             metadata: Metadata::default(),
@@ -3351,7 +3390,7 @@ mod tests {
             json,
             json!({ "checkpoint": [
                 { "checkpointMetadata": { "version": 42 } },
-                { "contentRoot": { "path": "s3://bucket/manifest", "sizeInBytes": 1024, "version": 40 } },
+                { "contentRoot": { "path": "s3://bucket/manifest", "sizeInBytes": 1024, "version": 40, "timestamp": 1_700_000_000_000_i64 } },
                 { "protocol": { "minReaderVersion": 1, "minWriterVersion": 2 } },
                 { "metaData": {
                     "id": "",
@@ -3396,6 +3435,7 @@ mod tests {
                 path: "s3://bucket/manifest".to_string(),
                 size_in_bytes: 8,
                 version: 8,
+                timestamp: None,
             },
             protocol: Protocol::new_unchecked(1, 2, None, None),
             metadata: Metadata::default(),
