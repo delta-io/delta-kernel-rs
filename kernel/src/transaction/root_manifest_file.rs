@@ -35,12 +35,16 @@ impl RootManifestFile {
     /// the table's protocol and metadata plus every active domain metadata and set transaction
     /// (this transaction's `dm_changes` and `set_transactions` merged in, newest wins).
     ///
+    /// `in_commit_timestamp` is the committing transaction's In-Commit Timestamp, recorded as the
+    /// content root's timestamp.
+    ///
     /// Errors if an existing checkpoint does not already cover the read snapshot's version, meaning
     /// delta log commits are still pending replay since it.
     pub(super) fn compute_checkpoint_action(
         &self,
         engine: &dyn Engine,
         commit_version: Version,
+        in_commit_timestamp: Option<i64>,
         table_config: &TableConfiguration,
         dm_changes: &[DomainMetadata],
         set_transactions: &[SetTransaction],
@@ -83,7 +87,8 @@ impl RootManifestFile {
         let version = version_as_i64(commit_version)?;
         let size = i64::try_from(self.file.size)
             .map_err(|_| KernelError::generic("root manifest file size exceeds i64::MAX"))?;
-        let content_root = ContentRoot::new(self.file.location.to_string(), size, version);
+        let content_root = ContentRoot::new(self.file.location.to_string(), size, version)
+            .with_timestamp(in_commit_timestamp);
 
         Ok(CheckpointAction::new(
             version,
@@ -225,6 +230,7 @@ mod tests {
         let checkpoint = manifest.compute_checkpoint_action(
             &engine,
             1,
+            None,
             snapshot.table_configuration(),
             &dm_changes,
             &set_transactions,
@@ -264,6 +270,7 @@ mod tests {
         let checkpoint = manifest.compute_checkpoint_action(
             &engine,
             2,
+            None,
             snapshot.table_configuration(),
             &[],
             &[],
@@ -297,6 +304,7 @@ mod tests {
         let result = manifest.compute_checkpoint_action(
             &engine,
             3,
+            None,
             snapshot.table_configuration(),
             &[],
             &[],
@@ -325,7 +333,8 @@ mod tests {
             )])
             .build();
 
-        let checkpoint = manifest.compute_checkpoint_action(&engine, 2, &table_config, &[], &[])?;
+        let checkpoint =
+            manifest.compute_checkpoint_action(&engine, 2, None, &table_config, &[], &[])?;
         assert!(checkpoint.transactions.is_empty());
         Ok(())
     }
@@ -363,6 +372,7 @@ mod tests {
         let checkpoint = manifest.compute_checkpoint_action(
             &engine,
             3,
+            None,
             snapshot.table_configuration(),
             std::slice::from_ref(&new_domain_metadata),
             std::slice::from_ref(&new_transaction),
@@ -465,6 +475,7 @@ mod tests {
         let checkpoint = manifest.compute_checkpoint_action(
             &engine,
             4,
+            None,
             snapshot.table_configuration(),
             &[],
             &[],
@@ -509,6 +520,7 @@ mod tests {
         let result = manifest.compute_checkpoint_action(
             &engine,
             2,
+            None,
             snapshot.table_configuration(),
             &[],
             &[],
@@ -626,6 +638,7 @@ mod tests {
         let checkpoint = manifest.compute_checkpoint_action(
             &engine,
             2,
+            None,
             snapshot.table_configuration(),
             &dm_changes,
             &[],
