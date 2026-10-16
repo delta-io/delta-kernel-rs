@@ -92,6 +92,12 @@ async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_actio
         .expect("contentRoot entry");
     assert_eq!(content_root["path"], json!(file.location.to_string()));
     assert_eq!(content_root["sizeInBytes"], json!(1024));
+    let commit_info = read_actions_from_commit(&table_url, 1, "commitInfo")?;
+    assert_eq!(
+        content_root["timestamp"],
+        commit_info[0]["inCommitTimestamp"]
+    );
+    assert!(content_root["timestamp"].is_i64());
 
     let protocol = entries
         .iter()
