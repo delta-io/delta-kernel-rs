@@ -1892,11 +1892,12 @@ impl CheckpointAction {
     #[internal_api]
     pub(crate) fn root_filemeta(&self, table_root: &Url) -> Result<FileMeta> {
         let content_root = &self.content_root;
-        Ok(FileMeta {
-            location: resolve_amt_location(&content_root.path, table_root)?,
-            last_modified: i64::MAX,
-            size: to_file_size(content_root.size_in_bytes, "checkpoint contentRoot")?,
-        })
+        amt_manifest_filemeta(
+            &content_root.path,
+            content_root.size_in_bytes,
+            table_root,
+            "checkpoint contentRoot",
+        )
     }
 
     /// The table protocol embedded in this checkpoint action (at [`Self::version`]).
@@ -1938,6 +1939,27 @@ pub(crate) struct Sidecar {
     /// A map containing any additional metadata about the logical file. Values can be null.
     #[allow_null_container_values]
     pub tags: Option<HashMap<String, String>>,
+}
+
+/// Builds the [`FileMeta`] of an AMT manifest file referenced by `path` (absolute, or relative to
+/// `table_root`) with `size_in_bytes`. AMT references carry no modification time, so
+/// `last_modified` is `i64::MAX`.
+///
+/// # Errors
+/// Returns an error if `path` cannot be resolved (see [`resolve_amt_location`]), or if
+/// `size_in_bytes` is negative (the error names `context`).
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn amt_manifest_filemeta(
+    path: &str,
+    size_in_bytes: i64,
+    table_root: &Url,
+    context: &str,
+) -> KernelResult<FileMeta> {
+    Ok(FileMeta {
+        location: resolve_amt_location(path, table_root)?,
+        last_modified: i64::MAX,
+        size: to_file_size(size_in_bytes, context)?,
+    })
 }
 
 /// Convert an `i64` byte count from a log action into a [`FileSize`], erroring with `context` (a
