@@ -269,6 +269,65 @@ fn combine_checkpoint_predicates(
     }
 }
 
+/// Whether a checkpoint read must add JSON `add.stats`, because structured stats cannot satisfy
+/// the scan's `stats_schema` and `action_schema` does not already read them.
+fn needs_json_stats_fallback(
+    action_schema: &StructType,
+    stats_schema: Option<&StructType>,
+    has_stats_parsed: bool,
+) -> bool {
+    stats_schema.is_some()
+        && !has_stats_parsed
+        && action_schema.field("add").is_some_and(|field| {
+            let DataType::Struct(add) = field.data_type() else {
+                return false;
+            };
+            add.field("stats").is_none()
+        })
+}
+
+/// Returns `action_schema` with `add_fields` appended to its `add` struct (when it has one) and,
+/// when `with_sidecar`, a top-level sidecar column for V2 checkpoints.
+fn augment_checkpoint_read_schema(
+    action_schema: &SchemaRef,
+    add_fields: Vec<StructField>,
+    with_sidecar: bool,
+) -> KernelResult<SchemaRef> {
+    if add_fields.is_empty() && !with_sidecar {
+        return Ok(action_schema.clone());
+    }
+    let mut new_fields: Vec<StructField> = match action_schema.field("add") {
+        Some(add_field) if !add_fields.is_empty() => {
+            let DataType::Struct(add_struct) = add_field.data_type() else {
+                return Err(KernelError::internal_error(
+                    "add field in action schema must be a struct",
+                ));
+            };
+            let add = StructField::new(
+                add_field.name(),
+                StructType::new_unchecked(add_struct.fields().cloned().chain(add_fields)),
+                add_field.is_nullable(),
+            )
+            .with_metadata(add_field.metadata.clone());
+            action_schema
+                .fields()
+                .map(|f| {
+                    if f.name() == "add" {
+                        add.clone()
+                    } else {
+                        f.clone()
+                    }
+                })
+                .collect()
+        }
+        _ => action_schema.fields().cloned().collect(),
+    };
+    if with_sidecar {
+        new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
+    }
+    Ok(Arc::new(StructType::new_unchecked(new_fields)))
+}
+
 impl LogSegment {
     /// Returns selected replay commit file statistics, failing if the byte sum overflows.
     pub(crate) fn stats(&self) -> KernelResult<LogSegmentStats> {
@@ -971,12 +1030,7 @@ impl LogSegment {
         engine: &dyn Engine,
         schema: SchemaRef,
     ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
-        let commit_files = self.find_commit_cover();
-        let actions = engine
-            .json_handler()
-            .read_json_files(&commit_files, schema, None)?
-            .map_ok(|batch| ActionsBatch::new(batch, true));
-        Ok(actions)
+        Self::read_commit_files(engine, &self.find_commit_cover(), schema)
     }
 
     /// find a minimal set to cover the range of commits we want. This is greedy so not always
@@ -985,13 +1039,21 @@ impl LogSegment {
     /// that all files in `self.ascending_commit_files` and `self.ascending_compaction_files` are in
     /// range for this log segment. This invariant is maintained by our listing code.
     pub(crate) fn find_commit_cover(&self) -> Vec<FileMeta> {
-        self.find_commit_cover_paths()
+        self.find_commit_cover_after(None)
+    }
+
+    /// [`Self::find_commit_cover`] restricted to files that start after version `after`, when
+    /// given. Files starting at or before `after` are excluded. A compaction that starts at or
+    /// before `after` but ends after it is covered by its individual commits after `after`
+    /// instead, since its actions may depend on state at or before `after`.
+    fn find_commit_cover_after(&self, after: Option<Version>) -> Vec<FileMeta> {
+        self.find_commit_cover_paths(after)
             .into_iter()
-            .map(|path| path.location)
+            .map(|path| path.location.clone())
             .collect()
     }
 
-    fn find_commit_cover_paths(&self) -> Vec<ParsedLogPath> {
+    fn find_commit_cover_paths(&self, after: Option<Version>) -> Vec<&ParsedLogPath> {
         // Create an iterator sorted in ascending order by (initial version, end version), e.g.
         // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
         //  10.19.compacted.json, 11.json, ...]
@@ -999,7 +1061,8 @@ impl LogSegment {
             self.listed.ascending_commit_files.iter(),
             self.listed.ascending_compaction_files.iter(),
             |path_a, path_b| path_a.version <= path_b.version,
-        );
+        )
+        .filter(|path| after.is_none_or(|after| path.version > after));
 
         let mut last_pushed: Option<&ParsedLogPath> = None;
 
@@ -1023,10 +1086,23 @@ impl LogSegment {
             }
             debug!("Provisionally selecting {next:?}");
             last_pushed = Some(next);
-            selected_files.push(next.clone());
+            selected_files.push(next);
         }
         selected_files.reverse();
         selected_files
+    }
+
+    /// Reads `commit_files` as log batches (`is_log_batch = true`), in the order given.
+    fn read_commit_files(
+        engine: &dyn Engine,
+        commit_files: &[FileMeta],
+        schema: SchemaRef,
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
+        let actions = engine
+            .json_handler()
+            .read_json_files(commit_files, schema, None)?
+            .map_ok(|batch| ActionsBatch::new(batch, true));
+        Ok(actions)
     }
 
     #[cfg(feature = "declarative-plans")]
@@ -1047,7 +1123,7 @@ impl LogSegment {
     /// Returns commit-cover files tagged with file-constant `version`.
     #[cfg(feature = "declarative-plans")]
     pub(crate) fn commit_cover_version_tagged_scan_files(&self) -> KernelResult<Vec<ScanFile>> {
-        Self::version_tagged_scan_files(&self.find_commit_cover_paths())
+        Self::version_tagged_scan_files(self.find_commit_cover_paths(None))
     }
 
     /// Returns the checkpoint parts tagged with file-constant `version`, paired with the single
@@ -1225,72 +1301,21 @@ impl LogSegment {
             .zip(file_actions_schema.as_ref())
             .is_some_and(|(ps, fs)| Self::schema_has_compatible_partition_values_parsed(fs, ps));
 
-        // JSON checkpoint stats are required when structured stats cannot satisfy the scan schema.
-        let needs_json_stats_fallback = stats_schema.is_some()
-            && !has_stats_parsed
-            && action_schema.field("add").is_some_and(|field| {
-                let DataType::Struct(add) = field.data_type() else {
-                    return false;
-                };
-                add.field("stats").is_none()
-            });
-
+        let needs_json_stats_fallback =
+            needs_json_stats_fallback(&action_schema, stats_schema, has_stats_parsed);
         let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
-        let needs_add_augmentation =
-            needs_json_stats_fallback || has_stats_parsed || has_partition_values_parsed;
-        let augmented_checkpoint_read_schema = if needs_add_augmentation || needs_sidecar {
-            let mut new_fields: Vec<StructField> = if let (true, Some(add_field)) =
-                (needs_add_augmentation, action_schema.field("add"))
-            {
-                let DataType::Struct(add_struct) = add_field.data_type() else {
-                    return Err(KernelError::internal_error(
-                        "add field in action schema must be a struct",
-                    ));
-                };
-                let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
-
-                if needs_json_stats_fallback {
-                    add_fields.push(StructField::nullable("stats", DataType::STRING));
-                }
-
-                if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
-                    add_fields.push(StructField::nullable("stats_parsed", ss.clone()));
-                }
-
-                if let (true, Some(ps)) = (has_partition_values_parsed, partition_schema) {
-                    add_fields.push(StructField::nullable("partitionValues_parsed", ps.clone()));
-                }
-
-                // Rebuild schema with modified add field
-                action_schema
-                    .fields()
-                    .map(|f| {
-                        if f.name() == "add" {
-                            StructField::new(
-                                add_field.name(),
-                                StructType::new_unchecked(add_fields.clone()),
-                                add_field.is_nullable(),
-                            )
-                            .with_metadata(add_field.metadata.clone())
-                        } else {
-                            f.clone()
-                        }
-                    })
-                    .collect()
-            } else {
-                action_schema.fields().cloned().collect()
-            };
-
-            // Add sidecar column at top-level for V2 checkpoints
-            if needs_sidecar {
-                new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
-            }
-
-            Arc::new(StructType::new_unchecked(new_fields))
-        } else {
-            // No modifications needed, use schema as-is
-            action_schema.clone()
-        };
+        let mut add_fields = Vec::new();
+        if needs_json_stats_fallback {
+            add_fields.push(StructField::nullable("stats", DataType::STRING));
+        }
+        if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
+            add_fields.push(StructField::nullable("stats_parsed", ss.clone()));
+        }
+        if let (true, Some(ps)) = (has_partition_values_parsed, partition_schema) {
+            add_fields.push(StructField::nullable("partitionValues_parsed", ps.clone()));
+        }
+        let augmented_checkpoint_read_schema =
+            augment_checkpoint_read_schema(&action_schema, add_fields, needs_sidecar)?;
 
         let checkpoint_file_meta: Vec<_> = self
             .listed
