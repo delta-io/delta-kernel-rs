@@ -1,3 +1,4 @@
+use std::iter;
 use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
@@ -2115,22 +2116,80 @@ async fn test_commit_cover(
     })
     .await;
     let cover = log_segment.find_commit_cover();
-    // our test-utils include "_delta_log" in the path, which is already in log_segment.log_root, so
-    // we don't use them. TODO: Unify this
-    let expected_locations = expected_files.iter().map(|ef| match ef {
-        ExpectedFile::Commit(version) => log_segment
-            .log_root
-            .join(&format!("{version:020}.json"))
-            .expect("Couldn't join"),
-        ExpectedFile::Compaction(lo, hi) => log_segment
-            .log_root
-            .join(&format!("{lo:020}.{hi:020}.compacted.json"))
-            .expect("Couldn't join"),
-    });
-    assert_eq!(cover.len(), expected_locations.len());
-    for (location, expected_location) in cover.iter().zip(expected_locations) {
-        assert_eq!(location.location, expected_location);
-    }
+    assert_eq!(
+        cover.into_iter().map(|f| f.location).collect_vec(),
+        expected_cover_locations(&log_segment.log_root, expected_files)
+    );
+}
+
+/// The locations of `expected_files` under `log_root`.
+// Our test-utils include "_delta_log" in the path, which is already in `log_root`, so we don't use
+// them. TODO: Unify this
+fn expected_cover_locations(log_root: &Url, expected_files: &[ExpectedFile]) -> Vec<Url> {
+    expected_files
+        .iter()
+        .map(|ef| match ef {
+            ExpectedFile::Commit(version) => log_root.join(&format!("{version:020}.json")),
+            ExpectedFile::Compaction(lo, hi) => {
+                log_root.join(&format!("{lo:020}.{hi:020}.compacted.json"))
+            }
+        })
+        .map(|url| url.expect("Couldn't join"))
+        .collect()
+}
+
+/// A compacted delta is selectable over a base tree at `after` only when it starts after `after`:
+/// one spanning `after` is skipped, and the commits after `after` are covered individually.
+#[rstest]
+#[case::compaction_after_base_tree(20, Some(8), vec![
+    ExpectedFile::Compaction(11, 20), ExpectedFile::Commit(10), ExpectedFile::Commit(9),
+])]
+#[case::compaction_spans_base_tree(20, Some(15), (16..=20).rev().map(ExpectedFile::Commit).collect())]
+#[case::compaction_after_earlier_base_tree(22, Some(5),
+    [ExpectedFile::Commit(22), ExpectedFile::Commit(21), ExpectedFile::Compaction(11, 20)]
+        .into_iter()
+        .chain((6..=10).rev().map(ExpectedFile::Commit))
+        .collect()
+)]
+#[case::compaction_spans_later_base_tree(30, Some(15),
+    (16..=30).rev().map(ExpectedFile::Commit).collect())]
+#[case::no_base_tree(20, None,
+    iter::once(ExpectedFile::Compaction(11, 20))
+        .chain((0..=10).rev().map(ExpectedFile::Commit))
+        .collect()
+)]
+fn commit_cover_after_skips_compaction_spanning_base_tree(
+    #[case] end_version: Version,
+    #[case] after: Option<Version>,
+    #[case] expected_files: Vec<ExpectedFile>,
+) {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let log_path = |name: String| create_log_path(log_root.join(&name).unwrap().as_str());
+    let commits = (0..=end_version)
+        .map(|v| log_path(format!("{v:020}.json")))
+        .collect_vec();
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            latest_commit_file: commits.last().cloned(),
+            max_published_version: Some(end_version),
+            ascending_commit_files: commits,
+            ascending_compaction_files: vec![log_path(format!(
+                "{:020}.{:020}.compacted.json",
+                11, 20
+            ))],
+            ..Default::default()
+        },
+        log_root.clone(),
+        Some(end_version),
+        None,
+    )
+    .unwrap();
+
+    let cover = log_segment.find_commit_cover_after(after);
+    assert_eq!(
+        cover.into_iter().map(|f| f.location).collect_vec(),
+        expected_cover_locations(&log_root, &expected_files)
+    );
 }
 
 #[tokio::test]
