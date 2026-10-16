@@ -183,9 +183,9 @@ build that batch from Parquet write results.
 > transactions. Create-table constructors also require `data_change`, but fix the operation to
 > `"CREATE TABLE"`. These values cannot be changed after construction.
 
-For a standalone schema change, use `UpdateTableOperation::AlterTable` with `data_change = false`.
-To evolve the schema while writing or rewriting data files, use the data operation, such as
-`UpdateTableOperation::Write`, and queue the schema changes on the same builder. See
+For a standalone schema change, use `snapshot.alter_table(engine_info)`. To evolve the schema while
+writing or rewriting data files, use the data operation, such as `UpdateTableOperation::Write`, and
+queue the schema changes on the same builder. See
 [ALTER TABLE versus schema evolution](../writing/alter_table.md#alter-table-versus-schema-evolution).
 
 See [Quick Start: Writing a Table](../getting_started/quick_start_write.md) for a complete example.

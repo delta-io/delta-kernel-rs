@@ -5,18 +5,24 @@
 // and for tests. Also allow dead_code since these are used by integration tests.
 #![allow(unreachable_pub, dead_code)]
 
+pub mod alter_table;
 pub mod create_table;
 mod state;
 pub mod update_table;
 
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
+
 pub(super) use self::state::TransactionBuilderState;
 use crate::actions::DomainMetadata;
-use crate::schema::SchemaRef;
+use crate::expressions::ColumnName;
+use crate::schema::{SchemaRef, StructField};
 use crate::transaction::commit_info::collect_operation_metadata;
-use crate::transaction::{CreateTable, UpdateTable};
-use crate::EngineData;
+use crate::transaction::schema_evolution::SchemaOperation;
+use crate::transaction::{AlterTable, CreateTable, SupportsSchemaChanges, UpdateTable};
+use crate::utils::require;
+use crate::{EngineData, KernelError, Result};
 
 /// A transaction type supported by [`TransactionBuilder`].
 ///
@@ -30,10 +36,12 @@ pub trait TransactionType: private::Sealed {
 
 /// Configures a transaction of type `T`.
 ///
-/// Shared setters preserve the transaction type. Constructors, type-specific setters, and
-/// `build` are provided by the specialized implementations for [`CreateTable`] and [`UpdateTable`].
+/// Common configuration setters preserve the transaction type. Constructors, type-specific setters,
+/// and `build` are provided by the specialized implementations for [`CreateTable`],
+/// [`UpdateTable`], and [`AlterTable`].
 /// Use [`create_table`](super::create_table::create_table) or
-/// [`Snapshot::update_table`](crate::Snapshot::update_table) to obtain a builder.
+/// [`Snapshot::update_table`](crate::Snapshot::update_table), or
+/// [`Snapshot::alter_table`](crate::Snapshot::alter_table) to obtain a builder.
 ///
 /// The operation cannot be changed on a builder:
 ///
@@ -144,16 +152,112 @@ impl<T: TransactionType> TransactionBuilder<T> {
     }
 }
 
+impl<T: SupportsSchemaChanges> TransactionBuilder<T> {
+    /// Adds schema changes to validate and apply when building the transaction.
+    ///
+    /// Appends `changes` in call order and returns the updated builder. Each change observes the
+    /// result of prior changes. Empty input is rejected immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `changes` is empty.
+    #[internal_api]
+    pub(crate) fn with_schema_changes(
+        mut self,
+        changes: impl IntoIterator<Item = SchemaOperation>,
+    ) -> Result<TransactionBuilder<T::WithSchemaChanges>> {
+        let mut changes = changes.into_iter().peekable();
+        require!(
+            changes.peek().is_some(),
+            KernelError::generic("with_schema_changes requires at least one schema operation")
+        );
+        self.local_state
+            .schema_changes
+            .get_or_insert_with(Vec::new)
+            .extend(changes);
+        Ok(self.transition())
+    }
+
+    /// Add a new top-level column to the table schema.
+    ///
+    /// The field must not already exist in the schema (case-insensitive). The field must be
+    /// nullable because existing data files do not contain this column and will read NULL for it.
+    /// On column-mapping tables, Kernel assigns or preserves column-mapping IDs and physical names
+    /// for the added field.
+    ///
+    /// Schema changes are applied in call order and validated when building the transaction.
+    pub fn add_column(mut self, field: StructField) -> TransactionBuilder<T::WithSchemaChanges> {
+        self.local_state
+            .schema_changes
+            .get_or_insert_with(Vec::new)
+            .push(SchemaOperation::add_column(None, field));
+        self.transition()
+    }
+
+    /// Add a new column or nested field to the table schema.
+    ///
+    /// `parent` identifies the struct that will contain `field`. An empty parent targets the
+    /// table's root schema; segments may traverse nested structs, array elements, map keys, and
+    /// map values.
+    ///
+    /// The added field must be nullable (existing data files lack the column and will read NULL),
+    /// must not be a metadata column and must not collide case-insensitively with a
+    /// sibling in the target struct. `parent` must resolve to a struct.
+    ///
+    /// With column mapping enabled, existing IDs and physical names are preserved and missing
+    /// annotations are assigned.
+    ///
+    /// Schema changes are applied in call order and validated when building the transaction.
+    pub fn add_column_at(
+        mut self,
+        parent: ColumnName,
+        field: StructField,
+    ) -> TransactionBuilder<T::WithSchemaChanges> {
+        self.local_state
+            .schema_changes
+            .get_or_insert_with(Vec::new)
+            .push(SchemaOperation::add_column(parent, field));
+        self.transition()
+    }
+
+    /// Change a column's nullability from NOT NULL to nullable. If the column is already
+    /// nullable, the op is a no-op but still generates a commit.
+    ///
+    /// Note: this matches Spark's behavior.
+    pub fn set_nullable(mut self, column: ColumnName) -> TransactionBuilder<T::WithSchemaChanges> {
+        self.local_state
+            .schema_changes
+            .get_or_insert_with(Vec::new)
+            .push(SchemaOperation::SetNullable { column });
+        self.transition()
+    }
+
+    // Reconstructs the builder with a different transaction type, changing which methods
+    // are available at compile time (e.g. Ready -> Modifying enables `build()`). All real
+    // fields are moved as-is; only the zero-sized type state changes.
+    fn transition(self) -> TransactionBuilder<T::WithSchemaChanges> {
+        TransactionBuilder {
+            common_state: self.common_state,
+            local_state: self.local_state,
+        }
+    }
+}
+
 impl TransactionType for CreateTable {
     type BuilderState = create_table::CreateTableBuilderState;
 }
 
 impl TransactionType for UpdateTable {
-    type BuilderState = update_table::UpdateTableBuilderState;
+    type BuilderState = update_table::ExistingTableBuilderState;
+}
+
+impl<S> TransactionType for AlterTable<S> {
+    type BuilderState = update_table::ExistingTableBuilderState;
 }
 
 impl private::Sealed for CreateTable {}
 impl private::Sealed for UpdateTable {}
+impl<S> private::Sealed for AlterTable<S> {}
 
 mod private {
     pub trait Sealed {}

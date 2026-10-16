@@ -1,8 +1,9 @@
 # Altering a table
 
-To add a column to an existing Delta table, you configure an existing-table transaction with one
-or more schema operations and commit it. A standalone ALTER commit updates the table's schema
-without rewriting data files. The same builder also supports schema evolution alongside a write.
+To add a column to an existing Delta table, you build an `AlterTableTransaction`
+from a `Snapshot`, queue one or more schema operations, and commit. The result
+is a metadata-only commit that updates the table's schema without rewriting any
+data files.
 
 Before reading this page, make sure you understand
 [Creating a Table](./create_table.md) and
@@ -18,27 +19,22 @@ transaction. For example, you can add a nullable column and append rows containi
 column atomically.
 
 The `dataChange` flag indicates whether file actions change the table's logical data.
-Pass it explicitly when you construct the builder. The table shows typical workflows.
 
 | Transaction Component | ALTER TABLE | SCHEMA EVOLUTION |
 |--------|------------------------|---------------------------------|
-| Operation | `UpdateTableOperation::AlterTable` | The data operation, such as `UpdateTableOperation::Write` |
+| Builder | `AlterTableTransactionBuilder` | `UpdateTableTransactionBuilder` |
 | Schema operations | Required | Queued alongside the data operation |
-| Data-file changes | None staged | Staged on the built transaction |
-| `data_change` constructor argument | `false` | `true` if records change; `false` otherwise |
+| Data-file changes | Unavailable at compile time | Staged on the built transaction |
+| `dataChange` | Always `false` | Required when constructing the builder |
 
-Both workflows use `UpdateTableTransactionBuilder`. You queue all schema operations before `build()`;
-Kernel validates and applies them during `build()`. For schema evolution, you stage data-file changes
-on the returned `Transaction`, whose `WriteState` uses the evolved schema.
+Both builders use `TransactionBuilder<T>` and share schema operations and common setters.
+You queue all schema operations before `build()`; Kernel validates and applies them during
+`build()`. Schema evolution during a write also lets you stage data-file changes on the returned
+`Transaction`, whose `WriteState` uses the evolved schema.
 
-`ALTER TABLE` requires `dataChange = false`. Kernel checks this at `build()` and retains a defensive
-check at `commit()`. Commit validation also rejects staged file additions, removals, and
-deletion-vector updates, including empty or fully unselected batches. Staged manifest writes are
-also rejected.
-The supplied value cannot be changed and is preserved even when no file batches are staged.
-
-For a rewrite that preserves logical data, select the data operation, such as
-`UpdateTableOperation::Optimize`, and pass `false` to `update_table()`.
+For schema evolution during a write, supply `data_change` when constructing the update-table builder.
+Kernel preserves this value even for empty commits. For protocol-valid rewrites that preserve
+logical data, use `snapshot.update_table(operation, engine_info, false)`.
 
 > [!NOTE]
 > The supported operations are adding columns and making columns nullable. Other schema operations
@@ -52,10 +48,9 @@ STRING` with rows for Alice, Bob, and Carol, and you want to add a `country`
 column. The flow is:
 
 1. Load a `Snapshot` of the table.
-2. Call `snapshot.update_table(UpdateTableOperation::AlterTable, "my-app/1.0", false)` to get an
-   `UpdateTableTransactionBuilder`.
+2. Call `snapshot.alter_table("my-app/1.0")` to get an `AlterTableTransactionBuilder`.
 3. Call `add_column()` with the new field.
-4. Call `build()` to produce a `Transaction`.
+4. Call `build()` to produce an `AlterTableTransaction`.
 5. Call `commit()` to atomically apply the schema change.
 
 ```rust,no_run
@@ -65,7 +60,7 @@ column. The flow is:
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField};
-# use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
+# use delta_kernel::transaction::CommitResult;
 # use delta_kernel::{Result, Snapshot};
 # fn example() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
@@ -75,7 +70,7 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
 // 2. Build and commit an alter-table transaction that adds a new column.
 let result = snapshot
-    .update_table(UpdateTableOperation::AlterTable, "my-app/1.0", /* data_change */ false)
+    .alter_table("my-app/1.0")
     .add_column(StructField::nullable("country", DataType::STRING))
     .build(&engine, Box::new(FileSystemCommitter::new()))?
     .commit(&engine)?;
@@ -121,16 +116,31 @@ validated as a whole before the commit is constructed:
 
 ```rust,ignore
 let result = snapshot
-    .update_table(UpdateTableOperation::AlterTable, "my-app/1.0", /* data_change */ false)
+    .alter_table("my-app/1.0")
     .add_column(StructField::nullable("country", DataType::STRING))
     .add_column(StructField::nullable("postal_code", DataType::STRING))
     .build(&engine, Box::new(FileSystemCommitter::new()))?
     .commit(&engine)?;
 ```
 
-Building an `UpdateTableOperation::AlterTable` transaction without adding a schema operation returns an
-error. The unified builder performs this check at runtime because other operations may combine
-schema evolution with data-file actions.
+The builder uses a type-state pattern to enforce that at least one operation is
+queued before `build()` is callable. Calling `.build()` directly on
+`snapshot.alter_table("my-app/1.0")` without first queuing a schema operation is a compile
+error.
+
+## What you cannot do on an alter-table transaction
+
+`AlterTableTransaction` is a metadata-only transaction. It does not implement
+`SupportsDataFiles`, so the data-file methods are not available at compile
+time. In particular, the following are not callable on an `AlterTableTransaction`:
+
+| Method | Used for |
+|--------|----------|
+| `write_state()` | Creating the `WriteState` used to bind a `BoundWriteContext` |
+| `add_files()` | Registering newly written data files |
+| `stats_schema()` | Retrieving the statistics schema for written files |
+
+The ALTER builder also has no `with_data_change()` or `with_blind_append()` setter.
 
 ## Evolving a schema while writing
 

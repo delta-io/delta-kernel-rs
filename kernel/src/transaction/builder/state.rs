@@ -1,4 +1,4 @@
-//! Shared configuration for create-table and update-table transaction builders.
+//! Shared configuration for transaction builders.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

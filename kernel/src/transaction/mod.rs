@@ -70,6 +70,9 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
+pub use builder::alter_table::AlterTableTransactionBuilder;
+use builder::alter_table::Modifying;
+use builder::update_table::ExistingTableBuilderState;
 pub use builder::update_table::UpdateTableTransactionBuilder;
 use builder::TransactionBuilderState;
 pub use builder::{TransactionBuilder, TransactionType};
@@ -197,6 +200,117 @@ pub struct UpdateTable;
 #[derive(Debug)]
 pub struct CreateTable;
 
+/// Marker type for alter-table (schema evolution) transactions.
+///
+/// Transactions in this state perform metadata-only commits. Data file operations are not
+/// available at compile time because `AlterTable` does not implement [`SupportsDataFiles`].
+#[derive(Debug)]
+pub struct AlterTable<S = builder::alter_table::Modifying>(PhantomType<S>);
+
+/// Marker trait for transaction states that support data file operations.
+///
+/// Only transaction types that implement this trait can access methods for adding, removing, or
+/// updating data files. This prevents compile-time misuse by states like `AlterTable` that
+/// only perform metadata-only commits.
+pub trait SupportsDataFiles: TransactionType {}
+
+/// A transaction type that accepts schema changes against an existing table.
+///
+/// Schema setters share their implementation and preserve transaction metadata while selecting
+/// the builder state in which a schema operation has been queued.
+pub trait SupportsSchemaChanges: TransactionType<BuilderState = ExistingTableBuilderState> {
+    /// Transaction type after adding at least one schema operation.
+    type WithSchemaChanges: TransactionType<BuilderState = ExistingTableBuilderState>;
+}
+
+impl SupportsDataFiles for CreateTable {}
+impl SupportsDataFiles for UpdateTable {}
+
+impl SupportsSchemaChanges for UpdateTable {
+    type WithSchemaChanges = UpdateTable;
+}
+
+impl<S> SupportsSchemaChanges for AlterTable<S> {
+    type WithSchemaChanges = AlterTable<Modifying>;
+}
+
+/// A type alias for alter-table transactions.
+///
+/// This provides a restricted API surface that only exposes operations valid during ALTER
+/// commands. Data file operations are not available at compile time because `AlterTable`
+/// does not implement [`SupportsDataFiles`].
+///
+/// ```compile_fail,E0599
+/// use delta_kernel::transaction::AlterTableTransaction;
+/// fn write_state(txn: AlterTableTransaction) {
+///     let _ = txn.write_state();
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use delta_kernel::{EngineData, transaction::AlterTableTransaction};
+/// fn add_files(mut txn: AlterTableTransaction, data: Box<dyn EngineData>) {
+///     txn.add_files(data);
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use delta_kernel::{engine_data::FilteredEngineData, transaction::AlterTableTransaction};
+/// fn remove_files(mut txn: AlterTableTransaction, data: FilteredEngineData) {
+///     txn.remove_files(data);
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use delta_kernel::transaction::AlterTableTransaction;
+/// fn update_deletion_vectors(mut txn: AlterTableTransaction) {
+///     let _ = txn.update_deletion_vectors(Default::default(), std::iter::empty());
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use delta_kernel::{Engine, transaction::AlterTableTransaction};
+/// fn manifest(mut txn: AlterTableTransaction, engine: &dyn Engine) {
+///     let _ = txn.with_manifest_commit(engine);
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use delta_kernel::{FileMeta, transaction::AlterTableTransaction};
+/// fn root_manifest(txn: AlterTableTransaction, file: FileMeta) {
+///     let _ = txn.with_root_manifest_file(file);
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use delta_kernel::transaction::AlterTableTransaction;
+/// fn stats_schema(txn: AlterTableTransaction) {
+///     let _ = txn.stats_schema();
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use delta_kernel::transaction::AlterTableTransaction;
+/// fn add_files_schema(txn: AlterTableTransaction) {
+///     let _ = txn.add_files_schema();
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use delta_kernel::transaction::AlterTableTransaction;
+/// fn high_water_mark(txn: AlterTableTransaction) {
+///     let _ = txn.with_row_tracking_high_water_mark(1);
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use delta_kernel::transaction::AlterTableTransaction;
+/// fn remove_domain(txn: AlterTableTransaction) {
+///     let _ = txn.with_domain_metadata_removed("connector.domain".to_string());
+/// }
+/// ```
+pub type AlterTableTransaction = Transaction<AlterTable>;
+
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
 /// changes to the table.
@@ -205,15 +319,14 @@ pub struct CreateTable;
 /// - [`UpdateTable`] (default): Full API for modifying existing tables.
 /// - [`CreateTable`]: Restricted API for table creation (see
 ///   [`CreateTableTransaction`](create_table::CreateTableTransaction)).
+/// - [`AlterTable`]: Metadata-only schema changes, without data-file or manifest APIs.
 ///
 /// The independent type parameter `MODE` selects the [`ExecutionMode`], which provides an
 /// abstraction over 1) how staged changes are represented and 2) how to inspect the changes. The
 /// default, [`Imperative`], stages [`EngineData`] and provides [`commit`](Self::commit).
 ///
-/// Both states support file additions. Schema-changing transactions use [`UpdateTable`] rather
-/// than a separate schema-only state, allowing schema and file changes in the same transaction.
-/// The builder validates schema intent, and commit validates the staged actions. `ALTER TABLE`
-/// commits reject staged data-file batches and manifest writes.
+/// [`UpdateTable`] supports schema evolution together with data-file changes. Standalone ALTER
+/// transactions use [`AlterTable`], which does not implement [`SupportsDataFiles`].
 ///
 /// Configure schema and data-change intent on the builder. Built transactions do not expose
 /// setters for either, including when the `internal-api` feature is enabled.
@@ -570,7 +683,9 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             .push(DomainMetadata::new(domain, configuration));
         self
     }
+}
 
+impl<STATE: SupportsDataFiles, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting
     /// information about a Parquet write operation back to Kernel.
     ///
@@ -599,7 +714,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
 // =============================================================================
 // Shared data file methods
 // =============================================================================
-impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
+impl<STATE: SupportsDataFiles, MODE: ExecutionMode> Transaction<STATE, MODE> {
     // TODO(#2499): Remove this API when Engine responsibilities encode column-default handling.
     /// Acknowledges that the connector applies column defaults before writing data files.
     ///
@@ -749,7 +864,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     }
 }
 
-impl<STATE> Transaction<STATE, Imperative> {
+impl<STATE: SupportsDataFiles> Transaction<STATE, Imperative> {
     /// Add files to include in this transaction. This API generally enables the engine to
     /// add/append/insert data (files) to the table. Note that this API can be called multiple times
     /// to add multiple batches.
@@ -1051,7 +1166,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         if self.effective_table_config.logical_schema().num_fields() == 0 {
             return Err(KernelError::generic(
                 "Cannot write data files to a Delta table with empty schema; \
-                 use `snapshot.update_table(UpdateTableOperation::AlterTable, engine_info, false)` and \
+                 use `snapshot.alter_table(engine_info)` and \
                  `add_column(...)` to add at least one column before writing data",
             ));
         }
@@ -1105,36 +1220,28 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             .map_err(KernelError::invalid_transaction_state)?;
         match (self.is_create_table(), &self.operation) {
             (true, CommitOperation::CreateTable) => Ok(()),
-            (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
-                if !self.should_emit_metadata =>
-            {
+            (false, CommitOperation::AlterTable) if !self.should_emit_metadata => {
                 Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE requires at least one schema change",
                 ))
             }
-            (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
-                if self.data_change =>
-            {
+            (false, CommitOperation::AlterTable) if self.data_change => {
                 Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE requires data_change to be false",
                 ))
             }
-            (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
-                if self.has_data_file_actions() =>
-            {
+            (false, CommitOperation::AlterTable) if self.has_data_file_actions() => {
                 Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE cannot include data-file actions",
                 ))
             }
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
-                if self.manifest_write.is_some() =>
-            {
+            (false, CommitOperation::AlterTable) if self.manifest_write.is_some() => {
                 Err(KernelError::invalid_transaction_state(
                     "ALTER TABLE cannot include manifest writes",
                 ))
             }
-            (false, CommitOperation::UpdateTable(_)) => Ok(()),
+            (false, CommitOperation::AlterTable | CommitOperation::UpdateTable(_)) => Ok(()),
             (true, _) => Err(KernelError::invalid_transaction_state(
                 "create-table transactions must use the CREATE TABLE operation",
             )),
@@ -1734,7 +1841,7 @@ impl<STATE> Transaction<STATE, Imperative> {
                     .add_files_metadata
                     .iter()
                     .map(|a| Ok(a.deref())),
-                self.add_files_schema().clone(),
+                BASE_ADD_FILES_SCHEMA.clone(),
                 self.data_change,
             )?;
             Ok((Box::new(add_actions), None))
@@ -3456,7 +3563,7 @@ mod tests {
     // ============================================================================
     // validate_blind_append tests
     // ============================================================================
-    fn add_dummy_file<STATE>(txn: &mut Transaction<STATE>) {
+    fn add_dummy_file<STATE: SupportsDataFiles>(txn: &mut Transaction<STATE>) {
         let batch = create_valid_add_file_batch(false /* all_nullable */);
         txn.add_files(Box::new(ArrowEngineData::new(batch)));
     }
@@ -3596,11 +3703,6 @@ mod tests {
         false,
         CommitOperation::CreateTable,
         "CREATE TABLE cannot use an update-table transaction"
-    )]
-    #[case::alter_without_schema_changes(
-        false,
-        CommitOperation::UpdateTable(UpdateTableOperation::AlterTable),
-        "ALTER TABLE requires at least one schema change"
     )]
     #[case::empty_custom_operation(
         false,

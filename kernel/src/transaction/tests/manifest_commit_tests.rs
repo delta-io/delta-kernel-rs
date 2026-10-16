@@ -1,7 +1,9 @@
 //! Tests for `adaptiveMetadata-preview` manifest (content-tree) commits and root manifest file
 //! commits.
 
-use super::super::{ManifestCommitState, ManifestWrite, Transaction, UpdateTableOperation};
+use super::super::{
+    ManifestCommitState, ManifestWrite, RootManifestFile, Transaction, UpdateTableOperation,
+};
 use super::{add_dummy_file, create_existing_table_txn};
 use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::committer::FileSystemCommitter;
@@ -197,12 +199,8 @@ fn new_leaf_node_writer_uses_effective_config_schema_not_snapshot() -> Result<()
     Ok(())
 }
 
-#[rstest::rstest]
-#[case(UpdateTableOperation::Write)]
-#[case(UpdateTableOperation::AlterTable)]
-fn manifest_commit_after_schema_change_uses_evolved_schema(
-    #[case] operation: UpdateTableOperation,
-) -> Result<()> {
+#[test]
+fn manifest_commit_after_schema_change_uses_evolved_schema() -> Result<()> {
     let (engine, table_root) = setup_table()?;
     let mut checkpoint = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
     let max_column_id = find_max_column_id_in_schema(&checkpoint.metadata.parse_schema()?)
@@ -218,9 +216,8 @@ fn manifest_commit_after_schema_change_uses_evolved_schema(
     )?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let initial_schema = snapshot.table_configuration().physical_schema();
-    let is_alter = operation == UpdateTableOperation::AlterTable;
     let mut txn = snapshot
-        .update_table(operation, "test-engine", !is_alter)
+        .update_table(UpdateTableOperation::Write, "test-engine", true)
         .add_column(StructField::nullable("fresh_column", DataType::INTEGER))
         .build(&engine, Box::new(FileSystemCommitter::new()))?;
     let expected = txn.effective_table_config.physical_schema();
@@ -229,13 +226,31 @@ fn manifest_commit_after_schema_change_uses_evolved_schema(
         .with_manifest_commit(&engine)?
         .new_leaf_node_writer(&engine);
     assert_eq!(writer.physical_schema(), &expected);
-    if is_alter {
-        let error = txn.commit(&engine).unwrap_err();
-        assert!(
-            matches!(&error, KernelError::InvalidTransactionState(message)
-            if message == "ALTER TABLE cannot include manifest writes")
-        );
-    }
+    Ok(())
+}
+
+#[test]
+fn alter_table_commit_rejects_internal_manifest_write() -> Result<()> {
+    let (engine, transaction, _tempdir) = create_existing_table_txn()?;
+    let snapshot = transaction.read_snapshot_opt.unwrap();
+    let file = FileMeta {
+        location: snapshot.table_root().join("metadata/root-v1.parquet")?,
+        last_modified: 0,
+        size: 1024,
+    };
+    let mut transaction = snapshot
+        .clone()
+        .alter_table("test-engine")
+        .add_column(StructField::nullable("fresh_column", DataType::INTEGER))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    transaction.manifest_write = Some(ManifestWrite::RootFile(RootManifestFile::new(
+        file, snapshot,
+    )));
+    let error = transaction.commit(engine.as_ref()).unwrap_err();
+    assert!(
+        matches!(&error, KernelError::InvalidTransactionState(message)
+        if message == "ALTER TABLE cannot include manifest writes")
+    );
     Ok(())
 }
 

@@ -95,10 +95,13 @@ three values.
 `Transaction<CreateTable>`. Its constructor requires the path, schema, engine info, and `data_change`
 and fixes the operation to `CREATE TABLE`. These inputs cannot be changed on either builder or
 transaction. Kernel preserves `data_change` even for empty commits rather than inferring it from
-staged files. `build()` rejects ALTER with `true` and blind append with `false`; `commit()` retains
-operation and staged-file validation.
-Schema changes use `UpdateTable`, including the
-`UpdateTableOperation::AlterTable` operation.
+staged files. `build()` rejects blind append with `false`.
+Schema evolution during writes uses `UpdateTable`. Standalone schema changes use
+`snapshot.alter_table(engine_info)` and `AlterTableTransactionBuilder<S>`, an alias for
+`TransactionBuilder<AlterTable<S>>`. Schema operations transition from `Ready` to `Modifying`,
+where `build()` becomes available. ALTER fixes operation to `ALTER TABLE` and `dataChange` to false
+and exposes no data-file or manifest APIs. Both existing-table builders share schema setters,
+validation, transaction construction, and common setters.
 
 Kernel captures table-wide configuration in a transportable `WriteState`. Each writer binds
 partition values and any logical materialized row-tracking columns to create a `BoundWriteContext`

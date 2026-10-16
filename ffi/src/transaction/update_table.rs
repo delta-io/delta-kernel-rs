@@ -358,11 +358,13 @@ pub unsafe extern "C" fn update_table_txn_builder_set_nullable(
         .into_extern_result(&engine)
 }
 
-unsafe fn decode_column_name(column: &FfiColumnName) -> Result<ColumnName> {
+pub(super) unsafe fn decode_column_name(column: &FfiColumnName) -> Result<ColumnName> {
     Ok(ColumnName::new(unsafe { column.path.try_to_strings() }?))
 }
 
-fn decode_single_field(schema: &EngineSchema) -> Result<delta_kernel::schema::StructField> {
+pub(super) fn decode_single_field(
+    schema: &EngineSchema,
+) -> Result<delta_kernel::schema::StructField> {
     let mut fields = decode_engine_schema(schema)?.into_fields();
     match (fields.next(), fields.next()) {
         (Some(field), None) => Ok(field),
@@ -438,7 +440,6 @@ pub unsafe extern "C" fn free_update_table_txn(txn: Handle<ExclusiveUpdateTableT
 pub enum KernelUpdateTableOperation {
     Write = 0,
     StreamingUpdate = 1,
-    AlterTable = 2,
     Delete = 3,
     Update = 4,
     Merge = 5,
@@ -450,7 +451,6 @@ impl From<KernelUpdateTableOperation> for UpdateTableOperation {
         match value {
             KernelUpdateTableOperation::Write => Self::Write,
             KernelUpdateTableOperation::StreamingUpdate => Self::StreamingUpdate,
-            KernelUpdateTableOperation::AlterTable => Self::AlterTable,
             KernelUpdateTableOperation::Delete => Self::Delete,
             KernelUpdateTableOperation::Update => Self::Update,
             KernelUpdateTableOperation::Merge => Self::Merge,
