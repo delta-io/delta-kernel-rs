@@ -1,6 +1,6 @@
 //! Domain metadata replay logic for [`LogSegment`].
 //!
-//! Two entry points: [`LogSegment::scan_domain_metadatas`] replays the whole log for the latest
+//! Two entry points: [`scan_domain_metadata_actions`] folds a whole-log replay into the latest
 //! domain metadata, and [`LogSegment::scan_domain_metadatas_rooted_in_crc`] scans only the commits
 //! after an authoritative stale CRC and reconciles them against its active-domain map.
 
@@ -18,21 +18,14 @@ use crate::{Engine, KernelResult, RowVisitor as _, Version};
 pub(crate) type DomainMetadataMap = HashMap<String, DomainMetadata>;
 
 impl LogSegment {
-    /// Scan this log segment for domain metadata actions. If a specific set of domains is
-    /// provided, terminate log replay early once all requested domains have been found. If no
-    /// filter is given, replay the entire log to collect all domains.
-    ///
-    /// Returns the latest domain metadata for each domain, accounting for tombstones
-    /// (`removed=true`) — removed domain metadatas will _never_ be present in the returned map.
-    #[instrument(name = "domain_metadata.scan", skip_all, fields(domains = ?domains.map(|d| d.iter().collect::<Vec<_>>())), err)]
+    /// [`scan_domain_metadata_actions`] over this segment's whole log.
+    #[cfg(test)]
     pub(crate) fn scan_domain_metadatas(
         &self,
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
     ) -> KernelResult<DomainMetadataMap> {
-        Ok(self
-            .visit_domain_metadatas(domains, engine)?
-            .into_domain_metadatas())
+        scan_domain_metadata_actions(self.read_domain_metadata_batches(engine)?, domains)
     }
 
     /// Answer a domain-metadata query rooted in an authoritative (`Complete`) but stale CRC's
@@ -90,33 +83,13 @@ impl LogSegment {
     }
 
     /// Reverse-replay this segment, folding domain metadata actions into a
-    /// [`DomainMetadataVisitor`] (newest-first, first-seen-wins). A domain filter terminates
-    /// the scan early once every requested domain is found; without one the whole segment is
-    /// replayed. The caller chooses whether to keep or strip tombstones from the returned
-    /// visitor.
+    /// [`DomainMetadataVisitor`] (see [`visit_domain_metadata_actions`]).
     fn visit_domain_metadatas(
         &self,
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
     ) -> KernelResult<DomainMetadataVisitor> {
-        let domain_filter = domains.map(|set| {
-            set.iter()
-                .map(|s| s.to_string())
-                .collect::<HashSet<String>>()
-        });
-        let mut visitor = DomainMetadataVisitor::new(domain_filter);
-        // If a specific set of domains is requested then we can terminate log replay early as
-        // soon as all requested domains have been found. If all domains are requested then we
-        // are forced to replay the entire log.
-        for actions in self.read_domain_metadata_batches(engine)? {
-            let domain_metadatas = actions?.actions;
-            visitor.visit_rows_of(domain_metadatas.as_ref())?;
-            // if all requested domains have been found, terminate early
-            if visitor.filter_found() {
-                break;
-            }
-        }
-        Ok(visitor)
+        visit_domain_metadata_actions(self.read_domain_metadata_batches(engine)?, domains)
     }
 
     /// Read action batches from the log, projecting rows to only contain domain metadata columns.
@@ -128,20 +101,69 @@ impl LogSegment {
     }
 }
 
+/// Folds `actions`, a newest-first replay read with [`LOG_DOMAIN_METADATA_SCHEMA`], into the latest
+/// domain metadata. If a specific set of domains is provided, stop reading once all requested
+/// domains have been found. If no filter is given, read every batch to collect all domains.
+///
+/// Returns the latest domain metadata for each domain, accounting for tombstones
+/// (`removed=true`) — removed domain metadatas will _never_ be present in the returned map.
+#[instrument(name = "domain_metadata.scan", skip_all, fields(domains = ?domains.map(|d| d.iter().collect::<Vec<_>>())), err)]
+pub(crate) fn scan_domain_metadata_actions(
+    actions: impl Iterator<Item = KernelResult<ActionsBatch>>,
+    domains: Option<&HashSet<&str>>,
+) -> KernelResult<DomainMetadataMap> {
+    Ok(visit_domain_metadata_actions(actions, domains)?.into_domain_metadatas())
+}
+
+/// Folds `actions` into a [`DomainMetadataVisitor`] (newest-first, first-seen-wins). A domain
+/// filter stops reading once every requested domain is found. The caller chooses whether to keep
+/// or strip tombstones from the returned visitor.
+fn visit_domain_metadata_actions(
+    actions: impl Iterator<Item = KernelResult<ActionsBatch>>,
+    domains: Option<&HashSet<&str>>,
+) -> KernelResult<DomainMetadataVisitor> {
+    let domain_filter = domains.map(|set| {
+        set.iter()
+            .map(|s| s.to_string())
+            .collect::<HashSet<String>>()
+    });
+    let mut visitor = DomainMetadataVisitor::new(domain_filter);
+    // If a specific set of domains is requested then we can terminate log replay early as
+    // soon as all requested domains have been found. If all domains are requested then we
+    // are forced to replay the entire log.
+    for actions in actions {
+        let domain_metadatas = actions?.actions;
+        visitor.visit_rows_of(domain_metadatas.as_ref())?;
+        // if all requested domains have been found, terminate early
+        if visitor.filter_found() {
+            break;
+        }
+    }
+    Ok(visitor)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use test_utils::add_commit;
     use url::Url;
 
     use crate::actions::visitors::DomainMetadataVisitor;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::actions::DomainMetadata;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
     use crate::transaction::create_table::create_table as create_table_txn;
     use crate::transaction::UpdateTableOperation;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::unit_test_utils::adaptive_metadata_fixtures::{
+        checkpoint_action_with_root, checkpoint_line, protocol_and_metadata_lines,
+    };
     use crate::{RowVisitor as _, Snapshot};
 
     /// Builds a two-commit in-memory Delta table:
@@ -347,5 +369,56 @@ mod tests {
         assert!(with_tombstones["domainA"].is_removed());
         assert!(!with_tombstones["domainB"].is_removed());
         assert!(!with_tombstones["domainC"].is_removed());
+    }
+
+    /// The `domainMetadata` entries of an AMT `checkpoint` action stand in for the commits at or
+    /// below its version, and later commits, including removals, override them.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[tokio::test]
+    async fn amt_checkpoint_action_supplies_domain_metadata() {
+        let dm_line = |domain: &str, configuration: &str, removed: bool| {
+            format!(
+                r#"{{"domainMetadata":{{"domain":"{domain}","configuration":"{configuration}","removed":{removed}}}}}"#
+            )
+        };
+        // The root manifest is never read, so it need not exist.
+        let mut checkpoint = checkpoint_action_with_root("metadata/root.parquet", 1, 1).unwrap();
+        checkpoint.domain_metadata = vec![
+            DomainMetadata::new("a".to_string(), "a1".to_string()),
+            DomainMetadata::new("b".to_string(), "b1".to_string()),
+        ];
+        let store = Arc::new(InMemory::new());
+        let commits = [
+            // At or below the checkpoint version, so the checkpoint action replaces it.
+            format!(
+                "{}\n{}",
+                protocol_and_metadata_lines(&[]),
+                dm_line("c", "c0", false)
+            ),
+            checkpoint_line(&checkpoint),
+            format!("{}\n{}", dm_line("a", "a2", false), dm_line("b", "", true)),
+        ];
+        for (version, commit) in commits.into_iter().enumerate() {
+            add_commit("memory:///", store.as_ref(), version as u64, commit)
+                .await
+                .unwrap();
+        }
+        let engine = SyncEngine::new_with_store(store);
+        let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
+
+        for (domain, expected) in [("a", Some("a2")), ("b", None), ("c", None)] {
+            assert_eq!(
+                snapshot
+                    .get_domain_metadata(domain, &engine)
+                    .unwrap()
+                    .as_deref(),
+                expected,
+                "domain {domain}"
+            );
+        }
+        let all = snapshot
+            .get_domain_metadatas_internal(&engine, None)
+            .unwrap();
+        assert_eq!(all.keys().collect::<Vec<_>>(), vec!["a"]);
     }
 }
