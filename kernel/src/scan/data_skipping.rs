@@ -3,7 +3,6 @@ use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
-use delta_kernel_derive::internal_api;
 use tracing::{debug, error};
 
 use crate::actions::visitors::SelectionVectorVisitor;
@@ -101,7 +100,6 @@ pub(crate) fn as_sql_data_skipping_predicate_with_stats_columns(
 }
 
 /// Filters file actions using parsed statistics and partition values.
-#[internal_api]
 pub(crate) struct DataSkippingFilter {
     /// Evaluator that extracts file-level statistics from the input batch. The caller provides
     /// the expression at construction time, which determines where stats come from:
