@@ -61,12 +61,24 @@ typed hint through a callback; connectors must copy any state retained after the
    (`kernel/src/log_segment/`) and resolve Protocol and Metadata through CRC state or log replay.
    Domain metadata is resolved lazily from CRC state or log replay when queried. Snapshot-hint
    builds validate and assemble the supplied state instead.
+   The snapshot builder binds its optional cancellation token through `KernelEngine`, an owned
+   adapter over the existing engine handlers. Discovery, CRC reads/reconstruction, and imperative
+   replay inherit the operation token. `KernelEngine` is crate-private; connectors configure
+   cancellation through the snapshot builder and pass their original engine.
+   Completed snapshots retain neither the adapter nor its token. Declarative plan execution
+   uses the original executor unchanged.
 2. **Log replay** (`kernel/src/log_replay/`): file-action deduplication via
    `FileActionDeduplicator` and `LogReplayProcessor` trait (distinct from Protocol/Metadata
    replay above)
 
 From a snapshot you can: read the schema and table properties, build a `Scan` to read data,
 start a `Transaction` to write data, or create a checkpoint.
+
+Metadata getters that may read storage live on `SnapshotReader`, created with `snapshot.reader()`.
+The reader borrows the snapshot and optionally holds an operation token; each getter accepts the
+original engine and binds the token through a temporary private `KernelEngine`. Getters are
+synchronous and may block on I/O, with or without a token. Cached results need not check cancellation.
+Separate readers keep their scopes independent without retaining an engine or changing the snapshot.
 
 ## Read Path
 
@@ -150,6 +162,11 @@ handlers below and an optional `PlanExecutor` under the `declarative-plans` feat
 Metrics are emitted as tracing events and collected by tracing layers. A `DefaultEngine` (Arrow +
 `object_store` + Tokio) lives in `default-engine/src/`. Custom engines only need to replace
 specific handlers: they can reuse defaults for the rest.
+
+`KernelEngine` wraps storage, JSON, and Parquet handlers with an operation's read token. Ordinary
+handler calls inherit it; explicit read tokens override it. Parsing, writes, evaluation, and
+declarative execution pass through unchanged. HEAD checks the bound token before the request,
+without interrupting an active request; nested wrappers each perform this check.
 
 ## EngineData Trait
 

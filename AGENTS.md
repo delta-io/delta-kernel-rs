@@ -112,6 +112,10 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
 **Snapshot** is the primary entry point for existing-table operations: an immutable view of a
 table at a specific version. From it you build a `Scan` (reads) or `Transaction` (writes).
 
+**Snapshot metadata:** `snapshot.reader()` creates a `SnapshotReader` for metadata getters that may
+read storage. Its optional token scopes synchronous, blocking reads without changing the shared
+snapshot or the connector's engine. In-memory getters remain on `Snapshot`.
+
 **Read path:** `Snapshot` -> `ScanBuilder` -> `Scan` -> data. Execution paths:
 `execute()` (simple), `scan_metadata()` (advanced/distributed),
 `parallel_scan_metadata()` (two-phase distributed log replay).

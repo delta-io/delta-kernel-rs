@@ -135,7 +135,15 @@ impl LogHistoryError {
 }
 
 impl From<LogHistoryError> for crate::KernelError {
+    /// Preserves typed cancellation and wraps other timestamp-conversion failures with context.
     fn from(e: LogHistoryError) -> Self {
+        if matches!(
+            &e,
+            LogHistoryError::Internal { source: Some(source), .. }
+                if matches!(source.as_ref(), crate::KernelError::Cancelled)
+        ) {
+            return crate::KernelError::Cancelled;
+        }
         crate::KernelError::LogHistory(Box::new(e))
     }
 }

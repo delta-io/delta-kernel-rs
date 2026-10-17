@@ -204,13 +204,8 @@ pub use log_compaction::{should_compact, LogCompactionWriter};
 #[cfg(feature = "declarative-plans")]
 pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
 use schema::StructField;
-pub use snapshot::{Snapshot, SnapshotRef};
+pub use snapshot::{Snapshot, SnapshotReader, SnapshotRef};
 
-#[cfg(any(
-    feature = "default-engine-base",
-    feature = "arrow-conversion",
-    feature = "declarative-plans"
-))]
 pub mod engine;
 
 /// Delta table version is 8 byte unsigned int

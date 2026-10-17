@@ -105,30 +105,32 @@ impl LogSegment {
 
     /// Pick the latest CRC to use as an advance base: this segment's on-disk CRC or
     /// `in_memory_base`, whichever is newer, falling back to `in_memory_base` on a failed on-disk
-    /// read. Drops a base below the checkpoint; returns None when no candidate remains.
+    /// read, except cancellation. Drops a base below the checkpoint; returns None when no candidate
+    /// remains.
     pub(crate) fn pick_latest_base_crc(
         &self,
         engine: &dyn Engine,
         in_memory_base: Option<&Arc<Crc>>,
-    ) -> Option<Arc<Crc>> {
+    ) -> KernelResult<Option<Arc<Crc>>> {
         let preferred_disk_crc = self
             .listed
             .latest_crc_file
             .as_ref()
             .filter(|f| in_memory_base.is_none_or(|m| f.version > m.version));
-        preferred_disk_crc
-            .and_then(|f| read_crc_file_or_none(engine, f))
-            .or_else(|| in_memory_base.cloned())
-            .filter(|crc| {
-                self.checkpoint_version
-                    .is_none_or(|ckpt| crc.version >= ckpt)
-            })
+        let disk_crc = preferred_disk_crc
+            .map(|file| read_crc_file_or_none(engine, file))
+            .transpose()?
+            .flatten();
+        Ok(disk_crc.or_else(|| in_memory_base.cloned()).filter(|crc| {
+            self.checkpoint_version
+                .is_none_or(|ckpt| crc.version >= ckpt)
+        }))
     }
 
     /// Read this segment's latest on-disk CRC (`latest_crc_file`), at whatever version it sits.
-    /// Returns None when there is no CRC file or the read fails. The returned CRC may be stale
-    /// (older than `end_version`).
-    pub(crate) fn read_latest_crc(&self, engine: &dyn Engine) -> Option<Arc<Crc>> {
+    /// Returns None when there is no CRC file or a non-cancellation read failure. The CRC may be
+    /// stale (older than `end_version`).
+    pub(crate) fn read_latest_crc(&self, engine: &dyn Engine) -> KernelResult<Option<Arc<Crc>>> {
         self.pick_latest_base_crc(engine, /* in_memory_base */ None)
     }
 
