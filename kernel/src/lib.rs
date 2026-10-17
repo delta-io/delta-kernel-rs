@@ -206,11 +206,6 @@ pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
 use schema::StructField;
 pub use snapshot::{Snapshot, SnapshotRef};
 
-#[cfg(any(
-    feature = "default-engine-base",
-    feature = "arrow-conversion",
-    feature = "declarative-plans"
-))]
 pub mod engine;
 
 /// Delta table version is 8 byte unsigned int
