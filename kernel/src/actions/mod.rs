@@ -1498,6 +1498,20 @@ impl LastManifestCommit {
         );
         Ok(())
     }
+
+    /// Whether this points at `checkpoint`. The caller must read `checkpoint` from the commit at
+    /// [`Self::version`].
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn points_at(&self, checkpoint: &CheckpointAction) -> bool {
+        checkpoint.content_root.version() == self.content_root_version
+    }
+
+    /// Parses the first `commitInfo.lastManifestCommit` in `data`, if any.
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> KernelResult<Option<Self>> {
+        let mut visitor = visitors::LastManifestCommitVisitor::default();
+        visitor.visit_rows_of(data)?;
+        Ok(visitor.last_manifest_commit)
+    }
 }
 
 /// The checkpoint action embeds metadata tree state in a Delta log entry.
@@ -1751,6 +1765,12 @@ impl ContentRoot {
             size_in_bytes,
             version,
         }
+    }
+
+    /// The table version the root manifest reflects.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn version(&self) -> i64 {
+        self.version
     }
 }
 
@@ -2211,6 +2231,18 @@ mod tests {
     ) {
         let result = LastManifestCommit::new(version, content_root_version);
         assert_eq!(result.is_ok(), ok);
+    }
+
+    #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+    #[rstest]
+    #[case::same_content_root_version(40, true)]
+    #[case::other_content_root_version(41, false)]
+    fn test_last_manifest_commit_points_at_matches_content_root_version(
+        #[case] content_root_version: i64,
+        #[case] expected: bool,
+    ) {
+        let pointer = LastManifestCommit::new(42, content_root_version).unwrap();
+        assert_eq!(pointer.points_at(&sample_checkpoint_action()), expected);
     }
 
     #[test]
