@@ -1738,7 +1738,7 @@ impl LogSegment {
 
 /// The first checkpoint action in `batches`, or `None` when no batch carries one.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn first_checkpoint_action(
+pub(super) fn first_checkpoint_action(
     batches: impl Iterator<Item = KernelResult<Box<dyn EngineData>>>,
 ) -> KernelResult<Option<CheckpointAction>> {
     for batch in batches {
