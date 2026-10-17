@@ -519,8 +519,8 @@ impl ScanBuilder {
     ///
     /// Cancellation is cooperative: Kernel forwards the token (if any) to cancellation-aware
     /// [`Engine`] operations, which own cancellation for their I/O and iterators. Work that
-    /// completes concurrently with cancellation may still succeed. Passing `None` means the scan
-    /// is not cancellable.
+    /// completes concurrently with cancellation may still succeed. Passing `None` leaves I/O
+    /// cancellation to the engine's handlers and disables scan-local checks on cached metadata.
     ///
     /// [`CancellationToken`]: crate::CancellationToken
     /// [`KernelError::Cancelled`]: crate::KernelError::Cancelled
@@ -848,8 +848,8 @@ pub struct Scan {
     stats: StatsOptions,
     correlation_id: Option<Arc<str>>,
     partition_values: PartitionValuesOptions,
-    /// Optional cooperative cancellation token supplied via
-    /// [`ScanBuilder::with_cancellation_token`]. `None` means the scan is not cancellable.
+    /// Scan-local token for cached metadata checks and I/O; `None` retains engine I/O
+    /// cancellation.
     cancellation_token: Option<CancellationTokenRef>,
 }
 
@@ -1348,9 +1348,10 @@ impl Scan {
     /// checkpoint manifests sequentially. After exhausting this iterator, call `finish()`
     /// to determine if a distributed phase is needed.
     ///
-    /// Cancellation is not supported on this path: it errors if a token was set via
-    /// [`ScanBuilder::with_cancellation_token`], rather than silently running to completion.
-    /// Only [`scan_metadata`](Self::scan_metadata) honors the token today.
+    /// Scan-local cancellation is not supported: a token supplied on the scan builder is rejected.
+    /// I/O can inherit a handler-bound token, but cancellation is not coordinated across
+    /// distributed phases. Use [`scan_metadata`](Self::scan_metadata) for scan-local
+    /// cancellation.
     ///
     /// # Example
     ///
@@ -1406,8 +1407,7 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> KernelResult<SequentialScanMetadata> {
-        // Fail fast rather than silently ignore a caller-supplied token: the parallel path does
-        // not thread cancellation, so honoring a set token would require dropping it on the floor.
+        // The scan token is not carried across distributed phases.
         if self.cancellation_token.is_some() {
             return Err(KernelError::unsupported(
                 "cancellation is not supported by parallel_scan_metadata; \

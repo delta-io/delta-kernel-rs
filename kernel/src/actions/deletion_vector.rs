@@ -814,7 +814,9 @@ mod tests {
 
     use super::{DeletionVectorDescriptor, *};
     use crate::engine::sync::SyncEngine;
-    use crate::unit_test_utils::assert_result_error_with_message;
+    use crate::engine::KernelEngine;
+    use crate::scan::state::DvInfo;
+    use crate::unit_test_utils::{assert_result_error_with_message, TestCancellationToken};
     use crate::Engine;
 
     fn dv_relative() -> DeletionVectorDescriptor {
@@ -1141,6 +1143,38 @@ mod tests {
         let expected: Vec<u64> = vec![0, 9];
         let found = tree_map.iter().collect::<Vec<_>>();
         assert_eq!(found, expected)
+    }
+
+    /// Cancels byte-backed deletion-vector reads through the bound storage handler.
+    #[rstest::rstest]
+    fn engine_deletion_vector_reads_inherit_cancellation(#[values(false, true)] cancelled: bool) {
+        let path = std::fs::canonicalize("tests/data/table-with-dv-small").unwrap();
+        let parent = Url::from_directory_path(path).unwrap();
+        let token = Arc::new(TestCancellationToken::default());
+        if cancelled {
+            token.cancel();
+        }
+        let engine = KernelEngine::new(&SyncEngine::new(), token);
+        let descriptor = dv_example();
+        let info = DvInfo {
+            deletion_vector: Some(descriptor.clone()),
+        };
+        let rows = info.get_row_indexes(&engine, &parent);
+        let selection = crate::scan::selection_vector(&engine, &descriptor, &parent);
+        if cancelled {
+            assert!(matches!(rows, Err(KernelError::Cancelled)));
+            assert!(matches!(selection, Err(KernelError::Cancelled)));
+        } else {
+            assert_eq!(rows.unwrap().unwrap(), [0, 9]);
+            assert_eq!(
+                selection
+                    .unwrap()
+                    .iter()
+                    .filter(|selected| !**selected)
+                    .count(),
+                2
+            );
+        }
     }
 
     // Reads through a `StorageHandler` to show the percent-encoded URL finds the raw-named object.
