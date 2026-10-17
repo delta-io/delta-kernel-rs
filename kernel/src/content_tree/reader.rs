@@ -606,10 +606,8 @@ fn build_entry_to_add_expression(
     // deletion-vector info across from the entry.
     let add = struct_expr_from_schema(&ADD_SCHEMA, |name| {
         Some(match name {
-            // TODO(#3319): `location` is the raw path stored in the AMT root; resolving it to a
-            // table-relative `Add.path` (percent-decoding, and relativizing against a manifest
-            // location for non-root entries) is not yet done -- it flows through verbatim, which
-            // round-trips only the minimal-root case that stored the raw path.
+            // `location` is a raw path; log replay of a checkpoint action encodes it into the
+            // RFC 2396 form `add.path` uses.
             n if n == PATH_NAME => Expression::column([LOCATION]),
             // TODO(#3320): read partition values from the entry's `partition` tuple once the read
             // path carries a partition spec.
