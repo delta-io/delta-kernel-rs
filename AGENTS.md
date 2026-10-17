@@ -391,28 +391,60 @@ Keep this list updated when new protocol features are added to kernel.
 
 ## Comment & Doc Style
 
+### Doc comments
+
 - MUST include doc comments for all public functions, structs, enums, and methods.
-- MUST document function parameters, return values, and errors.
-- Doc comments focus on "what" (contract with caller) more than "how" (implementation),
-  unless the "how" meaningfully impacts the "what".
+- Start with one concise sentence describing the caller-facing behavior. Add semantics and usage
+  details that help callers use the API correctly: preconditions, side effects, ownership, or edge
+  cases. Ask what the caller would do differently after reading each detail.
+- Rustdoc already displays the signature and links to types. Explain parameter meanings and
+  relationships in prose when needed; don't restate types or mention every parameter by rote.
+  `# Arguments`, `# Returns`, and `# Errors` sections are optional, not a checklist to fill in.
+- Document a function's errors only when the information changes how callers use or recover from
+  the API, is an intended part of its public contract, and is not already covered by the error
+  type's documentation. Don't enumerate propagated implementation errors or promise an exhaustive
+  set of failures.
+- Keep safety obligations explicit in `# Safety` sections for unsafe APIs, including relevant
+  ownership and lifetime requirements.
+- Type and module docs explain the abstraction, how to use it, and its relationships with other
+  abstractions. Don't inventory members that rustdoc already lists. Keep implementation rationale
+  and maintainer commentary in code comments unless callers need the information to use the API.
+- Add small, runnable doctests for important entry points when they clarify usage or invariants.
+  Scale their number and size to the API's complexity and importance; prefer focused examples over
+  a monolithic one. An invariant tested by a doctest need not have a duplicate unit test. Don't add
+  examples just to have them.
+
+For example, this summary from `ColumnName::parent` explains when the result is absent:
+
+```rust
+/// Returns the parent of this column name, or `None` if this is a top-level column.
+pub fn parent(&self) -> Option<ColumnName>
+```
+
+A separate "Returns an `Option<ColumnName>`" section would add nothing to the signature.
+
+### Code comments
+
 - Code comments state intent and explain "why": don't restate what the code self-documents.
-- Be succinct. No verbose AI-slop comments. With well-written and well-named code,
-  verbose comments are worse than none.
-- Say each thing once, in the right place: don't repeat the same idea across
-  doc comment and inline comment.
 - Comments earn their place only for hidden invariants, real-bug workarounds, or
   constraints the reader can't see from the code itself.
 - Don't enumerate what grep can answer. Lists like `// Used by a, b, c` rot the
   moment `d` lands. Describe the shape; let the reader grep.
+- Use `==` as a visual section divider in comments (e.g. `// === Helpers ===` or
+  `// ============`).
+
+### Shared conventions
+
+- Be succinct. No verbose AI-slop comments. With well-written and well-named code,
+  verbose comments are worse than none.
+- Say each thing once, in the right place: don't repeat the same idea across
+  doc comment and inline comment.
 - No stale-prone anchors in durable docs or source comments: counts ("the 10
   variants", "5-arm match"), line numbers, or enumeration lists. Describe the
   shape; let the reader grep.
 - Comments MUST NOT include temporal references: only refer to current code and
   design, not past iterations.
 - Keep comments up-to-date with code changes.
-- Include examples in doc comments for complex functions only.
-- Use `==` as a visual section divider in comments (e.g. `// === Helpers ===` or
-  `// ============`).
 - NEVER use emoji or unicode in comments that emulates emoji (e.g. special arrows,
   checkmarks). Use ASCII equivalents (`->`, `=>`, etc.) instead.
 
