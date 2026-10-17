@@ -72,13 +72,43 @@ pub unsafe extern "C" fn get_plan_based_engine(
     engine_to_handle(engine, allocate_error)
 }
 
+/// Construct a native Arrow engine whose raw I/O is supplied by `plan_executor`.
+///
+/// Only I/O operations are dispatched to the executor. Parsing and expression evaluation stay in
+/// Rust, and callbacks run synchronously on the thread invoking each kernel operation.
+///
+/// # Safety
+///
+/// `plan_executor` must be a valid handle from [`get_plan_executor`]. It is consumed
+/// unconditionally. The caller must keep its context and callbacks alive until the returned engine
+/// and all resources derived from it are released. `allocate_error` must remain valid for the same
+/// lifetime.
+#[no_mangle]
+pub unsafe extern "C" fn get_storage_engine(
+    plan_executor: Handle<SharedPlanExecutor>,
+    allocate_error: AllocateErrorFn,
+) -> Handle<SharedExternEngine> {
+    let executor = unsafe { plan_executor.into_inner() };
+    let storage = delta_kernel::engine::plans::storage::PlanBasedStorageHandler::new(executor);
+    let engine = delta_kernel::engine::storage::StorageEngine::new(Arc::new(storage));
+    engine_to_handle(Arc::new(engine), allocate_error)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+    use std::sync::Mutex;
+    use std::thread::{self, ThreadId};
+
     use delta_kernel::arrow::array::{Array, RecordBatch, StringArray};
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::engine_data::FilteredEngineData;
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::plans::proto::operation as proto;
+    use delta_kernel::schema::schema_ref;
     use delta_kernel_default_engine::DefaultEngineBuilder;
+    use prost::Message as _;
     use url::Url;
 
     use super::*;
@@ -158,6 +188,73 @@ mod tests {
         assert_is_plan_based_engine(&engine_handle);
 
         unsafe { free_engine(engine_handle) };
+    }
+
+    #[test]
+    fn storage_engine_keeps_parsing_native_and_dispatches_only_raw_io_on_caller_thread() {
+        type Calls = Mutex<Vec<(ThreadId, Vec<u8>)>>;
+        extern "C" fn write_callback(
+            context: NullableCvoid,
+            plan_proto: crate::KernelBytesSlice,
+            out: *mut EngineExecResult<CPlanResult>,
+        ) {
+            // SAFETY: the test retains the context until the engine handle is freed.
+            let calls = unsafe { &*context.unwrap().cast::<Calls>().as_ptr() };
+            let bytes = unsafe { plan_proto.try_as_slice() }.unwrap().to_vec();
+            calls.lock().unwrap().push((thread::current().id(), bytes));
+            unsafe { out.write(EngineExecResult::Success(CPlanResult::Unit)) };
+        }
+
+        let calls: Calls = Mutex::new(Vec::new());
+        let context = NonNull::new((&calls as *const Calls).cast_mut().cast::<c_void>());
+        let executor = unsafe { get_plan_executor(context, write_callback) };
+        let handle = unsafe { get_storage_engine(executor, allocate_err) };
+        let engine = unsafe { handle.as_ref() }.engine();
+        assert!(engine
+            .any_ref()
+            .is::<delta_kernel::engine::storage::StorageEngine>());
+        assert!(engine.plan_executor().is_none());
+        let json = RecordBatch::try_from_iter(vec![(
+            "json",
+            Arc::new(StringArray::from(vec![r#"{"value":"one"}"#])) as Arc<dyn Array>,
+        )])
+        .unwrap();
+        let data = engine
+            .json_handler()
+            .parse_json(
+                Box::new(ArrowEngineData::new(json)),
+                schema_ref! { not_null "value": STRING },
+            )
+            .unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+        let location = Url::parse("memory:///table/00000000000000000000.json").unwrap();
+        let size = engine
+            .json_handler()
+            .write_json_file(
+                &location,
+                Box::new(std::iter::once(Ok(
+                    FilteredEngineData::with_all_rows_selected(data),
+                ))),
+                false,
+            )
+            .unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, thread::current().id());
+        let op = proto::Operation::decode(calls[0].1.as_slice()).unwrap();
+        let Some(proto::operation::Op::Io(op)) = op.op else {
+            panic!("expected raw I/O")
+        };
+        let Some(proto::io_operation::Op::WriteBytes(write)) = op.op else {
+            panic!("expected byte write")
+        };
+        assert_eq!(write.url, location.to_string());
+        assert!(!write.overwrite);
+        assert_eq!(write.data, b"{\"value\":\"one\"}\n");
+        assert_eq!(size, write.data.len() as u64);
+        drop(calls);
+        drop(engine);
+        unsafe { free_engine(handle) };
     }
 
     /// Without a fallback, an operation the plan-execution path does not implement reports that
