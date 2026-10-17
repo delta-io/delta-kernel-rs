@@ -3,8 +3,10 @@
 //! The default Arrow/Tokio engine lives in the separate `delta_kernel_default_engine` crate.
 //! `SyncEngine` is included only in test builds.
 
+mod kernel_engine;
 #[cfg(feature = "arrow-expression")]
 use delta_kernel_derive::internal_api;
+pub(crate) use kernel_engine::KernelEngine;
 
 #[cfg(feature = "arrow-expression")]
 use crate::parquet::arrow::arrow_reader::ArrowReaderOptions;

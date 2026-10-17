@@ -232,11 +232,10 @@ impl CommitActionsIterator {
     }
 }
 
-/// Prepend `commit v={version}` context to `err`, preserving the original variant for the two
-/// kernel error kinds that protocol validation surfaces ([`KernelError::Unsupported`] and
-/// [`KernelError::InvalidProtocol`]). Other variants fall back to [`KernelError::generic`].
+/// Adds commit-version context while preserving protocol error kinds and typed cancellation.
 fn with_version_context(version: Version, err: KernelError) -> KernelError {
     match err {
+        KernelError::Cancelled => KernelError::Cancelled,
         KernelError::Unsupported(msg) => {
             KernelError::Unsupported(format!("commit v={version}: {msg}"))
         }

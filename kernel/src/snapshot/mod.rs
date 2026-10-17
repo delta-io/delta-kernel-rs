@@ -405,7 +405,9 @@ impl Snapshot {
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
         //         (or use it as-is when already there) per `incremental_replay`.
-        let base_crc = log_segment.read_latest_crc(engine);
+        let base_crc = log_segment
+            .read_latest_crc(engine)
+            .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
         let crc_at_version = log_segment
             .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
             .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;

@@ -6,6 +6,7 @@ use delta_kernel_derive::internal_api;
 use tracing::{info, instrument};
 
 use crate::cancellation::CancellationTokenRef;
+use crate::engine::KernelEngine;
 use crate::log_path::LogPath;
 use crate::log_segment::{validate_catalog_managed_log_tail, LogSegment};
 use crate::log_segment_files::CheckpointHandling;
@@ -56,9 +57,7 @@ pub struct SnapshotBuilder<Mode = FromTableRoot> {
     /// Opaque, caller-supplied id recorded on this build's metric events. Not interpreted by
     /// kernel; set via [`with_correlation_id`](Self::with_correlation_id).
     correlation_id: Option<Arc<str>>,
-    /// Optional cooperative cancellation token supplied via
-    /// [`with_cancellation_token`](Self::with_cancellation_token). `None` means the build is not
-    /// cancellable.
+    /// Optional cooperative cancellation token for this build's handler-backed reads.
     cancellation_token: Option<CancellationTokenRef>,
     // Carries the zero-sized typestate that limits mode-specific methods at compile time.
     mode: PhantomType<Mode>,
@@ -267,10 +266,14 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// Supply a [`CancellationToken`] for snapshot builds that list or read the log.
     ///
     /// Kernel forwards the token (if any) to cancellation-aware [`Engine`] listing and read
-    /// operations, and [`build`](Self::build) fails with [`KernelError::Cancelled`] if cancellation
-    /// is observed before they complete. Snapshot-hint builds perform no listing or reads, so
-    /// the token has no effect on them. By default (or when passing `None`), the build is not
-    /// cancellable.
+    /// operations, including CRC and imperative protocol/metadata replay. Declarative plan
+    /// execution does not use this token. The build fails with [`KernelError::Cancelled`] if
+    /// cancellation is observed during these reads. Snapshot-hint builds perform no listing or
+    /// reads, so the token has no effect on them. By default (or when passing `None`), the
+    /// supplied engine's cancellation behavior is unchanged.
+    ///
+    /// This token applies only to the build and is not retained by the snapshot. Builds run
+    /// synchronously and may block on I/O, including when a cancellation token is supplied.
     ///
     /// [`CancellationToken`]: crate::CancellationToken
     /// [`KernelError::Cancelled`]: crate::KernelError::Cancelled
@@ -376,6 +379,10 @@ impl<Mode> SnapshotBuilder<Mode> {
                 incremental_replay,
             )?
         } else {
+            let scoped_engine = cancellation_token.map(|token| KernelEngine::new(engine, token));
+            let engine = scoped_engine
+                .as_ref()
+                .map_or(engine, |engine| engine as &dyn Engine);
             let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
 
             // Pre-build validations for catalog-managed tables
@@ -398,7 +405,7 @@ impl<Mode> SnapshotBuilder<Mode> {
                     log_tail,
                     effective_version,
                     metric_context.clone(),
-                    cancellation_token.as_ref(),
+                    None,
                 )?;
                 Snapshot::try_new_from_log_segment(
                     table_url,
@@ -424,7 +431,6 @@ impl<Mode> SnapshotBuilder<Mode> {
                     incremental_replay,
                     checkpoint_handling,
                     built_as_latest,
-                    cancellation_token.as_ref(),
                 )?
             }
         };
