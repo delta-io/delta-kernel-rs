@@ -47,6 +47,9 @@ use crate::utils::require;
 use crate::{Engine, KernelError, KernelResult, LogCompactionWriter, Version};
 
 mod builder;
+#[cfg(all(feature = "internal-api", feature = "declarative-plans"))]
+#[doc(hidden)]
+pub mod externalized;
 mod hint;
 mod incremental;
 mod snapshot_crc;

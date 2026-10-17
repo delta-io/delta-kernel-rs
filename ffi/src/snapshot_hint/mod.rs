@@ -15,6 +15,8 @@ use crate::{
 };
 
 mod export;
+#[cfg(feature = "declarative-plans")]
+mod planning;
 
 /// Exports retained snapshot state through one callback without engine I/O.
 ///

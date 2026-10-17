@@ -36,6 +36,261 @@ fn slice(value: &'static str) -> KernelStringSlice {
     unsafe { KernelStringSlice::new_unsafe(value) }
 }
 
+#[cfg(feature = "declarative-plans")]
+fn assert_trusted_round_trip(
+    snapshot: &Handle<SharedSnapshot>,
+    engine: &Handle<SharedExternEngine>,
+) {
+    let reconstructed = planning_tests::reconstruct_and_assert(snapshot, engine);
+    unsafe { free_snapshot(reconstructed) };
+}
+
+#[cfg(feature = "declarative-plans")]
+mod planning_tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::error::{EngineExecError, EngineExecResult};
+    use crate::plans::result::CPlanResult;
+    use crate::plans::{get_plan_based_engine, get_plan_executor};
+    use crate::scan::{
+        free_scan, scan_builder, scan_builder_build, scan_declarative_metadata_plan, SharedScan,
+    };
+    use crate::snapshot_hint::planning::{
+        snapshot_hint_reconstruct_trusted, snapshot_schema_to_proto,
+    };
+    use crate::KernelBytesSlice;
+
+    extern "C" fn no_checkpoint_executor(
+        _context: NullableCvoid,
+        _bytes: KernelBytesSlice,
+        out: *mut EngineExecResult<CPlanResult>,
+    ) {
+        let error = EngineExecError {
+            etype: FFIKernelError::UnsupportedError,
+            message: Box::new("unexpected engine I/O during planning".to_string()).into(),
+        };
+        unsafe { out.write(EngineExecResult::Failure(error)) };
+    }
+
+    unsafe extern "C" fn copy_bytes(context: NullableCvoid, bytes: KernelBytesSlice) -> bool {
+        let output = unsafe { &mut *context.unwrap().as_ptr().cast::<Vec<u8>>() };
+        match unsafe { bytes.try_as_slice() } {
+            Ok(bytes) => {
+                output.extend_from_slice(bytes);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    unsafe extern "C" fn reject_bytes(_context: NullableCvoid, _bytes: KernelBytesSlice) -> bool {
+        false
+    }
+
+    fn plan_bytes(scan: &Handle<SharedScan>, engine: &Handle<SharedExternEngine>) -> Vec<u8> {
+        let result = unsafe {
+            ok_or_panic(scan_declarative_metadata_plan(
+                scan.shallow_copy(),
+                engine.shallow_copy(),
+            ))
+        };
+        match result {
+            OptionalValue::Some(bytes) => unsafe { bytes.into_vec() },
+            OptionalValue::None => panic!("expected a metadata plan"),
+        }
+    }
+
+    struct ReconstructVisit<'a> {
+        table_root: &'a str,
+        engine: &'a Handle<SharedExternEngine>,
+        schema: &'a [u8],
+        result: Option<ExternResult<Handle<SharedSnapshot>>>,
+    }
+
+    extern "C" fn reconstruct_hint(context: NullableCvoid, hint: *const FfiSnapshotHint) {
+        let state = unsafe { &mut *context.unwrap().as_ptr().cast::<ReconstructVisit<'_>>() };
+        state.result = Some(unsafe {
+            snapshot_hint_reconstruct_trusted(
+                KernelStringSlice::new_unsafe(state.table_root),
+                hint,
+                KernelBytesSlice::new_unsafe(state.schema),
+                state.engine.shallow_copy(),
+            )
+        });
+    }
+
+    pub(super) fn reconstruct_and_assert(
+        snapshot: &Handle<SharedSnapshot>,
+        engine: &Handle<SharedExternEngine>,
+    ) -> Handle<SharedSnapshot> {
+        let original = unsafe { snapshot.as_ref() };
+        let mut schema = Vec::new();
+        assert!(unsafe {
+            ok_or_panic(snapshot_schema_to_proto(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+                Some(NonNull::from(&mut schema).cast()),
+                copy_bytes,
+            ))
+        });
+        let mut visit = ReconstructVisit {
+            table_root: original.table_root().as_str(),
+            engine,
+            schema: &schema,
+            result: None,
+        };
+        assert!(unsafe {
+            ok_or_panic(snapshot_to_snapshot_hint(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+                Some(NonNull::from(&mut visit).cast()),
+                reconstruct_hint,
+            ))
+        });
+        let reconstructed = ok_or_panic(visit.result.take().unwrap());
+        let restored = unsafe { reconstructed.as_ref() };
+        assert_eq!(restored.version(), original.version());
+        assert_eq!(restored.schema(), original.schema());
+        assert_eq!(
+            restored.table_configuration().metadata(),
+            original.table_configuration().metadata(),
+        );
+        assert_eq!(
+            restored.table_configuration().protocol(),
+            original.table_configuration().protocol(),
+        );
+        assert_eq!(restored.is_built_as_latest(), original.is_built_as_latest());
+        assert_eq!(restored.crc_at_version(), original.crc_at_version());
+        assert_eq!(restored.log_segment(), original.log_segment());
+        reconstructed
+    }
+
+    #[rstest]
+    #[case::snapshot_open(false)]
+    #[case::snapshot_closed(true)]
+    fn reconstructed_scan_can_plan_repeatedly(
+        #[case] close_snapshot_first: bool,
+        #[values(false, true)] with_crc: bool,
+        #[values(false, true)] latest: bool,
+    ) {
+        let fallback = test_engine();
+        let paths = [
+            FfiLogPath::new(
+                slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+                12,
+                34,
+            ),
+            FfiLogPath::new(
+                slice("memory:///hinted-table/_delta_log/00000000000000000001.json"),
+                56,
+                78,
+            ),
+        ];
+        const SCHEMA: &str = r#"{"type":"struct","fields":[
+              {"name":"id","type":"integer","nullable":true,"metadata":{}}
+            ]}"#;
+        let metadata = || FfiMetadata {
+            schema_string: slice(SCHEMA),
+            ..test_metadata()
+        };
+        let crc = FfiCrc {
+            version: 1,
+            metadata: metadata(),
+            file_stats_state: FfiFileStatsState {
+                kind: FfiFileStatsStateKind::Complete,
+                file_stats: FfiFileStats {
+                    num_files: 3,
+                    table_size_bytes: 42,
+                },
+                file_size_histogram: std::ptr::null(),
+            },
+            ..empty_crc()
+        };
+        let freshness = if latest {
+            FfiSnapshotHintFreshness::Latest
+        } else {
+            FfiSnapshotHintFreshness::Unverified
+        };
+        let mut hint = test_snapshot_hint(&paths, 1, freshness);
+        hint.metadata = metadata();
+        if with_crc {
+            hint.crc = &crc;
+        }
+        let builder = unsafe {
+            ok_or_panic(snapshot_builder_with_snapshot_hint(
+                test_builder(&fallback),
+                &hint,
+            ))
+        };
+        let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+        let executor = unsafe { get_plan_executor(None, no_checkpoint_executor) };
+        let engine = unsafe { get_plan_based_engine(executor, OptionalValue::None, allocate_err) };
+        assert_extern_result_error_contains(
+            unsafe {
+                snapshot_schema_to_proto(
+                    snapshot.shallow_copy(),
+                    engine.shallow_copy(),
+                    None,
+                    reject_bytes,
+                )
+            },
+            FFIKernelError::InvalidSnapshotHint,
+            "byte callback rejected delivery",
+        );
+        let scan = unsafe {
+            ok_or_panic(scan_builder_build(
+                scan_builder(snapshot.shallow_copy()),
+                engine.shallow_copy(),
+            ))
+        };
+        let baseline = plan_bytes(&scan, &engine);
+        let reconstructed = reconstruct_and_assert(&snapshot, &engine);
+        let reconstructed_scan = unsafe {
+            ok_or_panic(scan_builder_build(
+                scan_builder(reconstructed.shallow_copy()),
+                engine.shallow_copy(),
+            ))
+        };
+        let mut reconstructed = Some(reconstructed);
+        if close_snapshot_first {
+            unsafe { free_snapshot(reconstructed.take().unwrap()) };
+        }
+        // The query's scan must not borrow the source snapshot or exported schema storage.
+        unsafe { free_scan(scan) };
+        unsafe { free_snapshot(snapshot) };
+        for _ in 0..3 {
+            assert_eq!(baseline, plan_bytes(&reconstructed_scan, &engine));
+        }
+        unsafe {
+            free_scan(reconstructed_scan);
+            if let Some(reconstructed) = reconstructed {
+                free_snapshot(reconstructed);
+            }
+            free_engine(engine);
+            free_engine(fallback);
+        }
+    }
+
+    #[test]
+    fn reconstruction_rejects_null_hint() {
+        let engine = test_engine();
+        assert_extern_result_error_contains(
+            unsafe {
+                snapshot_hint_reconstruct_trusted(
+                    slice("memory:///hinted-table/"),
+                    std::ptr::null(),
+                    KernelBytesSlice::new_unsafe(&[]),
+                    engine.shallow_copy(),
+                )
+            },
+            FFIKernelError::InvalidSnapshotHint,
+            "snapshot hint must not be null",
+        );
+        unsafe { free_engine(engine) };
+    }
+}
+
 fn invalid_utf8() -> KernelStringSlice {
     static INVALID_UTF8: [u8; 1] = [0xff];
     KernelStringSlice {
@@ -393,6 +648,8 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
         crc_version: None,
         visits: 0,
     };
+    #[cfg(feature = "declarative-plans")]
+    assert_trusted_round_trip(&snapshot, &engine);
     assert!(unsafe {
         ok_or_panic(snapshot_to_snapshot_hint(
             snapshot.shallow_copy(),
@@ -564,6 +821,8 @@ fn rebuild_through_visitor(
     snapshot: &Handle<SharedSnapshot>,
     engine: &Handle<SharedExternEngine>,
 ) -> Handle<SharedSnapshot> {
+    #[cfg(feature = "declarative-plans")]
+    assert_trusted_round_trip(snapshot, engine);
     let builder = ok_or_panic(install_through_visitor(
         snapshot,
         test_builder(engine),
@@ -676,6 +935,8 @@ fn visited_hint_round_trips_explicit_watermark_and_outlives_source(
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let expected_segment = unsafe { snapshot.as_ref() }.log_segment().clone();
     let expected_crc = unsafe { snapshot.as_ref() }.crc_at_version().cloned();
+    #[cfg(feature = "declarative-plans")]
+    assert_trusted_round_trip(&snapshot, &engine);
     let mut state = VisitedHint {
         builder: Some(test_builder(&engine)),
         result: None,
@@ -873,6 +1134,8 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
         source_ref.log_segment().listed.ascending_commit_files
     );
     let published: Handle<SharedSnapshot> = published.into();
+    #[cfg(feature = "declarative-plans")]
+    assert_trusted_round_trip(&published, &engine);
     let expected_segment = unsafe { published.as_ref() }.log_segment().listed.clone();
     let builder = unsafe { snapshot_builder_with_max_catalog_version(test_builder(&engine), 1) };
     let mut state = VisitedHint {
