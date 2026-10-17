@@ -10,7 +10,9 @@ use test_utils::{add_commit, assert_result_error_with_message, delta_path_for_ve
 use url::Url;
 
 use super::{CheckpointActionResolution, LastManifestCommitResolution, LogSegment};
-use crate::actions::LastManifestCommit;
+#[cfg(feature = "declarative-plans")]
+use crate::actions::SetTransaction;
+use crate::actions::{CheckpointAction, CommitInfo, ContentRoot, LastManifestCommit, Protocol};
 use crate::committer::FileSystemCommitter;
 use crate::crc::{Crc, CrcDelta, FileStats, FileStatsState};
 use crate::engine::sync::SyncEngine;
@@ -49,13 +51,17 @@ fn checkpoint_commit(version: i64, extra_features: &[TableFeature], schema: Sche
 // `lastManifestCommit` pointer.
 fn checkpoint_action(version: i64, extra_features: &[TableFeature], schema: SchemaRef) -> String {
     let config = adaptive_metadata_table_configuration(schema, extra_features);
-    serde_json::json!({ "checkpoint": [
-        { "checkpointMetadata": { "version": version } },
-        { "contentRoot": { "path": "metadata/root.parquet", "sizeInBytes": 1, "version": version } },
-        { "protocol": config.protocol() },
-        { "metaData": config.metadata() },
-    ] })
-    .to_string()
+    let checkpoint = CheckpointAction {
+        version,
+        content_root: ContentRoot::new("metadata/root.parquet".to_string(), 1, version),
+        protocol: config.protocol().clone(),
+        metadata: config.metadata().clone(),
+        transactions: vec![],
+        domain_metadata: vec![],
+        txn_sidecars: vec![],
+        domain_metadata_sidecars: vec![],
+    };
+    serde_json::json!({ "checkpoint": checkpoint }).to_string()
 }
 
 // Builds a top-level `metaData` commit line with the given schema (no protocol).
@@ -75,13 +81,16 @@ fn standalone_pm_commit(schema: SchemaRef) -> String {
     )
 }
 
+// Builds a commit holding only a `txn` action: no commitInfo, Protocol, or Metadata.
+#[cfg(feature = "declarative-plans")]
+fn txn_commit() -> String {
+    serde_json::json!({ "txn": SetTransaction::new("app".to_string(), 1, None) }).to_string()
+}
+
 // Builds a top-level `protocol` commit line with the given reader/writer versions (no features).
-fn protocol_commit(min_reader_version: i64, min_writer_version: i64) -> String {
-    serde_json::json!({ "protocol": {
-        "minReaderVersion": min_reader_version,
-        "minWriterVersion": min_writer_version,
-    } })
-    .to_string()
+fn protocol_commit(min_reader_version: i32, min_writer_version: i32) -> String {
+    let protocol = Protocol::try_new_legacy(min_reader_version, min_writer_version).unwrap();
+    serde_json::json!({ "protocol": protocol }).to_string()
 }
 
 // Prepends to `commit` a `commitInfo` carrying `last_manifest_commit` forward, as a writer does on
@@ -96,9 +105,11 @@ fn commit_info(last_manifest_commit: Option<(i64, i64)>) -> String {
         Some((version, content_root_version)) => {
             last_manifest_commit_info(version, content_root_version)
         }
-        None => {
-            serde_json::json!({ "commitInfo": { "operation": "WRITE", "inCommitTimestamp": 1 } })
-        }
+        None => serde_json::json!({ "commitInfo": CommitInfo {
+            operation: Some("WRITE".to_string()),
+            in_commit_timestamp: Some(1),
+            ..Default::default()
+        } }),
     }
     .to_string()
 }
@@ -436,6 +447,19 @@ async fn assert_replay_resolution<E: Engine>(
     expected_version: Option<i64>,
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
 ) {
+    // Only a capture counts: a `Located` defers the action to the accessor.
+    let version = match replay_checkpoint_action(commits, make_engine).await {
+        CheckpointActionResolution::Captured(action) => Some(action.version),
+        CheckpointActionResolution::Located(_) | CheckpointActionResolution::Unresolved => None,
+    };
+    assert_eq!(version, expected_version);
+}
+
+// Writes `commits` as versions 0.. and replays P&M at the latest version.
+async fn replay_checkpoint_action<E: Engine>(
+    commits: &[String],
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) -> CheckpointActionResolution {
     let store = Arc::new(InMemory::new());
     let table_root = url::Url::parse("memory:///").unwrap();
     for (version, commit) in commits.iter().enumerate() {
@@ -452,15 +476,10 @@ async fn assert_replay_resolution<E: Engine>(
     let engine = make_engine(store);
     let log_segment = latest_log_segment(&table_root, &engine);
 
-    let resolution = log_segment
+    log_segment
         .read_protocol_metadata_opt(&engine, None)
-        .unwrap();
-    // Only a capture counts: a `Located` defers the action to the accessor.
-    let version = match resolution.checkpoint_action {
-        CheckpointActionResolution::Captured(action) => Some(action.version),
-        CheckpointActionResolution::Located(_) | CheckpointActionResolution::Unresolved => None,
-    };
-    assert_eq!(version, expected_version);
+        .unwrap()
+        .checkpoint_action
 }
 
 // The plan path finds checkpoint actions only through `lastManifestCommit`, so an older action is
@@ -514,15 +533,32 @@ async fn plan_replay_errors_on_invalid_pointer(
     #[case] commits: Vec<String>,
     #[case] expected_error: &str,
 ) {
+    assert_replay_errors(&commits, expected_error, |store| {
+        SyncEngine::new_with_store(store)
+    })
+    .await;
+}
+
+#[cfg(feature = "declarative-plans")]
+async fn assert_replay_errors<E: Engine>(
+    commits: &[String],
+    expected_error: &str,
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
     let store = Arc::new(InMemory::new());
     let table_root = url::Url::parse("memory:///").unwrap();
-    for (version, commit) in commits.into_iter().enumerate() {
-        add_commit(table_root.as_str(), store.as_ref(), version as u64, commit)
-            .await
-            .unwrap();
+    for (version, commit) in commits.iter().enumerate() {
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            version as u64,
+            commit.clone(),
+        )
+        .await
+        .unwrap();
     }
 
-    let engine = SyncEngine::new_with_store(store);
+    let engine = make_engine(store);
     let result = Snapshot::builder_for(table_root).build(&engine);
     assert_result_error_with_message(result, expected_error);
 }
@@ -766,9 +802,17 @@ async fn assert_replay_last_manifest_commit<E: Engine>(
     let resolution = log_segment
         .read_protocol_metadata_opt(&engine, None)
         .unwrap();
-    match (resolution.last_manifest_commit, expected) {
+    assert_last_manifest_commit_resolution(&resolution.last_manifest_commit, expected);
+}
+
+// Asserts that replay found `expected`, or left a miss `Unresolved`.
+fn assert_last_manifest_commit_resolution(
+    resolution: &LastManifestCommitResolution,
+    expected: &Option<LastManifestCommit>,
+) {
+    match (resolution, expected) {
         (LastManifestCommitResolution::Resolved(Some(resolved)), Some(expected)) => {
-            assert_eq!(&resolved, expected)
+            assert_eq!(resolved, expected)
         }
         (LastManifestCommitResolution::Unresolved, None) => {}
         (resolution, expected) => panic!("expected {expected:?}, got {resolution:?}"),
@@ -781,18 +825,53 @@ async fn assert_replay_last_manifest_commit<E: Engine>(
 #[cfg(feature = "declarative-plans")]
 #[tokio::test]
 async fn plan_replay_reads_pointer_from_newest_commit_covered_by_compaction() {
-    let two_column_schema = test_schema_flat_with_column_mapping();
-    let (store, table_root) = manifest_commit_table(&[
-        checkpoint_commit(1, &[], two_column_schema.clone()),
+    let later_commits = [
+        checkpoint_commit(1, &[], test_schema_flat_with_column_mapping()),
         commit_info(Some((1, 1))),
-    ])
+    ];
+    assert_compacted_replay(
+        &later_commits,
+        &test_schema_flat_with_column_mapping(),
+        &Some(LastManifestCommit::new(1, 1).unwrap()),
+        |store| SyncEngine::new_with_store(store),
+    )
     .await;
-    let compaction = compacted_log_path_for_versions(1, 2, "json");
-    let txn = serde_json::json!({ "txn": { "appId": "app", "version": 1 } }).to_string();
-    store.put(&compaction, txn.into()).await.unwrap();
+}
 
-    let engine = SyncEngine::new_with_store(store);
-    let mut log_segment = latest_log_segment(&table_root, &engine);
+#[cfg(feature = "declarative-plans")]
+async fn assert_compacted_replay<E: Engine>(
+    later_commits: &[String],
+    expected_schema: &SchemaRef,
+    expected_pointer: &Option<LastManifestCommit>,
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let (store, table_root) = manifest_commit_table(later_commits).await;
+    let engine = make_engine(store.clone());
+    let log_segment =
+        segment_with_newest_two_compacted(&store, &table_root, &engine, later_commits.len()).await;
+
+    let resolution = log_segment
+        .read_protocol_metadata_opt(&engine, None)
+        .unwrap();
+    let schema = resolution.metadata.unwrap().parse_schema().unwrap();
+    assert_eq!(&schema, expected_schema.as_ref());
+    assert_last_manifest_commit_resolution(&resolution.last_manifest_commit, expected_pointer);
+}
+
+// Writes a log compaction covering the newest two commits and returns a segment that uses it.
+// Compaction listing is disabled, so the compaction is added to the segment by hand.
+#[cfg(feature = "declarative-plans")]
+async fn segment_with_newest_two_compacted(
+    store: &InMemory,
+    table_root: &url::Url,
+    engine: &impl Engine,
+    newest_version: usize,
+) -> LogSegment {
+    let newest_version = newest_version as u64;
+    let compaction = compacted_log_path_for_versions(newest_version - 1, newest_version, "json");
+    store.put(&compaction, txn_commit().into()).await.unwrap();
+
+    let mut log_segment = latest_log_segment(table_root, engine);
     let compaction_location = table_root.join(compaction.as_ref()).unwrap();
     let compaction = ParsedLogPath::try_from(FileMeta::new(compaction_location, 0, 100))
         .unwrap()
@@ -801,34 +880,36 @@ async fn plan_replay_reads_pointer_from_newest_commit_covered_by_compaction() {
         .listed
         .ascending_compaction_files
         .push(compaction);
-
-    let resolution = log_segment
-        .read_protocol_metadata_opt(&engine, None)
-        .unwrap();
-    let schema = resolution.metadata.unwrap().parse_schema().unwrap();
-    assert_eq!(&schema, two_column_schema.as_ref());
-    assert!(matches!(
-        resolution.last_manifest_commit,
-        LastManifestCommitResolution::Resolved(Some(pointer)) if pointer.version == 1
-    ));
+    log_segment
 }
 
 // A replayed snapshot serves `lastManifestCommit` from build-time state: it still resolves after
-// the commit file that carried it is deleted.
+// the newest commit file is deleted.
+#[rstest]
+#[case::carried_pointer(commit_info(Some((0, 0))), Some((0, 0)))]
 #[tokio::test]
-async fn replayed_snapshot_serves_last_manifest_commit_without_reading_the_log() {
-    let (store, table_root) = manifest_commit_table(&[commit_info(Some((0, 0)))]).await;
-    let engine = non_plan_engine(store.clone());
+async fn replayed_snapshot_serves_last_manifest_commit_without_reading_the_log(
+    #[case] newest_commit: String,
+    #[case] expected: Option<(i64, i64)>,
+) {
+    assert_snapshot_serves_last_manifest_commit(&newest_commit, expected, non_plan_engine).await;
+}
+
+async fn assert_snapshot_serves_last_manifest_commit<E: Engine>(
+    newest_commit: &str,
+    expected: Option<(i64, i64)>,
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let (store, table_root) = manifest_commit_table(&[newest_commit.to_string()]).await;
+    let engine = make_engine(store.clone());
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
     store
         .delete(&delta_path_for_version(1, "json"))
         .await
         .unwrap();
-    assert_eq!(
-        snapshot.last_manifest_commit(&engine).unwrap(),
-        Some(LastManifestCommit::new(0, 0).unwrap())
-    );
+    let expected = expected.map(|(v, c)| LastManifestCommit::new(v, c).unwrap());
+    assert_eq!(snapshot.last_manifest_commit(&engine).unwrap(), expected);
 }
 
 // A snapshot built without P&M replay (`Snapshot::new`) reads `lastManifestCommit` from its

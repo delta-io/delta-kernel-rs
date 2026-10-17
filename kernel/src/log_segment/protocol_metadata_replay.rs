@@ -8,6 +8,8 @@ use std::sync::{Arc, LazyLock};
 use tracing::{info, instrument};
 use url::Url;
 
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+use super::first_checkpoint_action;
 use super::LogSegment;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::LastManifestCommitVisitor;
@@ -193,9 +195,13 @@ impl LogSegment {
             return resolve_pm_batches(
                 self.read_pm_batches_via_plan(executor.as_ref())?,
                 #[cfg(feature = "adaptive-metadata-in-dev")]
-                |candidate| {
-                    self.merge_pointed_checkpoint_action(candidate, |commit| {
-                        Self::read_checkpoint_action_via_plan(executor.as_ref(), commit)
+                |resolved| {
+                    self.merge_pointed_checkpoint_action(resolved, |commit, pointer| {
+                        Self::read_pointed_checkpoint_action_via_plan(
+                            executor.as_ref(),
+                            commit,
+                            pointer,
+                        )
                     })
                 },
             );
@@ -208,25 +214,25 @@ impl LogSegment {
     }
 
     /// Merges in the checkpoint action that `lastManifestCommit` points at, read with
-    /// `read_checkpoint`.
+    /// `read_pointed`.
     ///
     /// # Errors
     /// Returns an error if the pointed commit cannot be read or lacks a matching checkpoint action.
     #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
     fn merge_pointed_checkpoint_action(
         &self,
-        candidate: PmCandidate,
-        read_checkpoint: impl FnOnce(&ParsedLogPath) -> KernelResult<Option<CheckpointAction>>,
+        resolved: PmCandidate,
+        read_pointed: impl FnOnce(&ParsedLogPath, &LastManifestCommit) -> KernelResult<CheckpointAction>,
     ) -> KernelResult<PmCandidate> {
-        let Some((_, pointer)) = candidate.last_manifest_commit.clone() else {
-            return Ok(candidate);
+        let Some((_, pointer)) = resolved.last_manifest_commit.clone() else {
+            return Ok(resolved);
         };
         // The pointed action's P&M is at or below `pointer.version`, so it can't replace newer P&M.
         let is_newer = |v: Option<i64>| v.is_some_and(|v| v > pointer.version);
-        if is_newer(candidate.protocol.as_ref().map(|(v, _)| *v))
-            && is_newer(candidate.metadata.as_ref().map(|(v, _)| *v))
+        if is_newer(resolved.protocol.as_ref().map(|(v, _)| *v))
+            && is_newer(resolved.metadata.as_ref().map(|(v, _)| *v))
         {
-            return Ok(candidate);
+            return Ok(resolved);
         }
         // A pointed commit outside this segment is no newer than the segment's P&M.
         let commits = &self.listed.ascending_commit_files;
@@ -235,37 +241,27 @@ impl LogSegment {
             .and_then(|v| commits.binary_search_by_key(&v, |c| c.version).ok())
             .and_then(|i| commits.get(i))
         else {
-            return Ok(candidate);
+            return Ok(resolved);
         };
-        let checkpoint = read_checkpoint(commit)?
-            .filter(|c| c.content_root.version() == pointer.content_root_version)
-            .ok_or_else(|| {
-                KernelError::generic(format!(
-                    "lastManifestCommit points at version {} with contentRootVersion {}, but that \
-                     commit carries no matching checkpoint action",
-                    pointer.version, pointer.content_root_version
-                ))
-            })?;
-        let (protocol, metadata) = checkpoint_pm(&checkpoint);
+        let checkpoint = read_pointed(commit, &pointer)?;
         // TODO(#2337): a log compaction batch ranks at its start version, so one that spans the
         // pointed commit and also holds a later P&M change loses to the pointed action's older
         // P&M. Once compactions are listed, replay the original commits after the pointed version
         // instead, as delta-io/delta#7825 requires.
-        Ok(PmCandidate {
-            protocol: newer(candidate.protocol, Some(protocol)),
-            metadata: newer(candidate.metadata, Some(metadata)),
-            checkpoint: Some((checkpoint.version(), checkpoint)),
-            ..candidate
-        })
+        Ok(resolved.with_checkpoint(checkpoint))
     }
 
-    /// Reads the checkpoint action from the single `commit` with a plan that keeps its first
-    /// non-null `checkpoint` row, or `None` if the commit carries none.
+    /// Reads the checkpoint action `pointer` points at from its manifest `commit`, with a plan that
+    /// keeps the commit's first non-null `checkpoint` row.
+    ///
+    /// # Errors
+    /// Returns an error if the plan fails or the commit carries no matching checkpoint action.
     #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
-    fn read_checkpoint_action_via_plan(
+    fn read_pointed_checkpoint_action_via_plan(
         executor: &dyn PlanExecutor,
         commit: &ParsedLogPath,
-    ) -> KernelResult<Option<CheckpointAction>> {
+        pointer: &LastManifestCommit,
+    ) -> KernelResult<CheckpointAction> {
         let schema = schema_ref! {
             (&CHECKPOINT_ACTION_FIELD),
             not_null "version": LONG,
@@ -277,10 +273,11 @@ impl LogSegment {
                 a.max_non_null_by(checkpoint(), checkpoint(), column_name!("version"))
             })?
             .build()?;
-        first_checkpoint_action(
+        pointed_checkpoint_action(
             executor
                 .execute_op(Operation::QueryPlan(plan))?
                 .into_data()?,
+            pointer,
         )
     }
 
@@ -578,6 +575,18 @@ impl PmCandidate {
             last_manifest_commit: newer(self.last_manifest_commit, other.last_manifest_commit),
         }
     }
+
+    /// Merges in the pointed `checkpoint` action and the P&M nested in it.
+    #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+    fn with_checkpoint(self, checkpoint: CheckpointAction) -> Self {
+        let (protocol, metadata) = checkpoint_pm(&checkpoint);
+        PmCandidate {
+            protocol: newer(self.protocol, Some(protocol)),
+            metadata: newer(self.metadata, Some(metadata)),
+            checkpoint: Some((checkpoint.version(), checkpoint)),
+            ..self
+        }
+    }
 }
 
 /// A P&M-projected batch with the versions to rank its Protocol and Metadata at.
@@ -692,17 +701,28 @@ fn checkpoint_pm(checkpoint: &CheckpointAction) -> ((i64, Protocol), (i64, Metad
     )
 }
 
-/// The first checkpoint action in `batches`, or `None` if they carry none.
+/// The checkpoint action `pointer` points at in `batches`, read from its manifest commit.
+///
+/// # Errors
+/// Returns an error if a batch fails to read or the commit carries no matching checkpoint action.
 #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
-fn first_checkpoint_action(
+fn pointed_checkpoint_action(
     batches: impl Iterator<Item = KernelResult<Box<dyn EngineData>>>,
-) -> KernelResult<Option<CheckpointAction>> {
-    for batch in batches {
-        if let Some(checkpoint) = CheckpointAction::try_new_from_data(batch?.as_ref())? {
-            return Ok(Some(checkpoint));
-        }
-    }
-    Ok(None)
+    pointer: &LastManifestCommit,
+) -> KernelResult<CheckpointAction> {
+    first_checkpoint_action(batches)?
+        .filter(|checkpoint| pointer.points_at(checkpoint))
+        .ok_or_else(|| missing_pointed_action(pointer))
+}
+
+/// The error for a manifest commit that lacks the checkpoint action `pointer` points at.
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+fn missing_pointed_action(pointer: &LastManifestCommit) -> KernelError {
+    KernelError::generic(format!(
+        "lastManifestCommit points at version {} with contentRootVersion {}, but that commit \
+         carries no matching checkpoint action",
+        pointer.version, pointer.content_root_version
+    ))
 }
 
 /// The newest commit's `lastManifestCommit` in `actions`, tagged with that commit's `version`.

@@ -1499,6 +1499,13 @@ impl LastManifestCommit {
         Ok(())
     }
 
+    /// Whether this points at `checkpoint`. The caller must read `checkpoint` from the commit at
+    /// [`Self::version`].
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn points_at(&self, checkpoint: &CheckpointAction) -> bool {
+        checkpoint.content_root.version() == self.content_root_version
+    }
+
     /// Parses the first `commitInfo.lastManifestCommit` in `data`, if any.
     pub(crate) fn try_new_from_data(data: &dyn EngineData) -> KernelResult<Option<Self>> {
         let mut visitor = visitors::LastManifestCommitVisitor::default();
@@ -2224,6 +2231,18 @@ mod tests {
     ) {
         let result = LastManifestCommit::new(version, content_root_version);
         assert_eq!(result.is_ok(), ok);
+    }
+
+    #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+    #[rstest]
+    #[case::same_content_root_version(40, true)]
+    #[case::other_content_root_version(41, false)]
+    fn test_last_manifest_commit_points_at_matches_content_root_version(
+        #[case] content_root_version: i64,
+        #[case] expected: bool,
+    ) {
+        let pointer = LastManifestCommit::new(42, content_root_version).unwrap();
+        assert_eq!(pointer.points_at(&sample_checkpoint_action()), expected);
     }
 
     #[test]
