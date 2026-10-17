@@ -26,6 +26,8 @@ use crate::snapshot::{IncrementalReplay, SnapshotBuilder, SnapshotRef};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_features::TableFeature;
 #[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::unit_test_utils::adaptive_metadata_fixtures::last_manifest_commit_info;
+#[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
 };
@@ -812,11 +814,14 @@ async fn test_crc_seeded_replay_captures_checkpoint_action_after_crc() {
         )
         .commit(
             1,
-            [amt_checkpoint_action(
-                1,
-                checkpoint_config.protocol().clone(),
-                checkpoint_config.metadata().clone(),
-            )],
+            [
+                last_manifest_commit_info(1, 1),
+                amt_checkpoint_action(
+                    1,
+                    checkpoint_config.protocol().clone(),
+                    checkpoint_config.metadata().clone(),
+                ),
+            ],
         )
         .build()
         .await
@@ -892,6 +897,37 @@ async fn test_crc_seeded_replay_without_checkpoint_action_is_unresolved() {
         .await
         .checkpoint_action_resolution();
     assert!(matches!(resolution, CheckpointActionResolution::Unresolved));
+}
+
+// A CRC-seeded pruned replay whose newest commit points at a manifest commit at or below the CRC
+// version cannot capture that action (the pruned replay never reads it), so the pointer becomes
+// `Located` for the accessor.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[tokio::test]
+async fn test_crc_seeded_replay_with_pointer_at_or_below_crc_is_located() {
+    let config = adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
+    let resolution = CrcReadTest::new()
+        .commit(
+            0,
+            [
+                last_manifest_commit_info(0, 0),
+                amt_checkpoint_action(0, config.protocol().clone(), config.metadata().clone()),
+            ],
+        )
+        .crc(
+            0,
+            config.protocol().clone(),
+            config.metadata().clone(),
+            1000, // AMT config enables ICT, so the CRC must carry an inCommitTimestampOpt.
+        )
+        .commit(1, [last_manifest_commit_info(0, 0)])
+        .build()
+        .await
+        .checkpoint_action_resolution();
+    assert!(
+        matches!(&resolution, CheckpointActionResolution::Located(p) if p.version == 0),
+        "expected Located at version 0, got {resolution:?}"
+    );
 }
 
 #[tokio::test]
@@ -1239,6 +1275,10 @@ async fn test_adds_and_removes_accumulate() {
 #[case::remove_no_size(vec![commit_info("WRITE", None), remove("orphan", None)])]
 #[case::add_with_unsafe_op(vec![commit_info("ANALYZE STATS", None), add("a", 100)])]
 #[case::add_with_no_commit_info(vec![add("a", 100)])]
+#[cfg_attr(
+    feature = "adaptive-metadata-in-dev",
+    case::manifest_commit(vec![last_manifest_commit_info(1, 1)])
+)]
 #[tokio::test]
 async fn test_trips_indeterminate(#[case] v1_actions: Vec<Value>) {
     // Base carries DM + txn entries so we can verify the indeterminate trip is scoped
@@ -1282,6 +1322,50 @@ async fn test_replay_rejects_last_manifest_commit_newer_than_newest_commit() {
             .contains("lastManifestCommit version 5 exceeds commit version 1"),
         "unexpected error: {err}"
     );
+}
+
+// Replay misses only the file changes a replayed manifest commit records solely in its manifest
+// (`contentRootVersion == version`). A pointer at or below the base is already reflected in the
+// base, and a manifest commit with an older content root logs its own file actions, which replay
+// counts. Each case lists the commits after the base CRC at version 0.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[rstest]
+#[case::pointer_at_or_below_base(vec![vec![last_manifest_commit_info(0, 0)]], Some(0))]
+#[case::manifest_commit_logs_its_file_actions(
+    vec![vec![write_with_last_manifest_commit(1, 0), add("a", 100)]],
+    Some(1)
+)]
+#[case::manifest_commit_hidden_behind_newer_one(
+    vec![
+        vec![last_manifest_commit_info(1, 1)],
+        vec![last_manifest_commit_info(1, 1)],
+        vec![last_manifest_commit_info(3, 2)],
+    ],
+    None
+)]
+#[tokio::test]
+async fn test_manifest_commit_file_stats(
+    #[case] commits: Vec<Vec<Value>>,
+    #[case] expected_num_files: Option<i64>,
+) {
+    let mut test = CrcReadTest::new().commit(0, create_table_actions());
+    for (version, commit) in (1..).zip(commits) {
+        test = test.commit(version, commit);
+    }
+    let crc = test
+        .build()
+        .await
+        .incrementally_build_crc(&crc_complete_empty_dm_set_txn())
+        .unwrap();
+    assert_eq!(crc.file_stats().map(|s| s.num_files()), expected_num_files);
+}
+
+// A WRITE commitInfo carrying `lastManifestCommit`, so replay counts the commit's file actions.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn write_with_last_manifest_commit(version: i64, content_root_version: i64) -> Value {
+    let mut commit_info = last_manifest_commit_info(version, content_root_version);
+    commit_info["commitInfo"]["operation"] = json!("WRITE");
+    commit_info
 }
 
 // === On-disk base CRC (exercises serde round-trip) ===

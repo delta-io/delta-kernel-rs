@@ -1486,6 +1486,13 @@ impl LastManifestCommit {
         Ok(())
     }
 
+    /// Whether the manifest commit's own file changes may be recorded only in its manifest. A
+    /// manifest commit whose content root is older than the commit also logs its add and remove
+    /// actions.
+    pub(crate) fn files_only_in_manifest(&self) -> bool {
+        self.content_root_version == self.version
+    }
+
     /// Errors unless this names a manifest commit at or before `commit_version`, the version of
     /// the commit or CRC that carries it.
     pub(crate) fn ensure_at_or_before(&self, commit_version: Version) -> KernelResult<()> {
@@ -1497,6 +1504,13 @@ impl LastManifestCommit {
             ))
         );
         Ok(())
+    }
+
+    /// Parses the first `commitInfo.lastManifestCommit` in `data`, if any.
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> KernelResult<Option<Self>> {
+        let mut visitor = visitors::LastManifestCommitVisitor::default();
+        visitor.visit_rows_of(data)?;
+        Ok(visitor.last_manifest_commit)
     }
 }
 
@@ -1751,6 +1765,12 @@ impl ContentRoot {
             size_in_bytes,
             version,
         }
+    }
+
+    /// The table version the root manifest reflects.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn version(&self) -> i64 {
+        self.version
     }
 }
 
