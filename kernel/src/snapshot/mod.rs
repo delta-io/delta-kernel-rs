@@ -28,6 +28,7 @@ use crate::crc::{
 };
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
+use crate::log_replay::ActionsBatch;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::log_segment::CheckpointActionResolution;
 use crate::log_segment::{DomainMetadataMap, LogSegment, PmResolution};
@@ -44,7 +45,10 @@ use crate::table_features::{physical_to_logical_column_name_and_type, Operation,
 use crate::table_properties::TableProperties;
 use crate::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult, LogCompactionWriter, Result, Version};
+use crate::{
+    Engine, KernelError, KernelResult, KernelResultIteratorStatic, LogCompactionWriter, Result,
+    Version,
+};
 
 mod builder;
 mod hint;
@@ -307,6 +311,35 @@ impl Snapshot {
             .map(Arc::new);
         let _ = self.checkpoint_action.set(found.clone());
         Ok(found)
+    }
+
+    /// Reads this snapshot's log with `schema`, newest first, for log replay. For a table with an
+    /// AMT `checkpoint` action (see [`Self::latest_checkpoint_action`]), that action stands in for
+    /// the checkpoint and the commits at or below its version.
+    ///
+    /// # Errors
+    /// Returns an error if the checkpoint action cannot be resolved or a read fails.
+    pub(crate) fn read_log_actions(
+        &self,
+        engine: &dyn Engine,
+        schema: SchemaRef,
+    ) -> Result<KernelResultIteratorStatic<ActionsBatch>> {
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(checkpoint) = self.latest_checkpoint_action(engine)? {
+            let result = self.log_segment.read_actions_with_checkpoint_action(
+                engine,
+                &checkpoint,
+                self.table_root(),
+                schema.clone(),
+                schema,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            return Ok(result.actions);
+        }
+        Ok(Box::new(self.log_segment.read_actions(engine, schema)?))
     }
 
     /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`]. Takes Protocol and Metadata
@@ -742,7 +775,7 @@ impl Snapshot {
 
         // Fallback: full log replay. Scan for the newest txn and apply expiration to it, like the
         // CRC paths above.
-        let txn = SetTransactionScanner::get_one(self.log_segment(), application_id, engine)?;
+        let txn = SetTransactionScanner::get_one(self, application_id, engine)?;
         let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
         record_metric(false, version.is_some());
         Ok(version)
@@ -759,7 +792,7 @@ impl Snapshot {
                 return Ok(map.clone());
             }
         }
-        SetTransactionScanner::get_all(self.log_segment(), engine)
+        SetTransactionScanner::get_all(self, engine)
     }
 
     /// Fetch the domainMetadata for a specific domain in this snapshot. This returns the latest

@@ -19,7 +19,6 @@ use crate::{Engine, KernelResult, KernelResultIteratorStatic};
 /// # Errors
 /// Returns an error if a sidecar path cannot be resolved, if `action` is not a struct in both
 /// schemas, or if a sidecar cannot be read.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn read_sidecar_actions(
     engine: &dyn Engine,
     log_root: &LogRoot,
