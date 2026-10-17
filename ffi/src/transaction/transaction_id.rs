@@ -63,7 +63,9 @@ fn get_app_id_version_impl(
     app_id_res: KernelResult<String>,
     extern_engine: &dyn ExternEngine,
 ) -> KernelResult<Option<i64>> {
-    snapshot.get_app_id_version(&app_id_res?, extern_engine.engine().as_ref())
+    snapshot
+        .reader()
+        .get_app_id_version(&app_id_res?, extern_engine.engine().as_ref())
 }
 
 #[cfg(test)]
@@ -141,9 +143,18 @@ mod tests {
                 .build(&engine)?;
 
             // Check versions
-            assert_eq!(snapshot.get_app_id_version("app_id1", &engine)?, Some(1));
-            assert_eq!(snapshot.get_app_id_version("app_id2", &engine)?, Some(2));
-            assert_eq!(snapshot.get_app_id_version("app_id3", &engine)?, None);
+            assert_eq!(
+                snapshot.reader().get_app_id_version("app_id1", &engine)?,
+                Some(1)
+            );
+            assert_eq!(
+                snapshot.reader().get_app_id_version("app_id2", &engine)?,
+                Some(2)
+            );
+            assert_eq!(
+                snapshot.reader().get_app_id_version("app_id3", &engine)?,
+                None
+            );
 
             // Check versions through ffi handles. `get_app_id_version` borrows the handle, so
             // one handle serves all three calls and is freed once at the end.

@@ -12,7 +12,7 @@
 //!   JSON commits, and Parquet checkpoints, with builder-bound or caller-wrapped engines.
 //! - CRC reconstruction and optional-read fallback: cancellation propagates, including after a JSON
 //!   batch, while malformed CRC content can fall back to replay.
-//! - Post-build domain metadata, transaction IDs, and clustering reads using the same wrapper.
+//! - SnapshotReader token forwarding for post-build metadata APIs, including timestamp fallback.
 //! - Correlated failure metrics through metered handlers, without snapshot success on cancellation.
 //!
 //! Tests using `KernelEngine` directly cover iterator ownership after the wrapper is dropped,
@@ -883,15 +883,29 @@ enum MetadataRead {
     Domain,
     Transaction,
     Clustering,
+    ClusteringInfo,
+    Domains,
+    InternalDomain,
+    UserDomains,
+    RowTracking,
+    Timestamp,
+    InCommitTimestamp,
 }
 
-/// Shares the operation token with lazy domain, transaction, and clustering metadata reads.
+/// Forwards the reader's exact token through each metadata API and preserves unscoped reads.
 #[rstest]
 fn post_build_metadata_reads_inherit_operation_token(
     #[values(
         MetadataRead::Domain,
         MetadataRead::Transaction,
-        MetadataRead::Clustering
+        MetadataRead::Clustering,
+        MetadataRead::ClusteringInfo,
+        MetadataRead::Domains,
+        MetadataRead::InternalDomain,
+        MetadataRead::UserDomains,
+        MetadataRead::RowTracking,
+        MetadataRead::Timestamp,
+        MetadataRead::InCommitTimestamp
     )]
     read: MetadataRead,
     #[values(false, true)] cancelled: bool,
@@ -905,6 +919,10 @@ fn post_build_metadata_reads_inherit_operation_token(
     )
     .with_domain_metadata("test", "value")
     .with_transaction_id("app", 7)
+    .with_table_properties([
+        ("delta.enableInCommitTimestamps", "true"),
+        ("delta.enableRowTracking", "true"),
+    ])
     .with_data_layout(DataLayout::Clustered {
         columns: vec![ColumnName::new(["id"])],
     })
@@ -915,37 +933,106 @@ fn post_build_metadata_reads_inherit_operation_token(
     .unwrap_committed();
     let mut reads = RecordingReads::new(None);
     Arc::get_mut(&mut reads).unwrap().inner = Arc::new(original);
-    let engine = KernelEngine::new(&reads.engine(), reads.token.clone());
-    let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
+    let engine = reads.engine();
+    let snapshot = Snapshot::builder_for("memory:///")
+        .build(reads.inner.as_ref())
+        .unwrap();
     assert!(snapshot.crc_at_version().is_none());
     reads.events.lock().unwrap().clear();
     if cancelled {
         reads.token.cancel();
     }
-    let load = |engine: &dyn Engine| -> KernelResult<()> {
+    let load = |reader: &crate::SnapshotReader<'_>, engine: &dyn Engine| -> KernelResult<()> {
         match read {
             MetadataRead::Domain => assert_eq!(
-                snapshot.get_domain_metadata("test", engine)?,
+                reader.get_domain_metadata("test", engine)?,
                 Some("value".into())
             ),
             MetadataRead::Transaction => {
-                assert_eq!(snapshot.get_app_id_version("app", engine)?, Some(7));
+                assert_eq!(reader.get_app_id_version("app", engine)?, Some(7));
             }
             MetadataRead::Clustering => assert_eq!(
-                snapshot.get_physical_clustering_columns(engine)?,
+                reader.get_physical_clustering_columns(engine)?,
                 Some(vec![ColumnName::new(["id"])])
             ),
+            MetadataRead::ClusteringInfo => {
+                let infos = reader.get_clustering_column_infos(engine)?.unwrap();
+                assert_eq!(infos[0].physical_column, ColumnName::new(["id"]));
+            }
+            MetadataRead::Domains => assert!(reader
+                .get_domain_metadatas_internal(engine, None)?
+                .contains_key("test")),
+            MetadataRead::InternalDomain => assert!(reader
+                .get_domain_metadata_internal("delta.clustering", engine)?
+                .is_some()),
+            MetadataRead::UserDomains => {
+                assert_eq!(reader.get_all_domain_metadata(engine)?.len(), 1)
+            }
+            MetadataRead::RowTracking => assert_eq!(
+                reader.get_row_tracking_high_water_mark(engine)?,
+                Some(crate::ROW_TRACKING_INITIAL_HIGH_WATER_MARK)
+            ),
+            MetadataRead::Timestamp => assert!(reader.get_timestamp(engine)? > 0),
+            MetadataRead::InCommitTimestamp => {
+                assert!(reader.get_in_commit_timestamp(engine)?.is_some())
+            }
         }
         Ok(())
     };
-    let result = load(&engine);
+    let reader = snapshot
+        .reader()
+        .with_cancellation_token(reads.token.clone() as CancellationTokenRef);
+    let result = load(&reader, &engine);
     if cancelled {
         assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
     } else {
         result.unwrap();
     }
     assert_eq!(*reads.events.lock().unwrap(), [Read::Json]);
-    load(reads.inner.as_ref()).unwrap();
+    load(&snapshot.reader(), reads.inner.as_ref()).unwrap();
+}
+
+/// Stops metadata replay at JSON or Parquet entry and on the next pull after a JSON batch.
+#[rstest]
+#[case::json_entry("app-txn-no-checkpoint", Read::Json, false)]
+#[case::json_batch("app-txn-no-checkpoint", Read::Json, true)]
+#[case::parquet_entry("app-txn-checkpoint", Read::Parquet, false)]
+fn reader_cancellation_during_replay(
+    #[case] table: &str,
+    #[case] boundary: Read,
+    #[case] after_batch: bool,
+) {
+    let mut reads = RecordingReads::new((!after_batch).then_some(boundary));
+    Arc::get_mut(&mut reads).unwrap().cancel_json_after_batch = after_batch;
+    let snapshot = Snapshot::builder_for(format!("tests/data/{table}"))
+        .build(reads.inner.as_ref())
+        .unwrap();
+    let result = snapshot
+        .reader()
+        .with_cancellation_token(reads.token.clone() as CancellationTokenRef)
+        .get_app_id_version("missing-app", &reads.engine());
+    assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
+    assert_eq!(reads.events.lock().unwrap().last(), Some(&boundary));
+}
+
+/// Keeps the reader token on tail-only metadata replay rooted in a stale complete CRC.
+#[test]
+fn reader_stale_crc_replay_is_cancellable() {
+    let (url, _temp) = stale_crc_table();
+    let reads = RecordingReads::new(Some(Read::Json));
+    let snapshot = Snapshot::builder_for(&url)
+        .with_incremental_crc_replay(IncrementalReplay::Disabled)
+        .build(reads.inner.as_ref())
+        .unwrap();
+    assert!(snapshot.crc_at_version().is_none());
+    let reader = snapshot
+        .reader()
+        .with_cancellation_token(reads.token.clone() as CancellationTokenRef);
+    assert!(matches!(
+        reader.get_domain_metadata("missing", &reads.engine()),
+        Err(KernelError::Cancelled)
+    ));
+    assert_eq!(*reads.events.lock().unwrap(), [Read::Json]);
 }
 
 /// Leaves declarative protocol and metadata replay independent of the wrapper's read token.

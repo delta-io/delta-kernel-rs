@@ -1330,6 +1330,7 @@ async fn test_write_checksum_with_no_dms_writes_empty_list(
 
     let snapshot = committed.post_commit_snapshot().unwrap();
     assert!(snapshot
+        .reader()
         .get_all_domain_metadata(engine.as_ref())?
         .is_empty());
     let crc = write_and_verify_crc(snapshot, &table_path, engine.as_ref());
@@ -1391,24 +1392,35 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> KernelResult<()
     // Asserts domain metadata on any snapshot, regardless of how it was loaded.
     let assert_domain_metadata = |snapshot: &Snapshot, engine: &dyn delta_kernel::Engine| {
         assert_eq!(
-            snapshot.get_domain_metadata("zip", engine).unwrap(),
+            snapshot
+                .reader()
+                .get_domain_metadata("zip", engine)
+                .unwrap(),
             Some("zap1".to_string())
         );
         assert_eq!(
-            snapshot.get_domain_metadata("foo", engine).unwrap(),
+            snapshot
+                .reader()
+                .get_domain_metadata("foo", engine)
+                .unwrap(),
             Some("bar".to_string())
         );
         // Miss on a Complete cache: served as authoritative None without log replay.
         assert_eq!(
-            snapshot.get_domain_metadata("nonexistent", engine).unwrap(),
+            snapshot
+                .reader()
+                .get_domain_metadata("nonexistent", engine)
+                .unwrap(),
             None
         );
         assert!(snapshot
+            .reader()
             .get_domain_metadata_internal("delta.clustering", engine)
             .unwrap()
             .is_some());
         assert_eq!(
             snapshot
+                .reader()
                 .get_domain_metadatas_internal(engine, None)
                 .unwrap()
                 .len(),
@@ -1498,37 +1510,50 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> KernelRes
 
     // Hit: "foo" is in the Partial cache, so served without log replay.
     assert_eq!(
-        snapshot_v1.get_domain_metadata("foo", &FailingEngine)?,
+        snapshot_v1
+            .reader()
+            .get_domain_metadata("foo", &FailingEngine)?,
         Some("bar".to_string())
     );
 
     // Miss: "zip" is not in this Partial cache; FailingEngine panics, real engine finds it.
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        snapshot_v1.get_domain_metadata("zip", &FailingEngine).ok()
+        snapshot_v1
+            .reader()
+            .get_domain_metadata("zip", &FailingEngine)
+            .ok()
     }))
     .is_err());
     assert_eq!(
-        snapshot_v1.get_domain_metadata("zip", engine.as_ref())?,
+        snapshot_v1
+            .reader()
+            .get_domain_metadata("zip", engine.as_ref())?,
         Some("zap0".to_string())
     );
 
     // Miss on a nonexistent domain falls through and returns None.
     assert_eq!(
-        snapshot_v1.get_domain_metadata("nonexistent", engine.as_ref())?,
+        snapshot_v1
+            .reader()
+            .get_domain_metadata("nonexistent", engine.as_ref())?,
         None
     );
 
     // Multi-key filter with a mixed hit ("foo") and miss ("zip"): the first miss
     // short-circuits the cache lookup and the full result comes from log replay.
     let filter = HashSet::from(["foo", "zip"]);
-    let map = snapshot_v1.get_domain_metadatas_internal(engine.as_ref(), Some(&filter))?;
+    let map = snapshot_v1
+        .reader()
+        .get_domain_metadatas_internal(engine.as_ref(), Some(&filter))?;
     assert_eq!(map.len(), 2);
     assert_eq!(map["foo"].configuration(), "bar");
     assert_eq!(map["zip"].configuration(), "zap0");
 
     // "All" queries against Partial always fall through. The replay-derived set must
     // include BOTH entries.
-    let mut all = snapshot_v1.get_all_domain_metadata(engine.as_ref())?;
+    let mut all = snapshot_v1
+        .reader()
+        .get_all_domain_metadata(engine.as_ref())?;
     all.sort_by(|a, b| a.domain().cmp(b.domain()));
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].domain(), "foo");
@@ -1564,6 +1589,7 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> KernelResult<()> {
     assert!(fresh_v0.crc_at_version().is_some());
     assert_eq!(
         fresh_v0
+            .reader()
             .get_app_id_version("my-app", &FailingEngine)
             .unwrap(),
         None
@@ -1582,12 +1608,14 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> KernelResult<()> {
     // Post-commit CRC tracks my-app=1, queryable via fast path
     assert_eq!(
         snapshot_v1
+            .reader()
             .get_app_id_version("my-app", &FailingEngine)
             .unwrap(),
         Some(1)
     );
     assert_eq!(
         snapshot_v1
+            .reader()
             .get_app_id_version("nonexistent", &FailingEngine)
             .unwrap(),
         None
@@ -1603,12 +1631,14 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> KernelResult<()> {
     assert!(fresh_v1.crc_at_version().is_some());
     assert_eq!(
         fresh_v1
+            .reader()
             .get_app_id_version("my-app", &FailingEngine)
             .unwrap(),
         Some(1)
     );
     assert_eq!(
         fresh_v1
+            .reader()
             .get_app_id_version("nonexistent", &FailingEngine)
             .unwrap(),
         None
@@ -1628,12 +1658,14 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> KernelResult<()> {
     // Post-commit CRC tracks updated versions, queryable via fast path
     assert_eq!(
         snapshot_v2
+            .reader()
             .get_app_id_version("my-app", &FailingEngine)
             .unwrap(),
         Some(2)
     );
     assert_eq!(
         snapshot_v2
+            .reader()
             .get_app_id_version("other-app", &FailingEngine)
             .unwrap(),
         Some(1)
@@ -1648,12 +1680,14 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> KernelResult<()> {
     assert!(fresh_v2.crc_at_version().is_some());
     assert_eq!(
         fresh_v2
+            .reader()
             .get_app_id_version("my-app", &FailingEngine)
             .unwrap(),
         Some(2)
     );
     assert_eq!(
         fresh_v2
+            .reader()
             .get_app_id_version("other-app", &FailingEngine)
             .unwrap(),
         Some(1)
@@ -1711,25 +1745,32 @@ async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> Kern
 
     // Hit: "my-app" is in the Partial cache -- served without log replay.
     assert_eq!(
-        snapshot_v2.get_app_id_version("my-app", &FailingEngine)?,
+        snapshot_v2
+            .reader()
+            .get_app_id_version("my-app", &FailingEngine)?,
         Some(1)
     );
 
     // Miss: "v1-app" is NOT in the Partial cache; FailingEngine panics, real engine finds it.
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         snapshot_v2
+            .reader()
             .get_app_id_version("v1-app", &FailingEngine)
             .ok()
     }))
     .is_err());
     assert_eq!(
-        snapshot_v2.get_app_id_version("v1-app", engine.as_ref())?,
+        snapshot_v2
+            .reader()
+            .get_app_id_version("v1-app", engine.as_ref())?,
         Some(1)
     );
 
     // Miss: completely absent app_id falls through and returns None.
     assert_eq!(
-        snapshot_v2.get_app_id_version("nonexistent", engine.as_ref())?,
+        snapshot_v2
+            .reader()
+            .get_app_id_version("nonexistent", engine.as_ref())?,
         None
     );
 
@@ -1792,6 +1833,7 @@ async fn test_set_txn_expiration_via_crc_fast_path(
     // FailingEngine proves the CRC fast path is used (no log replay)
     assert_eq!(
         snapshot
+            .reader()
             .get_app_id_version("my-app", &FailingEngine)
             .unwrap(),
         expected
@@ -1853,7 +1895,9 @@ async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> Kernel
 
     // FailingEngine proves the Partial fast path is used; the expiration filter drops the txn.
     assert_eq!(
-        snapshot_v2.get_app_id_version("my-app", &FailingEngine)?,
+        snapshot_v2
+            .reader()
+            .get_app_id_version("my-app", &FailingEngine)?,
         None
     );
 
@@ -1894,7 +1938,9 @@ async fn test_set_txn_null_last_updated_never_expires_via_log_replay() -> Kernel
 
     // Despite aggressive retention, null last_updated means the txn never expires
     assert_eq!(
-        fresh.get_app_id_version("null-app", engine.as_ref())?,
+        fresh
+            .reader()
+            .get_app_id_version("null-app", engine.as_ref())?,
         Some(42)
     );
 
@@ -1936,7 +1982,10 @@ async fn test_set_txn_expired_newest_returns_none_not_older_via_log_replay() -> 
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(fresh.version(), 2);
     assert!(fresh.crc_at_version().is_none());
-    assert_eq!(fresh.get_app_id_version("app", engine.as_ref())?, None);
+    assert_eq!(
+        fresh.reader().get_app_id_version("app", engine.as_ref())?,
+        None
+    );
 
     Ok(())
 }
@@ -2468,6 +2517,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     // - If no CRC, then we must re-read the latest commit -> need real engine.
     // - Else, we did CRC replay and cached the result -> use fake engine.
     assert!(fresh
+        .reader()
         .get_in_commit_timestamp(real_engine_iff_crc_missing)?
         .is_some());
 
@@ -2482,6 +2532,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     // === Check: domain metadata written *before* the CRC ===
     for domain in ["domain_at_create", "delta.clustering"] {
         assert!(fresh
+            .reader()
             .get_domain_metadata_internal(
                 domain,
                 real_engine_iff_crc_missing_or_crc_missing_opt_fields
@@ -2492,13 +2543,14 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     // === Check: domain metadata written *after* the CRC ===
     for domain in ["domain", "delta.rowTracking"] {
         assert!(fresh
+            .reader()
             .get_domain_metadata_internal(domain, real_engine_iff_crc_missing)?
             .is_some());
     }
 
     // === Check: set transactions written *before* the CRC ===
     assert_eq!(
-        fresh.get_app_id_version(
+        fresh.reader().get_app_id_version(
             "app_before_crc",
             real_engine_iff_crc_missing_or_crc_missing_opt_fields
         )?,
@@ -2507,7 +2559,9 @@ async fn test_stale_crc_fresh_build_advance_matrix(
 
     // === Check: set transactions written *after* the CRC ===
     assert_eq!(
-        fresh.get_app_id_version("app", real_engine_iff_crc_missing)?,
+        fresh
+            .reader()
+            .get_app_id_version("app", real_engine_iff_crc_missing)?,
         Some(LATEST_VERSION)
     );
 
@@ -2744,12 +2798,13 @@ async fn test_dm_query_rooted_in_stale_complete_crc(#[case] query: Query) -> Ker
     };
     match query {
         Query::One(domain, expected) => assert_eq!(
-            fresh.get_domain_metadata(domain, &engine)?,
+            fresh.reader().get_domain_metadata(domain, &engine)?,
             expected.map(str::to_string)
         ),
         Query::Filter(keys) => {
             let filter = keys.iter().copied().collect();
             let got: HashMap<String, String> = fresh
+                .reader()
                 .get_domain_metadatas_internal(&engine, Some(&filter))?
                 .into_iter()
                 .map(|(domain, dm)| (domain, dm.configuration().to_string()))
@@ -2758,6 +2813,7 @@ async fn test_dm_query_rooted_in_stale_complete_crc(#[case] query: Query) -> Ker
         }
         Query::All => {
             let all: HashMap<String, String> = fresh
+                .reader()
                 .get_all_domain_metadata(&engine)?
                 .into_iter()
                 .map(|dm| (dm.domain().to_string(), dm.configuration().to_string()))
@@ -2783,11 +2839,15 @@ async fn test_dm_query_stale_partial_crc_falls_through_to_full_scan() -> KernelR
 
     // Results are still correct via the full scan (with the real engine).
     assert_eq!(
-        fresh.get_domain_metadata("dom_before", engine.as_ref())?,
+        fresh
+            .reader()
+            .get_domain_metadata("dom_before", engine.as_ref())?,
         Some("cfg_before".to_string())
     );
     assert_eq!(
-        fresh.get_domain_metadata("dom_removed", engine.as_ref())?,
+        fresh
+            .reader()
+            .get_domain_metadata("dom_removed", engine.as_ref())?,
         None
     );
 
@@ -2797,7 +2857,10 @@ async fn test_dm_query_stale_partial_crc_falls_through_to_full_scan() -> KernelR
         inner: engine.clone(),
     };
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        fresh.get_domain_metadata("dom_before", &no_parquet).ok()
+        fresh
+            .reader()
+            .get_domain_metadata("dom_before", &no_parquet)
+            .ok()
     }))
     .is_err());
 
@@ -2869,7 +2932,10 @@ async fn test_txn_query_rooted_in_stale_complete_crc(
     let engine = NoParquetReadsEngine {
         inner: engine.clone(),
     };
-    assert_eq!(fresh.get_app_id_version(app_id, &engine)?, expected);
+    assert_eq!(
+        fresh.reader().get_app_id_version(app_id, &engine)?,
+        expected
+    );
     Ok(())
 }
 
@@ -2888,11 +2954,15 @@ async fn test_txn_query_stale_partial_crc_falls_through_to_full_scan() -> Kernel
 
     // Results are still correct via the full scan (with the real engine).
     assert_eq!(
-        fresh.get_app_id_version("app_before", engine.as_ref())?,
+        fresh
+            .reader()
+            .get_app_id_version("app_before", engine.as_ref())?,
         Some(5)
     );
     assert_eq!(
-        fresh.get_app_id_version("app_updated", engine.as_ref())?,
+        fresh
+            .reader()
+            .get_app_id_version("app_updated", engine.as_ref())?,
         Some(16)
     );
 
@@ -2902,7 +2972,10 @@ async fn test_txn_query_stale_partial_crc_falls_through_to_full_scan() -> Kernel
         inner: engine.clone(),
     };
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        fresh.get_app_id_version("app_before", &no_parquet).ok()
+        fresh
+            .reader()
+            .get_app_id_version("app_before", &no_parquet)
+            .ok()
     }))
     .is_err());
 
