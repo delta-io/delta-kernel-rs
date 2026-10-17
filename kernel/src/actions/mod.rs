@@ -1501,7 +1501,6 @@ impl LastManifestCommit {
 
     /// Whether this points at `checkpoint`. The caller must read `checkpoint` from the commit at
     /// [`Self::version`].
-    #[cfg(feature = "declarative-plans")]
     pub(crate) fn points_at(&self, checkpoint: &CheckpointAction) -> bool {
         checkpoint.content_root.version() == self.content_root_version
     }
@@ -1768,7 +1767,6 @@ impl ContentRoot {
     }
 
     /// The table version the root manifest reflects.
-    #[cfg(feature = "declarative-plans")]
     pub(crate) fn version(&self) -> i64 {
         self.version
     }
@@ -2233,7 +2231,7 @@ mod tests {
         assert_eq!(result.is_ok(), ok);
     }
 
-    #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest]
     #[case::same_content_root_version(40, true)]
     #[case::other_content_root_version(41, false)]
