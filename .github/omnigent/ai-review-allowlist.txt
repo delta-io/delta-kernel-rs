@@ -1,0 +1,7 @@
+# Add one GitHub login per line. Logins match case-insensitively; put nothing else on the line.
+#
+# Only add users trusted to invoke automatic review on their own PRs or /review on any PR.
+# Each listed account can trigger paid model runs and submit pull request content to the
+# configured LLM gateway. Keep this list small and review changes carefully because it
+# controls both cost and access to a secret-bearing workflow. Update an entry immediately
+# when its user renames their GitHub account; the old login may later belong to someone else.
