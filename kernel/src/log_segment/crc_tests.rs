@@ -26,6 +26,8 @@ use crate::snapshot::{IncrementalReplay, SnapshotBuilder, SnapshotRef};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_features::TableFeature;
 #[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::unit_test_utils::adaptive_metadata_fixtures::last_manifest_commit_info;
+#[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
 };
@@ -812,11 +814,14 @@ async fn test_crc_seeded_replay_captures_checkpoint_action_after_crc() {
         )
         .commit(
             1,
-            [amt_checkpoint_action(
-                1,
-                checkpoint_config.protocol().clone(),
-                checkpoint_config.metadata().clone(),
-            )],
+            [
+                last_manifest_commit_info(1, 1),
+                amt_checkpoint_action(
+                    1,
+                    checkpoint_config.protocol().clone(),
+                    checkpoint_config.metadata().clone(),
+                ),
+            ],
         )
         .build()
         .await
@@ -892,6 +897,37 @@ async fn test_crc_seeded_replay_without_checkpoint_action_is_unresolved() {
         .await
         .checkpoint_action_resolution();
     assert!(matches!(resolution, CheckpointActionResolution::Unresolved));
+}
+
+// A CRC-seeded pruned replay whose newest commit points at a manifest commit at or below the CRC
+// version cannot capture that action (the pruned replay never reads it), so the pointer becomes
+// `Located` for the accessor.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[tokio::test]
+async fn test_crc_seeded_replay_with_pointer_at_or_below_crc_is_located() {
+    let config = adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
+    let resolution = CrcReadTest::new()
+        .commit(
+            0,
+            [
+                last_manifest_commit_info(0, 0),
+                amt_checkpoint_action(0, config.protocol().clone(), config.metadata().clone()),
+            ],
+        )
+        .crc(
+            0,
+            config.protocol().clone(),
+            config.metadata().clone(),
+            1000, // AMT config enables ICT, so the CRC must carry an inCommitTimestampOpt.
+        )
+        .commit(1, [last_manifest_commit_info(0, 0)])
+        .build()
+        .await
+        .checkpoint_action_resolution();
+    assert!(
+        matches!(&resolution, CheckpointActionResolution::Located(p) if p.version == 0),
+        "expected Located at version 0, got {resolution:?}"
+    );
 }
 
 #[tokio::test]
