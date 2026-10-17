@@ -54,6 +54,7 @@ mod builder;
 mod cancellation_tests;
 mod hint;
 mod incremental;
+mod reader;
 mod snapshot_crc;
 #[cfg(test)]
 mod tracing_tests;
@@ -63,6 +64,7 @@ pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder
 #[allow(unused_imports)]
 #[internal_api]
 pub(crate) use hint::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
+pub use reader::SnapshotReader;
 use snapshot_crc::SnapshotCrc;
 
 pub use crate::error::SnapshotHintError;
@@ -186,6 +188,15 @@ impl Snapshot {
     /// to a more recent version.
     pub fn builder_from(existing_snapshot: SnapshotRef) -> IncrementalSnapshotBuilder {
         SnapshotBuilder::new_from(existing_snapshot)
+    }
+
+    /// Creates a reader for metadata getters that may access storage.
+    ///
+    /// Getters run synchronously and may block on I/O. The reader uses the supplied engine's
+    /// normal behavior unless configured with a cancellation token; it does not inherit the
+    /// snapshot builder's token. Creating the reader does not issue I/O.
+    pub fn reader(&self) -> SnapshotReader<'_> {
+        SnapshotReader::new(self)
     }
 
     // ============================================================================
@@ -753,7 +764,7 @@ impl Snapshot {
         err,
         fields(report, from_cache, found)
     )]
-    pub fn get_app_id_version(
+    pub(crate) fn get_app_id_version(
         &self,
         application_id: &str,
         engine: &dyn Engine,
@@ -838,7 +849,7 @@ impl Snapshot {
     /// configuration for the domain, or None if the domain does not exist.
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
-    pub fn get_domain_metadata(
+    pub(crate) fn get_domain_metadata(
         &self,
         domain: &str,
         engine: &dyn Engine,
@@ -860,7 +871,7 @@ impl Snapshot {
     ///
     /// Reads domain metadata, potentially replaying the log, and returns an error if the metadata
     /// cannot be read or its JSON configuration is malformed.
-    pub fn get_row_tracking_high_water_mark(
+    pub(crate) fn get_row_tracking_high_water_mark(
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<i64>> {
@@ -887,7 +898,6 @@ impl Snapshot {
     /// Returns an error if the clustering domain metadata is malformed, or if a physical
     /// column name cannot be resolved to a logical name in the schema.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    #[internal_api]
     pub(crate) fn get_clustering_column_infos(
         &self,
         engine: &dyn Engine,
@@ -924,7 +934,6 @@ impl Snapshot {
     ///
     /// The columns are returned as physical column names, respecting the column mapping mode.
     /// Note that this method performs log replay (fetches and processes metadata from storage).
-    #[internal_api]
     pub(crate) fn get_physical_clustering_columns(
         &self,
         engine: &dyn Engine,
@@ -967,7 +976,6 @@ impl Snapshot {
         err,
         fields(report, from_cache, num_domains_returned)
     )]
-    #[internal_api]
     pub(crate) fn get_domain_metadatas_internal(
         &self,
         engine: &dyn Engine,
@@ -1054,7 +1062,6 @@ impl Snapshot {
     /// (or was removed). Unlike [`Snapshot::get_domain_metadata`], this does not reject `delta.*`
     /// domains.
     #[allow(unused)]
-    #[internal_api]
     pub(crate) fn get_domain_metadata_internal(
         &self,
         domain: &str,
@@ -1068,7 +1075,6 @@ impl Snapshot {
     ///
     /// Internal (`delta.*`) domains are filtered out.
     #[allow(unused)]
-    #[internal_api]
     pub(crate) fn get_all_domain_metadata(
         &self,
         engine: &dyn Engine,
@@ -1098,7 +1104,6 @@ impl Snapshot {
     /// - `Ok(None)` - ICT is not enabled
     /// - `Err(...)` - ICT is enabled but cannot be read, or enablement version is invalid
     #[instrument(parent = &self.span, name = "snap.get_ict", skip_all, err)]
-    #[internal_api]
     pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
         // Get ICT enablement info and check if we should read ICT for this version
         let enablement = self
@@ -1208,7 +1213,7 @@ impl Snapshot {
     /// [`get_in_commit_timestamp`]: Self::get_in_commit_timestamp
     #[allow(unused)]
     #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
-    pub fn get_timestamp(&self, engine: &dyn Engine) -> KernelResult<i64> {
+    pub(crate) fn get_timestamp(&self, engine: &dyn Engine) -> KernelResult<i64> {
         match self
             .table_configuration()
             .in_commit_timestamp_enablement()?

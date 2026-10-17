@@ -89,6 +89,12 @@ typed hint through a callback; connectors must copy any state retained after the
 From a snapshot you can: read the schema and table properties, build a `Scan` to read data,
 start a `Transaction` to write data, or create a checkpoint.
 
+Metadata getters that may read storage live on `SnapshotReader`, created with `snapshot.reader()`.
+The reader borrows the snapshot and optionally holds an operation token; each getter accepts the
+original engine and binds the token through a temporary private `KernelEngine`. Getters are
+synchronous and may block on I/O, with or without a token. Cached results need not check cancellation.
+Separate readers keep their scopes independent without retaining an engine or changing the snapshot.
+
 ## Read Path
 
 `Snapshot` -> `ScanBuilder` -> `Scan` -> data

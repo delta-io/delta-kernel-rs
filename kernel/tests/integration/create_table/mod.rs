@@ -234,7 +234,9 @@ async fn test_create_table_with_user_domain_metadata() -> KernelResult<()> {
     );
 
     // Verify domain metadata string was persisted correctly
-    let retrieved_config = snapshot.get_domain_metadata(domain, engine.as_ref())?;
+    let retrieved_config = snapshot
+        .reader()
+        .get_domain_metadata(domain, engine.as_ref())?;
     assert_eq!(
         retrieved_config,
         Some(config.to_string()),
@@ -247,7 +249,9 @@ async fn test_create_table_with_user_domain_metadata() -> KernelResult<()> {
     assert_eq!(parsed["enabled"], true);
 
     // Verify non-existent domain returns None
-    let missing = snapshot.get_domain_metadata("nonexistent.domain", engine.as_ref())?;
+    let missing = snapshot
+        .reader()
+        .get_domain_metadata("nonexistent.domain", engine.as_ref())?;
     assert!(missing.is_none(), "Non-existent domain should return None");
 
     Ok(())
