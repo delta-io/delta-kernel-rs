@@ -919,13 +919,14 @@ mod tests {
     use super::*;
     use crate::actions::{CommitInfo, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
+    use crate::engine::KernelEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::{schema_ref, SchemaRef};
     use crate::snapshot::{Snapshot, SnapshotBuilder};
     use crate::table_features::TableFeature;
-    use crate::unit_test_utils::{Action, LocalMockTable};
+    use crate::unit_test_utils::{Action, LocalMockTable, TestCancellationToken};
     use crate::utils::FoldWithOption as _;
-    use crate::Version;
+    use crate::{KernelError, Version};
 
     fn get_test_schema() -> SchemaRef {
         schema_ref! {
@@ -2083,6 +2084,60 @@ mod tests {
         version_range
             .map(|v| delta_path_for_version(v, "json").to_string())
             .collect()
+    }
+
+    /// Applies the bound token to published and recreatable history listings.
+    #[rstest::rstest]
+    fn earliest_commit_listing_inherits_engine_token(
+        #[values(HistoryCommitType::Published, HistoryCommitType::Recreatable)]
+        commit_type: HistoryCommitType,
+        #[values(false, true)] cancelled: bool,
+    ) {
+        let (engine, log_root) = engine_with_log_files(&commit_path(0..=1), &HashSet::new());
+        let token = Arc::new(TestCancellationToken::default());
+        if cancelled {
+            token.cancel();
+        }
+        let engine = KernelEngine::new(&engine, token);
+        let result = get_earliest_commit(&engine, &log_root, None, commit_type);
+        if cancelled {
+            assert!(matches!(result, Err(KernelError::Cancelled)));
+        } else {
+            assert_eq!(result.unwrap(), 0);
+        }
+    }
+
+    /// Preserves cancellation through both timestamp-search bounds and history modes.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn timestamp_lookup_preserves_cancellation(
+        #[values(HistoryCommitType::Published, HistoryCommitType::Recreatable)]
+        commit_type: HistoryCommitType,
+        #[values(Bound::GreatestLower, Bound::LeastUpper)] bound: Bound,
+        #[values(false, true)] cancelled: bool,
+    ) {
+        let table = mock_table_with_timestamps(&[(100, None), (200, None)], None).await;
+        let original = SyncEngine::new();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&original).unwrap();
+        let token = Arc::new(TestCancellationToken::default());
+        if cancelled {
+            token.cancel();
+        }
+        let engine = KernelEngine::new(&original, token);
+        let result = match bound {
+            Bound::GreatestLower => latest_version_as_of(&snapshot, &engine, 150, commit_type),
+            Bound::LeastUpper => first_version_after(&snapshot, &engine, 150, commit_type),
+        };
+        if cancelled {
+            assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
+        } else {
+            let expected = match bound {
+                Bound::GreatestLower => CommitAt::new(0, 100),
+                Bound::LeastUpper => CommitAt::new(1, 200),
+            };
+            assert_eq!(result.unwrap(), expected);
+        }
     }
 
     fn single_part_checkpoint_path(v: Version) -> String {

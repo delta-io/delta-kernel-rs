@@ -327,8 +327,10 @@ mod tests {
     use crate::arrow::array::{Array, AsArray, MapArray, StringArray, StructArray};
     use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
     use crate::engine::sync::SyncEngine;
+    use crate::engine::KernelEngine;
     use crate::engine_data::RowVisitor;
     use crate::object_store::memory::InMemory;
+    use crate::unit_test_utils::TestCancellationToken;
     use crate::Snapshot;
 
     /// Open a `CommitRange` over `table-with-dv-small` with a matching anchor snapshot.
@@ -374,6 +376,26 @@ mod tests {
                 files[i].location.last_modified,
                 "commit {i} timestamp must match file last_modified",
             );
+        }
+    }
+
+    /// Keeps cancellation typed when a commit-header read adds version context.
+    #[rstest::rstest]
+    fn commit_header_read_preserves_cancellation(#[values(false, true)] cancelled: bool) {
+        let (range, engine, snapshot) = open_test_range_at(0);
+        let token = Arc::new(TestCancellationToken::default());
+        let engine = Arc::new(KernelEngine::new(engine.as_ref(), token.clone()));
+        let mut commits = range
+            .commits(engine, Some(snapshot), &[DeltaAction::Add])
+            .unwrap();
+        if cancelled {
+            token.cancel();
+        }
+        let result = commits.next().unwrap();
+        if cancelled {
+            assert!(matches!(result, Err(KernelError::Cancelled)));
+        } else {
+            assert_eq!(result.unwrap().version(), 0);
         }
     }
 
