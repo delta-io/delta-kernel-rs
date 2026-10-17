@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rstest::rstest;
 use serde_json::json;
@@ -17,6 +17,7 @@ use crate::checkpoint::tests::{
     write_commit_to_store,
 };
 use crate::checkpoint::CheckpointWriter;
+use crate::crc::Crc;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::sync::SyncEngine;
@@ -713,7 +714,10 @@ fn dummy_struct() -> DataType {
     "'remove' field must be nullable"
 )]
 fn test_splitter_rejects_invalid_schema(#[case] schema: StructType, #[case] expected_msg: &str) {
-    let iter = ActionReconciliationIterator::new(Box::new(std::iter::empty()));
+    let iter = ActionReconciliationIterator::new(
+        Box::new(std::iter::empty()),
+        Arc::new(Mutex::new(Crc::default())),
+    );
     let result = SidecarSplitter::new(iter, &ArrowEvaluationHandler, Arc::new(schema));
     assert!(result.is_err(), "should reject invalid schema");
     let err = result.err().unwrap();
@@ -729,7 +733,10 @@ fn test_single_sidecar_data_iterator_rejects_zero_max_file_actions_hint() {
         nullable "add": (dummy_struct()),
         nullable "remove": (dummy_struct()),
     };
-    let iter = ActionReconciliationIterator::new(Box::new(std::iter::empty()));
+    let iter = ActionReconciliationIterator::new(
+        Box::new(std::iter::empty()),
+        Arc::new(Mutex::new(Crc::default())),
+    );
     let splitter = SidecarSplitter::new_mut_shared(iter, &ArrowEvaluationHandler, schema).unwrap();
     let result = SingleSidecarDataIterator::new(splitter, 0);
     assert!(result.is_err());

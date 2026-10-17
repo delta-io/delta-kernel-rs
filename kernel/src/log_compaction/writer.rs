@@ -1,12 +1,15 @@
 // TODO(#2337): remove dead_code allows when log compaction is re-enabled
 #![allow(dead_code, unused_imports)]
 
+use std::sync::{Arc, Mutex};
+
 use itertools::Itertools;
 use url::Url;
 
 use super::COMPACTION_ACTIONS_SCHEMA;
 use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
 use crate::action_reconciliation::{ActionReconciliationIterator, RetentionCalculator};
+use crate::crc::Crc;
 use crate::log_replay::HasSelectionVector;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
@@ -123,10 +126,15 @@ impl LogCompactionWriter {
 
         // Create action reconciliation processor for compaction
         // This reuses the same reconciliation logic as checkpoints
+        let crc = Arc::new(Mutex::new(Crc {
+            version: self.end_version,
+            ..Default::default()
+        }));
         let mut processor = ActionReconciliationProcessor::new(
             min_file_retention_timestamp_millis,
             self.get_transaction_expiration_timestamp()?,
             self.snapshot.table_configuration().dv_normalization_root(),
+            Arc::clone(&crc),
         );
 
         // Process actions using the same iterator pattern as checkpoints
@@ -136,6 +144,9 @@ impl LogCompactionWriter {
             .filter_ok(HasSelectionVector::has_selected_rows);
 
         // Wrap the iterator to track action counts lazily
-        Ok(ActionReconciliationIterator::new(Box::new(result_iter)))
+        Ok(ActionReconciliationIterator::new(
+            Box::new(result_iter),
+            crc,
+        ))
     }
 }

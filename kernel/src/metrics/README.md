@@ -23,6 +23,11 @@ Success and failure are two variants of one event. Emit the success span, then f
 (`#[instrument(err)]` does this on `Err`; an emit helper calls `tracing::info!(error = ...)`). The
 layer sees `error` and flips the event via `MetricEvent::into_failure`.
 
+`CrcValidationFailure` reports a mismatch between checkpoint file totals and the cached CRC at
+the same version. Checkpoint finalization compares only `numFiles` and `tableSizeBytes`, emits one
+failure event and an error log on mismatch, and continues writing `_last_checkpoint`. It skips the
+comparison when the cached CRC or complete file totals are unavailable.
+
 ## Adding an event
 
 1. Define the struct + `SPAN_NAME` in `events.rs`; add a `MetricEvent` variant and its

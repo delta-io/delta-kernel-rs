@@ -102,7 +102,7 @@
 use std::sync::{Arc, LazyLock, Mutex};
 
 use itertools::Itertools;
-use tracing::info;
+use tracing::{error, info};
 use url::Url;
 
 use crate::action_reconciliation::log_replay::{
@@ -116,10 +116,12 @@ use crate::actions::{
     DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
     SIDECAR_FIELD,
 };
+use crate::crc::Crc;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, Scalar};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::HasSelectionVector;
+use crate::metrics::events::emit_crc_validation_failure;
 use crate::path::{self, ParsedLogPath};
 use crate::schema::{lazy_schema_ref, SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
@@ -360,6 +362,7 @@ pub struct CheckpointWriter {
     read_schema: SchemaRef,
     output_schema: SchemaRef,
     transform_expr: ExpressionRef,
+    crc: Arc<Mutex<Crc>>,
 }
 
 impl RetentionCalculator for CheckpointWriter {
@@ -392,6 +395,10 @@ impl CheckpointWriter {
             schema_context.partition_schema.as_ref(),
         )?;
 
+        let crc = Arc::new(Mutex::new(Crc {
+            version: snapshot.version(),
+            ..Default::default()
+        }));
         Ok(Self {
             version: version_as_i64(snapshot.version())?,
             snapshot,
@@ -399,6 +406,7 @@ impl CheckpointWriter {
             read_schema,
             output_schema,
             transform_expr,
+            crc,
         })
     }
 
@@ -465,6 +473,7 @@ impl CheckpointWriter {
             self.deleted_file_retention_timestamp()?,
             self.get_transaction_expiration_timestamp()?,
             self.snapshot.table_configuration().dv_normalization_root(),
+            Arc::clone(&self.crc),
         );
         let checkpoint_data = actions
             .map(move |batch| processor.process_actions_batch(batch?))
@@ -497,12 +506,18 @@ impl CheckpointWriter {
             .is_v2
             .then(|| self.create_checkpoint_metadata_batch(engine, &self.output_schema));
 
-        Ok(ActionReconciliationIterator::new(Box::new(
-            transformed.chain(checkpoint_metadata),
-        )))
+        Ok(ActionReconciliationIterator::new(
+            Box::new(transformed.chain(checkpoint_metadata)),
+            Arc::clone(&self.crc),
+        ))
     }
 
     /// Finalizes checkpoint creation by saving metadata about the checkpoint.
+    ///
+    /// Compares `numFiles` and `tableSizeBytes` with the cached CRC at the snapshot's version,
+    /// when both have complete file totals. A mismatch emits a
+    /// [`CrcValidationFailure`](crate::metrics::MetricEvent::CrcValidationFailure) metric and an
+    /// error log without failing finalization. Other CRC fields are not compared.
     ///
     /// # Important
     /// This method **must** be called only after:
@@ -523,6 +538,8 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         last_checkpoint_stats: &LastCheckpointHintStats,
     ) -> Result<()> {
+        self.validate_crc();
+
         // Skip writing `_last_checkpoint` if the existing hint already points to a newer
         // checkpoint, to avoid regressing the hint.
         let checkpoint_version = self.snapshot.version();
@@ -716,6 +733,42 @@ impl CheckpointWriter {
             actions_count: 1,
             add_actions_count: 0,
         })
+    }
+
+    fn validate_crc(&self) {
+        let Some(expected) = self
+            .snapshot
+            .crc_at_version()
+            .and_then(|crc| crc.file_stats())
+        else {
+            return;
+        };
+        let actual = match self.crc.lock() {
+            Ok(crc) => crc
+                .file_stats()
+                .map(|stats| (stats.num_files(), stats.table_size_bytes())),
+            Err(error) => {
+                error!(%error, "Cannot validate checkpoint CRC: lock poisoned");
+                return;
+            }
+        };
+        let Some((actual_num_files, actual_table_size_bytes)) = actual else {
+            return;
+        };
+        if expected.num_files() != actual_num_files
+            || expected.table_size_bytes() != actual_table_size_bytes
+        {
+            emit_crc_validation_failure();
+            error!(
+                table_root = %self.snapshot.table_root(),
+                version = self.snapshot.version(),
+                expected_num_files = expected.num_files(),
+                actual_num_files,
+                expected_table_size_bytes = expected.table_size_bytes(),
+                actual_table_size_bytes,
+                "Checkpoint CRC mismatch in numFiles or tableSizeBytes"
+            );
+        }
     }
 
     /// Helper for computing the checkpoint schema context from the snapshot and engine.

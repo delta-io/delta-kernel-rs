@@ -31,10 +31,12 @@
 //!      counts of actions selected
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
+use tracing::error;
 use url::Url;
 
+use crate::crc::{Crc, FileStatsState};
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector};
@@ -62,6 +64,7 @@ pub(crate) struct ActionReconciliationProcessor {
     txn_expiration_timestamp: Option<i64>,
     /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
     dv_normalization_root: Option<Url>,
+    crc: Arc<Mutex<Crc>>,
 }
 
 /// This struct is the output of the [`ActionReconciliationProcessor`].
@@ -131,14 +134,19 @@ impl ActionReconciliationIteratorState {
 pub struct ActionReconciliationIterator {
     inner: KernelResultIteratorStatic<ActionReconciliationBatch>,
     state: Arc<ActionReconciliationIteratorState>,
+    crc: Arc<Mutex<Crc>>,
 }
 
 impl ActionReconciliationIterator {
     /// Create a new iterator with counters initialized to 0
-    pub(crate) fn new(inner: KernelResultIteratorStatic<ActionReconciliationBatch>) -> Self {
+    pub(crate) fn new(
+        inner: KernelResultIteratorStatic<ActionReconciliationBatch>,
+        crc: Arc<Mutex<Crc>>,
+    ) -> Self {
         Self {
             inner,
             state: Arc::new(ActionReconciliationIteratorState::default()),
+            crc,
         }
     }
 
@@ -156,6 +164,17 @@ impl ActionReconciliationIterator {
             self.state.is_exhausted.store(true, Ordering::Release);
             return None;
         };
+        let batch = batch.or_else(|error| {
+            self.crc
+                .lock()
+                .map_err(|error| {
+                    KernelError::internal_error(format!(
+                        "action reconciliation CRC lock poisoned: {error}"
+                    ))
+                })?
+                .file_stats_state = FileStatsState::Indeterminate;
+            Err(error)
+        });
         Some(batch.map(|batch| {
             self.state
                 .actions_count
@@ -203,9 +222,13 @@ impl ActionReconciliationProcessor {
             is_log_batch,
         } = actions_batch;
         let selection_vector = vec![true; actions.len()];
+        let mut crc = self.crc.lock().map_err(|error| {
+            KernelError::internal_error(format!("action reconciliation CRC lock poisoned: {error}"))
+        })?;
 
         // Create the action reconciliation visitor to process actions and update selection vector
         let mut visitor = ActionReconciliationVisitor::new(
+            &mut crc,
             &mut self.seen_file_keys,
             is_log_batch,
             selection_vector,
@@ -236,6 +259,7 @@ impl ActionReconciliationProcessor {
         minimum_file_retention_timestamp: i64,
         txn_expiration_timestamp: Option<i64>,
         dv_normalization_root: Option<Url>,
+        crc: Arc<Mutex<Crc>>,
     ) -> Self {
         Self {
             seen_file_keys: Default::default(),
@@ -246,6 +270,7 @@ impl ActionReconciliationProcessor {
             minimum_file_retention_timestamp,
             txn_expiration_timestamp,
             dv_normalization_root,
+            crc,
         }
     }
 }
@@ -291,6 +316,7 @@ impl ActionReconciliationProcessor {
 ///
 /// The resulting filtered set of actions are the reconciled actions.
 pub(crate) struct ActionReconciliationVisitor<'seen> {
+    crc: &'seen mut Crc,
     // Deduplicates file actions (applies logic to filter Adds with corresponding Removes,
     // and keep unexpired Removes). This deduplicator builds a set of seen file actions.
     // This set has O(M) memory usage where M = number of file actions with unique (path, dvId)
@@ -369,6 +395,7 @@ impl ActionReconciliationVisitor<'_> {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new<'seen>(
+        crc: &'seen mut Crc,
         seen_file_keys: &'seen mut HashSet<FileActionKey>,
         is_log_batch: bool,
         selection_vector: Vec<bool>,
@@ -381,6 +408,7 @@ impl ActionReconciliationVisitor<'_> {
         dv_normalization_root: Option<Url>,
     ) -> ActionReconciliationVisitor<'seen> {
         ActionReconciliationVisitor {
+            crc,
             deduplicator: FileActionDeduplicator::new(
                 seen_file_keys,
                 is_log_batch,
@@ -447,7 +475,7 @@ impl ActionReconciliationVisitor<'_> {
         let Some(FileActionInfo {
             key: file_key,
             is_add,
-            ..
+            size,
         }) = self.deduplicator.extract_file_action(i, getters, false)?
         else {
             return Ok(None); // No file action found, continue checking other types
@@ -458,6 +486,22 @@ impl ActionReconciliationVisitor<'_> {
             false // duplicate!
         } else if is_add {
             self.add_actions_count += 1;
+            if let FileStatsState::Complete(stats) = &mut self.crc.file_stats_state {
+                let num_files = stats.num_files.checked_add(1);
+                let table_size_bytes = i64::try_from(size)
+                    .ok()
+                    .and_then(|bytes| stats.table_size_bytes.checked_add(bytes));
+                if let (Some(num_files), Some(table_size_bytes)) = (num_files, table_size_bytes) {
+                    stats.num_files = num_files;
+                    stats.table_size_bytes = table_size_bytes;
+                } else {
+                    self.crc.file_stats_state = FileStatsState::Indeterminate;
+                    error!(
+                        version = self.crc.version,
+                        "Checkpoint CRC file totals overflowed i64"
+                    );
+                }
+            }
             true
         } else {
             // Expired remove actions are not valid
@@ -705,25 +749,100 @@ mod tests {
         Ok(ActionsBatch::new(actions, true))
     }
 
-    /// Helper function which applies the [`ActionReconciliationProcessor`] to a set of
-    /// input batches and returns the results.
+    #[test]
+    fn reconciliation_error_invalidates_shared_crc() {
+        let crc = Arc::new(Mutex::new(Crc::default()));
+        let failed_batch = Err(KernelError::internal_error("reconciliation failed"));
+        let mut iterator = ActionReconciliationIterator::new(
+            Box::new(std::iter::once(failed_batch)),
+            Arc::clone(&crc),
+        );
+
+        assert!(iterator.next().unwrap().is_err());
+        assert!(crc.lock().unwrap().file_stats().is_none());
+    }
+
+    #[test]
+    fn checkpoint_crc_counts_only_live_adds_across_batches() -> Result<()> {
+        let batches = vec![
+            create_batch(vec![
+                r#"{"add":{"path":"live","size":10,"partitionValues":{},
+                    "modificationTime":0,"dataChange":true}}"#,
+                r#"{"remove":{"path":"deleted","deletionTimestamp":100,"dataChange":true}}"#,
+            ])?,
+            create_batch(vec![
+                r#"{"add":{"path":"live","size":99,"partitionValues":{},
+                    "modificationTime":0,"dataChange":true}}"#,
+                r#"{"add":{"path":"deleted","size":88,"partitionValues":{},
+                    "modificationTime":0,"dataChange":true}}"#,
+                r#"{"add":{"path":"other","size":20,"partitionValues":{},
+                    "modificationTime":0,"dataChange":true}}"#,
+                r#"{"add":{"path":"empty","size":0,"partitionValues":{},
+                    "modificationTime":0,"dataChange":true}}"#,
+            ])?,
+        ];
+        let crc = Arc::new(Mutex::new(Crc {
+            version: 42,
+            ..Default::default()
+        }));
+        let mut processor = ActionReconciliationProcessor::new(0, None, None, Arc::clone(&crc));
+        for batch in batches {
+            processor.process_actions_batch(batch)?;
+        }
+        let crc = crc.lock().unwrap();
+        assert_eq!(crc.version, 42);
+        let stats = crc.file_stats().unwrap();
+        assert_eq!(stats.num_files(), 3);
+        assert_eq!(stats.table_size_bytes(), 30);
+        assert!(stats.file_size_histogram().is_none());
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    fn checkpoint_crc_overflow_does_not_fail_reconciliation(
+        #[values(false, true)] separate_batches: bool,
+    ) -> Result<()> {
+        let adds = vec![
+            r#"{"add":{"path":"large","size":9223372036854775807,"partitionValues":{},
+                "modificationTime":0,"dataChange":true}}"#,
+            r#"{"add":{"path":"small","size":1,"partitionValues":{},
+                "modificationTime":0,"dataChange":true}}"#,
+        ];
+        let batches = if separate_batches {
+            adds.into_iter()
+                .map(|add| create_batch(vec![add]))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![create_batch(adds)?]
+        };
+        let crc = Arc::new(Mutex::new(Crc::default()));
+        let mut processor = ActionReconciliationProcessor::new(0, None, None, Arc::clone(&crc));
+        let mut add_actions_count = 0;
+        for batch in batches {
+            add_actions_count += processor.process_actions_batch(batch)?.add_actions_count;
+        }
+        assert_eq!(add_actions_count, 2);
+        assert!(crc.lock().unwrap().file_stats().is_none());
+        Ok(())
+    }
+
     fn run_action_reconciliation_test(
         input_batches: Vec<ActionsBatch>,
     ) -> Result<(Vec<FilteredEngineData>, i64, i64)> {
-        let mut processor = ActionReconciliationProcessor::new(0, None, None);
-        let processed_batches: Vec<_> = input_batches
+        let crc = Arc::new(Mutex::new(Crc::default()));
+        let mut processor = ActionReconciliationProcessor::new(0, None, None, Arc::clone(&crc));
+        let reconciled = input_batches
             .into_iter()
             .map(move |batch| processor.process_actions_batch(batch))
-            .filter_ok(HasSelectionVector::has_selected_rows)
-            .try_collect()?;
-        let total_count: i64 = processed_batches.iter().map(|b| b.actions_count).sum();
-        let add_count: i64 = processed_batches.iter().map(|b| b.add_actions_count).sum();
-        let filtered_data = processed_batches
-            .into_iter()
-            .map(|b| b.filtered_data)
-            .collect();
-
-        Ok((filtered_data, total_count, add_count))
+            .filter_ok(HasSelectionVector::has_selected_rows);
+        let iterator = ActionReconciliationIterator::new(Box::new(reconciled), crc);
+        let state = iterator.state();
+        let filtered_data = iterator.try_collect()?;
+        Ok((
+            filtered_data,
+            state.actions_count(),
+            state.add_actions_count(),
+        ))
     }
     #[test]
     fn test_action_reconciliation_visitor() -> Result<()> {
@@ -731,7 +850,9 @@ mod tests {
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
+        let mut crc = Crc::default();
         let mut visitor = ActionReconciliationVisitor::new(
+            &mut crc,
             &mut seen_file_keys,
             true,
             vec![true; 9],
@@ -790,7 +911,9 @@ mod tests {
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
+        let mut crc = Crc::default();
         let mut visitor = ActionReconciliationVisitor::new(
+            &mut crc,
             &mut seen_file_keys,
             true,
             vec![true; 4],
@@ -824,7 +947,9 @@ mod tests {
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
+        let mut crc = Crc::default();
         let mut visitor = ActionReconciliationVisitor::new(
+            &mut crc,
             &mut seen_file_keys,
             false, // is_log_batch = false (batch)
             vec![true; 1],
@@ -866,7 +991,9 @@ mod tests {
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
+        let mut crc = Crc::default();
         let mut visitor = ActionReconciliationVisitor::new(
+            &mut crc,
             &mut seen_file_keys,
             true,
             vec![true; 3],
@@ -904,7 +1031,9 @@ mod tests {
         let mut seen_domains = HashSet::new();
         seen_txns.insert("app1".to_string());
 
+        let mut crc = Crc::default();
         let mut visitor = ActionReconciliationVisitor::new(
+            &mut crc,
             &mut seen_file_keys,
             true,
             vec![true; 3],
@@ -945,7 +1074,9 @@ mod tests {
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
+        let mut crc = Crc::default();
         let mut visitor = ActionReconciliationVisitor::new(
+            &mut crc,
             &mut seen_file_keys,
             true, // is_log_batch
             vec![true; 7],
@@ -1106,7 +1237,9 @@ mod tests {
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
+        let mut crc = Crc::default();
         let mut visitor = ActionReconciliationVisitor::new(
+            &mut crc,
             &mut seen_file_keys,
             true,
             vec![true; 4],
@@ -1149,7 +1282,9 @@ mod tests {
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
+        let mut crc = Crc::default();
         let mut visitor = ActionReconciliationVisitor::new(
+            &mut crc,
             &mut seen_file_keys,
             true,
             vec![true; 2],
@@ -1193,7 +1328,12 @@ mod tests {
         let input_batches = vec![create_batch(batch1)?, create_batch(batch2)?];
 
         // Create processor with txn expiration timestamp
-        let mut processor = ActionReconciliationProcessor::new(0, Some(1000), None);
+        let mut processor = ActionReconciliationProcessor::new(
+            0,
+            Some(1000),
+            None,
+            Arc::new(Mutex::new(Crc::default())),
+        );
         let results: Vec<_> = input_batches
             .into_iter()
             .map(move |batch| processor.process_actions_batch(batch))
@@ -1298,12 +1438,14 @@ mod tests {
 
     /// Helper function to create a standard action reconciliation visitor for error testing
     fn create_test_visitor<'a>(
+        crc: &'a mut Crc,
         seen_file_keys: &'a mut HashSet<FileActionKey>,
         seen_txns: &'a mut HashSet<String>,
         seen_domains: &'a mut HashSet<String>,
         txn_expiration_timestamp: Option<i64>,
     ) -> ActionReconciliationVisitor<'a> {
         ActionReconciliationVisitor::new(
+            crc,
             seen_file_keys,
             true,
             vec![true; 1],
@@ -1340,8 +1482,14 @@ mod tests {
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
-        let mut visitor =
-            create_test_visitor(&mut seen_file_keys, &mut seen_txns, &mut seen_domains, None);
+        let mut crc = Crc::default();
+        let mut visitor = create_test_visitor(
+            &mut crc,
+            &mut seen_file_keys,
+            &mut seen_txns,
+            &mut seen_domains,
+            None,
+        );
         let getter = MockErrorGetData::default();
         let getters = vec![&getter as &dyn GetData<'_>; 5]; // Wrong count (should be 15)!
         let result = visitor.visit(1, &getters);
@@ -1368,8 +1516,14 @@ mod tests {
             let mut seen_file_keys = HashSet::new();
             let mut seen_txns = HashSet::new();
             let mut seen_domains = HashSet::new();
-            let mut visitor =
-                create_test_visitor(&mut seen_file_keys, &mut seen_txns, &mut seen_domains, None);
+            let mut crc = Crc::default();
+            let mut visitor = create_test_visitor(
+                &mut crc,
+                &mut seen_file_keys,
+                &mut seen_txns,
+                &mut seen_domains,
+                None,
+            );
             let getters = create_getters_with_error_at_index(getter_index, field_name, error_type);
             let getter_refs: Vec<&dyn GetData<'_>> =
                 getters.iter().map(|g| g as &dyn GetData<'_>).collect();
@@ -1388,7 +1542,9 @@ mod tests {
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
+        let mut crc = Crc::default();
         let mut visitor = create_test_visitor(
+            &mut crc,
             &mut seen_file_keys,
             &mut seen_txns,
             &mut seen_domains,
@@ -1417,8 +1573,14 @@ mod tests {
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
-        let mut visitor =
-            create_test_visitor(&mut seen_file_keys, &mut seen_txns, &mut seen_domains, None);
+        let mut crc = Crc::default();
+        let mut visitor = create_test_visitor(
+            &mut crc,
+            &mut seen_file_keys,
+            &mut seen_txns,
+            &mut seen_domains,
+            None,
+        );
         let defaults = (0..5)
             .map(|_| MockErrorGetData::default())
             .collect::<Vec<_>>();
@@ -1454,7 +1616,8 @@ mod tests {
         // Create a processor and try to process the batch
         // We can't easily trigger an error in the normal flow since parse_json_batch creates valid
         // data But this test ensures the error propagation path exists and is tested
-        let mut processor = ActionReconciliationProcessor::new(0, None, None);
+        let mut processor =
+            ActionReconciliationProcessor::new(0, None, None, Arc::new(Mutex::new(Crc::default())));
         let result = processor.process_actions_batch(batch);
 
         // This should succeed - the test mainly verifies that the error propagation paths compile
