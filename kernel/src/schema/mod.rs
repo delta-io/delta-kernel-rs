@@ -2722,13 +2722,17 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         }
 
         self.transform_inner(field.name(), |this| {
-            let field = this.recurse_into_struct_field(field)?;
             if this.mode == MakePhysicalMode::ValidateStrict {
-                return Ok(field);
+                return this.recurse_into_struct_field(field);
             }
+            let data_type = this.transform(field.data_type())?.into_owned();
             let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
-            let name = physical_name.to_owned();
-            Ok(Cow::Owned(field.with_name(name).with_metadata(metadata)))
+            Ok(Cow::Owned(StructField {
+                name: physical_name.to_owned(),
+                data_type,
+                nullable: field.nullable,
+                metadata,
+            }))
         })
     }
 
