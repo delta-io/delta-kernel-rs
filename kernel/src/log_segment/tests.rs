@@ -46,6 +46,7 @@ use crate::schema::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table, write_commit,
+    write_manifest_commit,
 };
 use crate::unit_test_utils::{
     assert_batch_matches, assert_result_error_with_message, create_log_path,
@@ -5647,12 +5648,11 @@ async fn amt_last_checkpoint_hint_bounds_listing(
 fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> KernelResult<()> {
     let (engine, table_root) = setup_table()?;
     for version in 1..=2 {
-        write_commit(
+        write_manifest_commit(
             &engine,
             &table_root,
             version,
-            minimal_checkpoint_action(&format!("metadata/root-v{version}.parquet"), version)?
-                .into_engine_data(&engine)?,
+            minimal_checkpoint_action(&format!("metadata/root-v{version}.parquet"), version)?,
         )?;
     }
     let hint = LastCheckpointHint {
