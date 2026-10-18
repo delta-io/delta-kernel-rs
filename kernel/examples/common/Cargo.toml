@@ -24,3 +24,5 @@ delta_kernel = { path = "../../../kernel", features = [
 ] }
 delta_kernel_default_engine = { path = "../../../default-engine", features = ["rustls"] }
 url = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
