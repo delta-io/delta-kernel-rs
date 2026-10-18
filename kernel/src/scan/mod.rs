@@ -19,6 +19,7 @@ use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
+use crate::engine::KernelEngine;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{
     column_name, ColumnName, ExpressionRef, MapToStructOptions, Predicate, PredicateRef,
@@ -1072,6 +1073,20 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
+        let scoped_engine = self
+            .cancellation_token
+            .clone()
+            .map(|token| KernelEngine::new(engine, token));
+        let engine = scoped_engine
+            .as_ref()
+            .map_or(engine, |engine| engine as &dyn Engine);
+        self.scan_metadata_with_engine(engine)
+    }
+
+    fn scan_metadata_with_engine(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
         let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
         self.scan_metadata_inner(engine, actions_with_checkpoint_info)
     }
@@ -1147,6 +1162,14 @@ impl Scan {
                  tables with TIMESTAMP partition columns; use scan_metadata instead"
             )
         );
+        let scoped_engine = self
+            .cancellation_token
+            .clone()
+            .map(|token| KernelEngine::new(engine, token));
+        let engine = scoped_engine
+            .as_ref()
+            .map_or(engine, |engine| engine as &dyn Engine);
+
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
         let existing_data = existing_data.into_iter();
         // Cached metadata bypasses engine handlers, so kernel must poll cancellation while
@@ -1205,7 +1228,7 @@ impl Scan {
         // TODO: we may be able to apply heuristics or other logic to try and fetch missing deltas
         // from the log.
         if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
-            return Ok(Box::new(self.scan_metadata(engine)?));
+            return Ok(Box::new(self.scan_metadata_with_engine(engine)?));
         }
 
         // create a new log segment containing only the commits added after the version hint.
@@ -1234,7 +1257,6 @@ impl Scan {
             meta_predicate,
             physical_stats_read_schema,
             None,
-            self.cancellation_token.as_ref(),
         )?;
         // Only the cached suffix needs a kernel-side check. The engine owns cancellation for the
         // newly read action prefix.
@@ -1372,7 +1394,6 @@ impl Scan {
                     .physical_partition_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
-                self.cancellation_token.as_ref(),
             )
     }
 

@@ -14,7 +14,6 @@ use crate::actions::CheckpointAction;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
-use crate::cancellation::CancellationTokenRef;
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::{FileMeta, KernelError, KernelResult, StorageHandler, Version};
@@ -448,13 +447,9 @@ impl LastCheckpointHint {
     pub(crate) fn try_read(
         storage: &dyn StorageHandler,
         log_root: &Url,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
-        match storage
-            .read_files_with_cancellation(vec![(file_path, None)], cancellation_token.cloned())?
-            .next()
-        {
+        match storage.read_files(vec![(file_path, None)])?.next() {
             Some(Ok(data)) => {
                 let result = Self::from_bytes_with_oversized_fields_dropped(&data)
                     .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
@@ -568,6 +563,8 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::engine::test_delegating::DelegatingEngine;
+    use crate::engine::KernelEngine;
     use crate::schema::schema;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::create_log_path;
@@ -816,7 +813,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        let hint = LastCheckpointHint::try_read(storage.as_ref(), &log_root, None).unwrap();
+        let hint = LastCheckpointHint::try_read(storage.as_ref(), &log_root).unwrap();
         assert_eq!(hint.is_some(), retained, "{json}");
     }
 
@@ -1344,9 +1341,8 @@ mod tests {
 
         let (engine, snapshot, _tempdir) = load_test_table(table)?;
         let seg = snapshot.log_segment();
-        let hint =
-            LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &seg.log_root, None)?
-                .expect("table has a _last_checkpoint");
+        let hint = LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &seg.log_root)?
+            .expect("table has a _last_checkpoint");
         let v2 = hint.v2_checkpoint.as_ref().expect("V2 checkpoint hint");
 
         // Version, checkpoint file path, and sidecar paths are this table's exact identity.
@@ -1521,9 +1517,13 @@ mod tests {
     #[test]
     fn try_read_propagates_cancellation() {
         let log_root = Url::parse("memory:///_delta_log/").unwrap();
-        let token: CancellationTokenRef =
-            std::sync::Arc::new(crate::unit_test_utils::TestCancellationToken::cancelled());
-        let result = LastCheckpointHint::try_read(&NoIoStorageHandler, &log_root, Some(&token));
+        let engine = DelegatingEngine::new(Arc::new(SyncEngine::new()))
+            .with_storage_handler(Arc::new(NoIoStorageHandler));
+        let engine = KernelEngine::new(
+            &engine,
+            Arc::new(crate::unit_test_utils::TestCancellationToken::cancelled()),
+        );
+        let result = LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &log_root);
         assert!(matches!(result, Err(KernelError::Cancelled)));
     }
 }

@@ -357,7 +357,6 @@ impl Snapshot {
             Some(listing_start),
             requested_version,
             checkpoint_handling,
-            None,
         )?;
 
         // NB: we need to check both checkpoints and commits since we filter commits at and below

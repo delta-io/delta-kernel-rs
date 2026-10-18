@@ -719,28 +719,22 @@ fn get_earliest_published_commit_version(
 ) -> KernelResult<Version> {
     // Listing inherits any token bound to the engine's storage handler.
     // TODO(#3188): accept cancellation tokens on the history-manager entry points.
-    list_delta_log_from_storage(
-        engine.storage_handler().as_ref(),
-        log_root,
-        0,
-        Version::MAX,
-        None,
-    )?
-    .filter_ok(|f| f.file_type == LogPathFileType::Commit)
-    .next()
-    .transpose()?
-    .map(|f| f.version)
-    .ok_or_else(|| {
-        if earliest_ratified_commit_version == Some(0) {
-            return DeltaError::generic(format!(
-                "expected a published v0 commit for catalog-managed table {log_root}, \
+    list_delta_log_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?
+        .filter_ok(|f| f.file_type == LogPathFileType::Commit)
+        .next()
+        .transpose()?
+        .map(|f| f.version)
+        .ok_or_else(|| {
+            if earliest_ratified_commit_version == Some(0) {
+                return DeltaError::generic(format!(
+                    "expected a published v0 commit for catalog-managed table {log_root}, \
                        but the log listing returned no commits"
-            ));
-        }
-        DeltaError::from(LogHistoryError::NoCommitsFound {
-            log_root: log_root.clone(),
+                ));
+            }
+            DeltaError::from(LogHistoryError::NoCommitsFound {
+                log_root: log_root.clone(),
+            })
         })
-    })
 }
 
 /// Returns the earliest table version that can be fully reconstructed, and from which we can replay
@@ -777,13 +771,8 @@ fn get_earliest_recreatable_commit(
 
     // Listing inherits any token bound to the engine's storage handler.
     // TODO(#3188): accept cancellation tokens on the history-manager entry points.
-    let listing = list_delta_log_from_storage(
-        engine.storage_handler().as_ref(),
-        log_root,
-        0,
-        Version::MAX,
-        None,
-    )?;
+    let listing =
+        list_delta_log_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?;
     for parsed_result in listing {
         let parsed_log_path = parsed_result?;
         if !should_process_log_file(&parsed_log_path) {
