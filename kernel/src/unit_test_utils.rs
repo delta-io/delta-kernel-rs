@@ -327,8 +327,9 @@ pub(crate) mod adaptive_metadata_fixtures {
     use std::iter;
 
     use super::*;
-    use crate::actions::{CheckpointAction, ContentRoot};
+    use crate::actions::{CheckpointAction, ContentRoot, Sidecar};
     use crate::engine_data::FilteredEngineData;
+    use crate::expressions::Scalar;
     use crate::path::LogRoot;
     use crate::version_as_i64;
 
@@ -367,6 +368,34 @@ pub(crate) mod adaptive_metadata_fixtures {
             vec![],
             vec![],
         ))
+    }
+
+    /// Writes `rows` (each a value of `schema`'s single action field) as the checkpoint sidecar
+    /// `name` of the table at `table_root`.
+    pub(crate) fn write_sidecar(
+        engine: &SyncEngine,
+        table_root: &Url,
+        name: &str,
+        schema: SchemaRef,
+        rows: Vec<Scalar>,
+    ) -> Sidecar {
+        let rows = rows.into_iter().map(|row| vec![row]).collect();
+        let data = engine
+            .evaluation_handler()
+            .create_many(schema, rows)
+            .unwrap();
+        let log_root = LogRoot::new(table_root.clone()).unwrap();
+        let location = log_root
+            .log_root()
+            .join("_sidecars/")
+            .unwrap()
+            .join(name)
+            .unwrap();
+        let size = engine
+            .parquet_handler()
+            .write_parquet_file(location, Box::new(iter::once(Ok(data))))
+            .unwrap();
+        Sidecar::new(name.to_string(), size as i64, 0, None)
     }
 
     /// Creates an empty in-memory table and returns its engine and table-root URL.

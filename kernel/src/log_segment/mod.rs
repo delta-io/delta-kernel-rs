@@ -43,6 +43,8 @@ use crate::{
     RowVisitor, StorageHandler, Version,
 };
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod checkpoint_sidecar;
 mod crc_replay;
 mod domain_metadata_replay;
 mod protocol_metadata_replay;
