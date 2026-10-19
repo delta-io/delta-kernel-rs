@@ -300,7 +300,7 @@ async fn arrow_round_trip_schema_can_create_table(
     let arrow: ArrowSchema = schema.as_ref().try_into_arrow()?;
     let recovered = Arc::new(StructType::try_from_arrow(&arrow)?);
     assert_eq!(schema, recovered);
-    let snapshot = create_table(&path, recovered, "test")
+    let snapshot = create_table(&path, recovered, "test", false)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
@@ -321,7 +321,7 @@ async fn alter_requires_existing_feature_without_upgrade(
     #[case] supported: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup()?;
-    let mut builder = create_table(&path, schema_ref! { nullable "id": INTEGER }, "test");
+    let mut builder = create_table(&path, schema_ref! { nullable "id": INTEGER }, "test", false);
     if signal.is_some() {
         builder = builder.with_table_properties([("delta.feature.collations", "supported")]);
     }
@@ -337,8 +337,7 @@ async fn alter_requires_existing_feature_without_upgrade(
     let collated_field = annotated_field("name", DataType::STRING, "name", "test.ASCII_CI");
     let result = snapshot
         .clone()
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test", false)
         .add_column(collated_field.clone())
         .build(engine.as_ref(), committer());
     if supported {
@@ -367,8 +366,7 @@ async fn alter_requires_existing_feature_without_upgrade(
         MetadataValue::Other(json!({ "bad": "test.ASCII_CI" })),
     )]);
     let error = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test", false)
         .add_column(malformed)
         .build(engine.as_ref(), committer())
         .err()
@@ -398,7 +396,7 @@ async fn annotations_inside_container_structs_auto_enable_feature(
         .unwrap()
         .get_config_value(&ColumnMetadataKey::Collations)
         .is_none());
-    let snapshot = create_table(&path, schema.clone(), "test")
+    let snapshot = create_table(&path, schema.clone(), "test", false)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
@@ -508,17 +506,16 @@ async fn malformed_annotations_rejected_before_create_and_alter(
         ColumnMetadataKey::Collations.as_ref(),
         MetadataValue::Other(metadata),
     )]);
-    let create = create_table(&path, schema_ref! { (invalid.clone()) }, "test")
+    let create = create_table(&path, schema_ref! { (invalid.clone()) }, "test", false)
         .build(engine.as_ref(), committer());
     assert_result_error_with_message(create, message);
-    let snapshot = create_table(&path, schema_ref! { nullable "id": INTEGER }, "test")
+    let snapshot = create_table(&path, schema_ref! { nullable "id": INTEGER }, "test", false)
         .with_table_properties([("delta.feature.collations", "supported")])
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
     let alter = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable)
+        .update_table(UpdateTableOperation::AlterTable, "test", false)
         .add_column(invalid)
         .build(engine.as_ref(), committer());
     assert_result_error_with_message(alter, message);
@@ -545,11 +542,16 @@ async fn snapshot_loading_rejects_malformed_collation_annotations(
     #[values("collations", "collations-preview")] feature: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup()?;
-    create_table(&path, schema_ref! { nullable "name": STRING }, "test")
-        .with_table_properties([("delta.feature.collations", "supported")])
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
-        .unwrap_committed();
+    create_table(
+        &path,
+        schema_ref! { nullable "name": STRING },
+        "test",
+        false,
+    )
+    .with_table_properties([("delta.feature.collations", "supported")])
+    .build(engine.as_ref(), committer())?
+    .commit(engine.as_ref())?
+    .unwrap_committed();
     if feature == "collations-preview" {
         rewrite_as_preview_table(&path)?;
     }
@@ -584,10 +586,15 @@ async fn snapshot_loading_requires_collation_feature_for_annotated_schema(
     #[case] protocol: Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup()?;
-    create_table(&path, schema_ref! { nullable "name": STRING }, "test")
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
-        .unwrap_committed();
+    create_table(
+        &path,
+        schema_ref! { nullable "name": STRING },
+        "test",
+        false,
+    )
+    .build(engine.as_ref(), committer())?
+    .commit(engine.as_ref())?
+    .unwrap_committed();
     let schema = schema_ref! {
         (annotated_field("name", DataType::STRING, "name", "test.ASCII_CI"))
     };
@@ -699,8 +706,7 @@ async fn checkpoint_repeatedly_preserves_multiple_identifiers_and_sparse_bounds(
         );
         if round < 2 {
             snapshot = snapshot
-                .transaction_builder()
-                .with_operation(UpdateTableOperation::AlterTable)
+                .update_table(UpdateTableOperation::AlterTable, "test", false)
                 .set_nullable(column_name!("id"))
                 .build(engine.as_ref(), committer())?
                 .commit(engine.as_ref())?
