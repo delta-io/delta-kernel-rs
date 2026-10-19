@@ -1,6 +1,6 @@
 //! Domain metadata replay logic for [`LogSegment`].
 //!
-//! Two entry points: [`LogSegment::scan_domain_metadatas`] replays the whole log for the latest
+//! Two entry points: [`scan_domain_metadata_actions`] folds a whole-log replay into the latest
 //! domain metadata, and [`LogSegment::scan_domain_metadatas_rooted_in_crc`] scans only the commits
 //! after an authoritative stale CRC and reconciles them against its active-domain map.
 
@@ -19,6 +19,7 @@ pub(crate) type DomainMetadataMap = HashMap<String, DomainMetadata>;
 
 impl LogSegment {
     /// [`scan_domain_metadata_actions`] over this segment's whole log.
+    #[cfg(test)]
     pub(crate) fn scan_domain_metadatas(
         &self,
         domains: Option<&HashSet<&str>>,
@@ -107,7 +108,7 @@ impl LogSegment {
 /// Returns the latest domain metadata for each domain, accounting for tombstones
 /// (`removed=true`) — removed domain metadatas will _never_ be present in the returned map.
 #[instrument(name = "domain_metadata.scan", skip_all, fields(domains = ?domains.map(|d| d.iter().collect::<Vec<_>>())), err)]
-fn scan_domain_metadata_actions(
+pub(crate) fn scan_domain_metadata_actions(
     actions: impl Iterator<Item = KernelResult<ActionsBatch>>,
     domains: Option<&HashSet<&str>>,
 ) -> KernelResult<DomainMetadataMap> {
@@ -146,15 +147,30 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use itertools::Itertools as _;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use test_utils::add_commit;
     use url::Url;
 
     use crate::actions::visitors::DomainMetadataVisitor;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::actions::{
+        CheckpointAction, ContentRoot, DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA,
+    };
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
     use crate::transaction::create_table::create_table as create_table_txn;
     use crate::transaction::UpdateTableOperation;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::unit_test_utils::adaptive_metadata_fixtures::{
+        checkpoint_action_with_root, checkpoint_line, protocol_and_metadata_lines,
+        setup_adaptive_metadata_table, write_ict_commit, write_sidecar,
+    };
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::unit_test_utils::Action;
     use crate::{RowVisitor as _, Snapshot};
 
     /// Builds a two-commit in-memory Delta table:
@@ -360,5 +376,107 @@ mod tests {
         assert!(with_tombstones["domainA"].is_removed());
         assert!(!with_tombstones["domainB"].is_removed());
         assert!(!with_tombstones["domainC"].is_removed());
+    }
+
+    /// The `domainMetadata` entries (inline and in sidecars) of an AMT `checkpoint` action stand
+    /// in for the commits at or below its version, and later commits, including removals, override
+    /// them.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[tokio::test]
+    async fn amt_checkpoint_action_supplies_domain_metadata() {
+        let dm_line =
+            |dm: DomainMetadata| serde_json::to_string(&Action::DomainMetadata(dm)).unwrap();
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        // The root manifest is never read, so it need not exist.
+        let mut checkpoint = checkpoint_action_with_root("metadata/root.parquet", 1, 1).unwrap();
+        checkpoint.domain_metadata = vec![
+            DomainMetadata::new("a".to_string(), "a1".to_string()),
+            DomainMetadata::new("b".to_string(), "b1".to_string()),
+        ];
+        checkpoint.domain_metadata_sidecars = vec![write_sidecar(
+            &engine,
+            &Url::parse("memory:///").unwrap(),
+            "domains.parquet",
+            LOG_DOMAIN_METADATA_SCHEMA.clone(),
+            vec![DomainMetadata::new("d".to_string(), "d1".to_string()).into()],
+        )];
+        let commits = [
+            // At or below the checkpoint version, so the checkpoint action replaces it.
+            format!(
+                "{}\n{}",
+                protocol_and_metadata_lines(&[]),
+                dm_line(DomainMetadata::new("c".to_string(), "c0".to_string()))
+            ),
+            checkpoint_line(&checkpoint),
+            format!(
+                "{}\n{}",
+                dm_line(DomainMetadata::new("a".to_string(), "a2".to_string())),
+                dm_line(DomainMetadata::remove("b".to_string(), String::new()))
+            ),
+        ];
+        for (version, commit) in commits.into_iter().enumerate() {
+            add_commit("memory:///", store.as_ref(), version as u64, commit)
+                .await
+                .unwrap();
+        }
+        let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
+
+        for (domain, expected) in [
+            ("a", Some("a2")),
+            ("b", None),
+            ("c", None),
+            ("d", Some("d1")),
+        ] {
+            assert_eq!(
+                snapshot
+                    .get_domain_metadata(domain, &engine)
+                    .unwrap()
+                    .as_deref(),
+                expected,
+                "domain {domain}"
+            );
+        }
+        let all = snapshot
+            .get_domain_metadatas_internal(&engine, None)
+            .unwrap();
+        assert_eq!(all.keys().sorted().collect::<Vec<_>>(), vec!["a", "d"]);
+    }
+
+    /// A stale CRC older than the checkpoint action cannot root a tail-only scan: the action's
+    /// `domainMetadata` entries would be missed.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn stale_crc_before_checkpoint_action_falls_back_to_full_replay() {
+        let (engine, table_root) = setup_adaptive_metadata_table();
+        write_ict_commit(&engine, &table_root, 1, "");
+        let snapshot = Snapshot::builder_for(table_root.clone())
+            .build(&engine)
+            .unwrap();
+        let (_, snapshot) = snapshot.write_checksum(&engine).unwrap();
+        let config = snapshot.table_configuration();
+        let checkpoint = CheckpointAction::new(
+            2,
+            ContentRoot::new("metadata/root.parquet".to_string(), 1, 2),
+            config.protocol().clone(),
+            config.metadata().clone(),
+            vec![],
+            vec![DomainMetadata::new(
+                "user.domain".to_string(),
+                "cfg".to_string(),
+            )],
+        );
+        write_ict_commit(&engine, &table_root, 2, &checkpoint_line(&checkpoint));
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+
+        assert!(snapshot.crc_at_version().is_none());
+        assert_eq!(
+            snapshot
+                .get_domain_metadata("user.domain", &engine)
+                .unwrap()
+                .as_deref(),
+            Some("cfg")
+        );
     }
 }
