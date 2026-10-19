@@ -179,8 +179,9 @@ mod tests {
     use crate::snapshot::Snapshot;
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
-        adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table,
-        write_commit, write_commit_after_manifest_commit, write_manifest_commit,
+        adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action,
+        setup_adaptive_metadata_table, setup_table, write_commit,
+        write_commit_after_manifest_commit, write_manifest_commit,
     };
     use crate::unit_test_utils::{MockTableConfigurationBuilder, assert_result_error_with_message};
     use crate::{KernelResult, create_row};
@@ -632,7 +633,7 @@ mod tests {
         #[case] dm_changes: Vec<DomainMetadata>,
         #[case] domain_kept: bool,
     ) -> KernelResult<()> {
-        let (engine, table_root) = setup_table()?;
+        let (engine, table_root) = setup_adaptive_metadata_table();
         let config = Snapshot::builder_for(table_root.clone())
             .build(&engine)?
             .table_configuration()
