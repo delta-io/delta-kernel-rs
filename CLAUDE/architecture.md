@@ -18,6 +18,7 @@ design decisions. This map provides entry points and broader design context.
 | Write checkpoints or CRCs | `kernel/src/checkpoint/`, `kernel/src/crc/` | `actions/` |
 | Implement engine capabilities | `kernel/src/lib.rs`, `kernel/src/engine/` | `default-engine/src/` |
 | Change schemas or expressions | `kernel/src/schema/`, `kernel/src/expressions/` | `transforms/` |
+| Change error types or propagation | `kernel/src/error.rs`, `kernel/src/lib.rs` | API result and iterator aliases |
 | Change protocol feature checks | `kernel/src/table_features/` | `table_configuration.rs`, `actions/` |
 | Work on catalog-managed tables | `kernel/src/committer/` | `delta-kernel-unity-catalog/` |
 
