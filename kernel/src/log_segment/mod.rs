@@ -331,12 +331,10 @@ fn augment_checkpoint_read_schema(
 impl LogSegment {
     /// Returns selected replay commit file statistics, failing if the byte sum overflows.
     pub(crate) fn stats(&self) -> KernelResult<LogSegmentStats> {
-        let selected;
-        let paths = if self.listed.ascending_compaction_files.is_empty() {
-            &self.listed.ascending_commit_files
+        let paths: Vec<&ParsedLogPath> = if self.listed.ascending_compaction_files.is_empty() {
+            self.listed.ascending_commit_files.iter().collect()
         } else {
-            selected = self.find_commit_cover_paths();
-            &selected
+            self.find_commit_cover_paths(None)
         };
         paths
             .iter()
