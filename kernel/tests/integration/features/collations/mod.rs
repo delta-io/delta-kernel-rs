@@ -228,7 +228,7 @@ async fn create_fixture(
     fixture: &CollationTable,
     properties: &[(&str, &str)],
 ) -> Result<SnapshotRef, Box<dyn std::error::Error>> {
-    let mut snapshot = create_table(table_path, fixture.schema.clone(), "collation-test")
+    let mut snapshot = create_table(table_path, fixture.schema.clone(), "collation-test", false)
         .with_table_properties(properties.iter().copied())
         .build(engine, committer())?
         .commit(engine)?

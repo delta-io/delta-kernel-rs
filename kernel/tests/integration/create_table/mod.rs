@@ -743,10 +743,10 @@ fn create_table_rejects_preview_feature_signals(
         "icebergNativeV4-preview"
     )]
     feature_name: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let key = format!("delta.feature.{feature_name}");
-    let result = create_table(&table_path, simple_schema()?, "Test/1.0")
+    let result = create_table(&table_path, simple_schema()?, "Test/1.0", false)
         .with_table_properties([(key.as_str(), "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
     assert_result_error_with_message(
