@@ -180,23 +180,24 @@ To execute a collation-aware query, your connector owns the string comparison ru
 the original row filter. Kernel preserves `__COLLATIONS` schema annotations. Existing
 `statsWithCollation` bounds reach your connector when you request JSON statistics.
 Structured statistics omit these bounds. `StatsOptions::all_struct()` disables JSON synthesis.
-Kernel's predicates and internal data skipping use UTF-8 binary semantics.
+Kernel's predicates and internal [data skipping](#how-data-skipping-works) use UTF-8 binary semantics.
 An ordinary equality predicate for `"alice"` can skip a file containing `"Alice"`.
 Evaluating a case-insensitive comparison later cannot recover that file.
 
-For connector-owned skipping, request JSON stats with `StatsOptions::json_only()` or
-`StatsOptions::all()` and select the bounds that match the filtering operation's collation
-exactly: provider, name, and version. The operation determines the collation, which can differ
-from the schema's default. Use those bounds only with a comparison you implement for that
-exact collation. If the matching entry or required bounds are absent, retain the file.
+For connector-owned skipping, [request JSON stats](#controlling-statistics) with
+`StatsOptions::json_only()` or `StatsOptions::all()` and select the bounds that match the
+filtering operation's collation exactly: provider, name, and version. The operation determines
+the collation, which can differ from the schema's default. Use those bounds only with a
+comparison you implement for that exact collation. If the matching entry or required bounds
+are absent, retain the file.
 Never substitute binary bounds or another collation/version.
 
 Where your evaluator supports opaque predicates, you can implement `OpaquePredicateOp`.
-Return `None` from `as_data_skipping_predicate` or `eval_as_data_skipping_predicate` when you
-can't safely prune. Kernel handles conservative relaxation, including negation, for those
-skipping callbacks. Scalar evaluation has a different contract: `eval_pred_scalar` returns
-`Err` for unsupported evaluation and `Ok(None)` for a SQL NULL result. Opaque predicates can't
-be serialized; reconstruct them on each worker when distributing a scan.
+Each `as_data_skipping_predicate` or `eval_as_data_skipping_predicate` callback must return a
+safe result for its `inverted` flag's polarity, or `None` when it can't safely prune.
+Kernel combines those results conservatively. Scalar evaluation has a different contract:
+`eval_pred_scalar` returns `Err` for unsupported evaluation and `Ok(None)` for a SQL NULL result.
+Opaque predicates can't be serialized; reconstruct them on each worker when distributing a scan.
 
 If you don't use opaque predicates, derive a conservative binary predicate before calling
 `ScanBuilder::with_predicate`:
