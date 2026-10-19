@@ -20,6 +20,7 @@ use tracing::warn;
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
+use crate::schema::collation_utils::rewrite_collation_field_prefix;
 use crate::table_features::{
     validate_and_extract_column_mapping_annotations, validate_column_mapping_id, ColumnMappingMode,
     StaleAnnotationPolicy,
@@ -813,23 +814,9 @@ impl StructField {
                 // TODO(#1070): Remove nested column ids when they are supported in kernel
             }
         }
-        match base_metadata.get_mut(ColumnMetadataKey::Collations.as_ref()) {
-            Some(MetadataValue::Other(serde_json::Value::Object(collations)))
-                if self.physical_name(column_mapping_mode) != self.name() =>
-            {
-                let physical_name = self.physical_name(column_mapping_mode);
-                *collations = std::mem::take(collations)
-                    .into_iter()
-                    .map(|(path, identifier)| {
-                        let physical_path = path
-                            .strip_prefix(self.name().as_str())
-                            .map(|suffix| format!("{physical_name}{suffix}"))
-                            .unwrap_or(path);
-                        (physical_path, identifier)
-                    })
-                    .collect();
-            }
-            _ => {}
+        let physical_name = self.physical_name(column_mapping_mode);
+        if let Some(annotation) = base_metadata.get_mut(ColumnMetadataKey::Collations.as_ref()) {
+            rewrite_collation_field_prefix(annotation, self.name(), physical_name);
         }
         base_metadata
     }
