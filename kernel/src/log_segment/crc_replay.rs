@@ -275,7 +275,11 @@ impl LogSegment {
         mut ascending_commits: impl DoubleEndedIterator<Item = &'a ParsedLogPath>,
         seed_histogram: Option<FileSizeHistogram>,
     ) -> KernelResult<CrcDelta> {
-        // Replay newest-first: ICT capture reads from the newest commit only.
+        // Replay newest-first: ICT capture reads from the newest commit only. Hold the oldest
+        // commit aside so adaptiveMetadata replay knows which manifest commits it crosses. The
+        // split runs for every table and changes nothing else: chaining it back last still reads
+        // each commit once, newest first, including a single commit (taken by `next()`, leaving
+        // `newer` empty).
         let oldest = ascending_commits.next();
         let newer = ascending_commits.next_back();
         let locations: Vec<FileMeta> = newer
@@ -312,8 +316,8 @@ impl LogSegment {
             {
                 last_manifest_commit.ensure_at_or_before(newest.version)?;
             }
-            // Replay misses only a replayed manifest commit's unlogged file changes; earlier
-            // commits and manifest commits with an older content root log theirs.
+            // Replay misses file changes only for a replayed manifest commit whose tree covers its
+            // own version.
             if let (Some(oldest), Some(version)) = (oldest, newest_files_only_in_manifest) {
                 if u64::try_from(version).is_ok_and(|v| v >= oldest.version) {
                     debug!(
