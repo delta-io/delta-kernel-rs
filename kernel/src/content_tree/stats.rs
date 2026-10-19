@@ -460,16 +460,19 @@ impl<'a> CategoryScopes<'a> {
     }
 }
 
-/// Callbacks for a [`StatsLeafWalker`] walk. `projection` is the Delta stat category scopes in
-/// effect at the current position, or `None` when not projecting.
+/// Callbacks for a [`StatsLeafWalker`] walk. `path` runs from the root to the visited field (its
+/// last segment is the field itself). `projection` is the Delta stat category scopes in effect at
+/// the current position, or `None` when not projecting.
+///
+/// The struct hooks fire for every struct, even one whose leaves the projection drops entirely.
 trait StatsLeafVisitor<'a> {
-    /// Called once for every non-struct leaf the projection does not drop, with the leaf field and
-    /// its root-to-leaf path (the last segment is the leaf itself).
+    /// Called once for every non-struct leaf the projection does not drop. `categories` is the
+    /// leaf's category membership, or `None` when not projecting.
     fn on_leaf(
         &mut self,
         field: &'a StructField,
         path: &[String],
-        projection: Option<&CategoryScopes<'a>>,
+        categories: Option<StatCategories>,
     ) -> KernelResult<()>;
 
     /// Called on entering a struct field, before its children are visited. `projection` is the
@@ -477,13 +480,14 @@ trait StatsLeafVisitor<'a> {
     fn enter_struct(
         &mut self,
         _field: &'a StructField,
+        _path: &[String],
         _projection: Option<&CategoryScopes<'a>>,
     ) -> KernelResult<()> {
         Ok(())
     }
 
-    /// Called after a struct field's children are visited. `path` ends with the struct's name and
-    /// `projection` is the struct's own scope.
+    /// Called after a struct field's children are visited successfully; it does not run when the
+    /// walk aborts with an error. `projection` is the struct's own scope.
     fn exit_struct(
         &mut self,
         _field: &'a StructField,
@@ -494,16 +498,16 @@ trait StatsLeafVisitor<'a> {
     }
 }
 
-/// Drives the table-schema walk shared by AMT `content_stats` schema generation
-/// ([`collect_stats_schema`]): it descends structs, threads the optional Delta stat projection
-/// through each descent, and reports leaves and struct boundaries to a [`StatsLeafVisitor`]. A leaf
-/// that a projection drops entirely (present in no category) is skipped before the visitor sees it.
-/// Stat-eligibility (field IDs, geospatial, array/map producing no stats) is left to the visitor.
+/// Drives a table-schema walk over AMT `content_stats` leaves: it descends structs, threads the
+/// optional Delta stat projection through each descent, and reports leaves and struct boundaries to
+/// a [`StatsLeafVisitor`]. A leaf that a projection drops entirely (present in no category) is
+/// skipped before the visitor sees it. Stat-eligibility (field IDs, geospatial, array/map producing
+/// no stats) is left to the visitor.
 ///
 /// Uses the `KernelResult<()>` carrier: the rebuilt output is discarded, the visitor holds the real
 /// result, and an `Err` short-circuits the walk.
 struct StatsLeafWalker<'a, V> {
-    /// Field names from the root to the current node; the last segment is the leaf being visited.
+    /// Field names from the root to the current node; the last segment is the field being visited.
     path: Vec<String>,
     /// Delta stat categories in scope at the current position, or `None` to visit every leaf.
     projection: Option<CategoryScopes<'a>>,
@@ -532,8 +536,8 @@ impl<'a, V: StatsLeafVisitor<'a>> SchemaTransform<'a> for StatsLeafWalker<'a, V>
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<()> {
         self.path.push(field.name().to_string());
-        // Descend into structs; every other type is a leaf. On `Err` the walk aborts and `path` is
-        // discarded, so the skipped pop is harmless.
+        // Descend into structs; every other type is a leaf. On `Err` the walk aborts and `walk`
+        // drops the walker, so the skipped `path` pop and `projection` restore are harmless.
         if let DataType::Struct(_) = field.data_type() {
             // The stat-category scopes step into this struct's sub-schema and are restored on the
             // way back up so siblings are unaffected. A category that is a scalar where the table
@@ -543,7 +547,8 @@ impl<'a, V: StatsLeafVisitor<'a>> SchemaTransform<'a> for StatsLeafWalker<'a, V>
                 .projection
                 .map(|s| s.descend(field.name(), &self.path))
                 .transpose()?;
-            self.visitor.enter_struct(field, self.projection.as_ref())?;
+            self.visitor
+                .enter_struct(field, &self.path, self.projection.as_ref())?;
             self.recurse_into_struct_field(field)?;
             self.visitor
                 .exit_struct(field, &self.path, self.projection.as_ref())?;
@@ -552,12 +557,9 @@ impl<'a, V: StatsLeafVisitor<'a>> SchemaTransform<'a> for StatsLeafWalker<'a, V>
             // Every non-struct type is a leaf -- including variants (never descended into: their
             // inner fields carry no field IDs) and array/map columns (which produce no stats). When
             // projecting, a leaf absent from every category is dropped here.
-            let dropped = self
-                .projection
-                .is_some_and(|s| !s.leaf_categories(field.name()).any());
-            if !dropped {
-                self.visitor
-                    .on_leaf(field, &self.path, self.projection.as_ref())?;
+            let categories = self.projection.map(|s| s.leaf_categories(field.name()));
+            if categories.is_none_or(|c| c.any()) {
+                self.visitor.on_leaf(field, &self.path, categories)?;
             }
         }
         self.path.pop();
@@ -640,9 +642,8 @@ impl<'a> StatsLeafVisitor<'a> for StatsSchemaCollector {
         &mut self,
         field: &'a StructField,
         path: &[String],
-        projection: Option<&CategoryScopes<'a>>,
+        categories: Option<StatCategories>,
     ) -> KernelResult<()> {
-        let categories = projection.map(|s| s.leaf_categories(field.name()));
         self.0.extend(leaf_stats_field(field, path, categories)?);
         Ok(())
     }
