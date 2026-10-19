@@ -1486,9 +1486,9 @@ impl LastManifestCommit {
         Ok(())
     }
 
-    /// Whether the manifest commit's own file changes may be recorded only in its manifest. A
-    /// manifest commit whose content root is older than the commit also logs its add and remove
-    /// actions.
+    /// Whether this manifest commit's own file changes may be recorded only in its tree. A manifest
+    /// commit's tree covers the table up to `contentRootVersion`; every add and remove after that
+    /// version is in the log unless a later manifest commit's tree covers it.
     pub(crate) fn files_only_in_manifest(&self) -> bool {
         self.content_root_version == self.version
     }
