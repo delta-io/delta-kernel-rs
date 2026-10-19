@@ -20,8 +20,8 @@
 //!
 //! ```no_run
 //! # use std::sync::Arc;
-//! # use delta_kernel::{Engine, Result, SnapshotRef};
-//! # fn read(snapshot: SnapshotRef, engine: Arc<dyn Engine>) -> Result<()> {
+//! # use delta_kernel::{Engine, KernelResult, SnapshotRef};
+//! # fn read(snapshot: SnapshotRef, engine: Arc<dyn Engine>) -> KernelResult<()> {
 //! let scan = snapshot.scan_builder().build()?;
 //! for batch in scan.execute(engine)? {
 //!     let batch = batch?;
