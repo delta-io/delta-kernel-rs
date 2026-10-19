@@ -24,7 +24,7 @@ use delta_kernel::{
     KernelError, KernelResult, KernelResultIterator, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
-use futures::{ready, FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt, ready};
 use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinHandle};
 use url::Url;
@@ -158,7 +158,7 @@ async fn read_json_files_parallel_impl(
     batch_size: usize,
     buffer_size: usize,
     parallel_chunks: usize,
-) -> Result<BoxStream<'static, Result<Box<dyn EngineData>>>> {
+) -> KernelResult<BoxStream<'static, KernelResult<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
     }
@@ -175,7 +175,7 @@ async fn read_json_files_parallel_impl(
     let mut receivers = Vec::new();
     let mut handles = Vec::new();
     for chunk in chunks {
-        let (tx, rx) = mpsc::channel::<Result<Box<dyn EngineData>>>(per_chunk_buffer);
+        let (tx, rx) = mpsc::channel::<KernelResult<Box<dyn EngineData>>>(per_chunk_buffer);
         receivers.push(rx);
 
         let store = store.clone();
@@ -249,9 +249,9 @@ impl Drop for AbortOnDropHandle {
 
 /// Drain `rx` then join `handle`. A panicked task is `Error::JoinFailure`, not EOF.
 fn drain_chunk(
-    rx: mpsc::Receiver<Result<Box<dyn EngineData>>>,
+    rx: mpsc::Receiver<KernelResult<Box<dyn EngineData>>>,
     handle: AbortOnDropHandle,
-) -> impl futures::Stream<Item = Result<Box<dyn EngineData>>> {
+) -> impl futures::Stream<Item = KernelResult<Box<dyn EngineData>>> {
     let batches = stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|item| (item, rx))
     });
@@ -452,13 +452,13 @@ mod tests {
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
         PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
     };
-    use delta_kernel::schema::{schema_ref, DataType as KernelDataType, StructField, StructType};
+    use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType, schema_ref};
     use delta_kernel_default_engine_test_utils::{into_record_batch, string_array_to_engine_data};
     use futures::future;
     use itertools::Itertools;
     use serde_json::json;
     use test_utils::engine_contract::test_json_handler_file_path_contract;
-    use test_utils::{assert_result_error_with_message, TestCancellationToken};
+    use test_utils::{TestCancellationToken, assert_result_error_with_message};
     use tracing::info;
 
     use super::*;
@@ -1176,7 +1176,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_drain_chunk_panicked_task_is_join_failure_not_eof() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Box<dyn EngineData>>>(1);
+        let (tx, rx) = tokio::sync::mpsc::channel::<KernelResult<Box<dyn EngineData>>>(1);
         let handle = AbortOnDropHandle::new(tokio::spawn(async {
             panic!("chunk task panicked");
         }));
@@ -1220,7 +1220,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_drain_chunk_successful_task_yields_no_join_item() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Box<dyn EngineData>>>(1);
+        let (tx, rx) = tokio::sync::mpsc::channel::<KernelResult<Box<dyn EngineData>>>(1);
         let handle = AbortOnDropHandle::new(tokio::spawn(async {}));
         drop(tx);
 
@@ -1233,7 +1233,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_drain_chunk_drop_aborts_unjoined_task() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Box<dyn EngineData>>>(1);
+        let (tx, rx) = tokio::sync::mpsc::channel::<KernelResult<Box<dyn EngineData>>>(1);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         let handle = AbortOnDropHandle::new(tokio::spawn(async move {
             let _tx = tx;
@@ -1285,7 +1285,7 @@ mod tests {
         )
         .with_parallel_chunks(NonZero::new(4));
         let physical_schema = schema_ref! { nullable "val": INTEGER };
-        let result: Result<Vec<_>> = handler
+        let result: KernelResult<Vec<_>> = handler
             .read_json_files(&files, physical_schema, None)
             .unwrap()
             .try_collect();
@@ -1326,7 +1326,7 @@ mod tests {
             .unwrap();
         let first = iter.next().expect("chunk 0 must yield a batch");
         assert!(first.is_ok(), "chunk 0 must succeed before chunk 1 errors");
-        let rest: Result<Vec<_>> = iter.try_collect();
+        let rest: KernelResult<Vec<_>> = iter.try_collect();
         assert!(rest.is_err(), "missing file in a later chunk must error");
     }
 
@@ -1435,7 +1435,7 @@ mod tests {
             )),
         )
         .with_parallel_chunks(NonZero::new(2));
-        let result: Result<Vec<_>> = handler
+        let result: KernelResult<Vec<_>> = handler
             .read_json_files(&files, physical_schema, None)
             .unwrap()
             .try_collect();
