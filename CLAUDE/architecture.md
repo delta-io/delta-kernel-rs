@@ -40,8 +40,6 @@ Compute engine (Spark, Flink, DuckDB, Polars, ...)
 - Kernel describes I/O and computation through `Engine`; engine implementations perform them.
 - `EngineData` is opaque to kernel production code. Inspect rows through the visitor APIs, and
   handle every batch returned for a file.
-- Public API behavior belongs in rustdoc. Implementation comments should explain hidden invariants
-  and design constraints.
 - Delta protocol behavior must match the
   [protocol specification](https://raw.githubusercontent.com/delta-io/delta/master/PROTOCOL.md).
 - Connector workflows that cross module boundaries belong in the user guide, not in this map.
