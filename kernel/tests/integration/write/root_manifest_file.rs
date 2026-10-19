@@ -14,12 +14,15 @@ use rstest::rstest;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
-use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
+use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
     assert_result_error_with_message, begin_transaction_with, create_table,
     create_table_with_column_mapping_mode, engine_store_setup, read_actions_from_commit,
+    write_batch_to_table,
 };
 use url::Url;
+
+use crate::common::write_utils::simple_id_batch;
 
 const READER_FEATURES: &[&str] = &[
     "columnMapping",
@@ -41,7 +44,15 @@ const WRITER_FEATURES: &[&str] = &[
 /// checkpoint with it.
 async fn setup_adaptive_metadata_table(
     table_name: &str,
-) -> Result<(impl Engine, TempDir, Url, SnapshotRef), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        DefaultEngine<TokioMultiThreadExecutor>,
+        TempDir,
+        Url,
+        SnapshotRef,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let temp_dir = tempfile::tempdir()?;
     let dir_url = Url::from_directory_path(temp_dir.path()).expect("valid directory url");
     let (store, _, table_url) = engine_store_setup(table_name, Some(&dir_url));
@@ -422,9 +433,8 @@ async fn test_no_checksum_after_manifest_commit(
 }
 
 /// `lastManifestCommit` round-trips through a CRC: a fresh snapshot reads it from the CRC at the
-/// manifest commit, the next log commit carries it forward, and that commit's checksum records it.
-/// Kernel cannot write a CRC after a manifest commit, so the one at the manifest commit is written
-/// by hand from the CRC of the commit before it.
+/// manifest commit, the next log commit adds a file and carries the pointer forward, and that
+/// commit's checksum counts the file and records the pointer.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_last_manifest_commit_carried_through_crc() -> Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
@@ -444,25 +454,38 @@ async fn test_last_manifest_commit_carried_through_crc() -> Result<(), Box<dyn s
         .commit(&engine)?
         .unwrap_committed();
 
-    let expected_last_manifest_commit = json!({ "version": 2, "contentRootVersion": 2 });
-    let mut crc = read_crc(&table_url, 1)?;
-    crc["lastManifestCommit"] = expected_last_manifest_commit.clone();
-    crc["inCommitTimestampOpt"] = commit_info_at(&table_url, 2)?["inCommitTimestamp"].clone();
-    std::fs::write(crc_path(&table_url, 2), serde_json::to_string(&crc)?)?;
+    write_updated_crc_for_manifest_commit(&table_url, 2)?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    begin_with_data_change(snapshot, &engine, true)?
-        .commit(&engine)?
-        .unwrap_post_commit_snapshot()
+    let batch = simple_id_batch(&snapshot.schema(), vec![1, 2]);
+    write_batch_to_table(&snapshot, &engine, batch, HashMap::new())
+        .await?
         .write_checksum(&engine)?;
+    let expected_last_manifest_commit = json!({ "version": 2, "contentRootVersion": 2 });
     assert_eq!(
         commit_info_at(&table_url, 3)?["lastManifestCommit"],
         expected_last_manifest_commit
     );
-    assert_eq!(
-        read_crc(&table_url, 3)?["lastManifestCommit"],
-        expected_last_manifest_commit
-    );
+    let crc = read_crc(&table_url, 3)?;
+    assert_eq!(crc["lastManifestCommit"], expected_last_manifest_commit);
+    let adds = read_actions_from_commit(&table_url, 3, "add")?;
+    assert_eq!(adds.len(), 1);
+    assert_eq!(crc["numFiles"], 1);
+    assert_eq!(crc["tableSizeBytes"], adds[0]["size"]);
+    Ok(())
+}
+
+/// Writes the CRC at manifest commit `version`: the CRC at `version - 1` with that commit's
+/// `lastManifestCommit` and in-commit timestamp.
+fn write_updated_crc_for_manifest_commit(
+    table_url: &Url,
+    version: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let commit_info = commit_info_at(table_url, version)?;
+    let mut crc = read_crc(table_url, version - 1)?;
+    crc["lastManifestCommit"] = commit_info["lastManifestCommit"].clone();
+    crc["inCommitTimestampOpt"] = commit_info["inCommitTimestamp"].clone();
+    std::fs::write(crc_path(table_url, version), serde_json::to_string(&crc)?)?;
     Ok(())
 }
 

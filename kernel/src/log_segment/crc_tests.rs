@@ -1371,14 +1371,14 @@ async fn test_replay_rejects_last_manifest_commit_newer_than_newest_commit() {
     );
 }
 
-// Replay misses only the file changes a replayed manifest commit records solely in its manifest
+// Replay misses file changes only for a replayed manifest commit whose tree covers its own version
 // (`contentRootVersion == version`). A pointer at or below the base is already reflected in the
-// base, and a manifest commit with an older content root logs its own file actions, which replay
-// counts. Each case lists the commits after the base CRC at version 0.
+// base, and adds after a manifest commit's `contentRootVersion` are in the log, so replay counts
+// them. Each case lists the commits after the base CRC at version 0.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[rstest]
 #[case::pointer_at_or_below_base(vec![vec![last_manifest_commit_info(0, 0)]], Some(0))]
-#[case::manifest_commit_logs_its_file_actions(
+#[case::manifest_commit_with_older_content_root_counts_its_adds(
     vec![vec![write_with_last_manifest_commit(1, 0), add("a", 100)]],
     Some(1)
 )]
