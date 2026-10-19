@@ -3,6 +3,8 @@
 //!
 //! [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
 
+use std::borrow::Cow;
+
 use url::{ParseError, Url};
 
 use crate::path_encoding::uri_encode_path;
@@ -54,6 +56,28 @@ pub(crate) fn amt_manifest_filemeta(
         location: resolve_amt_location(path, table_root)?,
         last_modified: i64::MAX,
         size: to_file_size(size_in_bytes, format_args!("{context} '{path}'"))?,
+    })
+}
+
+/// Converts a raw AMT data-file `location` into the RFC 2396 form `add.path` uses: the path
+/// component is percent-encoded as in [`resolve_amt_location`], while a scheme and authority are
+/// kept as-is, and a relative location stays relative. Returns [`Cow::Borrowed`] when nothing
+/// needs encoding.
+///
+/// # Errors
+///
+/// Returns an error if `location` contains a `.` or `..` segment, which [`resolve_amt_location`]
+/// rejects too.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn amt_location_to_add_path(location: &str) -> KernelResult<Cow<'_, str>> {
+    reject_dot_segments(location)?;
+    let (prefix, raw_path) = match scheme_len(location) {
+        Some(scheme_len) => split_authority(location, scheme_len),
+        None => ("", location),
+    };
+    Ok(match uri_encode_path(raw_path) {
+        Cow::Borrowed(_) => Cow::Borrowed(location),
+        Cow::Owned(encoded) => Cow::Owned(format!("{prefix}{encoded}")),
     })
 }
 
@@ -191,6 +215,77 @@ mod tests {
     use test_utils::assert_result_error_with_message;
 
     use super::*;
+
+    /// `expected_url` is where a scan reads the file: `add.path` joined onto the table root.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::plain_relative(
+        "data/a.parquet",
+        "data/a.parquet",
+        false,
+        "memory:///table/data/a.parquet"
+    )]
+    #[case::spaced_relative(
+        "data/a b.parquet",
+        "data/a%20b.parquet",
+        true,
+        "memory:///table/data/a%20b.parquet"
+    )]
+    #[case::percent_relative(
+        "data/a%b.parquet",
+        "data/a%25b.parquet",
+        true,
+        "memory:///table/data/a%25b.parquet"
+    )]
+    #[case::non_ascii_relative(
+        "data/M\u{fc}nchen.parquet",
+        "data/M%C3%BCnchen.parquet",
+        true,
+        "memory:///table/data/M%C3%BCnchen.parquet"
+    )]
+    #[case::query_and_fragment_relative(
+        "data/a?b#c.parquet",
+        "data/a%3Fb%23c.parquet",
+        true,
+        "memory:///table/data/a%3Fb%23c.parquet"
+    )]
+    #[case::plain_absolute(
+        "s3://bucket/t/a.parquet",
+        "s3://bucket/t/a.parquet",
+        false,
+        "s3://bucket/t/a.parquet"
+    )]
+    #[case::spaced_absolute(
+        "s3://bucket/t/a b.parquet",
+        "s3://bucket/t/a%20b.parquet",
+        true,
+        "s3://bucket/t/a%20b.parquet"
+    )]
+    fn test_amt_location_to_add_path(
+        #[case] location: &str,
+        #[case] expected: &str,
+        #[case] encoded: bool,
+        #[case] expected_url: &str,
+    ) {
+        let path = amt_location_to_add_path(location).unwrap();
+        assert_eq!(path, expected);
+        assert_eq!(matches!(path, Cow::Owned(_)), encoded);
+        let table_root = Url::parse("memory:///table/").unwrap();
+        let url = table_root.join(&path).unwrap();
+        assert_eq!(url.as_str(), expected_url);
+        assert_eq!(url, resolve_amt_location(location, &table_root).unwrap());
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    fn amt_location_to_add_path_rejects_dot_segments(
+        #[values("../a.parquet", "data/./a.parquet", "s3://bucket/t/../a.parquet")] location: &str,
+    ) {
+        assert_result_error_with_message(
+            amt_location_to_add_path(location),
+            "contains a '.' or '..' segment",
+        );
+    }
 
     #[rstest]
     #[case::relative_path(

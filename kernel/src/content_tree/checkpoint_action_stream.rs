@@ -406,6 +406,41 @@ mod tests {
         assert_eq!(batches, expected);
     }
 
+    #[rstest]
+    #[case::mixed(
+        &["plain.parquet", "a b.parquet", "a%b.parquet", "M\u{fc}nchen.parquet", "s3://bucket/t/c d.parquet"],
+        &["plain.parquet", "a%20b.parquet", "a%25b.parquet", "M%C3%BCnchen.parquet", "s3://bucket/t/c%20d.parquet"],
+    )]
+    #[case::all_plain(
+        &["plain.parquet", "dir/other.parquet"],
+        &["plain.parquet", "dir/other.parquet"],
+    )]
+    fn tree_add_paths_are_url_encoded(#[case] locations: &[&str], #[case] expected: &[&str]) {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let entries: Vec<_> = locations
+            .iter()
+            .enumerate()
+            .map(|(i, location)| added_data_entry(location, 1, 1, i as i64, 0))
+            .collect();
+        let checkpoint = checkpoint_with_tree(&engine, &entries, 1);
+
+        let paths: Vec<_> = read_checkpoint_action(
+            &engine,
+            &checkpoint,
+            &log_root(),
+            CHECKPOINT_READ_SCHEMA.clone(),
+            None,
+        )
+        .unwrap()
+        .flat_map(|batch| {
+            let batch = batch.unwrap().actions.try_into_record_batch().unwrap();
+            action_paths(&batch, ADD_NAME)
+        })
+        .collect();
+
+        assert_eq!(paths, strings(expected));
+    }
+
     #[test]
     fn tree_adds_have_constant_modification_time_and_no_data_change() {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
