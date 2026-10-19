@@ -1,4 +1,4 @@
-//! Detection and structural validation of field-relative collation annotations.
+//! Detection, validation, and physical-name rewriting of field-relative collation annotations.
 
 use crate::schema::{
     ColumnMetadataKey, DataType, FieldMetadataKeyChecker, MetadataValue, Schema, StructField,
@@ -46,6 +46,30 @@ pub(crate) fn validate_collations_feature_support(
         )
     );
     Ok(())
+}
+
+/// Replaces matching logical field prefixes with the physical name, preserving path suffixes.
+pub(crate) fn rewrite_collation_field_prefix(
+    annotation: &mut MetadataValue,
+    logical_name: &str,
+    physical_name: &str,
+) {
+    if logical_name == physical_name {
+        return;
+    }
+    let MetadataValue::Other(serde_json::Value::Object(collations)) = annotation else {
+        return;
+    };
+    *collations = std::mem::take(collations)
+        .into_iter()
+        .map(|(path, identifier)| {
+            let physical_path = path
+                .strip_prefix(logical_name)
+                .map(|suffix| format!("{physical_name}{suffix}"))
+                .unwrap_or(path);
+            (physical_path, identifier)
+        })
+        .collect();
 }
 
 struct CollationAnnotationValidator;

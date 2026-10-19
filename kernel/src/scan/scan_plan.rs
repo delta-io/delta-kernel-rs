@@ -681,6 +681,7 @@ mod tests {
         plan.nodes.iter().map(|node| node.op.to_string()).collect()
     }
 
+    // Inspect the leaf read schema to verify collation bounds survive checkpoint projection.
     fn leaf_read_schema<'plan>(plan: &'plan Plan, shape: &CheckpointShape) -> &'plan SchemaRef {
         plan.nodes
             .iter()
@@ -887,6 +888,7 @@ mod tests {
         Ok(())
     }
 
+    // Struct-only and no-stats requests omit collation bounds because they don't synthesize JSON.
     #[rstest::rstest]
     #[case::json(StatsOptions::json_only(), true)]
     #[case::both(StatsOptions::all(), true)]

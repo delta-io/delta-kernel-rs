@@ -132,8 +132,8 @@ async fn reads_all_collation_bounds_and_annotations(
         );
         if nested && expected.0.num_rows() == 2 {
             let email = physical_path(&snapshot, &column_name!("email"));
-            // Uppercase B sorts before lowercase a in binary order; these supplied bounds reverse
-            // it.
+            // Binary bounds put uppercase B before lowercase a; the fixture's collation bounds
+            // reverse that order.
             assert_eq!(
                 resolve_json_path(&stats["minValues"], &email),
                 "Bob.Dylan@Example.Com"
@@ -676,15 +676,21 @@ async fn checkpoint_repeatedly_preserves_multiple_identifiers_and_sparse_bounds(
         let actual = read_add_infos(&snapshot, engine.as_ref())?;
         assert_eq!(actual.len(), expected.len());
         for add in actual {
-            let actual = add.stats.unwrap();
+            let mut actual = add.stats.unwrap();
             let expected = &expected[&add.path];
-            for (identifier, bounds) in expected["statsWithCollation"].as_object().unwrap() {
-                for (bound, values) in bounds.as_object().unwrap() {
-                    assert_eq!(&actual["statsWithCollation"][identifier][bound], values);
+            if write_json {
+                assert_eq!(&actual, expected);
+            } else {
+                // Struct-only JSON synthesis preserves collation bounds without binary bounds.
+                for bounds in actual["statsWithCollation"]
+                    .as_object_mut()
+                    .unwrap()
+                    .values_mut()
+                {
+                    remove_null_padding(bounds);
                 }
-            }
-            for name in ["numRecords", "minValues", "maxValues", "nullCount"] {
-                assert_eq!(actual[name], expected[name]);
+                assert_eq!(actual["statsWithCollation"], expected["statsWithCollation"]);
+                assert_eq!(actual["numRecords"], expected["numRecords"]);
             }
         }
         assert_rows(
@@ -702,4 +708,13 @@ async fn checkpoint_repeatedly_preserves_multiple_identifiers_and_sparse_bounds(
         }
     }
     Ok(())
+}
+
+fn remove_null_padding(value: &mut Value) {
+    if let Value::Object(fields) = value {
+        fields.retain(|_, value| {
+            remove_null_padding(value);
+            !value.is_null() && value.as_object().is_none_or(|fields| !fields.is_empty())
+        });
+    }
 }
