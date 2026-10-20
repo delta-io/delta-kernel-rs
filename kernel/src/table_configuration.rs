@@ -1143,26 +1143,25 @@ impl TableConfiguration {
         Ok(())
     }
 
-    /// Validates the Concurrent Identity Column invariants: on a table that supports
-    /// `concurrentIdentityColumns`, the feature's requirements hold and every identity column is a
-    /// valid Concurrent Identity Column. On any other table, no field is an identity column.
+    /// Validates the Concurrent Identity Column invariants on a table that supports
+    /// `concurrentIdentityColumns`: the feature's requirements hold and every identity column is a
+    /// valid Concurrent Identity Column. Tables without the feature are not checked.
     ///
     /// Must hold for any configuration kernel commits, so kernel never commits a table that would
     /// fail [`Self::ensure_operation_supported`] for writes.
     ///
     /// # Errors
     ///
-    /// Returns an `InvalidProtocol` error if a `sequenceId` appears on a table without the feature,
-    /// or a schema error describing the first CIC rule violation.
+    /// Returns an `InvalidProtocol` error if the feature's requirements are not met, or a schema
+    /// error describing the first CIC rule violation.
     pub(crate) fn validate_concurrent_identity_columns(&self) -> KernelResult<()> {
-        let cic_supported = self.is_feature_supported(&TableFeature::ConcurrentIdentityColumns);
-        if cic_supported {
-            self.validate_feature_requirements(&TableFeature::ConcurrentIdentityColumns)?;
+        if !self.is_feature_supported(&TableFeature::ConcurrentIdentityColumns) {
+            return Ok(());
         }
+        self.validate_feature_requirements(&TableFeature::ConcurrentIdentityColumns)?;
         concurrent_identity_column::validate_concurrent_identity_columns(
             &self.logical_schema,
             self.metadata.partition_columns(),
-            cic_supported,
         )?;
         Ok(())
     }
@@ -2520,33 +2519,21 @@ mod test {
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
     }
 
+    // The CIC rules apply only to tables that support `concurrentIdentityColumns`.
     #[rstest]
-    #[case::top_level(
-        concurrent_identity_column("id", "seq-abc", 1, 1, false),
-        "does not support the 'concurrentIdentityColumns' feature"
-    )]
-    #[case::nested(
-        StructField::nullable(
-            "wrapper",
-            StructType::try_new(vec![concurrent_identity_column("id", "seq-abc", 1, 1, false)])
-                .unwrap(),
-        ),
-        "is nested"
-    )]
-    fn orphaned_sequence_id_write_rejected_but_scan_allowed(
-        #[case] field: StructField,
-        #[case] expected_error: &str,
-    ) {
-        // A `sequenceId` on a table without the `concurrentIdentityColumns` feature is an invalid
-        // state, in builds with and without the cargo feature.
+    #[case::sequence_id(concurrent_identity_column("id", "seq-abc", 1, 1, false))]
+    #[case::nested_sequence_id(StructField::nullable(
+        "wrapper",
+        StructType::try_new(vec![concurrent_identity_column("id", "seq-abc", 1, 1, false)])
+            .unwrap(),
+    ))]
+    #[case::classic(classic_identity_column("id", Some(42)))]
+    fn identity_metadata_without_cic_feature_not_validated(#[case] field: StructField) {
         let config = MockTableConfigurationBuilder::new()
             .with_schema(StructType::try_new(vec![field]).unwrap())
             .build();
-        assert_result_error_with_message(
-            config.ensure_operation_supported(Operation::Write),
-            expected_error,
-        );
-        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+        config.ensure_operation_supported(Operation::Write).unwrap();
+        config.ensure_operation_supported(Operation::Scan).unwrap();
     }
 
     // `identityColumns` without `concurrentIdentityColumns` is classic high-water-mark identity,

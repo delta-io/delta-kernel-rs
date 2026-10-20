@@ -25,8 +25,8 @@ use crate::schema::file_utils::schema_contains_file_type;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
-    normalize_column_names_to_schema_casing, schema_contains_non_null_fields, DataType, SchemaRef,
-    StructType,
+    normalize_column_names_to_schema_casing, schema_contains_non_null_fields,
+    schema_has_concurrent_sequence_id, DataType, SchemaRef, StructType,
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
@@ -53,7 +53,7 @@ use crate::table_properties::{
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
 use crate::transaction::{CommitOperation, CreateTable, ExecutionMode, Imperative, Transaction};
-use crate::utils::{current_time_ms, try_parse_uri};
+use crate::utils::{current_time_ms, require, try_parse_uri};
 use crate::{Engine, KernelError, KernelResult, StorageHandler};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
@@ -1044,6 +1044,14 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
         maybe_enable_file_type_preview(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
         maybe_enable_invariants(&effective_schema, &mut validated);
+        // TODO(#3586): enable `concurrentIdentityColumns` instead once kernel can create CIC
+        // tables.
+        require!(
+            !schema_has_concurrent_sequence_id(&effective_schema),
+            KernelError::unsupported(
+                "Creating a table with Concurrent Identity Columns is not yet supported"
+            )
+        );
 
         // Property-driven auto-enablement: check enablement properties
         maybe_auto_enable_property_driven_features(&mut validated);
