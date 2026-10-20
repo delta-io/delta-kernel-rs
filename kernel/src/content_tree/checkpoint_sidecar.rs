@@ -15,7 +15,6 @@ use crate::{Engine, KernelResult, KernelResultIterator};
 /// Each sidecar is a Parquet file that, like a V2 checkpoint sidecar, holds one action per row in
 /// a top-level `action` column described by `source_schema`, and whose path is relative to the
 /// `_delta_log/_sidecars/` directory under `log_root` (see [`Sidecar::to_filemeta`]).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn read_sidecar_actions(
     engine: &dyn Engine,
     log_root: &LogRoot,
