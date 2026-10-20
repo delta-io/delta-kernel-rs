@@ -1,4 +1,9 @@
 //! Shared table fixtures for collation passthrough and connector-contract tests.
+//!
+//! Generates flat and nested annotated schemas, then seeds versioned collation statistics for
+//! preservation and file-skipping checks under the [collation RFC].
+//!
+//! [collation RFC]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/collated-string-type.md
 
 use std::collections::HashMap;
 use std::sync::Arc;

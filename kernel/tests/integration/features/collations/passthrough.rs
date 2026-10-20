@@ -1,4 +1,11 @@
-//! Collation metadata passthrough through table creation, writes and log reconstruction.
+//! Collation metadata passthrough through CREATE, append, ALTER, checkpoints and CRC reloads.
+//!
+//! Covers schema annotations in nested and mapped fields, stable/preview writer features, Arrow
+//! round-trips, validation, binary predicates, versioned statistics and domain hints, per the
+//! [collation RFC]. Domain hints also follow the [Delta protocol]'s preservation rules.
+//!
+//! [collation RFC]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/collated-string-type.md
+//! [Delta protocol]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#domain-metadata
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,6 +76,7 @@ fn assert_annotations(logical: &StructType, physical: &StructType, mapped: bool)
     }
 }
 
+/// Preserves mapped annotations and bounds (RFC: "Specifying collations in the table schema").
 #[rstest]
 #[tokio::test]
 async fn reads_all_collation_bounds_and_annotations(
@@ -147,6 +155,7 @@ async fn reads_all_collation_bounds_and_annotations(
     Ok(())
 }
 
+/// Uses binary predicates on collated fields (RFC: "Reader Requirements for Collations").
 #[rstest]
 #[tokio::test]
 async fn predicates_use_binary_semantics_on_collated_columns(
@@ -200,6 +209,7 @@ async fn predicates_use_binary_semantics_on_collated_columns(
     Ok(())
 }
 
+/// Enables stable features and keeps preview on append (RFC: "Collations Table Feature").
 #[rstest]
 #[case::automatic(None, TableFeature::Collations, TableFeature::CollationsPreview)]
 #[case::stable(
@@ -286,6 +296,7 @@ async fn create_stable_tables_and_preserve_existing_features_on_append(
     Ok(())
 }
 
+/// Round-trips field annotations via Arrow (RFC: "Specifying collations in the table schema").
 #[rstest]
 #[case::string(DataType::STRING, "value")]
 #[case::array(ArrayType::new(DataType::STRING, true).into(), "value.element")]
@@ -311,6 +322,7 @@ async fn arrow_round_trip_schema_can_create_table(
     Ok(())
 }
 
+/// Requires declared features and preserves ALTER annotations (RFC: "Collations Table Feature").
 #[rstest]
 #[case::missing_feature(None, false)]
 #[case::stable(Some("collations"), true)]
@@ -375,6 +387,7 @@ async fn alter_requires_existing_feature_without_upgrade(
     Ok(())
 }
 
+/// Detects annotations in container structs (RFC: "Specifying collations in the table schema").
 #[rstest]
 #[case::array(DataType::from(ArrayType::new(
     schema_ref! { (annotated_field("name", DataType::STRING, "name", "test.ASCII_CI")) }.as_ref().clone(),
@@ -410,6 +423,7 @@ async fn annotations_inside_container_structs_auto_enable_feature(
     Ok(())
 }
 
+/// Preserves schema and protocol through CRC reloads and time travel (RFC: "Collations").
 #[rstest]
 #[tokio::test]
 async fn crc_and_time_travel_keep_schema_and_protocol_at_each_version(
@@ -491,6 +505,95 @@ async fn crc_and_time_travel_keep_schema_and_protocol_at_each_version(
     Ok(())
 }
 
+/// Preserves hints through append, ALTER, checkpoints and CRCs (RFC: "Collation versions").
+#[rstest]
+#[case::v1(CheckpointSpec::V1, false)]
+#[case::v2_inline(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar), true)]
+#[case::v2_sidecars(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+    file_actions_per_sidecar_hint: Some(1),
+}), true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collation_domain_hints_survive_append_alter_checkpoint_and_crc(
+    #[case] spec: CheckpointSpec,
+    #[case] v2: bool,
+    #[values(false, true)] preview: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, path, engine) = test_table_setup_mt()?;
+    let fixture = generated_table(false, &["name"]);
+    let configuration = json!({ "writeVersions": {
+        "icu.UNICODE_CI": ["75.1", "76.1"],
+        "spark.UTF8_LCASE": ["75.1"],
+    }})
+    .to_string();
+    let mut builder = create_table(&path, fixture.schema.clone(), "test", false)
+        .with_domain_metadata("collations", configuration.clone());
+    if v2 {
+        builder = builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")]);
+    }
+    let mut seeded = builder
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    if preview {
+        rewrite_as_preview_table(&path)?;
+        seeded = Snapshot::builder_for(&path).build(engine.as_ref())?;
+    }
+    let appended = write_batch_to_table(
+        &seeded,
+        engine.as_ref(),
+        fixture.files[0].0.clone(),
+        HashMap::new(),
+    )
+    .await?;
+    let altered = appended
+        .clone()
+        .update_table(UpdateTableOperation::AlterTable, "test", false)
+        .add_column(StructField::nullable("extra", DataType::INTEGER))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    for snapshot in [seeded, appended, altered.clone()] {
+        let reloaded = Snapshot::builder_for(&path)
+            .at_version(snapshot.version())
+            .build(engine.as_ref())?;
+        assert_eq!(
+            reloaded.get_domain_metadata("collations", engine.as_ref())?,
+            Some(configuration.clone())
+        );
+    }
+    assert_eq!(
+        altered.checkpoint(engine.as_ref(), Some(&spec))?.0,
+        CheckpointWriteResult::Written
+    );
+    let checkpointed = Snapshot::builder_for(&path).build(engine.as_ref())?;
+    assert_eq!(
+        checkpointed.log_segment().checkpoint_version,
+        Some(altered.version())
+    );
+    assert!(checkpointed.log_segment().listed.latest_crc_file.is_none());
+    assert_eq!(
+        checkpointed.get_domain_metadata("collations", engine.as_ref())?,
+        Some(configuration.clone())
+    );
+    assert_eq!(
+        checkpointed.write_checksum(engine.as_ref())?.0,
+        ChecksumWriteResult::Written
+    );
+    let reloaded = Snapshot::builder_for(&path).build(engine.as_ref())?;
+    let crc = reloaded.crc_at_version().unwrap();
+    assert_eq!(crc.version, altered.version());
+    assert_eq!(
+        crc.domain_metadata_state.expect_complete()["collations"].configuration(),
+        configuration
+    );
+    assert_eq!(
+        reloaded.get_domain_metadata("collations", engine.as_ref())?,
+        Some(configuration)
+    );
+    Ok(())
+}
+
+/// Rejects invalid CREATE/ALTER annotations (RFC: "Specifying collations in the table schema").
 #[rstest]
 #[case::text(json!("test.ASCII_CI"), "JSON object")]
 #[case::non_string(json!({ "bad": 1 }), "string identifier")]
@@ -528,6 +631,7 @@ async fn malformed_annotations_rejected_before_create_and_alter(
     Ok(())
 }
 
+/// Validates annotations on snapshot load (RFC: "Specifying collations in the table schema").
 #[rstest]
 #[case::non_object(json!("test.ASCII_CI"), "JSON object")]
 #[case::non_string(json!({ "name": 1 }), "string identifier")]
@@ -575,6 +679,7 @@ async fn snapshot_loading_rejects_malformed_collation_annotations(
     Ok(())
 }
 
+/// Rejects annotated schemas without the writer feature (RFC: "Collations Table Feature").
 #[rstest]
 #[case::legacy(json!({ "minReaderVersion": 1, "minWriterVersion": 2 }))]
 #[case::writer_features(json!({
@@ -618,6 +723,7 @@ async fn snapshot_loading_requires_collation_feature_for_annotated_schema(
     Ok(())
 }
 
+/// Preserves sparse, versioned bounds through checkpoints (RFC: "Per-file Statistics").
 #[rstest]
 #[case::v1(CheckpointSpec::V1, false)]
 #[case::v2_inline(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar), true)]

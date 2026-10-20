@@ -814,6 +814,7 @@ impl StructField {
                 // TODO(#1070): Remove nested column ids when they are supported in kernel
             }
         }
+        // Keep collation paths rooted at the physical field name, as required by the protocol.
         let physical_name = self.physical_name(column_mapping_mode);
         if let Some(annotation) = base_metadata.get_mut(ColumnMetadataKey::Collations.as_ref()) {
             rewrite_collation_field_prefix(annotation, self.name(), physical_name);
