@@ -1145,7 +1145,7 @@ impl TableConfiguration {
 
     /// Validates the Concurrent Identity Column invariants: on a table that supports
     /// `concurrentIdentityColumns`, the feature's requirements hold and every identity column is a
-    /// valid Concurrent Identity Column. On any other table, no field carries a `sequenceId`.
+    /// valid Concurrent Identity Column. On any other table, no field is an identity column.
     ///
     /// Must hold for any configuration kernel commits, so kernel never commits a table that would
     /// fail [`Self::ensure_operation_supported`] for writes.

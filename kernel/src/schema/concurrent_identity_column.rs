@@ -78,10 +78,9 @@ impl<'a> ConcurrentIdentityColumn<'a> {
 /// column default, or a generation expression. A nested identity column, classic or concurrent, is
 /// always rejected.
 ///
-/// When the table supports `concurrentIdentityColumns` (`cic_supported`) every identity column
-/// must be concurrent: a classic identity column (one carrying `delta.identity.*` keys but no
-/// `sequenceId`) is rejected. If the table does not support the `concurrentIdentityColumns`
-/// feature, any CIC is rejected.
+/// Every identity column must be concurrent: a classic identity column (one carrying
+/// `delta.identity.*` keys but no `sequenceId`) is rejected. If the table does not support the
+/// `concurrentIdentityColumns` feature (`cic_supported`), any CIC is rejected.
 ///
 /// `partition_columns` must be the raw, unescaped leaf names (as returned by
 /// [`StructField::name`]) so they compare in the same vocabulary as the schema's field names.
@@ -95,7 +94,6 @@ pub(crate) fn validate_concurrent_identity_columns(
     cic_supported: bool,
 ) -> KernelResult<bool> {
     let mut seen_sequence_ids: HashSet<&str> = HashSet::new();
-    let mut classic_identity_column: Option<&str> = None;
     for field in schema.fields() {
         match ConcurrentIdentityColumn::try_from_field(field)? {
             Some(cic) => {
@@ -117,9 +115,9 @@ pub(crate) fn validate_concurrent_identity_columns(
             }
             None if is_identity_column(field) => {
                 return Err(KernelError::schema(format!(
-                    "Classic identity column '{field.name()}' has no '{}'; on a table with Concurrent Identity Columns \
-                     every identity column must be concurrent (classic '{}' identity generation is not \
-                     supported).",
+                    "Classic identity column '{}' has no '{}'; every identity column must be \
+                     concurrent (classic '{}' identity generation is not supported).",
+                    field.name(),
                     ColumnMetadataKey::IdentityConcurrentSequenceId.as_ref(),
                     ColumnMetadataKey::IdentityHighWaterMark.as_ref(),
                 )));
@@ -539,10 +537,10 @@ mod tests {
         true,
         Err("nested"),
     )]
-    // On a table supporting the feature, every identity column must be concurrent, including a
-    // classic identity column that never emitted a value (no high-water mark).
+    // Every identity column must be concurrent, including a classic identity column that never
+    // emitted a value (no high-water mark), whether or not the table supports the feature.
     #[case::classic_on_cic_supported_table(vec![classic_identity_column("classic", None)], &[], true, Err("must be concurrent"))]
-    #[case::classic_without_cic(vec![classic_identity_column("classic", None)], &[], false, Ok(false))]
+    #[case::classic_without_cic(vec![classic_identity_column("classic", None)], &[], false, Err("must be concurrent"))]
     fn validate_enforces_each_rule(
         #[case] fields: Vec<StructField>,
         #[case] partition_columns: &[&str],
