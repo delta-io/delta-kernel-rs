@@ -1459,12 +1459,12 @@ fn create_concurrent_identity_column_table(
     table_path: &str,
     engine: &dyn delta_kernel::Engine,
     properties: &[(&str, &str)],
-) -> Result<Arc<Snapshot>> {
+) -> KernelResult<Arc<Snapshot>> {
     let schema = Arc::new(StructType::try_new([
         concurrent_identity_column("id", "seq-abc", 1, 1, false),
         StructField::nullable("v", DataType::STRING),
     ])?);
-    create_table(table_path, schema, "Test/1.0")
+    create_table(table_path, schema, "Test/1.0", true)
         .with_table_properties(
             [
                 ("delta.feature.catalogManaged", "supported"),
@@ -1511,28 +1511,26 @@ enum ConcurrentIdentityColumnAlter {
 #[rstest]
 #[case::set_nullable_on_concurrent_identity_column(
     ConcurrentIdentityColumnAlter::SetNullable,
-    "must be non-nullable"
+    None
 )]
 #[case::add_concurrent_identity_column(
     ConcurrentIdentityColumnAlter::AddConcurrent,
-    "metadata annotation 'delta.identity."
+    Some("metadata annotation 'delta.identity.")
 )]
 #[case::add_classic_identity_column(
     ConcurrentIdentityColumnAlter::AddClassic,
-    "metadata annotation 'delta.identity."
+    Some("metadata annotation 'delta.identity.")
 )]
 #[tokio::test]
-async fn alter_on_concurrent_identity_column_table_fails(
+async fn alter_on_concurrent_identity_column_table(
     #[case] op: ConcurrentIdentityColumnAlter,
-    #[case] error_contains: &str,
-) -> Result<()> {
+    #[case] expected_error: Option<&str>,
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let engine = engine.as_ref();
     let snapshot = create_concurrent_identity_column_table(&table_path, engine, &[])?;
 
-    let alter = snapshot
-        .transaction_builder()
-        .with_operation(UpdateTableOperation::AlterTable);
+    let alter = snapshot.update_table(UpdateTableOperation::AlterTable, "test-engine", false);
     let alter = match op {
         ConcurrentIdentityColumnAlter::SetNullable => alter.set_nullable(column_name!("id")),
         ConcurrentIdentityColumnAlter::AddConcurrent => {
@@ -1542,11 +1540,16 @@ async fn alter_on_concurrent_identity_column_table_fails(
             alter.add_column(nullable_classic_identity_column("legacy_id"))
         }
     };
-    let err = alter
-        .build(engine, Box::new(TestCatalogCommitter))
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains(error_contains), "unexpected error: {err}");
+    let result = alter.build(engine, Box::new(TestCatalogCommitter));
+    match expected_error {
+        None => {
+            result?;
+        }
+        Some(needle) => {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains(needle), "unexpected error: {err}");
+        }
+    }
     Ok(())
 }
 
