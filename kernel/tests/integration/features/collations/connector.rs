@@ -1,4 +1,9 @@
-//! Connector-contract examples using a synthetic ASCII case-insensitive comparison, not ICU.
+//! Collation-aware file skipping and predicate pushdown using synthetic ASCII comparisons.
+//!
+//! Covers exact provider/name/version matching, missing-bound fallback and conservative AND/OR/NOT
+//! pushdown followed by the original row filter, per the [collation RFC]'s reader requirements.
+//!
+//! [collation RFC]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/collated-string-type.md
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -104,6 +109,7 @@ fn rows(batches: &[RecordBatch]) -> Vec<(i32, String)> {
     rows
 }
 
+/// Retains files when required bounds are absent (RFC: "Reader Requirements for Collations").
 #[test]
 fn missing_required_minimum_retains_file() {
     let stats = json!({"statsWithCollation": {
@@ -112,6 +118,7 @@ fn missing_required_minimum_retains_file() {
     assert!(Operation::Equal.may_match(&stats, "Zoe"));
 }
 
+/// Skips only with the operation's exact collation (RFC: "Reader Requirements for Collations").
 #[rstest]
 #[case::matching(Some(SYNTHETIC_ID), true)]
 #[case::missing(None, false)]
@@ -216,6 +223,7 @@ fn compound(and: bool) -> Filter {
     }
 }
 
+/// Preserves matches through AND/OR/NOT pushdown (RFC: "Reader Requirements for Collations").
 #[rstest]
 #[case::comparison(Filter::CaseInsensitiveEqual("alice"), 4)]
 #[case::and(compound(true), 2)]
