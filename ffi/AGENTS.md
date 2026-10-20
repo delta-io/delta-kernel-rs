@@ -1011,9 +1011,14 @@ The kernel reports CICs but never generates their values, so the connector fills
 update_table_txn_builder_build()
   -> update_table_txn_visit_concurrent_identity_columns(txn, engine, ctx, visitor)
   -> update_table_txn_ack_concurrent_identity_columns(txn)   // REQUIRED for a CIC table, else the
-                                                            // write context errors
+                                                            // write context and committing
+                                                            // added files error
   -> update_table_txn_get_unpartitioned_write_context(txn, engine) ... add_files ... commit
 ```
+
+A create-table transaction that stages initial data follows the same flow with
+`create_table_txn_visit_concurrent_identity_columns` and
+`create_table_txn_ack_concurrent_identity_columns` before `create_table_txn_get_*_write_context`.
 
 Deletion vector update flow:
 

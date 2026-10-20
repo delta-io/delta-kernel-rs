@@ -4992,4 +4992,158 @@ mod tests {
             unsafe { free_engine(engine) };
         }
     }
+
+    /// The kernel's Concurrent Identity Column acknowledgement gate on a create-table transaction,
+    /// observed through the FFI: CREATE enables `concurrentIdentityColumns` for a
+    /// [`visit_field_cic`] schema, and a write context for the initial data is only obtainable
+    /// after [`create_table_txn_ack_concurrent_identity_columns`].
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    mod concurrent_identity_column_ack_gate {
+        use delta_kernel_ffi::concurrent_identity_column::{
+            create_table_txn_ack_concurrent_identity_columns,
+            create_table_txn_visit_concurrent_identity_columns,
+        };
+
+        use super::*;
+        use crate::schema_visitor::visit_field_cic;
+
+        type VisitedColumn = (String, String, i64, i64, bool);
+
+        /// Schema: struct<id: cic(seq-1, start=10, step=5), v: string>
+        extern "C" fn visit_cic_schema(
+            _schema: *mut c_void,
+            state: &mut KernelSchemaVisitorState,
+        ) -> usize {
+            let (id, sequence_id, v, root) = ("id", "seq-1", "v", "schema");
+            let field_ids = unsafe {
+                [
+                    ok_or_panic(visit_field_cic(
+                        state,
+                        kernel_string_slice!(id),
+                        kernel_string_slice!(sequence_id),
+                        10,
+                        5,
+                        false,
+                        allocate_err,
+                    )),
+                    ok_or_panic(visit_field_string(
+                        state,
+                        kernel_string_slice!(v),
+                        true,
+                        std::ptr::null(),
+                        allocate_err,
+                    )),
+                ]
+            };
+            ok_or_panic(unsafe {
+                visit_field_struct(
+                    state,
+                    kernel_string_slice!(root),
+                    field_ids.as_ptr(),
+                    field_ids.len(),
+                    false,
+                    std::ptr::null(),
+                    allocate_err,
+                )
+            })
+        }
+
+        extern "C" fn collect_column(
+            engine_context: NullableCvoid,
+            column_name: KernelStringSlice,
+            sequence_id: KernelStringSlice,
+            start: i64,
+            step: i64,
+            allow_explicit_insert: bool,
+        ) {
+            let collected = engine_context
+                .unwrap()
+                .as_ptr()
+                .cast::<Vec<VisitedColumn>>();
+            let column = unsafe {
+                (
+                    String::try_from_slice(&column_name).unwrap(),
+                    String::try_from_slice(&sequence_id).unwrap(),
+                    start,
+                    step,
+                    allow_explicit_insert,
+                )
+            };
+            unsafe { (*collected).push(column) };
+        }
+
+        #[test]
+        fn create_table_write_context_is_blocked_until_the_cic_columns_are_acknowledged() {
+            let table_path = "memory:///";
+            let engine = get_default_engine(table_path);
+            let schema = EngineSchema {
+                schema: std::ptr::null_mut(),
+                visitor: visit_cic_schema,
+            };
+            let (engine_info, catalog_managed, supported) = (
+                "test-engine/1.0",
+                "delta.feature.catalogManaged",
+                "supported",
+            );
+            let builder = ok_or_panic(unsafe {
+                new_create_table_txn_builder(
+                    kernel_string_slice!(table_path),
+                    &schema,
+                    kernel_string_slice!(engine_info),
+                    true,
+                    engine.shallow_copy(),
+                )
+            });
+            let builder = ok_or_panic(unsafe {
+                create_table_txn_builder_with_table_property(
+                    builder,
+                    kernel_string_slice!(catalog_managed),
+                    kernel_string_slice!(supported),
+                    engine.shallow_copy(),
+                )
+            });
+            let txn = ok_or_panic(unsafe {
+                create_table_txn_builder_build(builder, engine.shallow_copy())
+            });
+
+            // Visiting the columns must not implicitly acknowledge them.
+            let mut collected: Vec<VisitedColumn> = Vec::new();
+            let count = ok_or_panic(unsafe {
+                create_table_txn_visit_concurrent_identity_columns(
+                    txn.shallow_copy(),
+                    engine.shallow_copy(),
+                    std::ptr::NonNull::new((&mut collected as *mut Vec<VisitedColumn>).cast()),
+                    collect_column,
+                )
+            });
+            assert_eq!(count, 1);
+            assert_eq!(
+                collected,
+                [("id".to_string(), "seq-1".to_string(), 10, 5, false)]
+            );
+
+            assert_extern_result_error_contains(
+                unsafe {
+                    create_table_txn_get_unpartitioned_write_context(
+                        txn.shallow_copy(),
+                        engine.shallow_copy(),
+                    )
+                },
+                FFIKernelError::InvalidTransactionStateError,
+                "Transaction::ack_concurrent_identity_columns()",
+            );
+
+            unsafe { create_table_txn_ack_concurrent_identity_columns(txn.shallow_copy()) };
+            let write_context = ok_or_panic(unsafe {
+                create_table_txn_get_unpartitioned_write_context(
+                    txn.shallow_copy(),
+                    engine.shallow_copy(),
+                )
+            });
+
+            unsafe { free_write_context(write_context) };
+            unsafe { free_create_table_txn(txn) };
+            unsafe { free_engine(engine) };
+        }
+    }
 }

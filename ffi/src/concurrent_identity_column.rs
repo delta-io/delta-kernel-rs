@@ -3,14 +3,14 @@ use delta_kernel::KernelResult;
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
-use crate::transaction::ExclusiveUpdateTableTransaction;
+use crate::transaction::{ExclusiveCreateTableTransaction, ExclusiveUpdateTableTransaction};
 use crate::{kernel_string_slice, KernelStringSlice, NullableCvoid, SharedExternEngine};
 
 /// Acknowledges that the connector generates and fills this table's Concurrent Identity Column
 /// values before writing data files.
 ///
 /// Required before requesting a write context for a table that has any CIC column; without it,
-/// write-context creation fails with `InvalidTransactionState`.
+/// write-context creation fails with `InvalidTransactionState`, as does committing added files.
 ///
 /// # Safety
 ///
@@ -25,8 +25,25 @@ pub unsafe extern "C" fn update_table_txn_ack_concurrent_identity_columns(
     txn.ack_concurrent_identity_columns();
 }
 
+/// Create-table counterpart of [`update_table_txn_ack_concurrent_identity_columns`], required
+/// before writing initial data into a new table that has any CIC column.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid transaction handle. The handle is borrowed and
+/// mutated in place, NOT consumed: `txn` stays valid after this call and must still be freed by
+/// the caller.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_ack_concurrent_identity_columns(
+    mut txn: Handle<ExclusiveCreateTableTransaction>,
+) {
+    let txn = unsafe { txn.as_mut() };
+    txn.ack_concurrent_identity_columns();
+}
+
 /// Callback invoked once per top-level Concurrent Identity Column by
-/// [`update_table_txn_visit_concurrent_identity_columns`].
+/// [`update_table_txn_visit_concurrent_identity_columns`] and
+/// [`create_table_txn_visit_concurrent_identity_columns`].
 ///
 /// `column_name` is the column's logical name; `sequence_id` points to the catalog sequence that
 /// issues its values. `start` and `step` are the sequence's first value and non-zero increment;
@@ -66,8 +83,31 @@ pub unsafe extern "C" fn update_table_txn_visit_concurrent_identity_columns(
     visit_concurrent_identity_columns_impl(txn, engine_context, visitor).into_extern_result(&engine)
 }
 
-fn visit_concurrent_identity_columns_impl(
-    txn: &Transaction,
+/// Create-table counterpart of [`update_table_txn_visit_concurrent_identity_columns`]: visits every
+/// top-level Concurrent Identity Column of the table being created, and returns how many there
+/// were.
+///
+/// Either an error is returned before the first callback, or every CIC column is visited.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid transaction and engine handles, a valid
+/// `engine_context` pointer passed through to each `visitor` invocation, and a valid `visitor`
+/// function pointer. The `txn` handle is borrowed (not consumed).
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_visit_concurrent_identity_columns(
+    txn: Handle<ExclusiveCreateTableTransaction>,
+    engine: Handle<SharedExternEngine>,
+    engine_context: NullableCvoid,
+    visitor: ConcurrentIdentityColumnVisitor,
+) -> ExternResult<usize> {
+    let engine = unsafe { engine.as_ref() };
+    let txn = unsafe { txn.as_ref() };
+    visit_concurrent_identity_columns_impl(txn, engine_context, visitor).into_extern_result(&engine)
+}
+
+fn visit_concurrent_identity_columns_impl<S>(
+    txn: &Transaction<S>,
     engine_context: NullableCvoid,
     visitor: ConcurrentIdentityColumnVisitor,
 ) -> KernelResult<usize> {
