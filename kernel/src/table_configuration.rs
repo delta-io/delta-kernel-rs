@@ -2490,7 +2490,6 @@ mod test {
         );
     }
 
-    // Every identity column on a CIC table must be concurrent, with or without a high-water mark.
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
     #[rstest]
     #[case::classic_without_high_water_mark(
@@ -2519,7 +2518,6 @@ mod test {
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
     }
 
-    // The CIC rules apply only to tables that support `concurrentIdentityColumns`.
     #[rstest]
     #[case::sequence_id(concurrent_identity_column("id", "seq-abc", 1, 1, false))]
     #[case::nested_sequence_id(StructField::nullable(
@@ -2536,7 +2534,7 @@ mod test {
         config.ensure_operation_supported(Operation::Scan).unwrap();
     }
 
-    // `identityColumns` without `concurrentIdentityColumns` is classic high-water-mark identity,
+    // `identityColumns` without `concurrentIdentityColumns` is classic high-water mark identity,
     // which kernel does not implement: writes are rejected at the support layer.
     #[test]
     fn classic_identity_columns_write_rejected_scan_allowed() {
@@ -2552,7 +2550,7 @@ mod test {
             .build();
         assert_result_error_with_message(
             config.ensure_operation_supported(Operation::Write),
-            "classic high-water-mark identity",
+            "classic high-water mark identity",
         );
         config.ensure_operation_supported(Operation::Scan).unwrap();
     }

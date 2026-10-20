@@ -379,8 +379,6 @@ static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 6)),
     feature_requirements: &[],
-    // Classic high-water-mark identity is unsupported for writes; kernel only supports writing an
-    // `identityColumns` table when it also has the `concurrentIdentityColumns` feature.
     kernel_support: KernelSupport::Custom(|protocol, _properties, operation| match operation {
         Operation::Write
             if cfg!(feature = "concurrent-identity-columns-in-dev")
@@ -389,10 +387,10 @@ static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
             Ok(())
         }
         Operation::Write => Err(KernelError::unsupported(
-            "Feature 'identityColumns' (classic high-water-mark identity) is not supported for \
-             writes",
+            "Feature 'identityColumns' (classic high-water mark identity) is not supported for \
+             writes.",
         )),
-        // Writer-only, so reads never consult this check; listed for exhaustiveness.
+        // Writer-only: reads never consult this check.
         Operation::SnapshotLoad | Operation::Scan | Operation::Cdf => Ok(()),
     }),
     enablement_check: EnablementCheck::AlwaysIfSupported,

@@ -577,11 +577,9 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// transaction is subsequently modified, call this method again to capture the updated
     /// configuration.
     ///
-    /// Returns an error if the table has an empty or unsupported schema, or if the table declares
+    /// Returns an error if the table has an empty or unsupported schema, if the table declares
     /// column defaults or CHECK constraints that the connector has not acknowledged, or if the
     /// table has Concurrent Identity Columns (writing data to them is not yet supported).
-    /// column defaults that the connector has not acknowledged, or if the table has Concurrent
-    /// Identity Columns.
     pub fn write_state(&self) -> KernelResult<Arc<WriteState>> {
         self.ensure_schema_non_empty_for_write_state()?;
         self.ensure_column_defaults_acknowledged()?;
@@ -1550,6 +1548,8 @@ mod tests {
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
     use crate::transaction::exec_mode::StagedDataChanges;
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    use crate::unit_test_utils::concurrent_identity_config;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::unit_test_utils::{
         adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
@@ -2126,7 +2126,7 @@ mod tests {
         /// Like [`txn_with_schema`] but with an explicit writer-feature list, so a test can
         /// exercise a table that does *not* enable `allowColumnDefaults`. Panics if the table
         /// configuration fails to construct; use [`try_table_config`] to assert that error.
-        pub(super) fn txn_with_schema_and_writer_features(
+        fn txn_with_schema_and_writer_features(
             schema: StructType,
             writer_features: impl IntoIterator<Item = TableFeature>,
         ) -> Transaction {
@@ -2240,7 +2240,6 @@ mod tests {
         }
     }
 
-    // Kernel cannot create tables with Concurrent Identity Columns yet.
     #[rstest]
     #[case::top_level(concurrent_identity_column("id", "seq-abc", 1, 1, false))]
     #[case::nested(StructField::nullable(
@@ -2263,21 +2262,24 @@ mod tests {
     }
 
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
-    #[test]
-    fn data_writes_rejected_on_concurrent_identity_columns() {
+    #[rstest]
+    fn data_writes_rejected_but_metadata_commits_allowed_on_concurrent_identity_columns(
+        #[values(true, false)] stage_adds: bool,
+    ) {
+        const MSG: &str = "Writing data to a table with Concurrent Identity Columns";
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn().unwrap();
         let schema =
             StructType::try_new([concurrent_identity_column("id", "seq-abc", 1, 1, false)]);
-        let mut txn = column_defaults::txn_with_schema_and_writer_features(
-            schema.unwrap(),
-            [
-                TableFeature::IdentityColumns,
-                TableFeature::ConcurrentIdentityColumns,
-            ],
-        );
-        assert_result_error_with_message(txn.write_state(), "not yet supported");
-        // A connector that bypasses `write_state` and stages adds directly is rejected at commit.
-        add_dummy_file(&mut txn);
-        assert_result_error_with_message(txn.commit(&SyncEngine::new()), "not yet supported");
+        txn.replace_effective_table_config(concurrent_identity_config(schema.unwrap()));
+        assert_result_error_with_message(txn.write_state(), MSG);
+        if stage_adds {
+            // A connector that bypasses `write_state` and stages adds directly is rejected at
+            // commit.
+            add_dummy_file(&mut txn);
+            assert_result_error_with_message(txn.validate_commit(), MSG);
+        } else {
+            txn.validate_commit().unwrap();
+        }
     }
 
     #[test]

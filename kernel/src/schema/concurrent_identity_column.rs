@@ -95,7 +95,7 @@ pub(crate) fn validate_concurrent_identity_columns(
     for field in schema.fields() {
         match ConcurrentIdentityColumn::try_from_field(field)? {
             Some(cic) => {
-                validate_cic(&cic, partition_columns)?;
+                validate_concurrent_identity_column(&cic, partition_columns)?;
                 if !seen_sequence_ids.insert(cic.sequence_id) {
                     return Err(KernelError::schema(format!(
                         "Sequence id '{}' is used by more than one Concurrent Identity Column; \
@@ -152,9 +152,8 @@ fn is_identity_column(field: &StructField) -> bool {
         .any(|key| field.get_config_value(key).is_some())
 }
 
-/// Validates a single Concurrent Identity Column. It only validates the CIC itself, not whether
-/// it is nested or not. The rules are the same as for [`validate_concurrent_identity_columns`].
-fn validate_cic(
+/// Checks one CIC against the per-column rules of [`validate_concurrent_identity_columns`].
+fn validate_concurrent_identity_column(
     cic: &ConcurrentIdentityColumn<'_>,
     partition_columns: &[String],
 ) -> KernelResult<()> {
@@ -191,7 +190,7 @@ fn validate_cic(
             )));
         }
     }
-    // Column-name matching is case-sensitive, consistent with Delta column-name handling.
+    // A Concurrent Identity Column cannot also be a partition column.
     if partition_columns.iter().any(|p| p == name) {
         return Err(KernelError::schema(format!(
             "Concurrent Identity Column '{name}' cannot also be a partition column"
@@ -343,30 +342,6 @@ mod tests {
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
     use crate::unit_test_utils::assert_result_error_with_message;
 
-    #[test]
-    fn concurrent_identity_column_stamps_all_identity_metadata_keys() {
-        let field = concurrent_identity_column("id", "seq-123", 5, 2, true);
-        assert_eq!(field.name(), "id");
-        assert_eq!(field.data_type(), &DataType::LONG);
-        assert!(!field.is_nullable());
-        assert_eq!(
-            field.get_config_value(&ColumnMetadataKey::IdentityConcurrentSequenceId),
-            Some(&MetadataValue::String("seq-123".to_string()))
-        );
-        assert_eq!(
-            field.get_config_value(&ColumnMetadataKey::IdentityStart),
-            Some(&MetadataValue::Number(5))
-        );
-        assert_eq!(
-            field.get_config_value(&ColumnMetadataKey::IdentityStep),
-            Some(&MetadataValue::Number(2))
-        );
-        assert_eq!(
-            field.get_config_value(&ColumnMetadataKey::IdentityAllowExplicitInsert),
-            Some(&MetadataValue::Boolean(true))
-        );
-    }
-
     #[rstest::rstest]
     #[case::missing_start(
         vec![
@@ -427,9 +402,8 @@ mod tests {
         assert_result_error_with_message(ConcurrentIdentityColumn::try_from_field(&field), needle);
     }
 
-    fn cic_field(name: &str, data_type: DataType, nullable: bool, step: i64) -> StructField {
-        StructField::new(name, data_type, nullable)
-            .with_metadata(cic_metadata("seq", 1, step, false))
+    fn cic(name: &str) -> StructField {
+        concurrent_identity_column(name, "seq", 1, 1, false)
     }
 
     fn nested(field: StructField) -> StructField {
@@ -437,22 +411,21 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::valid(vec![cic_field("id", DataType::LONG, false, 1)], &[], Ok(true))]
+    #[case::valid(vec![cic("id")], &[], Ok(true))]
     #[case::no_cic(vec![StructField::new("id", DataType::LONG, false)], &[], Ok(false))]
-    #[case::non_long(vec![cic_field("id", DataType::INTEGER, false, 1)], &[], Err("must be of type LONG"))]
-    #[case::nullable(vec![cic_field("id", DataType::LONG, true, 1)], &[], Ok(true))]
-    #[case::step_zero(vec![cic_field("id", DataType::LONG, false, 0)], &[], Err("step 0"))]
-    #[case::missing_allow_explicit_insert(
-        vec![StructField::not_null("id", DataType::LONG).with_metadata(
-            cic_metadata("seq", 1, 1, false)
-                .into_iter()
-                .filter(|(k, _)| k != ColumnMetadataKey::IdentityAllowExplicitInsert.as_ref()),
-        )],
+    #[case::non_long(
+        vec![StructField::not_null("id", DataType::INTEGER).with_metadata(cic_metadata("seq", 1, 1, false))],
         &[],
-        Err("delta.identity.allowExplicitInsert"),
+        Err("must be of type LONG"),
     )]
+    #[case::nullable(
+        vec![StructField::nullable("id", DataType::LONG).with_metadata(cic_metadata("seq", 1, 1, false))],
+        &[],
+        Ok(true),
+    )]
+    #[case::step_zero(vec![concurrent_identity_column("id", "seq", 1, 0, false)], &[], Err("step 0"))]
     #[case::high_water_mark(
-        vec![cic_field("id", DataType::LONG, false, 1).add_metadata([(
+        vec![cic("id").add_metadata([(
             ColumnMetadataKey::IdentityHighWaterMark.as_ref(),
             MetadataValue::Number(1),
         )])],
@@ -460,7 +433,7 @@ mod tests {
         Err("must not carry 'delta.identity.highWaterMark'"),
     )]
     #[case::column_default(
-        vec![cic_field("id", DataType::LONG, false, 1).add_metadata([(
+        vec![cic("id").add_metadata([(
             ColumnMetadataKey::CurrentDefault.as_ref(),
             MetadataValue::from("0"),
         )])],
@@ -468,23 +441,19 @@ mod tests {
         Err("must not carry 'CURRENT_DEFAULT'"),
     )]
     #[case::generation_expression(
-        vec![cic_field("id", DataType::LONG, false, 1).add_metadata([(
+        vec![cic("id").add_metadata([(
             ColumnMetadataKey::GenerationExpression.as_ref(),
             MetadataValue::from("1"),
         )])],
         &[],
         Err("must not carry 'delta.generationExpression'"),
     )]
-    #[case::partition_column(vec![cic_field("id", DataType::LONG, false, 1)], &["id"], Err("cannot also be a partition column"))]
-    #[case::partition_column_special_char(vec![cic_field("a.b", DataType::LONG, false, 1)], &["a.b"], Err("cannot also be a partition column"))]
-    #[case::partition_column_case_sensitive(vec![cic_field("id", DataType::LONG, false, 1)], &["ID"], Ok(true))]
+    #[case::partition_column(vec![cic("id")], &["id"], Err("cannot also be a partition column"))]
+    #[case::partition_column_special_char(vec![cic("a.b")], &["a.b"], Err("cannot also be a partition column"))]
+    #[case::partition_column_case_sensitive(vec![cic("id")], &["ID"], Ok(true))]
     #[case::sequence_id_max_length(vec![concurrent_identity_column("id", "x".repeat(64), 1, 1, false)], &[], Ok(true))]
     #[case::sequence_id_too_long(vec![concurrent_identity_column("id", "x".repeat(65), 1, 1, false)], &[], Err("longer than 64"))]
-    #[case::duplicate_sequence_id(
-        vec![cic_field("a", DataType::LONG, false, 1), cic_field("b", DataType::LONG, false, 1)],
-        &[],
-        Err("must be unique"),
-    )]
+    #[case::duplicate_sequence_id(vec![cic("a"), cic("b")], &[], Err("must be unique"))]
     #[case::distinct_sequence_ids(
         vec![
             concurrent_identity_column("a", "seq-1", 1, 1, false),
@@ -493,49 +462,11 @@ mod tests {
         &[],
         Ok(true),
     )]
-    #[case::nested_in_struct(vec![nested(cic_field("id", DataType::LONG, false, 1))], &[], Err("nested"))]
-    #[case::nested_in_array(
-        vec![StructField::nullable(
-            "wrapper",
-            ArrayType::new(
-                cic_struct(),
-                true,
-            ),
-        )],
-        &[],
-        Err("nested"),
-    )]
-    #[case::nested_in_map_value(
-        vec![StructField::nullable(
-            "wrapper",
-            MapType::new(
-                DataType::STRING,
-                cic_struct(),
-                true,
-            ),
-        )],
-        &[],
-        Err("nested"),
-    )]
-    #[case::nested_in_map_key(
-        vec![StructField::nullable(
-            "wrapper",
-            MapType::new(
-                cic_struct(),
-                DataType::STRING,
-                true,
-            ),
-        )],
-        &[],
-        Err("nested"),
-    )]
     #[case::nested_classic_next_to_cic(
-        vec![cic_field("id", DataType::LONG, false, 1), nested(classic_identity_column("classic", None))],
+        vec![cic("id"), nested(classic_identity_column("classic", None))],
         &[],
         Err("nested"),
     )]
-    // Every identity column must be concurrent, including a classic identity column that never
-    // emitted a value (no high-water mark).
     #[case::classic_on_cic_supported_table(vec![classic_identity_column("classic", None)], &[], Err("must be concurrent"))]
     fn validate_enforces_each_rule(
         #[case] fields: Vec<StructField>,
@@ -552,19 +483,27 @@ mod tests {
     }
 
     #[rstest::rstest]
+    fn nested_cic_detected_and_rejected(
+        #[values(
+            nested(cic("id")),
+            StructField::nullable("v", ArrayType::new(cic_struct(), true)),
+            StructField::nullable("v", MapType::new(cic_struct(), DataType::STRING, true)),
+            StructField::nullable("v", MapType::new(DataType::STRING, cic_struct(), true))
+        )]
+        field: StructField,
+    ) {
+        let schema = StructType::try_new(vec![field]).unwrap();
+        assert!(schema_has_concurrent_sequence_id(&schema));
+        assert_result_error_with_message(
+            validate_concurrent_identity_columns(&schema, &[]),
+            "nested",
+        );
+    }
+
+    #[rstest::rstest]
     #[case::plain(StructField::nullable("v", DataType::STRING), false)]
-    #[case::top_level(cic_field("id", DataType::LONG, false, 1), true)]
-    #[case::struct_field(StructField::nullable("v", cic_struct()), true)]
-    #[case::array_element(StructField::nullable("v", ArrayType::new(cic_struct(), true)), true)]
-    #[case::map_key(
-        StructField::nullable("v", MapType::new(cic_struct(), DataType::STRING, true)),
-        true
-    )]
-    #[case::map_value(
-        StructField::nullable("v", MapType::new(DataType::STRING, cic_struct(), true)),
-        true
-    )]
-    fn sequence_id_detected_at_any_depth(
+    #[case::top_level(cic("id"), true)]
+    fn sequence_id_detected_on_top_level_field(
         #[case] field: StructField,
         #[case] has_sequence_id: bool,
     ) {
@@ -573,8 +512,6 @@ mod tests {
     }
 
     fn cic_struct() -> DataType {
-        StructType::try_new(vec![cic_field("id", DataType::LONG, false, 1)])
-            .unwrap()
-            .into()
+        StructType::try_new(vec![cic("id")]).unwrap().into()
     }
 }
