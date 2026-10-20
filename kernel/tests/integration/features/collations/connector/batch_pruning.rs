@@ -20,7 +20,7 @@ use delta_kernel::kernel_predicates::{
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::schema::DataType;
 use delta_kernel::transaction::UpdateTableOperation;
-use delta_kernel::{KernelError, Result, Snapshot};
+use delta_kernel::{KernelError, KernelResult, Snapshot};
 use rstest::rstest;
 use test_utils::{begin_transaction_with, into_record_batch, read_scan, test_table_setup_mt};
 
@@ -175,9 +175,14 @@ async fn opaque_batch_pruning_does_not_resurrect_removed_matching_files(
         .scan_builder()
         .with_predicate(Arc::new(col!("id").eq(lit(1))))
         .build()?;
-    let mut transaction = begin_transaction_with(snapshot, engine.as_ref(), |builder| {
-        builder.with_operation(UpdateTableOperation::Delete)
-    })?;
+    let mut transaction = begin_transaction_with(
+        snapshot,
+        engine.as_ref(),
+        UpdateTableOperation::Delete,
+        "collation-test",
+        true,
+        |builder| builder,
+    )?;
     for metadata in remove_scan.scan_metadata(engine.as_ref())? {
         transaction.remove_files(metadata?.scan_files);
     }
@@ -556,7 +561,7 @@ impl ArrowOpaquePredicateOp for AsciiCaseInsensitiveOp {
         args: &[Expression],
         batch: &RecordBatch,
         inverted: bool,
-    ) -> Result<BooleanArray> {
+    ) -> KernelResult<BooleanArray> {
         let Some(stats_inverted) = self.stats_inverted else {
             return Err(KernelError::unsupported(
                 "Row comparisons are connector-owned",
@@ -567,7 +572,7 @@ impl ArrowOpaquePredicateOp for AsciiCaseInsensitiveOp {
         let arrays = args
             .iter()
             .map(|arg| evaluate_expression(arg, batch, Some(&DataType::STRING)))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<KernelResult<Vec<_>>>()?;
         let strings: Vec<_> = arrays
             .iter()
             .map(|array| array.as_any().downcast_ref::<StringArray>().unwrap())
@@ -608,7 +613,7 @@ impl ArrowOpaquePredicateOp for AsciiCaseInsensitiveOp {
         _eval_pred: &DirectPredicateEvaluator<'_>,
         _exprs: &[Expression],
         _inverted: bool,
-    ) -> Result<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         Err(KernelError::unsupported("No scalar collation evaluator"))
     }
 

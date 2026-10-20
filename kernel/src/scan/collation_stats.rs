@@ -41,7 +41,13 @@ pub(super) fn extend_output_schemas(
                 )));
             }
         }
-        let Some(bounds) = table.build_selected_stats_output_schemas(columns, false)? else {
+        let Some(bounds) = table.build_selected_stats_output_schemas(
+            columns,
+            false,
+            #[cfg(feature = "geo-type-in-dev")]
+            false,
+        )?
+        else {
             continue;
         };
         logical.push(identifier_field(identifier, &bounds.logical)?);

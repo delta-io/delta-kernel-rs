@@ -1433,7 +1433,7 @@ mod tests {
             _args: &[Expression],
             batch: &RecordBatch,
             _inverted: bool,
-        ) -> Result<BooleanArray> {
+        ) -> KernelResult<BooleanArray> {
             Ok(BooleanArray::from(vec![false; batch.num_rows()]))
         }
 
@@ -1443,7 +1443,7 @@ mod tests {
             _evaluator: &DirectPredicateEvaluator<'_>,
             _exprs: &[Expr],
             _inverted: bool,
-        ) -> Result<Option<bool>> {
+        ) -> KernelResult<Option<bool>> {
             Err(KernelError::unsupported("No scalar evaluation"))
         }
 

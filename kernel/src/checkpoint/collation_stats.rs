@@ -62,9 +62,12 @@ pub(crate) fn build_collation_stats_read_transform(
         Some(_) => return Err(KernelError::schema("stats_parsed must be a struct")),
         None => schema! { nullable NUM_RECORDS: LONG, nullable TIGHT_BOUNDS: BOOLEAN },
     };
-    let stats = SchemaStructPatchBuilder::new()
-        .append(source.clone())
-        .build(&stats)?;
+    let stats = if stats.field(COLLATION_STATS).is_some() {
+        SchemaStructPatchBuilder::new().replace(COLLATION_STATS, source.clone())
+    } else {
+        SchemaStructPatchBuilder::new().append(source.clone())
+    }
+    .build(&stats)?;
     let raw_field = StructField::nullable("stats_parsed", stats);
     let read_schema = Arc::new(
         if target.is_some() {
