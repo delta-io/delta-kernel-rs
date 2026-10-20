@@ -4,6 +4,7 @@ use std::iter;
 
 use super::action_projector::ActionProjector;
 use crate::actions::{CheckpointAction, ADD_NAME, LOG_ADD_SCHEMA, REMOVE_NAME};
+use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::{read_actions_from_amt, ReadContext};
 use crate::log_replay::ActionsBatch;
 use crate::path::LogRoot;
@@ -12,19 +13,16 @@ use crate::{Engine, KernelError, KernelResult, KernelResultIteratorStatic};
 
 /// Reads the actions `read_schema` asks for from `checkpoint`, as checkpoint batches
 /// (`is_log_batch = false`) matching `read_schema`. `log_root` resolves the action's file
-/// references.
+/// references, and `cancellation_token` stops their reads.
 ///
 /// `add` rows come from the action's content tree. A checkpoint holds reconciled state, so `remove`
 /// rows are never produced.
-///
-/// # Errors
-/// Returns an error if `read_schema` asks for an action kind the checkpoint action cannot supply,
-/// or if the content tree cannot be read.
 pub(super) fn read_checkpoint_action(
     engine: &dyn Engine,
     checkpoint: &CheckpointAction,
     log_root: &LogRoot,
     read_schema: SchemaRef,
+    cancellation_token: Option<&CancellationTokenRef>,
 ) -> KernelResult<KernelResultIteratorStatic<ActionsBatch>> {
     let mut reads_adds = false;
     for field in read_schema.fields() {
@@ -53,7 +51,13 @@ pub(super) fn read_checkpoint_action(
     };
     let projector =
         ActionProjector::try_new(engine, ADD_NAME, LOG_ADD_SCHEMA.clone(), read_schema)?;
-    let adds = read_actions_from_amt(engine, checkpoint, log_root.table_root(), &ctx, None)?;
+    let adds = read_actions_from_amt(
+        engine,
+        checkpoint,
+        log_root.table_root(),
+        &ctx,
+        cancellation_token,
+    )?;
     // The tree marks the rows that are not live files only in the selection vector, but replay
     // reads every row whose `add.path` is non-null, so only the selected rows are passed on.
     Ok(Box::new(adds.map(move |batch| {
@@ -96,7 +100,7 @@ mod tests {
         create_adaptive_metadata_table,
     };
     use crate::unit_test_utils::{
-        assert_result_error_with_message, create_log_path_with_size, Action,
+        assert_result_error_with_message, create_log_path_with_size, Action, TestCancellationToken,
     };
     use crate::Version;
 
@@ -313,6 +317,7 @@ mod tests {
             &checkpoint,
             &log_root(),
             CHECKPOINT_READ_SCHEMA.clone(),
+            None,
         )
         .unwrap()
         .map(|batch| batch.unwrap().actions.try_into_record_batch().unwrap())
@@ -423,7 +428,7 @@ mod tests {
         };
 
         let batches: Vec<_> =
-            read_checkpoint_action(&engine, &checkpoint, &log_root(), read_schema.clone())
+            read_checkpoint_action(&engine, &checkpoint, &log_root(), read_schema.clone(), None)
                 .unwrap()
                 .map(|batch| batch.unwrap().actions.try_into_record_batch().unwrap())
                 .collect();
@@ -447,6 +452,21 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_read_stops() {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let checkpoint = checkpoint_with_tree(&engine, &tree_with_deleted_entry(), 1);
+        let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
+        let result = read_checkpoint_action(
+            &engine,
+            &checkpoint,
+            &log_root(),
+            CHECKPOINT_READ_SCHEMA.clone(),
+            Some(&token),
+        );
+        assert!(matches!(result, Err(KernelError::Cancelled)));
+    }
+
+    #[test]
     fn unsupported_action_kind_errors() {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let checkpoint = checkpoint_action_with_root(ROOT_PATH, 1, 1).unwrap();
@@ -460,7 +480,7 @@ mod tests {
             .unwrap(),
         );
         assert_result_error_with_message(
-            read_checkpoint_action(&engine, &checkpoint, &log_root(), schema),
+            read_checkpoint_action(&engine, &checkpoint, &log_root(), schema, None),
             &format!("reading `{SET_TRANSACTION_NAME}` actions"),
         );
     }
