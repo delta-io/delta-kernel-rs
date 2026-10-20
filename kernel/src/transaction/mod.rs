@@ -581,7 +581,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// column defaults or CHECK constraints that the connector has not acknowledged, or if the
     /// table has Concurrent Identity Columns (writing data to them is not yet supported).
     /// column defaults that the connector has not acknowledged, or if the table has Concurrent
-    /// Identity Columns (writing data to them is not yet supported).
+    /// Identity Columns.
     pub fn write_state(&self) -> KernelResult<Arc<WriteState>> {
         self.ensure_schema_non_empty_for_write_state()?;
         self.ensure_column_defaults_acknowledged()?;
