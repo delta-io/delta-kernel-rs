@@ -27,8 +27,8 @@ use crate::schema::has_concurrent_sequence_id;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
-    concurrent_identity_column, schema_has_concurrent_sequence_id, schema_has_invariants,
-    validate_column_defaults_metadata, ColumnMetadataKey, SchemaRef, StructField, StructType,
+    concurrent_identity_column, schema_has_invariants, validate_column_defaults_metadata,
+    SchemaRef, StructField, StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::table_features::validate_geospatial_feature_support;
@@ -1155,22 +1155,14 @@ impl TableConfiguration {
     /// Returns an `InvalidProtocol` error if a `sequenceId` appears on a table without the feature,
     /// or a schema error describing the first CIC rule violation.
     pub(crate) fn validate_concurrent_identity_columns(&self) -> KernelResult<()> {
-        if !self.is_feature_supported(&TableFeature::ConcurrentIdentityColumns) {
-            require!(
-                !schema_has_concurrent_sequence_id(&self.logical_schema),
-                KernelError::invalid_protocol(format!(
-                    "A column carries '{}' but the table does not support the \
-                     'concurrentIdentityColumns' feature",
-                    ColumnMetadataKey::IdentityConcurrentSequenceId.as_ref(),
-                ))
-            );
-            return Ok(());
+        let cic_supported = self.is_feature_supported(&TableFeature::ConcurrentIdentityColumns);
+        if cic_supported {
+            self.validate_feature_requirements(&TableFeature::ConcurrentIdentityColumns)?;
         }
-        self.validate_feature_requirements(&TableFeature::ConcurrentIdentityColumns)?;
         concurrent_identity_column::validate_concurrent_identity_columns(
             &self.logical_schema,
             self.metadata.partition_columns(),
-            true,
+            cic_supported,
         )?;
         Ok(())
     }
@@ -2529,12 +2521,22 @@ mod test {
     }
 
     #[rstest]
-    #[case::top_level(concurrent_identity_column("id", "seq-abc", 1, 1, false))]
-    #[case::nested(StructField::nullable(
-        "wrapper",
-        StructType::try_new(vec![concurrent_identity_column("id", "seq-abc", 1, 1, false)]).unwrap(),
-    ))]
-    fn orphaned_sequence_id_write_rejected_but_scan_allowed(#[case] field: StructField) {
+    #[case::top_level(
+        concurrent_identity_column("id", "seq-abc", 1, 1, false),
+        "does not support the 'concurrentIdentityColumns' feature"
+    )]
+    #[case::nested(
+        StructField::nullable(
+            "wrapper",
+            StructType::try_new(vec![concurrent_identity_column("id", "seq-abc", 1, 1, false)])
+                .unwrap(),
+        ),
+        "is nested"
+    )]
+    fn orphaned_sequence_id_write_rejected_but_scan_allowed(
+        #[case] field: StructField,
+        #[case] expected_error: &str,
+    ) {
         // A `sequenceId` on a table without the `concurrentIdentityColumns` feature is an invalid
         // state, in builds with and without the cargo feature.
         let config = MockTableConfigurationBuilder::new()
@@ -2542,7 +2544,7 @@ mod test {
             .build();
         assert_result_error_with_message(
             config.ensure_operation_supported(Operation::Write),
-            "does not support the 'concurrentIdentityColumns' feature",
+            expected_error,
         );
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
     }

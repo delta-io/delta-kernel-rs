@@ -34,7 +34,6 @@ pub(crate) use column_default::{try_collect_column_defaults, validate_column_def
 pub(crate) mod concurrent_identity_column;
 #[cfg(feature = "concurrent-identity-columns-in-dev")]
 pub(crate) use concurrent_identity_column::has_concurrent_sequence_id;
-pub(crate) use concurrent_identity_column::schema_has_concurrent_sequence_id;
 #[cfg(test)]
 pub(crate) use concurrent_identity_column::{classic_identity_column, concurrent_identity_column};
 pub(crate) mod compare;

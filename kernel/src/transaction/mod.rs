@@ -962,7 +962,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         Ok(())
     }
 
-    /// Rejects write-state creation when the table has Concurrent Identity Columns.
+    /// Rejects data writes (write-state creation or committing adds) when the table has Concurrent
+    /// Identity Columns.
     // TODO(#3586): surface the CIC columns to the connector instead of rejecting.
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
     fn ensure_no_concurrent_identity_columns(&self) -> KernelResult<()> {
@@ -1142,6 +1143,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         // metadata-only commits are always allowed.
         if self.staged_data_changes.has_adds() {
             validate_schema_for_write(&self.effective_table_config.logical_schema())?;
+            #[cfg(feature = "concurrent-identity-columns-in-dev")]
+            self.ensure_no_concurrent_identity_columns()?;
         }
 
         // If a data-changing transaction has add files together with remove files or DV updates,
@@ -2262,10 +2265,10 @@ mod tests {
 
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
     #[test]
-    fn write_state_rejects_concurrent_identity_columns() {
+    fn data_writes_rejected_on_concurrent_identity_columns() {
         let schema =
             StructType::try_new([concurrent_identity_column("id", "seq-abc", 1, 1, false)]);
-        let txn = column_defaults::txn_with_schema_and_writer_features(
+        let mut txn = column_defaults::txn_with_schema_and_writer_features(
             schema.unwrap(),
             [
                 TableFeature::IdentityColumns,
@@ -2273,6 +2276,9 @@ mod tests {
             ],
         );
         assert_result_error_with_message(txn.write_state(), "not yet supported");
+        // A connector that bypasses `write_state` and stages adds directly is rejected at commit.
+        add_dummy_file(&mut txn);
+        assert_result_error_with_message(txn.commit(&SyncEngine::new()), "not yet supported");
     }
 
     #[test]

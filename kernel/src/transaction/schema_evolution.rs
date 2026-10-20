@@ -296,12 +296,7 @@ pub(crate) fn evolve_table_config(
         });
 
     // Validates the evolved metadata against the protocol.
-    let evolved_table_config =
-        TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)?;
-    // The evolved columns must still satisfy the CIC rules (e.g. `set_nullable` must not make a
-    // CIC nullable).
-    evolved_table_config.validate_concurrent_identity_columns()?;
-    Ok(evolved_table_config)
+    TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)
 }
 
 #[cfg(test)]
@@ -312,14 +307,10 @@ mod tests {
 
     use super::*;
     use crate::expressions::{column_name, ColumnName};
-    #[cfg(feature = "concurrent-identity-columns-in-dev")]
-    use crate::schema::concurrent_identity_column;
     use crate::schema::{
         schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
         StructField, StructType,
     };
-    #[cfg(feature = "concurrent-identity-columns-in-dev")]
-    use crate::unit_test_utils::{assert_result_error_with_message, concurrent_identity_config};
 
     fn simple_schema() -> StructType {
         schema! {
@@ -1114,27 +1105,5 @@ mod tests {
             "new id must follow schema max (42), not stale property (5)"
         );
         assert_eq!(result.new_max_column_id, Some(43));
-    }
-
-    // Check that CIC non-nullability is enforced when adding a new column.
-    #[cfg(feature = "concurrent-identity-columns-in-dev")]
-    #[rstest]
-    #[case::set_nullable_on_cic(column_name!("id"), Some("must be non-nullable"))]
-    #[case::set_nullable_on_other_column(column_name!("v"), None)]
-    fn evolve_table_config_enforces_cic_rules(
-        #[case] column: ColumnName,
-        #[case] expected_error: Option<&str>,
-    ) {
-        let schema = StructType::try_new([
-            concurrent_identity_column("id", "seq-abc", 1, 1, false),
-            StructField::not_null("v", DataType::STRING),
-        ])
-        .unwrap();
-        let config = concurrent_identity_config(schema);
-        let result = evolve_table_config(&config, vec![SchemaOperation::SetNullable { column }]);
-        match expected_error {
-            None => assert!(result.is_ok(), "{:?}", result.err()),
-            Some(needle) => assert_result_error_with_message(result, needle),
-        }
     }
 }
