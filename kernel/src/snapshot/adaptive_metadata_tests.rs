@@ -5,7 +5,10 @@ use itertools::Itertools as _;
 use rstest::rstest;
 use url::Url;
 
-use crate::actions::{CheckpointAction, ContentRoot, SetTransaction, LOG_TXN_SCHEMA};
+use crate::actions::{
+    CheckpointAction, ContentRoot, DomainMetadata, SetTransaction, LOG_DOMAIN_METADATA_SCHEMA,
+    LOG_TXN_SCHEMA,
+};
 use crate::engine::sync::SyncEngine;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     checkpoint_line, setup_adaptive_metadata_table, write_ict_commit, write_sidecar,
@@ -160,4 +163,71 @@ fn app_id_versions_come_from_checkpoint_action_and_later_commits(
     assert_eq!(all, [txn("a", 1), txn("b", 3), txn("d", 4)]);
     let tail_base = snapshot.tail_replay_base_crc(&engine).unwrap();
     assert_eq!(tail_base.map(|crc| crc.version), expected_tail_base);
+}
+
+fn dm_line(domain: &str, configuration: &str) -> String {
+    let dm = DomainMetadata::new(domain.to_string(), configuration.to_string());
+    serde_json::to_string(&Action::DomainMetadata(dm)).unwrap()
+}
+
+/// The action's domains, which the consistent cases also commit before it.
+const ACTION_DOMAINS: &[(&str, &str)] = &[("a", "a1"), ("b", "b1"), ("d", "d1")];
+
+/// Like [`app_id_versions_come_from_checkpoint_action_and_later_commits`], for domain metadata:
+/// the action's inline (`a`, `b`) and sidecar (`d`) entries are read, and a later commit updates
+/// `a` and removes `b`.
+#[rstest]
+#[case::no_crc(&[("c", "c0")], None)]
+#[case::stale_crc_before_checkpoint_action(&[("c", "c0")], Some(1))]
+#[case::stale_crc_at_checkpoint_action(ACTION_DOMAINS, Some(CHECKPOINT_VERSION))]
+#[case::crc_at_snapshot_version(ACTION_DOMAINS, Some(CHECKPOINT_VERSION + 1))]
+fn domain_metadata_comes_from_checkpoint_action_and_later_commits(
+    #[case] before: &[(&str, &str)],
+    #[case] crc_version: Option<Version>,
+) {
+    let before = before
+        .iter()
+        .map(|(domain, configuration)| dm_line(domain, configuration))
+        .join("\n");
+    let removed_b = DomainMetadata::remove("b".to_string(), String::new());
+    let after = format!(
+        "{}\n{}",
+        dm_line("a", "a2"),
+        serde_json::to_string(&Action::DomainMetadata(removed_b)).unwrap()
+    );
+    let (engine, snapshot) = table_with_checkpoint_action(
+        &before,
+        |engine, table_root, snapshot| CheckpointAction {
+            domain_metadata: vec![
+                DomainMetadata::new("a".to_string(), "a1".to_string()),
+                DomainMetadata::new("b".to_string(), "b1".to_string()),
+            ],
+            domain_metadata_sidecars: vec![write_sidecar(
+                engine,
+                table_root,
+                "domains.parquet",
+                LOG_DOMAIN_METADATA_SCHEMA.clone(),
+                vec![DomainMetadata::new("d".to_string(), "d1".to_string()).into()],
+            )],
+            ..checkpoint_action(snapshot)
+        },
+        &after,
+        crc_version,
+    );
+
+    for (domain, expected) in [
+        ("a", Some("a2")),
+        ("b", None),
+        ("c", None),
+        ("d", Some("d1")),
+    ] {
+        assert_eq!(
+            snapshot
+                .get_domain_metadata(domain, &engine)
+                .unwrap()
+                .as_deref(),
+            expected,
+            "domain {domain}"
+        );
+    }
 }

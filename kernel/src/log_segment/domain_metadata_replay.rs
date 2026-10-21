@@ -155,9 +155,7 @@ mod tests {
 
     use crate::actions::visitors::DomainMetadataVisitor;
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::actions::{
-        CheckpointAction, ContentRoot, DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA,
-    };
+    use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
@@ -166,8 +164,7 @@ mod tests {
     use crate::transaction::UpdateTableOperation;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
-        checkpoint_action_with_root, checkpoint_line, protocol_and_metadata_lines,
-        setup_adaptive_metadata_table, write_ict_commit, write_sidecar,
+        checkpoint_action_with_root, checkpoint_line, protocol_and_metadata_lines, write_sidecar,
     };
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::unit_test_utils::{test_schema_flat_with_column_mapping, Action};
@@ -441,42 +438,5 @@ mod tests {
             .get_domain_metadatas_internal(&engine, None)
             .unwrap();
         assert_eq!(all.keys().sorted().collect::<Vec<_>>(), vec!["a", "d"]);
-    }
-
-    /// A stale CRC older than the checkpoint action cannot root a tail-only scan: the action's
-    /// `domainMetadata` entries would be missed.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn stale_crc_before_checkpoint_action_falls_back_to_full_replay() {
-        let (engine, table_root) = setup_adaptive_metadata_table();
-        write_ict_commit(&engine, &table_root, 1, "");
-        let snapshot = Snapshot::builder_for(table_root.clone())
-            .build(&engine)
-            .unwrap();
-        let (_, snapshot) = snapshot.write_checksum(&engine).unwrap();
-        let config = snapshot.table_configuration();
-        let checkpoint = CheckpointAction::new(
-            2,
-            ContentRoot::new("metadata/root.parquet".to_string(), 1, 2),
-            config.protocol().clone(),
-            config.metadata().clone(),
-            vec![],
-            vec![DomainMetadata::new(
-                "user.domain".to_string(),
-                "cfg".to_string(),
-            )],
-        );
-        write_ict_commit(&engine, &table_root, 2, &checkpoint_line(&checkpoint));
-
-        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
-
-        assert!(snapshot.crc_at_version().is_none());
-        assert_eq!(
-            snapshot
-                .get_domain_metadata("user.domain", &engine)
-                .unwrap()
-                .as_deref(),
-            Some("cfg")
-        );
     }
 }
