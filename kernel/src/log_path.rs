@@ -111,8 +111,8 @@ impl LogPath {
     ///
     /// # Errors
     ///
-    /// Returns an error if `table_root` does not end with '/', or if `filename` is empty or does
-    /// not remain the final path segment after URL resolution.
+    /// Returns an error if `table_root` does not end with '/', or if `filename` is empty, contains
+    /// '%', or does not remain the final path segment after URL resolution.
     pub fn staged_commit_url(table_root: Url, filename: &str) -> KernelResult<Url> {
         Self::log_file_url(table_root, STAGED_COMMITS_DIR, filename)
     }
