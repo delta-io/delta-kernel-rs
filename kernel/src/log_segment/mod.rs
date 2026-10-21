@@ -953,8 +953,7 @@ impl LogSegment {
     /// by the actions it carries, and the commits and checkpoint files at or below that version are
     /// not read.
     ///
-    /// `table_root` resolves the action's manifest locations. The actions read from the
-    /// checkpoint action have no pre-parsed stats or partition values.
+    /// `table_root` resolves the action's manifest locations.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
@@ -968,19 +967,16 @@ impl LogSegment {
         stats_schema: Option<&StructType>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<ActionsWithCheckpointInfo<KernelResultIteratorStatic<ActionsBatch>>> {
-        let version = Version::try_from(checkpoint.version()).map_err(|_| {
-            KernelError::invalid_checkpoint(format!(
-                "checkpoint action version {} is negative",
-                checkpoint.version()
-            ))
-        })?;
-        require!(
-            version <= self.end_version,
-            KernelError::invalid_checkpoint(format!(
-                "checkpoint action version {version} is after the log segment's end version {}",
-                self.end_version
-            ))
-        );
+        let version = Version::try_from(checkpoint.version())
+            .ok()
+            .filter(|v| *v <= self.end_version)
+            .ok_or_else(|| {
+                KernelError::invalid_checkpoint(format!(
+                    "checkpoint action version {} is outside the log segment's versions 0..={}",
+                    checkpoint.version(),
+                    self.end_version
+                ))
+            })?;
         // A manifest commit's checkpoint action covers its version with the tree alone; an older
         // root needs the inline file actions only a standalone checkpoint carries.
         require!(
