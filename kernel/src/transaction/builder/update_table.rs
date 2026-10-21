@@ -8,6 +8,7 @@ use super::state::TransactionBuilderState;
 use super::TransactionBuilder;
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
+use crate::schema::generated_column::has_top_level_generation_expression;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
@@ -153,8 +154,9 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// An empty `parent` targets the root schema. Path segments may traverse nested structs, array
     /// elements, map keys, and map values, but the resolved parent must be a struct. The field must
     /// be nullable, must not be a metadata column, and must not collide case-insensitively with a
-    /// sibling. On column-mapping tables, Kernel assigns or preserves column-mapping IDs and
-    /// physical names.
+    /// sibling. A non-empty `parent` is rejected when a top-level column carries a
+    /// `delta.generationExpression`. On column-mapping tables, Kernel assigns or preserves
+    /// column-mapping IDs and physical names.
     ///
     /// Schema changes are applied in call order and validated by [`build`](Self::build).
     pub fn add_column_at(mut self, parent: ColumnName, field: StructField) -> Self {
@@ -215,8 +217,9 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// - Connector commit information that does not contain exactly one row.
     ///
     /// Schema changes are rejected when `icebergCompatV2`, `icebergCompatV3`, or
-    /// `allowColumnDefaults` is enabled. This applies to standalone ALTER TABLE transactions and
-    /// schema evolution during data-changing writes.
+    /// `allowColumnDefaults` is enabled, and adding a nested field is rejected when a top-level
+    /// column carries a `delta.generationExpression`. This applies to standalone ALTER TABLE
+    /// transactions and schema evolution during data-changing writes.
     pub fn build(
         self,
         engine: &dyn Engine,
@@ -378,7 +381,27 @@ fn apply_schema_changes(
             "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
         ));
     }
+    // Delta writers require every top-level generation expression to keep its column's type, even
+    // on a table whose protocol doesn't support generated columns. A nested field can change the
+    // type of a struct-valued generated column or of the struct its expression returns.
+    if has_top_level_generation_expression(table_config.logical_schema_ref())
+        && changes.iter().any(adds_nested_field)
+    {
+        return Err(KernelError::unsupported(
+            "Adding a nested field is not yet supported on tables with generation expressions",
+        ));
+    }
     evolve_table_config(&table_config, changes)
+}
+
+/// Whether `change` adds a field below the top level of the schema.
+fn adds_nested_field(change: &SchemaOperation) -> bool {
+    match change {
+        SchemaOperation::AddColumn { parent, .. } => parent
+            .as_ref()
+            .is_some_and(|parent| !parent.path().is_empty()),
+        SchemaOperation::SetNullable { .. } => false,
+    }
 }
 
 #[cfg(test)]
@@ -389,6 +412,7 @@ mod tests {
     use rstest_reuse::{apply, template};
     use tempfile::TempDir;
 
+    use super::apply_schema_changes;
     use crate::arrow::array::{ArrayRef, Int32Array, StringArray};
     use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::arrow::record_batch::RecordBatch;
@@ -406,7 +430,10 @@ mod tests {
     use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3};
     use crate::transaction::create_table::create_table;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
-    use crate::unit_test_utils::{copy_test_table, load_test_table, test_schema_flat};
+    use crate::unit_test_utils::{
+        copy_test_table, field_with_generation_expression, load_test_table, test_schema_flat,
+        MockProtocolBuilder, MockTableConfigurationBuilder,
+    };
     use crate::{Engine, KernelError, KernelResult, SnapshotRef};
 
     #[rstest]
@@ -800,6 +827,49 @@ mod tests {
             } else {
                 assert_eq!(schema, snapshot.schema());
             }
+        }
+    }
+
+    #[rstest]
+    fn nested_add_column_is_rejected_on_tables_with_generation_expressions(
+        #[values(true, false)] feature_listed: bool,
+        #[values(true, false)] nested: bool,
+    ) {
+        let writer_features = if feature_listed {
+            vec![TableFeature::GeneratedColumns]
+        } else {
+            vec![]
+        };
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_schema(schema_ref! {
+                nullable "event_time": TIMESTAMP,
+                nullable "details": { nullable "a": INTEGER },
+                (field_with_generation_expression(
+                    "event_year",
+                    DataType::INTEGER,
+                    "YEAR(event_time)"
+                )),
+            })
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_writer_features(writer_features)
+                    .build(),
+            )
+            .build();
+        let parent = nested.then(|| column_name!("details"));
+        let change =
+            SchemaOperation::add_column(parent, StructField::nullable("b", DataType::INTEGER));
+
+        let result = apply_schema_changes(table_config, vec![change]);
+
+        if nested {
+            let rejected = matches!(result, Err(KernelError::Unsupported(_)));
+            assert!(rejected, "expected an unsupported error, got: {result:?}");
+        } else {
+            assert!(
+                result.is_ok(),
+                "expected a top-level add to succeed, got: {result:?}"
+            );
         }
     }
 

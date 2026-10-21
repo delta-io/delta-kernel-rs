@@ -682,6 +682,19 @@ impl MockProtocolBuilder {
 // Reusable test schemas
 // Each variant exists with and without column mapping metadata.
 
+/// Builds a nullable [`StructField`] carrying `metadata_value` as its `delta.generationExpression`
+/// metadata.
+pub(crate) fn field_with_generation_expression(
+    name: &str,
+    ty: impl Into<KernelDataType>,
+    metadata_value: impl Into<MetadataValue>,
+) -> StructField {
+    StructField::nullable(name, ty).add_metadata([(
+        ColumnMetadataKey::GenerationExpression.as_ref(),
+        metadata_value.into(),
+    )])
+}
+
 /// Builds a nullable [`StructField`] carrying column-mapping id + physical name metadata.
 fn cm_field(
     name: &str,
