@@ -21,6 +21,19 @@ use crate::common::write_utils::get_scan_files;
 
 const GENERATED_COLUMNS_FEATURE: &[&str] = &["generatedColumns"];
 const EVENT_YEAR: &[(&str, &str)] = &[("event_year", "YEAR(event_time)")];
+const TESTING_GENERATED_COLUMNS: &[(&str, &str)] = &[
+    // Expressions a user would expect.
+    ("event_year", "YEAR(event_time)"),
+    ("double_id", "id * 2"),
+    ("next_age", "age + 1"),
+    ("age_decade", "CAST(age / 10 AS INT)"),
+    ("id_or_zero", "COALESCE(id, 0)"),
+    // Unusual expressions, returned verbatim. The engine must parse these expressions and reject
+    // invalid ones.
+    ("empty", ""),
+    ("blank", "   "),
+    ("broken", "YEAR("),
+];
 
 /// The operation whose generated-column acknowledgement gate is under test.
 #[derive(Clone, Copy)]
@@ -30,8 +43,9 @@ enum GatedOp {
     WriteState,
 }
 
-/// A schema with an `event_time` column followed by one INTEGER column per `(name, raw_sql)` pair
-/// in `generated`, each carrying its SQL as `delta.generationExpression` metadata.
+/// A schema with `id`, `age`, and `event_time` columns followed by one INTEGER column per
+/// `(name, raw_sql)` pair in `generated`, each carrying its SQL as `delta.generationExpression`
+/// metadata.
 fn test_schema(generated: &[(&str, &str)]) -> SchemaRef {
     let generated_fields = generated.iter().map(|(name, raw_sql)| {
         StructField::nullable(*name, DataType::INTEGER).add_metadata([(
@@ -39,8 +53,13 @@ fn test_schema(generated: &[(&str, &str)]) -> SchemaRef {
             MetadataValue::String(raw_sql.to_string()),
         )])
     });
-    let fields = std::iter::once(StructField::nullable("event_time", DataType::TIMESTAMP))
-        .chain(generated_fields);
+    let fields = [
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("age", DataType::INTEGER),
+        StructField::nullable("event_time", DataType::TIMESTAMP),
+    ]
+    .into_iter()
+    .chain(generated_fields);
     Arc::new(StructType::try_new(fields).expect("test schema must be valid"))
 }
 
@@ -123,22 +142,23 @@ fn discovered(generated_columns: &[GeneratedColumn]) -> Vec<(&str, &str)> {
 async fn discovers_generated_columns_from_snapshot_and_transaction(
 ) -> KernelResult<(), Box<dyn std::error::Error>> {
     let (_tmp, table_path, engine) = test_table_setup()?;
-    let generated = [
-        ("event_year", "YEAR(event_time)"),
-        ("event_month", "MONTH(event_time)"),
-    ];
-    let table_url = write_table(&table_path, GENERATED_COLUMNS_FEATURE, &generated).await?;
+    let table_url = write_table(
+        &table_path,
+        GENERATED_COLUMNS_FEATURE,
+        TESTING_GENERATED_COLUMNS,
+    )
+    .await?;
 
     // Discovery keeps schema order and needs no acknowledgement.
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let snapshot_columns = snapshot.generated_columns()?;
     let from_snapshot = discovered(&snapshot_columns);
-    assert_eq!(from_snapshot, generated);
+    assert_eq!(from_snapshot, TESTING_GENERATED_COLUMNS);
 
     let txn = write_txn(&snapshot, engine.as_ref())?;
     let txn_columns = txn.generated_columns()?;
     let from_txn = discovered(&txn_columns);
-    assert_eq!(from_txn, generated);
+    assert_eq!(from_txn, TESTING_GENERATED_COLUMNS);
     Ok(())
 }
 
@@ -360,9 +380,14 @@ async fn alter_table_on_generated_column_table_requires_acknowledgement(
     #[values(true, false)] acknowledge: bool,
 ) -> KernelResult<(), Box<dyn std::error::Error>> {
     let (_tmp, table_path, engine) = test_table_setup()?;
-    let table_url = write_table(&table_path, GENERATED_COLUMNS_FEATURE, EVENT_YEAR).await?;
+    let table_url = write_table(
+        &table_path,
+        GENERATED_COLUMNS_FEATURE,
+        TESTING_GENERATED_COLUMNS,
+    )
+    .await?;
 
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = snapshot
         .update_table(UpdateTableOperation::AlterTable, "Test/1.0", false)
         .add_column(StructField::nullable("note", DataType::STRING))
@@ -376,6 +401,12 @@ async fn alter_table_on_generated_column_table_requires_acknowledgement(
     let altered = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
     let altered_columns = altered.generated_columns()?;
     let from_altered = discovered(&altered_columns);
-    assert_eq!(from_altered, EVENT_YEAR);
+    assert_eq!(from_altered, TESTING_GENERATED_COLUMNS);
+
+    // The ALTER commit rewrites the schema, so a fresh load reads the expressions kernel wrote.
+    let reloaded = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let reloaded_columns = reloaded.generated_columns()?;
+    let from_reloaded = discovered(&reloaded_columns);
+    assert_eq!(from_reloaded, TESTING_GENERATED_COLUMNS);
     Ok(())
 }
