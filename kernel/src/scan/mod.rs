@@ -1417,19 +1417,6 @@ impl Scan {
             self.checkpoint_read_options();
         #[cfg(feature = "adaptive-metadata-in-dev")]
         if let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)? {
-            // TODO(#3320): the content tree does not yet carry partition values.
-            let partition_columns = self
-                .snapshot
-                .table_configuration()
-                .metadata()
-                .partition_columns();
-            require!(
-                partition_columns.is_empty(),
-                KernelError::unsupported(format!(
-                    "scanning a partitioned adaptiveMetadata table is not yet supported; \
-                     partition columns: {partition_columns:?}"
-                ))
-            );
             return self
                 .snapshot
                 .log_segment()
