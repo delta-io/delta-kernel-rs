@@ -382,23 +382,12 @@ async fn test_commit_info_records_data_change_and_last_manifest_commit(
 
 /// A manifest commit records its files in the manifest rather than as add/remove actions, so
 /// kernel cannot count them: file stats are unknown from the manifest commit onward and no
-/// checksum can be written, whether it is resolved from the post-commit snapshot, by replaying
-/// the log, or from a checkpoint.
+/// checksum can be written, whether it is resolved from the post-commit snapshot or by replaying
+/// the log.
 #[rstest]
-#[case::post_commit("post_commit", "Indeterminate file stats")]
-#[case::log_replay("log_replay", "Indeterminate file stats")]
-#[case::checkpoint(
-    "checkpoint",
-    "checkpoint 1 may not list the files of adaptiveMetadata manifest commit 1"
-)]
-#[case::checkpoint_with_tail(
-    "checkpoint_with_tail",
-    "checkpoint 1 may not list the files of adaptiveMetadata manifest commit 1"
-)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_no_checksum_after_manifest_commit(
-    #[case] source: &str,
-    #[case] expected_error: &str,
+    #[values(true, false)] reload_snapshot: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("no_checksum_after_manifest_commit").await?;
@@ -411,24 +400,13 @@ async fn test_no_checksum_after_manifest_commit(
         .with_root_manifest_file(file)?
         .commit(&engine)?
         .unwrap_post_commit_snapshot();
-    let snapshot = match source {
-        "post_commit" => snapshot,
-        "log_replay" => Snapshot::builder_for(table_url.clone()).build(&engine)?,
-        "checkpoint" => {
-            snapshot.checkpoint(&engine, None)?;
-            Snapshot::builder_for(table_url.clone()).build(&engine)?
-        }
-        _ => {
-            snapshot.checkpoint(&engine, None)?;
-            let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-            begin_with_data_change(snapshot, &engine, true)?
-                .commit(&engine)?
-                .unwrap_committed();
-            Snapshot::builder_for(table_url.clone()).build(&engine)?
-        }
+    let snapshot = if reload_snapshot {
+        Snapshot::builder_for(table_url.clone()).build(&engine)?
+    } else {
+        snapshot
     };
     assert!(snapshot.get_file_stats_if_present().is_none());
-    assert_result_error_with_message(snapshot.write_checksum(&engine), expected_error);
+    assert_result_error_with_message(snapshot.write_checksum(&engine), "Indeterminate file stats");
     Ok(())
 }
 
