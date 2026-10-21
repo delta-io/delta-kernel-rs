@@ -9,6 +9,7 @@ use crate::content_tree::{read_actions_from_amt, ReadContext};
 use crate::log_replay::ActionsBatch;
 use crate::path::LogRoot;
 use crate::schema::SchemaRef;
+use crate::utils::require;
 use crate::{Engine, KernelError, KernelResult, KernelResultIteratorStatic};
 
 /// Reads the actions `read_schema` asks for from `checkpoint`, as checkpoint batches
@@ -43,6 +44,16 @@ pub(super) fn read_checkpoint_action(
     if !reads_adds {
         return Ok(Box::new(iter::empty()));
     }
+    // TODO(#3320): the content tree does not yet carry partition values, so its adds would read
+    // with empty `partitionValues`.
+    let partition_columns = checkpoint.metadata().partition_columns();
+    require!(
+        partition_columns.is_empty(),
+        KernelError::unsupported(format!(
+            "reading adds from a partitioned adaptiveMetadata checkpoint action is not yet \
+             supported; partition columns: {partition_columns:?}"
+        ))
+    );
 
     let ctx = ReadContext {
         // TODO(#2866): inherit each file's commit timestamp instead of a non-zero constant.
@@ -58,9 +69,9 @@ pub(super) fn read_checkpoint_action(
         &ctx,
         cancellation_token,
     )?;
-    // The tree marks the rows that are not live files only in the selection vector, but replay
-    // reads every row whose `add.path` is non-null, so only the selected rows are passed on.
     Ok(Box::new(adds.map(move |batch| {
+        // `ActionsBatch` does not take a `FilteredEngineData` yet, so drop the deselected rows
+        // here; otherwise replay would read them as live adds.
         let selected = batch?.apply_selection_vector()?;
         Ok(ActionsBatch::new(
             projector.project(selected.as_ref())?,
@@ -96,11 +107,12 @@ mod tests {
     use crate::scan::{CHECKPOINT_READ_SCHEMA, COMMIT_READ_SCHEMA};
     use crate::schema::{schema_ref, StructType};
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
-        adaptive_metadata_protocol_and_metadata, checkpoint_action_with_root, commit_files,
-        create_adaptive_metadata_table,
+        adaptive_metadata_pm, adaptive_metadata_protocol_and_metadata, checkpoint_action_with_root,
+        commit_files, create_adaptive_metadata_table,
     };
     use crate::unit_test_utils::{
-        assert_result_error_with_message, create_log_path_with_size, Action, TestCancellationToken,
+        assert_result_error_with_message, create_log_path_with_size,
+        test_schema_flat_with_column_mapping, Action, TestCancellationToken,
     };
     use crate::Version;
 
@@ -387,8 +399,8 @@ mod tests {
     }
 
     #[rstest]
-    #[case::negative(-1, -1, "checkpoint action version -1 is negative")]
-    #[case::after_segment_end(4, 4, "version 4 is after the log segment's end version 3")]
+    #[case::negative(-1, -1, "version -1 is outside the log segment's versions 0..=3")]
+    #[case::after_segment_end(4, 4, "version 4 is outside the log segment's versions 0..=3")]
     #[case::older_content_root(2, 1, "content root version 1 is older than its version 2")]
     fn rejects_checkpoint_action_versions_it_cannot_read(
         #[case] version: i64,
@@ -464,6 +476,32 @@ mod tests {
             Some(&token),
         );
         assert!(matches!(result, Err(KernelError::Cancelled)));
+    }
+
+    #[test]
+    fn partitioned_checkpoint_action_rejects_add_reads() {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let (protocol, metadata) =
+            adaptive_metadata_pm(test_schema_flat_with_column_mapping(), &["id"]);
+        let checkpoint = CheckpointAction::new(
+            1,
+            ContentRoot::new(ROOT_PATH.to_string(), 1, 1),
+            protocol,
+            metadata,
+            vec![],
+            vec![],
+        );
+        assert_result_error_with_message(
+            read_checkpoint_action(
+                &engine,
+                &checkpoint,
+                &log_root(),
+                CHECKPOINT_READ_SCHEMA.clone(),
+                None,
+            ),
+            "partitioned adaptiveMetadata checkpoint action is not yet supported; partition \
+             columns: [\"id\"]",
+        );
     }
 
     #[test]
