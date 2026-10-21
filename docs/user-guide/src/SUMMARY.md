@@ -37,6 +37,7 @@
 - [Column Defaults](./writing/column_defaults.md)
 - [Check Constraints](./writing/check_constraints.md)
 - [Checkpoint Protection](./writing/checkpoint_protection.md)
+- [Generated Columns](./writing/generated_columns.md)
 - [Altering a Table](./writing/alter_table.md)
 
 # Maintenance Operations
