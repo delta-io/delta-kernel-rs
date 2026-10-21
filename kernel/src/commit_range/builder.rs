@@ -275,10 +275,6 @@ impl CommitRangeBuilder {
                 ))
             );
         }
-        require!(
-            self.log_tail.iter().all(ParsedLogPath::is_commit),
-            KernelError::CommitRange("Commit range log tail must contain only commits".to_string())
-        );
         validate_catalog_managed_log_tail(
             self.end_version,
             self.max_catalog_version,
@@ -791,7 +787,7 @@ mod tests {
             .build(&engine)
             .unwrap_err();
 
-        assert!(matches!(err, KernelError::CommitRange(message) if message.contains("only commits")));
+        assert!(matches!(err, KernelError::Generic(message) if message.contains("only commits")));
     }
 
     #[test]

@@ -1144,5 +1144,25 @@ pub(super) mod tests {
 
             Ok(())
         }
+
+        #[test_log::test(tokio::test)]
+        async fn test_non_commit_log_tail_errors() -> KernelResult<(), Box<dyn std::error::Error>> {
+            let (engine, _store, table_root) = setup_catalog_managed_test().await;
+            let log_tail = vec![create_log_path(
+                &table_root,
+                test_utils::delta_path_for_version(1, "crc"),
+            )];
+
+            let result = SnapshotBuilder::new_for(table_root)
+                .with_log_tail(log_tail)
+                .with_max_catalog_version(1)
+                .build(engine.as_ref());
+
+            assert!(
+                matches!(result, Err(KernelError::Generic(ref message)) if message.contains("only commits"))
+            );
+
+            Ok(())
+        }
     }
 }

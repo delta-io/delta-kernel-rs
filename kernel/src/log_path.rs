@@ -107,22 +107,26 @@ impl LogPath {
     /// Resolve the bare `filename` in `subdir` (empty, or ending with '/') of the table's
     /// `_delta_log/` directory.
     ///
-    /// Returns an error if `table_root` does not end with '/', or if `Url::join` would not keep
-    /// `filename` as the final path segment. A separator, query, fragment, or dot segment would
-    /// resolve elsewhere, and `Url::join` strips tabs and newlines and trims spaces.
+    /// Returns an error if `table_root` does not end with '/', or if the resolved URL would not
+    /// name `filename` itself. `Url::join` resolves separators, queries, fragments, and dot
+    /// segments, and strips tabs and newlines and trims spaces. Engines percent-decode URL paths,
+    /// so a percent-escape would name a different object than `ParsedLogPath` validated.
     fn log_file_url(table_root: Url, subdir: &str, filename: &str) -> KernelResult<Url> {
         // TODO: we should introduce TablePath/LogPath types which enforce checks like ending '/'
         if !table_root.path().ends_with('/') {
             return Err(KernelError::invalid_table_location(table_root));
         }
-        let url = table_root
+        let dir = table_root
             .join(DELTA_LOG_DIR_WITH_SLASH)
             .and_then(|url| url.join(subdir))
-            .and_then(|url| url.join(filename))
             .map_err(|_| KernelError::invalid_table_location(table_root))?;
+        let invalid =
+            || KernelError::invalid_log_path(format!("not a bare log file name: {filename}"));
+        let url = dir.join(filename).map_err(|_| invalid())?;
         require!(
-            url.path_segments().and_then(|mut s| s.next_back()) == Some(filename),
-            KernelError::invalid_log_path(format!("not a bare log file name: {filename}"))
+            !filename.contains('%')
+                && url.path_segments().and_then(|mut s| s.next_back()) == Some(filename),
+            invalid()
         );
         Ok(url)
     }
@@ -180,6 +184,12 @@ mod test {
     #[case::query(10, "00000000000000000010.json?x")]
     #[case::fragment(10, "00000000000000000010.json#x")]
     #[case::percent_encoded(10, "%2E%2E%2F00000000000000000010.json")]
+    // Engines percent-decode this into a nested path under `_staged_commits/`.
+    #[case::percent_encoded_uuid(
+        10,
+        "00000000000000000010.%2Fother%2F_delta_log%2Fzzzzzzzzzzzz.json"
+    )]
+    #[case::absolute_url(10, "http://[bad")]
     // `Url::join` strips tabs and newlines and trims spaces, so these would otherwise resolve to
     // `00000000000000000010.json`.
     #[case::embedded_tab(10, "0000000000000000001\t0.json")]
@@ -242,6 +252,7 @@ mod test {
     #[case::parquet("00000000000000000010.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.parquet")]
     #[case::published("00000000000000000010.json")]
     #[case::query("00000000000000000010.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json?x")]
+    #[case::percent_encoded_uuid("00000000000000000010.%2Fother%2F_delta_log%2Fzzzzzzzzzzzz.json")]
     fn test_staged_commit_path_creation_failures(#[case] filename: &str) {
         let table_root = Url::from_str(TABLE_ROOT).unwrap();
         LogPath::staged_commit(table_root, filename, 0, 0).unwrap_err();

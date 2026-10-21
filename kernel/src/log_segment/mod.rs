@@ -156,6 +156,10 @@ pub(crate) fn validate_catalog_managed_log_tail(
     max_catalog_version: Option<Version>,
     log_tail: &[ParsedLogPath],
 ) -> KernelResult<()> {
+    require!(
+        log_tail.iter().all(ParsedLogPath::is_commit),
+        KernelError::generic("Catalog log tail must contain only commits")
+    );
     for pair in log_tail.windows(2) {
         require!(
             pair[0].version.checked_add(1) == Some(pair[1].version),

@@ -209,7 +209,7 @@ async fn test_snapshot_from_catalog_response_with_published_commits(
             1749830881779,
         ),
     ];
-    let max_published = published_names
+    let last_published_idx = published_names
         .iter()
         .rposition(|published| *published)
         .ok_or("expected a published commit")?;
@@ -218,7 +218,7 @@ async fn test_snapshot_from_catalog_response_with_published_commits(
     for (i, &(version, ts, uuid, size, mod_ts)) in staged.iter().enumerate() {
         let staged_name = format!("{version:020}.{uuid}.json");
         let published_name = format!("{version:020}.json");
-        if i <= max_published {
+        if i <= last_published_idx {
             std::fs::copy(
                 log_dir.join("_staged_commits").join(&staged_name),
                 log_dir.join(&published_name),
@@ -245,7 +245,7 @@ async fn test_snapshot_from_catalog_response_with_published_commits(
     // Publishing copies only staged commits above this watermark.
     assert_eq!(
         snapshot.log_segment().listed.max_published_version,
-        Some(max_published as u64 + 1)
+        Some(last_published_idx as u64 + 1)
     );
     let scan = snapshot.clone().scan_builder().build()?;
     let rows: usize = read_scan(&scan, engine.clone() as Arc<dyn Engine>)?
