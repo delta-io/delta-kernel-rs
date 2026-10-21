@@ -10,7 +10,6 @@ use test_utils::add_commit;
 use url::Url;
 
 use super::get_files_for_scan;
-use crate::actions::{CheckpointAction, ContentRoot};
 use crate::arrow::array::StringArray;
 use crate::content_tree::test_utils::{added_data_entry, data_manifest_entry, write_manifest};
 use crate::content_tree::{ContentTreeNodeEntry, TrackingInfo, TrackingStatus};
@@ -21,7 +20,7 @@ use crate::scan::{Scan, ScanMetadata};
 use crate::schema::schema_ref;
 use crate::transaction::BASE_ADD_FILES_SCHEMA;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    adaptive_metadata_protocol_and_metadata, checkpoint_line, commit_file_changes, commit_files,
+    checkpoint_action_with_root, checkpoint_line, commit_file_changes, commit_files,
     commit_root_manifest, commit_root_manifest_file, create_adaptive_metadata_table,
     setup_adaptive_metadata_table,
 };
@@ -68,15 +67,7 @@ async fn two_checkpoint_table() -> SyncEngine {
     ];
     let root_path = "metadata/root-4.parquet";
     let root = write_manifest(&engine, table_root().join(root_path).unwrap(), &tree2);
-    let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
-    let checkpoint = CheckpointAction::new(
-        4,
-        ContentRoot::new(root_path.to_string(), root.size as i64, 4),
-        protocol,
-        metadata,
-        vec![],
-        vec![],
-    );
+    let checkpoint = checkpoint_action_with_root(root_path, root.size as i64, 4).unwrap();
     add_commit(TABLE_ROOT, store.as_ref(), 4, checkpoint_line(&checkpoint))
         .await
         .unwrap();
