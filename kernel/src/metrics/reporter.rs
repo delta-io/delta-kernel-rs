@@ -13,7 +13,7 @@ use super::events::{
     storage_metric_from_attrs, CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted,
     LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadSuccess,
     ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess,
-    TransactionCommitSuccess, STORAGE_SPAN,
+    TransactionCommitSuccess, CRC_VALIDATION_FAILED_SPAN, STORAGE_SPAN,
 };
 
 // ====================================================================
@@ -129,6 +129,7 @@ where
             CrcReadSuccess::SPAN_NAME => Some(MetricEvent::CrcReadSuccess(
                 CrcReadSuccess::from_attrs(attrs),
             )),
+            CRC_VALIDATION_FAILED_SPAN => Some(MetricEvent::CrcValidationFailure),
             JsonReadCompleted::SPAN_NAME => Some(MetricEvent::JsonReadCompleted(
                 JsonReadCompleted::from_attrs(attrs),
             )),

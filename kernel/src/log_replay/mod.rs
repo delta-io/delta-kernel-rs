@@ -172,6 +172,7 @@ impl Deduplicator for FileActionDeduplicator<'_> {
     ) -> KernelResult<Option<FileActionInfo>> {
         // Try to extract an add action by the required path column
         if let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? {
+            // TODO(#3715): Revisit clamping missing or negative add.size to zero.
             let size = match getters[self.add_size_index].get_long(i, "add.size")? {
                 Some(s) => u64::try_from(s).unwrap_or_else(|e| {
                     warn!("Could not convert add.size {s} to u64: {e}");

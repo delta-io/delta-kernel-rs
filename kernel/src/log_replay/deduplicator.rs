@@ -144,6 +144,7 @@ impl Deduplicator for CheckpointDeduplicator<'_> {
             return Ok(None);
         };
         let dv_unique_id = self.extract_dv_unique_id(i, getters, self.add_dv_start_index)?;
+        // TODO(#3715): Revisit clamping missing or negative add.size to zero.
         let size = match getters[self.add_size_index].get_long(i, "add.size")? {
             Some(s) => u64::try_from(s).unwrap_or_else(|e| {
                 warn!("Could not convert add.size {s} to u64: {e}");

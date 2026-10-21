@@ -1,18 +1,22 @@
 //! Integration tests for CRC (version checksum) file-based APIs on Snapshot.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use delta_kernel::checkpoint::{CheckpointSpec, LastCheckpointHintStats, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::crc::{Crc, DomainMetadataState, SetTransactionState};
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::metrics::{MetricEvent, WithMetricsReporterLayer};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{schema_ref, SchemaRef};
-use delta_kernel::snapshot::{ChecksumWriteResult, IncrementalReplay, Snapshot, SnapshotRef};
+use delta_kernel::snapshot::{
+    CheckpointWriteResult, ChecksumWriteResult, IncrementalReplay, Snapshot, SnapshotRef,
+};
 #[cfg(feature = "internal-api")]
 use delta_kernel::snapshot::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
 use delta_kernel::transaction::create_table::create_table;
@@ -26,13 +30,349 @@ use delta_kernel::{
     PredicateRef, StorageHandler, Version,
 };
 use rstest::rstest;
+use serde_json::{json, Value};
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
-    add_commit, begin_transaction_with, copy_directory, insert_data, test_table_setup,
-    test_table_setup_mt,
+    add_commit, begin_transaction_with, copy_directory,
+    ensure_metrics_compatible_global_subscriber, insert_data,
+    install_thread_local_metrics_reporter, read_actions_from_commit, test_table_setup,
+    test_table_setup_mt, CapturingReporter,
 };
+use tracing_subscriber::prelude::*;
 use url::Url;
+
+// ============================================================================
+// Checkpoint CRC validation
+// ============================================================================
+
+#[rstest]
+#[case::v1(CheckpointSpec::V1)]
+#[case::v2(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))]
+#[case::sidecars(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+    file_actions_per_sidecar_hint: Some(1),
+}))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_crc_mismatch_reports_without_blocking_write(
+    #[case] spec: CheckpointSpec,
+    #[values(None, Some("numFiles"), Some("tableSizeBytes"), Some("txnId"))] field: Option<&str>,
+) -> KernelResult<()> {
+    let (_directory, table_path, engine) = test_table_setup_mt()?;
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let snapshot = create_table_with_crc(&table_path, &engine, &spec).await?;
+    if let Some(field) = field {
+        // Remove the optional histogram so modified file totals survive CRC loading and reach
+        // checkpoint validation.
+        strip_field_from_crc(&table_path, snapshot.version(), "fileSizeHistogram");
+        let value = if field == "txnId" {
+            json!("different")
+        } else {
+            json!(0)
+        };
+        modify_crc_on_disk(
+            &crc_file_path(&table_path, snapshot.version()),
+            field,
+            value,
+        )?;
+    }
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let cached_stats = snapshot.get_file_stats_if_present();
+
+    let (result, checkpointed) = snapshot.checkpoint(engine.as_ref(), Some(&spec))?;
+
+    assert_eq!(result, CheckpointWriteResult::Written);
+    assert_eq!(checkpointed.get_file_stats_if_present(), cached_stats);
+    let failures = reporter
+        .events()
+        .into_iter()
+        .filter(|event| matches!(event, MetricEvent::CrcValidationFailure))
+        .count();
+    assert_eq!(
+        failures,
+        usize::from(matches!(field, Some("numFiles" | "tableSizeBytes")))
+    );
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_crc_validation_uses_in_memory_crc_after_commit(
+    #[values("numFiles", "tableSizeBytes")] field: &str,
+) -> KernelResult<()> {
+    let (directory, table_path, engine) = test_table_setup_mt()?;
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    // === Given a table with a corrupted on-disk CRC at version N ===
+    let snapshot = create_table_with_crc(&table_path, &engine, &CheckpointSpec::V1).await?;
+    let stats = snapshot.get_file_stats_if_present().unwrap();
+    let value = if field == "numFiles" {
+        stats.num_files()
+    } else {
+        stats.table_size_bytes()
+    };
+    strip_field_from_crc(&table_path, snapshot.version(), "fileSizeHistogram");
+    modify_crc_on_disk(
+        &crc_file_path(&table_path, snapshot.version()),
+        field,
+        json!(value + 1),
+    )?;
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    // === When a commit advances to N + 1 without writing a CRC file ===
+    let snapshot = insert_data(snapshot, &engine, vec![Arc::new(Int32Array::from(vec![3]))])
+        .await?
+        .unwrap_post_commit_snapshot();
+    assert!(!crc_file_path(&table_path, snapshot.version()).exists());
+    let expected_bytes = snapshot
+        .get_file_stats_if_present()
+        .unwrap()
+        .table_size_bytes()
+        - i64::from(field == "tableSizeBytes");
+
+    // === Then checkpointing reports the mismatch and writes a readable checkpoint ===
+    let (result, _) = snapshot.checkpoint(engine.as_ref(), None)?;
+
+    assert_eq!(result, CheckpointWriteResult::Written);
+    let failures = reporter
+        .events()
+        .into_iter()
+        .filter(|event| matches!(event, MetricEvent::CrcValidationFailure))
+        .count();
+    assert_eq!(failures, 1);
+    let hint: Value = serde_json::from_slice(&std::fs::read(
+        directory.path().join("_delta_log/_last_checkpoint"),
+    )?)?;
+    assert_eq!(hint["version"], json!(snapshot.version()));
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let mut files = Vec::new();
+    for batch in reloaded
+        .scan_builder()
+        .build()?
+        .scan_metadata(engine.as_ref())?
+    {
+        files = batch?.visit_scan_files(files, |files, file| files.push(file.size))?;
+    }
+    assert_eq!(files.len(), 3);
+    assert_eq!(files.into_iter().sum::<i64>(), expected_bytes);
+    Ok(())
+}
+
+/// A custom checkpoint writer (i.e., one that does not use [`Snapshot::checkpoint`]) still
+/// validates the CRC at finalization.
+#[rstest]
+#[case::single_writer(false, 0)]
+#[case::double_writer_partial(true, 1)]
+#[case::double_writer_full(true, usize::MAX)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_checkpoint_writer_validates_crc_at_finalize(
+    #[case] double_writer: bool,
+    #[case] replay_batches: usize,
+    #[values(false, true)] mismatch: bool,
+) -> KernelResult<()> {
+    let (directory, table_path, engine) = test_table_setup_mt()?;
+    let reporter = Arc::new(CapturingReporter::default());
+    let log_path = directory.path().join("validation.log");
+    ensure_metrics_compatible_global_subscriber();
+    let guard = tracing_subscriber::registry()
+        .with_metrics_reporter_layer(reporter.clone())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(std::fs::File::create(&log_path)?)
+                .with_filter(tracing_subscriber::filter::LevelFilter::ERROR),
+        )
+        .set_default();
+    let snapshot = create_table_with_crc(&table_path, &engine, &CheckpointSpec::V1).await?;
+    if mismatch {
+        let stats = snapshot.get_file_stats_if_present().unwrap();
+        strip_field_from_crc(&table_path, snapshot.version(), "fileSizeHistogram");
+        modify_crc_on_disk(
+            &crc_file_path(&table_path, snapshot.version()),
+            "numFiles",
+            json!(stats.num_files() * 2),
+        )?;
+        modify_crc_on_disk(
+            &crc_file_path(&table_path, snapshot.version()),
+            "tableSizeBytes",
+            json!(stats.table_size_bytes() * 2),
+        )?;
+    }
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let writer = snapshot.create_checkpoint_writer(engine.as_ref())?;
+    // When `double_writer` is true, clone the writer and consume the first `replay_batches`.
+    // This verifies that multiple `checkpoint_data` calls do not interfere with each other.
+    if double_writer {
+        let prior_data = writer.clone().checkpoint_data(engine.as_ref())?;
+        for batch in prior_data.take(replay_batches) {
+            batch?;
+        }
+    }
+    let data = writer.checkpoint_data(engine.as_ref())?;
+    let state = data.state();
+    let bytes = engine.parquet_handler().write_parquet_file(
+        writer.checkpoint_path()?,
+        Box::new(data.map(|batch| batch?.apply_selection_vector())),
+    )?;
+    assert!(!reporter
+        .events()
+        .iter()
+        .any(|event| matches!(event, MetricEvent::CrcValidationFailure)));
+    let stats = LastCheckpointHintStats::from_reconciliation_state(
+        Arc::into_inner(state).unwrap(),
+        bytes,
+        0,
+    )?;
+
+    writer.finalize(engine.as_ref(), &stats)?;
+    drop(guard);
+
+    let failures = reporter
+        .events()
+        .into_iter()
+        .filter(|event| matches!(event, MetricEvent::CrcValidationFailure))
+        .count();
+    assert_eq!(failures, usize::from(mismatch));
+    assert_eq!(
+        std::fs::read_to_string(log_path)?.contains("Checkpoint CRC mismatch"),
+        mismatch
+    );
+    assert!(directory
+        .path()
+        .join("_delta_log/_last_checkpoint")
+        .exists());
+    Ok(())
+}
+
+#[rstest]
+#[case::missing(false, IncrementalReplay::Disabled)]
+#[case::stale(true, IncrementalReplay::Disabled)]
+#[case::indeterminate(true, IncrementalReplay::Unlimited)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_crc_validation_skips_unavailable_totals(
+    #[case] write_crc: bool,
+    #[case] replay: IncrementalReplay,
+) -> KernelResult<()> {
+    let (_directory, table_path, engine) = test_table_setup_mt()?;
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let snapshot = create_table_with_crc(&table_path, &engine, &CheckpointSpec::V1).await?;
+    let crc_path = crc_file_path(&table_path, snapshot.version());
+    if write_crc {
+        strip_field_from_crc(&table_path, snapshot.version(), "fileSizeHistogram");
+        modify_crc_on_disk(&crc_path, "numFiles", json!(100))?;
+    } else {
+        std::fs::remove_file(crc_path)?;
+    }
+    let table_root = Url::from_directory_path(&table_path).unwrap().to_string();
+    add_commit(
+        &table_root,
+        &LocalFileSystem::new(),
+        snapshot.version() + 1,
+        format!(
+            "{}\n{}",
+            json!({"commitInfo": {"operation": "ANALYZE STATS"}}),
+            json!({"add": {
+                "path": "file.parquet", "size": 17, "partitionValues": {},
+                "modificationTime": 0, "dataChange": true,
+            }}),
+        ),
+    )
+    .await
+    .unwrap();
+    let snapshot = Snapshot::builder_for(&table_root)
+        .with_incremental_crc_replay(replay)
+        .build(engine.as_ref())?;
+    assert!(snapshot.get_file_stats_if_present().is_none());
+
+    let (result, _) = snapshot.checkpoint(engine.as_ref(), None)?;
+
+    assert_eq!(result, CheckpointWriteResult::Written);
+    assert!(!reporter
+        .events()
+        .iter()
+        .any(|event| matches!(event, MetricEvent::CrcValidationFailure)));
+    Ok(())
+}
+
+#[rstest]
+#[case::v1(CheckpointSpec::V1)]
+#[case::v2(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))]
+#[case::sidecars(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+    file_actions_per_sidecar_hint: Some(1),
+}))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_crc_validation_does_not_recount_readd(
+    #[case] spec: CheckpointSpec,
+) -> KernelResult<()> {
+    let (_directory, table_path, engine) = test_table_setup_mt()?;
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    // === Given a table with a CRC and one commit after its checkpoint ===
+    let snapshot = create_table_with_crc(&table_path, &engine, &spec).await?;
+    let expected_stats = snapshot.get_file_stats_if_present().unwrap();
+    let mut expected_files = HashMap::new();
+    for batch in Arc::clone(&snapshot)
+        .scan_builder()
+        .build()?
+        .scan_metadata(engine.as_ref())?
+    {
+        expected_files = batch?.visit_scan_files(expected_files, |files, file| {
+            files.insert(file.path, file.size);
+        })?;
+    }
+
+    // === When a stats-only re-add is committed and an at-version CRC exists ===
+    let table_root = Url::from_directory_path(&table_path).unwrap();
+    let mut adds = read_actions_from_commit(&table_root, snapshot.version(), "add")?;
+    assert_eq!(adds.len(), 1);
+    let mut readd = adds.pop().unwrap();
+    readd["dataChange"] = json!(false);
+    readd["stats"] = json!({"numRecords": 1, "nullCount": {"id": 0}})
+        .to_string()
+        .into();
+    let after_commit_version = snapshot.version() + 1;
+    add_commit(
+        &table_root,
+        &LocalFileSystem::new(),
+        after_commit_version,
+        format!(
+            "{}\n{}",
+            json!({"commitInfo": {"operation": "ANALYZE STATS"}}),
+            json!({"add": readd}),
+        ),
+    )
+    .await?;
+    std::fs::copy(
+        crc_file_path(&table_path, snapshot.version()),
+        crc_file_path(&table_path, after_commit_version),
+    )?;
+    let snapshot = Snapshot::builder_for(&table_root).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), after_commit_version);
+    assert_eq!(snapshot.get_file_stats_if_present(), Some(expected_stats));
+
+    // === Then checkpoint CRC validation passes without recounting Add files ===
+    let (result, _) = snapshot.checkpoint(engine.as_ref(), Some(&spec))?;
+
+    assert_eq!(result, CheckpointWriteResult::Written);
+    assert!(!reporter
+        .events()
+        .iter()
+        .any(|event| matches!(event, MetricEvent::CrcValidationFailure)));
+    let reloaded = Snapshot::builder_for(&table_root).build(engine.as_ref())?;
+    let mut files = Vec::new();
+    for batch in reloaded
+        .scan_builder()
+        .build()?
+        .scan_metadata(engine.as_ref())?
+    {
+        files = batch?.visit_scan_files(files, |files, file| files.push((file.path, file.size)))?;
+    }
+    assert_eq!(files.len(), expected_files.len());
+    assert_eq!(files.into_iter().collect::<HashMap<_, _>>(), expected_files);
+    Ok(())
+}
 
 // ============================================================================
 // File stats from CRC on disk
@@ -2906,5 +3246,44 @@ async fn test_txn_query_stale_partial_crc_falls_through_to_full_scan() -> Kernel
     }))
     .is_err());
 
+    Ok(())
+}
+
+async fn create_table_with_crc<E: TaskExecutor>(
+    table_path: &str,
+    engine: &Arc<DefaultEngine<E>>,
+    spec: &CheckpointSpec,
+) -> KernelResult<SnapshotRef> {
+    let builder = create_table(
+        table_path,
+        schema_ref! { nullable "id": INTEGER },
+        "test",
+        true,
+    );
+    let builder = match spec {
+        CheckpointSpec::V1 => builder,
+        CheckpointSpec::V2(_) => {
+            builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")])
+        }
+    };
+    let snapshot = builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let snapshot = insert_data(snapshot, engine, vec![Arc::new(Int32Array::from(vec![1]))])
+        .await?
+        .unwrap_post_commit_snapshot();
+    let (_, snapshot) = snapshot.checkpoint(engine.as_ref(), Some(spec))?;
+    let snapshot = insert_data(snapshot, engine, vec![Arc::new(Int32Array::from(vec![2]))])
+        .await?
+        .unwrap_post_commit_snapshot();
+    snapshot.write_checksum(engine.as_ref())?;
+    Ok(snapshot)
+}
+
+fn modify_crc_on_disk(path: &Path, field: &str, value: Value) -> KernelResult<()> {
+    let mut crc: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    crc[field] = value;
+    std::fs::write(path, serde_json::to_vec(&crc)?)?;
     Ok(())
 }
