@@ -7,7 +7,7 @@ use url::Url;
 use super::*;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
-use crate::engine::KernelEngine;
+use crate::engine::CancellableEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
 use crate::object_store::ObjectStoreExt as _;
@@ -1833,7 +1833,7 @@ fn precancelled_token_stops_listing_before_any_storage_call() {
     let (log_root, pulled, storage) = finite_listing_handler(100);
     let engine =
         DelegatingEngine::new(Arc::new(SyncEngine::new())).with_storage_handler(Arc::new(storage));
-    let engine = KernelEngine::new(&engine, Arc::new(TestCancellationToken::cancelled()));
+    let engine = CancellableEngine::new(&engine, Arc::new(TestCancellationToken::cancelled()));
 
     let result = list_delta_log_from_storage(
         engine.storage_handler().as_ref(),
@@ -1854,7 +1854,7 @@ fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
     let token = Arc::new(TestCancellationToken::default());
     let engine =
         DelegatingEngine::new(Arc::new(SyncEngine::new())).with_storage_handler(Arc::new(storage));
-    let engine = KernelEngine::new(&engine, token.clone());
+    let engine = CancellableEngine::new(&engine, token.clone());
     let storage = engine.storage_handler();
     let mut iter =
         list_delta_log_from_storage(storage.as_ref(), &log_root, 0, Version::MAX).unwrap();

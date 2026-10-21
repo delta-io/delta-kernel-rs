@@ -19,7 +19,7 @@ use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
-use crate::engine::KernelEngine;
+use crate::engine::CancellableEngine;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{
     column_name, ColumnName, ExpressionRef, MapToStructOptions, Predicate, PredicateRef,
@@ -1076,7 +1076,7 @@ impl Scan {
         let scoped_engine = self
             .cancellation_token
             .clone()
-            .map(|token| KernelEngine::new(engine, token));
+            .map(|token| CancellableEngine::new(engine, token));
         let engine = scoped_engine
             .as_ref()
             .map_or(engine, |engine| engine as &dyn Engine);
@@ -1165,7 +1165,7 @@ impl Scan {
         let scoped_engine = self
             .cancellation_token
             .clone()
-            .map(|token| KernelEngine::new(engine, token));
+            .map(|token| CancellableEngine::new(engine, token));
         let engine = scoped_engine
             .as_ref()
             .map_or(engine, |engine| engine as &dyn Engine);

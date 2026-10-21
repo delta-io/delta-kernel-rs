@@ -564,7 +564,7 @@ mod tests {
 
     use super::*;
     use crate::engine::test_delegating::DelegatingEngine;
-    use crate::engine::KernelEngine;
+    use crate::engine::CancellableEngine;
     use crate::schema::schema;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::create_log_path;
@@ -1519,7 +1519,7 @@ mod tests {
         let log_root = Url::parse("memory:///_delta_log/").unwrap();
         let engine = DelegatingEngine::new(Arc::new(SyncEngine::new()))
             .with_storage_handler(Arc::new(NoIoStorageHandler));
-        let engine = KernelEngine::new(
+        let engine = CancellableEngine::new(
             &engine,
             Arc::new(crate::unit_test_utils::TestCancellationToken::cancelled()),
         );
