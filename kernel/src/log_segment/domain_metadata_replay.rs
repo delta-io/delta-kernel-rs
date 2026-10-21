@@ -165,7 +165,7 @@ mod tests {
     use crate::transaction::UpdateTableOperation;
     use crate::transaction::create_table::create_table as create_table_txn;
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::unit_test_utils::Action;
+    use crate::unit_test_utils::{Action, test_schema_flat_with_column_mapping};
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
         checkpoint_action_with_root, checkpoint_line, protocol_and_metadata_lines,
@@ -405,7 +405,7 @@ mod tests {
             // At or below the checkpoint version, so the checkpoint action replaces it.
             format!(
                 "{}\n{}",
-                protocol_and_metadata_lines(&[]),
+                protocol_and_metadata_lines(test_schema_flat_with_column_mapping(), &[]),
                 dm_line(DomainMetadata::new("c".to_string(), "c0".to_string()))
             ),
             checkpoint_line(&checkpoint),
