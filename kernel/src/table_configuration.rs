@@ -1555,12 +1555,26 @@ mod test {
     )]
     // Unusual metadata, detected like any other generation expression. The engine must parse
     // these expressions and reject invalid ones.
-    #[case::empty_expression(
+    #[case::empty_expression_with_feature(
+        schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "")) },
+        MockProtocolBuilder::new()
+            .with_writer_features([TableFeature::GeneratedColumns])
+            .build(),
+        WriteSupport::Unsupported
+    )]
+    #[case::non_string_expression_with_feature(
+        schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, 7_i64)) },
+        MockProtocolBuilder::new()
+            .with_writer_features([TableFeature::GeneratedColumns])
+            .build(),
+        WriteSupport::Unsupported
+    )]
+    #[case::empty_expression_without_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "")) },
         MockProtocolBuilder::new().with_versions(1, 2).build(),
         WriteSupport::InvalidProtocol
     )]
-    #[case::non_string_expression(
+    #[case::non_string_expression_without_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, 7_i64)) },
         MockProtocolBuilder::new().with_versions(1, 2).build(),
         WriteSupport::InvalidProtocol
