@@ -62,6 +62,8 @@ mod tests {
 
     #[test]
     fn collects_top_level_generated_columns_in_schema_order() {
+        // Only top-level columns can be generated columns, so the expression on `details.nested`
+        // defines no generated column.
         let schema = schema! {
             (field_with_generation_expression("event_year", DataType::INTEGER, "YEAR(event_time)")),
             nullable "event_time": TIMESTAMP,
