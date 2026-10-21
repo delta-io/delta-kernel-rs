@@ -2,7 +2,7 @@
 
 use url::Url;
 
-use crate::path::ParsedLogPath;
+use crate::path::{ParsedLogPath, DELTA_LOG_DIR_WITH_SLASH, STAGED_COMMITS_DIR};
 use crate::utils::require;
 use crate::{FileMeta, FileSize, KernelError, KernelResult, Version};
 
@@ -36,19 +36,18 @@ impl LogPath {
         Ok(Self(parsed))
     }
 
-    /// Create a commit log path from a catalog-reported commit filename, which may name a staged
-    /// commit or one the catalog already published.
+    /// Create a commit log path from a catalog-reported commit filename.
     ///
     /// The filename's form selects the directory: `00000000000000000010.json` resolves to
     /// `_delta_log/00000000000000000010.json`, and `00000000000000000010.<uuid>.json` resolves to
-    /// `_delta_log/_staged_commits/00000000000000000010.<uuid>.json`. `table_root` must point to
-    /// the root of the table and end with a '/'. `version` is the catalog's version for this
-    /// commit, and `last_modified` and `size` describe the referenced file. Performs no I/O.
+    /// `_delta_log/_staged_commits/00000000000000000010.<uuid>.json`. `table_root` must end with
+    /// '/'. `version` is the catalog's version for the commit and must match the filename's.
+    /// Performs no I/O.
     ///
     /// # Errors
     ///
-    /// Returns an error if `table_root` does not end with '/', if `filename` is not a bare
-    /// published or staged commit filename, or if the filename's version differs from `version`.
+    /// Returns an error if `table_root` does not end with '/', or if `filename` is not a bare
+    /// published or staged commit filename for `version`.
     pub fn from_commit_filename(
         table_root: Url,
         version: Version,
@@ -56,40 +55,26 @@ impl LogPath {
         last_modified: i64,
         size: FileSize,
     ) -> KernelResult<LogPath> {
-        // `Url::join` interprets separators, queries, fragments, and percent-escapes, so such a
-        // filename could resolve outside the chosen directory or to a different file.
-        require!(
-            !filename.is_empty() && !filename.contains(['/', '\\', '?', '#', '%']),
-            KernelError::invalid_log_path(format!("invalid commit filename: {filename}"))
-        );
-        // Only the published form `<version>.json` has two dot-separated parts. `ParsedLogPath`
-        // validates the remaining grammar against the chosen directory.
-        let subdir = if filename.split('.').count() == 2 {
+        let invalid = || {
+            KernelError::invalid_log_path(format!(
+                "{filename} is not a published or staged commit filename for version {version}"
+            ))
+        };
+        // A published commit has exactly one valid name for `version`. Any other name must be a
+        // staged commit, which `ParsedLogPath` validates against the staged-commit directory.
+        let subdir = if filename == format!("{version:020}.json") {
             ""
         } else {
-            "_staged_commits/"
+            STAGED_COMMITS_DIR
         };
-        let location = Self::log_dir_url(table_root, subdir)?
-            .join(filename)
-            .map_err(|_| KernelError::invalid_log_path(filename))?;
+        let location = Self::log_file_url(table_root, subdir, filename)?;
         let log_path = Self::try_new(FileMeta {
             location,
             last_modified,
             size,
-        })?;
-        let parsed = &log_path.0;
-        // `Url::join` normalizes dot segments, so also require that the parsed path kept the
-        // caller's filename.
-        require!(
-            parsed.is_commit() && parsed.filename == filename,
-            KernelError::invalid_log_path(format!("not a commit filename: {filename}"))
-        );
-        require!(
-            parsed.version == version,
-            KernelError::invalid_log_path(format!(
-                "commit filename {filename} does not match expected version {version}"
-            ))
-        );
+        })
+        .map_err(|_| invalid())?;
+        require!(log_path.0.version == version, invalid());
         Ok(log_path)
     }
 
@@ -116,22 +101,30 @@ impl LogPath {
     /// Create the URL for a staged commit file given the table root and filename. The table_root
     /// must point to the root of the table and end with a '/'.
     pub fn staged_commit_url(table_root: Url, filename: &str) -> KernelResult<Url> {
-        Self::log_dir_url(table_root.clone(), "_staged_commits/")?
-            .join(filename)
-            .map_err(|_| KernelError::invalid_table_location(table_root))
+        Self::log_file_url(table_root, STAGED_COMMITS_DIR, filename)
     }
 
-    /// Resolve `subdir` (empty, or ending with '/') under the table's `_delta_log/` directory.
-    /// Returns an error if `table_root` does not end with '/'.
-    fn log_dir_url(table_root: Url, subdir: &str) -> KernelResult<Url> {
+    /// Resolve the bare `filename` in `subdir` (empty, or ending with '/') of the table's
+    /// `_delta_log/` directory.
+    ///
+    /// Returns an error if `table_root` does not end with '/', or if `Url::join` would not keep
+    /// `filename` as the final path segment. A separator, query, fragment, or dot segment would
+    /// resolve elsewhere, and `Url::join` strips tabs and newlines and trims spaces.
+    fn log_file_url(table_root: Url, subdir: &str, filename: &str) -> KernelResult<Url> {
         // TODO: we should introduce TablePath/LogPath types which enforce checks like ending '/'
         if !table_root.path().ends_with('/') {
             return Err(KernelError::invalid_table_location(table_root));
         }
-        table_root
-            .join("_delta_log/")
+        let url = table_root
+            .join(DELTA_LOG_DIR_WITH_SLASH)
             .and_then(|url| url.join(subdir))
-            .map_err(|_| KernelError::invalid_table_location(table_root))
+            .and_then(|url| url.join(filename))
+            .map_err(|_| KernelError::invalid_table_location(table_root))?;
+        require!(
+            url.path_segments().and_then(|mut s| s.next_back()) == Some(filename),
+            KernelError::invalid_log_path(format!("not a bare log file name: {filename}"))
+        );
+        Ok(url)
     }
 }
 
@@ -178,35 +171,42 @@ mod test {
     }
 
     #[rstest]
-    #[case::empty("")]
-    #[case::subdir("subdir/00000000000000000010.json")]
-    #[case::parent_dir("../00000000000000000010.json")]
-    #[case::backslash("..\\00000000000000000010.json")]
-    #[case::query("00000000000000000010.json?x")]
-    #[case::fragment("00000000000000000010.json#x")]
-    #[case::percent_encoded("%2E%2E%2F00000000000000000010.json")]
-    #[case::invalid_uuid("00000000000000000010.not-a-uuid.json")]
-    #[case::non_numeric_version("000000000000000000aa.json")]
-    #[case::short_version("10.json")]
-    #[case::staged_parquet("00000000000000000010.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.parquet")]
-    #[case::crc("00000000000000000010.crc")]
-    #[case::checkpoint("00000000000000000010.checkpoint.parquet")]
-    #[case::compaction("00000000000000000010.00000000000000000011.compacted.json")]
-    fn from_commit_filename_rejects_non_commit_filenames(#[case] filename: &str) {
+    #[case::empty(10, "")]
+    #[case::dot(10, ".")]
+    #[case::dot_dot(10, "..")]
+    #[case::subdir(10, "subdir/00000000000000000010.json")]
+    #[case::parent_dir(10, "../00000000000000000010.json")]
+    #[case::backslash(10, "..\\00000000000000000010.json")]
+    #[case::query(10, "00000000000000000010.json?x")]
+    #[case::fragment(10, "00000000000000000010.json#x")]
+    #[case::percent_encoded(10, "%2E%2E%2F00000000000000000010.json")]
+    // `Url::join` strips tabs and newlines and trims spaces, so these would otherwise resolve to
+    // `00000000000000000010.json`.
+    #[case::embedded_tab(10, "0000000000000000001\t0.json")]
+    #[case::embedded_newline(10, "0000000000000000001\n0.json")]
+    #[case::leading_space(10, " 00000000000000000010.json")]
+    #[case::invalid_uuid(10, "00000000000000000010.not-a-uuid.json")]
+    #[case::non_numeric_version(10, "000000000000000000aa.json")]
+    #[case::short_version(10, "10.json")]
+    #[case::staged_parquet(
+        10,
+        "00000000000000000010.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.parquet"
+    )]
+    #[case::crc(10, "00000000000000000010.crc")]
+    #[case::checkpoint(10, "00000000000000000010.checkpoint.parquet")]
+    #[case::compaction(10, "00000000000000000010.00000000000000000011.compacted.json")]
+    #[case::published_version_mismatch(11, "00000000000000000010.json")]
+    #[case::staged_version_mismatch(
+        11,
+        "00000000000000000010.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json"
+    )]
+    fn from_commit_filename_rejects_invalid_filenames(
+        #[case] version: Version,
+        #[case] filename: &str,
+    ) {
         let table_root = Url::from_str(TABLE_ROOT).unwrap();
-        let err = LogPath::from_commit_filename(table_root, 10, filename, 0, 0).unwrap_err();
+        let err = LogPath::from_commit_filename(table_root, version, filename, 0, 0).unwrap_err();
         assert!(matches!(err, KernelError::InvalidLogPath(_)), "{err:?}");
-    }
-
-    #[rstest]
-    #[case::published("00000000000000000010.json")]
-    #[case::staged("00000000000000000010.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json")]
-    fn from_commit_filename_rejects_version_mismatch(#[case] filename: &str) {
-        let table_root = Url::from_str(TABLE_ROOT).unwrap();
-        let err = LogPath::from_commit_filename(table_root, 11, filename, 0, 0).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("does not match expected version 11"));
     }
 
     #[test]
@@ -241,6 +241,7 @@ mod test {
     #[case::non_numeric_version("000000000000000000aa.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json")]
     #[case::parquet("00000000000000000010.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.parquet")]
     #[case::published("00000000000000000010.json")]
+    #[case::query("00000000000000000010.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json?x")]
     fn test_staged_commit_path_creation_failures(#[case] filename: &str) {
         let table_root = Url::from_str(TABLE_ROOT).unwrap();
         LogPath::staged_commit(table_root, filename, 0, 0).unwrap_err();

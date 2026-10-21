@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
+use delta_kernel::commit_range::CommitRange;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::create_table::create_table;
@@ -10,7 +11,8 @@ use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_unity_catalog::{
-    get_required_properties_for_disk, snapshot_builder_from_load_table, UCCommitter,
+    get_required_properties_for_disk, log_tail_from_commits, snapshot_builder_from_load_table,
+    UCCommitter,
 };
 use rstest::rstest;
 use test_utils::{insert_data_with, read_scan};
@@ -171,26 +173,25 @@ async fn test_scan_returns_fixture_rows() -> Result<(), TestError> {
     Ok(())
 }
 
-/// `catalog_reports_published[i]` selects whether the catalog names version `i + 1` by its
-/// published or staged filename. Every version up to the last published name also gets a
-/// published file, matching in-order backfill, so a staged name can precede or follow a
-/// published one.
+/// `published_names[i]` selects whether the catalog names version `i + 1` by its published or
+/// staged filename. Every version up to the last published name also gets a published file,
+/// matching in-order backfill.
 #[rstest]
 #[case::published_prefix(&[true, false])]
 #[case::published_suffix(&[false, true])]
 #[case::all_published(&[true, true])]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_snapshot_from_catalog_response_with_published_commits(
-    #[case] catalog_reports_published: &[bool],
+    #[case] published_names: &[bool],
 ) -> Result<(), TestError> {
     let TestSetup {
         engine,
         table_uri,
-        _tmp_dir,
+        _tmp_dir: tmp_dir,
         ..
     } = setup().await?;
     let engine = Arc::new(engine);
-    let log_dir = _tmp_dir.path().join("_delta_log");
+    let log_dir = tmp_dir.path().join("_delta_log");
     // (version, timestamp, uuid, file size, modification time) of the fixture's staged commits.
     let staged = [
         (
@@ -208,7 +209,7 @@ async fn test_snapshot_from_catalog_response_with_published_commits(
             1749830881779,
         ),
     ];
-    let max_published = catalog_reports_published
+    let max_published = published_names
         .iter()
         .rposition(|published| *published)
         .ok_or("expected a published commit")?;
@@ -223,7 +224,7 @@ async fn test_snapshot_from_catalog_response_with_published_commits(
                 log_dir.join(&published_name),
             )?;
         }
-        let file_name = if catalog_reports_published[i] {
+        let file_name = if published_names[i] {
             published_name
         } else {
             staged_name
@@ -241,6 +242,11 @@ async fn test_snapshot_from_catalog_response_with_published_commits(
 
     let snapshot = build_snapshot(&client, &engine, &table_uri)?;
     assert_eq!(snapshot.version(), 2);
+    // Publishing copies only staged commits above this watermark.
+    assert_eq!(
+        snapshot.log_segment().listed.max_published_version,
+        Some(max_published as u64 + 1)
+    );
     let scan = snapshot.clone().scan_builder().build()?;
     let rows: usize = read_scan(&scan, engine.clone() as Arc<dyn Engine>)?
         .iter()
@@ -248,7 +254,13 @@ async fn test_snapshot_from_catalog_response_with_published_commits(
         .sum();
     assert_eq!(rows, 200);
 
-    // Publishing must copy only staged commits newer than the published ones in the log tail.
+    let resp = client.load_table_response(TABLE_ID, table_uri.as_str())?;
+    let range = CommitRange::builder_for(table_uri.as_str(), 0)
+        .with_log_tail(log_tail_from_commits(&resp.commits, table_uri.clone())?, 2)
+        .build(engine.as_ref())?;
+    assert_eq!(range.end_version(), 2);
+
+    // Checkpointing a new commit requires publishing it on top of the mixed log tail.
     commit(&snapshot, &client, &engine)?
         .publish(engine.as_ref(), &uc_committer(&client))?
         .checkpoint(engine.as_ref(), None)?;
