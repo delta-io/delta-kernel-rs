@@ -91,6 +91,7 @@ impl RootManifestFile {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use itertools::Itertools as _;
@@ -99,7 +100,8 @@ mod tests {
 
     use super::*;
     use crate::actions::{
-        LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA, METADATA_NAME, PROTOCOL_NAME, get_commit_schema,
+        LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA, LastManifestCommit, METADATA_NAME,
+        PROTOCOL_NAME, get_commit_schema,
     };
     use crate::committer::FileSystemCommitter;
     use crate::crc::{Crc, DomainMetadataState, SetTransactionState};
@@ -640,11 +642,42 @@ mod tests {
             )?;
         }
 
-        let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-        let (_, snapshot) = snapshot.write_checksum(&engine)?;
+        // File stats are unknown after a manifest commit, so no checksum can be written; attach a
+        // CRC that tracks the domain metadata, transactions, and pointer instead.
+        let built = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let domain_metadata = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
+        let transaction = SetTransaction::new("app-1".to_string(), 5, None);
+        let crc = Arc::new(Crc {
+            version: built.version(),
+            protocol: built.table_configuration().protocol().clone(),
+            metadata: built.table_configuration().metadata().clone(),
+            in_commit_timestamp_opt: Some(4),
+            domain_metadata_state: DomainMetadataState::Complete(HashMap::from([(
+                "test.domain".to_string(),
+                domain_metadata,
+            )])),
+            set_transaction_state: SetTransactionState::Complete(HashMap::from([(
+                "app-1".to_string(),
+                transaction,
+            )])),
+            last_manifest_commit_opt: Some(LastManifestCommit::new(1, 1)?),
+            ..Default::default()
+        });
+        let snapshot = Snapshot::new_with_crc(
+            built.log_segment().clone(),
+            built.table_configuration().clone(),
+            Some(crc),
+            true,
+            false,
+        )?;
         assert!(snapshot.crc_at_version().is_some());
 
-        let manifest = root_manifest(&table_root, "metadata/root-v1.parquet", 1024, snapshot);
+        let manifest = root_manifest(
+            &table_root,
+            "metadata/root-v1.parquet",
+            1024,
+            Arc::new(snapshot),
+        );
         let (domain_metadata, transactions) = manifest.scan_non_content_metadata(&engine)?;
 
         assert_eq!(domain_metadata.len(), 1);
