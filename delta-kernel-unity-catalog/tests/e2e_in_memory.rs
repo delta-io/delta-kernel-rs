@@ -12,6 +12,7 @@ use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_unity_catalog::{
     get_required_properties_for_disk, snapshot_builder_from_load_table, UCCommitter,
 };
+use rstest::rstest;
 use test_utils::{insert_data_with, read_scan};
 use unity_catalog_delta_client_api::{
     Commit, InMemoryUpdateTableClient, TableData, TableIdentifier,
@@ -167,6 +168,92 @@ async fn test_scan_returns_fixture_rows() -> Result<(), TestError> {
         .schema();
     assert!(schema.column_with_name("part1").is_some());
     assert!(schema.column_with_name("col1").is_some());
+    Ok(())
+}
+
+/// UC may name an already-published commit by its canonical filename instead of its staged one.
+/// The fixture publishes v1 and v2 (copying the staged files) up to the highest version the
+/// catalog reports as published, so the filesystem matches what a backfill would have produced.
+#[rstest]
+#[case::published_prefix(&[true, false])]
+#[case::published_suffix(&[false, true])]
+#[case::all_published(&[true, true])]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_snapshot_from_catalog_response_with_published_commits(
+    #[case] catalog_reports_published: &[bool],
+) -> Result<(), TestError> {
+    let TestSetup {
+        engine,
+        table_uri,
+        _tmp_dir,
+        ..
+    } = setup().await?;
+    let engine = Arc::new(engine);
+    let log_dir = _tmp_dir.path().join("_delta_log");
+    let staged = [
+        (
+            1,
+            1749830871085,
+            "4cb9708e-b478-44de-b203-53f9ba9b2876",
+            889,
+            1749830870833,
+        ),
+        (
+            2,
+            1749830881799,
+            "5b9bba4a-0085-430d-a65e-b0d38c1afbe9",
+            891,
+            1749830881779,
+        ),
+    ];
+    let max_published = catalog_reports_published
+        .iter()
+        .rposition(|published| *published)
+        .ok_or("expected a published commit")?;
+
+    let mut catalog_commits = vec![];
+    for (i, &(version, ts, uuid, size, mod_ts)) in staged.iter().enumerate() {
+        let staged_name = format!("{version:020}.{uuid}.json");
+        let published_name = format!("{version:020}.json");
+        if i <= max_published {
+            std::fs::copy(
+                log_dir.join("_staged_commits").join(&staged_name),
+                log_dir.join(&published_name),
+            )?;
+        }
+        let file_name = if catalog_reports_published[i] {
+            published_name
+        } else {
+            staged_name
+        };
+        catalog_commits.push(Commit::new(version, ts, file_name, size, mod_ts));
+    }
+    let client = Arc::new(InMemoryUpdateTableClient::new());
+    client.insert_table(
+        TABLE_ID,
+        TableData {
+            max_ratified_version: 2,
+            catalog_commits,
+        },
+    );
+
+    let snapshot = build_snapshot(&client, &engine, &table_uri)?;
+    assert_eq!(snapshot.version(), 2);
+    let scan = snapshot.clone().scan_builder().build()?;
+    let rows: usize = read_scan(&scan, engine.clone() as Arc<dyn Engine>)?
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(rows, 200);
+
+    // Writing, publishing, and checkpointing on top of the mixed log tail succeeds.
+    commit(&snapshot, &client, &engine)?
+        .publish(engine.as_ref(), &uc_committer(&client))?
+        .checkpoint(engine.as_ref(), None)?;
+    let snapshot = Snapshot::builder_for(table_uri)
+        .with_max_catalog_version(3)
+        .build(engine.as_ref())?;
+    assert_eq!(snapshot.log_segment().checkpoint_version, Some(3));
     Ok(())
 }
 
