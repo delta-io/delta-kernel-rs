@@ -106,16 +106,13 @@ mod tests {
     use url::Url;
 
     use super::*;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::actions::{CheckpointAction, ContentRoot};
     use crate::arrow::array::StringArray;
     use crate::engine::sync::SyncEngine;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::object_store::memory::InMemory;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
-        checkpoint_action_with_root, checkpoint_line, protocol_and_metadata_lines,
-        setup_adaptive_metadata_table, write_ict_commit, write_sidecar,
+        checkpoint_action_with_root, checkpoint_line, protocol_and_metadata_lines, write_sidecar,
     };
     use crate::unit_test_utils::parse_json_batch;
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -244,34 +241,6 @@ mod tests {
                 "app id {app_id}"
             );
         }
-    }
-
-    /// A stale CRC older than the checkpoint action cannot root a tail-only scan: the action's
-    /// `txn` entries would be missed.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_stale_crc_before_checkpoint_action_falls_back_to_full_replay() {
-        let (engine, table_root) = setup_adaptive_metadata_table();
-        write_ict_commit(&engine, &table_root, 1, "");
-        let snapshot = Snapshot::builder_for(table_root.clone())
-            .build(&engine)
-            .unwrap();
-        let (_, snapshot) = snapshot.write_checksum(&engine).unwrap();
-        let config = snapshot.table_configuration();
-        let checkpoint = CheckpointAction::new(
-            2,
-            ContentRoot::new("metadata/root.parquet".to_string(), 1, 2),
-            config.protocol().clone(),
-            config.metadata().clone(),
-            vec![SetTransaction::new("a".to_string(), 7, None)],
-            vec![],
-        );
-        write_ict_commit(&engine, &table_root, 2, &checkpoint_line(&checkpoint));
-
-        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
-
-        assert!(snapshot.crc_at_version().is_none());
-        assert_eq!(snapshot.get_app_id_version("a", &engine).unwrap(), Some(7));
     }
 
     #[test]

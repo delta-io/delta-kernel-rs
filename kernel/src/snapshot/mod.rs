@@ -52,6 +52,8 @@ use crate::{
     Engine, KernelError, KernelResult, KernelResultIterator, LogCompactionWriter, Version,
 };
 
+#[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
+mod adaptive_metadata_tests;
 mod builder;
 #[cfg(test)]
 mod cancellation_tests;
@@ -1502,6 +1504,10 @@ impl Snapshot {
 
         let end = self.version();
         let log_segment = &self.log_segment;
+
+        // TODO(#2866): the replays below read only commits, so a CRC over an AMT checkpoint action
+        // misses any `txn` or `domainMetadata` entry (inline or in a sidecar) that only the action
+        // carries. The CRC must inline those entries or omit the fields.
 
         // Case 2: a stale base CRC, older than this version. Advance the retained base over the
         // tail commits (a held base is always at or above the checkpoint, so a tail exists).
