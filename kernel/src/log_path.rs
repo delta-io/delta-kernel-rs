@@ -40,13 +40,13 @@ impl LogPath {
     ///
     /// The filename's form selects the directory: `00000000000000000010.json` resolves to
     /// `_delta_log/00000000000000000010.json`, and `00000000000000000010.<uuid>.json` resolves to
-    /// `_delta_log/_staged_commits/00000000000000000010.<uuid>.json`. `table_root` must end with
-    /// '/'. `version` is the catalog's version for the commit and must match the filename's.
-    /// Performs no I/O.
+    /// `_delta_log/_staged_commits/00000000000000000010.<uuid>.json`. `table_root` points to the
+    /// table's root directory. `version` is the catalog's version for the commit and must match
+    /// the filename's. Performs no I/O.
     ///
     /// # Errors
     ///
-    /// Returns an error if `table_root` does not end with '/', or if `filename` is not a bare
+    /// Returns an error if `table_root` cannot be a base URL, or if `filename` is not a bare
     /// published or staged commit filename for `version`.
     pub fn from_commit_filename(
         table_root: Url,
@@ -81,15 +81,14 @@ impl LogPath {
         Ok(log_path)
     }
 
-    /// Create a new staged commit log path given the table root and filename and metadata. The
-    /// table_root must point to the root of the table and end with a '/'.
+    /// Create a new staged commit log path given the table root, filename, and metadata.
     ///
     /// Use [`Self::from_commit_filename`] for catalog responses, which may contain published
     /// commits.
     ///
     /// # Errors
     ///
-    /// Returns an error if `table_root` does not end with '/', or if `filename` is not a bare
+    /// Returns an error if `table_root` cannot be a base URL, or if `filename` is not a bare
     /// staged commit filename.
     pub fn staged_commit(
         table_root: Url,
@@ -106,12 +105,11 @@ impl LogPath {
         LogPath::try_new(file_meta)
     }
 
-    /// Create the URL for a staged commit file given the table root and filename. The table_root
-    /// must point to the root of the table and end with a '/'.
+    /// Create the URL for a staged commit file given the table root and filename.
     ///
     /// # Errors
     ///
-    /// Returns an error if `table_root` does not end with '/', or if `filename` is empty, contains
+    /// Returns an error if `table_root` cannot be a base URL, or if `filename` is empty, contains
     /// '%', or does not remain the final path segment after URL resolution.
     pub fn staged_commit_url(table_root: Url, filename: &str) -> KernelResult<Url> {
         Self::log_file_url(table_root, STAGED_COMMITS_DIR, filename)
@@ -120,14 +118,13 @@ impl LogPath {
     /// Resolve the bare `filename` in `subdir` (empty, or ending with '/') of the table's
     /// `_delta_log/` directory.
     ///
-    /// Returns an error if `table_root` does not end with '/', or if the resolved URL would not
+    /// Returns an error if `table_root` cannot be a base URL, or if the resolved URL would not
     /// name `filename` itself. `Url::join` resolves separators, queries, fragments, and dot
     /// segments, and strips tabs and newlines and trims spaces. Engines percent-decode URL paths,
     /// so a percent-escape would name a different object than `ParsedLogPath` validated.
-    fn log_file_url(table_root: Url, subdir: &str, filename: &str) -> KernelResult<Url> {
-        // TODO: we should introduce TablePath/LogPath types which enforce checks like ending '/'
+    fn log_file_url(mut table_root: Url, subdir: &str, filename: &str) -> KernelResult<Url> {
         if !table_root.path().ends_with('/') {
-            return Err(KernelError::invalid_table_location(table_root));
+            table_root.set_path(&format!("{}/", table_root.path()));
         }
         let dir = table_root
             .join(DELTA_LOG_DIR_WITH_SLASH)
@@ -170,16 +167,20 @@ mod test {
         LogPathFileType::StagedCommit
     )]
     fn from_commit_filename_resolves_directory_by_form(
+        #[values(TABLE_ROOT, "s3://my-bucket/my-table")] table_root: &str,
         #[case] filename: &str,
         #[case] expected_rel_path: &str,
         #[case] expected_type: LogPathFileType,
     ) {
-        let table_root = Url::from_str(TABLE_ROOT).unwrap();
+        let table_root = Url::from_str(table_root).unwrap();
         let log_path =
             LogPath::from_commit_filename(table_root.clone(), 10, filename, 1234, 1024).unwrap();
 
         let expected = FileMeta {
-            location: table_root.join(expected_rel_path).unwrap(),
+            location: Url::from_str(TABLE_ROOT)
+                .unwrap()
+                .join(expected_rel_path)
+                .unwrap(),
             last_modified: 1234,
             size: 1024,
         };
@@ -234,24 +235,19 @@ mod test {
         assert!(matches!(err, KernelError::InvalidLogPath(_)), "{err:?}");
     }
 
-    #[test]
-    fn from_commit_filename_rejects_table_root_without_trailing_slash() {
-        let table_root = Url::from_str("s3://my-bucket/my-table").unwrap();
-        let err = LogPath::from_commit_filename(table_root, 10, "00000000000000000010.json", 0, 0)
-            .unwrap_err();
-        assert!(matches!(err, KernelError::InvalidTableLocation(_)));
-    }
-
-    #[test]
-    fn test_staged_commit_path_creation() {
-        let table_root = Url::from_str(TABLE_ROOT).unwrap();
+    #[rstest]
+    fn test_staged_commit_path_creation(
+        #[values(TABLE_ROOT, "s3://my-bucket/my-table")] table_root: &str,
+    ) {
+        let table_root = Url::from_str(table_root).unwrap();
         let filename = format!("00000000000000000010.{UUID}.json");
 
         let log_path = LogPath::staged_commit(table_root.clone(), &filename, 1234, 1024)
             .expect("Failed to create staged commit log path");
 
         let expected = FileMeta {
-            location: table_root
+            location: Url::from_str(TABLE_ROOT)
+                .unwrap()
                 .join(&format!("_delta_log/_staged_commits/{filename}"))
                 .unwrap(),
             last_modified: 1234,
@@ -280,13 +276,5 @@ mod test {
         let table_root = Url::from_str(TABLE_ROOT).unwrap();
         let err = LogPath::staged_commit_url(table_root, "").unwrap_err();
         assert!(matches!(err, KernelError::InvalidLogPath(_)), "{err:?}");
-    }
-
-    #[test]
-    fn test_staged_commit_rejects_table_root_without_trailing_slash() {
-        let table_root = Url::from_str("s3://my-bucket/my-table").unwrap();
-        let filename = format!("00000000000000000010.{UUID}.json");
-        let err = LogPath::staged_commit(table_root, &filename, 0, 0).unwrap_err();
-        assert!(matches!(err, KernelError::InvalidTableLocation(_)));
     }
 }
