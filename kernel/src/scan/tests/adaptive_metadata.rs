@@ -1,6 +1,7 @@
 //! Scans of adaptiveMetadata (AMT) tables, whose state at or below the latest `checkpoint` action
 //! is read from that action's content tree.
 
+use std::iter;
 use std::sync::Arc;
 
 use itertools::Itertools as _;
@@ -10,21 +11,27 @@ use test_utils::add_commit;
 use url::Url;
 
 use super::get_files_for_scan;
-use crate::arrow::array::StringArray;
+use crate::arrow::array::{AsArray as _, StringArray};
+use crate::arrow::datatypes::Int64Type;
 use crate::content_tree::test_utils::{added_data_entry, data_manifest_entry, write_manifest};
 use crate::content_tree::{ContentTreeNodeEntry, TrackingInfo, TrackingStatus};
+use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{col, lit, Predicate as Pred};
+use crate::expressions::{col, lit, Predicate as Pred, Scalar};
 use crate::object_store::memory::InMemory;
 use crate::scan::{Scan, ScanMetadata};
-use crate::schema::schema_ref;
+use crate::schema::{schema_ref, SchemaRef};
+use crate::table_features::ColumnMappingMode;
 use crate::transaction::BASE_ADD_FILES_SCHEMA;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     checkpoint_action_with_root, checkpoint_line, commit_file_changes, commit_files,
     commit_root_manifest, commit_root_manifest_file, create_adaptive_metadata_table,
     setup_adaptive_metadata_table,
 };
-use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+use crate::unit_test_utils::{
+    assert_result_error_with_message, string_array_to_engine_data,
+    test_schema_flat_with_column_mapping,
+};
 use crate::{Engine, EngineData, FileMeta, KernelResult, Snapshot, Version};
 
 const TABLE_ROOT: &str = "memory:///";
@@ -325,4 +332,73 @@ async fn scan_metadata_from_hint_before_checkpoint_action_rescans(
     }
     paths.sort();
     assert_eq!(paths, strings(expected));
+}
+
+/// Tree locations are decoded paths, so a data file literally named `c%20d.parquet` is found only
+/// if `add.path` encodes its `%`: `Scan::execute` joins each scan file's path onto the table root.
+#[test]
+fn scan_execute_reads_files_whose_locations_need_encoding() {
+    let (engine, table_root) = setup_adaptive_metadata_table();
+    let physical_schema: SchemaRef = Arc::new(
+        test_schema_flat_with_column_mapping()
+            .make_physical(ColumnMappingMode::Id)
+            .unwrap(),
+    );
+    let files = [
+        ("a b.parquet", 1, "first"),
+        ("dir/c%20d.parquet", 2, "second"),
+    ];
+    let entries: Vec<_> = files
+        .iter()
+        .enumerate()
+        .map(|(row_id, (location, id, name))| {
+            let data = engine
+                .evaluation_handler()
+                .create_many(
+                    physical_schema.clone(),
+                    vec![vec![Scalar::from(*id as i64), Scalar::from(*name)]],
+                )
+                .unwrap();
+            // Escape each segment independently of the code under test.
+            let mut url = table_root.clone();
+            url.path_segments_mut()
+                .unwrap()
+                .pop_if_empty()
+                .extend(location.split('/'));
+            let size = engine
+                .parquet_handler()
+                .write_parquet_file(url, Box::new(iter::once(Ok(data))))
+                .unwrap();
+            added_data_entry(location, size as i64, 1, row_id as i64, 0)
+        })
+        .collect();
+    let version = commit_root_manifest(&engine, &table_root, "metadata/root.parquet", &entries);
+
+    let scan = snapshot_at(&engine, version)
+        .scan_builder()
+        .build()
+        .unwrap();
+    let rows: Vec<(i64, String)> = scan
+        .execute(Arc::new(engine))
+        .unwrap()
+        .flat_map(|data| {
+            let batch = data.unwrap().try_into_record_batch().unwrap();
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_primitive::<Int64Type>();
+            let names = batch.column_by_name("name").unwrap().as_string::<i32>();
+            ids.values()
+                .iter()
+                .zip(names.iter().flatten())
+                .map(|(id, name)| (*id, name.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .sorted()
+        .collect();
+
+    assert_eq!(
+        rows,
+        vec![(1, "first".to_string()), (2, "second".to_string())]
+    );
 }
