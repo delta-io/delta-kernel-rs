@@ -171,9 +171,10 @@ async fn test_scan_returns_fixture_rows() -> Result<(), TestError> {
     Ok(())
 }
 
-/// UC may name an already-published commit by its canonical filename instead of its staged one.
-/// The fixture publishes v1 and v2 (copying the staged files) up to the highest version the
-/// catalog reports as published, so the filesystem matches what a backfill would have produced.
+/// `catalog_reports_published[i]` selects whether the catalog names version `i + 1` by its
+/// published or staged filename. Every version up to the last published name also gets a
+/// published file, matching in-order backfill, so a staged name can precede or follow a
+/// published one.
 #[rstest]
 #[case::published_prefix(&[true, false])]
 #[case::published_suffix(&[false, true])]
@@ -190,6 +191,7 @@ async fn test_snapshot_from_catalog_response_with_published_commits(
     } = setup().await?;
     let engine = Arc::new(engine);
     let log_dir = _tmp_dir.path().join("_delta_log");
+    // (version, timestamp, uuid, file size, modification time) of the fixture's staged commits.
     let staged = [
         (
             1,
@@ -246,7 +248,7 @@ async fn test_snapshot_from_catalog_response_with_published_commits(
         .sum();
     assert_eq!(rows, 200);
 
-    // Writing, publishing, and checkpointing on top of the mixed log tail succeeds.
+    // Publishing must copy only staged commits newer than the published ones in the log tail.
     commit(&snapshot, &client, &engine)?
         .publish(engine.as_ref(), &uc_committer(&client))?
         .checkpoint(engine.as_ref(), None)?;

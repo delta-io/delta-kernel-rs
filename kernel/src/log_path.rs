@@ -36,19 +36,19 @@ impl LogPath {
         Ok(Self(parsed))
     }
 
-    /// Create a commit log path from a catalog-provided commit filename, choosing the published
-    /// (`_delta_log/`) or staged (`_delta_log/_staged_commits/`) directory from the filename's
-    /// form.
+    /// Create a commit log path from a catalog-reported commit filename, which may name a staged
+    /// commit or one the catalog already published.
     ///
-    /// `table_root` must point to the root of the table and end with a '/'. `filename` must be a
-    /// bare published (`<version>.json`) or staged (`<version>.<uuid>.json`) commit filename whose
-    /// version equals `version`. `last_modified` and `size` describe the referenced file. Performs
-    /// no I/O.
+    /// The filename's form selects the directory: `00000000000000000010.json` resolves to
+    /// `_delta_log/00000000000000000010.json`, and `00000000000000000010.<uuid>.json` resolves to
+    /// `_delta_log/_staged_commits/00000000000000000010.<uuid>.json`. `table_root` must point to
+    /// the root of the table and end with a '/'. `version` is the catalog's version for this
+    /// commit, and `last_modified` and `size` describe the referenced file. Performs no I/O.
     ///
     /// # Errors
     ///
-    /// Returns an error if `table_root` does not end with '/', if `filename` is not a bare commit
-    /// filename, or if its version differs from `version`.
+    /// Returns an error if `table_root` does not end with '/', if `filename` is not a bare
+    /// published or staged commit filename, or if the filename's version differs from `version`.
     pub fn from_commit_filename(
         table_root: Url,
         version: Version,
@@ -56,14 +56,14 @@ impl LogPath {
         last_modified: i64,
         size: FileSize,
     ) -> KernelResult<LogPath> {
-        // Reject anything `Url::join` could resolve outside the chosen directory, or that would
-        // otherwise not round-trip as the URL's final path segment.
+        // `Url::join` interprets separators, queries, fragments, and percent-escapes, so such a
+        // filename could resolve outside the chosen directory or to a different file.
         require!(
             !filename.is_empty() && !filename.contains(['/', '\\', '?', '#', '%']),
             KernelError::invalid_log_path(format!("invalid commit filename: {filename}"))
         );
-        // Only the published form `<version>.json` has two parts; `ParsedLogPath` validates the
-        // rest of the grammar for the chosen directory.
+        // Only the published form `<version>.json` has two dot-separated parts. `ParsedLogPath`
+        // validates the remaining grammar against the chosen directory.
         let subdir = if filename.split('.').count() == 2 {
             ""
         } else {
@@ -78,6 +78,8 @@ impl LogPath {
             size,
         })?;
         let parsed = &log_path.0;
+        // `Url::join` normalizes dot segments, so also require that the parsed path kept the
+        // caller's filename.
         require!(
             parsed.is_commit() && parsed.filename == filename,
             KernelError::invalid_log_path(format!("not a commit filename: {filename}"))
@@ -120,6 +122,7 @@ impl LogPath {
     }
 
     /// Resolve `subdir` (empty, or ending with '/') under the table's `_delta_log/` directory.
+    /// Returns an error if `table_root` does not end with '/'.
     fn log_dir_url(table_root: Url, subdir: &str) -> KernelResult<Url> {
         // TODO: we should introduce TablePath/LogPath types which enforce checks like ending '/'
         if !table_root.path().ends_with('/') {
