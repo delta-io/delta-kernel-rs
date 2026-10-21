@@ -7,7 +7,7 @@ use delta_kernel_derive::internal_api;
 use super::Snapshot;
 use crate::actions::DomainMetadata;
 use crate::clustering::ClusteringColumnInfo;
-use crate::engine::KernelEngine;
+use crate::engine::CancellableEngine;
 use crate::expressions::ColumnName;
 use crate::log_segment::DomainMetadataMap;
 use crate::{CancellationTokenRef, Engine, KernelResult};
@@ -62,7 +62,7 @@ use crate::{CancellationTokenRef, Engine, KernelResult};
 /// The engine adapter is internal to Kernel:
 ///
 /// ```compile_fail,E0603
-/// use delta_kernel::engine::KernelEngine;
+/// use delta_kernel::engine::CancellableEngine;
 /// ```
 pub struct SnapshotReader<'a> {
     /// Immutable table state shared independently of this read scope.
@@ -237,7 +237,7 @@ impl<'a> SnapshotReader<'a> {
         let scoped_engine = self
             .cancellation_token
             .as_ref()
-            .map(|token| KernelEngine::new(engine, token.clone()));
+            .map(|token| CancellableEngine::new(engine, token.clone()));
         let engine = scoped_engine
             .as_ref()
             .map_or(engine, |engine| engine as &dyn Engine);

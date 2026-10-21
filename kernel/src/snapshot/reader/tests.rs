@@ -7,7 +7,7 @@ use rstest::rstest;
 use super::super::snapshot_crc::SnapshotCrc;
 use crate::crc::{DomainMetadataState, SetTransactionState};
 use crate::engine::sync::SyncEngine;
-use crate::engine::KernelEngine;
+use crate::engine::CancellableEngine;
 use crate::metrics::MetricEvent;
 use crate::unit_test_utils::{
     install_thread_local_metrics_reporter, CapturingReporter, TestCancellationToken,
@@ -70,7 +70,7 @@ fn unscoped_reader_preserves_engine_cancellation() {
     let snapshot = Snapshot::builder_for("tests/data/app-txn-no-checkpoint")
         .build(&engine)
         .unwrap();
-    let engine = KernelEngine::new(&engine, Arc::new(TestCancellationToken::cancelled()));
+    let engine = CancellableEngine::new(&engine, Arc::new(TestCancellationToken::cancelled()));
     assert!(matches!(
         snapshot.reader().get_app_id_version("my-app", &engine),
         Err(KernelError::Cancelled)
