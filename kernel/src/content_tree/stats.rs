@@ -716,8 +716,8 @@ pub(crate) fn build_parsed_stats_expression(
     }
 
     let scopes = CategoryScopes::from_delta_stats_schema(delta_stats_schema)?;
-    let builder = StatsLeafWalker::walk(table_schema, Some(scopes), ParsedStatsExprBuilder::new())?;
-    let stats_expr = builder.finish(delta_stats_schema, &scopes)?;
+    let root = StatsLeafWalker::walk(table_schema, Some(scopes), &ParsedStatsExprBuilder)?;
+    let stats_expr = assemble_parsed_stats_expr(root, delta_stats_schema, &scopes)?;
 
     let output_field = StructField::nullable(STATS_PARSED, delta_stats_schema.clone());
     ProjectionStructPatchBuilder::new(input_schema)
@@ -731,100 +731,48 @@ const CATEGORY_SUB_FIELDS: [&str; 3] = [NULL_VALUE_COUNT, LOWER_BOUND, UPPER_BOU
 /// A built child expression and the name of the output field it fills.
 type NamedExpr<'a> = (&'a str, ExpressionRef);
 
-/// The children built so far for one open struct, per category (indexed like [`STAT_CATEGORIES`]).
-type Frame<'a> = [Vec<NamedExpr<'a>>; 3];
-
-/// [`StatsLeafVisitor`] that builds the parsed Delta stats expression. Each leaf's `content_stats`
-/// entry comes from [`leaf_stats_field`], the same function that names it in the read schema.
-struct ParsedStatsExprBuilder<'a> {
-    /// One frame per open struct, innermost last. The first frame holds the top-level children.
-    frames: Vec<Frame<'a>>,
-    /// One `coalesce(tight_bounds, true)` per leaf that contributes to `tightBounds`.
+/// One folded field of the parsed Delta stats expression.
+struct StatsExprNode<'a> {
+    /// The field's name in each category's output struct.
+    name: &'a str,
+    /// The field's expression in each category it appears in, indexed like [`STAT_CATEGORIES`].
+    exprs: [Option<ExpressionRef>; 3],
+    /// One `coalesce(tight_bounds, true)` per leaf at or under this field that contributes to
+    /// `tightBounds`.
     tight_bounds: Vec<Predicate>,
 }
 
-impl<'a> ParsedStatsExprBuilder<'a> {
-    fn new() -> Self {
-        Self {
-            frames: vec![Frame::default()],
-            tight_bounds: Vec::new(),
-        }
-    }
+/// [`StatsLeafVisitor`] that builds the parsed Delta stats expression. Each leaf's `content_stats`
+/// entry comes from [`leaf_stats_field`], the same function that names it in the read schema.
+struct ParsedStatsExprBuilder;
 
-    /// Assembles the top-level stats struct expression, field for field with `delta_stats_schema`.
-    fn finish(
-        mut self,
-        delta_stats_schema: &StructType,
-        scopes: &CategoryScopes<'_>,
-    ) -> KernelResult<Expression> {
-        let mut root = match (self.frames.pop(), self.frames.is_empty()) {
-            (Some(root), true) => root,
-            _ => {
-                return Err(KernelError::internal_error(
-                    "parsed stats walk finished with unbalanced structs",
-                ))
-            }
-        };
-        let mut fields = Vec::new();
-        for field in delta_stats_schema.fields() {
-            let name = field.name().as_str();
-            let expr = match name {
-                NUM_RECORDS => Expression::column([RECORD_COUNT]),
-                // TODO: revisit this mapping once Iceberg settles on its final tight bounds format.
-                // TODO: force `tightBounds` to false when the entry has a deletion vector, once DVs
-                // are read from content-tree entries.
-                DELTA_TIGHT_BOUNDS => {
-                    Expression::from_pred(Predicate::and_from(mem::take(&mut self.tight_bounds)))
-                }
-                _ => {
-                    let scope = STAT_CATEGORIES
-                        .iter()
-                        .position(|category| *category == name)
-                        .and_then(|i| scopes.categories[i].map(|scope| (i, scope)));
-                    let Some((i, scope)) = scope else {
-                        return Err(KernelError::generic(format!(
-                            "unexpected top-level Delta stats field '{name}'"
-                        )));
-                    };
-                    aligned_struct_expr(mem::take(&mut root[i]), scope, &[], i)?
-                }
-            };
-            fields.push(Arc::new(expr));
-        }
-        Ok(Expression::struct_from(fields))
-    }
-}
+impl<'a> StatsLeafVisitor<'a> for ParsedStatsExprBuilder {
+    type Output = StatsExprNode<'a>;
 
-impl<'a> StatsLeafVisitor<'a> for ParsedStatsExprBuilder<'a> {
     fn on_leaf(
-        &mut self,
+        &self,
         field: &'a StructField,
         path: &[String],
         categories: Option<StatCategories>,
-    ) -> KernelResult<()> {
+    ) -> KernelResult<StatsExprNode<'a>> {
         let categories = require_projection(categories)?;
         // The read schema keeps exactly the sub-fields backed by the leaf's categories, so the
         // entry has every sub-field referenced below.
         let entry = leaf_stats_field(field, path, Some(categories))?;
-        let frame = self.frames.last_mut().ok_or_else(|| {
-            KernelError::internal_error(format!(
-                "no open struct for leaf '{}'",
-                ColumnName::new(path)
-            ))
-        })?;
-        for (i, sub_field) in CATEGORY_SUB_FIELDS.into_iter().enumerate() {
-            if !categories.as_array()[i] {
-                continue;
-            }
-            let expr = match &entry {
-                Some(entry) => {
-                    Expression::column([CONTENT_STATS_FIELD_NAME, entry.name(), sub_field])
-                }
-                None if sub_field == NULL_VALUE_COUNT => null_lit(DataType::LONG),
-                None => null_lit(field.data_type().clone()),
-            };
-            frame[i].push((field.name(), Arc::new(expr)));
-        }
+        let present = categories.as_array();
+        let exprs = std::array::from_fn(|i| {
+            present[i].then(|| {
+                let sub_field = CATEGORY_SUB_FIELDS[i];
+                let expr = match &entry {
+                    Some(entry) => {
+                        Expression::column([CONTENT_STATS_FIELD_NAME, entry.name(), sub_field])
+                    }
+                    None if sub_field == NULL_VALUE_COUNT => null_lit(DataType::LONG),
+                    None => null_lit(field.data_type().clone()),
+                };
+                Arc::new(expr)
+            })
+        });
 
         let contributes_tight_bounds = |entry: &StructField| {
             let has_tight_bounds = matches!(
@@ -833,46 +781,94 @@ impl<'a> StatsLeafVisitor<'a> for ParsedStatsExprBuilder<'a> {
             );
             has_tight_bounds && !tight_bounds_forced_false(field.data_type())
         };
-        if let Some(entry) = entry.filter(contributes_tight_bounds) {
-            let tight = Expression::column([CONTENT_STATS_FIELD_NAME, entry.name(), TIGHT_BOUNDS]);
-            let tight = Expression::coalesce([tight, lit(true)]);
-            self.tight_bounds.push(Predicate::from_expr(tight));
-        }
-        Ok(())
+        let tight_bounds = entry
+            .filter(contributes_tight_bounds)
+            .map(|entry| {
+                let tight =
+                    Expression::column([CONTENT_STATS_FIELD_NAME, entry.name(), TIGHT_BOUNDS]);
+                Predicate::from_expr(Expression::coalesce([tight, lit(true)]))
+            })
+            .into_iter()
+            .collect();
+        Ok(StatsExprNode {
+            name: field.name(),
+            exprs,
+            tight_bounds,
+        })
     }
 
-    fn enter_struct(
-        &mut self,
-        _field: &'a StructField,
-        _path: &[String],
-        _projection: Option<&CategoryScopes<'a>>,
-    ) -> KernelResult<()> {
-        self.frames.push(Frame::default());
-        Ok(())
-    }
-
-    fn exit_struct(
-        &mut self,
+    fn on_struct(
+        &self,
         field: &'a StructField,
         path: &[String],
         projection: Option<&CategoryScopes<'a>>,
-    ) -> KernelResult<()> {
-        let scopes = require_projection(projection)?;
-        let (Some(children), Some(parent)) = (self.frames.pop(), self.frames.last_mut()) else {
-            return Err(KernelError::internal_error(format!(
-                "unbalanced struct exit at '{}'",
-                ColumnName::new(path)
-            )));
-        };
-        // A category that omits this struct recorded no leaves under it, so it emits nothing.
-        for (i, children) in children.into_iter().enumerate() {
-            if let Some(scope) = scopes.categories[i] {
-                let expr = aligned_struct_expr(children, scope, path, i)?;
-                parent[i].push((field.name(), Arc::new(expr)));
-            }
-        }
-        Ok(())
+        children: Vec<StatsExprNode<'a>>,
+    ) -> KernelResult<StatsExprNode<'a>> {
+        let (exprs, tight_bounds) =
+            combine_children(children, require_projection(projection)?, path)?;
+        Ok(StatsExprNode {
+            name: field.name(),
+            exprs: exprs.map(|expr| expr.map(Arc::new)),
+            tight_bounds,
+        })
     }
+}
+
+/// Assembles the top-level stats struct expression from the walk's `root` outputs, field for field
+/// with `delta_stats_schema`.
+fn assemble_parsed_stats_expr(
+    root: Vec<StatsExprNode<'_>>,
+    delta_stats_schema: &StructType,
+    scopes: &CategoryScopes<'_>,
+) -> KernelResult<Expression> {
+    let (mut categories, mut tight_bounds) = combine_children(root, scopes, &[])?;
+    let mut fields = Vec::new();
+    for field in delta_stats_schema.fields() {
+        let name = field.name().as_str();
+        let expr = match name {
+            NUM_RECORDS => Expression::column([RECORD_COUNT]),
+            // TODO: revisit this mapping once Iceberg settles on its final tight bounds format.
+            // TODO: force `tightBounds` to false when the entry has a deletion vector, once DVs
+            // are read from content-tree entries.
+            DELTA_TIGHT_BOUNDS => {
+                Expression::from_pred(Predicate::and_from(mem::take(&mut tight_bounds)))
+            }
+            _ => STAT_CATEGORIES
+                .iter()
+                .position(|category| *category == name)
+                .and_then(|i| categories[i].take())
+                .ok_or_else(|| {
+                    KernelError::generic(format!("unexpected top-level Delta stats field '{name}'"))
+                })?,
+        };
+        fields.push(Arc::new(expr));
+    }
+    Ok(Expression::struct_from(fields))
+}
+
+/// Combines the struct at `path`'s `children` into one struct expression per category that `scopes`
+/// carries (indexed like [`STAT_CATEGORIES`]), and gathers their tight-bounds predicates. A
+/// category that omits the struct recorded no leaves under it, so it yields `None`.
+fn combine_children<'a>(
+    children: Vec<StatsExprNode<'a>>,
+    scopes: &CategoryScopes<'_>,
+    path: &[String],
+) -> KernelResult<([Option<Expression>; 3], Vec<Predicate>)> {
+    let mut per_category: [Vec<NamedExpr<'a>>; 3] = Default::default();
+    let mut tight_bounds = Vec::new();
+    for child in children {
+        for (category, expr) in per_category.iter_mut().zip(child.exprs) {
+            category.extend(expr.map(|expr| (child.name, expr)));
+        }
+        tight_bounds.extend(child.tight_bounds);
+    }
+    let mut exprs = [None, None, None];
+    for (i, children) in per_category.into_iter().enumerate() {
+        if let Some(scope) = scopes.categories[i] {
+            exprs[i] = Some(aligned_struct_expr(children, scope, path, i)?);
+        }
+    }
+    Ok((exprs, tight_bounds))
 }
 
 /// Unwraps projection-derived visitor input, which the parsed stats walk always supplies.
