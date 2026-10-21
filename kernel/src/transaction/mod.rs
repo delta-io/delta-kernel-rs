@@ -2832,6 +2832,7 @@ mod tests {
             table_path.to_string_lossy(),
             schema_ref! { nullable "id": INTEGER },
             "test-engine",
+            true,
         )
         .with_table_properties([("delta.enableIcebergNativeV4", "true")])
         .build(&engine, Box::new(FileSystemCommitter::new()))?;

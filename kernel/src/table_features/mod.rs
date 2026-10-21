@@ -540,6 +540,8 @@ static ICEBERG_NATIVE_V4_PREVIEW_INFO: FeatureInfo = FeatureInfo {
 };
 
 /// Writer features an `icebergNativeV4-preview` table may list.
+// TODO: The RFC does not cover geospatial and type widening yet. Update their entries once it
+// does.
 const ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURES: &[TableFeature] = &[
     TableFeature::IcebergNativeV4Preview,
     TableFeature::AdaptiveMetadataPreview,
@@ -560,8 +562,6 @@ const ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURES: &[TableFeature] = &[
     TableFeature::GeospatialType,
     TableFeature::CatalogManaged,
     TableFeature::CatalogOwnedPreview,
-    // Redundant with IcebergNativeV4, so it is allowed. The RFC list does not include it.
-    TableFeature::MaterializePartitionColumns,
     // Allowed only while inactive. The `NotEnabled` requirements check this.
     TableFeature::AppendOnly,
     TableFeature::ChangeDataFeed,

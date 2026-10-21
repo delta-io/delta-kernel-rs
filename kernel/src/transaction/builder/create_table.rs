@@ -2731,13 +2731,18 @@ mod tests {
     fn build_create_table_txn(
         schema: SchemaRef,
         properties: &[(&str, &str)],
-    ) -> Result<CreateTableTransaction> {
+    ) -> KernelResult<CreateTableTransaction> {
         let tempdir = tempfile::tempdir()?;
         let table_path = tempdir.path().join("table");
         std::fs::create_dir(&table_path)?;
-        CreateTableTransactionBuilder::new(table_path.to_string_lossy(), schema, "test-engine")
-            .with_table_properties(properties.iter().copied())
-            .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+        CreateTableTransactionBuilder::new(
+            table_path.to_string_lossy(),
+            schema,
+            "test-engine",
+            true,
+        )
+        .with_table_properties(properties.iter().copied())
+        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -2871,6 +2876,33 @@ mod tests {
             build_create_table_txn(schema, &properties),
             expected_substring,
         );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::column_mapping(TableFeature::ColumnMapping)]
+    #[case::deletion_vectors(TableFeature::DeletionVectors)]
+    #[case::row_tracking(TableFeature::RowTracking)]
+    #[case::domain_metadata(TableFeature::DomainMetadata)]
+    #[case::in_commit_timestamp(TableFeature::InCommitTimestamp)]
+    #[case::vacuum_protocol_check(TableFeature::VacuumProtocolCheck)]
+    #[case::type_widening(TableFeature::TypeWidening)]
+    #[case::variant_type(TableFeature::VariantType)]
+    #[case::variant_shredding(TableFeature::VariantShredding)]
+    #[case::catalog_managed(TableFeature::CatalogManaged)]
+    fn test_create_table_iceberg_native_v4_accepts_allowed_feature(#[case] feature: TableFeature) {
+        let feature_key = format!("delta.feature.{feature}");
+        let txn = build_create_table_txn(
+            schema_ref! { nullable "id": INTEGER },
+            &[
+                (ENABLE_ICEBERG_NATIVE_V4, "true"),
+                (feature_key.as_str(), "supported"),
+            ],
+        )
+        .unwrap();
+        let config = &txn.effective_table_config;
+        assert!(config.is_feature_enabled(&TableFeature::IcebergNativeV4Preview));
+        assert!(config.is_feature_supported(&feature));
     }
 
     /// Asserts the field has CM id == `expected_id` and a `col-` prefixed physical name; returns
