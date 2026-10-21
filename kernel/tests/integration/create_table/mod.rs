@@ -465,33 +465,23 @@ async fn test_create_table_with_invariants_feature_signal_allowed() -> KernelRes
     Ok(())
 }
 
-/// CREATE TABLE rejects column metadata holding SQL expressions that kernel can't evaluate or
-/// create, at the top level and in nested fields.
-#[rstest]
-#[case::invariants(
-    ColumnMetadataKey::Invariants,
-    r#"{"expression": {"expression": "x > 0"}}"#
-)]
-#[case::generation_expression(ColumnMetadataKey::GenerationExpression, "x + 1")]
+/// CREATE TABLE rejects any schema with `delta.invariants` metadata annotations
+/// because kernel cannot evaluate SQL expression invariants.
 #[tokio::test]
-async fn test_create_table_rejects_sql_expression_column_metadata(
-    #[case] key: ColumnMetadataKey,
-    #[case] value: &str,
-    #[values(true, false)] nested: bool,
-) -> KernelResult<()> {
+async fn test_create_table_rejects_delta_invariants_metadata() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let field = StructField::nullable("y", DataType::INTEGER)
-        .add_metadata([(key.as_ref(), MetadataValue::String(value.to_string()))]);
-    let schema = if nested {
-        schema_ref! { nullable "s": (StructType::try_new([field])?) }
-    } else {
-        schema_ref! { nullable "x": INTEGER, (field) }
-    };
+
+    let mut field = StructField::nullable("x", DataType::INTEGER);
+    field.metadata.insert(
+        ColumnMetadataKey::Invariants.as_ref().to_string(),
+        MetadataValue::String(r#"{"expression": {"expression": "x > 0"}}"#.to_string()),
+    );
+    let schema = schema_ref! { (field) };
 
     let result = create_table(&table_path, schema, "Test/1.0", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
 
-    assert_result_error_with_message(result, key.as_ref());
+    assert_result_error_with_message(result, "delta.invariants");
 
     Ok(())
 }

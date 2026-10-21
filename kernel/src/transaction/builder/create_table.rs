@@ -25,8 +25,8 @@ use crate::schema::file_utils::schema_contains_file_type;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
-    normalize_column_names_to_schema_casing, schema_contains_non_null_fields, ColumnMetadataKey,
-    DataType, SchemaRef, StructField, StructType,
+    normalize_column_names_to_schema_casing, schema_contains_non_null_fields, DataType, SchemaRef,
+    StructType,
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
@@ -53,8 +53,7 @@ use crate::table_properties::{
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
 use crate::transaction::{CommitOperation, CreateTable, ExecutionMode, Imperative, Transaction};
-use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::utils::{current_time_ms, require, try_parse_uri};
+use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{Engine, KernelError, KernelResult, StorageHandler};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
@@ -802,31 +801,6 @@ fn validate_extract_table_features_and_properties(
     })
 }
 
-/// Rejects a schema in which any field, at any nesting depth, declares a generation expression.
-fn reject_generation_expressions(schema: &StructType) -> KernelResult<()> {
-    GenerationExpressionRejector.transform_struct(schema)
-}
-
-/// Fails on the first field that carries `delta.generationExpression` metadata.
-struct GenerationExpressionRejector;
-
-impl<'a> SchemaTransform<'a> for GenerationExpressionRejector {
-    transform_output_type!(|'a, T| KernelResult<()>);
-
-    fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<()> {
-        let key = ColumnMetadataKey::GenerationExpression;
-        require!(
-            field.get_config_value(&key).is_none(),
-            KernelError::schema(format!(
-                "Setting '{}' metadata on column '{}' is not supported during CREATE TABLE",
-                key.as_ref(),
-                field.name()
-            ))
-        );
-        self.recurse_into_struct_field(field)
-    }
-}
-
 /// Builder for configuring a new Delta table.
 ///
 /// Use this to configure table properties before building a [`CreateTableTransaction`].
@@ -1044,7 +1018,6 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
             column_mapping_mode,
             validated.is_property_true(ENABLE_CHANGE_DATA_FEED),
         )?;
-        reject_generation_expressions(&effective_schema)?;
 
         // Strip CM metadata in `None` mode: a new table has no prior schema (passed as `None`), so
         // any annotation the caller supplied is newly introduced (see

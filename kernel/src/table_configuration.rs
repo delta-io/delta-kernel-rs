@@ -25,7 +25,8 @@ pub(crate) use crate::schema::file_utils::validate_file_type_feature_support;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
-    schema_has_invariants, validate_column_defaults_metadata, SchemaRef, StructField, StructType,
+    schema_has_invariants, validate_column_defaults_metadata, ColumnMetadataKey, SchemaRef,
+    StructField, StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::table_features::validate_geospatial_feature_support;
@@ -839,6 +840,16 @@ impl TableConfiguration {
                 .has_table_feature(&"collations-preview".into())
     }
 
+    /// Whether any top-level column of the logical schema carries `delta.generationExpression`
+    /// metadata.
+    pub(crate) fn has_generation_expressions(&self) -> bool {
+        self.logical_schema.fields().any(|field| {
+            field
+                .get_config_value(&ColumnMetadataKey::GenerationExpression)
+                .is_some()
+        })
+    }
+
     /// The physical schema ([`SchemaRef`]) of this table at this version.
     ///
     /// When column mapping is disabled, this is identical to
@@ -1114,6 +1125,17 @@ impl TableConfiguration {
             )
         );
 
+        // The protocol allows generation expressions only on tables that support the
+        // `generatedColumns` writer feature.
+        require!(
+            self.is_feature_supported(&TableFeature::GeneratedColumns)
+                || !self.has_generation_expressions(),
+            KernelError::invalid_protocol(
+                "Table contains generation expressions but does not support the \
+                 'generatedColumns' writer feature",
+            )
+        );
+
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
         // TODO: Better story for schema validation for Invariants and other features
         if self.is_feature_supported(&TableFeature::Invariants)
@@ -1308,8 +1330,9 @@ mod test {
         ENABLE_ROW_TRACKING,
     };
     use crate::unit_test_utils::{
-        assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
-        test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
+        assert_result_error_with_message, field_with_generation_expression, test_schema_flat,
+        test_schema_flat_with_column_mapping, test_schema_nested,
+        test_schema_nested_with_column_mapping, test_schema_with_array,
         test_schema_with_array_and_column_mapping, test_schema_with_map,
         test_schema_with_map_and_column_mapping, MockProtocolBuilder,
         MockTableConfigurationBuilder,
@@ -1362,6 +1385,17 @@ mod test {
         Supported,
         InvalidProtocol,
         Unsupported,
+    }
+
+    impl WriteSupport {
+        fn of(table_config: &TableConfiguration) -> Self {
+            match table_config.ensure_operation_supported(Operation::Write) {
+                Ok(()) => Self::Supported,
+                Err(KernelError::InvalidProtocol(_)) => Self::InvalidProtocol,
+                Err(KernelError::Unsupported(_)) => Self::Unsupported,
+                Err(err) => panic!("unexpected write error: {err:?}"),
+            }
+        }
     }
 
     #[rstest]
@@ -1455,12 +1489,7 @@ mod test {
             .with_protocol(protocol)
             .build();
 
-        let write_support = match table_config.ensure_operation_supported(Operation::Write) {
-            Ok(()) => WriteSupport::Supported,
-            Err(KernelError::InvalidProtocol(_)) => WriteSupport::InvalidProtocol,
-            Err(KernelError::Unsupported(_)) => WriteSupport::Unsupported,
-            Err(err) => panic!("unexpected write error: {err:?}"),
-        };
+        let write_support = WriteSupport::of(&table_config);
         assert_eq!(write_support, expected_write_support);
 
         let read_supported = table_config
@@ -1490,6 +1519,110 @@ mod test {
 
         let has_check_constraints = table_config.has_check_constraints();
         assert_eq!(has_check_constraints, expected);
+    }
+
+    /// A schema whose top-level `event_year` column declares a generation expression.
+    fn generated_event_year_schema() -> SchemaRef {
+        schema_ref! {
+            nullable "event_time": TIMESTAMP,
+            (field_with_generation_expression("event_year", DataType::INTEGER, "YEAR(event_time)")),
+        }
+    }
+
+    #[rstest]
+    // Tables whose top-level columns declare generation expressions.
+    #[case::without_feature(
+        generated_event_year_schema(),
+        MockProtocolBuilder::new().build(),
+        WriteSupport::InvalidProtocol
+    )]
+    #[case::with_feature(
+        generated_event_year_schema(),
+        MockProtocolBuilder::new()
+            .with_writer_features([TableFeature::GeneratedColumns])
+            .build(),
+        WriteSupport::Unsupported
+    )]
+    #[case::legacy_writer_below_min_version(
+        generated_event_year_schema(),
+        MockProtocolBuilder::new().with_versions(1, 2).build(),
+        WriteSupport::InvalidProtocol
+    )]
+    #[case::legacy_writer_at_min_version(
+        generated_event_year_schema(),
+        MockProtocolBuilder::new().with_versions(1, 4).build(),
+        WriteSupport::Unsupported
+    )]
+    // Unusual metadata, detected like any other generation expression.
+    #[case::non_string_expression(
+        schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, 7_i64)) },
+        MockProtocolBuilder::new().with_versions(1, 2).build(),
+        WriteSupport::InvalidProtocol
+    )]
+    // No top-level generation expressions.
+    #[case::no_generation_expression(
+        schema_ref! { nullable "event_time": TIMESTAMP },
+        MockProtocolBuilder::new().with_versions(1, 2).build(),
+        WriteSupport::Supported
+    )]
+    #[case::nested_generation_expression(
+        schema_ref! {
+            nullable "details": (schema! {
+                (field_with_generation_expression("nested", DataType::INTEGER, "1")),
+            }),
+        },
+        MockProtocolBuilder::new().with_versions(1, 2).build(),
+        WriteSupport::Supported
+    )]
+    fn write_and_read_support_for_generation_expressions(
+        #[case] schema: SchemaRef,
+        #[case] protocol: Protocol,
+        #[case] expected_write_support: WriteSupport,
+    ) {
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_schema(schema)
+            .with_protocol(protocol)
+            .build();
+
+        let write_support = WriteSupport::of(&table_config);
+        assert_eq!(write_support, expected_write_support);
+
+        let read_supported = table_config
+            .ensure_operation_supported(Operation::Scan)
+            .is_ok();
+        assert!(read_supported);
+    }
+
+    #[rstest]
+    // Top-level generation expressions.
+    #[case::string_expression(
+        schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "1")) },
+        true
+    )]
+    #[case::non_string_expression(
+        schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, 7_i64)) },
+        true
+    )]
+    // No top-level generation expressions.
+    #[case::nested_expression_only(
+        schema_ref! {
+            nullable "details": (schema! {
+                (field_with_generation_expression("nested", DataType::INTEGER, "1")),
+            }),
+        },
+        false
+    )]
+    #[case::no_expression(schema_ref! { nullable "event_time": TIMESTAMP }, false)]
+    fn has_generation_expressions_detects_top_level_expressions(
+        #[case] schema: SchemaRef,
+        #[case] expected: bool,
+    ) {
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_schema(schema)
+            .build();
+
+        let has_generation_expressions = table_config.has_generation_expressions();
+        assert_eq!(has_generation_expressions, expected);
     }
 
     #[test]
