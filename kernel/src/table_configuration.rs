@@ -1553,7 +1553,13 @@ mod test {
         MockProtocolBuilder::new().with_versions(1, 4).build(),
         WriteSupport::Unsupported
     )]
-    // Unusual metadata, detected like any other generation expression.
+    // Unusual metadata, detected like any other generation expression. The engine must parse
+    // these expressions and reject invalid ones.
+    #[case::empty_expression(
+        schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "")) },
+        MockProtocolBuilder::new().with_versions(1, 2).build(),
+        WriteSupport::InvalidProtocol
+    )]
     #[case::non_string_expression(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, 7_i64)) },
         MockProtocolBuilder::new().with_versions(1, 2).build(),
@@ -1594,9 +1600,54 @@ mod test {
     }
 
     #[rstest]
-    // Top-level generation expressions.
-    #[case::string_expression(
-        schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "1")) },
+    // Expressions a user would expect.
+    #[case::function_call(generated_event_year_schema(), true)]
+    #[case::multiplication(
+        schema_ref! {
+            nullable "id": LONG,
+            (field_with_generation_expression("double_id", DataType::LONG, "id * 2")),
+        },
+        true
+    )]
+    #[case::addition(
+        schema_ref! {
+            nullable "age": INTEGER,
+            (field_with_generation_expression("next_age", DataType::INTEGER, "age + 1")),
+        },
+        true
+    )]
+    #[case::string_function(
+        schema_ref! {
+            nullable "city": STRING,
+            (field_with_generation_expression("city_upper", DataType::STRING, "UPPER(city)")),
+        },
+        true
+    )]
+    #[case::cast(
+        schema_ref! {
+            nullable "event_time": TIMESTAMP,
+            (field_with_generation_expression(
+                "event_date",
+                DataType::DATE,
+                "CAST(event_time AS DATE)"
+            )),
+        },
+        true
+    )]
+    // Unusual metadata, detected like any other generation expression. The engine must parse
+    // these expressions and reject invalid ones.
+    #[case::empty_expression(
+        schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "")) },
+        true
+    )]
+    #[case::whitespace_only_expression(
+        schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "   ")) },
+        true
+    )]
+    #[case::invalid_sql_expression(
+        schema_ref! {
+            (field_with_generation_expression("event_year", DataType::INTEGER, "YEAR(")),
+        },
         true
     )]
     #[case::non_string_expression(
@@ -1609,6 +1660,20 @@ mod test {
             nullable "details": (schema! {
                 (field_with_generation_expression("nested", DataType::INTEGER, "1")),
             }),
+        },
+        false
+    )]
+    #[case::case_variant_key(
+        schema_ref! {
+            (StructField::nullable("event_year", DataType::INTEGER)
+                .add_metadata([("Delta.GenerationExpression", "YEAR(event_time)")])),
+        },
+        false
+    )]
+    #[case::unrelated_column_metadata(
+        schema_ref! {
+            (StructField::nullable("event_year", DataType::INTEGER)
+                .add_metadata([("comment", "the year of event_time")])),
         },
         false
     )]
