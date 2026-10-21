@@ -19,7 +19,7 @@ async fn test_create_table_iceberg_native_v4() -> Result<(), Box<dyn std::error:
         nullable "name": STRING,
     };
 
-    create_table(&table_path, schema, "Test/1.0")
+    create_table(&table_path, schema, "Test/1.0", true)
         .with_table_properties([("delta.enableIcebergNativeV4", "true")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
