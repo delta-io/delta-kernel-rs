@@ -170,7 +170,7 @@ mod tests {
         setup_adaptive_metadata_table, write_ict_commit, write_sidecar,
     };
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::unit_test_utils::Action;
+    use crate::unit_test_utils::{test_schema_flat_with_column_mapping, Action};
     use crate::{RowVisitor as _, Snapshot};
 
     /// Builds a two-commit in-memory Delta table:
@@ -405,7 +405,7 @@ mod tests {
             // At or below the checkpoint version, so the checkpoint action replaces it.
             format!(
                 "{}\n{}",
-                protocol_and_metadata_lines(&[]),
+                protocol_and_metadata_lines(test_schema_flat_with_column_mapping(), &[]),
                 dm_line(DomainMetadata::new("c".to_string(), "c0".to_string()))
             ),
             checkpoint_line(&checkpoint),
