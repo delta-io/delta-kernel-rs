@@ -105,6 +105,13 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   `Transaction::ack_check_constraints`. Kernel does not evaluate constraint SQL, so enforcement is
   the connector's responsibility. CREATE TABLE rejects `delta.constraints.*` properties in every
   build. Also gates the internal SQL tokenizer and parser.
+- `generated-columns-in-dev`: generated columns support (experimental, in development). Gates
+  `KernelSupport::Supported` for the `generatedColumns` writer feature (without it, writes to
+  tables that support the feature, including legacy writer version 4 and above, are blocked).
+  With it, kernel discovers generated columns and exposes their raw generation expression SQL
+  through `generated_columns()` on `Snapshot` and `Transaction`, and on a table with generated
+  columns `write_state` and every commit require `Transaction::ack_generated_columns`. The
+  connector computes and verifies generated values.
 - `adaptive-metadata-in-dev`: adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature. Without it, reads and writes to tables listing
