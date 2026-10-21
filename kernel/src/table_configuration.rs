@@ -1396,6 +1396,7 @@ mod test {
     enum WriteSupport {
         Supported,
         InvalidProtocol,
+        InvalidSchema,
         Unsupported,
     }
 
@@ -1405,6 +1406,7 @@ mod test {
             match table_config.ensure_operation_supported(Operation::Write) {
                 Ok(()) => Self::Supported,
                 Err(KernelError::InvalidProtocol(_)) => Self::InvalidProtocol,
+                Err(KernelError::Schema(_)) => Self::InvalidSchema,
                 Err(KernelError::Unsupported(_)) => Self::Unsupported,
                 Err(err) => panic!("unexpected write error: {err:?}"),
             }
@@ -1550,6 +1552,15 @@ mod test {
             WriteSupport::Unsupported
         };
 
+    /// The write support of a table whose protocol supports generated columns and whose generation
+    /// expression is a non-string value.
+    const NON_STRING_GENERATED_COLUMN_WRITE_SUPPORT: WriteSupport =
+        if cfg!(feature = "generated-columns-in-dev") {
+            WriteSupport::InvalidSchema
+        } else {
+            WriteSupport::Unsupported
+        };
+
     #[rstest]
     // Tables with top-level generation expressions, but without `generatedColumns` in the protocol.
     // Kernel ignores the expressions and writes the table as a normal table, like Delta Spark.
@@ -1584,14 +1595,16 @@ mod test {
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        WriteSupport::Unsupported
+        GENERATED_COLUMNS_WRITE_SUPPORT
     )]
+    // Engines receive generation expressions as SQL text, so kernel rejects a non-string
+    // expression once it supports writing the feature.
     #[case::non_string_expression_with_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, 7_i64)) },
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        WriteSupport::Unsupported
+        NON_STRING_GENERATED_COLUMN_WRITE_SUPPORT
     )]
     #[case::empty_expression_without_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "")) },
@@ -1774,28 +1787,6 @@ mod test {
             .map(|column| (column.name(), column.raw_sql()))
             .collect();
         assert_eq!(discovered, expected);
-    }
-
-    #[cfg(feature = "generated-columns-in-dev")]
-    #[test]
-    fn non_string_generation_expression_blocks_writes_with_protocol_support() {
-        let table_config = MockTableConfigurationBuilder::new()
-            .with_schema(schema_ref! {
-                (field_with_generation_expression("event_year", DataType::INTEGER, 7_i64)),
-            })
-            .with_protocol(
-                MockProtocolBuilder::new()
-                    .with_writer_features([TableFeature::GeneratedColumns])
-                    .build(),
-            )
-            .build();
-
-        let read_supported = table_config
-            .ensure_operation_supported(Operation::Scan)
-            .is_ok();
-        assert!(read_supported);
-        let write_result = table_config.ensure_operation_supported(Operation::Write);
-        assert_result_error_with_message(write_result, "non-string `delta.generationExpression`");
     }
 
     #[test]
