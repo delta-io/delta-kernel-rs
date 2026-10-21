@@ -67,7 +67,10 @@ impl LogPath {
         } else {
             STAGED_COMMITS_DIR
         };
-        let location = Self::log_file_url(table_root, subdir, filename)?;
+        let location = Self::log_file_url(table_root, subdir, filename).map_err(|e| match e {
+            KernelError::InvalidLogPath(_) => invalid(),
+            e => e,
+        })?;
         let log_path = Self::try_new(FileMeta {
             location,
             last_modified,
@@ -83,6 +86,11 @@ impl LogPath {
     ///
     /// Use [`Self::from_commit_filename`] for catalog responses, which may contain published
     /// commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `table_root` does not end with '/', or if `filename` is not a bare
+    /// staged commit filename.
     pub fn staged_commit(
         table_root: Url,
         filename: &str,
@@ -100,6 +108,11 @@ impl LogPath {
 
     /// Create the URL for a staged commit file given the table root and filename. The table_root
     /// must point to the root of the table and end with a '/'.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `table_root` does not end with '/', or if `filename` is empty or does
+    /// not remain the final path segment after URL resolution.
     pub fn staged_commit_url(table_root: Url, filename: &str) -> KernelResult<Url> {
         Self::log_file_url(table_root, STAGED_COMMITS_DIR, filename)
     }
@@ -124,7 +137,8 @@ impl LogPath {
             || KernelError::invalid_log_path(format!("not a bare log file name: {filename}"));
         let url = dir.join(filename).map_err(|_| invalid())?;
         require!(
-            !filename.contains('%')
+            !filename.is_empty()
+                && !filename.contains('%')
                 && url.path_segments().and_then(|mut s| s.next_back()) == Some(filename),
             invalid()
         );
@@ -184,7 +198,8 @@ mod test {
     #[case::query(10, "00000000000000000010.json?x")]
     #[case::fragment(10, "00000000000000000010.json#x")]
     #[case::percent_encoded(10, "%2E%2E%2F00000000000000000010.json")]
-    // Engines percent-decode this into a nested path under `_staged_commits/`.
+    // The middle part has a UUID's length, so it parses as a staged commit; engines
+    // percent-decode it into a nested path under `_staged_commits/`.
     #[case::percent_encoded_uuid(
         10,
         "00000000000000000010.%2Fother%2F_delta_log%2Fzzzzzzzzzzzz.json"
@@ -251,11 +266,20 @@ mod test {
     #[case::non_numeric_version("000000000000000000aa.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json")]
     #[case::parquet("00000000000000000010.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.parquet")]
     #[case::published("00000000000000000010.json")]
+    #[case::empty("")]
     #[case::query("00000000000000000010.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json?x")]
     #[case::percent_encoded_uuid("00000000000000000010.%2Fother%2F_delta_log%2Fzzzzzzzzzzzz.json")]
     fn test_staged_commit_path_creation_failures(#[case] filename: &str) {
         let table_root = Url::from_str(TABLE_ROOT).unwrap();
-        LogPath::staged_commit(table_root, filename, 0, 0).unwrap_err();
+        let err = LogPath::staged_commit(table_root, filename, 0, 0).unwrap_err();
+        assert!(matches!(err, KernelError::InvalidLogPath(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_staged_commit_url_rejects_empty_filename() {
+        let table_root = Url::from_str(TABLE_ROOT).unwrap();
+        let err = LogPath::staged_commit_url(table_root, "").unwrap_err();
+        assert!(matches!(err, KernelError::InvalidLogPath(_)), "{err:?}");
     }
 
     #[test]
