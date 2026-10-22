@@ -3,17 +3,17 @@
 
 use std::sync::Arc;
 
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, GeneratedColumn, MetadataValue, SchemaRef, StructField, StructType,
 };
 use delta_kernel::transaction::{Transaction, UpdateTableOperation};
-use delta_kernel::{Engine, KernelError, KernelResult, Snapshot, SnapshotRef};
+use delta_kernel::{Engine, KernelError, KernelResult, Snapshot};
 use rstest::rstest;
 use serde_json::json;
 use test_utils::{
-    add_commit, create_add_files_metadata, create_table, test_table_setup, test_table_setup_mt,
+    add_commit, begin_transaction, begin_transaction_with, create_add_files_metadata, create_table,
+    test_table_setup, test_table_setup_mt,
 };
 use url::Url;
 
@@ -28,8 +28,8 @@ const TESTING_GENERATED_COLUMNS: &[(&str, &str)] = &[
     ("next_age", "age + 1"),
     ("age_decade", "CAST(age / 10 AS INT)"),
     ("id_or_zero", "COALESCE(id, 0)"),
-    // Unusual expressions, returned verbatim. The engine must parse these expressions and reject
-    // invalid ones.
+    // Unusual expressions, returned verbatim. The connector must parse these expressions and
+    // reject invalid ones.
     ("empty", ""),
     ("blank", "   "),
     ("broken", "YEAR("),
@@ -82,14 +82,6 @@ async fn write_table(
         writer_features.to_vec(),
     )
     .await
-}
-
-/// Builds a data-changing write transaction on `snapshot`.
-fn write_txn(snapshot: &SnapshotRef, engine: &dyn Engine) -> KernelResult<Transaction> {
-    snapshot
-        .clone()
-        .update_table(UpdateTableOperation::Write, "Test/1.0", true)
-        .build(engine, Box::new(FileSystemCommitter::new()))
 }
 
 fn stage_one_file(txn: &mut Transaction) -> KernelResult<()> {
@@ -155,7 +147,7 @@ async fn discovers_generated_columns_from_snapshot_and_transaction(
     let from_snapshot = discovered(&snapshot_columns);
     assert_eq!(from_snapshot, TESTING_GENERATED_COLUMNS);
 
-    let txn = write_txn(&snapshot, engine.as_ref())?;
+    let txn = begin_transaction(snapshot, engine.as_ref())?;
     let txn_columns = txn.generated_columns()?;
     let from_txn = discovered(&txn_columns);
     assert_eq!(from_txn, TESTING_GENERATED_COLUMNS);
@@ -192,7 +184,7 @@ async fn discovers_logical_names_of_mapped_and_partition_generated_columns(
     let from_snapshot = discovered(&generated_columns);
     assert_eq!(from_snapshot, EVENT_YEAR);
 
-    let txn = write_txn(&snapshot, engine.as_ref())?;
+    let txn = begin_transaction(snapshot, engine.as_ref())?;
     assert_gate_error(txn.write_state());
     Ok(())
 }
@@ -213,7 +205,7 @@ async fn generated_column_table_write_requires_acknowledgement(
     let table_url = write_table(&table_path, GENERATED_COLUMNS_FEATURE, EVENT_YEAR).await?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let mut txn = write_txn(&snapshot, engine.as_ref())?;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
     // Discovery alone must not count as an acknowledgement.
     if discover_first {
         let _discovered = txn.generated_columns()?;
@@ -251,7 +243,7 @@ async fn table_without_generated_columns_needs_no_acknowledgement(
     let snapshot_columns = snapshot.generated_columns()?;
     assert!(snapshot_columns.is_empty());
 
-    let txn = write_txn(&snapshot, engine.as_ref())?;
+    let txn = begin_transaction(snapshot, engine.as_ref())?;
     let txn_columns = txn.generated_columns()?;
     assert!(txn_columns.is_empty());
     run_gated_op(op, txn, engine.as_ref())?;
@@ -264,7 +256,7 @@ async fn protocol_upgrade_turns_existing_generation_expressions_into_generated_c
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = write_table(&table_path, &[], EVENT_YEAR).await?;
     let before_upgrade = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let write_before_upgrade = write_txn(&before_upgrade, engine.as_ref());
+    let write_before_upgrade = begin_transaction(before_upgrade.clone(), engine.as_ref());
     let rejected = matches!(write_before_upgrade, Err(KernelError::InvalidProtocol(_)));
     assert!(
         rejected,
@@ -295,7 +287,7 @@ async fn protocol_upgrade_turns_existing_generation_expressions_into_generated_c
     let time_travel_columns = time_travel.generated_columns()?;
     assert!(time_travel_columns.is_empty());
 
-    let mut txn = write_txn(&incremental, engine.as_ref())?;
+    let mut txn = begin_transaction(incremental, engine.as_ref())?;
     stage_one_file(&mut txn)?;
     assert_gate_error(txn.commit(engine.as_ref()));
     Ok(())
@@ -310,7 +302,7 @@ async fn remove_only_commit_on_generated_column_table_requires_acknowledgement(
     let table_url = write_table(&table_path, GENERATED_COLUMNS_FEATURE, EVENT_YEAR).await?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let mut add_txn = write_txn(&snapshot, engine.as_ref())?;
+    let mut add_txn = begin_transaction(snapshot, engine.as_ref())?;
     add_txn.ack_generated_columns();
     stage_one_file(&mut add_txn)?;
     let snapshot = add_txn
@@ -318,7 +310,7 @@ async fn remove_only_commit_on_generated_column_table_requires_acknowledgement(
         .unwrap_post_commit_snapshot();
 
     let scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
-    let mut remove_txn = write_txn(&snapshot, engine.as_ref())?;
+    let mut remove_txn = begin_transaction(snapshot, engine.as_ref())?;
     for scan_file in scan_files {
         remove_txn.remove_files(scan_file);
     }
@@ -351,7 +343,7 @@ async fn discovers_generated_columns_after_checkpoint(
     let from_reloaded = discovered(&reloaded_columns);
     assert_eq!(from_reloaded, EVENT_YEAR);
 
-    let mut txn = write_txn(&reloaded, engine.as_ref())?;
+    let mut txn = begin_transaction(reloaded, engine.as_ref())?;
     stage_one_file(&mut txn)?;
     assert_gate_error(txn.commit(engine.as_ref()));
     Ok(())
@@ -364,7 +356,7 @@ async fn acknowledgement_survives_later_builder_calls(
     let table_url = write_table(&table_path, GENERATED_COLUMNS_FEATURE, EVENT_YEAR).await?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let mut txn = write_txn(&snapshot, engine.as_ref())?;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
     txn.ack_generated_columns();
     let mut txn = txn
         .with_transaction_id("app_id".to_string(), 1)
@@ -388,10 +380,14 @@ async fn alter_table_on_generated_column_table_requires_acknowledgement(
     .await?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot
-        .update_table(UpdateTableOperation::AlterTable, "Test/1.0", false)
-        .add_column(StructField::nullable("note", DataType::STRING))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let mut txn = begin_transaction_with(
+        snapshot,
+        engine.as_ref(),
+        UpdateTableOperation::AlterTable,
+        "Test/1.0",
+        false,
+        |builder| builder.add_column(StructField::nullable("note", DataType::STRING)),
+    )?;
     if !acknowledge {
         assert_gate_error(txn.commit(engine.as_ref()));
         return Ok(());
