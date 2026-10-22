@@ -29,8 +29,8 @@ Every row's value must match the expression, and the comparison is null-safe: a 
 matches a `NULL` expression result. For the protocol contract, see
 [Generated columns in the Delta protocol][generated-columns].
 
-Kernel's create-table API rejects generation expressions. Create generated columns with another
-Delta writer. For example, in a SQL engine that supports Delta generated columns:
+Kernel's public create-table API can't enable generated columns. Create generated columns with
+another Delta writer. For example, in a SQL engine that supports Delta generated columns:
 
 ```sql
 CREATE TABLE people (
@@ -97,7 +97,8 @@ expression isn't a string, and Kernel rejects writes to such a table.
 This example appends batches to an existing unpartitioned table. Your connector supplies
 `compile_generation`, which parses one generation expression with your compute engine. It returns a
 `CompiledExpression`, a function that evaluates the expression over a batch and returns one value
-per row. Kernel doesn't provide a SQL evaluator for generation expressions.
+per row, cast to the generated column's declared type. Kernel doesn't provide a SQL evaluator for
+generation expressions.
 
 For each generated column, the example computes the expression over the batch. When the batch omits
 the column, the example appends the computed values with the hidden `append_column` helper, which

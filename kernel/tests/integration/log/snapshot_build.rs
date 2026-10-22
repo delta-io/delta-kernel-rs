@@ -172,7 +172,7 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error() -> KernelResu
 #[case::unsupported_writer_only(SnapshotLoadProtocolCase {
     min_reader_version: 3,
     reader_features: &["deletionVectors"],
-    writer_features: &["deletionVectors", "generatedColumns"],
+    writer_features: &["deletionVectors", "identityColumns"],
     expected_error: None,
 })]
 #[case::future_reader_version(SnapshotLoadProtocolCase {

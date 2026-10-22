@@ -1597,8 +1597,8 @@ mod test {
             .build(),
         GENERATED_COLUMNS_WRITE_SUPPORT
     )]
-    // Engines receive generation expressions as SQL text, so kernel rejects a non-string
-    // expression once it supports writing the feature.
+    // Connectors receive generation expressions as SQL text, so with `generated-columns-in-dev`
+    // kernel rejects a non-string expression.
     #[case::non_string_expression_with_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, 7_i64)) },
         MockProtocolBuilder::new()
