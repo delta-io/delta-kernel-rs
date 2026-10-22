@@ -787,7 +787,7 @@ mod tests {
             .build(&engine)
             .unwrap_err();
 
-        assert!(matches!(err, KernelError::Generic(message) if message.contains("only commits")));
+        assert!(matches!(err, KernelError::InvalidLogPath(_)));
     }
 
     #[test]

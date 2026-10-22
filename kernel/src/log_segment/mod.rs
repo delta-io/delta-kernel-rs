@@ -157,7 +157,7 @@ pub(crate) fn validate_catalog_managed_log_tail(
     log_tail: &[ParsedLogPath],
 ) -> KernelResult<()> {
     if let Some(path) = log_tail.iter().find(|path| !path.is_commit()) {
-        return Err(KernelError::generic(format!(
+        return Err(KernelError::invalid_log_path(format!(
             "Catalog log tail must contain only commits, found {:?}: {}",
             path.file_type, path.location.location
         )));

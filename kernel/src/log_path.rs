@@ -44,6 +44,8 @@ impl LogPath {
     /// table's root directory. `version` is the catalog's version for the commit and must match
     /// the filename's. Performs no I/O.
     ///
+    /// A published filename asserts that this version and all lower versions are already published.
+    ///
     /// # Errors
     ///
     /// Returns an error if `table_root` cannot be a base URL, or if `filename` is not a bare
@@ -76,7 +78,10 @@ impl LogPath {
             last_modified,
             size,
         })
-        .map_err(|_| invalid_commit_filename())?;
+        .map_err(|e| match e {
+            KernelError::InvalidLogPath(_) => invalid_commit_filename(),
+            e => e,
+        })?;
         require!(log_path.0.version == version, invalid_commit_filename());
         Ok(log_path)
     }

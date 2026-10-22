@@ -18,8 +18,9 @@ pub use utils::{
 /// kernel `LogPath`s suitable for `Snapshot::builder_for(...).with_log_tail(...)`.
 ///
 /// Sorts commits by version because they may arrive out of order. Each commit may name either a
-/// staged or an already-published commit file; [`LogPath::from_commit_filename`] resolves the
-/// matching directory. Accepts `table_root` with or without a trailing `/`.
+/// staged or an already-published commit file. [`LogPath::from_commit_filename`] resolves the
+/// matching directory. A published filename asserts that its version and all lower versions are
+/// already published.
 ///
 /// # Errors
 ///
