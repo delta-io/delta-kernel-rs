@@ -131,7 +131,7 @@ check-constraints-in-dev = []
 # Enables checkpointProtection support.
 checkpoint-protection = []
 # Experimental, temporary feature flag guarding the in-progress generated columns support (see
-# `generated-columns-in-dev` in AGENTS.md). TODO: remove once full support ships.
+# `generated-columns-in-dev` in AGENTS.md). TODO(#3695): remove once full support ships.
 generated-columns-in-dev = []
 # Experimental, temporary, test-only feature flag guarding the in-progress adaptiveMetadata
 # (Iceberg V4 adaptive metadata tree) work. TODO(#2866): remove once full support ships.
