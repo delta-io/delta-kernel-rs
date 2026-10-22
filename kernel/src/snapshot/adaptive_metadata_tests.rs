@@ -84,15 +84,21 @@ fn txn_line(app_id: &str, version: i64) -> String {
 /// The action's txns, which the consistent cases also commit before it.
 const ACTION_TXNS: &[(&str, i64)] = &[("a", 1), ("b", 2), ("d", 4)];
 
-/// The checkpoint action's inline (`a`, `b`) and sidecar (`d`) `txn` entries are read for the
-/// commits at or below its version, and a later commit (`b`) overrides them. Without a CRC, or
-/// with one older than the action, only the action carries them, so `c` from an earlier commit
-/// proves the action replaced the commits. A CRC is built from commits alone (TODO(#2866)), so the
-/// CRC-rooted cases first commit the action's txns, as a writer would.
+/// Every case builds the same table state, so the expected values do not change; the cases differ
+/// only in which read path answers, and each must agree with full replay. The checkpoint action's
+/// inline (`a`, `b`) and sidecar (`d`) `txn` entries stand in for the commits at or below its
+/// version, and a later commit (`b`) overrides them.
 #[rstest]
+// Full replay of the action and the later commit: `c`, committed only before the action, is
+// absent because the action replaces those commits.
 #[case::no_crc(&[("c", 9)], None)]
+// The CRC predates the action, so it is skipped for full replay; its `c` must not leak through.
 #[case::stale_crc_before_checkpoint_action(&[("c", 9)], Some(1))]
+// The CRC at the action's version roots a scan of only the later commit. The CRC writer reads
+// commits alone (TODO(#2866)), so the action's txns are committed first, as a writer would, to
+// keep the CRC consistent with the action.
 #[case::stale_crc_at_checkpoint_action(ACTION_TXNS, Some(CHECKPOINT_VERSION))]
+// The CRC at the snapshot version answers directly, without reading the log.
 #[case::crc_at_snapshot_version(ACTION_TXNS, Some(CHECKPOINT_VERSION + 1))]
 fn app_id_versions_come_from_checkpoint_action_and_later_commits(
     #[case] before: &[(&str, i64)],
