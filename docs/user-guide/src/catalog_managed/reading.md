@@ -51,7 +51,7 @@ commits, then translates each one into a `LogPath`:
 use delta_kernel::LogPath;
 
 let log_path = LogPath::from_commit_filename(
-    table_url.clone(),                              // table root URL (must end with '/')
+    table_url.clone(),                              // table root URL
     8,                                              // version the catalog reported
     "00000000000000000008.<uuid>.json",             // filename the catalog reported
     1234567890,                                     // last modified timestamp
@@ -66,8 +66,7 @@ resulting path to the catalog, and the catalog returns that same path on reads. 
 catalog returns commits as `(version, uuid, ...)` tuples, format the filename as
 `{version:020}.{uuid}.json`. Catalogs may also report a commit that is already published by its
 `{version:020}.json` filename; `LogPath::from_commit_filename` resolves either form to the
-right directory. It returns an error if the filename's version does not match `version` or if
-`table_url` does not end with `/`.
+right directory. It returns an error if the filename's version does not match `version`.
 
 Then pass the resulting `Vec<LogPath>` to `SnapshotBuilder` along with the maximum
 catalog-ratified version:

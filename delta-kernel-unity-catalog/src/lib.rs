@@ -27,15 +27,7 @@ pub use utils::{
 /// Returns an error if a commit's `version` or `file_size` is negative, or if
 /// [`LogPath::from_commit_filename`] rejects its filename (including a filename whose version
 /// differs from the commit's `version`).
-pub fn log_tail_from_commits(
-    commits: &[Commit],
-    mut table_root: Url,
-) -> KernelResult<Vec<LogPath>> {
-    // `load_table` returns the location without a trailing slash, but commit path resolution
-    // requires the table root to end in `/`.
-    if !table_root.path().ends_with('/') {
-        table_root.set_path(&format!("{}/", table_root.path()));
-    }
+pub fn log_tail_from_commits(commits: &[Commit], table_root: Url) -> KernelResult<Vec<LogPath>> {
     let mut sorted: Vec<&Commit> = commits.iter().collect();
     sorted.sort_by_key(|c| c.version);
     sorted
