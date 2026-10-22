@@ -1125,8 +1125,9 @@ impl TableConfiguration {
             )
         );
 
-        // The protocol allows generation expressions only on tables that support the
-        // `generatedColumns` writer feature.
+        // A generation expression only takes effect on a table that supports the `generatedColumns`
+        // writer feature. Kernel refuses to write a table that has one without that support, while
+        // Delta Spark writes such a table and ignores the expression.
         require!(
             self.is_feature_supported(&TableFeature::GeneratedColumns)
                 || !self.has_generation_expressions(),
@@ -1557,7 +1558,7 @@ mod test {
         MockProtocolBuilder::new().with_versions(1, 4).build(),
         WriteSupport::Unsupported
     )]
-    // Unusual metadata, detected like any other generation expression. The engine must parse
+    // Unusual metadata, detected like any other generation expression. The connector must parse
     // these expressions and reject invalid ones.
     #[case::empty_expression_with_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "")) },
@@ -1654,7 +1655,7 @@ mod test {
         },
         true
     )]
-    // Unusual metadata, detected like any other generation expression. The engine must parse
+    // Unusual metadata, detected like any other generation expression. The connector must parse
     // these expressions and reject invalid ones.
     #[case::empty_expression(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "")) },
