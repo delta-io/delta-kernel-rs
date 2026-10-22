@@ -2051,7 +2051,7 @@ mod tests {
     /// Root and leaf entry locations are encoded into `add.path`; a deleted entry's location is
     /// neither encoded nor validated, since it does not become an `Add`.
     #[test]
-    fn read_actions_from_amt_encodes_root_and_leaf_paths() {
+    fn read_add_actions_from_amt_encodes_root_and_leaf_paths() {
         let engine = memory_engine();
         let leaf = write_leaf(
             &engine,
@@ -2091,7 +2091,7 @@ mod tests {
     }
 
     #[test]
-    fn read_actions_from_amt_rejects_dot_segment_in_live_location() {
+    fn read_add_actions_from_amt_rejects_dot_segment_in_live_location() {
         let engine = memory_engine();
         let checkpoint = write_root(&engine, &[added_data_entry("../a.parquet", 1, 1, 0, 0)]);
         assert_result_error_with_message(
