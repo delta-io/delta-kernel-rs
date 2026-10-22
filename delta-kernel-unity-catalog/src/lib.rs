@@ -18,9 +18,8 @@ pub use utils::{
 /// kernel `LogPath`s suitable for `Snapshot::builder_for(...).with_log_tail(...)`.
 ///
 /// Sorts commits by version because they may arrive out of order. Each commit may name either a
-/// staged or an already-published commit file. [`LogPath::from_commit_filename`] resolves the
-/// matching directory. A published filename asserts that its version and all lower versions are
-/// already published.
+/// staged or an already-published commit file. A published filename asserts that its version and
+/// all lower versions are already published.
 ///
 /// # Errors
 ///
@@ -213,14 +212,14 @@ mod tests {
         #[case] version: i64,
         #[case] file_name: &str,
         #[case] file_size: i64,
-        #[case] is_invalid_log_path: bool,
+        #[case] expected_invalid_log_path_error: bool,
     ) {
         let commits = vec![Commit::new(version, 0, file_name, file_size, 0)];
         let table_root = Url::parse("memory:///my_table/").unwrap();
 
         let err = log_tail_from_commits(&commits, table_root).unwrap_err();
 
-        let expected_kind = if is_invalid_log_path {
+        let expected_kind = if expected_invalid_log_path_error {
             matches!(err, KernelError::InvalidLogPath(_))
         } else {
             matches!(err, KernelError::Generic(_))

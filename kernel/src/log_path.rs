@@ -36,7 +36,7 @@ impl LogPath {
         Ok(Self(parsed))
     }
 
-    /// Create a commit log path from a catalog-reported commit filename.
+    /// Create a commit log path from a commit filename.
     ///
     /// The filename's form selects the directory: `00000000000000000010.json` resolves to
     /// `_delta_log/00000000000000000010.json`, and `00000000000000000010.<uuid>.json` resolves to
@@ -124,9 +124,7 @@ impl LogPath {
     /// `_delta_log/` directory.
     ///
     /// Returns an error if `table_root` cannot be a base URL, or if the resolved URL would not
-    /// name `filename` itself. `Url::join` resolves separators, queries, fragments, and dot
-    /// segments, and strips tabs and newlines and trims spaces. Engines percent-decode URL paths,
-    /// so a percent-escape would name a different object than `ParsedLogPath` validated.
+    /// name `filename` itself.
     fn log_file_url(mut table_root: Url, subdir: &str, filename: &str) -> KernelResult<Url> {
         if !table_root.path().ends_with('/') {
             table_root.set_path(&format!("{}/", table_root.path()));
@@ -137,7 +135,11 @@ impl LogPath {
             .map_err(|_| KernelError::invalid_table_location(table_root))?;
         let invalid_log_filename =
             || KernelError::invalid_log_path(format!("not a bare log file name: {filename}"));
+        // `Url::join` resolves separators, queries, fragments, and dot segments, strips tabs and
+        // newlines, and trims spaces. Require the resolved name to match the supplied filename.
         let url = dir.join(filename).map_err(|_| invalid_log_filename())?;
+        // Engines percent-decode URL paths, so an escape would name a different object than
+        // `ParsedLogPath` validated.
         require!(
             !filename.is_empty()
                 && !filename.contains('%')
