@@ -405,10 +405,10 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     ///   parse each one's [`raw_sql`](GeneratedColumn::raw_sql) itself. The SQL refers to logical
     ///   column names.
     /// - Make every written row, including its partition values, satisfy `(<value> <=> <generation
-    ///   expression>) IS TRUE` for each generated column. The requirement also covers rows in files
-    ///   written for an earlier commit attempt, such as one that conflicted, and validated against
-    ///   an older table version. `<=>` is null-safe equality, so a `NULL` value matches a `NULL`
-    ///   expression result.
+    ///   expression>) IS TRUE` for each generated column. When you reuse files from an earlier
+    ///   commit attempt, for example after a conflict, check their rows against this transaction's
+    ///   generated columns, which can differ from the earlier attempt's. `<=>` is null-safe
+    ///   equality, so a `NULL` value matches a `NULL` expression result.
     /// - Compute each generated column from its expression when the write omits the column, and
     ///   reject a row whose supplied value doesn't match.
     ///
@@ -1007,8 +1007,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         Ok(())
     }
 
-    /// Rejects writing to or committing to a table with generated columns when the connector has
-    /// not acknowledged enforcing them. The table's generated columns are those it has once this
+    /// Fails `write_state` and commits on a table with generated columns until the connector
+    /// acknowledges enforcing them. The table's generated columns are those it has once this
     /// transaction commits.
     #[cfg(feature = "generated-columns-in-dev")]
     fn ensure_generated_columns_acknowledged(&self) -> KernelResult<()> {

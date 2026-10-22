@@ -203,10 +203,9 @@ that don't match it into the table. Handle the returned `CommitResult` as descri
 
 On a table that has generated columns, `write_state()` and `commit()` both fail with an
 `InvalidTransactionState` error until you call `ack_generated_columns()`. Kernel applies this to
-every commit, including commits that only remove files or record a transaction identifier. The
-acknowledgement covers whatever the transaction commits, so one rule applies to every commit. A
-table that supports the `generatedColumns` feature but has no generated columns needs no
-acknowledgement.
+every commit, including schema changes and commits that only remove files or record a transaction
+identifier. The acknowledgement covers everything the transaction commits. A table that supports
+the `generatedColumns` feature but has no generated columns needs no acknowledgement.
 
 The acknowledgement belongs to one transaction. Acknowledge again on each new transaction.
 
