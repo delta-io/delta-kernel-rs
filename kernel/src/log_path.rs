@@ -55,7 +55,7 @@ impl LogPath {
         last_modified: i64,
         size: FileSize,
     ) -> KernelResult<LogPath> {
-        let invalid = || {
+        let invalid_commit_filename = || {
             KernelError::invalid_log_path(format!(
                 "{filename} is not a published or staged commit filename for version {version}"
             ))
@@ -68,7 +68,7 @@ impl LogPath {
             STAGED_COMMITS_DIR
         };
         let location = Self::log_file_url(table_root, subdir, filename).map_err(|e| match e {
-            KernelError::InvalidLogPath(_) => invalid(),
+            KernelError::InvalidLogPath(_) => invalid_commit_filename(),
             e => e,
         })?;
         let log_path = Self::try_new(FileMeta {
@@ -76,8 +76,8 @@ impl LogPath {
             last_modified,
             size,
         })
-        .map_err(|_| invalid())?;
-        require!(log_path.0.version == version, invalid());
+        .map_err(|_| invalid_commit_filename())?;
+        require!(log_path.0.version == version, invalid_commit_filename());
         Ok(log_path)
     }
 
@@ -130,14 +130,14 @@ impl LogPath {
             .join(DELTA_LOG_DIR_WITH_SLASH)
             .and_then(|url| url.join(subdir))
             .map_err(|_| KernelError::invalid_table_location(table_root))?;
-        let invalid =
+        let invalid_log_filename =
             || KernelError::invalid_log_path(format!("not a bare log file name: {filename}"));
-        let url = dir.join(filename).map_err(|_| invalid())?;
+        let url = dir.join(filename).map_err(|_| invalid_log_filename())?;
         require!(
             !filename.is_empty()
                 && !filename.contains('%')
                 && url.path_segments().and_then(|mut s| s.next_back()) == Some(filename),
-            invalid()
+            invalid_log_filename()
         );
         Ok(url)
     }
@@ -199,7 +199,7 @@ mod test {
     #[case::query(10, "00000000000000000010.json?x")]
     #[case::fragment(10, "00000000000000000010.json#x")]
     #[case::percent_encoded(10, "%2E%2E%2F00000000000000000010.json")]
-    // The middle part has a UUID's length, so it parses as a staged commit; engines
+    // The middle part has a UUID's length, so it parses as a staged commit. Engines
     // percent-decode it into a nested path under `_staged_commits/`.
     #[case::percent_encoded_uuid(
         10,
