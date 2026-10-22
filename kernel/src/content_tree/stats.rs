@@ -846,9 +846,26 @@ fn assemble_parsed_stats_expr(
     Ok(Expression::struct_from(fields))
 }
 
-/// Combines the struct at `path`'s `children` into one struct expression per category that `scopes`
-/// carries (indexed like [`STAT_CATEGORIES`]), and gathers their tight-bounds predicates. A
-/// category that omits the struct recorded no leaves under it, so it yields `None`.
+/// Combines a struct's `children` into one struct expression per stat category, and gathers the
+/// children's tight-bounds predicates. `path` locates the struct for error context.
+///
+/// Returns `(exprs, tight_bounds)`. `exprs` is indexed like [`STAT_CATEGORIES`]: entry `i` is a
+/// struct over the children present in category `i`, or `None` when `scopes` omits that category
+/// here (so no leaf under the struct is in it). `tight_bounds` concatenates every child's
+/// predicates.
+///
+/// For example, for `s: struct{a: int, b: string}` with `a` in `nullCount` and `minValues`, `b`
+/// only in `nullCount`, and `s` absent from `maxValues`:
+///
+/// ```text
+/// exprs[nullCount] = Some(struct(a: content_stats.`s.a`.null_value_count,
+///                                b: content_stats.`s.b`.null_value_count))
+/// exprs[minValues] = Some(struct(a: content_stats.`s.a`.lower_bound))
+/// exprs[maxValues] = None
+/// tight_bounds     = [coalesce(content_stats.`s.a`.tight_bounds, true)]
+/// ```
+///
+/// Errors if a category's children don't line up with its sub-schema (see [`aligned_struct_expr`]).
 fn combine_children<'a>(
     children: Vec<StatsExprNode<'a>>,
     scopes: &CategoryScopes<'_>,
@@ -876,15 +893,18 @@ fn require_projection<T>(projection: Option<T>) -> KernelResult<T> {
     projection.ok_or_else(|| KernelError::internal_error("parsed stats walk requires a projection"))
 }
 
-/// Wraps a struct's children into a struct expression. The evaluator matches struct fields by
-/// position, so this errors unless the children line up with the category sub-schema `scope` (both
-/// come from the same table walk, so they always should).
+/// Wraps a struct's `children` into a struct expression for the category sub-schema `scope`.
+/// `path` and `category` are for error context.
+///
+/// Errors if the children's names don't match `scope`'s fields, in order.
 fn aligned_struct_expr(
     children: Vec<NamedExpr<'_>>,
     scope: &StructType,
     path: &[String],
     category: usize,
 ) -> KernelResult<Expression> {
+    // The evaluator matches struct fields by position, so the children must line up with `scope`.
+    // Both come from the same table walk, so a mismatch is an internal error.
     let child_names = || children.iter().map(|(name, _)| *name);
     if !child_names().eq(scope.field_names().map(String::as_str)) {
         return Err(KernelError::internal_error(format!(
