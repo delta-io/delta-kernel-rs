@@ -84,7 +84,7 @@ fn scan_application_transactions(
     Ok(visitor.set_transactions)
 }
 
-// Factored out to facilitate testing
+// The full-log `txn` read that `get_one` and `get_all` fold; factored out to facilitate testing.
 fn replay_for_app_ids(
     log_segment: &LogSegment,
     engine: &dyn Engine,
