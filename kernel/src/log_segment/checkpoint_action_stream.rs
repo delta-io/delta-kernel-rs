@@ -5,7 +5,7 @@ use std::iter;
 use super::action_projector::ActionProjector;
 use crate::actions::{CheckpointAction, ADD_NAME, LOG_ADD_SCHEMA, REMOVE_NAME};
 use crate::cancellation::CancellationTokenRef;
-use crate::content_tree::{read_actions_from_amt, ReadContext};
+use crate::content_tree::{read_add_actions_from_amt, ReadContext};
 use crate::log_replay::ActionsBatch;
 use crate::path::LogRoot;
 use crate::schema::SchemaRef;
@@ -62,7 +62,7 @@ pub(super) fn read_checkpoint_action(
     };
     let projector =
         ActionProjector::try_new(engine, ADD_NAME, LOG_ADD_SCHEMA.clone(), read_schema)?;
-    let adds = read_actions_from_amt(
+    let adds = read_add_actions_from_amt(
         engine,
         checkpoint,
         log_root.table_root(),
