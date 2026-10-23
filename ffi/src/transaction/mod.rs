@@ -2,6 +2,7 @@
 mod committed;
 mod create_table;
 mod deletion_vector;
+mod deletion_vector_writer;
 mod partition_value;
 mod transaction_id;
 mod update_table;
@@ -20,6 +21,7 @@ pub use deletion_vector::{
     free_dv_descriptor_map, update_table_txn_update_deletion_vectors, ExclusiveDvDescriptor,
     ExclusiveDvDescriptorMap, KernelDvStorageType,
 };
+pub use deletion_vector_writer::{write_deletion_vectors, FfiDeletionVectorUpdate};
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::transaction::create_table::{
