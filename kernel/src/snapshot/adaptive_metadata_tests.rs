@@ -35,26 +35,35 @@ fn table_with_checkpoint_action(
                 .unwrap();
         }
     };
-    write_ict_commit(&engine, &table_root, 1, before);
+    write_ict_commit(&engine, &table_root, 1, None, before);
     write_crc_at(1);
     let snapshot = Snapshot::builder_for(table_root.clone())
         .build(&engine)
         .unwrap();
     let checkpoint = checkpoint(&engine, &table_root, &snapshot);
+    // The manifest commit and every later commit point at the manifest commit, as an AMT writer
+    // records them; a CRC carries the pointer forward. [`checkpoint_action`]'s content root is at
+    // the action's version.
+    let pointer = Some((checkpoint.version(), checkpoint.version()));
     write_ict_commit(
         &engine,
         &table_root,
         CHECKPOINT_VERSION,
+        pointer,
         &checkpoint_line(&checkpoint),
     );
     write_crc_at(CHECKPOINT_VERSION);
-    write_ict_commit(&engine, &table_root, CHECKPOINT_VERSION + 1, after);
+    write_ict_commit(&engine, &table_root, CHECKPOINT_VERSION + 1, pointer, after);
     write_crc_at(CHECKPOINT_VERSION + 1);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     assert_eq!(
         snapshot.crc_at_version().is_some(),
         crc_version == Some(CHECKPOINT_VERSION + 1)
     );
+    assert!(snapshot
+        .latest_checkpoint_action(&engine)
+        .unwrap()
+        .is_some());
     (engine, snapshot)
 }
 
@@ -84,25 +93,35 @@ fn txn_line(app_id: &str, version: i64) -> String {
 /// The action's txns, which the consistent cases also commit before it.
 const ACTION_TXNS: &[(&str, i64)] = &[("a", 1), ("b", 2), ("d", 4)];
 
-/// Every case builds the same table state, so the expected values do not change; the cases differ
-/// only in which read path answers, and each must agree with full replay. The checkpoint action's
+/// Every case expects the same app-id versions; the cases differ only in which read path answers
+/// (pinned by `expected_tail_base`, the CRC a tail-only replay starts from), and each must agree
+/// with full replay. The checkpoint action's
 /// inline (`a`, `b`) and sidecar (`d`) `txn` entries stand in for the commits at or below its
 /// version, and a later commit (`b`) overrides them.
 #[rstest]
 // Full replay of the action and the later commit: `c`, committed only before the action, is
 // absent because the action replaces those commits.
-#[case::no_crc(&[("c", 9)], None)]
+#[case::no_crc(&[("c", 9)], None, None)]
 // The CRC predates the action, so it is skipped for full replay; its `c` must not leak through.
-#[case::stale_crc_before_checkpoint_action(&[("c", 9)], Some(1))]
+#[case::stale_crc_before_checkpoint_action(&[("c", 9)], Some(1), None)]
 // The CRC at the action's version roots a scan of only the later commit. The CRC writer reads
 // commits alone (TODO(#2866)), so the action's txns are committed first, as a writer would, to
 // keep the CRC consistent with the action.
-#[case::stale_crc_at_checkpoint_action(ACTION_TXNS, Some(CHECKPOINT_VERSION))]
+#[case::stale_crc_at_checkpoint_action(
+    ACTION_TXNS,
+    Some(CHECKPOINT_VERSION),
+    Some(CHECKPOINT_VERSION)
+)]
 // The CRC at the snapshot version answers directly, without reading the log.
-#[case::crc_at_snapshot_version(ACTION_TXNS, Some(CHECKPOINT_VERSION + 1))]
+#[case::crc_at_snapshot_version(
+    ACTION_TXNS,
+    Some(CHECKPOINT_VERSION + 1),
+    Some(CHECKPOINT_VERSION + 1)
+)]
 fn app_id_versions_come_from_checkpoint_action_and_later_commits(
     #[case] before: &[(&str, i64)],
     #[case] crc_version: Option<Version>,
+    #[case] expected_tail_base: Option<Version>,
 ) {
     let before = before
         .iter()
@@ -132,4 +151,13 @@ fn app_id_versions_come_from_checkpoint_action_and_later_commits(
             "app id {app_id}"
         );
     }
+    let all = snapshot
+        .get_app_id_versions(&engine)
+        .unwrap()
+        .into_values()
+        .sorted_by(|x, y| x.app_id.cmp(&y.app_id))
+        .collect_vec();
+    assert_eq!(all, [txn("a", 1), txn("b", 3), txn("d", 4)]);
+    let tail_base = snapshot.tail_replay_base_crc(&engine).unwrap();
+    assert_eq!(tail_base.map(|crc| crc.version), expected_tail_base);
 }
