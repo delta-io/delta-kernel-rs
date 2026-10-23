@@ -56,14 +56,14 @@ pub(crate) fn read_checkpoint_action(
                 engine,
                 PROTOCOL_NAME,
                 LOG_PROTOCOL_SCHEMA.clone(),
-                vec![checkpoint.protocol().clone().into()],
+                iter::once(checkpoint.protocol().clone()),
                 read_schema.clone(),
             )?,
             METADATA_NAME => inline_actions(
                 engine,
                 METADATA_NAME,
                 LOG_METADATA_SCHEMA.clone(),
-                vec![checkpoint.metadata().clone().into()],
+                iter::once(checkpoint.metadata().clone()),
                 read_schema.clone(),
             )?,
             SET_TRANSACTION_NAME => inline_and_sidecar_actions(
@@ -71,12 +71,7 @@ pub(crate) fn read_checkpoint_action(
                 log_root,
                 SET_TRANSACTION_NAME,
                 LOG_TXN_SCHEMA.clone(),
-                checkpoint
-                    .transactions
-                    .iter()
-                    .cloned()
-                    .map(Into::into)
-                    .collect(),
+                checkpoint.transactions.iter().cloned(),
                 &checkpoint.txn_sidecars,
                 read_schema.clone(),
             )?,
@@ -134,14 +129,14 @@ fn inline_actions(
     engine: &dyn Engine,
     action: &str,
     source: SchemaRef,
-    rows: Vec<Scalar>,
+    rows: impl IntoIterator<Item = impl Into<Scalar>>,
     read_schema: SchemaRef,
 ) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
+    let rows: Vec<_> = rows.into_iter().map(|row| vec![row.into()]).collect();
     if rows.is_empty() {
         return Ok(Box::new(iter::empty()));
     }
     let projector = ActionProjector::try_new(engine, action, source.clone(), read_schema)?;
-    let rows = rows.into_iter().map(|row| vec![row]).collect();
     let data = engine.evaluation_handler().create_many(source, rows)?;
     let batch = ActionsBatch::new(projector.project(data.as_ref())?, false);
     Ok(Box::new(iter::once(Ok(batch))))
@@ -154,7 +149,7 @@ fn inline_and_sidecar_actions(
     log_root: &LogRoot,
     action: &str,
     source: SchemaRef,
-    rows: Vec<Scalar>,
+    rows: impl IntoIterator<Item = impl Into<Scalar>>,
     sidecars: &[Sidecar],
     read_schema: SchemaRef,
 ) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
@@ -272,10 +267,6 @@ mod tests {
 
     /// A read batch's `(is_log_batch, add paths, remove paths)`.
     type BatchPaths = (bool, Vec<String>, Vec<String>);
-
-    /// Sets a checkpoint action's inline entries of one action kind, by key, and its sidecars of
-    /// that kind.
-    type SetActions = fn(&mut CheckpointAction, &[&str], Vec<Sidecar>);
 
     /// Reads `log_segment` with `checkpoint`, returning each batch's [`BatchPaths`].
     fn read_paths(
@@ -615,6 +606,10 @@ mod tests {
             Some(checkpoint.metadata().clone())
         );
     }
+
+    /// Sets a checkpoint action's inline entries of one action kind, by key, and its sidecars of
+    /// that kind.
+    type SetActions = fn(&mut CheckpointAction, &[&str], Vec<Sidecar>);
 
     /// Sets the inline `txn` entries of `checkpoint` to `app_ids` and its `txn` sidecars to
     /// `sidecars`.

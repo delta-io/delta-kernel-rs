@@ -96,28 +96,13 @@ fn replay_for_app_ids(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use std::sync::Arc;
 
     use itertools::Itertools;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use test_utils::add_commit;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use url::Url;
 
     use super::*;
     use crate::arrow::array::StringArray;
     use crate::engine::sync::SyncEngine;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::object_store::memory::InMemory;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::unit_test_utils::adaptive_metadata_fixtures::{
-        checkpoint_action_with_root, checkpoint_line, protocol_and_metadata_lines, write_sidecar,
-    };
     use crate::unit_test_utils::parse_json_batch;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::unit_test_utils::{test_schema_flat_with_column_mapping, Action};
-    use crate::Snapshot;
 
     fn get_latest_transactions(
         path: &str,
@@ -184,63 +169,6 @@ mod tests {
             .try_collect()
             .unwrap();
         assert_eq!(data.len(), 2);
-    }
-
-    /// The `txn` entries (inline and in sidecars) of an AMT `checkpoint` action stand in for the
-    /// commits at or below its version, and later commits override them.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[tokio::test]
-    async fn test_amt_checkpoint_action_supplies_transactions() {
-        let txn = |app_id: &str, version| SetTransaction {
-            app_id: app_id.to_string(),
-            version,
-            last_updated: None,
-        };
-        let txn_line = |app_id: &str, version| {
-            serde_json::to_string(&Action::Txn(txn(app_id, version))).unwrap()
-        };
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
-        // The root manifest is never read, so it need not exist.
-        let mut checkpoint = checkpoint_action_with_root("metadata/root.parquet", 1, 1).unwrap();
-        checkpoint.transactions = vec![txn("a", 1), txn("b", 2)];
-        checkpoint.txn_sidecars = vec![write_sidecar(
-            &engine,
-            &Url::parse("memory:///").unwrap(),
-            "txn.parquet",
-            LOG_TXN_SCHEMA.clone(),
-            vec![txn("d", 4).into()],
-        )];
-        let commits = [
-            // At or below the checkpoint version, so the checkpoint action replaces it.
-            format!(
-                "{}\n{}",
-                protocol_and_metadata_lines(test_schema_flat_with_column_mapping(), &[]),
-                txn_line("c", 9)
-            ),
-            checkpoint_line(&checkpoint),
-            txn_line("b", 3),
-        ];
-        for (version, commit) in commits.into_iter().enumerate() {
-            add_commit("memory:///", store.as_ref(), version as u64, commit)
-                .await
-                .unwrap();
-        }
-        let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
-
-        let all: Vec<_> = SetTransactionScanner::get_all(&snapshot, &engine)
-            .unwrap()
-            .into_values()
-            .sorted_by(|x, y| x.app_id.cmp(&y.app_id))
-            .collect();
-        assert_eq!(all, vec![txn("a", 1), txn("b", 3), txn("d", 4)]);
-        for (app_id, expected) in [("a", Some(1)), ("b", Some(3)), ("c", None), ("d", Some(4))] {
-            assert_eq!(
-                snapshot.get_app_id_version(app_id, &engine).unwrap(),
-                expected,
-                "app id {app_id}"
-            );
-        }
     }
 
     #[test]

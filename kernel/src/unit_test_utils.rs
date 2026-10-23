@@ -495,19 +495,22 @@ pub(crate) mod adaptive_metadata_fixtures {
             engine,
             table_root,
             0,
+            None,
             &protocol_and_metadata_lines(test_schema_flat_with_column_mapping(), partition_columns),
         );
     }
 
     /// Writes `actions` (one JSON action per line) as the commit at `version`, after a
-    /// `commitInfo` carrying the In-Commit Timestamp adaptiveMetadata tables require.
+    /// `commitInfo` carrying the In-Commit Timestamp adaptiveMetadata tables require and, when
+    /// given, the `lastManifestCommit` `pointer` (see [`commit_info_line`]).
     pub(crate) fn write_ict_commit(
         engine: &SyncEngine,
         table_root: &Url,
         version: Version,
+        pointer: Option<(i64, i64)>,
         actions: &str,
     ) {
-        let commit_info = commit_info_line(version_as_i64(version).unwrap() + 1, None);
+        let commit_info = commit_info_line(version_as_i64(version).unwrap() + 1, pointer);
         let lines: StringArray = iter::once(commit_info.as_str())
             .chain(actions.lines())
             .collect::<Vec<_>>()

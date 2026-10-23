@@ -390,15 +390,17 @@ async fn test_commit_info_omits_adaptive_metadata_fields_without_the_feature(
 /// Configures one transaction's builder.
 type Configure = fn(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder;
 
-/// Commits a transaction configured by each of `configures` in order, the middle one as a manifest
-/// commit of a root manifest that is never read, and returns a freshly loaded snapshot.
+/// Commits transactions configured by `before`, `manifest`, then `after`, the `manifest` one as a
+/// manifest commit of a root manifest that is never read, and returns a freshly loaded snapshot.
 fn commit_around_root_manifest(
     engine: &dyn Engine,
     table_url: &Url,
-    mut snapshot: SnapshotRef,
-    configures: [Configure; 3],
+    snapshot: SnapshotRef,
+    before: Configure,
+    manifest: Configure,
+    after: Configure,
 ) -> Result<SnapshotRef, Box<dyn std::error::Error>> {
-    for (index, configure) in configures.into_iter().enumerate() {
+    let commit = |snapshot, configure, root_manifest: Option<FileMeta>| {
         let mut txn = begin_transaction_with(
             snapshot,
             engine,
@@ -407,15 +409,19 @@ fn commit_around_root_manifest(
             true,
             configure,
         )?;
-        if index == 1 {
-            txn = txn.with_root_manifest_file(FileMeta {
-                location: table_url.join("metadata/root-v2.parquet")?,
-                last_modified: 0,
-                size: 1024,
-            })?;
+        if let Some(file) = root_manifest {
+            txn = txn.with_root_manifest_file(file)?;
         }
-        snapshot = txn.commit(engine)?.unwrap_post_commit_snapshot();
-    }
+        Ok::<_, Box<dyn std::error::Error>>(txn.commit(engine)?.unwrap_post_commit_snapshot())
+    };
+    let root_manifest = FileMeta {
+        location: table_url.join("metadata/root-v2.parquet")?,
+        last_modified: 0,
+        size: 1024,
+    };
+    let snapshot = commit(snapshot, before, None)?;
+    let snapshot = commit(snapshot, manifest, Some(root_manifest))?;
+    commit(snapshot, after, None)?;
     Ok(Snapshot::builder_for(table_url.clone()).build(engine)?)
 }
 
@@ -425,17 +431,16 @@ async fn test_app_id_versions_read_across_a_root_manifest_commit(
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("root_manifest_file_app_id_versions").await?;
 
-    // The manifest commit's checkpoint action captures `app-1` and adds `app-2`; the commit after
-    // it overrides `app-1`.
+    // End-to-end consistency with the real writer, which also writes each `txn` to its commit: the
+    // manifest commit's checkpoint action holds `app-1` and `app-2`, and the commit after it
+    // overrides `app-1`.
     let snapshot = commit_around_root_manifest(
         &engine,
         &table_url,
         snapshot,
-        [
-            |builder| builder.with_transaction_id("app-1", 5),
-            |builder| builder.with_transaction_id("app-2", 7),
-            |builder| builder.with_transaction_id("app-1", 6),
-        ],
+        |builder| builder.with_transaction_id("app-1", 5),
+        |builder| builder.with_transaction_id("app-2", 7),
+        |builder| builder.with_transaction_id("app-1", 6),
     )?;
 
     assert_eq!(snapshot.get_app_id_version("app-1", &engine)?, Some(6));
