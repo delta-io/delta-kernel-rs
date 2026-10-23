@@ -7,6 +7,7 @@ use url::Url;
 
 /// Encodes manifest deletion vector positions as a Mumbling bitmap.
 pub(crate) use crate::content_tree::mumbling::tests::encode_positions as mumbling_bitmap;
+use crate::arrow::array::{AsArray as _, RecordBatch};
 use crate::content_tree::{
     AMT_FORMAT_VERSION, ContentTreeNodeEntry, DataContentType, DataFileFormat, DeletionVectorInfo,
     ManifestInfo, TrackingInfo, TrackingStatus,
@@ -242,4 +243,18 @@ mod tests {
             assert_eq!(&cast(actual, expected.data_type()).unwrap(), expected);
         }
     }
+}
+
+/// The non-null `<action>.path` leaf values of `batch`, as replay reads them, or none if it lacks
+/// the action column.
+pub(crate) fn action_paths(batch: &RecordBatch, action: &str) -> Vec<String> {
+    let Some(column) = batch.column_by_name(action) else {
+        return vec![];
+    };
+    let paths = column
+        .as_struct()
+        .column_by_name("path")
+        .unwrap()
+        .as_string::<i32>();
+    paths.iter().flatten().map(str::to_string).collect()
 }
