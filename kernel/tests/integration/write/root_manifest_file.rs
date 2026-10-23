@@ -470,11 +470,9 @@ async fn test_domain_metadata_read_across_a_root_manifest_commit(
         &engine,
         &table_url,
         snapshot,
-        [
-            |builder| builder.with_domain_metadata("domain.a", "a1"),
-            |builder| builder.with_domain_metadata("domain.b", "b1"),
-            |builder| builder.with_domain_metadata("domain.a", "a2"),
-        ],
+        |builder| builder.with_domain_metadata("domain.a", "a1"),
+        |builder| builder.with_domain_metadata("domain.b", "b1"),
+        |builder| builder.with_domain_metadata("domain.a", "a2"),
     )?;
 
     for (domain, expected) in [
