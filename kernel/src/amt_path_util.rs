@@ -67,13 +67,16 @@ pub(crate) fn amt_manifest_filemeta(
 /// # Errors
 ///
 /// Returns an error if `location` contains a `.` or `..` segment, which [`resolve_amt_location`]
-/// rejects too.
-#[cfg(feature = "adaptive-metadata-in-dev")]
+/// rejects too, or if a relative `location` is empty or begins with `/` (see
+/// [`validate_table_relative`]), which would resolve outside the table root.
 pub(crate) fn amt_location_to_add_path(location: &str) -> KernelResult<Cow<'_, str>> {
     reject_dot_segments(location)?;
     let (prefix, raw_path) = match scheme_len(location) {
         Some(scheme_len) => split_authority(location, scheme_len),
-        None => ("", location),
+        None => {
+            validate_table_relative(location)?;
+            ("", location)
+        }
     };
     Ok(match uri_encode_path(raw_path) {
         Cow::Borrowed(_) => Cow::Borrowed(location),
@@ -217,7 +220,6 @@ mod tests {
     use super::*;
 
     /// `expected_url` is where a scan reads the file: `add.path` joined onto the table root.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest]
     #[case::plain_relative(
         "data/a.parquet",
@@ -261,6 +263,12 @@ mod tests {
         true,
         "s3://bucket/t/a%20b.parquet"
     )]
+    #[case::spaced_absolute_without_authority(
+        "file:/tmp/a b.parquet",
+        "file:/tmp/a%20b.parquet",
+        true,
+        "file:///tmp/a%20b.parquet"
+    )]
     fn test_amt_location_to_add_path(
         #[case] location: &str,
         #[case] expected: &str,
@@ -276,15 +284,18 @@ mod tests {
         assert_eq!(url, resolve_amt_location(location, &table_root).unwrap());
     }
 
-    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest]
-    fn amt_location_to_add_path_rejects_dot_segments(
-        #[values("../a.parquet", "data/./a.parquet", "s3://bucket/t/../a.parquet")] location: &str,
+    #[case::parent_segment("../a.parquet", "contains a '.' or '..' segment")]
+    #[case::current_segment("data/./a.parquet", "contains a '.' or '..' segment")]
+    #[case::absolute_parent_segment("s3://bucket/t/../a.parquet", "contains a '.' or '..' segment")]
+    #[case::empty("", "must not be empty")]
+    #[case::leading_slash("/a.parquet", "must not begin with a leading '/'")]
+    #[case::network_path("//host/a.parquet", "must not begin with a leading '/'")]
+    fn amt_location_to_add_path_rejects_invalid_locations(
+        #[case] location: &str,
+        #[case] message: &str,
     ) {
-        assert_result_error_with_message(
-            amt_location_to_add_path(location),
-            "contains a '.' or '..' segment",
-        );
+        assert_result_error_with_message(amt_location_to_add_path(location), message);
     }
 
     #[rstest]

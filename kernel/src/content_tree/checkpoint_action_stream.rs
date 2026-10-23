@@ -183,7 +183,7 @@ mod tests {
     };
     use crate::arrow::array::{AsArray as _, RecordBatch};
     use crate::arrow::datatypes::Int64Type;
-    use crate::content_tree::test_utils::{added_data_entry, write_manifest};
+    use crate::content_tree::test_utils::{action_paths, added_data_entry, write_manifest};
     use crate::content_tree::{ContentTreeNodeEntry, TrackingStatus};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
@@ -260,20 +260,6 @@ mod tests {
             None,
         )
         .unwrap()
-    }
-
-    /// The non-null `<action>.path` leaf values of `batch`, as replay reads them, or none if it
-    /// lacks the action column.
-    fn action_paths(batch: &RecordBatch, action: &str) -> Vec<String> {
-        let Some(column) = batch.column_by_name(action) else {
-            return vec![];
-        };
-        let paths = column
-            .as_struct()
-            .column_by_name("path")
-            .unwrap()
-            .as_string::<i32>();
-        paths.iter().flatten().map(str::to_string).collect()
     }
 
     /// A read batch's `(is_log_batch, add paths, remove paths)`.
@@ -404,41 +390,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(batches, expected);
-    }
-
-    #[rstest]
-    #[case::mixed(
-        &["plain.parquet", "a b.parquet", "a%b.parquet", "M\u{fc}nchen.parquet", "s3://bucket/t/c d.parquet"],
-        &["plain.parquet", "a%20b.parquet", "a%25b.parquet", "M%C3%BCnchen.parquet", "s3://bucket/t/c%20d.parquet"],
-    )]
-    #[case::all_plain(
-        &["plain.parquet", "dir/other.parquet"],
-        &["plain.parquet", "dir/other.parquet"],
-    )]
-    fn tree_add_paths_are_url_encoded(#[case] locations: &[&str], #[case] expected: &[&str]) {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
-        let entries: Vec<_> = locations
-            .iter()
-            .enumerate()
-            .map(|(i, location)| added_data_entry(location, 1, 1, i as i64, 0))
-            .collect();
-        let checkpoint = checkpoint_with_tree(&engine, &entries, 1);
-
-        let paths: Vec<_> = read_checkpoint_action(
-            &engine,
-            &checkpoint,
-            &log_root(),
-            CHECKPOINT_READ_SCHEMA.clone(),
-            None,
-        )
-        .unwrap()
-        .flat_map(|batch| {
-            let batch = batch.unwrap().actions.try_into_record_batch().unwrap();
-            action_paths(&batch, ADD_NAME)
-        })
-        .collect();
-
-        assert_eq!(paths, strings(expected));
     }
 
     #[test]

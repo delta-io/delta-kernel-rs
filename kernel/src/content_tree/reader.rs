@@ -298,16 +298,12 @@ static ENCODED_PATH_HELPER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
-/// Root converter input schema: the entry schema plus [`ENCODED_PATH_HELPER`].
-static ROOT_INPUT_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| entry_schema_with(&ENCODED_PATH_HELPER_SCHEMA));
-
-/// Leaf converter input schema: the entry schema plus [`FIRST_ROW_ID_HELPER`] and
-/// [`ENCODED_PATH_HELPER`].
+/// Leaf converter input schema: the entry schema plus [`FIRST_ROW_ID_HELPER`].
 static LEAF_INPUT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let mut fields: Vec<StructField> = FIRST_ROW_ID_HELPER_SCHEMA.fields().cloned().collect();
-    fields.extend(ENCODED_PATH_HELPER_SCHEMA.fields().cloned());
-    entry_schema_with(&StructType::new_unchecked(fields))
+    schema_with_helpers(
+        &ContentTreeNodeEntry::to_schema(),
+        &FIRST_ROW_ID_HELPER_SCHEMA,
+    )
 });
 
 /// Converts content-tree entry batches into `Add`-action batches. The entry->`Add` evaluator is
@@ -352,16 +348,15 @@ impl EntryConverter {
         let mut selector = AddSelectionVisitor {
             removed,
             selection: Vec::new(),
+            encoded_paths: Vec::new(),
         };
         selector.visit_rows_of(entries)?;
-        let mut encoder = AddPathEncoder::new(&selector.selection);
-        encoder.visit_rows_of(entries)?;
-        let helper_column = ArrayData::try_new(
-            ArrayType::new(DataType::STRING, true),
-            encoder.encoded_paths,
+        let augmented = append_helper_column(
+            entries,
+            &ENCODED_PATH_HELPER_SCHEMA,
+            DataType::STRING,
+            selector.encoded_paths,
         )?;
-        let augmented =
-            entries.append_columns(ENCODED_PATH_HELPER_SCHEMA.clone(), vec![helper_column])?;
         let actions = self.evaluator.evaluate(augmented.as_ref())?;
         FilteredEngineData::try_new(actions, selector.selection)
     }
@@ -383,7 +378,7 @@ fn make_root_entry_converter(
         engine,
         ctx,
         &AddFieldSources::root(),
-        ROOT_INPUT_SCHEMA.clone(),
+        Arc::new(ContentTreeNodeEntry::to_schema()),
     )
 }
 
@@ -466,10 +461,12 @@ impl LeafReadContext {
         let (first_row_ids, next_first_row_id) =
             validate_and_assign_first_row_ids(entries, self.next_first_row_id, removed)?;
 
-        let helper_column =
-            ArrayData::try_new(ArrayType::new(DataType::LONG, true), first_row_ids)?;
-        let augmented =
-            entries.append_columns(FIRST_ROW_ID_HELPER_SCHEMA.clone(), vec![helper_column])?;
+        let augmented = append_helper_column(
+            entries,
+            &FIRST_ROW_ID_HELPER_SCHEMA,
+            DataType::LONG,
+            first_row_ids,
+        )?;
 
         let filtered = self.converter.convert(augmented.as_ref(), removed)?;
         self.next_first_row_id = next_first_row_id;
@@ -503,54 +500,23 @@ impl LeafReadContext {
 
 // === Helpers ===
 
-/// [`ContentTreeNodeEntry::to_schema`] followed by the fields of `helpers`.
-fn entry_schema_with(helpers: &StructType) -> SchemaRef {
+/// `schema` followed by the fields of `helpers`.
+fn schema_with_helpers(schema: &StructType, helpers: &StructType) -> SchemaRef {
     Arc::new(StructType::new_unchecked(
-        ContentTreeNodeEntry::to_schema()
-            .fields()
-            .chain(helpers.fields())
-            .cloned(),
+        schema.fields().chain(helpers.fields()).cloned(),
     ))
 }
 
-/// Encodes the raw `location` of each selected entry (see [`amt_location_to_add_path`]) into
-/// [`ENCODED_PATH_HELPER`] values: the encoded path when encoding changes it, else null.
-struct AddPathEncoder<'s> {
-    /// Which entries become `Add` actions; the others are left null without being read.
-    selection: &'s [bool],
-    encoded_paths: Vec<Scalar>,
-}
-
-impl<'s> AddPathEncoder<'s> {
-    fn new(selection: &'s [bool]) -> Self {
-        Self {
-            selection,
-            encoded_paths: Vec::with_capacity(selection.len()),
-        }
-    }
-}
-
-impl RowVisitor for AddPathEncoder<'_> {
-    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-            LazyLock::new(|| (vec![ColumnName::new([LOCATION])], vec![DataType::STRING]).into());
-        NAMES_AND_TYPES.as_ref()
-    }
-
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
-        let start = self.encoded_paths.len();
-        for row in 0..row_count {
-            let encoded = match self.selection.get(start + row) {
-                Some(true) => match amt_location_to_add_path(getters[0].get(row, LOCATION)?)? {
-                    Cow::Owned(path) => Some(path),
-                    Cow::Borrowed(_) => None,
-                },
-                _ => None,
-            };
-            self.encoded_paths.push(encoded.into());
-        }
-        Ok(())
-    }
+/// Appends the nullable `data_type` column `values`, named by the single field of `schema`, to
+/// `entries`.
+fn append_helper_column(
+    entries: &dyn EngineData,
+    schema: &SchemaRef,
+    data_type: DataType,
+    values: Vec<Scalar>,
+) -> KernelResult<Box<dyn EngineData>> {
+    let column = ArrayData::try_new(ArrayType::new(data_type, true), values)?;
+    entries.append_columns(schema.clone(), vec![column])
 }
 
 /// Index of the first of the [`TRACKING_COLUMNS`] getters that end `getters`.
@@ -727,8 +693,9 @@ impl RowVisitor for FilePathVisitor {
 /// Shared constructor for [`EntryConverter`]: builds the entry->`Add` transform (with the caller's
 /// [`AddFieldSources`]) and its evaluator.
 ///
-/// `input_schema` is the schema the transform evaluates against -- the entry schema for a root
-/// batch, or an augmented schema when a caller appends helper columns.
+/// `input_schema` is the schema of the batches passed to [`EntryConverter::convert`] -- the entry
+/// schema for a root batch, or an augmented schema when a caller appends helper columns. The
+/// converter appends [`ENCODED_PATH_HELPER`] itself.
 fn make_entry_converter(
     engine: &dyn Engine,
     ctx: &ReadContext,
@@ -738,7 +705,7 @@ fn make_entry_converter(
     let output_type = DataType::from(LOG_ADD_SCHEMA.as_ref().clone());
     let expr = build_entry_to_add_expression(ctx, sources)?;
     let evaluator = engine.evaluation_handler().new_expression_evaluator(
-        input_schema,
+        schema_with_helpers(&input_schema, &ENCODED_PATH_HELPER_SCHEMA),
         Arc::new(expr),
         output_type,
     )?;
@@ -838,9 +805,13 @@ fn partition_values_map_type() -> KernelResult<MapType> {
 /// - a selected entry that carries a deletion vector: the read path does not yet populate
 ///   `Add.deletionVector`, so a DV-less `Add` would read its logically deleted rows back as live;
 /// - a selected entry that carries column files, whose updated values a plain `Add` would drop.
+///
+/// Alongside, it encodes each selected entry's raw `location` (see [`amt_location_to_add_path`])
+/// into [`ENCODED_PATH_HELPER`] values: the encoded path when encoding changes it, else null.
 struct AddSelectionVisitor<'r> {
     removed: RemovedEntries<'r>,
     selection: Vec<bool>,
+    encoded_paths: Vec<Scalar>,
 }
 
 impl RowVisitor for AddSelectionVisitor<'_> {
@@ -877,10 +848,12 @@ impl RowVisitor for AddSelectionVisitor<'_> {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         self.selection.reserve(row_count);
+        self.encoded_paths.reserve(row_count);
         for row in 0..row_count {
             // `selection` holds one flag per row visited so far, so its length is this row's index.
             if self.removed.contains(self.selection.len()) {
                 self.selection.push(false);
+                self.encoded_paths.push(Scalar::Null(DataType::STRING));
                 continue;
             }
             let content_type = DataContentType::try_from_repr(getters[0].get(row, CONTENT_TYPE)?)?;
@@ -899,10 +872,17 @@ impl RowVisitor for AddSelectionVisitor<'_> {
                     false
                 }
             };
-            if selected {
+            let encoded_path = if selected {
                 check_selected_entry(row, location, getters)?;
-            }
+                match amt_location_to_add_path(location)? {
+                    Cow::Owned(path) => Some(path),
+                    Cow::Borrowed(_) => None,
+                }
+            } else {
+                None
+            };
             self.selection.push(selected);
+            self.encoded_paths.push(encoded_path.into());
         }
         Ok(())
     }
@@ -1192,8 +1172,8 @@ mod tests {
     use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::Int64Type;
     use crate::content_tree::test_utils::{
-        added_data_entry, data_manifest_entry, entry_batch, mumbling_bitmap, struct_batch,
-        with_field, write_manifest,
+        action_paths, added_data_entry, data_manifest_entry, entry_batch, mumbling_bitmap,
+        struct_batch, with_field, write_manifest,
     };
     use crate::content_tree::{DeletionVectorInfo, ManifestInfo};
     use crate::engine::arrow_conversion::TryFromArrow as _;
@@ -2076,15 +2056,7 @@ mod tests {
         let paths: Vec<_> = read_tree(&engine, &checkpoint)
             .unwrap()
             .iter()
-            .flat_map(|batch| {
-                let add = batch.column_by_name(ADD_NAME).unwrap().as_struct();
-                let paths = add.column_by_name(PATH_NAME).unwrap().as_string::<i32>();
-                paths
-                    .iter()
-                    .flatten()
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|batch| action_paths(batch, ADD_NAME))
             .collect();
 
         assert_eq!(paths, ["a%20b.parquet", "c%20d.parquet"]);
