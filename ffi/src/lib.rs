@@ -2181,6 +2181,28 @@ pub unsafe extern "C" fn visit_protocol(
 
 // === Metadata handle FFI ===
 
+/// Visits the snapshot's complete metadata action without engine I/O.
+///
+/// Borrows `snapshot` and invokes `visitor` once with `context` and a borrowed metadata view.
+/// The view and all nested pointers are valid only until the callback returns. Callers must copy
+/// any values they retain. The original schema JSON is preserved without reserialization.
+///
+/// # Safety
+///
+/// `snapshot` must be a valid, live handle for the duration of the call. `visitor` must not unwind
+/// or invalidate the snapshot. Any non-null `context` must satisfy the visitor's requirements.
+#[cfg(feature = "internal-api")]
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_visit_metadata(
+    snapshot: Handle<SharedSnapshot>,
+    context: NullableCvoid,
+    visitor: extern "C" fn(NullableCvoid, *const delta_types::FfiMetadata),
+) {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let backing = delta_types::MetadataBacking::new(snapshot.table_configuration().metadata());
+    visitor(context, &backing.as_ffi());
+}
+
 /// Get the metadata for this snapshot. The returned handle must be freed with [`free_metadata`].
 ///
 /// # Safety
