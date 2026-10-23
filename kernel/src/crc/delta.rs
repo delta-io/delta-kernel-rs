@@ -39,8 +39,10 @@ pub(crate) struct CrcDelta {
     pub(crate) last_manifest_commit: Option<LastManifestCommit>,
     /// Whether the file-stats portion of this delta can be applied incrementally. When `false`,
     /// [`Crc::apply`] transitions [`FileStatsState`] to `Indeterminate`. Producers set this to
-    /// `false` whenever they observe a signal that makes incremental tracking unsound (for
-    /// example, a non-incremental operation such as `ANALYZE STATS`).
+    /// `false` when file-stat changes cannot be tracked safely or their policy excludes
+    /// incremental construction. Replay rejects unknown operations only when their commit
+    /// contains file actions; transactions exclude custom operations even without file
+    /// actions.
     pub(crate) is_incremental_safe: bool,
 }
 
