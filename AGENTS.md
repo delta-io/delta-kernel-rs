@@ -129,6 +129,8 @@ create-table builder aliases `TransactionBuilder<CreateTable, MODE>`. The mode d
 `Imperative`. Both entry points return imperative builders; with `declarative-plans`,
 `with_execution_mode::<MODE>()` selects the mode returned by `build()`. Common setters have one
 generic implementation.
+`transaction::imperative` and `transaction::declarative` contain mode-specific staging and commit
+APIs; transaction configuration and mode-independent validation remain shared.
 The sealed `TransactionType` trait selects opaque type-specific state; specialized implementations
 provide constructors, custom setters, and build validation.
 `Snapshot::update_table(operation, engine_info, data_change)` requires all three values at
