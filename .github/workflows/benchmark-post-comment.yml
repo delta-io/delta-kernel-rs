@@ -84,7 +84,7 @@ jobs:
         id: download-num
         if: github.event.workflow_run.event == 'issue_comment'
         continue-on-error: true
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@v8.0.2
         with:
           name: bench-pr-number
           path: /tmp/
@@ -151,7 +151,7 @@ jobs:
         id: download-body
         if: steps.pr.outputs.skip != 'true'
         continue-on-error: true
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@v8.0.2
         with:
           name: bench-comment
           path: /tmp/
@@ -160,7 +160,7 @@ jobs:
       - name: Find existing bench comment
         id: find
         if: steps.pr.outputs.skip != 'true' && steps.download-body.outcome == 'success'
-        uses: peter-evans/find-comment@3eae4d37986fb5a8592848f6a574fdf654e61f9e # v3.1.0
+        uses: peter-evans/find-comment@v3.1.0
         with:
           issue-number: ${{ steps.pr.outputs.number }}
           comment-author: 'github-actions[bot]'
@@ -170,7 +170,7 @@ jobs:
         # otherwise it replaces the existing body. Either way only one bench
         # comment exists on the PR.
         if: steps.pr.outputs.skip != 'true' && steps.download-body.outcome == 'success'
-        uses: peter-evans/create-or-update-comment@71345be0265236311c031f5c7866368bd1eff043 # v4.0.0
+        uses: peter-evans/create-or-update-comment@v4.0.0
         with:
           comment-id: ${{ steps.find.outputs.comment-id }}
           issue-number: ${{ steps.pr.outputs.number }}
@@ -200,7 +200,7 @@ jobs:
         id: download-num
         if: github.event.workflow_run.event == 'issue_comment'
         continue-on-error: true
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@v8.0.2
         with:
           name: bench-pr-number
           path: /tmp/
@@ -264,7 +264,7 @@ jobs:
         id: probe-body
         if: steps.pr.outputs.skip != 'true'
         continue-on-error: true
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@v8.0.2
         with:
           name: bench-comment
           path: /tmp/
@@ -273,14 +273,14 @@ jobs:
       - name: Find existing bench comment
         id: find
         if: steps.pr.outputs.skip != 'true' && steps.probe-body.outcome != 'success'
-        uses: peter-evans/find-comment@3eae4d37986fb5a8592848f6a574fdf654e61f9e # v3.1.0
+        uses: peter-evans/find-comment@v3.1.0
         with:
           issue-number: ${{ steps.pr.outputs.number }}
           comment-author: 'github-actions[bot]'
           body-includes: '<!-- delta-kernel-bench-comment -->'
       - name: Post or update failure note
         if: steps.pr.outputs.skip != 'true' && steps.probe-body.outcome != 'success'
-        uses: peter-evans/create-or-update-comment@71345be0265236311c031f5c7866368bd1eff043 # v4.0.0
+        uses: peter-evans/create-or-update-comment@v4.0.0
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}
         with:

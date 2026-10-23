@@ -239,7 +239,7 @@ jobs:
         # TODO: Split dependency preparation and publication from model execution so the
         # secret-bearing model job has no GitHub write credential and can allow only GATEWAY_HOST.
         # This job also needs GitHub, npm, and PyPI endpoints for setup and publication.
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40  # v2.20.1
+        uses: step-security/harden-runner@v2.20.1
         with:
           egress-policy: block
           disable-sudo-and-containers: true
@@ -300,7 +300,7 @@ jobs:
 
       - name: Check out repo
         if: steps.creds.outputs.available == 'true'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           # The workflow event commit is the trusted base/default-branch SHA for
           # pull_request_target and issue_comment, or the selected dispatch ref.
@@ -312,7 +312,7 @@ jobs:
       # TODO: Evaluate the stability of tracking Delta master and define an update policy.
       - name: Check out Delta reference
         if: steps.creds.outputs.available == 'true'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           repository: delta-io/delta
           ref: master
@@ -322,19 +322,19 @@ jobs:
 
       - name: Set up Python
         if: steps.creds.outputs.available == 'true'
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@v6.2.0
         with:
           python-version: "3.12"
 
       - name: Set up uv
         if: steps.creds.outputs.available == 'true'
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        uses: astral-sh/setup-uv@v8.2.0
         with:
           enable-cache: true
 
       - name: Set up Node.js
         if: steps.creds.outputs.available == 'true'
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6.0.0
+        uses: actions/setup-node@v6.5.0
         with:
           node-version: "22"
           cache: npm
@@ -1217,7 +1217,7 @@ jobs:
         if: >-
           steps.review.outputs.review_text != '' &&
           vars.OMNIGENT_BOT_APP_ID != ''
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        uses: actions/create-github-app-token@v3.2.0
         with:
           client-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
           private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
@@ -1334,7 +1334,7 @@ jobs:
         if: >-
           steps.review.outputs.review_text != '' &&
           needs.authorize.outputs.output_mode == 'artifact'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ai-review-${{ needs.authorize.outputs.pr_number }}-${{ github.run_id }}
           path: /tmp/review_output.txt

@@ -53,15 +53,15 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
         with:
           cache: false
       # shared-key keeps this and `run-benchmark` in the same cache namespace
       # so PR runs can restore what we save here.
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-bin: false
           shared-key: bench
@@ -181,7 +181,7 @@ jobs:
         # workflow YAML is fork-controlled, so the post-comment workflow
         # ignores this artifact and derives the PR number from the trusted
         # workflow_run.head_branch instead.
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: bench-pr-number
           path: /tmp/pr-number.txt
@@ -192,7 +192,7 @@ jobs:
         # --locked is omitted for cargo install (same exemption as cargo miri
         # setup); --version pins the top-level crate.
         run: cargo install critcmp --version 0.1.8
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@v7.0.1
         with:
           # Check out the integration commit (PR head merged into base) that
           # GitHub maintains at refs/pull/<N>/merge -- the same ref build.yml
@@ -202,7 +202,7 @@ jobs:
           # and the job stops (parity with build/test; see SECURITY_MODEL.md).
           ref: refs/pull/${{ steps.pr.outputs.pr_number }}/merge
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
         with:
           cache: false
       # See build.yml top-level comment for why save-if is restricted to main
@@ -210,7 +210,7 @@ jobs:
       # with `warm-bench-cache` so PR runs restore the entry that main pushes
       # save -- without the shared-key, each job's cache lives in a separate
       # namespace and the warming would not benefit PRs.
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-bin: false
           shared-key: bench
@@ -233,7 +233,7 @@ jobs:
         # Default `if: success()` -- a bench failure leaves no body to post.
         # Runs before the regression gate below so the artifact exists even
         # when the gate fails the job.
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: bench-comment
           path: /tmp/bench-comment.md
@@ -256,7 +256,7 @@ jobs:
         if: >-
           ${{ always() && steps.bench.outputs.results_dir != '' &&
               steps.bench.outputs.archive_results == 'true' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: bench-results
           path: ${{ steps.bench.outputs.results_dir }}

@@ -49,7 +49,7 @@ jobs:
 
       # Download the classified semver outcome artifact written by semver-checks.yml.
       - name: Download semver outcome
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           name: semver-outcome
           github-token: ${{ github.token }}
@@ -107,7 +107,7 @@ jobs:
 
       - name: Upload PR number for title validator
         if: steps.pr-context.outputs.number != ''
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: pr-number
           path: pr-number.txt
