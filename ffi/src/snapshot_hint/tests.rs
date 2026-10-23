@@ -863,8 +863,11 @@ fn visited_hint_preserves_partial_crc_maps_and_indeterminate_file_stats() {
     }
 }
 
-#[test]
-fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
+#[rstest::rstest]
+fn visited_hint_preserves_ratified_staged_paths_for_explicit_version(
+    #[values(false, true)] publish: bool,
+    #[values(None, Some(1), Some(2))] max_catalog_version: Option<Version>,
+) {
     let engine = test_engine();
     let reader_features = [slice("catalogManaged")];
     let writer_features = [slice("catalogManaged"), slice("inCommitTimestamp")];
@@ -926,12 +929,17 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
         Some(0)
     );
     let kernel_engine = unsafe { engine.as_ref() }.engine();
-    let published = source_ref
-        .publish(kernel_engine.as_ref(), &TestCatalogCommitter)
-        .unwrap();
+    let published = if publish {
+        source_ref
+            .publish(kernel_engine.as_ref(), &TestCatalogCommitter)
+            .unwrap()
+    } else {
+        source_ref.clone()
+    };
+    let published_version = u64::from(publish);
     assert_eq!(
         published.log_segment().listed.max_published_version,
-        Some(1)
+        Some(published_version)
     );
     assert_eq!(
         published.log_segment().listed.ascending_commit_files,
@@ -939,7 +947,12 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
     );
     let published: Handle<SharedSnapshot> = published.into();
     let expected_segment = unsafe { published.as_ref() }.log_segment().listed.clone();
-    let builder = unsafe { snapshot_builder_with_max_catalog_version(test_builder(&engine), 1) };
+    let builder = unsafe { snapshot_builder_with_version(test_builder(&engine), 1) };
+    let builder = if let Some(bound) = max_catalog_version {
+        unsafe { snapshot_builder_with_max_catalog_version(builder, bound) }
+    } else {
+        builder
+    };
     let mut state = VisitedHint {
         builder: Some(builder),
         result: None,
@@ -962,7 +975,7 @@ fn visited_hint_after_publish_preserves_staged_paths_and_advanced_watermark() {
     drop(source_ref);
     assert_eq!(
         state.watermark,
-        Some(PublicationWatermark::PublishedThrough(1))
+        Some(PublicationWatermark::PublishedThrough(published_version))
     );
     let rebuilt =
         unsafe { ok_or_panic(snapshot_builder_build(ok_or_panic(state.result.unwrap()))) };
