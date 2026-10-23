@@ -165,8 +165,11 @@ fn app_id_versions_come_from_checkpoint_action_and_later_commits(
     assert_eq!(tail_base.map(|crc| crc.version), expected_tail_base);
 }
 
-fn dm_line(domain: &str, configuration: &str) -> String {
-    let dm = DomainMetadata::new(domain.to_string(), configuration.to_string());
+fn dm(domain: &str, configuration: &str) -> DomainMetadata {
+    DomainMetadata::new(domain.to_string(), configuration.to_string())
+}
+
+fn dm_line(dm: DomainMetadata) -> String {
     serde_json::to_string(&Action::DomainMetadata(dm)).unwrap()
 }
 
@@ -187,27 +190,23 @@ fn domain_metadata_comes_from_checkpoint_action_and_later_commits(
 ) {
     let before = before
         .iter()
-        .map(|(domain, configuration)| dm_line(domain, configuration))
+        .map(|(domain, configuration)| dm_line(dm(domain, configuration)))
         .join("\n");
-    let removed_b = DomainMetadata::remove("b".to_string(), String::new());
     let after = format!(
         "{}\n{}",
-        dm_line("a", "a2"),
-        serde_json::to_string(&Action::DomainMetadata(removed_b)).unwrap()
+        dm_line(dm("a", "a2")),
+        dm_line(DomainMetadata::remove("b".to_string(), String::new()))
     );
     let (engine, snapshot) = table_with_checkpoint_action(
         &before,
         |engine, table_root, snapshot| CheckpointAction {
-            domain_metadata: vec![
-                DomainMetadata::new("a".to_string(), "a1".to_string()),
-                DomainMetadata::new("b".to_string(), "b1".to_string()),
-            ],
+            domain_metadata: vec![dm("a", "a1"), dm("b", "b1")],
             domain_metadata_sidecars: vec![write_sidecar(
                 engine,
                 table_root,
                 "domains.parquet",
                 LOG_DOMAIN_METADATA_SCHEMA.clone(),
-                vec![DomainMetadata::new("d".to_string(), "d1".to_string()).into()],
+                vec![dm("d", "d1").into()],
             )],
             ..checkpoint_action(snapshot)
         },
@@ -230,4 +229,8 @@ fn domain_metadata_comes_from_checkpoint_action_and_later_commits(
             "domain {domain}"
         );
     }
+    let all = snapshot
+        .get_domain_metadatas_internal(&engine, None)
+        .unwrap();
+    assert_eq!(all.keys().sorted().collect_vec(), ["a", "d"]);
 }

@@ -464,20 +464,24 @@ async fn test_domain_metadata_read_across_a_root_manifest_commit(
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("root_manifest_file_domain_metadata").await?;
 
-    // The manifest commit's checkpoint action captures `domain.a` and adds `domain.b`; the commit
-    // after it updates `domain.a`.
+    // The manifest commit's checkpoint action holds `domain.a` and `domain.b`; the commit after it
+    // updates `domain.a` and removes `domain.b`.
     let snapshot = commit_around_root_manifest(
         &engine,
         &table_url,
         snapshot,
         |builder| builder.with_domain_metadata("domain.a", "a1"),
         |builder| builder.with_domain_metadata("domain.b", "b1"),
-        |builder| builder.with_domain_metadata("domain.a", "a2"),
+        |builder| {
+            builder
+                .with_domain_metadata("domain.a", "a2")
+                .with_domain_metadata_removed("domain.b")
+        },
     )?;
 
     for (domain, expected) in [
         ("domain.a", Some("a2")),
-        ("domain.b", Some("b1")),
+        ("domain.b", None),
         ("domain.c", None),
     ] {
         assert_eq!(

@@ -147,27 +147,15 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use itertools::Itertools as _;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use test_utils::add_commit;
     use url::Url;
 
     use crate::actions::visitors::DomainMetadataVisitor;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
     use crate::transaction::create_table::create_table as create_table_txn;
     use crate::transaction::UpdateTableOperation;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::unit_test_utils::adaptive_metadata_fixtures::{
-        checkpoint_action_with_root, checkpoint_line, protocol_and_metadata_lines, write_sidecar,
-    };
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::unit_test_utils::{test_schema_flat_with_column_mapping, Action};
     use crate::{RowVisitor as _, Snapshot};
 
     /// Builds a two-commit in-memory Delta table:
@@ -373,70 +361,5 @@ mod tests {
         assert!(with_tombstones["domainA"].is_removed());
         assert!(!with_tombstones["domainB"].is_removed());
         assert!(!with_tombstones["domainC"].is_removed());
-    }
-
-    /// The `domainMetadata` entries (inline and in sidecars) of an AMT `checkpoint` action stand
-    /// in for the commits at or below its version, and later commits, including removals, override
-    /// them.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[tokio::test]
-    async fn amt_checkpoint_action_supplies_domain_metadata() {
-        let dm_line =
-            |dm: DomainMetadata| serde_json::to_string(&Action::DomainMetadata(dm)).unwrap();
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
-        // The root manifest is never read, so it need not exist.
-        let mut checkpoint = checkpoint_action_with_root("metadata/root.parquet", 1, 1).unwrap();
-        checkpoint.domain_metadata = vec![
-            DomainMetadata::new("a".to_string(), "a1".to_string()),
-            DomainMetadata::new("b".to_string(), "b1".to_string()),
-        ];
-        checkpoint.domain_metadata_sidecars = vec![write_sidecar(
-            &engine,
-            &Url::parse("memory:///").unwrap(),
-            "domains.parquet",
-            LOG_DOMAIN_METADATA_SCHEMA.clone(),
-            vec![DomainMetadata::new("d".to_string(), "d1".to_string()).into()],
-        )];
-        let commits = [
-            // At or below the checkpoint version, so the checkpoint action replaces it.
-            format!(
-                "{}\n{}",
-                protocol_and_metadata_lines(test_schema_flat_with_column_mapping(), &[]),
-                dm_line(DomainMetadata::new("c".to_string(), "c0".to_string()))
-            ),
-            checkpoint_line(&checkpoint),
-            format!(
-                "{}\n{}",
-                dm_line(DomainMetadata::new("a".to_string(), "a2".to_string())),
-                dm_line(DomainMetadata::remove("b".to_string(), String::new()))
-            ),
-        ];
-        for (version, commit) in commits.into_iter().enumerate() {
-            add_commit("memory:///", store.as_ref(), version as u64, commit)
-                .await
-                .unwrap();
-        }
-        let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
-
-        for (domain, expected) in [
-            ("a", Some("a2")),
-            ("b", None),
-            ("c", None),
-            ("d", Some("d1")),
-        ] {
-            assert_eq!(
-                snapshot
-                    .get_domain_metadata(domain, &engine)
-                    .unwrap()
-                    .as_deref(),
-                expected,
-                "domain {domain}"
-            );
-        }
-        let all = snapshot
-            .get_domain_metadatas_internal(&engine, None)
-            .unwrap();
-        assert_eq!(all.keys().sorted().collect::<Vec<_>>(), vec!["a", "d"]);
     }
 }
