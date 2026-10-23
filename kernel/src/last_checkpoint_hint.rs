@@ -563,14 +563,15 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::engine::sync::SyncEngine;
     use crate::engine::test_delegating::DelegatingEngine;
     use crate::engine::CancellableEngine;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::object_store::memory::InMemory;
     use crate::schema::schema;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::create_log_path;
-    use crate::KernelResultIterator;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::{engine::sync::SyncEngine, object_store::memory::InMemory, Engine};
+    use crate::{Engine, KernelResultIterator};
 
     /// A real `_last_checkpoint` for a V2 checkpoint carries a `v2Checkpoint` object; we parse its
     /// `path` and file metadata. An empty `sidecarFiles` (a leaf checkpoint) parses to `Some([])`,
