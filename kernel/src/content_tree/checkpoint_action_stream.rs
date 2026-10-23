@@ -3,9 +3,9 @@
 use std::iter;
 
 use super::action_projector::ActionProjector;
+use super::reader::{read_add_actions_from_amt, ReadContext};
 use crate::actions::{CheckpointAction, ADD_NAME, LOG_ADD_SCHEMA, REMOVE_NAME};
 use crate::cancellation::CancellationTokenRef;
-use crate::content_tree::{read_add_actions_from_amt, ReadContext};
 use crate::log_replay::ActionsBatch;
 use crate::path::LogRoot;
 use crate::schema::SchemaRef;
@@ -18,7 +18,7 @@ use crate::{Engine, KernelError, KernelResult, KernelResultIteratorStatic};
 ///
 /// `add` rows come from the action's content tree. A checkpoint holds reconciled state, so `remove`
 /// rows are never produced.
-pub(super) fn read_checkpoint_action(
+pub(crate) fn read_checkpoint_action(
     engine: &dyn Engine,
     checkpoint: &CheckpointAction,
     log_root: &LogRoot,
