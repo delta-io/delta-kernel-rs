@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::content_tree::struct_expr_from_schema;
+use super::struct_expr_from_schema;
 use crate::expressions::{null_lit, Expression};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{Engine, EngineData, ExpressionEvaluator, KernelError, KernelResult};

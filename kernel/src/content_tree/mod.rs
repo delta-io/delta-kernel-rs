@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 #![allow(unreachable_pub)]
 
+mod action_projector;
 mod builder;
 mod dv_conversion;
 mod mumbling;
@@ -508,7 +509,7 @@ pub(crate) struct ManifestInfo {
 /// # Errors
 /// Returns an error if a non-nullable field has no projection: falling back to a typed null there
 /// would silently emit a null in a non-nullable column.
-pub(crate) fn struct_expr_from_schema(
+fn struct_expr_from_schema(
     schema: &StructType,
     project: impl Fn(&str) -> Option<Expression>,
 ) -> KernelResult<Expression> {
