@@ -1366,14 +1366,7 @@ async fn snapshot_with_crc_at_version_serves_last_manifest_commit_from_crc(
 #[tokio::test]
 async fn no_checksum_from_checkpoint_after_manifest_commit(#[case] later_commits: Vec<String>) {
     let (store, table_root) = manifest_commit_table(&[]).await;
-    let checkpoint_rows = standalone_pm_commit(one_column_schema());
-    add_checkpoint_to_store(
-        &store,
-        parse_json_batch(StringArray::from_iter_values(checkpoint_rows.lines())),
-        &format!("{:020}.checkpoint.parquet", 0),
-    )
-    .await
-    .unwrap();
+    put_pm_checkpoint(&store, 0).await;
     for (version, commit) in later_commits.into_iter().enumerate() {
         add_commit(
             table_root.as_str(),
