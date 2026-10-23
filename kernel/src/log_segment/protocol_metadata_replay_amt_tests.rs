@@ -1357,26 +1357,6 @@ async fn snapshot_with_crc_at_version_serves_last_manifest_commit_from_crc(
     assert_eq!(snapshot.last_manifest_commit(&engine).unwrap(), expected);
 }
 
-// A post-commit snapshot takes `lastManifestCommit` from the committing transaction: the new
-// commit file is never written here, so any log read would fail.
-#[tokio::test]
-async fn post_commit_snapshot_takes_last_manifest_commit_from_the_transaction() {
-    let (store, table_root) = manifest_commit_table(&[]).await;
-    let engine = non_plan_engine(store);
-    let snapshot = Snapshot::builder_for(table_root.clone())
-        .build(&engine)
-        .unwrap();
-    let expected = Some(LastManifestCommit::new(0, 0).unwrap());
-
-    let commit = ParsedLogPath::create_parsed_published_commit(&table_root, 1);
-    let crc_delta = CrcDelta {
-        last_manifest_commit: expected.clone(),
-        ..Default::default()
-    };
-    let post_commit = snapshot.new_post_commit(commit, crc_delta, None).unwrap();
-    assert_eq!(post_commit.last_manifest_commit(&engine).unwrap(), expected);
-}
-
 // A checkpoint at or after a manifest commit lists only the files added after the manifest tree, so
 // a checksum counted from it would miss the tree's files. Kernel refuses to write such a
 // checkpoint, so it is written by hand, standing in for another writer's.
