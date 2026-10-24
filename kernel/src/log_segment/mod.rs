@@ -931,31 +931,15 @@ impl LogSegment {
         engine: &dyn Engine,
         pointer: &LastManifestCommit,
     ) -> KernelResult<CheckpointAction> {
-        let inconsistent = |detail: String| {
-            KernelError::invalid_log_segment(format!(
-                "lastManifestCommit names manifest commit version {} as the source of content \
-                 root version {}, but {detail}",
-                pointer.version, pointer.content_root_version
-            ))
-        };
         let commit = self.find_pointed_commit(pointer).ok_or_else(|| {
-            inconsistent("this log segment does not list that commit".to_string())
+            inconsistent_pointer(pointer, "this log segment does not list that commit")
         })?;
         let files = std::slice::from_ref(&commit.location);
         let batches =
             engine
                 .json_handler()
                 .read_json_files(files, LOG_CHECKPOINT_SCHEMA.clone(), None)?;
-        let action = first_checkpoint_action(batches)?
-            .ok_or_else(|| inconsistent("that commit carries no checkpoint action".to_string()))?;
-        require!(
-            action.content_root_version() == pointer.content_root_version,
-            inconsistent(format!(
-                "that commit's checkpoint action has content root version {}",
-                action.content_root_version()
-            ))
-        );
-        Ok(action)
+        require_pointed_checkpoint_action(pointer, first_checkpoint_action(batches)?)
     }
 
     /// The listed commit at `pointer`'s version, or `None` when this segment does not list it.
@@ -1010,14 +994,50 @@ impl LogSegment {
     }
 
     fn find_commit_cover_paths(&self) -> Vec<ParsedLogPath> {
+        Self::commit_cover_paths_using(
+            self.listed.ascending_commit_files.iter(),
+            self.listed.ascending_compaction_files.iter(),
+        )
+    }
+
+    /// The commit cover over versions in `(oldest_exclusive, newest_inclusive]`, in descending
+    /// order. Each of `required_deltas` is read as its own commit file, never through a log
+    /// compaction.
+    #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+    fn find_commit_cover_paths_in_range(
+        &self,
+        oldest_exclusive: Option<Version>,
+        newest_inclusive: Version,
+        required_deltas: &[Version],
+    ) -> Vec<ParsedLogPath> {
+        let (commits, compactions) =
+            self.filtered_commits_and_compactions(oldest_exclusive, newest_inclusive);
+        let spans_required_delta = |compaction: &&ParsedLogPath| {
+            matches!(
+                compaction.file_type,
+                LogPathFileType::CompactedCommit { hi }
+                    if required_deltas.iter().any(|v| (compaction.version..=hi).contains(v))
+            )
+        };
+        Self::commit_cover_paths_using(
+            commits.iter(),
+            compactions
+                .iter()
+                .filter(|compaction| !spans_required_delta(compaction)),
+        )
+    }
+
+    /// The commit cover over the ascending `commits` and `compactions`.
+    fn commit_cover_paths_using<'a>(
+        commits: impl Iterator<Item = &'a ParsedLogPath>,
+        compactions: impl Iterator<Item = &'a ParsedLogPath>,
+    ) -> Vec<ParsedLogPath> {
         // Create an iterator sorted in ascending order by (initial version, end version), e.g.
         // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
         //  10.19.compacted.json, 11.json, ...]
-        let all_files = itertools::Itertools::merge_by(
-            self.listed.ascending_commit_files.iter(),
-            self.listed.ascending_compaction_files.iter(),
-            |path_a, path_b| path_a.version <= path_b.version,
-        );
+        let all_files = itertools::Itertools::merge_by(commits, compactions, |path_a, path_b| {
+            path_a.version <= path_b.version
+        });
 
         let mut last_pushed: Option<&ParsedLogPath> = None;
 
@@ -1738,6 +1758,43 @@ impl LogSegment {
         debug!("Checkpoint schema has compatible partitionValues_parsed for partition pruning");
         true
     }
+}
+
+/// Returns `action`, the first checkpoint action read from the manifest commit `pointer` names,
+/// after checking that it exists and has the pointer's content root version.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn require_pointed_checkpoint_action(
+    pointer: &LastManifestCommit,
+    action: Option<CheckpointAction>,
+) -> KernelResult<CheckpointAction> {
+    let action = action.ok_or_else(|| missing_checkpoint_action(pointer))?;
+    require!(
+        action.content_root_version() == pointer.content_root_version,
+        inconsistent_pointer(
+            pointer,
+            &format!(
+                "that commit's checkpoint action has content root version {}",
+                action.content_root_version()
+            )
+        )
+    );
+    Ok(action)
+}
+
+/// The error for a manifest commit `pointer` names that carries no checkpoint action.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn missing_checkpoint_action(pointer: &LastManifestCommit) -> KernelError {
+    inconsistent_pointer(pointer, "that commit carries no checkpoint action")
+}
+
+/// The error for a `pointer` that the log contradicts, as explained by `detail`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn inconsistent_pointer(pointer: &LastManifestCommit, detail: &str) -> KernelError {
+    KernelError::invalid_log_segment(format!(
+        "lastManifestCommit names manifest commit version {} as the source of content root \
+         version {}, but {detail}",
+        pointer.version, pointer.content_root_version
+    ))
 }
 
 /// The first checkpoint action in `batches`, or `None` when no batch carries one.

@@ -360,6 +360,15 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         crate::version_as_i64(self.version)
     }
 
+    /// The newest version this file covers: the end of a log compaction's range, else
+    /// [`Self::version`].
+    pub(crate) fn last_version(&self) -> Version {
+        match self.file_type {
+            LogPathFileType::CompactedCommit { hi } => hi,
+            _ => self.version,
+        }
+    }
+
     #[internal_api]
     pub(crate) fn is_commit(&self) -> bool {
         matches!(

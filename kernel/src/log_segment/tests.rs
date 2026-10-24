@@ -45,7 +45,8 @@ use crate::schema::{
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table, write_commit,
+    adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table,
+    write_manifest_commit,
 };
 use crate::unit_test_utils::{
     assert_batch_matches, assert_result_error_with_message, create_log_path,
@@ -2279,7 +2280,15 @@ async fn test_commit_cover(
         ..Default::default()
     })
     .await;
-    let cover = log_segment.find_commit_cover();
+    assert_cover(
+        &log_segment,
+        &log_segment.find_commit_cover(),
+        expected_files,
+    );
+}
+
+/// Asserts that `cover`, a commit cover of `log_segment`, reads exactly `expected_files` in order.
+fn assert_cover(log_segment: &LogSegment, cover: &[FileMeta], expected_files: &[ExpectedFile]) {
     // our test-utils include "_delta_log" in the path, which is already in log_segment.log_root, so
     // we don't use them. TODO: Unify this
     let expected_locations = expected_files.iter().map(|ef| match ef {
@@ -2296,6 +2305,87 @@ async fn test_commit_cover(
     for (location, expected_location) in cover.iter().zip(expected_locations) {
         assert_eq!(location.location, expected_location);
     }
+}
+
+// Compaction listing is disabled, so the compactions are added to the listed segment by hand.
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+#[rstest]
+#[case::replaces_spanning_compaction_with_commits(
+    (None, 4),
+    &[2],
+    &[
+        ExpectedFile::Commit(4),
+        ExpectedFile::Commit(3),
+        ExpectedFile::Commit(2),
+        ExpectedFile::Compaction(0, 1),
+    ]
+)]
+#[case::spanning_compaction_end(
+    (None, 4),
+    &[1],
+    &[
+        ExpectedFile::Commit(4),
+        ExpectedFile::Compaction(2, 3),
+        ExpectedFile::Commit(1),
+        ExpectedFile::Commit(0),
+    ]
+)]
+#[case::no_compaction_spans_version(
+    (None, 4),
+    &[4],
+    &[ExpectedFile::Commit(4), ExpectedFile::Compaction(2, 3), ExpectedFile::Compaction(0, 1)]
+)]
+#[case::compactions_spanning_either_version(
+    (None, 4),
+    &[0, 3],
+    &[
+        ExpectedFile::Commit(4),
+        ExpectedFile::Commit(3),
+        ExpectedFile::Commit(2),
+        ExpectedFile::Commit(1),
+        ExpectedFile::Commit(0),
+    ]
+)]
+#[case::oldest_exclusive_drops_files_at_or_below_it(
+    (Some(1), 4),
+    &[],
+    &[ExpectedFile::Commit(4), ExpectedFile::Compaction(2, 3)]
+)]
+#[case::newest_inclusive_drops_compaction_past_it(
+    (None, 2),
+    &[],
+    &[ExpectedFile::Commit(2), ExpectedFile::Compaction(0, 1)]
+)]
+#[case::empty_range((Some(4), 4), &[], &[])]
+#[tokio::test]
+async fn commit_cover_in_range_reads_required_deltas_as_their_own_files(
+    #[case] (oldest_exclusive, newest_inclusive): (Option<Version>, Version),
+    #[case] required_deltas: &[Version],
+    #[case] expected_files: &[ExpectedFile],
+) {
+    let mut log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    let compaction = |lo: Version, hi: Version| {
+        let location = log_segment
+            .log_root
+            .join(&format!("{lo:020}.{hi:020}.compacted.json"))
+            .unwrap();
+        ParsedLogPath::try_from(FileMeta::new(location, 0, 100))
+            .unwrap()
+            .unwrap()
+    };
+    let compactions = vec![compaction(0, 1), compaction(2, 3)];
+    log_segment.listed.ascending_compaction_files = compactions;
+
+    let cover = log_segment
+        .find_commit_cover_paths_in_range(oldest_exclusive, newest_inclusive, required_deltas)
+        .into_iter()
+        .map(|path| path.location)
+        .collect_vec();
+    assert_cover(&log_segment, &cover, expected_files);
 }
 
 #[tokio::test]
@@ -5659,17 +5749,17 @@ fn latest_checkpoint_action_returns_none_without_checkpoint() -> KernelResult<()
 #[test]
 fn latest_checkpoint_action_returns_the_latest_of_multiple() -> KernelResult<()> {
     let (engine, table_root) = setup_table()?;
-    write_commit(
+    write_manifest_commit(
         &engine,
         &table_root,
         1,
-        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?.into_engine_data(&engine)?,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?,
     )?;
-    write_commit(
+    write_manifest_commit(
         &engine,
         &table_root,
         2,
-        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?.into_engine_data(&engine)?,
+        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?,
     )?;
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -5689,11 +5779,11 @@ fn latest_checkpoint_action_returns_the_latest_of_multiple() -> KernelResult<()>
 #[test]
 fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> KernelResult<()> {
     let (engine, table_root) = setup_table()?;
-    write_commit(
+    write_manifest_commit(
         &engine,
         &table_root,
         1,
-        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?.into_engine_data(&engine)?,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?,
     )?;
 
     let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
@@ -5704,11 +5794,11 @@ fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> K
     assert_eq!(first.version(), 1);
 
     // Write a newer checkpoint action AFTER the snapshot's log segment was frozen.
-    write_commit(
+    write_manifest_commit(
         &engine,
         &table_root,
         2,
-        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?.into_engine_data(&engine)?,
+        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?,
     )?;
 
     // The frozen snapshot still reports version 1.
@@ -5812,12 +5902,11 @@ async fn amt_last_checkpoint_hint_bounds_listing(
 fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> KernelResult<()> {
     let (engine, table_root) = setup_table()?;
     for version in 1..=2 {
-        write_commit(
+        write_manifest_commit(
             &engine,
             &table_root,
             version,
-            minimal_checkpoint_action(&format!("metadata/root-v{version}.parquet"), version)?
-                .into_engine_data(&engine)?,
+            minimal_checkpoint_action(&format!("metadata/root-v{version}.parquet"), version)?,
         )?;
     }
     let hint = LastCheckpointHint {
