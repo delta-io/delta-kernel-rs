@@ -38,11 +38,11 @@ pub mod arrow_conversion;
 
 #[cfg(all(feature = "arrow-expression", feature = "default-engine-base"))]
 pub mod arrow_expression;
-#[cfg(all(feature = "arrow-expression", feature = "internal-api"))]
+#[cfg(all(feature = "default-engine-base", feature = "internal-api"))]
 pub mod arrow_utils;
-#[cfg(all(feature = "arrow-expression", not(feature = "internal-api")))]
+#[cfg(all(feature = "default-engine-base", not(feature = "internal-api")))]
 pub(crate) mod arrow_utils;
-#[cfg(all(feature = "internal-api", feature = "arrow-expression"))]
+#[cfg(all(feature = "default-engine-base", feature = "internal-api"))]
 pub use self::arrow_utils::{parse_json, to_json_bytes};
 
 // The plan executor support modules read Arrow data (`arrow_utils`, `arrow_data`), so they

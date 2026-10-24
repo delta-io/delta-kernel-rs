@@ -845,12 +845,14 @@ fn visited_hint_preserves_partial_crc_maps_and_indeterminate_file_stats() {
     let kernel_engine = unsafe { engine.as_ref() }.engine();
     assert_eq!(
         rebuilt_ref
+            .reader()
             .get_app_id_version("app", kernel_engine.as_ref())
             .unwrap(),
         Some(7)
     );
     assert_eq!(
         rebuilt_ref
+            .reader()
             .get_domain_metadata("example.domain", kernel_engine.as_ref())
             .unwrap()
             .as_deref(),
@@ -1695,12 +1697,14 @@ fn aggregate_with_builds_latest_snapshot_from_rich_crc(
     let kernel_engine = unsafe { engine.as_ref() }.engine();
     assert_eq!(
         snapshot_ref
+            .reader()
             .get_app_id_version("app", kernel_engine.as_ref())
             .unwrap(),
         Some(7)
     );
     assert_eq!(
         snapshot_ref
+            .reader()
             .get_domain_metadata("example.domain", kernel_engine.as_ref())
             .unwrap()
             .as_deref(),

@@ -2163,11 +2163,15 @@ mod tests {
             assert_eq!(unsafe { version_and_free(ok_or_panic(result)) }, 0);
             let snapshot = Snapshot::builder_for(table_url).build(&test_engine)?;
             assert_eq!(
-                snapshot.get_app_id_version("app_id1", &test_engine)?,
+                snapshot
+                    .reader()
+                    .get_app_id_version("app_id1", &test_engine)?,
                 Some(1)
             );
             assert_eq!(
-                snapshot.get_app_id_version("app_id2", &test_engine)?,
+                snapshot
+                    .reader()
+                    .get_app_id_version("app_id2", &test_engine)?,
                 Some(2)
             );
         }

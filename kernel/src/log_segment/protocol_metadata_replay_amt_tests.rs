@@ -335,8 +335,7 @@ async fn latest_checkpoint_action_without_replay_follows_commit_info_pointer() {
     let storage = engine.storage_handler();
     let log_root = table_root.join("_delta_log/").unwrap();
     let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
-            .unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
     let table_configuration = adaptive_metadata_table_configuration(one_column_schema(), &[]);
     let snapshot = Snapshot::new(log_segment, table_configuration).unwrap();
 
@@ -406,8 +405,7 @@ async fn assert_replay_resolution<E: Engine>(
     let storage = engine.storage_handler();
     let log_root = table_root.join("_delta_log/").unwrap();
     let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
-            .unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
 
     let resolution = log_segment
         .read_protocol_metadata_opt(&engine, None)
@@ -640,10 +638,9 @@ async fn read_last_checkpoint_action_from_pointer_rejects_commit_outside_segment
     let engine = non_plan_engine(store);
     let storage = engine.storage_handler();
     let log_root = table_root.join("_delta_log/").unwrap();
-    let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
-            .unwrap()
-            .segment_after_version(0);
+    let log_segment = LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None)
+        .unwrap()
+        .segment_after_version(0);
 
     let pointer = LastManifestCommit::new(pointer_version, pointer_version).unwrap();
     let result = log_segment.read_last_checkpoint_action_from_pointer(&engine, &pointer);

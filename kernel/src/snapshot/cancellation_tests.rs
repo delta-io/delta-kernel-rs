@@ -183,6 +183,26 @@ fn engine_reported_crc_cancellation_is_not_optional() {
     assert_eq!(reads.events.lock().unwrap().last(), Some(&Read::Crc));
 }
 
+/// Keeps the reader token on tail-only metadata replay rooted in a stale complete CRC.
+#[test]
+fn reader_stale_crc_replay_is_cancellable() {
+    let (url, _temp) = stale_crc_table();
+    let reads = RecordingReads::new(Some(Read::Json));
+    let snapshot = Snapshot::builder_for(&url)
+        .with_incremental_crc_replay(IncrementalReplay::Disabled)
+        .build(reads.inner.as_ref())
+        .unwrap();
+    assert!(snapshot.crc_at_version().is_none());
+    let reader = snapshot
+        .reader()
+        .with_cancellation_token(reads.token.clone() as CancellationTokenRef);
+    assert!(matches!(
+        reader.get_domain_metadata("missing", &reads.engine()),
+        Err(KernelError::Cancelled)
+    ));
+    assert_eq!(*reads.events.lock().unwrap(), [Read::Json]);
+}
+
 /// Creates a table with CRC at version zero and a newer commit to replay.
 fn stale_crc_table() -> (Url, TempDir) {
     let (url, temp) = copy_test_table("crc-full").unwrap();

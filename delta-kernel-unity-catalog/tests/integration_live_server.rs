@@ -312,6 +312,7 @@ async fn live_create_table() {
 
     // Appending 3 rows to a row-tracking table assigns IDs 0..=2, advancing the mark from -1 to 2.
     let row_tracking = snapshot
+        .reader()
         .get_domain_metadata_internal("delta.rowTracking", engine.as_ref())
         .expect("failed to read delta.rowTracking domain metadata");
     assert_eq!(

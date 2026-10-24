@@ -67,9 +67,18 @@ async fn test_write_txn_actions(
         let snapshot = Snapshot::builder_for(table_url.clone())
             .at_version(1)
             .build(&engine)?;
-        assert_eq!(snapshot.get_app_id_version("app_id1", &engine)?, Some(1));
-        assert_eq!(snapshot.get_app_id_version("app_id2", &engine)?, Some(2));
-        assert_eq!(snapshot.get_app_id_version("app_id3", &engine)?, None);
+        assert_eq!(
+            snapshot.reader().get_app_id_version("app_id1", &engine)?,
+            Some(1)
+        );
+        assert_eq!(
+            snapshot.reader().get_app_id_version("app_id2", &engine)?,
+            Some(2)
+        );
+        assert_eq!(
+            snapshot.reader().get_app_id_version("app_id3", &engine)?,
+            None
+        );
 
         let commit1 = store
             .get(&Path::from(format!(

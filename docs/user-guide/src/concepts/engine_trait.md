@@ -80,7 +80,8 @@ column matching for column mapping.
 Reading the Delta log for a large table can touch many commit and checkpoint files, and a
 connector often wants to abandon that work when the request behind it goes away — a cancelled
 query, a dropped RPC, a closed session. Kernel supports this cooperatively through an optional
-[`CancellationToken`] that a caller attaches to a scan (see
+[`CancellationToken`] that a caller attaches to a snapshot builder, snapshot metadata reader,
+or scan (see
 [Advanced reads with scan_metadata()](../reading/scan_metadata.md#cancelling-a-scan)).
 
 Cancellation-aware handlers respond at two boundaries:

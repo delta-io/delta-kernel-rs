@@ -1710,6 +1710,7 @@ pub unsafe extern "C" fn snapshot_timestamp(
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
     snapshot
+        .reader()
         .get_timestamp(engine_ref.engine().as_ref())
         .into_extern_result(&engine_ref)
 }
