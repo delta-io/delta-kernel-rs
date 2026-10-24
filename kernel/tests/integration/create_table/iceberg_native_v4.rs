@@ -8,6 +8,7 @@ use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::UpdateTableOperation;
 use test_utils::{read_actions_from_commit, test_table_setup};
 use url::Url;
 
@@ -70,5 +71,30 @@ async fn test_create_table_iceberg_native_v4() -> Result<(), Box<dyn std::error:
     let table_url = Url::from_directory_path(&table_path).expect("valid path");
     assert!(read_actions_from_commit(&table_url, 0, "add")?.is_empty());
     assert!(read_actions_from_commit(&table_url, 0, "checkpoint")?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_commit_without_file_actions_after_create_iceberg_native_v4(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    create_table(
+        &table_path,
+        schema_ref! { nullable "id": LONG },
+        "Test/1.0",
+        true,
+    )
+    .with_table_properties([("delta.enableIcebergNativeV4", "true")])
+    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+    .commit(engine.as_ref())?
+    .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let committed = snapshot
+        .update_table(UpdateTableOperation::Write, "Test/1.0", false)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    assert_eq!(committed.commit_version(), 1);
     Ok(())
 }
