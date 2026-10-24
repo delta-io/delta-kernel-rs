@@ -29,8 +29,6 @@ use crate::schema::{
     StructType,
 };
 use crate::table_configuration::TableConfiguration;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::table_features::Operation;
 use crate::table_features::{
     add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
     ensure_domain_metadata_dependency, find_max_column_id_in_schema,
@@ -1183,11 +1181,13 @@ fn try_new_create_table<MODE: ExecutionMode>(
         IcebergCompatValidationContext::Write,
     )?;
 
-    // IcebergNativeV4 limits the allowed writer features. This includes features that build
-    // adds, such as invariants for non-null columns.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     if effective_table_config.is_feature_enabled(&TableFeature::IcebergNativeV4Preview) {
-        effective_table_config.ensure_operation_supported(Operation::Write)?;
+        // IcebergNativeV4 limits the allowed writer features. This includes features that build
+        // adds, such as invariants for non-null columns. Only the V4 requirements are checked,
+        // so features that are listed in the protocol but not enabled impose no requirements.
+        effective_table_config
+            .validate_feature_requirements(&TableFeature::IcebergNativeV4Preview)?;
     }
 
     let span = tracing::info_span!(
@@ -2863,6 +2863,11 @@ mod tests {
         &[(CHECKPOINT_POLICY, "v2")],
         "'v2Checkpoint'"
     )]
+    #[case::byte_column(
+        schema_ref! { nullable "b": BYTE },
+        &[],
+        "icebergNativeV4-preview does not support type at column: b (byte)"
+    )]
     fn test_create_table_iceberg_native_v4_rejects_auto_enabled_features(
         #[case] schema: SchemaRef,
         #[case] extra_properties: &[(&str, &str)],
@@ -2903,6 +2908,25 @@ mod tests {
         let config = &txn.effective_table_config;
         assert!(config.is_feature_enabled(&TableFeature::IcebergNativeV4Preview));
         assert!(config.is_feature_supported(&feature));
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::v2(TableFeature::IcebergCompatV2)]
+    #[case::v3(TableFeature::IcebergCompatV3)]
+    fn test_create_table_iceberg_native_v4_accepts_supported_iceberg_compat(
+        #[case] feature: TableFeature,
+    ) {
+        let feature_key = format!("delta.feature.{feature}");
+        let txn = build_create_table_txn(
+            schema_ref! { nullable "id": INTEGER },
+            &[
+                (ENABLE_ICEBERG_NATIVE_V4, "true"),
+                (feature_key.as_str(), "supported"),
+            ],
+        )
+        .unwrap();
+        assert!(txn.effective_table_config.is_feature_supported(&feature));
     }
 
     /// Asserts the field has CM id == `expected_id` and a `col-` prefixed physical name; returns

@@ -958,7 +958,7 @@ impl TableConfiguration {
     }
 
     /// Validates that all feature requirements for a given feature are satisfied.
-    fn validate_feature_requirements(&self, feature: &TableFeature) -> KernelResult<()> {
+    pub(crate) fn validate_feature_requirements(&self, feature: &TableFeature) -> KernelResult<()> {
         for req in feature.info().feature_requirements {
             match req {
                 FeatureRequirement::Supported(dep) => {
