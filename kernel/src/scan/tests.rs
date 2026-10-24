@@ -796,14 +796,22 @@ fn scan_metadata_from_cancels_cached_metadata_consumption() {
 }
 
 #[rstest]
-#[case::incremental_commits("basic_partitioned", 0, 1, Read::Json, Some(&[3, 3][..]))]
-#[case::checkpoint_full_rescan("with_checkpoint_no_last_checkpoint", 1, 2, Read::Footer, None)]
+#[case::incremental_commits("basic_partitioned", 0, 1, &[3], &[3, 3], &[Read::Json])]
+#[case::checkpoint_full_rescan(
+    "with_checkpoint_no_last_checkpoint",
+    1,
+    2,
+    &[1],
+    &[1],
+    &[Read::Footer, Read::Parquet]
+)]
 fn scan_metadata_from_binds_token_to_new_reads(
     #[case] table_name: &str,
     #[case] existing_version: Version,
     #[case] snapshot_version: Version,
-    #[case] expected_read: Read,
-    #[case] expected_rows: Option<&[usize]>,
+    #[case] expected_existing_rows: &[usize],
+    #[case] expected_rows: &[usize],
+    #[case] expected_reads: &[Read],
     #[values(false, true)] pre_cancelled: bool,
 ) {
     let path = std::fs::canonicalize(PathBuf::from(format!("./tests/data/{table_name}/"))).unwrap();
@@ -827,6 +835,8 @@ fn scan_metadata_from_binds_token_to_new_reads(
         })
         .try_collect()
         .unwrap();
+    let existing_rows: Vec<_> = files.iter().map(RecordBatch::num_rows).collect();
+    assert_eq!(existing_rows, expected_existing_rows);
 
     let files: Vec<_> = files
         .into_iter()
@@ -867,18 +877,18 @@ fn scan_metadata_from_binds_token_to_new_reads(
             })
             .try_collect()
             .unwrap();
-        if let Some(expected_rows) = expected_rows {
-            let actual_rows: Vec<_> = new_files.iter().map(RecordBatch::num_rows).collect();
-            assert_eq!(actual_rows, expected_rows);
-        }
+        let actual_rows: Vec<_> = new_files.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(actual_rows, expected_rows);
     }
 
     if !pre_cancelled {
         let events = reads.events.lock().unwrap();
-        assert!(
-            events.contains(&expected_read),
-            "expected {expected_read:?} read, got {events:?}"
-        );
+        for expected_read in expected_reads {
+            assert!(
+                events.contains(expected_read),
+                "expected {expected_read:?} read, got {events:?}"
+            );
+        }
     }
 }
 

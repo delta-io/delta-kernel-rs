@@ -1073,14 +1073,7 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
-        let scoped_engine = self
-            .cancellation_token
-            .clone()
-            .map(|token| CancellableEngine::new(engine, token));
-        let engine = scoped_engine
-            .as_ref()
-            .map_or(engine, |engine| engine as &dyn Engine);
-        self.scan_metadata_with_engine(engine)
+        self.with_bound_engine(engine, |engine| self.scan_metadata_with_engine(engine))
     }
 
     fn scan_metadata_with_engine(
@@ -1147,6 +1140,23 @@ impl Scan {
         engine: &dyn Engine,
         existing_version: Version,
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
+        existing_predicate: Option<PredicateRef>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<ScanMetadata>>> {
+        self.with_bound_engine(engine, |engine| {
+            self.scan_metadata_from_with_engine(
+                engine,
+                existing_version,
+                existing_data,
+                existing_predicate,
+            )
+        })
+    }
+
+    fn scan_metadata_from_with_engine(
+        &self,
+        engine: &dyn Engine,
+        existing_version: Version,
+        existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
         _existing_predicate: Option<PredicateRef>,
     ) -> KernelResult<Box<dyn KernelResultIterator<ScanMetadata>>> {
         // TODO(#3609): scan_metadata_from does not reuse existing partitionValues_parsed
@@ -1162,14 +1172,6 @@ impl Scan {
                  tables with TIMESTAMP partition columns; use scan_metadata instead"
             )
         );
-        let scoped_engine = self
-            .cancellation_token
-            .clone()
-            .map(|token| CancellableEngine::new(engine, token));
-        let engine = scoped_engine
-            .as_ref()
-            .map_or(engine, |engine| engine as &dyn Engine);
-
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
         let existing_data = existing_data.into_iter();
         // Cached metadata bypasses engine handlers, so kernel must poll cancellation while
@@ -1274,6 +1276,21 @@ impl Scan {
             engine,
             actions_with_checkpoint_info,
         )?))
+    }
+
+    fn with_bound_engine<T>(
+        &self,
+        engine: &dyn Engine,
+        operation: impl FnOnce(&dyn Engine) -> T,
+    ) -> T {
+        let scoped_engine = self
+            .cancellation_token
+            .clone()
+            .map(|token| CancellableEngine::new(engine, token));
+        let engine = scoped_engine
+            .as_ref()
+            .map_or(engine, |engine| engine as &dyn Engine);
+        operation(engine)
     }
 
     fn scan_metadata_inner(
