@@ -845,8 +845,8 @@ async fn test_lagging_checkpoint_action_defers_to_crc_pm() {
 }
 
 // A CRC-seeded pruned replay captures the latest checkpoint action only when it reads the pointed
-// manifest commit: that commit must be after the CRC, and only the non-plan replay reads checkpoint
-// actions once a CRC bounds the replay. Otherwise the snapshot follows the newest commit's pointer.
+// manifest commit, which must be after the CRC. Otherwise the snapshot follows the newest commit's
+// pointer.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[rstest]
 #[case::pointed_commit_after_crc(1)]
@@ -892,7 +892,7 @@ async fn test_crc_seeded_replay_follows_pointer_to_checkpoint_action(#[case] poi
     let captured = test
         .captured_checkpoint_action()
         .map(|action| action.version);
-    let replay_reads_pointed_action = pointed_version == 1 && !cfg!(feature = "declarative-plans");
+    let replay_reads_pointed_action = pointed_version == 1;
     assert_eq!(
         captured,
         replay_reads_pointed_action.then_some(pointed_version as i64)

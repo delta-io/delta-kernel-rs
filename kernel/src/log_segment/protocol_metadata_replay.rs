@@ -136,11 +136,8 @@ impl LogSegment {
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 PmPlanSegment::WholeSegment,
             )?;
-            // This plan reads no checkpoint action, so only the pointer's version can be checked.
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            if let Some((_, pointer)) = &candidate.last_manifest_commit {
-                pointer.ensure_at_or_before(self.end_version)?;
-            }
+            let candidate = candidate.validated_pointer(self.end_version)?;
             return Ok(candidate);
         }
         let replayed = resolve_pm_batches(self.read_pm_batches(engine)?)?;
@@ -237,10 +234,8 @@ impl LogSegment {
         #[cfg(feature = "adaptive-metadata-in-dev")] segment: PmPlanSegment,
     ) -> KernelResult<Plan> {
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let (commit_paths, extra_actions) = (
-            segment.commit_paths(self),
-            segment.extra_actions(self.end_version)?,
-        );
+        let (commit_paths, extra_actions) =
+            (segment.commit_paths(self), segment.extra_actions(self)?);
         #[cfg(not(feature = "adaptive-metadata-in-dev"))]
         let (commit_paths, extra_actions) = (self.find_commit_cover_paths(None), Vec::new());
         let schema = pm_plan_schema(&extra_actions)?;
@@ -331,7 +326,8 @@ impl LogSegment {
             segment,
         )?;
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let end_version = self.end_version;
+        let (end_version, reads_checkpoint_action) =
+            (self.end_version, segment.reads_checkpoint_action(self));
         let batches = executor
             .execute_op(Operation::QueryPlan(plan))?
             .into_data()?
@@ -349,13 +345,13 @@ impl LogSegment {
                     protocol_version,
                     metadata_version,
                     #[cfg(feature = "adaptive-metadata-in-dev")]
-                    projects_checkpoint_action: segment.reads_checkpoint_action(),
+                    projects_checkpoint_action: reads_checkpoint_action,
                     #[cfg(feature = "adaptive-metadata-in-dev")]
                     commit_info_version,
                     // A plan reads the checkpoint action only from the newest or the pointed
                     // commit.
                     #[cfg(feature = "adaptive-metadata-in-dev")]
-                    captures_checkpoint: segment.reads_checkpoint_action(),
+                    captures_checkpoint: reads_checkpoint_action,
                     actions,
                 })
             });
@@ -546,20 +542,29 @@ impl PmPlanSegment {
     }
 
     /// Whether the plan reads the AMT checkpoint action.
-    fn reads_checkpoint_action(self) -> bool {
-        matches!(
-            self,
-            Self::NewestCommit
-                | Self::OlderCommits {
-                    manifest_commit: Some(_),
-                    ..
-                }
-        )
+    fn reads_checkpoint_action(self, log_segment: &LogSegment) -> bool {
+        self.checkpoint_action_version(log_segment).is_some()
     }
 
-    /// The actions the plan reads beyond Protocol and Metadata, in a segment ending at
-    /// `end_version`.
-    fn extra_actions(self, end_version: Version) -> KernelResult<Vec<PmPlanExtraAction>> {
+    /// The version of the commit in `log_segment` whose checkpoint action the plan keeps. Any other
+    /// commit's action is older than the one replay takes. Log compactions carry none.
+    fn checkpoint_action_version(self, log_segment: &LogSegment) -> Option<Version> {
+        match self {
+            // The newest commit's own action, which replay checks against its pointer. A segment
+            // ending on a checkpoint does not list that commit, and the checkpoint's rows share
+            // its version.
+            Self::WholeSegment => log_segment.newest_commit().map(|commit| commit.version),
+            // The newest commit's own action, which replay checks against its pointer.
+            Self::NewestCommit => Some(log_segment.end_version),
+            // The action the newest commit's pointer names.
+            Self::OlderCommits {
+                manifest_commit, ..
+            } => manifest_commit,
+        }
+    }
+
+    /// The actions the plan reads from `log_segment` beyond Protocol and Metadata.
+    fn extra_actions(self, log_segment: &LogSegment) -> KernelResult<Vec<PmPlanExtraAction>> {
         // Keep only `commitInfo` rows with a pointer (none without AMT). Replay uses the newest one
         // only if it is the newest commit's.
         let commit_info = self.reads_commit_info().then(|| PmPlanExtraAction {
@@ -567,19 +572,8 @@ impl PmPlanSegment {
             keep: col!(COMMIT_INFO_NAME, "lastManifestCommit", "version").is_not_null(),
             version_column: Some(COMMIT_INFO_VERSION_COLUMN),
         });
-        // Keep a checkpoint action only from the one commit replay takes it from; any other
-        // commit's action is older. Log compactions carry none.
-        let checkpoint_action_version = match self {
-            // A CRC or checkpoint file bounds this replay, so it needs no checkpoint action.
-            Self::WholeSegment => None,
-            // The newest commit's own action, which replay checks against its pointer.
-            Self::NewestCommit => Some(end_version),
-            // The action the newest commit's pointer names.
-            Self::OlderCommits {
-                manifest_commit, ..
-            } => manifest_commit,
-        };
-        let checkpoint_action = checkpoint_action_version
+        let checkpoint_action = self
+            .checkpoint_action_version(log_segment)
             .map(|version| -> KernelResult<_> {
                 Ok(PmPlanExtraAction {
                     field: &CHECKPOINT_ACTION_FIELD,
