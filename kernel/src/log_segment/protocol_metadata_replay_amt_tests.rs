@@ -586,13 +586,6 @@ async fn non_plan_replay_reads_pointed_commit_once(#[case] later_commits: &[Stri
     ],
     "that commit's checkpoint action has content root version 0"
 )]
-#[case::newest_action_has_other_content_root(
-    vec![
-        standalone_pm_commit(one_column_schema()),
-        carrying_pointer((1, 1), checkpoint_action(0, &[], one_column_schema())),
-    ],
-    "that commit's checkpoint action has content root version 0"
-)]
 #[case::only_older_manifest_commit_carries_action(
     vec![
         checkpoint_commit(0, &[], one_column_schema()),
@@ -601,6 +594,24 @@ async fn non_plan_replay_reads_pointed_commit_once(#[case] later_commits: &[Stri
         commit_info(Some((2, 0))),
     ],
     "that commit carries no checkpoint action"
+)]
+#[tokio::test]
+async fn replay_errors_on_invalid_pointer(
+    #[case] commits: Vec<String>,
+    #[case] expected_error: &str,
+) {
+    assert_replay_errors_on_both_paths(&commits, None, expected_error).await;
+}
+
+// Replay fails the build when the newest commit's checkpoint action contradicts its own pointer,
+// whether or not a CRC bounds the replay.
+#[rstest]
+#[case::newest_action_has_other_content_root(
+    vec![
+        standalone_pm_commit(one_column_schema()),
+        carrying_pointer((1, 1), checkpoint_action(0, &[], one_column_schema())),
+    ],
+    "that commit's checkpoint action has content root version 0"
 )]
 #[case::newest_action_without_pointer(
     vec![
@@ -624,13 +635,23 @@ async fn non_plan_replay_reads_pointed_commit_once(#[case] later_commits: &[Stri
     "that commit carries no checkpoint action"
 )]
 #[tokio::test]
-async fn replay_errors_on_invalid_pointer(
+async fn replay_errors_on_newest_commit_contradicting_its_pointer(
     #[case] commits: Vec<String>,
     #[case] expected_error: &str,
+    #[values(false, true)] crc_seeded: bool,
 ) {
-    assert_replay_errors(&commits, expected_error, non_plan_engine).await;
+    let crc = crc_seeded.then(|| Arc::new(Crc::default()));
+    assert_replay_errors_on_both_paths(&commits, crc.as_ref(), expected_error).await;
+}
+
+async fn assert_replay_errors_on_both_paths(
+    commits: &[String],
+    crc: Option<&Arc<Crc>>,
+    expected_error: &str,
+) {
+    assert_replay_errors(commits, crc, expected_error, non_plan_engine).await;
     #[cfg(feature = "declarative-plans")]
-    assert_replay_errors(&commits, expected_error, |store| {
+    assert_replay_errors(commits, crc, expected_error, |store| {
         SyncEngine::new_with_store(store)
     })
     .await;
@@ -638,13 +659,15 @@ async fn replay_errors_on_invalid_pointer(
 
 async fn assert_replay_errors<E: Engine>(
     commits: &[String],
+    crc: Option<&Arc<Crc>>,
     expected_error: &str,
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
 ) {
     let (store, table_root) = commit_table(commits).await;
 
     let engine = make_engine(store);
-    let result = Snapshot::builder_for(table_root).build(&engine);
+    let log_segment = latest_log_segment(&table_root, &engine);
+    let result = log_segment.read_protocol_metadata_opt(&engine, crc);
     assert!(matches!(&result, Err(KernelError::InvalidLogSegment(_))));
     assert_result_error_with_message(result, expected_error);
 }
@@ -829,7 +852,8 @@ async fn plan_replay_skips_commits_below_pointed_content_root() {
 
 // The pointed manifest commit is newer than the segment's checkpoint, but its content root is not.
 // The non-plan replay reads the whole segment and captures the pointed action. A plan replay
-// bounded by a checkpoint file reads no checkpoint action, leaving it to the pointer.
+// bounded by a checkpoint file reads only the newest commit's action, leaving the pointed one to
+// the pointer.
 #[tokio::test]
 async fn replay_resolves_pointed_action_above_segment_checkpoint() {
     check_pointed_action_above_segment_checkpoint(non_plan_engine, Some(1)).await;
