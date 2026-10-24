@@ -1505,8 +1505,7 @@ impl LastManifestCommit {
         &self,
         action: Option<CheckpointAction>,
     ) -> KernelResult<CheckpointAction> {
-        let action =
-            action.ok_or_else(|| self.inconsistency("that commit carries no checkpoint action"))?;
+        let action = action.ok_or_else(|| self.missing_checkpoint_action())?;
         require!(
             action.content_root_version() == self.content_root_version,
             self.inconsistency(format!(
@@ -1515,6 +1514,11 @@ impl LastManifestCommit {
             ))
         );
         Ok(action)
+    }
+
+    /// The error for a manifest commit this names that carries no checkpoint action.
+    pub(crate) fn missing_checkpoint_action(&self) -> KernelError {
+        self.inconsistency("that commit carries no checkpoint action")
     }
 
     /// The error for a pointer that the log contradicts, as explained by `detail`.
