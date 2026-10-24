@@ -137,8 +137,9 @@ async fn mid_stream_cancellation_yields_cancelled() -> KernelResult<()> {
     Ok(())
 }
 
-// A pre-cancelled scan over a table WITH a checkpoint surfaces `Err(Cancelled)` -- reaching the
-// checkpoint/sidecar/footer `check_cancelled` guards that the JSON-only fixtures never enter.
+// A pre-cancelled scan over a table WITH a checkpoint surfaces `Err(Cancelled)` -- the bound
+// Parquet handler checks the token on checkpoint, sidecar and footer reads that the JSON-only
+// fixtures never enter.
 // `packed` distinguishes a `.tar.zst` fixture (unpacked to a temp dir) from a plain directory.
 #[rstest]
 #[case::v1_checkpoint("with_checkpoint_no_last_checkpoint", false)]
