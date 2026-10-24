@@ -19,6 +19,8 @@ use super::{
     missing_pointed_checkpoint_action, require_pointed_checkpoint_action,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::Version;
+#[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::LastManifestCommitVisitor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{CHECKPOINT_ACTION_FIELD, CheckpointAction, LastManifestCommit};
@@ -49,9 +51,7 @@ use crate::schema::{
     ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, StructField, StructType,
     column_name, schema_ref,
 };
-use crate::{
-    Engine, EngineData, KernelError, KernelResult, KernelResultIterator, Version, version_as_i64,
-};
+use crate::{Engine, EngineData, KernelError, KernelResult, KernelResultIterator, version_as_i64};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -402,23 +402,27 @@ impl LogSegment {
             .actions;
         Ok(batches.map(move |batch| {
             let batch = batch?;
-            // A commit's version is parsed from its `_file`; a checkpoint batch uses the constant.
-            let version = if batch.is_log_batch {
-                batch_version(batch.actions.as_ref())? as i64
+            // A log file's versions are parsed from its `_file`; a checkpoint batch uses the
+            // constant. A log compaction holds the P&M in effect at its last version, so it ranks
+            // there.
+            let (first_version, rank_version) = if batch.is_log_batch {
+                let path = batch_log_path(batch.actions.as_ref())?;
+                (path.version as i64, path.last_version() as i64)
             } else {
-                checkpoint_version.ok_or_else(|| {
+                let version = checkpoint_version.ok_or_else(|| {
                     KernelError::internal_error("checkpoint batch without a version")
-                })?
+                })?;
+                (version, version)
             };
             // Only the commit schema projects the checkpoint action and `commitInfo`.
             #[cfg(feature = "adaptive-metadata-in-dev")]
             let commit_version = batch
                 .is_log_batch
-                .then(|| as_version(version))
+                .then(|| as_version(first_version))
                 .transpose()?;
             Ok(VersionedBatch {
-                protocol_version: Some(version),
-                metadata_version: Some(version),
+                protocol_version: Some(rank_version),
+                metadata_version: Some(rank_version),
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 checkpoint_commit_version: commit_version,
                 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -840,8 +844,8 @@ fn resolve_pm_batches(
     Ok(resolved)
 }
 
-/// Parses the log version from a batch's `_file` metadata column.
-fn batch_version(data: &dyn EngineData) -> KernelResult<Version> {
+/// Parses the log file a batch came from out of its `_file` metadata column.
+fn batch_log_path(data: &dyn EngineData) -> KernelResult<ParsedLogPath<Url>> {
     #[derive(Default)]
     struct FilePathVisitor {
         file: Option<String>,
@@ -871,7 +875,6 @@ fn batch_version(data: &dyn EngineData) -> KernelResult<Version> {
     let url = Url::parse(&file)
         .map_err(|e| KernelError::internal_error(format!("batch has invalid _file {file}: {e}")))?;
     ParsedLogPath::new(url)
-        .map(|path| path.version)
         .ok_or_else(|| KernelError::internal_error(format!("batch from non-log file {file}")))
 }
 
