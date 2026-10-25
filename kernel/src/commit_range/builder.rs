@@ -8,7 +8,7 @@ use crate::log_segment::{
     validate_start_version_available,
 };
 use crate::log_segment_files::LogSegmentFiles;
-use crate::path::{LogPathFileType, ParsedLogPath};
+use crate::path::ParsedLogPath;
 use crate::snapshot::SnapshotRef;
 use crate::utils::require;
 use crate::{Engine, KernelError, KernelResult, LogPath, Version};
@@ -78,8 +78,8 @@ impl CommitRangeBuilder {
         self
     }
 
-    /// Set the catalog-ratified staged commits and maximum catalog-ratified version. The entries
-    /// must be sorted in ascending, contiguous version order.
+    /// Set the catalog-ratified commits and maximum catalog-ratified version. The entries may be
+    /// staged or published commits and must be sorted in ascending, contiguous version order.
     pub fn with_log_tail(mut self, log_tail: Vec<LogPath>, max_catalog_version: Version) -> Self {
         self.log_tail = log_tail.into_iter().map(Into::into).collect();
         self.max_catalog_version = Some(max_catalog_version);
@@ -275,14 +275,6 @@ impl CommitRangeBuilder {
                 ))
             );
         }
-        require!(
-            self.log_tail
-                .iter()
-                .all(|path| path.file_type == LogPathFileType::StagedCommit),
-            KernelError::CommitRange(
-                "Commit range log tail must contain only staged commits".to_string()
-            )
-        );
         validate_catalog_managed_log_tail(
             self.end_version,
             self.max_catalog_version,
@@ -339,6 +331,7 @@ mod tests {
     use crate::commit_range::DeltaAction;
     use crate::engine::sync::SyncEngine;
     use crate::engine::test_delegating::DelegatingEngine;
+    use crate::path::LogPathFileType;
     use crate::utils::FoldWithOption as _;
     use crate::{Engine, FileMeta, KernelResultIterator, LogPath, Snapshot, StorageHandler};
 
@@ -745,8 +738,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_catalog_log_tail_must_contain_only_staged_commits() {
+    #[rstest::rstest]
+    fn test_catalog_log_tail_accepts_published_commits(#[values(false, true)] from_snapshot: bool) {
         let table_root = dv_small_table_root();
         let engine = SyncEngine::new();
         let published = LogPath::try_new(FileMeta::new(
@@ -757,14 +750,44 @@ mod tests {
             1,
         ))
         .unwrap();
-        let err = CommitRange::builder_for(table_root.as_str(), 0)
+        let builder = if from_snapshot {
+            let snapshot = Snapshot::builder_for(table_root.as_str())
+                .at_version(0)
+                .build(&engine)
+                .unwrap();
+            CommitRange::builder_from(snapshot, 0)
+        } else {
+            CommitRange::builder_for(table_root.as_str(), 0)
+        };
+
+        let range = builder
             .with_log_tail(vec![published], 1)
+            .build(&engine)
+            .unwrap();
+
+        assert_eq!(range.end_version(), 1);
+        assert_eq!(range.commit_files.len(), 2);
+        assert_eq!(range.commit_files[1].file_type, LogPathFileType::Commit);
+    }
+
+    #[test]
+    fn test_catalog_log_tail_rejects_non_commit_files() {
+        let table_root = dv_small_table_root();
+        let engine = SyncEngine::new();
+        let crc = LogPath::try_new(FileMeta::new(
+            table_root
+                .join("_delta_log/00000000000000000001.crc")
+                .unwrap(),
+            0,
+            1,
+        ))
+        .unwrap();
+        let err = CommitRange::builder_for(table_root.as_str(), 0)
+            .with_log_tail(vec![crc], 1)
             .build(&engine)
             .unwrap_err();
 
-        assert!(
-            matches!(err, KernelError::CommitRange(message) if message.contains("only staged"))
-        );
+        assert!(matches!(err, KernelError::InvalidLogPath(_)));
     }
 
     #[test]
