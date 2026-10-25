@@ -1288,7 +1288,7 @@ impl Committer for TestCatalogCommitter {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: KernelResultIterator<'_, FilteredEngineData>,
+        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         commit_metadata: CommitMetadata,
     ) -> KernelResult<CommitResponse> {
         let path = commit_metadata.published_commit_path()?;
@@ -1501,6 +1501,18 @@ pub fn nested_variant_schema() -> SchemaRef {
 
 pub fn multiple_variant_schema() -> SchemaRef {
     multi_schema_with_type(DataType::unshredded_variant())
+}
+
+pub fn top_level_file_schema() -> SchemaRef {
+    schema_with_type(DataType::file_type())
+}
+
+pub fn nested_file_schema() -> SchemaRef {
+    nested_schema_with_type(DataType::file_type())
+}
+
+pub fn multiple_file_schema() -> SchemaRef {
+    multi_schema_with_type(DataType::file_type())
 }
 
 /// Returns column mapping table properties for the given mode, or empty for `"none"`.
@@ -1901,7 +1913,7 @@ impl JsonHandler for CapturingJsonHandler {
     fn write_json_file(
         &self,
         path: &Url,
-        data: KernelResultIterator<'_, FilteredEngineData>,
+        data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         overwrite: bool,
     ) -> KernelResult<u64> {
         self.inner.write_json_file(path, data, overwrite)

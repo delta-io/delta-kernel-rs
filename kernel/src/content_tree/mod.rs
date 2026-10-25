@@ -6,6 +6,7 @@
 
 mod builder;
 mod dv_conversion;
+mod mumbling;
 mod reader;
 pub(crate) mod stats;
 #[cfg(test)]

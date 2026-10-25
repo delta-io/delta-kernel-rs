@@ -1,5 +1,7 @@
 //! Builder for transactions against an existing table.
 
+use std::marker::PhantomData;
+
 use delta_kernel_derive::internal_api;
 
 use super::state::TransactionBuilderState;
@@ -15,7 +17,9 @@ use crate::table_features::{
 };
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
-use crate::transaction::{ExecutionMode, Transaction, UpdateTable, UpdateTableOperation};
+use crate::transaction::{
+    ExecutionMode, Imperative, Transaction, UpdateTable, UpdateTableOperation,
+};
 use crate::utils::{current_time_ms, require};
 use crate::{Engine, KernelError, KernelResult};
 
@@ -47,7 +51,7 @@ use crate::{Engine, KernelError, KernelResult};
 /// data-file batches or manifest writes for `ALTER TABLE`.
 ///
 /// cbindgen:ignore
-pub type UpdateTableTransactionBuilder = TransactionBuilder<UpdateTable>;
+pub type UpdateTableTransactionBuilder<MODE = Imperative> = TransactionBuilder<UpdateTable, MODE>;
 
 /// Opaque state collected by update-table-specific builder setters.
 #[doc(hidden)]
@@ -59,7 +63,7 @@ pub struct UpdateTableBuilderState {
     is_blind_append: bool,
 }
 
-impl std::fmt::Debug for TransactionBuilder<UpdateTable> {
+impl<MODE: ExecutionMode> std::fmt::Debug for TransactionBuilder<UpdateTable, MODE> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UpdateTableTransactionBuilder")
             .field("snapshot_version", &self.local_state.snapshot.version())
@@ -88,9 +92,12 @@ impl TransactionBuilder<UpdateTable> {
                 domain_metadata_removals: Vec::new(),
                 is_blind_append: false,
             },
+            _mode: PhantomData,
         }
     }
+}
 
+impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// Marks the transaction as a blind append assertion.
     ///
     /// Blind appends add new files without depending on existing table state. Commit validation
@@ -214,7 +221,7 @@ impl TransactionBuilder<UpdateTable> {
         self,
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
-    ) -> KernelResult<Transaction> {
+    ) -> KernelResult<Transaction<UpdateTable, MODE>> {
         self.validate()?;
         let transaction = try_new_update_table(self, committer, engine)?;
         transaction.validate_domain_metadata_operations()?;
@@ -280,13 +287,14 @@ impl TransactionBuilder<UpdateTable> {
 }
 
 fn try_new_update_table<MODE: ExecutionMode>(
-    builder: UpdateTableTransactionBuilder,
+    builder: UpdateTableTransactionBuilder<MODE>,
     committer: Box<dyn Committer>,
     engine: &dyn Engine,
 ) -> KernelResult<Transaction<UpdateTable, MODE>> {
     let TransactionBuilder {
         common_state,
         local_state,
+        _mode: _,
     } = builder;
     let UpdateTableBuilderState {
         snapshot: read_snapshot,

@@ -40,8 +40,8 @@ use crate::EngineData;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
 use crate::{
-    Engine, FileMeta, KernelError, KernelResult, Predicate, PredicateRef, RowVisitor,
-    StorageHandler, Version,
+    Engine, FileMeta, KernelError, KernelResult, KernelResultIterator, Predicate, PredicateRef,
+    RowVisitor, StorageHandler, Version,
 };
 
 mod crc_replay;
@@ -112,7 +112,7 @@ impl CheckpointReadInfo {
 ///
 /// This struct provides named access to the return values instead of tuple indexing.
 #[internal_api]
-pub(crate) struct ActionsWithCheckpointInfo<A: Iterator<Item = KernelResult<ActionsBatch>>> {
+pub(crate) struct ActionsWithCheckpointInfo<A: KernelResultIterator<ActionsBatch>> {
     /// Iterator over action batches read from the log segment.
     pub actions: A,
     /// Metadata about checkpoint reading, including the schema used.
@@ -871,9 +871,7 @@ impl LogSegment {
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> KernelResult<
-        ActionsWithCheckpointInfo<impl Iterator<Item = KernelResult<ActionsBatch>> + Send>,
-    > {
+    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch>>> {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
@@ -908,7 +906,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         action_schema: SchemaRef,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<ActionsBatch>> + Send> {
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
         let result = self.read_actions_with_projected_checkpoint_actions(
             engine,
             action_schema.clone(),
@@ -985,7 +983,7 @@ impl LogSegment {
         engine: &dyn Engine,
         schema: SchemaRef,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<ActionsBatch>> + Send> {
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
         let commit_files = self.find_commit_cover();
         let actions = engine
             .json_handler()
@@ -1250,9 +1248,7 @@ impl LogSegment {
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
         cancellation_token: Option<&CancellationTokenRef>,
-    ) -> KernelResult<
-        ActionsWithCheckpointInfo<impl Iterator<Item = KernelResult<ActionsBatch>> + Send>,
-    > {
+    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch>>> {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
         let (file_actions_schema, sidecar_files) = if need_file_actions {
@@ -1747,7 +1743,7 @@ impl LogSegment {
 /// The first checkpoint action in `batches`, or `None` when no batch carries one.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn first_checkpoint_action(
-    batches: impl Iterator<Item = KernelResult<Box<dyn EngineData>>>,
+    batches: impl KernelResultIterator<Box<dyn EngineData>>,
 ) -> KernelResult<Option<CheckpointAction>> {
     for batch in batches {
         if let Some(action) = CheckpointAction::try_new_from_data(batch?.as_ref())? {
@@ -1863,7 +1859,8 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> KernelResult<()> {
     Ok(())
 }
 
-fn validate_commit_file_types(commits: &[ParsedLogPath]) -> KernelResult<()> {
+/// Validates that every entry is a published or staged commit file.
+pub(crate) fn validate_commit_file_types(commits: &[ParsedLogPath]) -> KernelResult<()> {
     for f in commits {
         if !f.is_commit() {
             return Err(KernelError::invalid_log_segment(
@@ -1874,7 +1871,8 @@ fn validate_commit_file_types(commits: &[ParsedLogPath]) -> KernelResult<()> {
     Ok(())
 }
 
-fn validate_commit_files_sorted(commits: &[ParsedLogPath]) -> KernelResult<()> {
+/// Validates that commit versions are in strictly increasing order.
+pub(crate) fn validate_commit_files_sorted(commits: &[ParsedLogPath]) -> KernelResult<()> {
     if let Some(pair) = commits
         .windows(2)
         .find(|pair| pair[0].version >= pair[1].version)
@@ -1910,7 +1908,8 @@ pub(crate) fn validate_start_version_available(
     }
 }
 
-fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> KernelResult<()> {
+/// Validates that each commit version immediately follows the previous version.
+pub(crate) fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> KernelResult<()> {
     for pair in commits.windows(2) {
         let Some(expected_version) = pair[0].version.checked_add(1) else {
             return Err(KernelError::invalid_log_segment(format!(

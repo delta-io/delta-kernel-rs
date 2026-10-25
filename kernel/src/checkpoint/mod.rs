@@ -130,8 +130,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    version_as_i64, Engine, EngineData, FileMeta, KernelError, KernelResult,
-    KernelResultIteratorStatic, Version,
+    version_as_i64, Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator,
+    Version,
 };
 
 #[cfg(feature = "declarative-plans")]
@@ -624,7 +624,7 @@ impl CheckpointWriter {
 
         // Write main checkpoint file: non-file actions + sidecar references
         let checkpoint_path = self.checkpoint_path()?;
-        let main_data: KernelResultIteratorStatic<Box<dyn EngineData>> =
+        let main_data: Box<dyn KernelResultIterator<Box<dyn EngineData>>> =
             Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
         let main_size = engine
             .parquet_handler()

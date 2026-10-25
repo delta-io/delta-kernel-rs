@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use delta_kernel::commit_range::{CommitAction, CommitRange, DeltaAction as KernelDeltaAction};
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{KernelError, KernelResult, KernelResultIteratorStatic, LogPath, Version};
+use delta_kernel::{KernelError, KernelResult, KernelResultIterator, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
@@ -336,7 +336,7 @@ pub unsafe extern "C" fn free_commit_action(commit_action: Handle<SharedCommitAc
     commit_action.drop_handle();
 }
 
-type CommitActionIter = KernelResultIteratorStatic<CommitAction>;
+type CommitActionIter = Box<dyn KernelResultIterator<CommitAction>>;
 
 /// Iterator handle returned by [`commit_range_commits`]. Holds the boxed kernel iterator behind a
 /// mutex (so it is safe to share across threads) plus an engine reference for error allocation.
@@ -884,7 +884,11 @@ mod tests {
                 unsafe { free_commit_actions_iter(iter) }
             }
             None => {
-                assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
+                assert_extern_result_error_with_message(
+                    result,
+                    FFIKernelError::CommitRangeError,
+                    None,
+                );
             }
         }
 
@@ -909,7 +913,7 @@ mod tests {
                 0,
             )
         };
-        assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::CommitRangeError, None);
 
         unsafe { free_commit_range(range) }
         unsafe { free_engine(engine) }

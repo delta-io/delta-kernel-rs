@@ -21,7 +21,7 @@ use crate::scan::log_replay::ScanLogReplayProcessor;
 use crate::scan::{ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIteratorStatic};
+use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIterator};
 
 /// Sequential log replay processor for parallel execution.
 ///
@@ -68,7 +68,7 @@ pub(crate) struct SequentialPhase {
     // The processor that will be used to process the action batches
     processor: ScanLogReplayProcessor,
     // Commit action batches, exhausted before the checkpoint manifest
-    commit_phase: Option<KernelResultIteratorStatic<ActionsBatch>>,
+    commit_phase: Option<Box<dyn KernelResultIterator<ActionsBatch>>>,
     // The checkpoint manifest reader that will be used to read the checkpoint manifest files.
     // If the checkpoint is single-part, this will be Some(CheckpointManifestReader).
     checkpoint_manifest_phase: Option<CheckpointManifestReader>,
@@ -106,7 +106,7 @@ impl SequentialPhase {
         engine: Arc<dyn Engine>,
         checkpoint_read_schema: SchemaRef,
     ) -> KernelResult<Self> {
-        let commit_phase: Option<KernelResultIteratorStatic<ActionsBatch>> = Some(Box::new(
+        let commit_phase: Option<Box<dyn KernelResultIterator<ActionsBatch>>> = Some(Box::new(
             log_segment.read_commit_actions(engine.as_ref(), COMMIT_READ_SCHEMA.clone(), None)?,
         ));
 
