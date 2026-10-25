@@ -3,7 +3,9 @@ use std::sync::LazyLock;
 use url::Url;
 
 use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use crate::amt_path_util::{resolve_amt_location, validate_table_relative};
+use crate::amt_path_util::{
+    raw_amt_location_from_uri, resolve_amt_location, validate_table_relative,
+};
 use crate::content_tree::DeletionVectorInfo;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Scalar};
@@ -18,7 +20,8 @@ use crate::{EngineData, KernelError, KernelResult};
 ///   is 20 characters (base85 encoded), and any characters before that are the optional random
 ///   prefix. Decodes to the table-root-relative path `<prefix>/deletion_vector_<uuid>.bin`.
 ///
-/// - `PersistedAbsolute`: The `path_or_inline_dv` contains the absolute path to the DV file.
+/// - `PersistedAbsolute`: The `path_or_inline_dv` is the absolute, percent-encoded URI of the DV
+///   file. Its path component is percent-decoded into the raw form content-tree locations use.
 ///
 /// - `PersistedUnencodedRelative`: The `path_or_inline_dv` is already the raw table-relative path,
 ///   so it is used as-is after validating that it is table-relative.
@@ -30,8 +33,7 @@ pub(crate) fn extract_deletion_vector_content(
 ) -> KernelResult<DeletionVectorInfo> {
     let location = match dv.storage_type {
         DeletionVectorStorageType::PersistedAbsolute => {
-            // Use absolute path as-is
-            dv.path_or_inline_dv.clone()
+            raw_amt_location_from_uri(&dv.path_or_inline_dv)?
         }
         DeletionVectorStorageType::PersistedRelative => {
             // Decode to relative path
@@ -68,7 +70,7 @@ pub(crate) fn extract_deletion_vector_content(
 /// carries: the inverse of [`extract_deletion_vector_content`].
 ///
 /// The descriptor is always `PersistedAbsolute`: the DV's raw `location` is resolved against
-/// `table_root` when relative and percent-encoded, as Delta `p` paths are URIs. Log replay
+/// `table_root` if relative, then percent-encoded, since Delta `p` paths are URIs. Log replay
 /// normalizes DV identities, so it still matches the `u` or `p` descriptor the writer started from.
 pub(crate) fn deletion_vector_descriptor_from_info(
     info: &DeletionVectorInfo,
@@ -626,7 +628,11 @@ mod tests {
         (DeletionVectorStorageType::PersistedRelative, "vBn[lx{q8@P<9BNH/isA", Some(1), 36),
         ("deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin", 1, 44)
     )]
-    // Persisted-absolute preserves the path verbatim.
+    // Persisted-absolute keeps the URI's prefix and decodes its path component.
+    #[case::absolute_escaped(
+        (DeletionVectorStorageType::PersistedAbsolute, "s3://other/dv%20file.bin", Some(4), 40),
+        ("s3://other/dv file.bin", 4, 48)
+    )]
     #[case::absolute(
         (
             DeletionVectorStorageType::PersistedAbsolute,
@@ -681,6 +687,14 @@ mod tests {
         (DeletionVectorStorageType::PersistedRelative, "éaaaaaaaaaaaaaaaaaaa", Some(1), 36),
         "Failed to decode DV uuid"
     )]
+    #[case::absolute_not_a_url(
+        (DeletionVectorStorageType::PersistedAbsolute, "dv.bin", Some(1), 36),
+        "no URI scheme"
+    )]
+    #[case::absolute_with_query(
+        (DeletionVectorStorageType::PersistedAbsolute, "s3://other/dv.bin?x=1", Some(1), 36),
+        "query or fragment"
+    )]
     #[case::unencoded_relative_absolute_url(
         (DeletionVectorStorageType::PersistedUnencodedRelative, "s3://other/dv.bin", Some(1), 36),
         "absolute URL"
@@ -727,17 +741,28 @@ mod tests {
         (DeletionVectorStorageType::PersistedAbsolute, ABSOLUTE_DV_PATH),
         ABSOLUTE_DV_PATH
     )]
+    #[case::absolute_escaped_in_root(
+        (DeletionVectorStorageType::PersistedAbsolute, "s3://bucket/table/data/dv%20file.bin"),
+        "s3://bucket/table/data/dv%20file.bin"
+    )]
+    #[case::absolute_escaped_outside_root(
+        (DeletionVectorStorageType::PersistedAbsolute, "s3://other/dv%20file.bin"),
+        "s3://other/dv%20file.bin"
+    )]
     fn test_deletion_vector_descriptor_from_info_inverts_extraction(
         #[case] (storage_type, path): (DeletionVectorStorageType, &str),
         #[case] expected_path: &str,
+        #[values(Some(4), None)] offset: Option<i32>,
     ) -> KernelResult<()> {
-        let original = dv((storage_type, path, Some(4), 40));
+        let original = dv((storage_type, path, offset, 40));
         let info = extract_deletion_vector_content(&original)?;
         let descriptor = deletion_vector_descriptor_from_info(&info, &table_root())?;
 
+        // An absent offset reads from byte 1, which the content entry records explicitly.
         let expected = DeletionVectorDescriptor {
             storage_type: DeletionVectorStorageType::PersistedAbsolute,
             path_or_inline_dv: expected_path.to_string(),
+            offset: offset.or(Some(1)),
             ..original.clone()
         };
         assert_eq!(descriptor, expected);
