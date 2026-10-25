@@ -1018,8 +1018,10 @@ impl RowVisitor for LeafEntryVisitor<'_> {
                     "AMT content-tree live non-Added leaf entry has a null '{SEQUENCE_NUMBER}'"
                 )));
             }
-            // A removed entry never becomes an `Add`, so it needs no `firstRowId`.
-            let live = status.is_live() && !removed;
+            // Unlike the `sequenceNumber` check above, which validates the leaf entry itself, a
+            // missing `firstRowId` only matters for the `baseRowId` of the `Add` the entry becomes.
+            // A removed entry never becomes one, so it may lack a `firstRowId`.
+            let needs_first_row_id = status.is_live() && !removed;
             let assigned = match getters[1].get_opt(row, FIRST_ROW_ID)? {
                 // An already-materialized `firstRowId` is kept and does not consume row IDs.
                 Some(existing) => Scalar::Long(existing),
@@ -1042,12 +1044,12 @@ impl RowVisitor for LeafEntryVisitor<'_> {
                         })?;
                     Scalar::Long(assigned)
                 }
-                None if live => {
+                None if needs_first_row_id => {
                     return Err(KernelError::missing_data(format!(
                         "AMT content-tree live non-Added leaf entry has a null '{FIRST_ROW_ID}'"
                     )));
                 }
-                // Entries that are not live never become an `Add`.
+                // Entries that are not live, or are removed, never become an `Add`.
                 None => Scalar::Null(DataType::LONG),
             };
             self.first_row_ids.push(assigned);
@@ -1705,14 +1707,32 @@ mod tests {
             5,
             1000,
         );
-        let without_dv = write_leaf(
+        // Positions restart at 0 for every leaf, so this deletion vector removes `e.parquet`.
+        let second_dv = write_leaf(
             &engine,
-            "metadata/without_dv.parquet",
-            &[leaf_entry("e.parquet", 500, 5, None, None, None)],
+            "metadata/second_dv.parquet",
+            &[
+                leaf_entry("e.parquet", 500, 5, None, None, None),
+                leaf_entry("f.parquet", 600, 6, None, None, None),
+            ],
             6,
             9000,
         );
-        let checkpoint = write_root(&engine, &[with_manifest_dv(with_dv, &[1, 3]), without_dv]);
+        let without_dv = write_leaf(
+            &engine,
+            "metadata/without_dv.parquet",
+            &[leaf_entry("g.parquet", 700, 7, None, None, None)],
+            7,
+            20000,
+        );
+        let checkpoint = write_root(
+            &engine,
+            &[
+                with_manifest_dv(with_dv, &[1, 3]),
+                with_manifest_dv(second_dv, &[0]),
+                without_dv,
+            ],
+        );
 
         let actual = read_tree(&engine, &checkpoint).unwrap();
         // The removed `b.parquet` still consumes its 20 row IDs, so `c.parquet` keeps the
@@ -1722,7 +1742,8 @@ mod tests {
             &[
                 ("a.parquet", 100, 1000, 5),
                 ("c.parquet", 300, 1030, 5),
-                ("e.parquet", 500, 9000, 6),
+                ("f.parquet", 600, 9005, 6),
+                ("g.parquet", 700, 20000, 7),
             ],
         );
         assert_eq!(
@@ -2335,6 +2356,49 @@ mod tests {
             out2.try_into_record_batch().unwrap(),
             expected2.try_into_record_batch().unwrap()
         );
+    }
+
+    #[test]
+    fn manifest_dv_positions_continue_across_uneven_batches_but_not_failed_ones() {
+        let engine = SyncEngine::new();
+        let dv = MumblingBitmap::deserialize(mumbling_bitmap(&[1, 3])).unwrap();
+        let mut ctx =
+            LeafReadContext::new(&engine, &valid_parent(), Some(dv), &read_ctx()).unwrap();
+        let mut convert = |entries: &[ContentTreeNodeEntry]| {
+            ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, entries).as_ref())
+                .map(|out| filtered_to_batch(out).try_into_record_batch().unwrap())
+        };
+        let expected = |rows: &[(&str, i64)]| {
+            let rows: Vec<_> = rows
+                .iter()
+                .map(|&(path, base_row_id)| expected_add_row(path, 1, base_row_id, 5))
+                .collect();
+            expected_batch(&engine, &rows)
+                .try_into_record_batch()
+                .unwrap()
+        };
+
+        // Positions 0..=2: `b.parquet` (position 1) is removed but still consumes its row IDs.
+        let out = convert(&[
+            leaf_entry("a.parquet", 1, 10, None, None, None),
+            leaf_entry("b.parquet", 1, 20, None, None, None),
+            leaf_entry("c.parquet", 1, 30, None, None, None),
+        ])
+        .unwrap();
+        assert_eq!(out, expected(&[("a.parquet", 100), ("c.parquet", 130)]));
+
+        // A failed batch advances neither the positions nor the row IDs.
+        let mut nested = leaf_entry("nested.parquet", 1, 1, None, None, None);
+        nested.content_type = DataContentType::DataManifest;
+        assert_result_error_with_message(convert(&[nested]), "has content type DataManifest");
+
+        // Positions 3..=4: `d.parquet` (position 3) is removed.
+        let out = convert(&[
+            leaf_entry("d.parquet", 1, 40, None, None, None),
+            leaf_entry("e.parquet", 1, 50, None, None, None),
+        ])
+        .unwrap();
+        assert_eq!(out, expected(&[("e.parquet", 200)]));
     }
 
     #[rstest]

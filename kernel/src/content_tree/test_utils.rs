@@ -161,9 +161,12 @@ pub(crate) fn mumbling_bitmap(positions: &[u32]) -> Bytes {
 mod tests {
     use std::slice;
 
+    use rstest::rstest;
+
     use super::*;
     use crate::arrow::array::RecordBatch;
     use crate::arrow::compute::{cast, concat_batches};
+    use crate::content_tree::mumbling::MumblingBitmap;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
@@ -256,5 +259,17 @@ mod tests {
         for (actual, expected) in read.columns().iter().zip(expected.columns()) {
             assert_eq!(&cast(actual, expected.data_type()).unwrap(), expected);
         }
+    }
+
+    #[rstest]
+    #[case::empty(&[])]
+    #[case::one_container(&[0, 7, 8, 255])]
+    #[case::gap_between_containers(&[0, 600])]
+    // Container 256 needs a second 256-descriptor PFOR chunk.
+    #[case::second_descriptor_chunk(&[3, 0x10000, 0x10001])]
+    fn mumbling_bitmap_round_trips(#[case] positions: &[u32]) {
+        let bitmap = MumblingBitmap::deserialize(mumbling_bitmap(positions)).unwrap();
+        assert_eq!(bitmap.iter().collect::<Vec<_>>(), positions);
+        assert_eq!(bitmap.cardinality(), positions.len());
     }
 }
