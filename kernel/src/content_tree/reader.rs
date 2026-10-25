@@ -218,7 +218,7 @@ impl LeafRef {
 const LEAF_FILE_PATH_COLUMN: &str = "_file";
 
 /// Name of the leaf read's row-index metadata column: each entry's position within its leaf, the
-/// position a backreference refers to.
+/// position a manifest deletion vector or backreference refers to.
 const LEAF_ROW_INDEX_COLUMN: &str = "_row_index";
 
 /// The schemas AMT root and leaf manifests are read with.
@@ -417,9 +417,10 @@ impl LeafReadContext {
     /// [`EntryConverter::convert`]. Batches must be passed in manifest order, since null
     /// `firstRowId`s are assigned, and entry positions counted, sequentially across them.
     ///
-    /// Entries the manifest deletion vector removes are dropped without being validated, but still
-    /// take part in `firstRowId` assignment, so a surviving entry's row IDs do not change when an
-    /// earlier entry is removed.
+    /// Entries the manifest deletion vector removes are dropped, but they still take part in
+    /// `firstRowId` assignment, so a surviving entry's row IDs do not change when an earlier entry
+    /// is removed. They are validated like any other leaf entry, except that their `Add`-specific
+    /// checks are skipped.
     ///
     /// # Errors
     /// Returns an error if an entry is malformed for a leaf (see [`LeafEntryVisitor`]), or any
@@ -502,21 +503,22 @@ impl LeafToAddActions {
                 dup.file_meta.location
             )));
         }
-        let mut pending = VecDeque::with_capacity(leaves.len());
-        let mut files = Vec::with_capacity(leaves.len());
-        for leaf in leaves {
-            leaf.check_readable()?;
-            let location = leaf.file_meta.location.to_string();
-            let context = LeafReadContext::new(engine, &leaf.parent_info, leaf.manifest_dv, ctx)
-                .map_err(|e| match e {
-                    KernelError::MissingData(msg) => {
-                        KernelError::missing_data(format!("{msg} (leaf manifest '{location}')"))
-                    }
-                    e => e,
-                })?;
-            pending.push_back((location, context));
-            files.push(leaf.file_meta);
-        }
+        let (pending, files): (VecDeque<_>, Vec<_>) = leaves
+            .into_iter()
+            .map(|leaf| {
+                leaf.check_readable()?;
+                let location = leaf.file_meta.location.to_string();
+                let context =
+                    LeafReadContext::new(engine, &leaf.parent_info, leaf.manifest_dv, ctx)
+                        .map_err(|e| match e {
+                            KernelError::MissingData(msg) => KernelError::missing_data(format!(
+                                "{msg} (leaf manifest '{location}')"
+                            )),
+                            e => e,
+                        })?;
+                Ok(((location, context), leaf.file_meta))
+            })
+            .collect::<KernelResult<_>>()?;
         let batches = if files.is_empty() {
             None
         } else {
@@ -645,8 +647,8 @@ fn make_entry_converter(
 /// per-row values and the next unassigned row ID.
 ///
 /// An entry with a `firstRowId` keeps it. An `Added` entry without one gets the next unassigned
-/// ID, which then advances by the entry's `recordCount`. Entries in `removed` are assigned IDs the
-/// same way but are not otherwise validated.
+/// ID, which then advances by the entry's `recordCount`. Entries in `removed` are assigned IDs
+/// the same way, and may have a null `firstRowId` whatever their status.
 ///
 /// # Errors
 /// See [`LeafEntryVisitor`].
@@ -944,10 +946,10 @@ impl RowVisitor for ColumnFileCounter {
 
 /// Visitor behind [`validate_and_assign_first_row_ids`].
 ///
-/// Errors if a leaf entry has an unknown status, needs a `firstRowId` but has a negative
-/// `recordCount`, if it is live and non-`Added` with a null `sequenceNumber`, or if assignment
-/// overflows `i64`. An entry not removed by the manifest deletion vector also errors if it is not
-/// `Data`, or if it is live and non-`Added` with a null `firstRowId`.
+/// Errors if a leaf entry is not `Data`, has an unknown status, is live and non-`Added` with a null
+/// `sequenceNumber`, or needs a `firstRowId` but has a negative `recordCount`, or if assignment
+/// overflows `i64`. An entry the manifest deletion vector does not remove also errors if it is live
+/// and non-`Added` with a null `firstRowId`.
 struct LeafEntryVisitor<'r> {
     /// Next unassigned `firstRowId`.
     next_first_row_id: i64,
@@ -996,30 +998,27 @@ impl RowVisitor for LeafEntryVisitor<'_> {
         self.first_row_ids.reserve(row_count);
         for row in 0..row_count {
             // `first_row_ids` holds one value per row visited so far, so its length is this row's
-            // index. A removed entry never becomes an `Add`, so only its row-ID assignment runs.
+            // index.
             let removed = self.removed.contains(self.first_row_ids.len());
             // A leaf manifest holds only data file entries.
-            if !removed {
-                let content_type =
-                    DataContentType::try_from_repr(getters[4].get(row, CONTENT_TYPE)?)?;
-                if content_type != DataContentType::Data {
-                    let location: &str = getters[5].get(row, LOCATION)?;
-                    return Err(KernelError::generic(format!(
-                        "AMT leaf manifest entry '{location}' has content type {content_type:?}; \
-                         leaf manifests may only contain Data entries"
-                    )));
-                }
+            let content_type = DataContentType::try_from_repr(getters[4].get(row, CONTENT_TYPE)?)?;
+            if content_type != DataContentType::Data {
+                let location: &str = getters[5].get(row, LOCATION)?;
+                return Err(KernelError::generic(format!(
+                    "AMT leaf manifest entry '{location}' has content type {content_type:?}; \
+                     leaf manifests may only contain Data entries"
+                )));
             }
             let status = TrackingStatus::try_from_repr(getters[2].get(row, TRACKING_STATUS)?)?;
-            // Only `Added` entries may inherit `sequenceNumber`, so a live non-`Added` entry must
-            // carry one, even when the manifest deletion vector removes it. Entries whose status is
-            // not live never become an `Add`, so they are not checked.
+            // Only `Added` entries may inherit `sequenceNumber`. Dropped entries never become an
+            // `Add`, so they are not checked.
             let sequence_number: Option<i64> = getters[3].get_opt(row, SEQUENCE_NUMBER)?;
             if status.is_live() && status != TrackingStatus::Added && sequence_number.is_none() {
                 return Err(KernelError::missing_data(format!(
                     "AMT content-tree live non-Added leaf entry has a null '{SEQUENCE_NUMBER}'"
                 )));
             }
+            // A removed entry never becomes an `Add`, so it needs no `firstRowId`.
             let live = status.is_live() && !removed;
             let assigned = match getters[1].get_opt(row, FIRST_ROW_ID)? {
                 // An already-materialized `firstRowId` is kept and does not consume row IDs.
@@ -1741,9 +1740,6 @@ mod tests {
     #[case::modified_snapshot_id(
         |e: &mut ContentTreeNodeEntry| e.tracking.modified_snapshot_id = Some(3)
     )]
-    #[case::data_manifest(
-        |e: &mut ContentTreeNodeEntry| e.content_type = DataContentType::DataManifest
-    )]
     #[case::existing_null_first_row_id(|e: &mut ContentTreeNodeEntry| {
         e.tracking.status = TrackingStatus::Existing;
         e.tracking.sequence_number = Some(1);
@@ -1769,19 +1765,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_add_actions_from_amt_rejects_manifest_dv_removed_entry_with_null_sequence_number() {
+    #[rstest]
+    #[case::data_manifest(
+        |e: &mut ContentTreeNodeEntry| e.content_type = DataContentType::DataManifest,
+        "has content type DataManifest"
+    )]
+    #[case::existing_null_sequence_number(
+        |e: &mut ContentTreeNodeEntry| e.tracking.status = TrackingStatus::Existing,
+        "live non-Added leaf entry has a null 'sequenceNumber'"
+    )]
+    fn read_add_actions_from_amt_rejects_malformed_manifest_dv_removed_entry(
+        #[case] edit_removed: fn(&mut ContentTreeNodeEntry),
+        #[case] message: &str,
+    ) {
         let engine = memory_engine();
-        let removed = with_status(
-            leaf_entry("removed.parquet", 1, 1, Some(1), None, Some(1)),
-            TrackingStatus::Existing,
-        );
+        let mut removed = leaf_entry("removed.parquet", 1, 1, Some(1), None, Some(1));
+        edit_removed(&mut removed);
         let leaf = write_leaf(&engine, "metadata/leaf.parquet", &[removed], 5, 100);
         let checkpoint = write_root(&engine, &[with_manifest_dv(leaf, &[0])]);
-        assert_result_error_with_message(
-            read_tree(&engine, &checkpoint),
-            "live non-Added leaf entry has a null 'sequenceNumber'",
-        );
+        assert_result_error_with_message(read_tree(&engine, &checkpoint), message);
     }
 
     #[rstest]
