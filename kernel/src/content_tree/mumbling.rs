@@ -17,8 +17,7 @@
 //! (`pos & 0xFF`). The container count limit bounds positions to 21 bits.
 //!
 //! [`MumblingBitmap`] is the owned, read-only decoded form: it answers membership queries and
-//! iterates set positions without materializing a `Vec<bool>`. Encoding and mutation are out of
-//! scope.
+//! iterates set positions. Encoding and mutation are out of scope.
 
 use bytes::{Buf, Bytes};
 use itertools::Either;

@@ -89,7 +89,7 @@ pub(crate) fn read_add_actions_from_amt(
     for batch in batches {
         let batch = batch?;
         leaves.visit_rows_of(batch.as_ref())?;
-        root_actions.push(converter.convert(batch.as_ref(), None)?);
+        root_actions.push(converter.convert(batch.as_ref(), RemovedEntries::default())?);
     }
     let leaf_actions =
         LeafToAddActions::try_new(engine, leaves.leaves, schemas.leaf, ctx, cancellation_token)?;
@@ -156,10 +156,6 @@ static LEAF_REF_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
 impl LeafRef {
     /// Parses one root `DataManifest` row from `getters`, which must follow [`LEAF_REF_COLUMNS`]
     /// order. The raw `location` resolves against `table_root` when relative.
-    ///
-    /// # Errors
-    /// Returns an error if the getter count is wrong, a field is malformed, or `manifestInfo.dv` is
-    /// not a valid Mumbling bitmap.
     fn try_from_getters<'a>(
         row: usize,
         getters: &[&'a dyn GetData<'a>],
@@ -198,10 +194,6 @@ impl LeafRef {
 
     /// Rejects a leaf the read path cannot yet read: one written before Iceberg v4, or one whose
     /// parent has column files, which the read path cannot yet apply to the leaf's entries.
-    ///
-    /// # Errors
-    /// Returns an unsupported error if the parent's `manifestInfo.formatVersion` is not
-    /// [`AMT_FORMAT_VERSION`], or the parent has column files.
     fn check_readable(&self) -> KernelResult<()> {
         let location = &self.file_meta.location;
         if self.format_version != AMT_FORMAT_VERSION {
@@ -226,7 +218,7 @@ impl LeafRef {
 const LEAF_FILE_PATH_COLUMN: &str = "_file";
 
 /// Name of the leaf read's row-index metadata column: each entry's position within its leaf, the
-/// position a manifest deletion vector or backreference refers to.
+/// position a backreference refers to.
 const LEAF_ROW_INDEX_COLUMN: &str = "_row_index";
 
 /// The schemas AMT root and leaf manifests are read with.
@@ -317,8 +309,7 @@ impl EntryConverter {
     /// - `entries`: a content-tree entry batch matching the converter's input schema (for a root
     ///   converter, [`ContentTreeNodeEntry::to_schema`], the columnar form produced by
     ///   [`super::builder`]).
-    /// - `removed`: per-row flags for the entries a manifest deletion vector removes, or `None`
-    ///   when no entry is removed.
+    /// - `removed`: the entries a manifest deletion vector removes.
     ///
     /// # Returns
     /// A [`FilteredEngineData`] over an `Add`-action batch (one row per input entry, schema
@@ -334,7 +325,7 @@ impl EntryConverter {
     fn convert(
         &self,
         entries: &dyn EngineData,
-        removed: Option<&[bool]>,
+        removed: RemovedEntries<'_>,
     ) -> KernelResult<FilteredEngineData> {
         let mut selector = AddSelectionVisitor {
             removed,
@@ -375,8 +366,8 @@ struct LeafReadContext {
     converter: EntryConverter,
     /// The parent's manifest deletion vector over this leaf's entry positions.
     manifest_dv: Option<MumblingBitmap>,
-    /// Number of entries converted so far that `manifest_dv` removed.
-    removed_count: usize,
+    /// Leaf position of the next unconverted entry.
+    next_position: u64,
 }
 
 impl LeafReadContext {
@@ -418,18 +409,17 @@ impl LeafReadContext {
             next_first_row_id: require(parent.first_row_id, FIRST_ROW_ID)?,
             converter: make_entry_converter(engine, ctx, &sources, LEAF_INPUT_SCHEMA.clone())?,
             manifest_dv,
-            removed_count: 0,
+            next_position: 0,
         })
     }
 
     /// Converts one batch of leaf entries into an `Add`-action batch, like
     /// [`EntryConverter::convert`]. Batches must be passed in manifest order, since null
-    /// `firstRowId`s are assigned sequentially across them.
+    /// `firstRowId`s are assigned, and entry positions counted, sequentially across them.
     ///
     /// Entries the manifest deletion vector removes are dropped without being validated, but still
     /// take part in `firstRowId` assignment, so a surviving entry's row IDs do not change when an
-    /// earlier entry is removed. With a manifest deletion vector, `entries` must carry the
-    /// [`LEAF_ROW_INDEX_COLUMN`] positions it refers to.
+    /// earlier entry is removed.
     ///
     /// # Errors
     /// Returns an error if an entry is malformed for a leaf (see [`LeafEntryVisitor`]), or any
@@ -438,12 +428,10 @@ impl LeafReadContext {
         &mut self,
         entries: &dyn EngineData,
     ) -> KernelResult<FilteredEngineData> {
-        let removed = self
-            .manifest_dv
-            .as_ref()
-            .map(|dv| removed_rows(entries, dv))
-            .transpose()?;
-        let removed = removed.as_deref();
+        let removed = RemovedEntries {
+            manifest_dv: self.manifest_dv.as_ref(),
+            first_position: self.next_position,
+        };
         // Only update `self` once the whole batch succeeds, so a failed batch leaves the cursor
         // unchanged.
         let (first_row_ids, next_first_row_id) =
@@ -456,29 +444,8 @@ impl LeafReadContext {
 
         let filtered = self.converter.convert(augmented.as_ref(), removed)?;
         self.next_first_row_id = next_first_row_id;
-        self.removed_count += removed.map_or(0, |r| r.iter().filter(|&&r| r).count());
+        self.next_position += entries.len() as u64;
         Ok(filtered)
-    }
-
-    /// Checks, once every batch of the leaf at `location` is converted, that the manifest deletion
-    /// vector removed exactly its cardinality of entries.
-    ///
-    /// # Errors
-    /// Returns an invalid-checkpoint error otherwise: the deletion vector marks a position past the
-    /// end of the leaf.
-    fn finish(&self, location: &str) -> KernelResult<()> {
-        let expected = self
-            .manifest_dv
-            .as_ref()
-            .map_or(0, MumblingBitmap::cardinality);
-        if self.removed_count != expected {
-            return Err(KernelError::invalid_checkpoint(format!(
-                "DataManifest entry '{location}' has a {MANIFEST_INFO}.{MANIFEST_DV} marking \
-                 {expected} positions, but only {} are within the leaf manifest",
-                self.removed_count
-            )));
-        }
-        Ok(())
     }
 }
 
@@ -581,7 +548,7 @@ impl LeafToAddActions {
         {
             // The engine returns each leaf's batches together and in request order, so a leaf
             // ahead of this batch's file has no batches left.
-            self.finish_front()?;
+            self.pending.pop_front();
         }
         let Some((_, context)) = self.pending.front_mut() else {
             return Err(KernelError::internal_error(format!(
@@ -592,23 +559,6 @@ impl LeafToAddActions {
         // the leaf converter's input schema does not declare.
         context.convert_leaf_entries_to_add_actions(batch)
     }
-
-    /// Drops the front leaf, whose batches are all converted, after checking it (see
-    /// [`LeafReadContext::finish`]).
-    fn finish_front(&mut self) -> KernelResult<()> {
-        match self.pending.pop_front() {
-            Some((location, context)) => context.finish(&location),
-            None => Ok(()),
-        }
-    }
-
-    /// Finishes every remaining leaf once the reads are exhausted.
-    fn finish_all(&mut self) -> KernelResult<()> {
-        while !self.pending.is_empty() {
-            self.finish_front()?;
-        }
-        Ok(())
-    }
 }
 
 impl Iterator for LeafToAddActions {
@@ -616,12 +566,7 @@ impl Iterator for LeafToAddActions {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let Some(next) = self.batches.as_mut()?.next() else {
-                // Stop reading the exhausted iterator, and surface a failed final check once.
-                self.batches = None;
-                return self.finish_all().err().map(Err);
-            };
-            let result = match next {
+            let result = match self.batches.as_mut()?.next()? {
                 // An empty batch carries no `_file` to group by, and no actions.
                 Ok(batch) if batch.is_empty() => continue,
                 Ok(batch) => self.convert_to_add_actions(batch.as_ref()),
@@ -700,15 +645,15 @@ fn make_entry_converter(
 /// per-row values and the next unassigned row ID.
 ///
 /// An entry with a `firstRowId` keeps it. An `Added` entry without one gets the next unassigned
-/// ID, which then advances by the entry's `recordCount`. Entries flagged in `removed` are assigned
-/// IDs the same way but are not otherwise validated.
+/// ID, which then advances by the entry's `recordCount`. Entries in `removed` are assigned IDs the
+/// same way but are not otherwise validated.
 ///
 /// # Errors
 /// See [`LeafEntryVisitor`].
 fn validate_and_assign_first_row_ids(
     entries: &dyn EngineData,
     seed: i64,
-    removed: Option<&[bool]>,
+    removed: RemovedEntries<'_>,
 ) -> KernelResult<(Vec<Scalar>, i64)> {
     let mut visitor = LeafEntryVisitor::new(seed, removed);
     visitor.visit_rows_of(entries)?;
@@ -791,8 +736,7 @@ fn partition_values_map_type() -> KernelResult<MapType> {
 ///   `Add.deletionVector`, so a DV-less `Add` would read its logically deleted rows back as live;
 /// - a selected entry that carries column files, whose updated values a plain `Add` would drop.
 struct AddSelectionVisitor<'r> {
-    /// Per-row flags for the entries a manifest deletion vector removes; `None` removes none.
-    removed: Option<&'r [bool]>,
+    removed: RemovedEntries<'r>,
     selection: Vec<bool>,
 }
 
@@ -832,7 +776,7 @@ impl RowVisitor for AddSelectionVisitor<'_> {
         self.selection.reserve(row_count);
         for row in 0..row_count {
             // `selection` holds one flag per row visited so far, so its length is this row's index.
-            if is_removed(self.removed, self.selection.len()) {
+            if self.removed.contains(self.selection.len()) {
                 self.selection.push(false);
                 continue;
             }
@@ -950,52 +894,23 @@ fn check_selected_entry<'a>(
     Ok(())
 }
 
-/// Flags each row of `entries` whose [`LEAF_ROW_INDEX_COLUMN`] position `manifest_dv` marks.
-///
-/// # Errors
-/// Returns an error if `entries` has no non-null [`LEAF_ROW_INDEX_COLUMN`].
-fn removed_rows(entries: &dyn EngineData, manifest_dv: &MumblingBitmap) -> KernelResult<Vec<bool>> {
-    let mut visitor = RemovedRowVisitor {
-        manifest_dv,
-        removed: Vec::new(),
-    };
-    visitor.visit_rows_of(entries)?;
-    Ok(visitor.removed)
+/// The entries of one leaf batch that the leaf's manifest deletion vector removes. The default
+/// removes none.
+#[derive(Clone, Copy, Default)]
+struct RemovedEntries<'a> {
+    manifest_dv: Option<&'a MumblingBitmap>,
+    /// Leaf position of the batch's first row.
+    first_position: u64,
 }
 
-/// Visitor behind [`removed_rows`].
-struct RemovedRowVisitor<'a> {
-    manifest_dv: &'a MumblingBitmap,
-    removed: Vec<bool>,
-}
-
-impl RowVisitor for RemovedRowVisitor<'_> {
-    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            (
-                vec![ColumnName::new([LEAF_ROW_INDEX_COLUMN])],
-                vec![DataType::LONG],
-            )
-                .into()
-        });
-        NAMES_AND_TYPES.as_ref()
-    }
-
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
-        self.removed.reserve(row_count);
-        for row in 0..row_count {
-            let position: i64 = getters[0].get(row, LEAF_ROW_INDEX_COLUMN)?;
+impl RemovedEntries<'_> {
+    /// Whether the batch's row `row` is removed.
+    fn contains(&self, row: usize) -> bool {
+        self.manifest_dv.is_some_and(|dv| {
             // Mumbling positions fit in 21 bits, so a larger position is never marked.
-            let removed = u32::try_from(position).is_ok_and(|pos| self.manifest_dv.contains(pos));
-            self.removed.push(removed);
-        }
-        Ok(())
+            u32::try_from(self.first_position + row as u64).is_ok_and(|pos| dv.contains(pos))
+        })
     }
-}
-
-/// Whether `removed` flags the row at `index`; `None` flags no row.
-fn is_removed(removed: Option<&[bool]>, index: usize) -> bool {
-    removed.is_some_and(|removed| removed.get(index).copied().unwrap_or(false))
 }
 
 /// Whether `column_files` holds at least one column file: an empty list carries no column updates.
@@ -1030,19 +945,19 @@ impl RowVisitor for ColumnFileCounter {
 /// Visitor behind [`validate_and_assign_first_row_ids`].
 ///
 /// Errors if a leaf entry has an unknown status, needs a `firstRowId` but has a negative
-/// `recordCount`, or if assignment overflows `i64`. Unless the entry is removed, also errors if it
-/// is not `Data` or is live and non-`Added` with a null `sequenceNumber` or `firstRowId`.
+/// `recordCount`, if it is live and non-`Added` with a null `sequenceNumber`, or if assignment
+/// overflows `i64`. An entry not removed by the manifest deletion vector also errors if it is not
+/// `Data`, or if it is live and non-`Added` with a null `firstRowId`.
 struct LeafEntryVisitor<'r> {
     /// Next unassigned `firstRowId`.
     next_first_row_id: i64,
     /// Resolved `firstRowId` per row, in entry order.
     first_row_ids: Vec<Scalar>,
-    /// Per-row flags for the entries a manifest deletion vector removes; `None` removes none.
-    removed: Option<&'r [bool]>,
+    removed: RemovedEntries<'r>,
 }
 
 impl<'r> LeafEntryVisitor<'r> {
-    fn new(next_first_row_id: i64, removed: Option<&'r [bool]>) -> Self {
+    fn new(next_first_row_id: i64, removed: RemovedEntries<'r>) -> Self {
         Self {
             next_first_row_id,
             first_row_ids: Vec::new(),
@@ -1082,7 +997,7 @@ impl RowVisitor for LeafEntryVisitor<'_> {
         for row in 0..row_count {
             // `first_row_ids` holds one value per row visited so far, so its length is this row's
             // index. A removed entry never becomes an `Add`, so only its row-ID assignment runs.
-            let removed = is_removed(self.removed, self.first_row_ids.len());
+            let removed = self.removed.contains(self.first_row_ids.len());
             // A leaf manifest holds only data file entries.
             if !removed {
                 let content_type =
@@ -1096,15 +1011,16 @@ impl RowVisitor for LeafEntryVisitor<'_> {
                 }
             }
             let status = TrackingStatus::try_from_repr(getters[2].get(row, TRACKING_STATUS)?)?;
-            // Only `Added` entries may inherit `sequenceNumber`. Dropped entries never become an
-            // `Add`, so they are not checked.
+            // Only `Added` entries may inherit `sequenceNumber`, so a live non-`Added` entry must
+            // carry one, even when the manifest deletion vector removes it. Entries whose status is
+            // not live never become an `Add`, so they are not checked.
             let sequence_number: Option<i64> = getters[3].get_opt(row, SEQUENCE_NUMBER)?;
-            let checked = status.is_live() && !removed;
-            if checked && status != TrackingStatus::Added && sequence_number.is_none() {
+            if status.is_live() && status != TrackingStatus::Added && sequence_number.is_none() {
                 return Err(KernelError::missing_data(format!(
                     "AMT content-tree live non-Added leaf entry has a null '{SEQUENCE_NUMBER}'"
                 )));
             }
+            let live = status.is_live() && !removed;
             let assigned = match getters[1].get_opt(row, FIRST_ROW_ID)? {
                 // An already-materialized `firstRowId` is kept and does not consume row IDs.
                 Some(existing) => Scalar::Long(existing),
@@ -1127,12 +1043,12 @@ impl RowVisitor for LeafEntryVisitor<'_> {
                         })?;
                     Scalar::Long(assigned)
                 }
-                None if checked => {
+                None if live => {
                     return Err(KernelError::missing_data(format!(
                         "AMT content-tree live non-Added leaf entry has a null '{FIRST_ROW_ID}'"
                     )));
                 }
-                // Dropped and removed entries never become an `Add`.
+                // Entries that are not live never become an `Add`.
                 None => Scalar::Null(DataType::LONG),
             };
             self.first_row_ids.push(assigned);
@@ -1183,7 +1099,7 @@ mod tests {
         entries: &dyn EngineData,
         ctx: &ReadContext,
     ) -> KernelResult<FilteredEngineData> {
-        make_root_entry_converter(engine, ctx)?.convert(entries, None)
+        make_root_entry_converter(engine, ctx)?.convert(entries, RemovedEntries::default())
     }
 
     /// Runs the read path over `entries`.
@@ -1828,10 +1744,6 @@ mod tests {
     #[case::data_manifest(
         |e: &mut ContentTreeNodeEntry| e.content_type = DataContentType::DataManifest
     )]
-    #[case::existing_null_sequence_number(|e: &mut ContentTreeNodeEntry| {
-        e.tracking.status = TrackingStatus::Existing;
-        e.tracking.first_row_id = Some(1);
-    })]
     #[case::existing_null_first_row_id(|e: &mut ContentTreeNodeEntry| {
         e.tracking.status = TrackingStatus::Existing;
         e.tracking.sequence_number = Some(1);
@@ -1857,24 +1769,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn read_add_actions_from_amt_rejects_manifest_dv_removed_entry_with_null_sequence_number() {
+        let engine = memory_engine();
+        let removed = with_status(
+            leaf_entry("removed.parquet", 1, 1, Some(1), None, Some(1)),
+            TrackingStatus::Existing,
+        );
+        let leaf = write_leaf(&engine, "metadata/leaf.parquet", &[removed], 5, 100);
+        let checkpoint = write_root(&engine, &[with_manifest_dv(leaf, &[0])]);
+        assert_result_error_with_message(
+            read_tree(&engine, &checkpoint),
+            "live non-Added leaf entry has a null 'sequenceNumber'",
+        );
+    }
+
     #[rstest]
     #[case::malformed(
         Bytes::from_static(b"dv"),
-        1,
         "'memory:///table/metadata/leaf.parquet' has a malformed manifestInfo.dv"
     )]
-    #[case::position_past_end(mumbling_bitmap(&[0, 5]), 1, "marking 2 positions, but only 1")]
-    #[case::empty_leaf(mumbling_bitmap(&[0]), 0, "marking 1 positions, but only 0")]
     fn read_add_actions_from_amt_rejects_invalid_manifest_dv(
         #[case] dv: Bytes,
-        #[case] entry_count: usize,
         #[case] message: &str,
     ) {
         let engine = memory_engine();
-        let entries: Vec<_> = (0..entry_count)
-            .map(|i| leaf_entry(&format!("{i}.parquet"), 1, 1, None, None, None))
-            .collect();
-        let mut leaf = write_leaf(&engine, "metadata/leaf.parquet", &entries, 5, 100);
+        let mut leaf = write_leaf(&engine, "metadata/leaf.parquet", &[], 5, 100);
         leaf.manifest_info.as_mut().unwrap().dv = Some(dv);
         let checkpoint = write_root(&engine, &[leaf]);
         assert_result_error_with_message(read_tree(&engine, &checkpoint), message);
@@ -2015,7 +1935,10 @@ mod tests {
 
         for (entries, (selection, row)) in batches.iter().zip(expected) {
             let filtered = converter
-                .convert(entry_batch(&engine, entries).as_ref(), None)
+                .convert(
+                    entry_batch(&engine, entries).as_ref(),
+                    RemovedEntries::default(),
+                )
                 .unwrap();
             assert_eq!(filtered.selection_vector(), selection.as_slice());
             assert_eq!(
