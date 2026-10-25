@@ -36,7 +36,7 @@ const UUID_PART_LEN: usize = 36;
 /// The subdirectory name within the table root where the delta log resides
 const DELTA_LOG_DIR: &str = "_delta_log";
 /// The subdirectory name within the delta log where staged commits reside
-const STAGED_COMMITS_DIR: &str = "_staged_commits/";
+pub(crate) const STAGED_COMMITS_DIR: &str = "_staged_commits/";
 /// The subdirectory name within the delta log where checkpoint sidecars reside
 const SIDECAR_DIR_WITH_SLASH: &str = "_sidecars/";
 
