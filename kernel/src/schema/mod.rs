@@ -35,10 +35,12 @@ pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
 
+pub(crate) mod collation_utils;
 #[cfg(feature = "internal-api")]
 pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
+pub(crate) mod file_utils;
 #[cfg(feature = "udt-in-dev")]
 mod user_defined;
 pub(crate) mod validation;
@@ -229,6 +231,12 @@ impl Display for MetadataValue {
 
 #[derive(Debug)]
 pub enum ColumnMetadataKey {
+    /// Collation identifiers keyed by field-relative path, stored as a JSON object.
+    ///
+    /// Kernel preserves these identifiers; string predicates use UTF-8 binary semantics.
+    /// See [`ScanBuilder::with_predicate`](crate::scan::ScanBuilder::with_predicate) and the
+    /// [collation RFC](https://github.com/delta-io/delta/pull/3068).
+    Collations,
     ColumnMappingId,
     ColumnMappingPhysicalName,
     /// Parquet field IDs for the synthesized `element` / `key` / `value` fields of an Array or
@@ -267,6 +275,7 @@ pub enum ColumnMetadataKey {
 impl AsRef<str> for ColumnMetadataKey {
     fn as_ref(&self) -> &str {
         match self {
+            Self::Collations => "__COLLATIONS",
             Self::ColumnMappingId => "delta.columnMapping.id",
             Self::ColumnMappingPhysicalName => "delta.columnMapping.physicalName",
             Self::ColumnMappingNestedIds => "delta.columnMapping.nested.ids",
@@ -733,6 +742,12 @@ impl StructField {
     pub(crate) fn has_invariants(&self) -> bool {
         self.metadata
             .contains_key(ColumnMetadataKey::Invariants.as_ref())
+    }
+
+    /// Returns whether this field carries `__COLLATIONS` metadata.
+    pub(crate) fn has_collations(&self) -> bool {
+        self.metadata
+            .contains_key(ColumnMetadataKey::Collations.as_ref())
     }
 
     /// Converts logical schema StructField metadata to physical schema metadata
@@ -1298,9 +1313,9 @@ impl StructType {
                     Self::ensure_no_metadata_columns(&mut struct_type.fields())?;
                 }
             }
-            // Primitive types cannot contain nested metadata columns and variant types are
-            // validated at creation
-            DataType::Primitive(_) | DataType::Variant(_) => {}
+            // Primitive types cannot contain nested metadata columns, and variant and file types
+            // are validated at creation
+            DataType::Primitive(_) | DataType::Variant(_) | DataType::File(_) => {}
             #[cfg(feature = "udt-in-dev")]
             DataType::UserDefined(_) => {}
         };
@@ -1542,13 +1557,13 @@ impl DoubleEndedIterator for StructFieldRefIter<'_> {
     }
 }
 
-struct InvariantChecker;
+struct FieldMetadataKeyChecker(ColumnMetadataKey);
 
-impl<'a> SchemaTransform<'a> for InvariantChecker {
+impl<'a> SchemaTransform<'a> for FieldMetadataKeyChecker {
     transform_output_type!(|'a, T| KernelResult<(), ()>);
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<(), ()> {
-        if field.has_invariants() {
+        if field.metadata.contains_key(self.0.as_ref()) {
             Err(())
         } else {
             self.recurse_into_struct_field(field)
@@ -1561,7 +1576,9 @@ impl<'a> SchemaTransform<'a> for InvariantChecker {
 /// This traverses the entire schema to check for the presence of the `delta.invariants`
 /// metadata key.
 pub(crate) fn schema_has_invariants(schema: &Schema) -> bool {
-    InvariantChecker.transform_struct(schema).is_err()
+    FieldMetadataKeyChecker(ColumnMetadataKey::Invariants)
+        .transform_struct(schema)
+        .is_err()
 }
 
 /// Visitor that reports whether any non-null (`nullable: false`) field exists in a schema.
@@ -2102,6 +2119,10 @@ fn serialize_variant<S: serde::Serializer>(
     serializer.serialize_str("variant")
 }
 
+fn serialize_file<S: serde::Serializer>(_: &StructType, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str("file")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IntervalField {
     Year,
@@ -2302,6 +2323,12 @@ pub enum DataType {
     #[cfg(feature = "udt-in-dev")]
     #[from(UserDefinedType)]
     UserDefined(UserDefinedType),
+    /// The File data type. A reference to a range of bytes located inline or in an external file.
+    /// Physically a group of six optional fields: `uri`, `offset`, `size`, `content_type`,
+    /// `checksum`, and `inline`. Like Variant, the type identity is carried in the Delta schema;
+    /// the physical representation is a plain struct.
+    #[serde(serialize_with = "serialize_file")]
+    File(Box<StructType>),
 }
 
 #[cfg(feature = "geo-type-in-dev")]
@@ -2336,13 +2363,16 @@ impl<'de> serde::Deserialize<'de> for DataType {
 
         let value = Value::deserialize(deserializer)?;
 
-        // String values are either primitive types or "variant"
+        // String values are either primitive types, "variant" or "file"
         if let Value::String(s) = &value {
             if s == "variant" {
                 return match DataType::unshredded_variant() {
                     DataType::Variant(st) => Ok(DataType::Variant(st)),
                     _ => Err(Error::custom("Failed to create variant type")),
                 };
+            }
+            if s == "file" {
+                return Ok(DataType::file_type());
             }
 
             // Try PrimitiveType - this will give us good error messages for unsupported types
@@ -2447,6 +2477,7 @@ impl DataType {
             Self::Variant(_) => "variant".to_string(),
             #[cfg(feature = "udt-in-dev")]
             Self::UserDefined(_) => "udt".to_string(),
+            Self::File(_) => "file".to_string(),
         }
     }
 
@@ -2494,6 +2525,21 @@ impl DataType {
             not_null "metadata": BINARY,
             not_null "value": BINARY,
         }))
+    }
+
+    /// Create a new [`DataType::File`] with the canonical physical layout: a struct of six
+    /// nullable fields — `uri`: STRING, `offset`: LONG, `size`: LONG, `content_type`: STRING,
+    /// `checksum`: STRING, `inline`: BINARY. Like Variant, the type identity is carried in the
+    /// Delta schema; physically a `file` is this struct.
+    pub fn file_type() -> Self {
+        DataType::File(Box::new(StructType::new_unchecked([
+            StructField::nullable("uri", DataType::STRING),
+            StructField::nullable("offset", DataType::LONG),
+            StructField::nullable("size", DataType::LONG),
+            StructField::nullable("content_type", DataType::STRING),
+            StructField::nullable("checksum", DataType::STRING),
+            StructField::nullable("inline", DataType::BINARY),
+        ])))
     }
 
     /// Create a new [`DataType::Variant`] from the provided fields. For unshredded variants, you
@@ -2577,6 +2623,7 @@ impl Display for DataType {
             DataType::Variant(_) => write!(f, "variant"),
             #[cfg(feature = "udt-in-dev")]
             DataType::UserDefined(udt) => write!(f, "udt({})", udt.sql_type()),
+            DataType::File(_) => write!(f, "file"),
         }
     }
 }
@@ -2735,6 +2782,13 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
     fn transform_variant(&mut self, stype: &'a StructType) -> KernelResult<Cow<'a, StructType>> {
         // There is no column mapping metadata inside the struct fields of a variant, so
         // we do not recurse into the variant fields
+        Ok(Cow::Borrowed(stype))
+    }
+
+    fn transform_file(&mut self, stype: &'a StructType) -> KernelResult<Cow<'a, StructType>> {
+        // The FILE group's inner field names (`uri`, `offset`, ...) are fixed literals that are not
+        // subject to column mapping and carry no column mapping metadata, so we do not recurse
+        // into them.
         Ok(Cow::Borrowed(stype))
     }
 }
@@ -2902,6 +2956,31 @@ mod tests {
                     "delta.identity.start": 2147483648
                 }
             }"#
+    }
+
+    #[test]
+    fn test_serde_file_type() {
+        let file = DataType::file_type();
+        assert_eq!(serde_json::to_string(&file).unwrap(), "\"file\"");
+        assert_eq!(serde_json::from_str::<DataType>("\"file\"").unwrap(), file);
+
+        // The canonical file has exactly the six protocol-defined, nullable fields.
+        let DataType::File(fields) = &file else {
+            panic!("expected a file type");
+        };
+        let names: Vec<_> = fields.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "uri",
+                "offset",
+                "size",
+                "content_type",
+                "checksum",
+                "inline"
+            ]
+        );
+        assert!(fields.fields().all(|f| f.is_nullable()));
     }
 
     #[test]

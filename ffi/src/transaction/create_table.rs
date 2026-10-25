@@ -16,6 +16,32 @@ pub struct ExclusiveCreateTableTransaction;
 // Create-table transaction FFI functions
 // ============================================================================
 
+/// Adds a transaction identifier for application `app_id` at `version` before table creation.
+///
+/// Returns the updated transaction handle, or an error if `app_id` is not valid UTF-8. The
+/// action's `lastUpdated` uses the transaction's commit timestamp. Each application id may occur
+/// only once, including ids added through the builder; duplicates are rejected at commit.
+///
+/// # Safety
+///
+/// `txn` and `engine` must be [valid][Handle#Validity] handles, and `app_id` must be a valid string
+/// slice. This call borrows `engine` and `app_id` for the call and unconditionally consumes `txn`,
+/// including on error. The caller must commit or free the returned handle.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_with_transaction_id(
+    txn: Handle<ExclusiveCreateTableTransaction>,
+    app_id: KernelStringSlice,
+    version: i64,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransaction>> {
+    let txn = unsafe { *txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let app_id: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&app_id) };
+    app_id
+        .map(|app_id| Box::new(txn.with_transaction_id(app_id, version)).into())
+        .into_extern_result(&engine)
+}
+
 /// Replaces create-table operation metrics after writing and before commit.
 ///
 /// # Safety

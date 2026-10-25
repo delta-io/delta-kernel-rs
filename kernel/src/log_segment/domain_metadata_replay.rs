@@ -13,7 +13,7 @@ use crate::actions::visitors::DomainMetadataVisitor;
 use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::crc::merge_domain_metadata;
 use crate::log_replay::ActionsBatch;
-use crate::{Engine, KernelResult, RowVisitor as _, Version};
+use crate::{Engine, KernelResult, KernelResultIterator, RowVisitor as _, Version};
 
 pub(crate) type DomainMetadataMap = HashMap<String, DomainMetadata>;
 
@@ -123,7 +123,7 @@ impl LogSegment {
     fn read_domain_metadata_batches(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<ActionsBatch>> + Send> {
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
         self.read_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())
     }
 }

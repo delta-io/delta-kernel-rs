@@ -6,19 +6,23 @@
 
 mod builder;
 mod dv_conversion;
+mod mumbling;
 mod reader;
 pub(crate) mod stats;
+#[cfg(test)]
+pub(crate) mod test_utils;
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use bytes::Bytes;
 use delta_kernel_derive::ToSchema;
 use url::Url;
 
-use crate::engine_data::EngineData;
+use crate::engine_data::{EngineData, GetData, TypedGetData as _};
 use crate::expressions::{null_lit, Expression, Scalar, StructData};
 use crate::schema::derive_macro_utils::ToDataType;
-use crate::schema::{DataType, StructType};
+use crate::schema::{ColumnNamesAndTypes, DataType, StructType, ToSchema as _};
 use crate::{KernelError, KernelResult, Version};
 
 /// Field names in the [`ContentTreeNodeEntry`] schema.
@@ -36,17 +40,45 @@ pub(crate) const CONTENT_STATS_FIELD_NAME: &str = "content_stats";
 pub(crate) const MANIFEST_INFO: &str = "manifestInfo";
 pub(crate) const KEY_METADATA: &str = "keyMetadata";
 pub(crate) const SPLIT_OFFSETS: &str = "splitOffsets";
-pub(crate) const EQUALITY_IDS: &str = "equalityIds";
-pub(crate) const FORMAT_VERSION: &str = "formatVersion";
+pub(crate) const COLUMN_FILES: &str = "columnFiles";
 pub(crate) const TAGS: &str = "tags";
+
+/// Field names within the [`ManifestInfo`] sub-struct.
+pub(crate) const FORMAT_VERSION: &str = "formatVersion";
+pub(crate) const MANIFEST_DV: &str = "dv";
+pub(crate) const ADDED_FILES_COUNT: &str = "addedFilesCount";
+pub(crate) const EXISTING_FILES_COUNT: &str = "existingFilesCount";
+pub(crate) const DELETED_FILES_COUNT: &str = "deletedFilesCount";
+pub(crate) const REPLACED_FILES_COUNT: &str = "replacedFilesCount";
+pub(crate) const MODIFIED_FILES_COUNT: &str = "modifiedFilesCount";
+pub(crate) const ADDED_ROWS_COUNT: &str = "addedRowsCount";
+pub(crate) const EXISTING_ROWS_COUNT: &str = "existingRowsCount";
+pub(crate) const DELETED_ROWS_COUNT: &str = "deletedRowsCount";
+pub(crate) const REPLACED_ROWS_COUNT: &str = "replacedRowsCount";
+pub(crate) const MODIFIED_ROWS_COUNT: &str = "modifiedRowsCount";
+pub(crate) const MIN_SEQUENCE_NUMBER: &str = "minSequenceNumber";
+
+/// The `manifestInfo.formatVersion` of a manifest written in Iceberg v4. Manifests written by
+/// earlier versions record 0.
+pub(crate) const AMT_FORMAT_VERSION: i32 = 4;
 
 /// Field names within the [`TrackingInfo`] sub-struct, shared by the AMT write and read paths.
 pub(crate) const TRACKING_STATUS: &str = "status";
 pub(crate) const TRACKING_SNAPSHOT_ID: &str = "snapshotId";
-pub(crate) const DV_SNAPSHOT_ID: &str = "dvSnapshotId";
+pub(crate) const MODIFIED_SNAPSHOT_ID: &str = "modifiedSnapshotId";
 pub(crate) const SEQUENCE_NUMBER: &str = "sequenceNumber";
 pub(crate) const FILE_SEQUENCE_NUMBER: &str = "fileSequenceNumber";
 pub(crate) const FIRST_ROW_ID: &str = "firstRowId";
+pub(crate) const DELETED_POSITIONS: &str = "deletedPositions";
+pub(crate) const REPLACED_POSITIONS: &str = "replacedPositions";
+
+/// Field names within the [`DeletionVectorInfo`] sub-struct.
+pub(crate) const DV_INFO_OFFSET: &str = "offset";
+pub(crate) const DV_INFO_SIZE_IN_BYTES: &str = "sizeInBytes";
+pub(crate) const DV_INFO_CARDINALITY: &str = "cardinality";
+
+/// Field names within the [`ColumnFile`] sub-struct.
+pub(crate) const FIELD_IDS: &str = "fieldIds";
 
 /// Field names for the different fields within content_stats.
 pub(crate) const LOWER_BOUND: &str = "lower_bound";
@@ -96,13 +128,17 @@ pub(crate) struct DeletionVectorInfo {
     /// Number of set bits (deleted rows) in the deletion vector.
     #[field_id = 156]
     pub(crate) cardinality: i64,
+
+    /// Implementation-specific key metadata for encryption.
+    #[field_id = 149]
+    pub(crate) key_metadata: Option<Bytes>,
 }
 
 /// Sub-struct of ContentTreeNodeEntry that tracks details
 /// of the history of a file in the AMT (its current state,
 /// a sequence number for when it was added, etc).
 #[derive(Debug, Clone, ToSchema)]
-#[cfg_attr(test, derive(delta_kernel_derive::IntoStructData))]
+#[cfg_attr(test, derive(PartialEq, delta_kernel_derive::IntoStructData))]
 pub struct TrackingInfo {
     /// Whether this entry is added, existing, or deleted.
     #[field_id = 0]
@@ -113,11 +149,11 @@ pub struct TrackingInfo {
     #[field_id = 1]
     pub snapshot_id: Option<i64>,
 
-    /// Snapshot ID in which this entry's deletion vector last changed. May predate this entry's
-    /// own snapshot for a carried-forward entry, so it can be set on any live status, not just
-    /// `Modified`.
+    /// Snapshot ID in which this entry was last modified (its deletion vector or column files
+    /// changed). Preserved when the entry is carried forward, so it can be set on any status, not
+    /// just `Modified`.
     #[field_id = 5]
-    pub(crate) dv_snapshot_id: Option<i64>,
+    pub(crate) modified_snapshot_id: Option<i64>,
 
     /// Data sequence number of the file. Inherited when `None` and status is 1 (added).
     /// Must be equal to file_sequence_number if content_type is {Data,Delete}Manifest.
@@ -136,17 +172,57 @@ pub struct TrackingInfo {
     #[field_id = 142]
     pub(crate) first_row_id: Option<i64>,
 
-    /// Positions deleted from this manifest in the current commit. Cleared between commits.
-    /// Encoded as a serialized `RoaringBitmapArray` (the same portable RoaringBitmap framing used
-    /// for inline deletion vectors, see [`crate::actions::deletion_vector`]).
+    /// Positions deleted from this manifest in the [`Self::modified_snapshot_id`] snapshot. Only
+    /// set on manifest entries. Encoded as a
+    /// [Mumbling bitmap](https://iceberg.apache.org/mumbling-spec/).
     #[field_id = 6]
     pub(crate) deleted_positions: Option<Bytes>,
 
-    /// Positions replaced (DV changed) in this manifest in the current commit. Cleared between
-    /// commits. Encoded as a serialized `RoaringBitmapArray`, matching `deleted_positions`.
+    /// Positions replaced in this manifest in the [`Self::modified_snapshot_id`] snapshot,
+    /// disjoint from `deleted_positions`. Only set on manifest entries. Encoded as a Mumbling
+    /// bitmap, matching `deleted_positions`.
     // TODO: always `None` until DvCache tracks replaced positions in a later change.
     #[field_id = 7]
     pub(crate) replaced_positions: Option<Bytes>,
+}
+
+/// The `tracking.*` leaf columns [`TrackingInfo::try_from_getters`] reads, in getter order.
+pub(crate) static TRACKING_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| TrackingInfo::to_schema().leaves(TRACKING));
+
+impl TrackingInfo {
+    /// Parses one row's `tracking` struct from `getters`, which must follow [`TRACKING_COLUMNS`]
+    /// order.
+    ///
+    /// # Errors
+    /// Returns an error if the getter count differs from [`TRACKING_COLUMNS`], if `status` is null
+    /// or not a known [`TrackingStatus`], or if a getter yields a value of the wrong type.
+    pub(crate) fn try_from_getters<'a>(
+        row: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> KernelResult<Self> {
+        let expected = TRACKING_COLUMNS.as_ref().0.len();
+        if getters.len() != expected {
+            return Err(KernelError::internal_error(format!(
+                "Expected {expected} AMT tracking getters, got {}",
+                getters.len()
+            )));
+        }
+        let positions = |getter: &'a dyn GetData<'a>, field: &str| -> KernelResult<_> {
+            let bytes: Option<&[u8]> = getter.get_opt(row, field)?;
+            Ok(bytes.map(Bytes::copy_from_slice))
+        };
+        Ok(Self {
+            status: TrackingStatus::try_from_repr(getters[0].get(row, TRACKING_STATUS)?)?,
+            snapshot_id: getters[1].get_opt(row, TRACKING_SNAPSHOT_ID)?,
+            modified_snapshot_id: getters[2].get_opt(row, MODIFIED_SNAPSHOT_ID)?,
+            sequence_number: getters[3].get_opt(row, SEQUENCE_NUMBER)?,
+            file_sequence_number: getters[4].get_opt(row, FILE_SEQUENCE_NUMBER)?,
+            first_row_id: getters[5].get_opt(row, FIRST_ROW_ID)?,
+            deleted_positions: positions(getters[6], DELETED_POSITIONS)?,
+            replaced_positions: positions(getters[7], REPLACED_POSITIONS)?,
+        })
+    }
 }
 
 /// Represents an entry/row in a ContentTree node.
@@ -162,8 +238,7 @@ pub(super) struct ContentTreeNodeEntry {
     #[field_id = 100]
     pub location: String,
 
-    /// File format of the entry: `parquet` for data files or `puffin` for deletion vectors (the
-    /// only formats kernel supports). See [`DataFileFormat`].
+    /// File format of the entry. Kernel only supports `parquet`; see [`DataFileFormat`].
     #[field_id = 101]
     pub(crate) file_format: DataFileFormat,
 
@@ -211,7 +286,6 @@ pub(super) struct ContentTreeNodeEntry {
     #[field_id = 150]
     pub(crate) manifest_info: Option<ManifestInfo>,
 
-    /// Location of the data file if the content_type is  PositionDeletes
     /// Location of affiliated data manifest if content_type is or DeleteManifest or `None` if
     /// delete manifest is unaffiliated. TODO: place holder for referenced file which is no longer
     /// necessary. #[field_id = 143]
@@ -227,16 +301,11 @@ pub(super) struct ContentTreeNodeEntry {
     #[nested_field_id = 133]
     pub(crate) split_offsets: Option<Vec<i64>>,
 
-    /// Field ids used to determine row equality in equality delete files.
-    /// Required when content is EqualityDeletes and must be `None` otherwise.
-    /// Fields with ids listed in this column must be present in the delete file
-    #[field_id = 135]
-    #[nested_field_id = 136]
-    pub(crate) equality_ids: Option<Vec<i32>>,
-
-    /// The AMT/Iceberg format version this entry was written at.
-    #[field_id = 157]
-    pub(crate) format_version: i32,
+    /// Column files storing updated values of some of this data file's fields. Only set on data
+    /// entries and v4 leaf manifests.
+    #[field_id = 158]
+    #[nested_field_id = 159]
+    pub(crate) column_files: Option<Vec<ColumnFile>>,
 
     /// Metadata tags for this file, propagated from the Add action. Map values can be null.
     ///
@@ -247,12 +316,36 @@ pub(super) struct ContentTreeNodeEntry {
     pub(crate) tags: Option<HashMap<String, Option<String>>>,
 }
 
+/// A file storing the values of some fields for each row of another file, used by column updates.
+#[derive(Debug, Clone, ToSchema)]
+#[cfg_attr(test, derive(delta_kernel_derive::IntoStructData))]
+pub(crate) struct ColumnFile {
+    /// Location of the column file.
+    #[field_id = 160]
+    pub(crate) location: String,
+
+    /// IDs of the top-level fields whose values this column file stores.
+    #[field_id = 161]
+    #[nested_field_id = 162]
+    pub(crate) field_ids: Vec<i32>,
+
+    /// File format of the column file.
+    #[field_id = 163]
+    pub(crate) file_format: DataFileFormat,
+
+    /// Total column file size in bytes.
+    #[field_id = 164]
+    pub(crate) file_size_in_bytes: i64,
+
+    /// Implementation-specific key metadata for encryption.
+    #[field_id = 165]
+    pub(crate) key_metadata: Option<Bytes>,
+}
+
 /// Type of content stored by the manifest entry
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum DataContentType {
     Data = 0,
-    PositionDeletes = 1,
-    EqualityDeletes = 2,
     // Types below are only allowed in the root
     DataManifest = 3,   // manifest of data files with inline DV info
     DeleteManifest = 4, // kept for backwards compat reading only
@@ -263,8 +356,6 @@ impl DataContentType {
     pub(crate) fn try_from_repr(value: i32) -> KernelResult<Self> {
         match value {
             0 => Ok(Self::Data),
-            1 => Ok(Self::PositionDeletes),
-            2 => Ok(Self::EqualityDeletes),
             3 => Ok(Self::DataManifest),
             4 => Ok(Self::DeleteManifest),
             other => Err(KernelError::generic(format!(
@@ -291,8 +382,6 @@ impl From<DataContentType> for Scalar {
 pub(crate) enum DataFileFormat {
     /// Parquet file format: <https://parquet.apache.org/>
     Parquet,
-    /// Puffin file format: <https://iceberg.apache.org/puffin-spec/>
-    Puffin,
 }
 
 impl ToDataType for DataFileFormat {
@@ -306,7 +395,6 @@ impl DataFileFormat {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Parquet => "parquet",
-            Self::Puffin => "puffin",
         }
     }
 }
@@ -360,9 +448,15 @@ impl From<TrackingStatus> for Scalar {
     }
 }
 
+/// Sub-struct of ContentTreeNodeEntry summarizing a referenced manifest.
 #[derive(Debug, Clone, Default, PartialEq, ToSchema)]
 #[cfg_attr(test, derive(delta_kernel_derive::IntoStructData))]
 pub(crate) struct ManifestInfo {
+    /// Format version the manifest was written with: [`AMT_FORMAT_VERSION`] for v4 manifests, 0
+    /// for manifests written by earlier versions.
+    #[field_id = 521]
+    pub(crate) format_version: i32,
+
     /// Number of entries with ADDED status in the manifest.
     #[field_id = 504]
     pub(crate) added_files_count: i32,
@@ -373,8 +467,11 @@ pub(crate) struct ManifestInfo {
     #[field_id = 506]
     pub(crate) deleted_files_count: i32,
     /// Number of entries with REPLACED status in the manifest.
-    #[field_id = 520]
+    #[field_id = 523]
     pub(crate) replaced_files_count: i32,
+    /// Number of entries with MODIFIED status in the manifest.
+    #[field_id = 525]
+    pub(crate) modified_files_count: i32,
 
     /// Total row count across all ADDED entries in the manifest.
     #[field_id = 512]
@@ -386,21 +483,20 @@ pub(crate) struct ManifestInfo {
     #[field_id = 514]
     pub(crate) deleted_rows_count: i64,
     /// Total row count across all REPLACED entries in the manifest.
-    #[field_id = 521]
+    #[field_id = 524]
     pub(crate) replaced_rows_count: i64,
+    /// Total row count across all MODIFIED entries in the manifest.
+    #[field_id = 526]
+    pub(crate) modified_rows_count: i64,
 
-    /// Minimum data sequence number of all entries in the manifest.
+    /// Minimum data sequence number of all live entries in the manifest.
     #[field_id = 516]
     pub(crate) min_sequence_number: i64,
 
-    /// Serialized deletion vector covering the manifest's entries, or `None` when the manifest has
-    /// no associated deletion vector. Encoded as a serialized `RoaringBitmapArray`, matching the
-    /// framing used for [`TrackingInfo::deleted_positions`].
+    /// Positions in the referenced leaf manifest that are not live, or `None` when every position
+    /// is live. Encoded as a [Mumbling bitmap](https://iceberg.apache.org/mumbling-spec/).
     #[field_id = 522]
     pub(crate) dv: Option<Bytes>,
-    /// Number of set bits (deleted rows) in [`Self::dv`], or `None` when `dv` is absent.
-    #[field_id = 523]
-    pub(crate) dv_cardinality: Option<i64>,
 }
 
 // === Helpers ===
@@ -435,8 +531,95 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, ToSchema};
+    use crate::content_tree::test_utils::{
+        added_data_entry, entry_batch, struct_batch, with_field,
+    };
+    use crate::engine::sync::SyncEngine;
+    use crate::engine_data::RowVisitor;
+    use crate::schema::{ColumnMetadataKey, ColumnName, MetadataValue, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
+
+    /// Collects every row's [`TrackingInfo`] via [`TrackingInfo::try_from_getters`].
+    #[derive(Default)]
+    struct TrackingVisitor {
+        tracking: Vec<TrackingInfo>,
+    }
+
+    impl RowVisitor for TrackingVisitor {
+        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+            TRACKING_COLUMNS.as_ref()
+        }
+
+        fn visit<'a>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'a dyn GetData<'a>],
+        ) -> KernelResult<()> {
+            for row in 0..row_count {
+                self.tracking
+                    .push(TrackingInfo::try_from_getters(row, getters)?);
+            }
+            Ok(())
+        }
+    }
+
+    fn visit_tracking(batch: &dyn EngineData) -> KernelResult<Vec<TrackingInfo>> {
+        let mut visitor = TrackingVisitor::default();
+        visitor.visit_rows_of(batch)?;
+        Ok(visitor.tracking)
+    }
+
+    #[rstest]
+    #[case::all_fields_set(TrackingInfo {
+        status: TrackingStatus::Existing,
+        snapshot_id: Some(1),
+        modified_snapshot_id: Some(2),
+        sequence_number: Some(3),
+        file_sequence_number: Some(4),
+        first_row_id: Some(5),
+        deleted_positions: Some(Bytes::from_static(b"deleted")),
+        replaced_positions: Some(Bytes::from_static(b"replaced")),
+    })]
+    #[case::optional_fields_null(TrackingInfo {
+        status: TrackingStatus::Deleted,
+        snapshot_id: None,
+        modified_snapshot_id: None,
+        sequence_number: None,
+        file_sequence_number: None,
+        first_row_id: None,
+        deleted_positions: None,
+        replaced_positions: None,
+    })]
+    fn tracking_info_parses_from_getters(#[case] tracking: TrackingInfo) {
+        let engine = SyncEngine::new();
+        let mut entry = added_data_entry("a.parquet", 1, 1, 0, 0);
+        entry.tracking = tracking.clone();
+        let batch = entry_batch(&engine, &[entry]);
+        assert_eq!(visit_tracking(batch.as_ref()).unwrap(), vec![tracking]);
+    }
+
+    #[test]
+    fn tracking_info_rejects_unknown_status() {
+        let engine = SyncEngine::new();
+        let entry = with_field(
+            &added_data_entry("a.parquet", 1, 1, 0, 0).into(),
+            &[TRACKING, TRACKING_STATUS],
+            Scalar::Integer(9),
+        );
+        let batch = struct_batch(&engine, &[entry]);
+        assert_result_error_with_message(
+            visit_tracking(batch.as_ref()),
+            "Invalid AMT tracking status value: 9",
+        );
+    }
+
+    #[test]
+    fn tracking_info_rejects_wrong_getter_count() {
+        assert_result_error_with_message(
+            TrackingInfo::try_from_getters(0, &[]),
+            "AMT tracking getters, got 0",
+        );
+    }
 
     #[test]
     fn struct_expr_from_schema_errors_on_missing_required_field() {
@@ -475,8 +658,6 @@ mod tests {
 
     #[rstest]
     #[case(0, DataContentType::Data)]
-    #[case(1, DataContentType::PositionDeletes)]
-    #[case(2, DataContentType::EqualityDeletes)]
     #[case(3, DataContentType::DataManifest)]
     #[case(4, DataContentType::DeleteManifest)]
     fn data_content_type_try_from_repr_roundtrips(
@@ -488,6 +669,8 @@ mod tests {
     }
 
     #[rstest]
+    #[case::position_deletes(1)]
+    #[case::equality_deletes(2)]
     #[case(5)]
     #[case(-1)]
     #[case(i32::MAX)]
@@ -495,34 +678,71 @@ mod tests {
         assert!(DataContentType::try_from_repr(repr).is_err());
     }
 
-    /// The `ContentTreeNodeEntry` Parquet field IDs and nullability are a protocol contract. This
-    /// pins the name, field ID, and nullability of every field in `to_schema()` so an accidental
-    /// change (e.g. reverting `location` or `fileSizeInBytes` back to `Option<...>`) fails loudly.
-    /// `partition` and `content_stats` are `#[skip_schema]` and only appear in
-    /// `to_schema_with_content_stats`, so they are intentionally absent here.
-    #[test]
-    fn content_tree_node_entry_schema_field_contract() {
-        let schema = ContentTreeNodeEntry::to_schema();
-
-        // (field name, Parquet field ID, nullable). `tags` carries no field ID (matched by name).
-        let expected: &[(&str, Option<i64>, bool)] = &[
-            (CONTENT_TYPE, Some(134), false),
-            (LOCATION, Some(100), false),
-            (FILE_FORMAT, Some(101), false),
-            (TRACKING, Some(147), false),
-            (DV_INFO, Some(148), true),
-            (PARTITION_SPEC_ID, Some(141), true),
-            (SORT_ORDER_ID, Some(140), true),
-            (RECORD_COUNT, Some(103), false),
-            (FILE_SIZE_IN_BYTES, Some(104), false),
-            (MANIFEST_INFO, Some(150), true),
-            (KEY_METADATA, Some(131), true),
-            (SPLIT_OFFSETS, Some(132), true),
-            (EQUALITY_IDS, Some(135), true),
-            (FORMAT_VERSION, Some(157), false),
-            (TAGS, None, true),
-        ];
-
+    /// The AMT struct Parquet field IDs and nullability are a protocol contract with the Iceberg v4
+    /// spec. This pins the name, field ID, and nullability of every field in each `to_schema()`, in
+    /// order, so an accidental change fails loudly. `partition` and `content_stats` are
+    /// `#[skip_schema]` and only appear in `to_schema_with_content_stats`, so they are absent here.
+    /// `tags` is a Delta extension with no field ID (matched by name).
+    #[rstest]
+    #[case::content_tree_node_entry(ContentTreeNodeEntry::to_schema(), &[
+        (CONTENT_TYPE, Some(134), false),
+        (LOCATION, Some(100), false),
+        (FILE_FORMAT, Some(101), false),
+        (TRACKING, Some(147), false),
+        (DV_INFO, Some(148), true),
+        (PARTITION_SPEC_ID, Some(141), true),
+        (SORT_ORDER_ID, Some(140), true),
+        (RECORD_COUNT, Some(103), false),
+        (FILE_SIZE_IN_BYTES, Some(104), false),
+        (MANIFEST_INFO, Some(150), true),
+        (KEY_METADATA, Some(131), true),
+        (SPLIT_OFFSETS, Some(132), true),
+        (COLUMN_FILES, Some(158), true),
+        (TAGS, None, true),
+    ])]
+    #[case::tracking_info(TrackingInfo::to_schema(), &[
+        (TRACKING_STATUS, Some(0), false),
+        (TRACKING_SNAPSHOT_ID, Some(1), true),
+        (MODIFIED_SNAPSHOT_ID, Some(5), true),
+        (SEQUENCE_NUMBER, Some(3), true),
+        (FILE_SEQUENCE_NUMBER, Some(4), true),
+        (FIRST_ROW_ID, Some(142), true),
+        (DELETED_POSITIONS, Some(6), true),
+        (REPLACED_POSITIONS, Some(7), true),
+    ])]
+    #[case::deletion_vector_info(DeletionVectorInfo::to_schema(), &[
+        (LOCATION, Some(155), false),
+        (DV_INFO_OFFSET, Some(144), false),
+        (DV_INFO_SIZE_IN_BYTES, Some(145), false),
+        (DV_INFO_CARDINALITY, Some(156), false),
+        (KEY_METADATA, Some(149), true),
+    ])]
+    #[case::manifest_info(ManifestInfo::to_schema(), &[
+        (FORMAT_VERSION, Some(521), false),
+        (ADDED_FILES_COUNT, Some(504), false),
+        (EXISTING_FILES_COUNT, Some(505), false),
+        (DELETED_FILES_COUNT, Some(506), false),
+        (REPLACED_FILES_COUNT, Some(523), false),
+        (MODIFIED_FILES_COUNT, Some(525), false),
+        (ADDED_ROWS_COUNT, Some(512), false),
+        (EXISTING_ROWS_COUNT, Some(513), false),
+        (DELETED_ROWS_COUNT, Some(514), false),
+        (REPLACED_ROWS_COUNT, Some(524), false),
+        (MODIFIED_ROWS_COUNT, Some(526), false),
+        (MIN_SEQUENCE_NUMBER, Some(516), false),
+        (MANIFEST_DV, Some(522), true),
+    ])]
+    #[case::column_file(ColumnFile::to_schema(), &[
+        (LOCATION, Some(160), false),
+        (FIELD_IDS, Some(161), false),
+        (FILE_FORMAT, Some(163), false),
+        (FILE_SIZE_IN_BYTES, Some(164), false),
+        (KEY_METADATA, Some(165), true),
+    ])]
+    fn amt_schema_field_contract(
+        #[case] schema: StructType,
+        #[case] expected: &[(&str, Option<i64>, bool)],
+    ) {
         // Assert the exact set and order of fields, catching added, removed, or reordered fields.
         let actual_names: Vec<&str> = schema.fields().map(|f| f.name().as_str()).collect();
         let expected_names: Vec<&str> = expected.iter().map(|(name, _, _)| *name).collect();

@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use serde_json::{from_slice, json, Value};
 use tempfile::tempdir;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use test_utils::assert_result_error_with_message;
 use test_utils::{actions_to_string, add_commit, delta_path_for_version, TestAction};
 use url::Url;
 
@@ -20,6 +22,8 @@ use crate::checkpoint::{
     create_last_checkpoint_data, CheckpointWriter, LastCheckpointHintStats,
     CHECKPOINT_ACTIONS_SCHEMA_V2,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::sync::SyncEngine;
@@ -32,6 +36,10 @@ use crate::table_features::TableFeature;
 use crate::transaction::create_table::create_table;
 use crate::transaction::UpdateTableOperation;
 use crate::unit_test_utils::Action;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::unit_test_utils::{
+    adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
+};
 use crate::{FileMeta, KernelResult, LogPath, Snapshot};
 
 #[rstest::rstest]
@@ -699,6 +707,39 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> KernelResult<()> {
         snapshot.create_checkpoint_writer(&engine).unwrap_err(),
         crate::KernelError::UnpublishedVersion(1)
     ));
+    Ok(())
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[rstest::rstest]
+#[tokio::test]
+async fn test_no_standalone_checkpoint_on_adaptive_metadata_table(
+    #[values(
+        None,
+        Some(CheckpointSpec::V1),
+        Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
+    )]
+    spec: Option<CheckpointSpec>,
+) -> KernelResult<()> {
+    let (store, _) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    let config = adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
+    let commit = [
+        json!({ "commitInfo": { "timestamp": 1, "inCommitTimestamp": 1 } }),
+        json!({ "protocol": config.protocol() }),
+        json!({ "metaData": config.metadata() }),
+    ]
+    .map(|action| action.to_string())
+    .join("\n");
+    add_commit("memory:///", store.as_ref(), 0, commit)
+        .await
+        .unwrap();
+
+    let snapshot = Snapshot::builder_for("memory:///").build(&engine)?;
+    let message =
+        "Standalone checkpoints are not yet supported for tables with adaptiveMetadata enabled";
+    assert_result_error_with_message(snapshot.checkpoint(&engine, spec.as_ref()), message);
+    assert_result_error_with_message(snapshot.create_checkpoint_writer(&engine), message);
     Ok(())
 }
 

@@ -49,6 +49,8 @@ use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
+#[cfg(feature = "check-constraints-in-dev")]
+use crate::table_properties::CheckConstraint;
 use crate::utils::{require, PhantomType};
 use crate::{
     create_row, version_as_i64, DataType, Engine, EngineData, Expression, FileMeta, KernelResult,
@@ -76,6 +78,8 @@ pub use builder::{TransactionBuilder, TransactionType};
 use commit_info::collect_operation_metadata;
 mod bound_write_context;
 mod commit_info;
+#[cfg(feature = "declarative-plans")]
+mod declarative;
 mod domain_metadata;
 mod exec_mode;
 mod operation;
@@ -100,6 +104,8 @@ mod write_state;
 mod write_validation;
 
 pub use bound_write_context::BoundWriteContext;
+#[cfg(feature = "declarative-plans")]
+pub use exec_mode::Declarative;
 pub use exec_mode::{ExecutionMode, Imperative};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[cfg_attr(not(feature = "internal-api"), allow(unused_imports))]
@@ -116,7 +122,8 @@ use update_table::{intermediate_dv_schema, new_dv_column_schema};
 pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState};
 
 /// Type alias for an iterator of [`EngineData`] results.
-pub(crate) type EngineDataResultIterator<'a> = KernelResultIterator<'a, Box<dyn EngineData>>;
+pub(crate) type EngineDataResultIterator<'a> =
+    Box<dyn KernelResultIterator<Box<dyn EngineData>> + 'a>;
 
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange
 /// column.
@@ -209,6 +216,7 @@ pub struct CreateTable;
 /// The independent type parameter `MODE` selects the [`ExecutionMode`], which provides an
 /// abstraction over 1) how staged changes are represented and 2) how to inspect the changes. The
 /// default, [`Imperative`], stages [`EngineData`] and provides [`commit`](Self::commit).
+/// With the `declarative-plans` feature, `Declarative` stages relation handles instead.
 ///
 /// Both states support file additions. Schema-changing transactions use [`UpdateTable`] rather
 /// than a separate schema-only state, allowing schema and file changes in the same transaction.
@@ -312,6 +320,10 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     // handling. Whether the connector acknowledged responsibility for applying column
     // defaults.
     column_defaults_acknowledged: bool,
+    // Whether the connector acknowledged responsibility for enforcing this table's CHECK
+    // constraints.
+    #[cfg(feature = "check-constraints-in-dev")]
+    check_constraints_acknowledged: bool,
     // Whether the connector acknowledged responsibility for preserving Row IDs and Row Commit
     // Versions.
     row_tracking_preservation_acknowledged: bool,
@@ -384,9 +396,9 @@ fn build_add_actions<'a, I, T>(
     add_files_metadata: I,
     input_schema: SchemaRef,
     data_change: bool,
-) -> KernelResult<impl Iterator<Item = KernelResult<Box<dyn EngineData>>> + 'a>
+) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + 'a>
 where
-    I: Iterator<Item = KernelResult<T>> + Send + 'a,
+    I: KernelResultIterator<T> + 'a,
     T: Deref<Target = dyn EngineData> + Send + 'a,
 {
     let evaluation_handler = engine.evaluation_handler();
@@ -534,6 +546,39 @@ impl<STATE> Transaction<STATE, Imperative> {
 // Shared methods available on ALL transaction types
 // =============================================================================
 impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
+    /// The effective CHECK constraints of this transaction, sorted by name and then SQL. Empty when
+    /// the table declares none.
+    ///
+    /// Each constraint is a Boolean SQL expression, stored under `delta.constraints.<name>`, that
+    /// every row in the table must satisfy. See [`Self::ack_check_constraints`] for what a
+    /// connector must do before writing to a table with constraints.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn check_constraints(&self) -> &[CheckConstraint] {
+        &self
+            .effective_table_config
+            .table_properties()
+            .check_constraints
+    }
+
+    /// Acknowledges that the connector enforces this table's CHECK constraints.
+    ///
+    /// Kernel does not see the rows a connector writes, so it does not evaluate constraints. The
+    /// connector must:
+    /// - Discover the constraints of this transaction via [`Self::check_constraints`] and parse
+    ///   each one's [`raw_sql`](crate::table_properties::CheckConstraint::raw_sql) itself. The SQL
+    ///   refers to logical column names.
+    /// - Reject every written row, including its partition values, for which a constraint evaluates
+    ///   to `false` or `NULL`. This includes files written for an earlier commit attempt, such as
+    ///   one that conflicted, and validated against an older table version.
+    ///
+    /// The acknowledgement covers whatever this transaction commits. Without it,
+    /// [`write_state`](Transaction::write_state) and [`commit`](Self::commit) fail whenever
+    /// [`Self::check_constraints`] is not empty.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn ack_check_constraints(&mut self) {
+        self.check_constraints_acknowledged = true;
+    }
+
     /// Replaces operation metrics recorded in `commitInfo`.
     ///
     /// Present values must already be stringified as expected in table history. `None` writes a
@@ -737,10 +782,12 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// configuration.
     ///
     /// Returns an error if the table has an empty or unsupported schema, or if the table declares
-    /// column defaults that the connector has not acknowledged.
+    /// column defaults or CHECK constraints that the connector has not acknowledged.
     pub fn write_state(&self) -> KernelResult<Arc<WriteState>> {
         self.ensure_schema_non_empty_for_write_state()?;
         self.ensure_column_defaults_acknowledged()?;
+        #[cfg(feature = "check-constraints-in-dev")]
+        self.ensure_check_constraints_acknowledged()?;
         self.validate_for_data_write()?;
         // The effective table configuration can change while building a transaction, so this
         // state must be derived on demand rather than cached on the transaction. TODO(#3149):
@@ -781,7 +828,7 @@ struct NonfileCommitActions {
 
 /// The encoded commit actions, plus the state the post-commit CRC and snapshot are built from.
 struct CommitBatches<'a> {
-    actions: KernelResultIterator<'a, FilteredEngineData>,
+    actions: Box<dyn KernelResultIterator<FilteredEngineData> + 'a>,
     dm_changes: Vec<DomainMetadata>,
     /// The `checkpoint` action this commit writes, if any (adaptiveMetadata).
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -839,6 +886,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             user_domain_removals: vec![],
             data_change: common_state.data_change,
             column_defaults_acknowledged: false,
+            #[cfg(feature = "check-constraints-in-dev")]
+            check_constraints_acknowledged: false,
             row_tracking_preservation_acknowledged: false,
             is_blind_append: false,
             #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1123,6 +1172,21 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         Ok(())
     }
 
+    /// Rejects writing or committing when this transaction has effective CHECK constraints that
+    /// the connector has not acknowledged.
+    #[cfg(feature = "check-constraints-in-dev")]
+    fn ensure_check_constraints_acknowledged(&self) -> KernelResult<()> {
+        require!(
+            !self.effective_table_config.has_check_constraints()
+                || self.check_constraints_acknowledged,
+            KernelError::invalid_transaction_state(
+                "Writing to a table with CHECK constraints requires calling \
+                 Transaction::ack_check_constraints() first",
+            )
+        );
+        Ok(())
+    }
+
     fn ensure_row_tracking_preservation_acknowledged(&self) -> KernelResult<()> {
         if !self
             .effective_table_config
@@ -1261,6 +1325,9 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
                 .validate_feature_support_for_remove()?;
             self.ensure_row_tracking_preservation_acknowledged()?;
         }
+
+        #[cfg(feature = "check-constraints-in-dev")]
+        self.ensure_check_constraints_acknowledged()?;
 
         // TODO(zach): we currently do this in two passes - can we do it in one and still keep refs
         // in the HashSet?
@@ -1544,19 +1611,19 @@ impl<STATE> Transaction<STATE, Imperative> {
         self.validate_add_files_stats(&self.staged_data_changes.add_files_metadata)?;
 
         // Validate required fields for addFile.
-        write_validation::StagedDataValidator::staged_add_file(
+        write_validation::StagedDataValidator::for_add_files(
             self.effective_table_config.physical_partition_columns(),
         )
-        .validate(&self.staged_data_changes.add_files_metadata)?;
+        .validate_batches(&self.staged_data_changes.add_files_metadata)?;
 
-        write_validation::StagedDataValidator::staged_dv_matched_file(
+        write_validation::StagedDataValidator::for_dv_updates(
             self.effective_table_config.physical_partition_columns(),
         )?
-        .validate_filtered(&self.staged_data_changes.dv_matched_files)?;
+        .validate_selected_rows(&self.staged_data_changes.dv_matched_files)?;
 
         // Validate required fields for RemoveFile.
-        write_validation::StagedDataValidator::staged_remove_file()
-            .validate_filtered(&self.staged_data_changes.remove_files_metadata)?;
+        write_validation::StagedDataValidator::for_remove_files()
+            .validate_selected_rows(&self.staged_data_changes.remove_files_metadata)?;
 
         Ok(())
     }
@@ -1640,7 +1707,7 @@ impl<STATE> Transaction<STATE, Imperative> {
     fn perform_commit(
         &self,
         engine: &dyn Engine,
-        actions: KernelResultIterator<'_, FilteredEngineData>,
+        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         commit_metadata: CommitMetadata,
     ) -> (KernelResult<CommitResponse>, Duration) {
         let committer_start = Instant::now();
@@ -1892,7 +1959,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         engine: &dyn Engine,
         remove_files_metadata: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
         has_dv_update_columns: bool,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<FilteredEngineData>> + Send + 'a> {
+    ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + 'a> {
         // Create-table transactions should not have any remove actions.
         // Only error if there are actually files queued for removal.
         if self.is_create_table() && !self.staged_data_changes.remove_files_metadata.is_empty() {
@@ -2298,6 +2365,8 @@ mod tests {
             user_domain_removals,
             data_change,
             column_defaults_acknowledged,
+            #[cfg(feature = "check-constraints-in-dev")]
+            check_constraints_acknowledged,
             row_tracking_preservation_acknowledged,
             is_blind_append,
             #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -2329,6 +2398,8 @@ mod tests {
         assert!(user_domain_removals.is_empty());
         assert_eq!(data_change, expected_data_change);
         assert!(!column_defaults_acknowledged);
+        #[cfg(feature = "check-constraints-in-dev")]
+        assert!(!check_constraints_acknowledged);
         assert!(!row_tracking_preservation_acknowledged);
         assert!(!is_blind_append);
         assert!(dv_matched_files.is_empty());
@@ -2433,7 +2504,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: KernelResultIterator<'_, FilteredEngineData>,
+            _actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
             _commit_metadata: CommitMetadata,
         ) -> KernelResult<CommitResponse> {
             Err(KernelError::IOError(std::io::Error::other(
@@ -2460,7 +2531,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: KernelResultIterator<'_, FilteredEngineData>,
+            _actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
             _commit_metadata: CommitMetadata,
         ) -> KernelResult<CommitResponse> {
             Err(KernelError::generic("simulated commit error"))
@@ -2484,7 +2555,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: KernelResultIterator<'_, FilteredEngineData>,
+            _actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
             _commit_metadata: CommitMetadata,
         ) -> KernelResult<CommitResponse> {
             // This won't be reached in tests — the validation error fires before commit.
@@ -4482,7 +4553,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn Engine,
-            _actions: KernelResultIterator<'_, FilteredEngineData>,
+            _actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
             commit_metadata: CommitMetadata,
         ) -> KernelResult<CommitResponse> {
             *self.captured.lock().unwrap() = Some(commit_metadata.in_commit_timestamp());

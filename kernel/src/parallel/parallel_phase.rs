@@ -15,7 +15,7 @@ use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::log_segment::checkpoint_action_projection_predicate;
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
-use crate::{Engine, EngineData, FileMeta, KernelResult, KernelResultIteratorStatic};
+use crate::{Engine, EngineData, FileMeta, KernelResult, KernelResultIterator};
 
 /// Processes checkpoint leaf files in parallel using a shared processor.
 ///
@@ -35,7 +35,7 @@ use crate::{Engine, EngineData, FileMeta, KernelResult, KernelResultIteratorStat
 #[internal_api]
 pub(crate) struct ParallelPhase<P: ParallelLogReplayProcessor> {
     processor: P,
-    leaf_checkpoint_reader: KernelResultIteratorStatic<ActionsBatch>,
+    leaf_checkpoint_reader: Box<dyn KernelResultIterator<ActionsBatch>>,
 }
 
 impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {

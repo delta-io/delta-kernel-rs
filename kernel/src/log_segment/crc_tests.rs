@@ -11,26 +11,28 @@ use serde_json::{json, Value};
 use test_utils::delta_path_for_version;
 use url::Url;
 
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use super::CheckpointActionResolution;
 use super::LogSegment;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::CheckpointAction;
 use crate::actions::{DomainMetadata, Format, Metadata, Protocol, SetTransaction};
 use crate::crc::{
     try_read_crc_file, Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState,
 };
 use crate::engine::sync::SyncEngine;
+use crate::engine::CancellableEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
 use crate::path::ParsedLogPath;
 use crate::snapshot::{IncrementalReplay, SnapshotBuilder, SnapshotRef};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_features::TableFeature;
+use crate::unit_test_utils::TestCancellationToken;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
 };
 use crate::utils::FoldWithOption as _;
-use crate::{Engine, KernelResult, Snapshot, Version};
+use crate::{Engine, KernelError, KernelResult, Snapshot, Version};
 
 // ============================================================================
 // Expected values
@@ -418,9 +420,10 @@ impl BuiltCrcTest {
         log_segment.build_crc_from_base(&self.engine, base)
     }
 
-    /// Run `pick_latest_base_crc` against a directly-listed `LogSegment`, using `in_memory_base`.
+    /// List with the fixture engine, then read the CRC with `engine` and `in_memory_base`.
     fn pick_latest_base_crc(
         &self,
+        engine: &dyn Engine,
         in_memory_base: Option<&Arc<Crc>>,
     ) -> KernelResult<Option<Version>> {
         let storage = self.engine.storage_handler();
@@ -428,7 +431,7 @@ impl BuiltCrcTest {
         let log_segment =
             LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)?;
         Ok(log_segment
-            .pick_latest_base_crc(&self.engine, in_memory_base)
+            .pick_latest_base_crc(engine, in_memory_base)?
             .map(|c| c.version))
     }
 
@@ -513,19 +516,19 @@ impl BuiltCrcTest {
     }
 
     /// Lists the log, reads the latest on-disk CRC, and runs the unchecked P&M replay, returning
-    /// how it resolved the latest AMT `checkpoint` action.
+    /// the latest AMT `checkpoint` action it captured, if any.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn checkpoint_action_resolution(&self) -> CheckpointActionResolution {
+    fn captured_checkpoint_action(&self) -> Option<Arc<CheckpointAction>> {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
             LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
                 .unwrap();
-        let crc = log_segment.read_latest_crc(&self.engine);
+        let crc = log_segment.read_latest_crc(&self.engine).unwrap();
         log_segment
             .read_protocol_metadata_opt(&self.engine, crc.as_ref())
             .unwrap()
-            .checkpoint_action
+            .captured_checkpoint_action
     }
 }
 
@@ -820,18 +823,18 @@ async fn test_crc_seeded_replay_captures_checkpoint_action_after_crc() {
         )
         .build()
         .await
-        .checkpoint_action_resolution();
+        .captured_checkpoint_action();
     assert!(
-        matches!(resolution, CheckpointActionResolution::Captured(a) if a.version == 1),
+        resolution.is_some_and(|a| a.version == 1),
         "a checkpoint action after the CRC is the latest and must be captured, not deferred"
     );
 }
 
-// A CRC at the target version short-circuits before any replay, so the checkpoint action is left
-// `Unresolved` for the accessor to settle by scanning.
+// A CRC at the target version short-circuits before any replay, so no checkpoint action is
+// captured; the accessor follows the CRC's `lastManifestCommit` instead.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[tokio::test]
-async fn test_crc_at_target_leaves_checkpoint_action_unresolved() {
+async fn test_crc_at_target_captures_no_checkpoint_action() {
     let config = adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
     let resolution = CrcReadTest::new()
         .commit(
@@ -850,16 +853,16 @@ async fn test_crc_at_target_leaves_checkpoint_action_unresolved() {
         )
         .build()
         .await
-        .checkpoint_action_resolution();
-    assert!(matches!(resolution, CheckpointActionResolution::Unresolved));
+        .captured_checkpoint_action();
+    assert!(resolution.is_none());
 }
 
 // A CRC-seeded pruned replay that resolves P&M from standalone actions but finds no checkpoint
-// action after the CRC leaves the resolution `Unresolved`: the latest action may sit at or below
-// the CRC version, which the pruned replay never reads.
+// action after the CRC captures none: the latest action may sit at or below the CRC version, which
+// the pruned replay never reads.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[tokio::test]
-async fn test_crc_seeded_replay_without_checkpoint_action_is_unresolved() {
+async fn test_crc_seeded_replay_without_checkpoint_action_captures_none() {
     let crc_config =
         adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
     let newer_config = adaptive_metadata_table_configuration(
@@ -890,8 +893,8 @@ async fn test_crc_seeded_replay_without_checkpoint_action_is_unresolved() {
         )
         .build()
         .await
-        .checkpoint_action_resolution();
-    assert!(matches!(resolution, CheckpointActionResolution::Unresolved));
+        .captured_checkpoint_action();
+    assert!(resolution.is_none());
 }
 
 #[tokio::test]
@@ -1456,6 +1459,36 @@ async fn test_stale_crc_advances_past_foreign_last_manifest_commit() {
     assert_eq!(snapshot.crc_at_version().map(|c| c.version), Some(1));
 }
 
+#[rstest]
+#[tokio::test]
+async fn pick_latest_base_crc_preserves_cancellation_with_in_memory_base(
+    #[values(false, true)] corrupt: bool,
+    #[values(false, true)] cancelled: bool,
+) {
+    let test = CrcReadTest::new()
+        .commit(0, create_table_actions())
+        .crc(0, protocol_a(), metadata_a(), None)
+        .commit(1, [commit_info(DEFAULT_OPERATION, None)]);
+    let test = if corrupt {
+        test.corrupt_crc(1)
+    } else {
+        test.crc(1, protocol_a(), metadata_a(), None)
+    };
+    let built = test.build().await;
+    let base = Arc::new(built.read_crc_at(0).unwrap());
+    let token = Arc::new(TestCancellationToken::default());
+    if cancelled {
+        token.cancel();
+    }
+    let engine = CancellableEngine::new(&built.engine, token);
+    let result = built.pick_latest_base_crc(&engine, Some(&base));
+    if cancelled {
+        assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
+    } else {
+        assert_eq!(result.unwrap(), Some(if corrupt { 0 } else { 1 }));
+    }
+}
+
 // A base exactly at the checkpoint version is kept (its tail is (ckpt, end]); a base below it is
 // dropped. Guards the `>=` vs `>` seam in `pick_latest_base_crc`.
 #[tokio::test]
@@ -1474,12 +1507,16 @@ async fn test_pick_latest_base_crc_keeps_base_at_checkpoint_drops_below() {
         ..Default::default()
     });
     assert_eq!(
-        built.pick_latest_base_crc(Some(&base_at_ckpt)).unwrap(),
+        built
+            .pick_latest_base_crc(&built.engine, Some(&base_at_ckpt))
+            .unwrap(),
         Some(2),
         "a base exactly at the checkpoint version must be retained"
     );
     assert_eq!(
-        built.pick_latest_base_crc(Some(&base_below_ckpt)).unwrap(),
+        built
+            .pick_latest_base_crc(&built.engine, Some(&base_below_ckpt))
+            .unwrap(),
         None,
         "a base below the checkpoint version must be dropped"
     );

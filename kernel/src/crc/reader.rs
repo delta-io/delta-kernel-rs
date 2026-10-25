@@ -14,7 +14,7 @@ use crate::{Engine, KernelError, KernelResult};
 /// Reads raw bytes via the storage handler and deserializes with serde_json.
 ///
 /// Returns `Ok(Crc)` on success, `Err` on any failure (file not readable, corrupt JSON,
-/// missing required fields). The caller should handle errors gracefully by falling back to log
+/// missing required fields). Cancellation must propagate; other failures may fall back to log
 /// replay.
 ///
 /// Reports metrics: `CrcReadSuccess` or `CrcReadFailure`.
@@ -33,15 +33,19 @@ pub(crate) fn try_read_crc_file(
     Crc::try_from_json_bytes(&data, crc_path.version)
 }
 
-/// Read a CRC file, returning `None` if it cannot be read.
+/// Read an optional CRC, propagating cancellation and ignoring other read failures.
 ///
 /// CRC files are optional, so an unreadable one is not an error: the caller proceeds without
 /// it. The failure is logged and metered by [`try_read_crc_file`]'s instrumentation.
 pub(crate) fn read_crc_file_or_none(
     engine: &dyn Engine,
     crc_file: &ParsedLogPath,
-) -> Option<Arc<Crc>> {
-    try_read_crc_file(engine, crc_file).ok().map(Arc::new)
+) -> KernelResult<Option<Arc<Crc>>> {
+    match try_read_crc_file(engine, crc_file) {
+        Ok(crc) => Ok(Some(Arc::new(crc))),
+        Err(KernelError::Cancelled) => Err(KernelError::Cancelled),
+        Err(_) => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -55,14 +59,42 @@ mod tests {
     use super::*;
     use crate::actions::{Format, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
+    use crate::engine::CancellableEngine;
     use crate::metrics::MetricEvent;
     use crate::path::ParsedLogPath;
     use crate::table_features::TableFeature;
-    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{
+        install_thread_local_metrics_reporter, CapturingReporter, TestCancellationToken,
+    };
 
     fn test_table_root(dir: &str) -> url::Url {
         let path = std::fs::canonicalize(PathBuf::from(dir)).unwrap();
         url::Url::from_directory_path(path).unwrap()
+    }
+
+    #[rstest::rstest]
+    #[case("crc-full", 0, Some(0))]
+    #[case("crc-malformed", 0, None)]
+    #[case("crc-full", 999, None)]
+    fn optional_crc_read_preserves_cancellation(
+        #[case] fixture: &str,
+        #[case] version: u64,
+        #[case] expected: Option<u64>,
+        #[values(false, true)] cancelled: bool,
+    ) {
+        let table_root = test_table_root(&format!("./tests/data/{fixture}/"));
+        let crc_path = ParsedLogPath::create_parsed_crc(&table_root, version);
+        let token = Arc::new(TestCancellationToken::default());
+        if cancelled {
+            token.cancel();
+        }
+        let engine = CancellableEngine::new(&SyncEngine::new(), token);
+        let result = read_crc_file_or_none(&engine, &crc_path);
+        if cancelled {
+            assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
+        } else {
+            assert_eq!(result.unwrap().map(|crc| crc.version), expected);
+        }
     }
 
     #[test]

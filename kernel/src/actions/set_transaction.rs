@@ -3,7 +3,7 @@ use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{SetTransaction, LOG_TXN_SCHEMA};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
-use crate::{Engine, KernelResult, RowVisitor as _, Version};
+use crate::{Engine, KernelResult, KernelResultIterator, RowVisitor as _, Version};
 
 /// Resolves the latest `txn` action per application id via log replay, where the newest action in
 /// log order wins.
@@ -88,7 +88,7 @@ fn scan_application_transactions(
 fn replay_for_app_ids(
     log_segment: &LogSegment,
     engine: &dyn Engine,
-) -> KernelResult<impl Iterator<Item = KernelResult<ActionsBatch>> + Send> {
+) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
     log_segment.read_actions(engine, LOG_TXN_SCHEMA.clone())
 }
 

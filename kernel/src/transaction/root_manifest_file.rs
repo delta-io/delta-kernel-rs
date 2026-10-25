@@ -164,6 +164,7 @@ impl RootManifestFile {
 mod tests {
     use std::sync::Arc;
 
+    use itertools::Itertools as _;
     use rstest::rstest;
 
     use super::*;
@@ -520,30 +521,59 @@ mod tests {
         Ok(())
     }
 
+    // An AMT table from v0 whose manifest commit at v1 carries the checkpoint action, followed by
+    // domain metadata and a transaction. Every commit records an In-Commit Timestamp and, from v1
+    // on, the `lastManifestCommit` that locates the checkpoint action, as an AMT writer does.
     #[test]
     fn scan_non_content_metadata_uses_crc_fast_path_with_existing_checkpoint() -> KernelResult<()> {
-        let (engine, table_root) = setup_table()?;
-        let write = |version, data| write_commit(&engine, &table_root, version, data);
-
-        // Checksum validation checks protocol continuity, so this uses the table's real
-        // protocol/metadata.
-        let table_snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-        let checkpoint = CheckpointAction::new(
-            1,
-            ContentRoot::new("metadata/root-v1.parquet".to_string(), 1024, 1),
-            table_snapshot.table_configuration().protocol().clone(),
-            table_snapshot.table_configuration().metadata().clone(),
-            vec![],
-            vec![],
-        );
-        write(1, checkpoint.into_engine_data(&engine)?)?;
-        let domain_metadata = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
-        write(
-            2,
-            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)?,
-        )?;
-        let transaction = SetTransaction::new("app-1".to_string(), 5, None);
-        write(3, create_row(&engine, LOG_TXN_SCHEMA.clone(), transaction)?)?;
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let table_root = url::Url::parse("memory:///")?;
+        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
+        let commit_info = |ict: i64, last_manifest_commit: Option<i64>| {
+            let mut commit_info = serde_json::json!({ "timestamp": ict, "inCommitTimestamp": ict });
+            if let Some(version) = last_manifest_commit {
+                commit_info["lastManifestCommit"] =
+                    serde_json::json!({ "version": version, "contentRootVersion": version });
+            }
+            serde_json::json!({ "commitInfo": commit_info })
+        };
+        let commits = [
+            vec![
+                commit_info(1, None),
+                serde_json::json!({ "protocol": protocol }),
+                serde_json::json!({ "metaData": metadata }),
+            ],
+            vec![
+                commit_info(2, Some(1)),
+                serde_json::json!({ "checkpoint": [
+                    { "checkpointMetadata": { "version": 1 } },
+                    { "contentRoot": {
+                        "path": "metadata/root-v1.parquet", "sizeInBytes": 1024, "version": 1,
+                    } },
+                    { "protocol": protocol },
+                    { "metaData": metadata },
+                ] }),
+            ],
+            vec![
+                commit_info(3, Some(1)),
+                serde_json::json!({ "domainMetadata": {
+                    "domain": "test.domain", "configuration": "{}", "removed": false,
+                } }),
+            ],
+            vec![
+                commit_info(4, Some(1)),
+                serde_json::json!({ "txn": { "appId": "app-1", "version": 5 } }),
+            ],
+        ];
+        let log_root = table_root.join("_delta_log/")?;
+        for (version, actions) in commits.iter().enumerate() {
+            let lines = actions.iter().map(|action| action.to_string()).join("\n");
+            engine.storage_handler().put(
+                &log_root.join(&format!("{version:020}.json"))?,
+                lines.into(),
+                false,
+            )?;
+        }
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let (_, snapshot) = snapshot.write_checksum(&engine)?;

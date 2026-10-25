@@ -126,11 +126,12 @@ use crate::log_replay::HasSelectionVector;
 use crate::path::{self, ParsedLogPath};
 use crate::schema::{lazy_schema_ref, SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
+use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    version_as_i64, Engine, EngineData, FileMeta, KernelError, KernelResult,
-    KernelResultIteratorStatic, Version,
+    version_as_i64, Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator,
+    Version,
 };
 
 #[cfg(feature = "declarative-plans")]
@@ -378,6 +379,8 @@ impl CheckpointWriter {
             .table_configuration()
             .ensure_read_write_supported()?;
 
+        ensure_standalone_checkpoint_supported(snapshot.table_configuration())?;
+
         // We disallow checkpointing if the Snapshot is not published. If we didn't, this could
         // create gaps in the version history, thereby breaking old readers.
         snapshot.log_segment().validate_published()?;
@@ -621,7 +624,7 @@ impl CheckpointWriter {
 
         // Write main checkpoint file: non-file actions + sidecar references
         let checkpoint_path = self.checkpoint_path()?;
-        let main_data: KernelResultIteratorStatic<Box<dyn EngineData>> =
+        let main_data: Box<dyn KernelResultIterator<Box<dyn EngineData>>> =
             Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
         let main_size = engine
             .parquet_handler()
@@ -760,6 +763,22 @@ impl CheckpointWriter {
             is_v2,
         })
     }
+}
+
+/// Returns an error if Kernel does not support writing standalone (V1/V2) checkpoints for the
+/// table.
+#[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_variables))]
+pub(crate) fn ensure_standalone_checkpoint_supported(
+    table_configuration: &TableConfiguration,
+) -> KernelResult<()> {
+    // TODO(#3683): support standalone checkpoints for adaptiveMetadata tables.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    if table_configuration.is_feature_enabled(&TableFeature::AdaptiveMetadataPreview) {
+        return Err(KernelError::unsupported(
+            "Standalone checkpoints are not yet supported for tables with adaptiveMetadata enabled",
+        ));
+    }
+    Ok(())
 }
 
 /// Creates the data for the _last_checkpoint file containing checkpoint metadata. Factored out to

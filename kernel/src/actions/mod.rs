@@ -15,7 +15,7 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::amt_path_util::resolve_amt_location;
+use crate::amt_path_util::amt_manifest_filemeta;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::Scalar;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -31,10 +31,10 @@ use crate::table_features::{
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
-use crate::utils::require;
+use crate::utils::{require, to_file_size};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::{create_row, Engine, Version};
-use crate::{EngineData, FileMeta, FileSize, KernelError, KernelResult, RowVisitor as _};
+use crate::{EngineData, FileMeta, KernelError, KernelResult, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
@@ -1915,11 +1915,12 @@ impl CheckpointAction {
     #[internal_api]
     pub(crate) fn root_filemeta(&self, table_root: &Url) -> KernelResult<FileMeta> {
         let content_root = &self.content_root;
-        Ok(FileMeta {
-            location: resolve_amt_location(&content_root.path, table_root)?,
-            last_modified: i64::MAX,
-            size: to_file_size(content_root.size_in_bytes, "checkpoint contentRoot")?,
-        })
+        amt_manifest_filemeta(
+            &content_root.path,
+            content_root.size_in_bytes,
+            table_root,
+            "checkpoint contentRoot",
+        )
     }
 
     /// The table protocol embedded in this checkpoint action (at [`Self::version`]).
@@ -1961,16 +1962,6 @@ pub(crate) struct Sidecar {
     /// A map containing any additional metadata about the logical file. Values can be null.
     #[allow_null_container_values]
     pub tags: Option<HashMap<String, String>>,
-}
-
-/// Convert an `i64` byte count from a log action into a [`FileSize`], erroring with `context` (a
-/// short action name, e.g. `"sidecar"`) and the offending value when it is negative.
-fn to_file_size(bytes: i64, context: &str) -> KernelResult<FileSize> {
-    bytes.try_into().map_err(|_| {
-        KernelError::generic(format!(
-            "Failed to convert {context} size {bytes} to FileSize"
-        ))
-    })
 }
 
 impl Sidecar {
@@ -2122,6 +2113,8 @@ mod tests {
     use crate::expressions::{Scalar, StructData};
     use crate::schema::{schema, schema_ref, DataType, MapType, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::FileSize;
     use crate::{
         create_row, Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
     };
@@ -3256,7 +3249,7 @@ mod tests {
         "metadata/root.parquet",
         -1,
         "memory:///table/metadata/root.parquet",
-        Err("Failed to convert checkpoint contentRoot size -1")
+        Err("Failed to convert checkpoint contentRoot 'metadata/root.parquet' size -1")
     )]
     fn test_checkpoint_action_root_filemeta(
         #[case] table_root: &str,

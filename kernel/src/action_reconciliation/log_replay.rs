@@ -40,7 +40,7 @@ use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector};
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, KernelResultIteratorStatic};
+use crate::{KernelError, KernelResult, KernelResultIterator};
 
 /// Filters log segment actions for action reconciliation.
 pub(crate) struct ActionReconciliationProcessor {
@@ -129,13 +129,13 @@ impl ActionReconciliationIteratorState {
 /// This iterator yields a stream of [`FilteredEngineData`] items while, tracking action
 /// counts. Used by both checkpoint and log compaction workflows.
 pub struct ActionReconciliationIterator {
-    inner: KernelResultIteratorStatic<ActionReconciliationBatch>,
+    inner: Box<dyn KernelResultIterator<ActionReconciliationBatch>>,
     state: Arc<ActionReconciliationIteratorState>,
 }
 
 impl ActionReconciliationIterator {
     /// Create a new iterator with counters initialized to 0
-    pub(crate) fn new(inner: KernelResultIteratorStatic<ActionReconciliationBatch>) -> Self {
+    pub(crate) fn new(inner: Box<dyn KernelResultIterator<ActionReconciliationBatch>>) -> Self {
         Self {
             inner,
             state: Arc::new(ActionReconciliationIteratorState::default()),

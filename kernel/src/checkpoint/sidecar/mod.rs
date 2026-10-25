@@ -240,7 +240,7 @@ impl SidecarSplitter {
 
     /// Creates a new `SidecarSplitter` wrapped in `Arc<Mutex<_>>` for
     /// shared mutable access. This is useful for passing [`SingleSidecarDataIterator`] to
-    /// [`ParquetHandler::write_parquet_file`], which requires `Box<dyn Iterator + Send>`.
+    /// [`ParquetHandler::write_parquet_file`], which requires `Box<dyn KernelResultIterator<_>>`.
     pub(super) fn new_mut_shared(
         checkpoint_data_iterator: ActionReconciliationIterator,
         eval_handler: &dyn EvaluationHandler,

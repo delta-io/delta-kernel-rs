@@ -684,8 +684,8 @@ impl ParseJsonExpression {
 /// Connector-supplied options controlling how a [`MapToStructExpression`] parses map values.
 ///
 /// Kernel does not infer these settings from the host environment or table metadata.
-/// Expression producers must use one reader timezone for all partition-value expressions in a
-/// scan so materialization and pruning cannot interpret the same value differently.
+/// Expression producers must use the same `timestamp_timezone` for all partition-value expressions
+/// in a scan so materialization and pruning cannot interpret the same value differently.
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct MapToStructOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -571,7 +571,7 @@ mod tests {
     use crate::schema::schema;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::create_log_path;
-    use crate::KernelResultIteratorStatic;
+    use crate::KernelResultIterator;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::{engine::sync::SyncEngine, object_store::memory::InMemory, Engine};
 
@@ -1491,13 +1491,13 @@ mod tests {
     struct NoIoStorageHandler;
 
     impl StorageHandler for NoIoStorageHandler {
-        fn list_from(&self, _path: &Url) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
+        fn list_from(&self, _path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
             panic!("list_from should not be called");
         }
         fn read_files(
             &self,
             _files: Vec<crate::FileSlice>,
-        ) -> KernelResult<KernelResultIteratorStatic<bytes::Bytes>> {
+        ) -> KernelResult<Box<dyn KernelResultIterator<bytes::Bytes>>> {
             panic!("read_files should not be called");
         }
         fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> KernelResult<()> {

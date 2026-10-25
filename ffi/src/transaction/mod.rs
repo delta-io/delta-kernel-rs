@@ -131,7 +131,7 @@ mod tests {
         schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
     };
     use delta_kernel::table_features::TableFeature;
-    use delta_kernel::KernelResult;
+    use delta_kernel::{KernelResult, Snapshot};
     use delta_kernel_ffi::delta_types::{
         FfiColumnNameArray, FfiNullableStringMap, FfiNullableStringMapEntry, FfiStringArray,
     };
@@ -185,7 +185,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn delta_kernel::Engine,
-            _actions: delta_kernel::KernelResultIterator<'_, FilteredEngineData>,
+            _actions: Box<dyn delta_kernel::KernelResultIterator<FilteredEngineData> + '_>,
             _commit_metadata: delta_kernel::committer::CommitMetadata,
         ) -> KernelResult<delta_kernel::committer::CommitResponse> {
             Err(delta_kernel::KernelError::IOError(std::io::Error::other(
@@ -218,7 +218,7 @@ mod tests {
         fn commit(
             &self,
             _engine: &dyn delta_kernel::Engine,
-            _actions: delta_kernel::KernelResultIterator<'_, FilteredEngineData>,
+            _actions: Box<dyn delta_kernel::KernelResultIterator<FilteredEngineData> + '_>,
             _commit_metadata: delta_kernel::committer::CommitMetadata,
         ) -> KernelResult<delta_kernel::committer::CommitResponse> {
             Err(delta_kernel::KernelError::generic(
@@ -2103,6 +2103,166 @@ mod tests {
         let version = unsafe { version_and_free(committed) };
         assert_eq!(version, 0);
         version
+    }
+
+    #[rstest]
+    #[case::builder(2, false)]
+    #[case::transaction(0, false)]
+    #[case::mixed(1, false)]
+    #[case::duplicate_app_id_after_build(0, true)]
+    #[case::duplicate_app_id_across_build(1, true)]
+    #[tokio::test]
+    async fn create_table_transaction_ids(
+        #[case] builder_ids: usize,
+        #[case] duplicate_app_id: bool,
+    ) -> KernelResult<()> {
+        let (store, test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_transaction_ids", None);
+        let (_table_path, engine, mut builder) = create_table_txn_builder(
+            true,
+            &store,
+            &table_url,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        let second_app_id = if duplicate_app_id {
+            "app_id1"
+        } else {
+            "app_id2"
+        };
+        let ids = [("app_id1", 1), (second_app_id, 2)];
+        for (app_id, version) in ids.iter().take(builder_ids) {
+            builder = ok_or_panic(unsafe {
+                create_table_txn_builder_with_transaction_id(
+                    builder,
+                    ffi_str(app_id),
+                    *version,
+                    engine.shallow_copy(),
+                )
+            });
+        }
+        let mut txn =
+            ok_or_panic(unsafe { create_table_txn_builder_build(builder, engine.shallow_copy()) });
+        for (app_id, version) in ids.iter().skip(builder_ids) {
+            txn = ok_or_panic(unsafe {
+                create_table_txn_with_transaction_id(
+                    txn,
+                    ffi_str(app_id),
+                    *version,
+                    engine.shallow_copy(),
+                )
+            });
+        }
+        let result = unsafe { create_table_txn_commit(txn, engine.shallow_copy()) };
+        if duplicate_app_id {
+            assert_extern_result_error_contains(
+                result,
+                FFIKernelError::GenericError,
+                "app_id app_id1",
+            );
+        } else {
+            assert_eq!(unsafe { version_and_free(ok_or_panic(result)) }, 0);
+            let snapshot = Snapshot::builder_for(table_url).build(&test_engine)?;
+            assert_eq!(
+                snapshot.get_app_id_version("app_id1", &test_engine)?,
+                Some(1)
+            );
+            assert_eq!(
+                snapshot.get_app_id_version("app_id2", &test_engine)?,
+                Some(2)
+            );
+        }
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn transaction_id_setters_consume_transaction_and_borrow_engine(
+        #[values(false, true)] create_table: bool,
+        #[values(false, true)] invalid_utf8: bool,
+    ) {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_transaction_id_ownership", None);
+        let (_table_path, engine, builder) = create_table_txn_builder(
+            true,
+            &store,
+            &table_url,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        let app_id_bytes: &[u8] = if invalid_utf8 { &[0xff] } else { b"app_id" };
+        let app_id = KernelStringSlice {
+            ptr: app_id_bytes.as_ptr().cast(),
+            len: app_id_bytes.len(),
+        };
+        let engine_owner = unsafe { engine.clone_as_arc() };
+        let engine_reference_count = Arc::strong_count(&engine_owner);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let committer: Box<dyn Committer> = Box::new(DropTrackingCommitter(Arc::clone(&drops)));
+        if create_table {
+            let txn = ok_or_panic(unsafe {
+                create_table_txn_builder_build_with_committer(
+                    builder,
+                    engine.shallow_copy(),
+                    committer.into(),
+                )
+            });
+            assert_transaction_id_setter_ownership(
+                unsafe {
+                    create_table_txn_with_transaction_id(txn, app_id, 1, engine.shallow_copy())
+                },
+                free_create_table_txn,
+                &drops,
+                invalid_utf8,
+            );
+        } else {
+            build_and_commit(builder, &engine);
+            let snapshot =
+                unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+            let builder = ok_or_panic(unsafe {
+                new_update_table_txn_builder(
+                    snapshot.shallow_copy(),
+                    KernelUpdateTableOperation::Write,
+                    ffi_str("test-engine/1.0"),
+                    true,
+                    engine.shallow_copy(),
+                )
+            });
+            unsafe { free_snapshot(snapshot) };
+            let txn = ok_or_panic(unsafe {
+                update_table_txn_builder_build_with_committer(
+                    builder,
+                    engine.shallow_copy(),
+                    committer.into(),
+                )
+            });
+            assert_transaction_id_setter_ownership(
+                unsafe {
+                    update_table_txn_with_transaction_id(txn, app_id, 1, engine.shallow_copy())
+                },
+                free_update_table_txn,
+                &drops,
+                invalid_utf8,
+            );
+        }
+        assert_eq!(Arc::strong_count(&engine_owner), engine_reference_count);
+        unsafe { free_engine(engine) };
+        assert_eq!(Arc::strong_count(&engine_owner), engine_reference_count - 1);
+    }
+
+    fn assert_transaction_id_setter_ownership<T>(
+        result: ExternResult<T>,
+        free_txn: unsafe extern "C" fn(T),
+        drops: &AtomicUsize,
+        invalid_utf8: bool,
+    ) {
+        if invalid_utf8 {
+            assert_extern_result_error_with_message(result, FFIKernelError::Utf8Error, None);
+        } else {
+            let txn = ok_or_panic(result);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            unsafe { free_txn(txn) };
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[rstest]

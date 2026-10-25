@@ -429,6 +429,10 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
                 );
             }
             DataType::Struct(st) => call!(visit_struct, visit_struct_fields(visitor, st)),
+            // A `file` is physically a struct of its fixed fields, so engines see it as that
+            // struct. A dedicated `visit_file` callback would change the C ABI, so it
+            // is deferred until the type is finalized.
+            DataType::File(st) => call!(visit_struct, visit_struct_fields(visitor, st)),
             DataType::Map(mt) => {
                 call!(
                     visit_map,

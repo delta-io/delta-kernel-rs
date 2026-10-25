@@ -23,7 +23,7 @@ use delta_kernel::history_manager::{
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{
-    CheckpointWriteResult, IncrementalReplay, Snapshot, SnapshotHint, SnapshotRef,
+    CheckpointWriteResult, IncrementalReplay, LogSegmentStats, Snapshot, SnapshotHint, SnapshotRef,
 };
 use delta_kernel::{Engine, EngineData, FileStats, KernelResult, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -1711,6 +1711,53 @@ pub unsafe extern "C" fn snapshot_timestamp(
     let snapshot = unsafe { snapshot.as_ref() };
     snapshot
         .get_timestamp(engine_ref.engine().as_ref())
+        .into_extern_result(&engine_ref)
+}
+
+/// Statistics for the commit files selected to replay a snapshot's log segment.
+///
+/// Includes published and staged commits, and selected compactions in place of covered commits.
+/// Excludes checkpoints, sidecars, CRCs, and commits retained only for timestamp lookup.
+#[derive(Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiLogSegmentStats {
+    /// Number of selected commit files, counting each selected compaction as one file.
+    pub num_commit_files: u64,
+    /// Sum of the selected commit file sizes in bytes.
+    pub total_commit_file_bytes: u64,
+}
+
+impl From<LogSegmentStats> for FfiLogSegmentStats {
+    fn from(stats: LogSegmentStats) -> Self {
+        Self {
+            num_commit_files: stats.num_commit_files,
+            total_commit_file_bytes: stats.total_commit_file_bytes,
+        }
+    }
+}
+
+/// Returns selected replay commit file statistics from `snapshot` without I/O.
+///
+/// Borrows both handles. Uses `engine` only to allocate errors. The returned value needs no
+/// release. Returns zero counts and bytes when a checkpoint covers the entire snapshot.
+///
+/// # Errors
+///
+/// Returns an error if the total commit file size exceeds `u64::MAX`.
+///
+/// # Safety
+///
+/// Caller must pass valid snapshot and engine handles, and retain ownership of both handles.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_log_segment_stats(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<FfiLogSegmentStats> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .log_segment_stats()
+        .map(FfiLogSegmentStats::from)
         .into_extern_result(&engine_ref)
 }
 

@@ -7,6 +7,7 @@
 //! than constructing the builder directly.
 
 use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
@@ -20,6 +21,7 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
+use crate::schema::file_utils::schema_contains_file_type;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
@@ -50,7 +52,7 @@ use crate::table_properties::{
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
-use crate::transaction::{CommitOperation, CreateTable, ExecutionMode, Transaction};
+use crate::transaction::{CommitOperation, CreateTable, ExecutionMode, Imperative, Transaction};
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{Engine, KernelError, KernelResult, StorageHandler};
 
@@ -373,6 +375,21 @@ fn maybe_enable_variant_type(schema: &SchemaRef, validated: &mut ValidatedTableP
     if schema_contains_variant_type(schema) {
         add_feature_to_lists(
             TableFeature::VariantType,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
+/// Conditionally adds the `fileType-preview` feature to the protocol when the schema contains File
+/// columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
+///
+/// The stable `fileType` feature is deliberately not written: the protocol change is still only
+/// proposed, and a stable feature name is permanent once it is in a table's protocol.
+fn maybe_enable_file_type_preview(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    if schema_contains_file_type(schema) {
+        add_feature_to_lists(
+            TableFeature::FileTypePreview,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
@@ -792,7 +809,7 @@ fn validate_extract_table_features_and_properties(
 /// Created via [`create_table()`](super::super::create_table::create_table).
 ///
 /// cbindgen:ignore
-pub type CreateTableTransactionBuilder = TransactionBuilder<CreateTable>;
+pub type CreateTableTransactionBuilder<MODE = Imperative> = TransactionBuilder<CreateTable, MODE>;
 
 /// Opaque state collected by create-table-specific builder setters.
 #[doc(hidden)]
@@ -823,9 +840,12 @@ impl TransactionBuilder<CreateTable> {
                 table_properties: HashMap::new(),
                 data_layout: DataLayout::None,
             },
+            _mode: PhantomData,
         }
     }
+}
 
+impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
     /// Sets table properties for the new Delta table.
     ///
     /// Custom application properties (those not starting with `delta.`) are always allowed.
@@ -926,7 +946,7 @@ impl TransactionBuilder<CreateTable> {
     /// This method performs validation:
     /// - Checks that the table path is valid
     /// - Verifies the table doesn't already exist
-    /// - Rejects schemas with `delta.invariants` metadata annotations (unsupported by kernel)
+    /// - Validates the schema and metadata annotations
     /// - Validates the data layout is valid
     /// - Validates table properties against the allow list
     ///
@@ -946,8 +966,7 @@ impl TransactionBuilder<CreateTable> {
     /// Returns an error if:
     /// - The table path is invalid
     /// - A table already exists at the given path
-    /// - The schema has `delta.invariants` metadata on any column
-    /// - CDF is enabled and the schema contains a top-level column reserved for CDF
+    /// - Schema or metadata annotation validation fails
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
     /// - Connector commit information does not contain exactly one row
@@ -957,7 +976,7 @@ impl TransactionBuilder<CreateTable> {
         self,
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
-    ) -> KernelResult<CreateTableTransaction> {
+    ) -> KernelResult<CreateTableTransaction<MODE>> {
         self.common_state.validate()?;
 
         // Validate path
@@ -992,7 +1011,7 @@ impl TransactionBuilder<CreateTable> {
         let (mut effective_schema, column_mapping_mode) =
             maybe_apply_column_mapping_for_table_create(&self.local_state.schema, &mut validated)?;
 
-        // Validate schema (column names, duplicates, no `delta.invariants` metadata).
+        // Validate the schema and metadata annotations.
         // Empty schemas are intentionally allowed.
         validate_schema(
             &effective_schema,
@@ -1022,6 +1041,7 @@ impl TransactionBuilder<CreateTable> {
 
         // Schema-driven auto-enablement: detect types or annotations that require a feature
         maybe_enable_variant_type(&effective_schema, &mut validated);
+        maybe_enable_file_type_preview(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
         maybe_enable_invariants(&effective_schema, &mut validated);
 
@@ -1726,6 +1746,7 @@ mod tests {
         };
 
         maybe_enable_variant_type(&schema, &mut validated);
+        maybe_enable_file_type_preview(&schema, &mut validated);
         maybe_enable_timestamp_ntz(&schema, &mut validated);
 
         for feature in expected_features {

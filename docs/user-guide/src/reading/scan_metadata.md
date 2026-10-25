@@ -153,8 +153,9 @@ for batch in read_results {
 > [!WARNING]
 > If `ScanFile.transform` is present, you must apply it before returning data. Omitting the
 > transform produces incorrect output — missing partition columns, wrong logical names, or nulls
-> where data should appear. If `transform` is `None`, the physical data already matches the
-> logical schema and no transformation is needed.
+> where data should appear. If you disable row transforms through `without_row_transforms` or
+> `with_timestamp_timezone`, your connector must reconstruct logical rows itself, even though
+> `transform` is `None`. Otherwise, `None` means no per-file transform is needed.
 
 ### Applying deletion vectors
 
@@ -278,8 +279,29 @@ let scan = snapshot
 
 Scan metadata output then gains a top-level `partitionValues_parsed` column with one typed,
 nullable field per partition column (by physical name). You read it as a typed column instead
-of parsing the string map per file. The raw string map is still present, so this option only
-adds the typed column.
+of parsing the string map per file. The raw string map is still present.
+
+By default, offset-less `TIMESTAMP` partition strings are interpreted in UTC. Use
+`PartitionValuesOptions::with_timestamp_timezone` with a recognized IANA timezone or a normalized
+`+HH:MM` or `-HH:MM` fixed offset to interpret offset-less partition values in another timezone. The
+configured timezone must match the timezone used when they were written. An explicit offset in a
+partition value takes precedence. When Kernel parses the partition string map, this setting affects
+both partition pruning and returned parsed partition values.
+
+When a checkpoint stores compatible `partitionValues_parsed`, Kernel uses those values directly
+instead of reparsing the offset-less `TIMESTAMP` partition strings with the supplied timezone. The
+`TIMESTAMP` values in that column already represent timezone-independent instants. Each value
+represents an integer number of microseconds since the Unix epoch; for example, `0` represents
+`1970-01-01T00:00:00Z` (UTC).
+
+Kernel doesn't yet support timezone-aware row transforms for `TIMESTAMP` partitions.
+`PartitionValuesOptions::with_timestamp_timezone` omits per-file row transforms when the table has
+`TIMESTAMP` partitions. As a result, `Scan::execute` returns an error in this case.
+`Scan::parallel_scan_metadata` and `Scan::declarative_metadata_scan_plan` also return errors in this
+case. You can use `scan_metadata` and reconstruct logical rows in your connector.
+
+`TIMESTAMP_NTZ` remains timezone-independent. For daylight-saving transitions, ambiguous local times
+use the earlier instant, and nonexistent local times use the offset from before the transition.
 
 > [!TIP]
 > When the checkpoint already stores typed partition values, Kernel reads that column directly
@@ -322,9 +344,10 @@ Cancellation can race with successful completion. Work already initiated may com
 results may still be returned. If cancellation stops replay before completion, it surfaces as
 `KernelError::Cancelled` rather than a partial result that appears complete.
 
-Without a token, the scan is not cancellable and runs to completion as usual. Cancellation applies
-to the lazy `scan_metadata()` path; [`parallel_scan_metadata()`](./parallel_scan_metadata.md) does
-not support it and rejects a token rather than silently ignoring it.
+Without a scan token, Kernel leaves I/O cancellation to your engine's handlers. Checks on
+cached scan metadata require a scan token.
+[`parallel_scan_metadata()`](./parallel_scan_metadata.md) rejects a scan token; it doesn't provide
+end-to-end cancellation across its distributed phases.
 
 ## What's next
 

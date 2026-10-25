@@ -303,7 +303,7 @@ fn kernel_field_into_arrow(
                 false, /* keys_sorted */
             ))
         }
-        DataType::Struct(_) | DataType::Primitive(_) | DataType::Variant(_) => {
+        DataType::Struct(_) | DataType::Primitive(_) | DataType::Variant(_) | DataType::File(_) => {
             datatype.try_into_arrow()
         }
     }
@@ -402,6 +402,17 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     )))
                 }
             }
+            DataType::File(s) => {
+                if *t == DataType::file_type() {
+                    Ok(ArrowDataType::Struct(
+                        try_kernel_struct_to_arrow_fields(s)?.into(),
+                    ))
+                } else {
+                    Err(ArrowError::SchemaError(format!(
+                        "Incorrect File Schema: {t}. Only the canonical file schema is supported."
+                    )))
+                }
+            }
         }
     }
 }
@@ -462,6 +473,15 @@ impl TryFromArrow<&ArrowField> for StructField {
                         ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
                         MetadataValue::Number(id),
                     ));
+                }
+                if k == ColumnMetadataKey::Collations.as_ref() {
+                    let value = serde_json::from_str(v).map_err(|error| {
+                        ArrowError::SchemaError(format!(
+                            "__COLLATIONS on field '{}' must be JSON: {error}",
+                            arrow_field.name()
+                        ))
+                    })?;
+                    return Ok((k.clone(), MetadataValue::Other(value)));
                 }
                 Ok((k.clone(), MetadataValue::from(v)))
             })
@@ -669,6 +689,7 @@ mod tests {
     use crate::engine::arrow_conversion::ArrowField;
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::schema::collation_utils::validate_collation_annotations;
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::EdgeInterpolationAlgorithm;
     use crate::schema::{
@@ -717,6 +738,32 @@ mod tests {
             &"hello world".to_owned()
         );
         Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::string(DataType::STRING, "field")]
+    #[case::array(ArrayType::new(DataType::STRING, true).into(), "field.element")]
+    #[case::map(MapType::new(DataType::STRING, DataType::STRING, true).into(), "field.value")]
+    fn collation_objects_round_trip_through_arrow(#[case] data_type: DataType, #[case] path: &str) {
+        let field = StructField::nullable("field", data_type).with_metadata([(
+            ColumnMetadataKey::Collations.as_ref(),
+            MetadataValue::Other(serde_json::json!({ path: "custom.name" })),
+        )]);
+        let kernel_schema = StructType::try_new([field]).unwrap();
+        let arrow: ArrowSchema = (&kernel_schema).try_into_arrow().unwrap();
+        let recovered = StructType::try_from_arrow(&arrow).unwrap();
+        assert_eq!(recovered, kernel_schema);
+        validate_collation_annotations(&recovered).unwrap();
+    }
+
+    #[test]
+    fn invalid_arrow_collation_json_is_rejected() {
+        let field = ArrowField::new("field", ArrowDataType::Utf8, true)
+            .with_metadata(HashMap::from([("__COLLATIONS".into(), "{invalid".into())]));
+        assert!(StructField::try_from_arrow(&field)
+            .unwrap_err()
+            .to_string()
+            .contains("__COLLATIONS"));
     }
 
     // Delta tables can have void columns. The kernel should parse them and convert
@@ -1177,6 +1224,28 @@ mod tests {
             Some(&MetadataValue::Other(serde_json::json!({"arr.element": 7}))),
         );
         Ok(())
+    }
+
+    /// Only the canonical `file` schema converts to Arrow; a struct that merely resembles it, or a
+    /// file with a different field set, is rejected rather than silently converted.
+    #[test]
+    fn test_non_canonical_file_schema_is_rejected() {
+        let non_canonical = DataType::File(Box::new(crate::schema::StructType::new_unchecked([
+            crate::schema::StructField::nullable("uri", DataType::STRING),
+        ])));
+        let err = ArrowDataType::try_from_kernel(&non_canonical).unwrap_err();
+        assert!(
+            err.to_string().contains("Only the canonical file schema"),
+            "unexpected error: {err}"
+        );
+
+        // The canonical file converts to a struct of its six fields.
+        let ArrowDataType::Struct(fields) =
+            ArrowDataType::try_from_kernel(&DataType::file_type()).unwrap()
+        else {
+            panic!("expected a struct");
+        };
+        assert_eq!(fields.len(), 6);
     }
 
     fn arc_elem_with_id(id: i32) -> Arc<ArrowField> {

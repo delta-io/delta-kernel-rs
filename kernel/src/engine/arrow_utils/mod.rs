@@ -1,6 +1,7 @@
 //! Some utilities for working with arrow data types
 
 pub(crate) mod apply_schema;
+mod file_values;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -13,6 +14,7 @@ use itertools::Itertools;
 use tracing::debug;
 
 use self::apply_schema::apply_schema_to_struct;
+use self::file_values::validate_file_values;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
     make_array, new_null_array, Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray,
@@ -41,7 +43,7 @@ use crate::schema::{
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
-use crate::{EngineData, KernelError, KernelResult};
+use crate::{EngineData, KernelError, KernelResult, KernelResultIterator};
 
 macro_rules! prim_array_cmp {
     ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
@@ -234,6 +236,9 @@ impl RowIndexBuilder {
 /// `DataTypeCompat::NeedsCast` into an actual `arrow::compute::cast`, so post-reorder leaf types
 /// are `Identical` to the kernel target.
 ///
+/// **File values.** A non-null `file` value that resolves to no referent (neither `uri` nor
+/// `inline` set, or `offset` set without `uri`) fails the read, as the File type requires.
+///
 /// **Cost.** O(F) per batch where F is the total number of fields (including nested). Row data
 /// (Arrow buffers, offsets, null buffers) is shared via `Arc` and never copied.
 #[internal_api]
@@ -247,7 +252,9 @@ pub(crate) fn fixup_parquet_read(
     let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)?;
     let data = fix_nested_null_masks(data);
     let data = if let Some(schema) = target_schema {
-        apply_schema_to_struct(&data, schema)?
+        let data = apply_schema_to_struct(&data, schema)?;
+        validate_file_values(&data, schema)?;
+        data
     } else {
         data
     };
@@ -519,7 +526,8 @@ fn get_indices(
             match field.data_type() {
                 ArrowDataType::Struct(fields) => {
                     if let DataType::Struct(requested_schema)
-                    | DataType::Variant(requested_schema) = requested_type
+                    | DataType::Variant(requested_schema)
+                    | DataType::File(requested_schema) = requested_type
                     {
                         let mask_before = mask_indices.len();
                         let (parquet_advance, children) = get_indices(
@@ -1409,7 +1417,14 @@ fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> KernelResult
 /// [`MAP_ROOT_DEFAULT`]: crate::engine::arrow_conversion::MAP_ROOT_DEFAULT
 /// [`LIST_ARRAY_ROOT`]: crate::engine::arrow_conversion::LIST_ARRAY_ROOT
 /// [`arrow_conversion`]: crate::engine::arrow_conversion
-#[cfg(test)]
+#[cfg(any(
+    test,
+    all(
+        feature = "test-utils",
+        feature = "declarative-plans",
+        feature = "default-engine-base"
+    )
+))]
 pub(crate) fn coerce_columns_to_schema(
     columns: Vec<ArrowArrayRef>,
     target: &ArrowSchemaRef,
@@ -1539,7 +1554,7 @@ impl Encoder for NullMapPlaceholderEncoder {
 // TODO (zach): this should stream data to the JSON writer and output an iterator.
 #[internal_api]
 pub(crate) fn to_json_bytes(
-    data: impl Iterator<Item = KernelResult<FilteredEngineData>> + Send,
+    data: impl KernelResultIterator<FilteredEngineData>,
 ) -> KernelResult<Vec<u8>> {
     let builder = WriterBuilder::new().with_encoder_factory(Arc::new(NullValueMapEncoderFactory));
     let mut writer = builder.build::<_, LineDelimited>(Vec::new());

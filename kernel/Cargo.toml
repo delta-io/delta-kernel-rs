@@ -37,12 +37,13 @@ pre-release-hook = [
 redundant_field_names = "allow"
 
 [dependencies]
-delta_kernel_derive = { path = "../derive-macros", version = "0.30.0" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.30.1" }
 bytes = "1.10"
 chrono = "0.4.41"
 chrono-tz = { version = "0.10.4", optional = true }
 crc = "3.2.2"
 derive_more = { version = "~2.1", default-features = false, features = ["constructor", "deref", "from"] }
+futures = { version = "0.3", optional = true }
 indexmap = "2.10.0"
 itertools = "0.14"
 percent-encoding = "2"
@@ -99,7 +100,7 @@ internal-api = []
 # prettyprint enables Arrow pretty-print helpers (test/example oriented).
 prettyprint = ["arrow_59?/prettyprint", "arrow_60?/prettyprint"]
 # test-utils exposes test-only constructors for downstream crate tests
-test-utils = ["prettyprint"]
+test-utils = ["prettyprint", "dep:futures"]
 # integration-test turns on a particularly heavy test for hdfs-object-store
 integration-test = ["hdfs-native-object-store/integration-test"]
 
@@ -123,9 +124,8 @@ declarative-plans = ["internal-api", "dep:prost", "dep:prost-build"]
 # a build that pins a hermetic toolchain cannot use a downloaded binary.
 vendored-protoc = ["dep:protoc-bin-vendored"]
 
-# Experimental, temporary, test-only feature flag guarding the in-progress check-constraints
-# work: the SQL predicate parser and, later, `checkConstraints` write enforcement. Remove once
-# full check-constraints support ships.
+# Experimental, temporary feature flag guarding the in-progress CHECK constraints support (see
+# `check-constraints-in-dev` in AGENTS.md). TODO(#2896): remove once full support ships.
 check-constraints-in-dev = []
 # Experimental, temporary, test-only feature flag guarding the in-progress adaptiveMetadata
 # (Iceberg V4 adaptive metadata tree) work. TODO(#2866): remove once full support ships.
@@ -157,8 +157,6 @@ delta_kernel = { path = ".", features = ["internal-api", "test-utils"] }
 # NOTE: test_utils forcibly pulls the default engine and arrow-59. By default it ALSO pulls
 # arrow-60, which takes precedence and would make it impossible to test against arrow-59.
 test_utils = { path = "../test-utils", default-features = false }
-# Used by the test-only SyncEngine to drive object_store calls via `futures::executor::block_on`.
-futures = "0.3"
 # Used by integration tests that bridge object_store's async API in test setup.
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros"] }
 criterion = "0.5"
@@ -176,6 +174,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 rstest = "0.23"
 rstest_reuse = "0.7"
+bincode = "1.3"
 [[bench]]
 name = "metadata_bench"
 harness = false

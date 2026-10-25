@@ -3,6 +3,8 @@
 //! The default Arrow/Tokio engine lives in the separate `delta_kernel_default_engine` crate.
 //! `SyncEngine` is included only in test builds.
 
+mod cancellable_engine;
+pub(crate) use cancellable_engine::CancellableEngine;
 #[cfg(feature = "arrow-expression")]
 use delta_kernel_derive::internal_api;
 
@@ -48,8 +50,15 @@ pub use self::arrow_utils::{parse_json, to_json_bytes};
 #[cfg(all(feature = "declarative-plans", feature = "default-engine-base"))]
 pub mod plans;
 
-#[cfg(test)]
-pub(crate) mod sync;
+#[cfg(any(
+    test,
+    all(
+        feature = "test-utils",
+        feature = "declarative-plans",
+        feature = "default-engine-base"
+    )
+))]
+pub mod sync;
 
 #[cfg(test)]
 pub(crate) mod test_delegating;

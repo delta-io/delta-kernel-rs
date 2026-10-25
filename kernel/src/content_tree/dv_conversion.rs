@@ -58,6 +58,7 @@ pub(crate) fn extract_deletion_vector_content(
         offset: dv.offset.map_or(1, i64::from),
         size_in_bytes: dv.size_in_bytes as i64 + 8,
         cardinality: dv.cardinality,
+        key_metadata: None,
     })
 }
 

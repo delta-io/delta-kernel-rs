@@ -36,8 +36,7 @@ use crate::transaction::data_layout::DataLayout;
 use crate::unit_test_utils::TestCancellationToken;
 use crate::{
     CancellationTokenRef, Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
-    KernelResult, KernelResultIteratorStatic, ParquetFooter, ParquetHandler, PredicateRef,
-    Snapshot,
+    KernelResult, KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
 };
 
 #[cfg(feature = "geo-type-in-dev")]
@@ -72,6 +71,23 @@ fn assert_stats_schemas_aligned(logical: &StructType, physical: &StructType) {
             (logical, physical) => assert_eq!(logical, physical),
         }
     }
+}
+
+#[rstest]
+fn map_to_struct_options_preserves_timezone(
+    #[values(
+        None,
+        Some("UTC"),
+        Some("America/Los_Angeles"),
+        Some("+05:30"),
+        Some("Not/AZone")
+    )]
+    timezone: Option<&str>,
+) {
+    assert_eq!(
+        map_to_struct_options(timezone).timestamp_timezone(),
+        timezone
+    );
 }
 
 #[test]
@@ -699,6 +715,51 @@ fn test_scan_metadata_from_same_version() {
         .unwrap();
 
     assert_eq!(new_files.len(), 1);
+}
+
+#[rstest]
+fn scan_metadata_from_requires_timezone_support_only_for_timestamp_partitions(
+    #[values("UTC", "America/Los_Angeles", "+05:30")] timezone: &str,
+    #[values(false, true)] parsed_struct: bool,
+    #[values(false, true)] timestamp_partition: bool,
+) {
+    let table_root = "memory:///test_table/";
+    let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+    let partition_type = if timestamp_partition {
+        DataType::TIMESTAMP
+    } else {
+        DataType::STRING
+    };
+    let schema = schema_ref! {
+        (StructField::nullable("p", partition_type)),
+        nullable "value": INTEGER,
+    };
+    let snapshot = create_table(table_root, schema, "SyncEngine", true)
+        .with_data_layout(DataLayout::partitioned(["p"]))
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(&engine)
+        .unwrap()
+        .unwrap_post_commit_snapshot();
+    let version = snapshot.version();
+    let options = if parsed_struct {
+        PartitionValuesOptions::with_struct()
+    } else {
+        PartitionValuesOptions::string_map_only()
+    };
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(options.with_timestamp_timezone(timezone))
+        .build()
+        .unwrap();
+
+    let result = scan.scan_metadata_from(&engine, version, Vec::new(), None);
+    if timestamp_partition {
+        assert_result_error_with_message(result, "with_timestamp_timezone in scan_metadata_from");
+    } else {
+        let metadata: Vec<_> = result.unwrap().try_collect().unwrap();
+        assert!(metadata.is_empty());
+    }
 }
 
 #[test_log::test]
@@ -1788,7 +1849,7 @@ impl ParquetHandler for RecordingParquetHandler {
     fn write_parquet_file(
         &self,
         location: url::Url,
-        data: KernelResultIteratorStatic<Box<dyn EngineData>>,
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
     ) -> KernelResult<FileSize> {
         self.inner.write_parquet_file(location, data)
     }
@@ -2711,7 +2772,7 @@ impl ParquetHandler for EmptyParquetHandler {
     fn write_parquet_file(
         &self,
         _location: url::Url,
-        _data: KernelResultIteratorStatic<Box<dyn EngineData>>,
+        _data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
     ) -> KernelResult<FileSize> {
         unimplemented!()
     }

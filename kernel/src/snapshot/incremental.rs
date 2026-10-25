@@ -8,7 +8,6 @@ use std::sync::Arc;
 use tracing::{error, instrument};
 
 use super::{IncrementalReplay, PreparedSnapshot, Snapshot};
-use crate::cancellation::CancellationTokenRef;
 use crate::log_segment::{LogSegment, PmResolution};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
@@ -111,7 +110,6 @@ impl Snapshot {
         incremental_replay: IncrementalReplay,
         checkpoint_handling: CheckpointHandling,
         built_as_latest: bool,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<Arc<Self>> {
         let requested_version = target_version.into();
         let mut current_segment = None;
@@ -124,7 +122,6 @@ impl Snapshot {
             incremental_replay,
             checkpoint_handling,
             built_as_latest,
-            cancellation_token,
             &mut current_segment,
         );
         result.inspect_err(|error| {
@@ -151,7 +148,6 @@ impl Snapshot {
         incremental_replay: IncrementalReplay,
         checkpoint_handling: CheckpointHandling,
         built_as_latest: bool,
-        cancellation_token: Option<&CancellationTokenRef>,
         current_segment: &mut Option<LogSegment>,
     ) -> KernelResult<Arc<Self>> {
         let existing_snapshot_version = existing_snapshot.version();
@@ -185,7 +181,6 @@ impl Snapshot {
             log_tail,
             requested_version,
             checkpoint_handling,
-            cancellation_token,
         )
         .inspect_err(|_| emit_log_segment_load_failure(metric_context))?
         {
@@ -209,7 +204,7 @@ impl Snapshot {
                     table_configuration,
                     crc,
                     #[cfg(feature = "adaptive-metadata-in-dev")]
-                    checkpoint_action,
+                    captured_checkpoint_action,
                     #[cfg(feature = "adaptive-metadata-in-dev")]
                     last_manifest_commit,
                 } = Self::prepare_new_from_log_segment(
@@ -230,7 +225,7 @@ impl Snapshot {
                     built_as_latest,
                     false, /* skipped_new_checkpoints */
                     #[cfg(feature = "adaptive-metadata-in-dev")]
-                    checkpoint_action,
+                    captured_checkpoint_action,
                     #[cfg(feature = "adaptive-metadata-in-dev")]
                     last_manifest_commit,
                 );
@@ -253,8 +248,9 @@ impl Snapshot {
         // `incremental_replay`. Time from here so the CRC-advance cost lands in the P&M duration,
         // matching the fresh path.
         let pm_start = std::time::Instant::now();
-        let base_crc =
-            combined_log_segment.pick_latest_base_crc(engine, existing_snapshot.base_crc());
+        let base_crc = combined_log_segment
+            .pick_latest_base_crc(engine, existing_snapshot.base_crc())
+            .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
         let crc_at_version = combined_log_segment
             .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
             .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
@@ -312,7 +308,7 @@ impl Snapshot {
             built_as_latest,
             skipped_new_checkpoints,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            resolution.checkpoint_action,
+            resolution.captured_checkpoint_action,
             #[cfg(feature = "adaptive-metadata-in-dev")]
             resolution.last_manifest_commit,
         );
@@ -333,7 +329,6 @@ impl Snapshot {
         log_tail: Vec<ParsedLogPath>,
         requested_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<NewSegment> {
         let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
@@ -362,7 +357,7 @@ impl Snapshot {
             Some(listing_start),
             requested_version,
             checkpoint_handling,
-            cancellation_token,
+            None,
         )?;
 
         // NB: we need to check both checkpoints and commits since we filter commits at and below
@@ -611,7 +606,7 @@ mod tests {
     use crate::unit_test_utils::{
         install_thread_local_metrics_reporter, string_array_to_engine_data, CapturingReporter,
     };
-    use crate::KernelResult;
+    use crate::{Engine, KernelResult};
 
     // ============================================================================
     // Helpers
@@ -756,7 +751,6 @@ mod tests {
             IncrementalReplay::Disabled,
             CheckpointHandling::Adopt,
             true, /* built_as_latest */
-            None, /* cancellation_token */
         )?;
         assert_eq!(result, base_snapshot);
         // `PartialEq` ignores `built_as_latest`, so assert it explicitly.
@@ -838,7 +832,6 @@ mod tests {
             IncrementalReplay::Disabled,
             CheckpointHandling::Adopt,
             false, /* built_as_latest */
-            None,  /* cancellation_token */
         )?;
 
         // Latest commit should now be version 2
@@ -899,7 +892,6 @@ mod tests {
             IncrementalReplay::Disabled,
             CheckpointHandling::Adopt,
             false, /* built_as_latest */
-            None,  /* cancellation_token */
         )?;
         assert!(Arc::ptr_eq(&same_version, &base_snapshot));
 
@@ -913,7 +905,6 @@ mod tests {
             IncrementalReplay::Disabled,
             CheckpointHandling::Adopt,
             false, /* built_as_latest */
-            None,  /* cancellation_token */
         );
         assert!(matches!(
             older_version,

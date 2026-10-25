@@ -1,9 +1,13 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
+#[cfg(feature = "declarative-plans")]
+use delta_kernel::committer::write_commit_json_declarative;
 use delta_kernel::committer::{
     CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
 };
+#[cfg(feature = "declarative-plans")]
+use delta_kernel::plans::{RelationRef, ScopedPlanExecutor};
 use delta_kernel::{
     Engine, FileMeta, FilteredEngineData, KernelError as DeltaError, KernelResult,
     KernelResultIterator,
@@ -40,7 +44,8 @@ macro_rules! require {
 /// NOTE: this [`Committer`] requires a multi-threaded tokio runtime. That is, whatever
 /// implementation consumes the Committer to commit to the table, must call `commit` from within a
 /// multi-threaded tokio runtime context. Since the default engine uses tokio, this is compatible,
-/// but must ensure that the multi-threaded runtime is used.
+/// but must ensure that the multi-threaded runtime is used. This applies to both `commit` and
+/// `commit_declarative`.
 #[derive(Debug, Clone)]
 pub struct UCCommitter<C: UpdateTableClient> {
     update_table_client: Arc<C>,
@@ -135,9 +140,8 @@ impl<C: UpdateTableClient> UCCommitter<C> {
     /// then writes the version 0 commit file directly to the published commit path.
     fn commit_version_0(
         &self,
-        engine: &dyn Engine,
-        actions: KernelResultIterator<'_, FilteredEngineData>,
         commit_metadata: &CommitMetadata,
+        write: impl FnOnce(&url::Url) -> KernelResult<FileMeta>,
     ) -> KernelResult<CommitResponse> {
         debug_assert!(
             commit_metadata.version() == 0,
@@ -146,17 +150,13 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         );
         self.validate_catalog_managed_state(commit_metadata)?;
         let published_commit_path = commit_metadata.published_commit_path()?;
-        match engine.json_handler().write_json_file(
-            &published_commit_path,
-            Box::new(actions),
-            false,
-        ) {
-            Ok(written_size) => {
+        match write(&published_commit_path) {
+            Ok(written_file) => {
                 info!("wrote version 0 commit file for UC table creation");
                 let file_meta = FileMeta::new(
                     published_commit_path,
                     commit_metadata.in_commit_timestamp(),
-                    written_size,
+                    written_file.size,
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }
@@ -172,9 +172,8 @@ impl<C: UpdateTableClient> UCCommitter<C> {
     /// commit file, and calls the UC commit API to ratify it.
     fn commit_version_non_zero(
         &self,
-        engine: &dyn Engine,
-        actions: KernelResultIterator<'_, FilteredEngineData>,
         commit_metadata: CommitMetadata,
+        write: impl FnOnce(&url::Url) -> KernelResult<FileMeta>,
     ) -> KernelResult<CommitResponse>
     where
         C: 'static,
@@ -186,11 +185,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         self.validate_catalog_managed_state(&commit_metadata)?;
         Self::validate_no_alter_table_changes(&commit_metadata)?;
         let staged_commit_path = commit_metadata.staged_commit_path()?;
-        engine
-            .json_handler()
-            .write_json_file(&staged_commit_path, Box::new(actions), false)?;
-
-        let committed = engine.storage_handler().head(&staged_commit_path)?;
+        let committed = write(&staged_commit_path)?;
         debug!("wrote staged commit file: {:?}", committed);
 
         let mut updates = vec![DeltaTableUpdate::AddCommit {
@@ -263,13 +258,45 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: KernelResultIterator<'_, FilteredEngineData>,
+        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         commit_metadata: CommitMetadata,
     ) -> KernelResult<CommitResponse> {
         if commit_metadata.version() == 0 {
-            return self.commit_version_0(engine, actions, &commit_metadata);
+            return self.commit_version_0(&commit_metadata, |path| {
+                let file_size =
+                    engine
+                        .json_handler()
+                        .write_json_file(path, Box::new(actions), false)?;
+                Ok(FileMeta::new(
+                    path.clone(),
+                    commit_metadata.in_commit_timestamp(),
+                    file_size,
+                ))
+            });
         }
-        self.commit_version_non_zero(engine, actions, commit_metadata)
+        self.commit_version_non_zero(commit_metadata, |path| {
+            engine
+                .json_handler()
+                .write_json_file(path, Box::new(actions), false)?;
+            engine.storage_handler().head(path)
+        })
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn commit_declarative(
+        &self,
+        executor: &dyn ScopedPlanExecutor,
+        actions: Box<dyn Iterator<Item = RelationRef> + '_>,
+        commit_metadata: CommitMetadata,
+    ) -> KernelResult<CommitResponse> {
+        if commit_metadata.version() == 0 {
+            return self.commit_version_0(&commit_metadata, |path| {
+                write_commit_json_declarative(executor, actions, path.clone())
+            });
+        }
+        self.commit_version_non_zero(commit_metadata, |path| {
+            write_commit_json_declarative(executor, actions, path.clone())
+        })
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -314,28 +341,44 @@ fn staged_commit_file_name(path: &url::Url) -> KernelResult<String> {
 mod tests {
     use std::collections::HashMap;
     use std::fs;
+    use std::sync::Mutex;
 
     use delta_kernel::arrow::array::{Array, RecordBatch, StringArray};
     use delta_kernel::committer::{CatalogCommit, CommitMetadata};
     use delta_kernel::engine::arrow_data::ArrowEngineData;
+    #[cfg(feature = "declarative-plans")]
+    use delta_kernel::engine::sync::plan::SyncPlanExecutor;
     use delta_kernel::object_store::local::LocalFileSystem;
+    #[cfg(feature = "declarative-plans")]
+    use delta_kernel::plans::{PlanBuilder, ScopedPlanExecutor};
+    #[cfg(feature = "declarative-plans")]
+    use delta_kernel::schema::schema_ref;
     use delta_kernel::{EngineData, FilteredEngineData, Version};
     use delta_kernel_default_engine::DefaultEngine;
+    use rstest::rstest;
     use unity_catalog_delta_client_api::error::Result;
 
     use super::*;
 
-    struct MockUpdateTableClient;
+    #[derive(Default)]
+    struct MockUpdateTableClient {
+        requests: Mutex<Vec<UpdateTableRequest>>,
+    }
 
     impl UpdateTableClient for MockUpdateTableClient {
-        async fn update_table(&self, _: &TableIdentifier, _: UpdateTableRequest) -> Result<()> {
-            unimplemented!()
+        async fn update_table(
+            &self,
+            _: &TableIdentifier,
+            request: UpdateTableRequest,
+        ) -> Result<()> {
+            self.requests.lock().unwrap().push(request);
+            Ok(())
         }
     }
 
     fn test_committer() -> UCCommitter<MockUpdateTableClient> {
         UCCommitter::new(
-            Arc::new(MockUpdateTableClient),
+            Arc::new(MockUpdateTableClient::default()),
             "test-table-id",
             TableIdentifier::new("test_catalog", "test_schema", "test_table"),
         )
@@ -362,28 +405,84 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn commit_version_0_writes_published_commit() {
+    #[derive(Clone, Copy)]
+    enum CommitStyle {
+        Imperative,
+        #[cfg(feature = "declarative-plans")]
+        Declarative,
+    }
+
+    fn commit_with_style<C: UpdateTableClient + 'static>(
+        committer: &UCCommitter<C>,
+        engine: &dyn Engine,
+        style: CommitStyle,
+        commit_metadata: CommitMetadata,
+    ) -> delta_kernel::KernelResult<CommitResponse> {
+        commit_with_values(committer, engine, style, commit_metadata, &["value"])
+    }
+
+    fn commit_with_values<C: UpdateTableClient + 'static>(
+        committer: &UCCommitter<C>,
+        engine: &dyn Engine,
+        style: CommitStyle,
+        commit_metadata: CommitMetadata,
+        values: &[&str],
+    ) -> delta_kernel::KernelResult<CommitResponse> {
+        match style {
+            CommitStyle::Imperative => {
+                let actions = values.iter().map(|value| {
+                    let action: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+                        RecordBatch::try_from_iter(vec![(
+                            "test",
+                            Arc::new(StringArray::from(vec![*value])) as Arc<dyn Array>,
+                        )])
+                        .unwrap(),
+                    ));
+                    Ok(FilteredEngineData::with_all_rows_selected(action))
+                });
+                let actions = Box::new(actions);
+                committer.commit(engine, actions, commit_metadata)
+            }
+            #[cfg(feature = "declarative-plans")]
+            CommitStyle::Declarative => {
+                let executor = SyncPlanExecutor::default().get_scoped();
+                let actions = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, value)| {
+                        let source = PlanBuilder::values(
+                            schema_ref! { nullable "test": STRING },
+                            vec![vec![(*value).into()]],
+                        )?
+                        .build()?;
+                        executor.execute_and_retain(&format!("actions-{i}"), source)
+                    })
+                    .collect::<delta_kernel::KernelResult<Vec<_>>>()?;
+                committer.commit_declarative(
+                    &executor,
+                    Box::new(actions.into_iter()),
+                    commit_metadata,
+                )
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::imperative(CommitStyle::Imperative)]
+    #[cfg_attr(
+        feature = "declarative-plans",
+        case::declarative(CommitStyle::Declarative)
+    )]
+    fn commit_version_0_writes_published_commit(#[case] style: CommitStyle) {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = catalog_managed_commit_metadata(table_root.clone(), 0);
         let committer = test_committer();
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
-        let action: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
-            RecordBatch::try_from_iter(vec![(
-                "test",
-                Arc::new(StringArray::from(vec!["value"])) as Arc<dyn Array>,
-            )])
-            .unwrap(),
-        ));
-        let actions = Box::new(std::iter::once(Ok(
-            FilteredEngineData::with_all_rows_selected(action),
-        )));
-
         // Create the _delta_log directory
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
-        let result = committer.commit(&engine, actions, commit_metadata).unwrap();
+        let result = commit_with_style(&committer, &engine, style, commit_metadata).unwrap();
         match result {
             CommitResponse::Committed { file_meta } => {
                 assert!(
@@ -398,15 +497,81 @@ mod tests {
                 let stored_size = fs::metadata(&commit_path).unwrap().len();
                 assert!(file_meta.size > 0);
                 assert_eq!(file_meta.size, stored_size);
+                assert_eq!(
+                    fs::read_to_string(commit_path).unwrap(),
+                    "{\"test\":\"value\"}\n"
+                );
             }
             CommitResponse::Conflict { .. } => {
                 panic!("expected Committed for version 0, got Conflict")
             }
         }
+        assert!(committer
+            .update_table_client
+            .requests
+            .lock()
+            .unwrap()
+            .is_empty());
     }
 
-    #[test]
-    fn commit_version_0_conflict_when_file_exists() {
+    #[rstest]
+    #[case::imperative(CommitStyle::Imperative)]
+    #[cfg_attr(
+        feature = "declarative-plans",
+        case::declarative(CommitStyle::Declarative)
+    )]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_version_non_zero_writes_staged_commit_and_ratifies(#[case] style: CommitStyle) {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+        fs::create_dir_all(tmp_dir.path().join("_delta_log/_staged_commits")).unwrap();
+        let committer = test_committer();
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let response = commit_with_values(
+            &committer,
+            &engine,
+            style,
+            catalog_managed_commit_metadata(table_root, 1),
+            &["first", "second"],
+        )
+        .unwrap();
+        let CommitResponse::Committed { file_meta } = response else {
+            panic!("expected a committed response");
+        };
+        assert!(file_meta.location.as_str().contains("/_staged_commits/"));
+        assert_eq!(
+            fs::read_to_string(file_meta.location.to_file_path().unwrap()).unwrap(),
+            "{\"test\":\"first\"}\n{\"test\":\"second\"}\n"
+        );
+        assert_eq!(
+            file_meta.size,
+            fs::metadata(file_meta.location.to_file_path().unwrap())
+                .unwrap()
+                .len()
+        );
+
+        let requests = committer.update_table_client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.table_uuid(), Some("test-table-id"));
+        let staged = request.staged_commit().unwrap();
+        assert_eq!(staged.version, 1);
+        assert_eq!(staged.timestamp, 0);
+        assert_eq!(staged.file_size, file_meta.size as i64);
+        assert_eq!(staged.file_modification_timestamp, file_meta.last_modified);
+        assert_eq!(
+            staged.file_name,
+            staged_commit_file_name(&file_meta.location).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case::imperative(CommitStyle::Imperative)]
+    #[cfg_attr(
+        feature = "declarative-plans",
+        case::declarative(CommitStyle::Declarative)
+    )]
+    fn commit_version_0_conflict_when_file_exists(#[case] style: CommitStyle) {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let committer = test_committer();
@@ -418,17 +583,20 @@ mod tests {
         fs::write(delta_log.join("00000000000000000000.json"), "existing").unwrap();
 
         let commit_metadata = catalog_managed_commit_metadata(table_root, 0);
-        let result = committer
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
-            .unwrap();
+        let result = commit_with_style(&committer, &engine, style, commit_metadata).unwrap();
         assert!(
             matches!(result, CommitResponse::Conflict { version: 0 }),
             "expected Conflict for version 0 when file exists, got: {result:?}"
         );
     }
 
-    #[test]
-    fn commit_version_0_rejects_missing_catalog_managed_feature() {
+    #[rstest]
+    #[case::imperative(CommitStyle::Imperative)]
+    #[cfg_attr(
+        feature = "declarative-plans",
+        case::declarative(CommitStyle::Declarative)
+    )]
+    fn commit_version_0_rejects_missing_catalog_managed_feature(#[case] style: CommitStyle) {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = CommitMetadata::new_unchecked(table_root, 0).unwrap();
@@ -436,17 +604,20 @@ mod tests {
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
-        let err = committer
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
-            .unwrap_err();
+        let err = commit_with_style(&committer, &engine, style, commit_metadata).unwrap_err();
         assert!(
             err.to_string().contains("catalogManaged"),
             "expected catalogManaged error, got: {err}"
         );
     }
 
-    #[test]
-    fn commit_version_0_rejects_missing_table_id() {
+    #[rstest]
+    #[case::imperative(CommitStyle::Imperative)]
+    #[cfg_attr(
+        feature = "declarative-plans",
+        case::declarative(CommitStyle::Declarative)
+    )]
+    fn commit_version_0_rejects_missing_table_id(#[case] style: CommitStyle) {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         // Has features but missing io.unitycatalog.tableId in config
@@ -465,17 +636,20 @@ mod tests {
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
-        let err = committer
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
-            .unwrap_err();
+        let err = commit_with_style(&committer, &engine, style, commit_metadata).unwrap_err();
         assert!(
             err.to_string().contains("io.unitycatalog.tableId"),
             "expected tableId error, got: {err}"
         );
     }
 
-    #[test]
-    fn commit_version_0_rejects_missing_ict_enablement() {
+    #[rstest]
+    #[case::imperative(CommitStyle::Imperative)]
+    #[cfg_attr(
+        feature = "declarative-plans",
+        case::declarative(CommitStyle::Declarative)
+    )]
+    fn commit_version_0_rejects_missing_ict_enablement(#[case] style: CommitStyle) {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         // Has features and tableId but missing delta.enableInCommitTimestamps=true
@@ -494,17 +668,20 @@ mod tests {
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
-        let err = committer
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
-            .unwrap_err();
+        let err = commit_with_style(&committer, &engine, style, commit_metadata).unwrap_err();
         assert!(
             err.to_string().contains("enableInCommitTimestamps"),
             "expected ICT enablement error, got: {err}"
         );
     }
 
-    #[test]
-    fn commit_version_non_zero_rejects_non_catalog_managed_table() {
+    #[rstest]
+    #[case::imperative(CommitStyle::Imperative)]
+    #[cfg_attr(
+        feature = "declarative-plans",
+        case::declarative(CommitStyle::Declarative)
+    )]
+    fn commit_version_non_zero_rejects_non_catalog_managed_table(#[case] style: CommitStyle) {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         // Version >= 1 but without catalogManaged feature (simulates downgrade attempt)
@@ -512,9 +689,7 @@ mod tests {
         let committer = test_committer();
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
-        let err = committer
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
-            .unwrap_err();
+        let err = commit_with_style(&committer, &engine, style, commit_metadata).unwrap_err();
         assert!(
             err.to_string().contains("catalogManaged"),
             "expected catalogManaged error, got: {err}"
@@ -523,88 +698,108 @@ mod tests {
 
     // A default `#[tokio::test]` is a current-thread runtime. `block_in_place` would panic there,
     // so the committer must reject the flavor with an error instead.
+    #[rstest]
+    #[case::imperative(CommitStyle::Imperative)]
+    #[cfg_attr(
+        feature = "declarative-plans",
+        case::declarative(CommitStyle::Declarative)
+    )]
     #[tokio::test]
-    async fn commit_version_non_zero_rejects_current_thread_runtime() {
+    async fn commit_version_non_zero_rejects_current_thread_runtime(#[case] style: CommitStyle) {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = catalog_managed_commit_metadata(table_root, 1);
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
-        let err = test_committer()
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
-            .unwrap_err();
+        let err =
+            commit_with_style(&test_committer(), &engine, style, commit_metadata).unwrap_err();
         assert!(
             err.to_string().contains("multi-threaded"),
             "expected a multi-threaded-runtime error, got: {err}"
         );
     }
 
-    #[test]
-    fn commit_version_non_zero_rejects_protocol_change() {
+    #[rstest]
+    #[case::imperative(CommitStyle::Imperative)]
+    #[cfg_attr(
+        feature = "declarative-plans",
+        case::declarative(CommitStyle::Declarative)
+    )]
+    fn commit_version_non_zero_rejects_protocol_change(#[case] style: CommitStyle) {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = catalog_managed_commit_metadata(table_root, 1).with_protocol_change();
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
-        let err = test_committer()
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
-            .unwrap_err();
+        let err =
+            commit_with_style(&test_committer(), &engine, style, commit_metadata).unwrap_err();
         assert!(
             err.to_string().contains("table protocol"),
             "expected protocol change error, got: {err}"
         );
     }
 
-    #[test]
-    fn commit_version_non_zero_rejects_metadata_change() {
+    #[rstest]
+    #[case::imperative(CommitStyle::Imperative)]
+    #[cfg_attr(
+        feature = "declarative-plans",
+        case::declarative(CommitStyle::Declarative)
+    )]
+    fn commit_version_non_zero_rejects_metadata_change(#[case] style: CommitStyle) {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = catalog_managed_commit_metadata(table_root, 1).with_metadata_change();
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
-        let err = test_committer()
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
-            .unwrap_err();
+        let err =
+            commit_with_style(&test_committer(), &engine, style, commit_metadata).unwrap_err();
         assert!(
             err.to_string().contains("table metadata"),
             "expected metadata change error, got: {err}"
         );
     }
 
-    #[test]
-    fn commit_version_non_zero_rejects_clustering_change() {
+    #[rstest]
+    #[case::imperative(CommitStyle::Imperative)]
+    #[cfg_attr(
+        feature = "declarative-plans",
+        case::declarative(CommitStyle::Declarative)
+    )]
+    fn commit_version_non_zero_rejects_clustering_change(#[case] style: CommitStyle) {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata =
             catalog_managed_commit_metadata(table_root, 1).with_domain_change("delta.clustering");
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
-        let err = test_committer()
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
-            .unwrap_err();
+        let err =
+            commit_with_style(&test_committer(), &engine, style, commit_metadata).unwrap_err();
         assert!(
             err.to_string().contains("clustering columns"),
             "expected clustering change error, got: {err}"
         );
     }
 
-    #[test]
-    fn commit_version_non_zero_rejects_mismatched_table_id() {
+    #[rstest]
+    #[case::imperative(CommitStyle::Imperative)]
+    #[cfg_attr(
+        feature = "declarative-plans",
+        case::declarative(CommitStyle::Declarative)
+    )]
+    fn commit_version_non_zero_rejects_mismatched_table_id(#[case] style: CommitStyle) {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = catalog_managed_commit_metadata(table_root, 1);
         // Committer initialized with a different table ID than what's in the metadata.
         let committer = UCCommitter::new(
-            Arc::new(MockUpdateTableClient),
+            Arc::new(MockUpdateTableClient::default()),
             "different-table-id",
             TableIdentifier::new("test_catalog", "test_schema", "test_table"),
         );
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
-        let err = committer
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
-            .unwrap_err();
+        let err = commit_with_style(&committer, &engine, style, commit_metadata).unwrap_err();
         assert!(
             err.to_string().contains("table ID mismatch"),
             "expected table ID mismatch error, got: {err}"
@@ -662,7 +857,7 @@ mod tests {
         // ===== WHEN =====
         let publish_metadata = PublishMetadata::try_new(12, catalog_commits).unwrap();
         let committer = UCCommitter::new(
-            Arc::new(MockUpdateTableClient),
+            Arc::new(MockUpdateTableClient::default()),
             "testUcTableId",
             TableIdentifier::new("test_catalog", "test_schema", "test_table"),
         );
