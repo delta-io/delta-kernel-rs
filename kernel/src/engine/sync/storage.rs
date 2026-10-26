@@ -8,9 +8,7 @@ use url::Url;
 use super::{put_bytes, resolve_scope};
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-use crate::{
-    FileMeta, FileSlice, KernelError, KernelResult, KernelResultIteratorStatic, StorageHandler,
-};
+use crate::{FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator, StorageHandler};
 
 #[derive(Constructor)]
 pub(crate) struct SyncStorageHandler {
@@ -31,7 +29,7 @@ impl SyncStorageHandler {
 // It relies on the default `*_with_cancellation` methods to check before delegation and before
 // pulling the resulting in-memory iterator.
 impl StorageHandler for SyncStorageHandler {
-    fn list_from(&self, url_path: &Url) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
+    fn list_from(&self, url_path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         let (store, base_url, offset) = resolve_scope(self.store.as_ref(), url_path)?;
 
         // For directory URLs, prefix == offset and the offset acts as a lower bound that still
@@ -69,7 +67,10 @@ impl StorageHandler for SyncStorageHandler {
         Ok(Box::new(iter))
     }
 
-    fn read_files(&self, files: Vec<FileSlice>) -> KernelResult<KernelResultIteratorStatic<Bytes>> {
+    fn read_files(
+        &self,
+        files: Vec<FileSlice>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
         let store = self.store.clone();
         let results: Vec<KernelResult<Bytes>> = files
             .into_iter()

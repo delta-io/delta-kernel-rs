@@ -10,13 +10,13 @@ use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIteratorStatic, RowVisitor};
+use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIterator, RowVisitor};
 
 /// Phase that processes single-part checkpoint. This also treats the checkpoint as a manifest file
 /// and extracts the sidecar actions during iteration.
 #[allow(unused)]
 pub(crate) struct CheckpointManifestReader {
-    actions: KernelResultIteratorStatic<ActionsBatch>,
+    actions: Box<dyn KernelResultIterator<ActionsBatch>>,
     sidecar_visitor: SidecarVisitor,
     log_root: Url,
     is_complete: bool,

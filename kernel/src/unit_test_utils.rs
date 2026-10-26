@@ -1,3 +1,5 @@
+pub(crate) mod recording_reads;
+
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

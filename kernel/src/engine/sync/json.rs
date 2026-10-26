@@ -20,10 +20,8 @@ use crate::engine_data::FilteredEngineData;
 use crate::object_store::DynObjectStore;
 use crate::schema::SchemaRef;
 #[cfg(test)]
-use crate::{
-    EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, KernelResultIterator,
-};
-use crate::{KernelResult, PredicateRef};
+use crate::{EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler};
+use crate::{KernelResult, KernelResultIterator, PredicateRef};
 
 #[cfg(test)]
 #[derive(Constructor)]
@@ -36,7 +34,7 @@ pub(super) fn try_create_from_json(
     schema: SchemaRef,
     _predicate: Option<PredicateRef>,
     file_location: String,
-) -> KernelResult<impl Iterator<Item = KernelResult<ArrowEngineData>>> {
+) -> KernelResult<impl KernelResultIterator<ArrowEngineData>> {
     let json_schema = Arc::new(json_arrow_schema(&schema)?);
     let reorder_indices = build_json_reorder_indices(&schema)?;
     let json = ReaderBuilder::new(json_schema)
@@ -75,7 +73,7 @@ impl JsonHandler for SyncJsonHandler {
     fn write_json_file(
         &self,
         path: &Url,
-        data: KernelResultIterator<'_, FilteredEngineData>,
+        data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         overwrite: bool,
     ) -> KernelResult<FileSize> {
         let buf = to_json_bytes(data)?;

@@ -13,8 +13,7 @@ use url::Url;
 use crate::metrics::events::{StorageCopyCompleted, StorageListCompleted, StorageReadCompleted};
 use crate::metrics::{emit_storage_span, MetricsIterator};
 use crate::{
-    CancellationTokenRef, FileMeta, FileSlice, KernelResult, KernelResultIteratorStatic,
-    StorageHandler,
+    CancellationTokenRef, FileMeta, FileSlice, KernelResult, KernelResultIterator, StorageHandler,
 };
 
 /// Decorator over an engine-provided `Arc<dyn StorageHandler>` that emits the kernel's
@@ -45,7 +44,7 @@ impl std::fmt::Debug for MeteredStorageHandler {
 }
 
 impl StorageHandler for MeteredStorageHandler {
-    fn list_from(&self, path: &Url) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
+    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         let start = Instant::now();
         let inner = self.inner.list_from(path)?;
         Ok(Box::new(MetricsIterator::<_, FileMeta>::new(
@@ -60,7 +59,7 @@ impl StorageHandler for MeteredStorageHandler {
         &self,
         path: &Url,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         let start = Instant::now();
         let inner = self
             .inner
@@ -72,7 +71,10 @@ impl StorageHandler for MeteredStorageHandler {
         )))
     }
 
-    fn read_files(&self, files: Vec<FileSlice>) -> KernelResult<KernelResultIteratorStatic<Bytes>> {
+    fn read_files(
+        &self,
+        files: Vec<FileSlice>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
         let start = Instant::now();
         let inner = self.inner.read_files(files)?;
         Ok(Box::new(MetricsIterator::<_, Bytes>::new(
@@ -86,7 +88,7 @@ impl StorageHandler for MeteredStorageHandler {
         &self,
         files: Vec<FileSlice>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> KernelResult<KernelResultIteratorStatic<Bytes>> {
+    ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
         let start = Instant::now();
         let inner = self
             .inner
@@ -134,7 +136,7 @@ mod tests {
     }
 
     impl StorageHandler for StubStorageHandler {
-        fn list_from(&self, _path: &Url) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
+        fn list_from(&self, _path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
             let results: Vec<_> = self.list_results.iter().cloned().map(Ok).collect();
             Ok(Box::new(results.into_iter()))
         }
@@ -142,7 +144,7 @@ mod tests {
         fn read_files(
             &self,
             _files: Vec<FileSlice>,
-        ) -> KernelResult<KernelResultIteratorStatic<Bytes>> {
+        ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
             let results: Vec<_> = self.read_results.iter().cloned().map(Ok).collect();
             Ok(Box::new(results.into_iter()))
         }
@@ -267,7 +269,7 @@ mod tests {
     }
 
     impl StorageHandler for TokenCapturingStorageHandler {
-        fn list_from(&self, _path: &Url) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
+        fn list_from(&self, _path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
             Ok(Box::new(std::iter::empty()))
         }
 
@@ -275,7 +277,7 @@ mod tests {
             &self,
             _path: &Url,
             cancellation_token: Option<CancellationTokenRef>,
-        ) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
+        ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
             *self.seen.lock().unwrap() = cancellation_token;
             Ok(Box::new(std::iter::empty()))
         }
@@ -283,7 +285,7 @@ mod tests {
         fn read_files(
             &self,
             _files: Vec<FileSlice>,
-        ) -> KernelResult<KernelResultIteratorStatic<Bytes>> {
+        ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
             Ok(Box::new(std::iter::empty()))
         }
 
@@ -291,7 +293,7 @@ mod tests {
             &self,
             _files: Vec<FileSlice>,
             cancellation_token: Option<CancellationTokenRef>,
-        ) -> KernelResult<KernelResultIteratorStatic<Bytes>> {
+        ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
             *self.seen.lock().unwrap() = cancellation_token;
             Ok(Box::new(std::iter::empty()))
         }

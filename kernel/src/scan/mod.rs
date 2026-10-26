@@ -20,7 +20,9 @@ use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
+use crate::expressions::{
+    column_name, ColumnName, ExpressionRef, MapToStructOptions, Predicate, PredicateRef,
+};
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
 };
@@ -47,8 +49,8 @@ use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::{require, FoldWithOption as _, IteratorExt};
 use crate::{
-    Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIteratorStatic,
-    SnapshotRef, Version,
+    Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, SnapshotRef,
+    Version,
 };
 
 pub(crate) mod data_skipping;
@@ -337,15 +339,11 @@ impl StatsOptions {
     }
 }
 
-/// Engine-facing partition value options. Pass to [`ScanBuilder::with_partition_values`] to
-/// declare whether scan metadata output includes the typed `partitionValues_parsed` struct
-/// alongside the raw string map (`fileConstantValues.partitionValues`), which is always present.
+/// Engine-facing partition value options. Pass to scan builders, such as [`ScanBuilder`] and
+/// [`crate::incremental_scan::IncrementalScanBuilder`], to control partition-column related
+/// behavior.
 ///
-/// When the typed struct is requested, scan metadata output gains a top-level
-/// `partitionValues_parsed` struct column with one typed nullable field per partition column
-/// (physical names, table partition-column order). On non-partitioned tables the column is
-/// omitted. Values come directly from the checkpoint's native `partitionValues_parsed` column
-/// when present, otherwise from parsing the string map.
+/// Note: Not all scans support every option. See each scan builder's documentation for limitations.
 #[derive(Clone, Debug, Default)]
 pub struct PartitionValuesOptions {
     /// Whether to emit the typed `partitionValues_parsed` struct column.
@@ -360,8 +358,13 @@ impl PartitionValuesOptions {
         Self::default()
     }
 
-    /// Emit the typed `partitionValues_parsed` struct alongside the raw string map. Lets engines
-    /// consume `partitionValues_parsed` directly instead of parsing the string map per row.
+    /// When this is called, the read output gains a `partitionValues_parsed` struct column with one
+    /// typed nullable field per partition column, using physical names. Fields follow table schema
+    /// order restricted to partition columns, which can differ from the order in metadata's
+    /// `partitionColumns`.
+    /// On non-partitioned tables the column is omitted. Values come directly from the checkpoint's
+    /// native `partitionValues_parsed` column when present and compatible, otherwise from parsing
+    /// the string map.
     pub fn with_struct() -> Self {
         Self {
             parsed_struct: true,
@@ -375,8 +378,9 @@ impl PartitionValuesOptions {
     ///
     /// `timestamp_timezone` must be an IANA timezone identifier recognized by Kernel or a
     /// normalized fixed offset in `+HH:MM` or `-HH:MM` form. An explicit offset in a partition
-    /// value takes precedence. This option applies to both partition pruning and returned parsed
-    /// partition values. It does not affect `TIMESTAMP_NTZ`.
+    /// value takes precedence. This option applies to partition pruning in full and incremental
+    /// scans and to returned parsed partition values in full scans. It does not affect
+    /// `TIMESTAMP_NTZ`.
     ///
     /// For example, if a `TIMESTAMP` partition column `ts` has
     /// `add.partitionValues["ts"] = "2024-01-15 12:30:45"`, setting `timestamp_timezone` to
@@ -386,20 +390,19 @@ impl PartitionValuesOptions {
     /// timezone, but does not record that timezone. As a result, the timezone can only be supplied
     /// by the connector, and Kernel cannot verify that it matches the writer's timezone.
     ///
-    /// Kernel does not yet support setting a timezone for row transforms on tables with `TIMESTAMP`
-    /// partition columns, so this option omits them as if [`ScanBuilder::without_row_transforms`]
-    /// were set on those tables.
+    /// For full scans, Kernel does not yet support setting a timezone for row transforms on tables
+    /// with `TIMESTAMP` partition columns, so this option omits them as if
+    /// [`ScanBuilder::without_row_transforms`] were set on those tables.
     ///
     /// Without this option, Kernel interprets offset-less timestamps as UTC. Invalid timezones
-    /// cause errors only when Kernel uses them to parse partition values, not when this option
-    /// is set or the scan is built.
-    ///
-    /// TODO(#3609): Row transforms always parse `addFile.partitionValues` instead of using
-    /// compatible `partitionValues_parsed` from checkpoints and are not timezone-aware.
-    /// Support using those parsed values and enable timezone support.
+    /// cause errors only when Kernel evaluates an expression with the timezone, not when this
+    /// option is set or the scan is built.
     ///
     /// [Delta protocol]:
     /// https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
+    // TODO(#3609): Row transforms always parse `addFile.partitionValues` instead of using
+    // compatible `partitionValues_parsed` from checkpoints and are not timezone-aware.
+    // Support using those parsed values and enable timezone support.
     pub fn with_timestamp_timezone(mut self, timestamp_timezone: impl Into<String>) -> Self {
         self.timestamp_timezone = Some(timestamp_timezone.into());
         self
@@ -414,7 +417,7 @@ pub struct ScanBuilder {
     stats: StatsOptions,
     correlation_id: Option<Arc<str>>,
     without_row_transforms: bool,
-    partition_values: PartitionValuesOptions,
+    partition_values_options: PartitionValuesOptions,
     cancellation_token: Option<CancellationTokenRef>,
 }
 
@@ -426,7 +429,7 @@ impl std::fmt::Debug for ScanBuilder {
             .field("stats", &self.stats)
             .field("correlation_id", &self.correlation_id)
             .field("without_row_transforms", &self.without_row_transforms)
-            .field("partition_values", &self.partition_values)
+            .field("partition_values_options", &self.partition_values_options)
             .finish()
     }
 }
@@ -441,7 +444,7 @@ impl ScanBuilder {
             stats: StatsOptions::default(),
             correlation_id: None,
             without_row_transforms: false,
-            partition_values: PartitionValuesOptions::default(),
+            partition_values_options: PartitionValuesOptions::default(),
             cancellation_token: None,
         }
     }
@@ -545,11 +548,17 @@ impl ScanBuilder {
 
     /// Configure partition value output for the scan. See [`PartitionValuesOptions`].
     ///
-    /// Defaults to [`PartitionValuesOptions::default`] (string map only). Engines that
-    /// consume `partitionValues_parsed` directly should pass
-    /// [`PartitionValuesOptions::with_struct`] to also emit the typed struct column.
-    pub fn with_partition_values(mut self, partition_values: PartitionValuesOptions) -> Self {
-        self.partition_values = partition_values;
+    /// Defaults to [`PartitionValuesOptions::default`] (string map only).
+    ///
+    /// If `with_struct` is requested for a partitioned table, `scan_files` includes
+    /// `partitionValues_parsed` as a top-level sibling of `fileConstantValues`. The raw
+    /// `fileConstantValues.partitionValues` map remains present. See
+    /// [`PartitionValuesOptions::with_struct`] for other output details.
+    pub fn with_partition_values(
+        mut self,
+        partition_values_options: PartitionValuesOptions,
+    ) -> Self {
+        self.partition_values_options = partition_values_options;
         self
     }
 
@@ -608,7 +617,7 @@ impl ScanBuilder {
             self.snapshot.table_configuration(),
             self.predicate,
             &self.stats,
-            &self.partition_values,
+            &self.partition_values_options,
             (), // No classifier, default is for scans
         )?;
 
@@ -617,7 +626,7 @@ impl ScanBuilder {
         state_info.skip_row_transforms = self.without_row_transforms
             || table_requires_timestamp_timezone_support(
                 self.snapshot.table_configuration(),
-                &self.partition_values,
+                &self.partition_values_options,
             );
 
         let commits_since_checkpoint = self.snapshot.log_segment().commits_since_checkpoint();
@@ -636,7 +645,7 @@ impl ScanBuilder {
             state_info: Arc::new(state_info),
             stats: self.stats,
             correlation_id: self.correlation_id,
-            partition_values: self.partition_values,
+            partition_values_options: self.partition_values_options,
             cancellation_token: self.cancellation_token,
         })
     }
@@ -895,7 +904,7 @@ pub struct Scan {
     state_info: Arc<StateInfo>,
     stats: StatsOptions,
     correlation_id: Option<Arc<str>>,
-    partition_values: PartitionValuesOptions,
+    partition_values_options: PartitionValuesOptions,
     /// Scan-local token for cached metadata checks and I/O; `None` retains engine I/O
     /// cancellation.
     cancellation_token: Option<CancellationTokenRef>,
@@ -987,8 +996,8 @@ impl Scan {
     /// Build the partition-value read options passed to [`ScanLogReplayProcessor`].
     fn partition_values_options(&self) -> log_replay::ScanPartitionValuesOptions {
         log_replay::ScanPartitionValuesOptions {
-            parsed_struct: self.partition_values.parsed_struct,
-            timestamp_timezone: self.partition_values.timestamp_timezone.clone(),
+            parsed_struct: self.partition_values_options.parsed_struct,
+            timestamp_timezone: self.partition_values_options.timestamp_timezone.clone(),
         }
     }
 
@@ -1062,7 +1071,7 @@ impl Scan {
     pub fn scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<ScanMetadata>>> {
+    ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
         let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
         self.scan_metadata_inner(engine, actions_with_checkpoint_info)
     }
@@ -1124,14 +1133,14 @@ impl Scan {
         existing_version: Version,
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
         _existing_predicate: Option<PredicateRef>,
-    ) -> KernelResult<KernelResultIteratorStatic<ScanMetadata>> {
+    ) -> KernelResult<Box<dyn KernelResultIterator<ScanMetadata>>> {
         // TODO(#3609): scan_metadata_from does not reuse existing partitionValues_parsed
         // from compatible checkpoints. Support reusing those values and enable connector-supplied
         // timezone support.
         require!(
             !table_requires_timestamp_timezone_support(
                 self.snapshot.table_configuration(),
-                &self.partition_values,
+                &self.partition_values_options,
             ),
             KernelError::unsupported(
                 "Kernel does not yet support with_timestamp_timezone in scan_metadata_from on \
@@ -1249,9 +1258,9 @@ impl Scan {
         &self,
         engine: &dyn Engine,
         actions_with_checkpoint_info: ActionsWithCheckpointInfo<
-            impl Iterator<Item = KernelResult<ActionsBatch>> + Send,
+            impl KernelResultIterator<ActionsBatch>,
         >,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<ScanMetadata>> + Send> {
+    ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
         let start = Instant::now();
         let operation_id = MetricId::new();
         let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
@@ -1321,7 +1330,7 @@ impl Scan {
         require!(
             !table_requires_timestamp_timezone_support(
                 self.snapshot.table_configuration(),
-                &self.partition_values,
+                &self.partition_values_options,
             ),
             KernelError::unsupported(
                 "Kernel does not yet support with_timestamp_timezone in \
@@ -1346,9 +1355,7 @@ impl Scan {
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<
-        ActionsWithCheckpointInfo<impl Iterator<Item = KernelResult<ActionsBatch>> + Send>,
-    > {
+    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch>>> {
         let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
@@ -1506,7 +1513,7 @@ impl Scan {
         require!(
             !table_requires_timestamp_timezone_support(
                 self.snapshot.table_configuration(),
-                &self.partition_values,
+                &self.partition_values_options,
             ),
             KernelError::unsupported(
                 "Kernel does not yet support with_timestamp_timezone in parallel_scan_metadata on \
@@ -1560,7 +1567,7 @@ impl Scan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<Box<dyn EngineData>>>> {
+    ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>>> {
         if self.state_info.skip_row_transforms {
             return Err(KernelError::unsupported(
                 "Scan::execute is not supported when row transforms are disabled by \
@@ -1709,6 +1716,14 @@ pub fn selection_vector(
     let storage = engine.storage_handler();
     let dv_treemap = descriptor.read(storage, table_root)?;
     Ok(deletion_treemap_to_bools(dv_treemap))
+}
+
+/// Returns [`MapToStructOptions`] with the supplied timezone, or the default (UTC) when absent.
+pub(crate) fn map_to_struct_options(timestamp_timezone: Option<&str>) -> MapToStructOptions {
+    MapToStructOptions::default().fold_with(
+        timestamp_timezone,
+        MapToStructOptions::with_timestamp_timezone,
+    )
 }
 
 /// If a table has `TIMESTAMP` partition columns and the connector supplies a timezone, the read

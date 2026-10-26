@@ -39,7 +39,7 @@ pub(crate) fn write_commit_json_declarative(
 }
 
 fn file_meta_from_batches(
-    batches: KernelResultIterator<'_, Box<dyn EngineData>>,
+    batches: impl KernelResultIterator<Box<dyn EngineData>>,
 ) -> KernelResult<FileMeta> {
     let mut visitor = FileMetaVisitor::default();
     for batch in batches {

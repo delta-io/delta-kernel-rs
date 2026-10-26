@@ -8,8 +8,7 @@ use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::{
     CancellationToken as _, CancellationTokenRef, Engine, FileMeta, FileSlice, JsonHandler,
-    KernelError, KernelResult, KernelResultIteratorStatic, ParquetHandler, Snapshot,
-    StorageHandler,
+    KernelError, KernelResult, KernelResultIterator, ParquetHandler, Snapshot, StorageHandler,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
@@ -308,7 +307,7 @@ struct CancelOnListHandler {
 }
 
 impl StorageHandler for CancelOnListHandler {
-    fn list_from(&self, path: &url::Url) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
+    fn list_from(&self, path: &url::Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         self.inner.list_from(path)
     }
 
@@ -316,7 +315,7 @@ impl StorageHandler for CancelOnListHandler {
         &self,
         path: &url::Url,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         self.token.cancel();
         self.inner
             .list_from_with_cancellation(path, cancellation_token)
@@ -325,7 +324,7 @@ impl StorageHandler for CancelOnListHandler {
     fn read_files(
         &self,
         files: Vec<FileSlice>,
-    ) -> KernelResult<KernelResultIteratorStatic<bytes::Bytes>> {
+    ) -> KernelResult<Box<dyn KernelResultIterator<bytes::Bytes>>> {
         self.inner.read_files(files)
     }
 
@@ -333,7 +332,7 @@ impl StorageHandler for CancelOnListHandler {
         &self,
         files: Vec<FileSlice>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> KernelResult<KernelResultIteratorStatic<bytes::Bytes>> {
+    ) -> KernelResult<Box<dyn KernelResultIterator<bytes::Bytes>>> {
         self.inner
             .read_files_with_cancellation(files, cancellation_token)
     }

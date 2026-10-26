@@ -172,7 +172,7 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
     fn commit(
         &self,
         engine: &dyn delta_kernel::Engine,
-        actions: KernelResultIterator<'_, delta_kernel::FilteredEngineData>,
+        actions: Box<dyn KernelResultIterator<delta_kernel::FilteredEngineData> + '_>,
         commit_metadata: delta_kernel::committer::CommitMetadata,
     ) -> KernelResult<delta_kernel::committer::CommitResponse> {
         // We hold this guard until the end of the function so we stay in the tokio context until

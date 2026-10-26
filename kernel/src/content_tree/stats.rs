@@ -328,7 +328,7 @@ fn leaf_stats_field(
         DataType::Variant(_) => {
             build_stats_struct(base_stats_id, &DataType::unshredded_variant(), categories)
         }
-        // Array/map columns carry no leaf stats.
+        // Array/map/file columns carry no leaf stats.
         _ => return Ok(None),
     };
 

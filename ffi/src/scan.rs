@@ -9,9 +9,7 @@ use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
 use delta_kernel::schema::MetadataValue;
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{
-    Expression, ExpressionRef, KernelError, KernelResult, KernelResultIteratorStatic,
-};
+use delta_kernel::{Expression, ExpressionRef, KernelError, KernelResult, KernelResultIterator};
 use delta_kernel_ffi_macros::handle_descriptor;
 use derive_more::From;
 use tracing::debug;
@@ -39,7 +37,7 @@ pub struct SharedScan;
 pub struct SharedScanMetadata;
 
 /// Boxed scan metadata iterator stored behind [`ScanMetadataIterator`]'s mutex.
-type ScanMetadataIter = KernelResultIteratorStatic<ScanMetadata>;
+type ScanMetadataIter = Box<dyn KernelResultIterator<ScanMetadata>>;
 
 /// An opaque, exclusive handle owning a [`ScanBuilder`].
 ///
@@ -103,6 +101,7 @@ impl FfiStatsOptions {
 /// The default behavior is `StringMapOnly`.
 ///
 /// cbindgen:prefix-with-name=true
+// TODO(#3609): Support connector-supplied timestamp timezones.
 #[repr(C)]
 pub enum FfiPartitionValuesOptions {
     /// Emit only the raw string map.

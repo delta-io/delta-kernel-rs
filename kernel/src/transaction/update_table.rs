@@ -39,7 +39,7 @@ use crate::table_features::TableFeature;
 use crate::utils::require;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::FileMeta;
-use crate::{DataType, Engine, Expression, KernelResult};
+use crate::{DataType, Engine, Expression, KernelResult, KernelResultIterator};
 
 // =============================================================================
 // Update table transactions only
@@ -270,8 +270,8 @@ impl Transaction<UpdateTable, Imperative> {
     /// txn.update_deletion_vectors(dv_map, files_iter)?;
     /// ```
     pub fn scan_metadata_to_engine_data(
-        scan_metadata: impl Iterator<Item = KernelResult<crate::scan::ScanMetadata>>,
-    ) -> impl Iterator<Item = KernelResult<FilteredEngineData>> {
+        scan_metadata: impl KernelResultIterator<crate::scan::ScanMetadata>,
+    ) -> impl KernelResultIterator<FilteredEngineData> {
         scan_metadata.map(|result| result.map(|metadata| metadata.scan_files))
     }
 
@@ -342,7 +342,7 @@ impl Transaction<UpdateTable, Imperative> {
     pub(crate) fn update_deletion_vectors(
         &mut self,
         new_dv_descriptors: HashMap<String, DeletionVectorDescriptor>,
-        existing_data_files: impl Iterator<Item = KernelResult<FilteredEngineData>>,
+        existing_data_files: impl KernelResultIterator<FilteredEngineData>,
     ) -> KernelResult<()> {
         if self.is_create_table() {
             return Err(KernelError::generic(
@@ -530,7 +530,7 @@ impl<STATE> Transaction<STATE, Imperative> {
     pub(super) fn generate_dv_update_actions<'a>(
         &'a self,
         engine: &'a dyn Engine,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<FilteredEngineData>> + Send + 'a> {
+    ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + 'a> {
         // Create-table transactions should not have any DV update actions
         if self.is_create_table() && !self.staged_data_changes.dv_matched_files.is_empty() {
             return Err(crate::error::KernelError::internal_error(
@@ -558,7 +558,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         &'a self,
         engine: &'a dyn Engine,
         file_metadata_batch: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<FilteredEngineData>> + Send + 'a> {
+    ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + 'a> {
         let evaluation_handler = engine.evaluation_handler();
         // Struct patch to replace the deletionVector field with the new DV/stats from
         // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME, then drop the

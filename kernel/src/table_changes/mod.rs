@@ -55,7 +55,7 @@ use crate::table_properties::{
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult, Version};
+use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Version};
 
 mod log_replay;
 mod net_changes;
@@ -518,7 +518,7 @@ impl TableChanges {
         self: Arc<Self>,
         engine: Arc<dyn Engine>,
         mode: TableChangesListingMode,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<TableChangesFileAction>>> {
+    ) -> KernelResult<impl KernelResultIterator<TableChangesFileAction>> {
         if self.mode != CdfMode::RowTracking {
             return Err(KernelError::unsupported(
                 "scan_file_listing is only supported for row-tracking change feeds; construct \
