@@ -11,6 +11,9 @@ use crate::table_changes::{
 /// in [`StateInfo::try_new`](crate::scan::state_info::StateInfo::try_new). A
 /// `TransformFieldClassifier` can be used to override the behavior implemented in that method.
 pub(crate) trait TransformFieldClassifier {
+    /// Whether ordinary table fields pass through without classifier transformations.
+    const IS_IDENTITY: bool = false;
+
     /// Classify a field and return its transform spec.
     /// Returns None if the field is physical (should be read from parquet).
     /// Returns Some(spec) if the field needs transformation (partition, metadata-derived, or
@@ -25,6 +28,8 @@ pub(crate) trait TransformFieldClassifier {
 
 // Empty classifier, always returns None
 impl TransformFieldClassifier for () {
+    const IS_IDENTITY: bool = true;
+
     fn classify_field(
         &self,
         _: &StructField,
