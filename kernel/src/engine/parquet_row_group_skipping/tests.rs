@@ -615,40 +615,63 @@ fn timestamp_footer_stats_match_engine_casts(
 }
 
 #[rstest]
-#[case::unannotated(ConvertedType::NONE, 1_000)]
-#[case::legacy_millis(ConvertedType::TIMESTAMP_MILLIS, 1_000_000)]
-#[case::legacy_micros(ConvertedType::TIMESTAMP_MICROS, 1_000)]
-fn timestamp_footer_stats_support_legacy_annotations(
+#[case::unannotated(None, ConvertedType::NONE, Some(1_000))]
+#[case::legacy_millis(None, ConvertedType::TIMESTAMP_MILLIS, Some(1_000_000))]
+#[case::legacy_micros(None, ConvertedType::TIMESTAMP_MICROS, Some(1_000))]
+#[case::legacy_time(None, ConvertedType::TIME_MICROS, None)]
+#[case::legacy_signed_integer(None, ConvertedType::INT_64, None)]
+#[case::legacy_unsigned_integer(None, ConvertedType::UINT_64, None)]
+#[case::legacy_decimal(None, ConvertedType::DECIMAL, None)]
+#[case::logical_time(
+    Some(LogicalType::time(true, TimeUnit::MICROS)),
+    ConvertedType::TIME_MICROS,
+    None
+)]
+#[case::logical_nanos_time(
+    Some(LogicalType::time(true, TimeUnit::NANOS)),
+    ConvertedType::NONE,
+    None
+)]
+#[case::logical_signed_integer(Some(LogicalType::integer(64, true)), ConvertedType::INT_64, None)]
+#[case::logical_unsigned_integer(
+    Some(LogicalType::integer(64, false)),
+    ConvertedType::UINT_64,
+    None
+)]
+#[case::logical_decimal(Some(LogicalType::decimal(2, 10)), ConvertedType::DECIMAL, None)]
+fn timestamp_footer_stats_respect_annotations(
+    #[case] logical_type: Option<LogicalType>,
     #[case] converted_type: ConvertedType,
-    #[case] expected: i64,
+    #[case] expected: Option<i64>,
 ) {
+    let builder = Type::primitive_type_builder("ts", PhysicalType::INT64)
+        .with_logical_type(logical_type.clone())
+        .with_converted_type(converted_type);
+    let builder = if converted_type == ConvertedType::DECIMAL {
+        builder.with_precision(10).with_scale(2)
+    } else {
+        builder
+    };
     let column = ColumnDescriptor::new(
-        Arc::new(
-            Type::primitive_type_builder("ts", PhysicalType::INT64)
-                .with_converted_type(converted_type)
-                .build()
-                .unwrap(),
-        ),
+        Arc::new(builder.build().unwrap()),
         0,
         0,
         ColumnPath::from("ts"),
     );
-    assert!(column.logical_type_ref().is_none());
+    assert_eq!(column.logical_type_ref(), logical_type.as_ref());
     let stats = Statistics::int64(Some(1_000), Some(1_000), None, Some(0), false);
     for data_type in [DataType::TIMESTAMP, DataType::TIMESTAMP_NTZ] {
-        let expected = if data_type == DataType::TIMESTAMP {
-            Scalar::Timestamp(expected)
+        let scalar = if data_type == DataType::TIMESTAMP {
+            Scalar::Timestamp as fn(i64) -> Scalar
         } else {
-            Scalar::TimestampNtz(expected)
+            Scalar::TimestampNtz as fn(i64) -> Scalar
         };
+        let expected = expected.map(scalar);
         assert_eq!(
             extract_min_scalar(&data_type, &stats, &column),
-            Some(expected.clone())
+            expected.clone()
         );
-        assert_eq!(
-            extract_max_scalar(&data_type, &stats, &column),
-            Some(expected)
-        );
+        assert_eq!(extract_max_scalar(&data_type, &stats, &column), expected);
     }
 }
 

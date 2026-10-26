@@ -311,11 +311,13 @@ fn timestamp_from_date(days: Option<&i32>) -> Option<Scalar> {
 /// Rescales footer timestamps to microseconds. Unannotated INT64 columns retain the microsecond
 /// interpretation used for external checkpoints.
 ///
-/// Returns `None` on scaling overflow, so that bound cannot justify skipping a row group.
+/// Returns `None` for unsupported annotations or scaling overflow, so that bound cannot justify
+/// skipping a row group.
 fn timestamp_stat_as_micros(value: i64, column: &ColumnDescriptor) -> Option<i64> {
     let unit = match column.logical_type_ref() {
         Some(LogicalType::Timestamp(timestamp)) => Some(&timestamp.unit),
-        _ => None,
+        None => None,
+        Some(_) => return None,
     };
     match unit {
         Some(TimeUnit::MILLIS) => value.checked_mul(1_000),
@@ -325,7 +327,8 @@ fn timestamp_stat_as_micros(value: i64, column: &ColumnDescriptor) -> Option<i64
         Some(TimeUnit::NANOS) => Some(value / 1_000),
         None => match column.converted_type() {
             ConvertedType::TIMESTAMP_MILLIS => value.checked_mul(1_000),
-            _ => Some(value),
+            ConvertedType::TIMESTAMP_MICROS | ConvertedType::NONE => Some(value),
+            _ => None,
         },
     }
 }
