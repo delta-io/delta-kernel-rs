@@ -21,7 +21,7 @@ use delta_kernel::object_store::{
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{
     CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler,
-    KernelError, KernelResult, PredicateRef, Result, ResultIterator,
+    KernelError, KernelResult, KernelResultIterator, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
@@ -158,7 +158,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         &self,
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
-    ) -> Result<Box<dyn EngineData>> {
+    ) -> KernelResult<Box<dyn EngineData>> {
         arrow_parse_json(json_strings, output_schema)
     }
 
@@ -167,7 +167,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         self.read_json_files_with_cancellation(files, physical_schema, predicate, None)
     }
 
@@ -177,7 +177,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         let future = read_json_files_impl(
             self.store.clone(),
             files.to_vec(),
@@ -197,9 +197,9 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     fn write_json_file(
         &self,
         path: &Url,
-        data: ResultIterator<'_, FilteredEngineData>,
+        data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         overwrite: bool,
-    ) -> Result<FileSize> {
+    ) -> KernelResult<FileSize> {
         self.task_executor.block_on(write_json_file_impl(
             self.store.clone(),
             path.clone(),
@@ -709,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_invalid_json() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_read_invalid_json() -> KernelResult<()> {
         let _ = tracing_subscriber::fmt().try_init();
         let (_temp_file1, file_url1) = make_invalid_named_temp();
         let (_temp_file2, file_url2) = make_invalid_named_temp();
@@ -853,7 +853,7 @@ mod tests {
     }
 
     // Helper function to create test data
-    fn create_test_data(values: Vec<&str>) -> Result<Box<dyn EngineData>> {
+    fn create_test_data(values: Vec<&str>) -> KernelResult<Box<dyn EngineData>> {
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "dog",
             DataType::Utf8,
@@ -865,7 +865,10 @@ mod tests {
     }
 
     // Helper function to read JSON file asynchronously
-    async fn read_json_file(store: &Arc<InMemory>, path: &Path) -> Result<Vec<serde_json::Value>> {
+    async fn read_json_file(
+        store: &Arc<InMemory>,
+        path: &Path,
+    ) -> KernelResult<Vec<serde_json::Value>> {
         let content = store.get(path).await?;
         let file_bytes = content.bytes().await?;
         let file_string =
@@ -881,16 +884,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_json_file_without_overwrite() -> Result<()> {
+    async fn test_write_json_file_without_overwrite() -> KernelResult<()> {
         do_test_write_json_file(false).await
     }
 
     #[tokio::test]
-    async fn test_write_json_file_overwrite() -> Result<()> {
+    async fn test_write_json_file_overwrite() -> KernelResult<()> {
         do_test_write_json_file(true).await
     }
 
-    async fn do_test_write_json_file(overwrite: bool) -> Result<()> {
+    async fn do_test_write_json_file(overwrite: bool) -> KernelResult<()> {
         let store = Arc::new(InMemory::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let handler = DefaultJsonHandler::new(store.clone(), executor);
@@ -935,7 +938,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_empty_json_file_reports_zero_size() -> Result<()> {
+    async fn test_write_empty_json_file_reports_zero_size() -> KernelResult<()> {
         let store = Arc::new(InMemory::new());
         let handler =
             DefaultJsonHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));

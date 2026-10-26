@@ -39,11 +39,14 @@
 //! # use delta_kernel::Engine;
 //! # use delta_kernel::Snapshot;
 //! # use delta_kernel::SnapshotRef;
-//! # use delta_kernel::Result;
+//! # use delta_kernel::KernelResult;
 //! # use delta_kernel::KernelError;
 //! # use delta_kernel::FileMeta;
 //! # use url::Url;
-//! fn write_checkpoint_file(path: Url, data: ActionReconciliationIterator) -> Result<FileMeta> {
+//! fn write_checkpoint_file(
+//!     path: Url,
+//!     data: ActionReconciliationIterator,
+//! ) -> KernelResult<FileMeta> {
 //!     todo!() /* engine-specific logic to write data to object storage*/
 //! }
 //!
@@ -123,11 +126,12 @@ use crate::log_replay::HasSelectionVector;
 use crate::path::{self, ParsedLogPath};
 use crate::schema::{lazy_schema_ref, SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
+use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    version_as_i64, Engine, EngineData, FileMeta, KernelError, KernelResult,
-    KernelResultIteratorStatic, Result, Version,
+    version_as_i64, Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator,
+    Version,
 };
 
 #[cfg(feature = "declarative-plans")]
@@ -195,7 +199,7 @@ impl LastCheckpointHintStats {
         state: ActionReconciliationIteratorState,
         size_in_bytes: u64,
         num_sidecars: u64,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         if !state.is_exhausted() {
             return Err(KernelError::checkpoint_write(
                 "Cannot build LastCheckpointHintStats: the reconciliation iterator must be fully \
@@ -375,6 +379,8 @@ impl CheckpointWriter {
             .table_configuration()
             .ensure_read_write_supported()?;
 
+        ensure_standalone_checkpoint_supported(snapshot.table_configuration())?;
+
         // We disallow checkpointing if the Snapshot is not published. If we didn't, this could
         // create gaps in the version history, thereby breaking old readers.
         snapshot.log_segment().validate_published()?;
@@ -412,7 +418,7 @@ impl CheckpointWriter {
     ///
     /// For example, if the table root is `s3://bucket/path` and the version is `10`,
     /// the checkpoint path will be: `s3://bucket/path/00000000000000000010.checkpoint.parquet`
-    pub fn checkpoint_path(&self) -> Result<Url> {
+    pub fn checkpoint_path(&self) -> KernelResult<Url> {
         ParsedLogPath::new_classic_parquet_checkpoint(
             self.snapshot.table_root(),
             self.snapshot.version(),
@@ -453,7 +459,10 @@ impl CheckpointWriter {
     // 3. Reads actions from the log segment and deduplicates via reconciliation
     // 4. Applies stats transforms (COALESCE/drop) to each reconciled batch
     // 5. Chains the checkpoint metadata action for V2 checkpoints
-    pub fn checkpoint_data(&self, engine: &dyn Engine) -> Result<ActionReconciliationIterator> {
+    pub fn checkpoint_data(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<ActionReconciliationIterator> {
         // Read actions from log segment
         let actions = self
             .snapshot
@@ -522,7 +531,7 @@ impl CheckpointWriter {
         self,
         engine: &dyn Engine,
         last_checkpoint_stats: &LastCheckpointHintStats,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         // Skip writing `_last_checkpoint` if the existing hint already points to a newer
         // checkpoint, to avoid regressing the hint.
         let checkpoint_version = self.snapshot.version();
@@ -615,7 +624,7 @@ impl CheckpointWriter {
 
         // Write main checkpoint file: non-file actions + sidecar references
         let checkpoint_path = self.checkpoint_path()?;
-        let main_data: KernelResultIteratorStatic<Box<dyn EngineData>> =
+        let main_data: Box<dyn KernelResultIterator<Box<dyn EngineData>>> =
             Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
         let main_size = engine
             .parquet_handler()
@@ -754,6 +763,22 @@ impl CheckpointWriter {
             is_v2,
         })
     }
+}
+
+/// Returns an error if Kernel does not support writing standalone (V1/V2) checkpoints for the
+/// table.
+#[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_variables))]
+pub(crate) fn ensure_standalone_checkpoint_supported(
+    table_configuration: &TableConfiguration,
+) -> KernelResult<()> {
+    // TODO(#3683): support standalone checkpoints for adaptiveMetadata tables.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    if table_configuration.is_feature_enabled(&TableFeature::AdaptiveMetadataPreview) {
+        return Err(KernelError::unsupported(
+            "Standalone checkpoints are not yet supported for tables with adaptiveMetadata enabled",
+        ));
+    }
+    Ok(())
 }
 
 /// Creates the data for the _last_checkpoint file containing checkpoint metadata. Factored out to

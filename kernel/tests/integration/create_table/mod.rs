@@ -3,6 +3,7 @@
 mod clustering;
 mod column_mapping;
 mod ctas;
+mod file;
 mod iceberg_compat;
 mod ict;
 mod interval;
@@ -24,14 +25,14 @@ use delta_kernel::table_features::{
 use delta_kernel::table_properties::TableProperties;
 use delta_kernel::transaction::create_table::{create_table, CreateTableTransaction};
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{KernelError, Result};
+use delta_kernel::{KernelError, KernelResult};
 use rstest::rstest;
 use serde_json::Value;
 use test_utils::{assert_result_error_with_message, test_table_setup, test_table_setup_mt};
 
 /// Helper to create a simple two-column schema for tests.
 /// Shared with sub-modules.
-pub(crate) fn simple_schema() -> Result<Arc<StructType>> {
+pub(crate) fn simple_schema() -> KernelResult<Arc<StructType>> {
     Ok(schema_ref! {
         nullable "id": INTEGER,
         nullable "value": STRING,
@@ -40,7 +41,7 @@ pub(crate) fn simple_schema() -> Result<Arc<StructType>> {
 
 /// Helper to create a three-column schema for partition tests (id, date, value).
 /// Shared with sub-modules.
-pub(crate) fn partition_test_schema() -> Result<Arc<StructType>> {
+pub(crate) fn partition_test_schema() -> KernelResult<Arc<StructType>> {
     Ok(schema_ref! {
         nullable "id": INTEGER,
         nullable "date": DATE,
@@ -49,7 +50,7 @@ pub(crate) fn partition_test_schema() -> Result<Arc<StructType>> {
 }
 
 #[tokio::test]
-async fn test_create_simple_table() -> Result<()> {
+async fn test_create_simple_table() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema for an events table
@@ -122,7 +123,7 @@ async fn create_table_validates_cdf_column_names(
     )]
     column_name: &str,
     #[values("none", "name", "id")] cm_mode: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! { (StructField::nullable(column_name, DataType::STRING)) };
     let mut properties = vec![
@@ -163,7 +164,7 @@ async fn create_table_validates_cdf_reserved_physical_column_names(
     #[case] cm_mode: &str,
     #[case] cdf_enabled: bool,
     #[case] expected_error: Option<&str>,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         (StructField::nullable("value", DataType::STRING).with_metadata([
@@ -202,7 +203,7 @@ async fn create_table_validates_cdf_reserved_physical_column_names(
 }
 
 #[tokio::test]
-async fn test_create_table_with_user_domain_metadata() -> Result<()> {
+async fn test_create_table_with_user_domain_metadata() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = simple_schema()?;
@@ -253,7 +254,7 @@ async fn test_create_table_with_user_domain_metadata() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_create_table_already_exists() -> Result<()> {
+async fn test_create_table_already_exists() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema for a user profiles table
@@ -293,7 +294,7 @@ async fn test_create_table_already_exists() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_create_table_empty_schema_succeeds() -> Result<()> {
+async fn test_create_table_empty_schema_succeeds() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // CREATE TABLE with no columns is a valid Delta operation; users may add columns
@@ -324,7 +325,7 @@ async fn test_create_table_empty_schema_succeeds() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_create_table_empty_schema_checkpoint_round_trip(
     #[case] cm_mode: Option<&str>,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
     let schema = schema_ref! {};
@@ -362,7 +363,7 @@ async fn test_create_table_empty_schema_checkpoint_round_trip(
 async fn test_create_table_empty_schema_layout_errors(
     #[case] layout: DataLayout,
     #[case] expected_err: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {};
@@ -398,7 +399,7 @@ fn nested_non_null_schema() -> Arc<StructType> {
 #[case::nested_non_null(nested_non_null_schema())]
 fn test_create_table_with_non_null_columns_auto_enables_invariants(
     #[case] schema: Arc<StructType>,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let _ = create_table(&table_path, schema, "Test/1.0", true)
@@ -430,7 +431,7 @@ fn test_create_table_with_non_null_columns_auto_enables_invariants(
 /// together must not duplicate the entry. This also verifies users can pre-enable the
 /// feature so a later ALTER TABLE ADD COLUMN NOT NULL does not need a protocol upgrade.
 #[tokio::test]
-async fn test_create_table_with_invariants_feature_signal_allowed() -> Result<()> {
+async fn test_create_table_with_invariants_feature_signal_allowed() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     // Non-null schema auto-enables Invariants; the feature signal also tries to add it.
     // Both code paths firing together must produce exactly one Invariants entry.
@@ -467,7 +468,7 @@ async fn test_create_table_with_invariants_feature_signal_allowed() -> Result<()
 /// CREATE TABLE rejects any schema with `delta.invariants` metadata annotations
 /// because kernel cannot evaluate SQL expression invariants.
 #[tokio::test]
-async fn test_create_table_rejects_delta_invariants_metadata() -> Result<()> {
+async fn test_create_table_rejects_delta_invariants_metadata() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let mut field = StructField::nullable("x", DataType::INTEGER);
@@ -492,7 +493,7 @@ async fn test_create_table_rejects_delta_invariants_metadata() -> Result<()> {
 async fn test_create_table_log_actions(
     #[case] replace_metrics_after_build: bool,
     #[values("AuditService/2.1.0", "")] engine_info: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema
@@ -625,7 +626,7 @@ async fn test_create_table_log_actions(
 }
 
 /// Helper to create a `CreateTableTransaction` for tests.
-fn create_test_create_table_txn() -> Result<(
+fn create_test_create_table_txn() -> KernelResult<(
     Arc<impl delta_kernel::Engine>,
     CreateTableTransaction,
     tempfile::TempDir,
@@ -641,7 +642,7 @@ fn create_test_create_table_txn() -> Result<(
 }
 
 #[tokio::test]
-async fn test_create_table_txn_debug() -> Result<()> {
+async fn test_create_table_txn_debug() -> KernelResult<()> {
     let (_engine, txn, _tempdir) = create_test_create_table_txn()?;
     let debug_str = format!("{txn:?}");
     assert!(
@@ -685,7 +686,7 @@ fn test_create_table_with_feature_signal(
     #[case] is_reader_writer: bool,
     #[case] enabled_when_supported: bool,
     #[case] expects_domain_metadata: bool,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let property_key = format!("delta.feature.{feature_name}");
@@ -743,7 +744,7 @@ fn create_resolves_domain_metadata_after_all_feature_selection(
     #[case] properties: &[(&str, &str)],
     #[case] layout: DataLayout,
     #[case] expects_domain_metadata: bool,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot = create_table(&table_path, simple_schema()?, "test", true)
         .with_table_properties(properties.iter().copied())
@@ -767,7 +768,7 @@ fn create_resolves_domain_metadata_after_all_feature_selection(
 }
 
 #[test]
-fn test_create_table_with_variant_shredding_has_variant_feature() -> Result<()> {
+fn test_create_table_with_variant_shredding_has_variant_feature() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         nullable "id": INTEGER,
@@ -801,7 +802,7 @@ fn test_create_table_with_variant_shredding_has_variant_feature() -> Result<()> 
 fn test_create_table_checkpoint_policy_auto_enables_v2_checkpoint(
     #[case] policy: &str,
     #[case] expect_v2_checkpoint: bool,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let _ = create_table(&table_path, simple_schema()?, "Test/1.0", true)
@@ -838,7 +839,7 @@ fn test_create_table_checkpoint_policy_auto_enables_v2_checkpoint(
 fn test_create_table_with_checkpoint_stats_properties(
     #[values(true, false)] write_stats_as_json: bool,
     #[values(true, false)] write_stats_as_struct: bool,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let json_val = write_stats_as_json.to_string();
@@ -876,7 +877,7 @@ fn test_create_table_with_enablement_property(
     #[case] feature: TableFeature,
     #[case] is_reader_writer: bool,
     #[values(true, false)] expect_enabled: bool,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let value = expect_enabled.to_string();
 
@@ -922,7 +923,7 @@ fn test_create_table_with_enablement_property(
 #[rstest]
 #[case::without_cm(false)]
 #[case::with_cm(true)]
-fn test_create_table_special_char_column_name(#[case] cm_enabled: bool) -> Result<()> {
+fn test_create_table_special_char_column_name(#[case] cm_enabled: bool) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {

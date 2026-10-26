@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use delta_kernel::arrow::array::{RecordBatch, StringArray};
 use delta_kernel::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::{EngineData, KernelError, Result};
+use delta_kernel::{EngineData, KernelError, KernelResult};
 
 /// Convert an `EngineData` into a `RecordBatch`. Panics if the underlying engine data is not
 /// `ArrowEngineData`.
@@ -24,8 +24,10 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
 }
 
 /// `?`-friendly variant of [`into_record_batch`] for use inside iterators that yield
-/// `Result<Box<dyn EngineData>>`.
-pub fn try_into_record_batch(engine_data: Result<Box<dyn EngineData>>) -> Result<RecordBatch> {
+/// `KernelResult<Box<dyn EngineData>>`.
+pub fn try_into_record_batch(
+    engine_data: KernelResult<Box<dyn EngineData>>,
+) -> KernelResult<RecordBatch> {
     engine_data
         .and_then(ArrowEngineData::try_from_engine_data)
         .map(Into::into)
@@ -41,14 +43,14 @@ pub fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineD
 }
 
 /// Returns the current time as a `Duration` since Unix epoch.
-pub fn current_time_duration() -> Result<Duration> {
+pub fn current_time_duration() -> KernelResult<Duration> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| KernelError::generic(format!("System time before Unix epoch: {e}")))
 }
 
 /// Returns the current time in milliseconds since Unix epoch.
-pub fn current_time_ms() -> Result<i64> {
+pub fn current_time_ms() -> KernelResult<i64> {
     let duration = current_time_duration()?;
     i64::try_from(duration.as_millis())
         .map_err(|_| KernelError::generic("Current timestamp exceeds i64 millisecond range"))
@@ -56,7 +58,7 @@ pub fn current_time_ms() -> Result<i64> {
 
 /// Assert that `res` is an `Err` whose `Display` contains `message`.
 #[track_caller]
-pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {
+pub fn assert_result_error_with_message<T, E: ToString>(res: KernelResult<T, E>, message: &str) {
     match res {
         Ok(_) => panic!("Expected error containing '{message}', but got Ok result"),
         Err(e) => {

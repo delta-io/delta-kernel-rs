@@ -17,7 +17,7 @@ use delta_kernel::arrow::compute::{cast, concat_batches};
 use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef};
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use delta_kernel::{KernelError as Error, Result};
+use delta_kernel::{KernelError as Error, KernelResult};
 use delta_kernel_workloads::models::{ExpectedError, ReadExpected, SnapshotExpected, TimeTravel};
 use itertools::Itertools;
 use serde_json::Value;
@@ -30,7 +30,7 @@ fn assert_aligned_data_matches(
     result: Vec<RecordBatch>,
     result_schema: &SchemaRef,
     expected: RecordBatch,
-) -> Result<()> {
+) -> KernelResult<()> {
     let expected = align_batch_to_schema(expected, result_schema.clone())?;
     assert_data_matches(result, result_schema, expected)
 }
@@ -42,7 +42,7 @@ fn assert_aligned_data_matches(
 /// timestamp as timezone-free nanoseconds, while Kernel returns microseconds in UTC. This function
 /// converts that timestamp when no precision would be lost. It makes the same adjustments inside
 /// structs, lists, and maps, but rejects all other schema differences.
-fn align_batch_to_schema(batch: RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
+fn align_batch_to_schema(batch: RecordBatch, schema: SchemaRef) -> KernelResult<RecordBatch> {
     let source_schema = batch.schema();
     require_matching_field_order(source_schema.fields(), schema.fields())?;
     let columns = schema
@@ -59,7 +59,7 @@ fn align_batch_to_schema(batch: RecordBatch, schema: SchemaRef) -> Result<Record
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-fn align_array(array: &ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
+fn align_array(array: &ArrayRef, data_type: &DataType) -> KernelResult<ArrayRef> {
     if array.data_type() == data_type {
         return Ok(array.clone());
     }
@@ -147,7 +147,7 @@ fn align_array(array: &ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
     )))
 }
 
-fn require_matching_field_order(source: &Fields, target: &Fields) -> Result<()> {
+fn require_matching_field_order(source: &Fields, target: &Fields) -> KernelResult<()> {
     let source_names = source
         .iter()
         .map(|field| field.name().clone())
@@ -176,7 +176,7 @@ fn require_matching_field_order(source: &Fields, target: &Fields) -> Result<()> 
     Ok(())
 }
 
-fn missing_void_array(field: &Field, len: usize) -> Result<ArrayRef> {
+fn missing_void_array(field: &Field, len: usize) -> KernelResult<ArrayRef> {
     if field.data_type() == &DataType::Null {
         Ok(new_null_array(field.data_type(), len))
     } else {
@@ -187,7 +187,7 @@ fn missing_void_array(field: &Field, len: usize) -> Result<ArrayRef> {
     }
 }
 
-fn require_same_nullability(context: &str, source: &Field, target: &Field) -> Result<()> {
+fn require_same_nullability(context: &str, source: &Field, target: &Field) -> KernelResult<()> {
     if source.is_nullable() != target.is_nullable() {
         return Err(Error::generic(format!(
             "Expected {context} nullability does not match the result"
@@ -201,7 +201,7 @@ fn require_map_compatibility(
     target_ordered: bool,
     source_field: &Field,
     target_field: &Field,
-) -> Result<()> {
+) -> KernelResult<()> {
     if source_ordered != target_ordered {
         return Err(Error::generic(
             "Expected map ordering does not match the result",
@@ -213,8 +213,8 @@ fn require_map_compatibility(
 fn protocols_equal(
     actual: &delta_kernel::actions::Protocol,
     expected: &delta_kernel::actions::Protocol,
-) -> Result<bool, String> {
-    fn normalized(protocol: &delta_kernel::actions::Protocol) -> Result<Value, String> {
+) -> KernelResult<bool, String> {
+    fn normalized(protocol: &delta_kernel::actions::Protocol) -> KernelResult<Value, String> {
         let mut value = serde_json::to_value(protocol).map_err(|error| error.to_string())?;
         for name in ["readerFeatures", "writerFeatures"] {
             if let Some(features) = value.get_mut(name).and_then(Value::as_array_mut) {
@@ -330,7 +330,7 @@ fn expected_error_matches(expected: &ExpectedError, actual: &Error) -> bool {
     }
 }
 
-fn validate_expected_error(actual: &Error, expected: &ExpectedError) -> Result<(), String> {
+fn validate_expected_error(actual: &Error, expected: &ExpectedError) -> KernelResult<(), String> {
     if expected_error_matches(expected, actual) {
         debug!(
             "Got expected error '{}' with message: {:?}\nKernel error: {}",
@@ -346,7 +346,7 @@ fn validate_expected_error(actual: &Error, expected: &ExpectedError) -> Result<(
 }
 
 /// Read expected data from parquet files in expected_dir/expected_data/.
-fn read_expected_data(expected_dir: &Path) -> Result<RecordBatch, String> {
+fn read_expected_data(expected_dir: &Path) -> KernelResult<RecordBatch, String> {
     let expected_data_dir = expected_dir.join("expected_data");
     if !expected_data_dir.exists() {
         return Err(format!(
@@ -405,10 +405,10 @@ fn read_expected_data(expected_dir: &Path) -> Result<RecordBatch, String> {
 
 /// Validate read results against expected outcome.
 pub fn validate_read_result(
-    result: Result<ReadResult>,
+    result: KernelResult<ReadResult>,
     expected_dir: &Path,
     expected: &ReadExpected,
-) -> Result<(), String> {
+) -> KernelResult<(), String> {
     match (result, expected) {
         (Ok(read_result), ReadExpected::Success { expected: exp }) => {
             // TODO: Check file_count and files_skipped against scan metrics once available.
@@ -449,10 +449,10 @@ pub fn validate_read_result(
 
 /// Validate snapshot result against expected outcome.
 pub fn validate_snapshot(
-    result: Result<SnapshotResult>,
+    result: KernelResult<SnapshotResult>,
     time_travel: Option<&TimeTravel>,
     expected: &SnapshotExpected,
-) -> Result<(), String> {
+) -> KernelResult<(), String> {
     match (result, expected) {
         (Ok(snapshot_result), SnapshotExpected::Success { expected }) => {
             if let Some(TimeTravel::Version { version }) = time_travel {

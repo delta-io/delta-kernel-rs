@@ -18,7 +18,7 @@ use crate::table_properties::{
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
 use crate::utils::require;
-use crate::{DataType, Expression, KernelError, KernelResult, Result};
+use crate::{DataType, Expression, KernelError, KernelResult};
 
 const WRITE_STATE_FORMAT_VERSION: u32 = 1;
 
@@ -155,7 +155,7 @@ impl BoundWriteContextBuilder {
     ///   is not in the table properties.
     /// - The connector specifies a row-tracking metadata column that conflicts with another logical
     ///   field.
-    pub fn build(self) -> Result<BoundWriteContext> {
+    pub fn build(self) -> KernelResult<BoundWriteContext> {
         let is_partitioned = !self.write_state.logical_partition_columns.is_empty();
         require!(
             is_partitioned || self.partition_values.is_none(),
@@ -356,7 +356,7 @@ impl WriteState {
     /// kernel upgrades.
     ///
     /// Returns an error if any field cannot be serialized.
-    pub fn encode(&self) -> Result<Vec<u8>> {
+    pub fn encode(&self) -> KernelResult<Vec<u8>> {
         Ok(serde_json::to_vec(&WriteStateWire {
             version: WRITE_STATE_FORMAT_VERSION,
             write_state: self,
@@ -370,7 +370,7 @@ impl WriteState {
     ///
     /// Returns an error if the bytes contain an unsupported format version or do not contain a
     /// valid serialized write state.
-    pub fn decode(bytes: &[u8]) -> Result<Arc<Self>> {
+    pub fn decode(bytes: &[u8]) -> KernelResult<Arc<Self>> {
         let wire: DecodedWriteStateWire = serde_json::from_slice(bytes)?;
         require!(
             wire.version == WRITE_STATE_FORMAT_VERSION,
@@ -704,7 +704,7 @@ mod tests {
     fn physical_partition_names_differing_only_by_case_bind_separately(
         #[case] column_mapping_mode: ColumnMappingMode,
         #[case] mode_property: &str,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let physical_field = |logical_name: &str, physical_name: &str, id: i64| {
             StructField::not_null(logical_name, DataType::INTEGER).with_metadata([
                 ("delta.columnMapping.id", MetadataValue::Number(id)),
@@ -777,7 +777,7 @@ mod tests {
             ColumnMappingMode::Id
         )]
         column_mapping_mode: ColumnMappingMode,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let mut write_state = partitioned_write_state(
             column_mapping_mode,
             false, /* materialize_partition_columns */

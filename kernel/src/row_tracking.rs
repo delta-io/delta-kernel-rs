@@ -10,7 +10,7 @@ use crate::actions::{DomainMetadata, NUM_RECORDS};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,7 +53,7 @@ pub(crate) fn parse_row_tracking_high_water_mark(configuration: &str) -> KernelR
 impl TryFrom<RowTrackingDomainMetadata> for DomainMetadata {
     type Error = crate::KernelError;
 
-    fn try_from(metadata: RowTrackingDomainMetadata) -> Result<Self> {
+    fn try_from(metadata: RowTrackingDomainMetadata) -> KernelResult<Self> {
         Ok(DomainMetadata::new(
             ROW_TRACKING_DOMAIN_NAME.to_string(),
             serde_json::to_string(&metadata)?,
@@ -116,7 +116,7 @@ impl RowVisitor for RowTrackingVisitor {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         require!(
             getters.len() == 1,
             KernelError::generic(format!(
@@ -160,7 +160,7 @@ mod tests {
     }
 
     impl<'a> GetData<'a> for MockGetData {
-        fn get_long(&'a self, row_index: usize, field_name: &str) -> Result<Option<i64>> {
+        fn get_long(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<i64>> {
             if field_name == NUM_RECORDS {
                 Ok(self.num_records_values.get(row_index).copied().flatten())
             } else {
@@ -174,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn test_visit_basic_functionality() -> Result<()> {
+    fn test_visit_basic_functionality() -> KernelResult<()> {
         let mut visitor = RowTrackingVisitor::new(None);
         let num_records_mock = MockGetData::new(vec![Some(10), Some(5), Some(20)]);
         let getters = create_getters(&num_records_mock);
@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn test_visit_with_negative_high_water_mark() -> Result<()> {
+    fn test_visit_with_negative_high_water_mark() -> KernelResult<()> {
         let mut visitor = RowTrackingVisitor::new(Some(-5));
         let num_records_mock = MockGetData::new(vec![Some(3), Some(2)]);
         let getters = create_getters(&num_records_mock);
@@ -208,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn test_visit_with_zero_records() -> Result<()> {
+    fn test_visit_with_zero_records() -> KernelResult<()> {
         let mut visitor = RowTrackingVisitor::new(Some(10));
         let num_records_mock = MockGetData::new(vec![Some(0), Some(0), Some(5)]);
         let getters = create_getters(&num_records_mock);
@@ -225,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    fn test_visit_empty_batch() -> Result<()> {
+    fn test_visit_empty_batch() -> KernelResult<()> {
         let mut visitor = RowTrackingVisitor::new(Some(42));
         let num_records_mock = MockGetData::new(vec![]);
         let getters = create_getters(&num_records_mock);
@@ -240,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn test_visit_multiple_batches() -> Result<()> {
+    fn test_visit_multiple_batches() -> KernelResult<()> {
         let mut visitor = RowTrackingVisitor::new(Some(0));
 
         // First batch
@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn test_visit_wrong_getter_count() -> Result<()> {
+    fn test_visit_wrong_getter_count() -> KernelResult<()> {
         let mut visitor = RowTrackingVisitor::new(Some(0));
         let wrong_getters: Vec<&dyn GetData<'_>> = vec![]; // No getters instead of expected count
 
@@ -279,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn test_visit_missing_num_records() -> Result<()> {
+    fn test_visit_missing_num_records() -> KernelResult<()> {
         let mut visitor = RowTrackingVisitor::new(Some(0));
         let num_records_mock = MockGetData::new(vec![None]); // Missing numRecords
         let getters = create_getters(&num_records_mock);
@@ -303,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn test_serialization_roundtrip() -> Result<()> {
+    fn test_serialization_roundtrip() -> KernelResult<()> {
         let original = RowTrackingDomainMetadata::new(-42);
         let json = serde_json::to_string(&original)?;
         let deserialized: RowTrackingDomainMetadata = serde_json::from_str(&json)?;

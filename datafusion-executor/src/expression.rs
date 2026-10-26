@@ -5,7 +5,9 @@ use std::sync::Arc;
 use datafusion::arrow::array::{new_null_array, ArrayRef, RecordBatch, StructArray};
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use datafusion::common::utils::take_function_args;
-use datafusion::common::{Column as DFColumn, DataFusionError, ScalarValue as DFScalarValue};
+use datafusion::common::{
+    Column as DFColumn, DataFusionError, Result as DFResult, ScalarValue as DFScalarValue,
+};
 use datafusion::functions::core::expr_fn::{coalesce, get_field, named_struct, nullif};
 use datafusion::functions_nested::expr_fn::make_array;
 use datafusion::logical_expr::{
@@ -25,7 +27,7 @@ use delta_kernel::schema::{
     DataType as KernelDataType, PrimitiveType, SchemaRef as KernelSchemaRef, StructField,
     StructType,
 };
-use delta_kernel::{EngineData, KernelError, KernelResult, Result};
+use delta_kernel::{EngineData, KernelError, KernelResult};
 
 use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
@@ -50,7 +52,7 @@ pub fn to_df_expr(
     expr: &KernelExpression,
     input_schema: &StructType,
     output_type: Option<&KernelDataType>,
-) -> Result<DFExpr> {
+) -> KernelResult<DFExpr> {
     match expr {
         KernelExpression::Literal(scalar) => Ok(lit(to_df_scalar(scalar)?)),
         KernelExpression::Column(name) => column_to_df_expr(name, input_schema),
@@ -512,11 +514,11 @@ impl ScalarUDFImpl for KernelMapToStructUdf {
         &self.signature
     }
 
-    fn return_type(&self, _arg_types: &[ArrowDataType]) -> Result<ArrowDataType, DataFusionError> {
+    fn return_type(&self, _arg_types: &[ArrowDataType]) -> DFResult<ArrowDataType> {
         Ok(self.return_type.clone())
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let num_rows = args.number_rows;
         let [map] = take_function_args(self.name(), args.args)?;
         let batch = RecordBatch::try_from_iter([("map", map.into_array(num_rows)?)])?;
@@ -598,11 +600,11 @@ impl ScalarUDFImpl for ParseJsonUdf {
         &self.signature
     }
 
-    fn return_type(&self, _arg_types: &[ArrowDataType]) -> Result<ArrowDataType, DataFusionError> {
+    fn return_type(&self, _arg_types: &[ArrowDataType]) -> DFResult<ArrowDataType> {
         Ok(self.return_type.clone())
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let num_rows = args.number_rows;
         let [json] = take_function_args(self.name(), args.args)?;
         let json = json.into_array(num_rows)?;
@@ -884,7 +886,7 @@ mod tests {
 
     /// Asserts `res` is an error whose message contains `message`.
     #[track_caller]
-    fn assert_error_message<T>(res: Result<T>, message: &str) {
+    fn assert_error_message<T>(res: KernelResult<T>, message: &str) {
         let error = res.err().expect("expected an error").to_string();
         assert!(error.contains(message), "{error}");
     }

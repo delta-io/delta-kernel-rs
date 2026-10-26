@@ -66,8 +66,8 @@ column. The flow is:
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField};
 # use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
-# use delta_kernel::{Result, Snapshot};
-# fn example() -> Result<()> {
+# use delta_kernel::{KernelResult, Snapshot};
+# fn example() -> KernelResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 // 1. Load a snapshot of the existing table.
@@ -94,6 +94,9 @@ After this commit, the table schema has four fields. Existing rows for Alice,
 Bob, and Carol read back `NULL` for `country`. New writes can populate the
 column by including it in the `RecordBatch` they pass to
 `engine.write_parquet()`.
+
+If the table declares CHECK constraints, acknowledge that your connector enforces them before you
+commit. See [Check constraints](./check_constraints.md) for the acknowledgement.
 
 ## Validation rules
 

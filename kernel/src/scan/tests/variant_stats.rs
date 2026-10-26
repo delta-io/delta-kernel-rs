@@ -267,7 +267,7 @@ impl EvaluationHandler for VariantStatsEvaluationHandler {
         input_schema: SchemaRef,
         expression: ExpressionRef,
         output_type: DataType,
-    ) -> Result<Arc<dyn ExpressionEvaluator>> {
+    ) -> KernelResult<Arc<dyn ExpressionEvaluator>> {
         let expression = Arc::new(
             DecodeVariantStatsTransform
                 .transform_expr(&expression)
@@ -281,7 +281,7 @@ impl EvaluationHandler for VariantStatsEvaluationHandler {
         &self,
         input_schema: SchemaRef,
         predicate: PredicateRef,
-    ) -> Result<Arc<dyn PredicateEvaluator>> {
+    ) -> KernelResult<Arc<dyn PredicateEvaluator>> {
         self.inner.new_predicate_evaluator(input_schema, predicate)
     }
 
@@ -289,7 +289,7 @@ impl EvaluationHandler for VariantStatsEvaluationHandler {
         &self,
         schema: SchemaRef,
         rows: Vec<Vec<Scalar>>,
-    ) -> Result<Box<dyn EngineData>> {
+    ) -> KernelResult<Box<dyn EngineData>> {
         self.inner.create_many(schema, rows)
     }
 }
@@ -327,7 +327,7 @@ impl ArrowOpaqueExpressionOp for DecodeVariantStatsOp {
         args: &[Expr],
         batch: &RecordBatch,
         _result_type: Option<&DataType>,
-    ) -> Result<ArrayRef> {
+    ) -> KernelResult<ArrayRef> {
         let [json] = args else {
             panic!("expected one argument, got {}", args.len());
         };
@@ -352,7 +352,7 @@ impl ArrowOpaqueExpressionOp for DecodeVariantStatsOp {
         &self,
         _eval_expr: &ScalarExpressionEvaluator<'_>,
         _exprs: &[Expr],
-    ) -> Result<Scalar> {
+    ) -> KernelResult<Scalar> {
         unimplemented!()
     }
 }

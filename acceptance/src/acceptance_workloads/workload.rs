@@ -10,7 +10,7 @@ use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predic
 use delta_kernel::expressions::Predicate;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{Engine, KernelError, KernelResult, Result, Version};
+use delta_kernel::{Engine, KernelError, KernelResult, Version};
 use delta_kernel_workloads::models::{ReadSpec, SnapshotConstructionSpec, Spec, TimeTravel};
 use delta_kernel_workloads::predicate_parser::parse_predicate;
 use itertools::Itertools;
@@ -63,7 +63,7 @@ pub fn execute_read_workload(
     engine: Arc<dyn Engine>,
     table_root: &Url,
     read_spec: &ReadSpec,
-) -> Result<ReadResult> {
+) -> KernelResult<ReadResult> {
     let snapshot = build_snapshot(engine.as_ref(), table_root, read_spec.time_travel.as_ref())?;
 
     let table_schema = snapshot.schema();
@@ -130,7 +130,10 @@ fn scan_columns(columns: &[String], predicate: Option<&Predicate>) -> Vec<String
     scan_columns
 }
 
-fn project_batches(batches: Vec<RecordBatch>, columns: &[String]) -> Result<Vec<RecordBatch>> {
+fn project_batches(
+    batches: Vec<RecordBatch>,
+    columns: &[String],
+) -> KernelResult<Vec<RecordBatch>> {
     batches
         .into_iter()
         .map(|batch| {
@@ -169,7 +172,7 @@ pub fn execute_snapshot_workload(
     engine: Arc<dyn Engine>,
     table_root: &Url,
     snapshot_spec: &SnapshotConstructionSpec,
-) -> Result<SnapshotResult> {
+) -> KernelResult<SnapshotResult> {
     let snapshot = build_snapshot(
         engine.as_ref(),
         table_root,
@@ -191,7 +194,7 @@ pub fn execute_and_validate_workload(
     table_root: &Url,
     spec: &Spec,
     expected_dir: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> KernelResult<(), Box<dyn std::error::Error>> {
     match spec {
         Spec::Read(read_spec) => {
             let expected = read_spec

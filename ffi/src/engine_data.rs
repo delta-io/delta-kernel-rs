@@ -12,7 +12,7 @@ use delta_kernel::arrow::array::{
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use delta_kernel::EngineData;
 #[cfg(feature = "default-engine-base")]
-use delta_kernel::{KernelResult, Result};
+use delta_kernel::KernelResult;
 
 use super::handle::Handle;
 #[cfg(feature = "default-engine-base")]
@@ -77,13 +77,13 @@ impl ArrowFFIData {
     /// The returned `ArrowFFIData` owns the exported data. The caller is responsible for
     /// either importing it (via `from_ffi`) or dropping it (the `Drop` impls on
     /// `FFI_ArrowArray`/`FFI_ArrowSchema` call their release callbacks).
-    pub fn try_from_engine_data(data: Box<dyn EngineData>) -> Result<Self> {
+    pub fn try_from_engine_data(data: Box<dyn EngineData>) -> KernelResult<Self> {
         let record_batch = data.try_into_record_batch()?;
         Self::try_from_record_batch(record_batch)
     }
 
     /// Export a `RecordBatch` as Arrow C Data Interface structs.
-    pub fn try_from_record_batch(batch: RecordBatch) -> Result<Self> {
+    pub fn try_from_record_batch(batch: RecordBatch) -> KernelResult<Self> {
         let sa: StructArray = batch.into();
         let array_data: ArrayData = sa.into();
         let array = FFI_ArrowArray::new(&array_data);

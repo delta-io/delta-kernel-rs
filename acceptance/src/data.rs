@@ -13,7 +13,7 @@ use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{Engine, KernelError, KernelResult, Result};
+use delta_kernel::{Engine, KernelError, KernelResult};
 use futures::stream::TryStreamExt;
 use futures::StreamExt;
 use itertools::Itertools;
@@ -21,7 +21,7 @@ use itertools::Itertools;
 use crate::{TestCaseInfo, TestResult};
 
 #[allow(deprecated)]
-pub async fn read_golden(path: &Path, _version: Option<&str>) -> Result<RecordBatch> {
+pub async fn read_golden(path: &Path, _version: Option<&str>) -> KernelResult<RecordBatch> {
     let expected_root = path.join("expected").join("latest").join("table_content");
     let store = Arc::new(LocalFileSystem::new_with_prefix(&expected_root)?);
     let files: Vec<_> = store.list(None).try_collect().await?;
@@ -88,7 +88,7 @@ pub fn assert_data_matches(
     result: Vec<RecordBatch>,
     result_schema: &SchemaRef,
     expected: RecordBatch,
-) -> Result<()> {
+) -> KernelResult<()> {
     let all_data = concat_batches(result_schema, result.iter())?;
 
     // Validate schemas match
@@ -137,7 +137,7 @@ pub async fn assert_scan_metadata(
     let mut schema = None;
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
-        .map(|data| -> Result<_> {
+        .map(|data| -> KernelResult<_> {
             let record_batch = data?.try_into_record_batch()?;
             if schema.is_none() {
                 schema = Some(record_batch.schema());

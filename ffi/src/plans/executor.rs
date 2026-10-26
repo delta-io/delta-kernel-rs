@@ -4,9 +4,7 @@ use std::sync::Arc;
 
 use delta_kernel::plans::proto::schema as proto_schema;
 use delta_kernel::schema::StructType;
-use delta_kernel::{
-    KernelError, KernelResult, Operation, ParquetFooter, PlanExecutor, PlanResult, Result,
-};
+use delta_kernel::{KernelError, KernelResult, Operation, ParquetFooter, PlanExecutor, PlanResult};
 use delta_kernel_ffi_macros::handle_descriptor;
 use prost::Message as _;
 
@@ -59,7 +57,7 @@ unsafe impl Send for FfiPlanExecutor {}
 unsafe impl Sync for FfiPlanExecutor {}
 
 impl PlanExecutor for FfiPlanExecutor {
-    fn execute_op(&self, op: Operation) -> Result<PlanResult> {
+    fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
         let plan_proto_bytes = op.to_proto_bytes();
         let plan_proto_slice = kernel_bytes_slice!(plan_proto_bytes);
 
@@ -146,7 +144,7 @@ mod tests {
 
     /// Executes a dummy plan operation against a `PlanExecutor` whose callback returns the given
     /// `expected_plan_result`, returning the raw result of `execute_op`.
-    fn try_execute_dummy_op(expected_plan_result: CPlanResult) -> Result<PlanResult> {
+    fn try_execute_dummy_op(expected_plan_result: CPlanResult) -> KernelResult<PlanResult> {
         let cell: Mutex<Option<CPlanResult>> = Mutex::new(Some(expected_plan_result));
         let context = NonNull::new(&cell as *const Mutex<Option<CPlanResult>> as *mut c_void);
         let executor = unsafe { get_plan_executor(context, mock_execute_op) };

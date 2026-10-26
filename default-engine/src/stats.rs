@@ -24,7 +24,7 @@ use delta_kernel::column_trie::ColumnTrie;
 use delta_kernel::engine::arrow_utils::fix_nested_null_masks;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::schema::{DataType as KernelDataType, StructType};
-use delta_kernel::{KernelError, KernelResult, Result};
+use delta_kernel::{KernelError, KernelResult};
 
 /// Maximum prefix length for string statistics (Delta protocol requirement).
 const STRING_PREFIX_LENGTH: usize = 32;
@@ -517,7 +517,7 @@ pub fn collect_stats(
     batch: &RecordBatch,
     stats_columns: &[ColumnName],
     physical_schema: &StructType,
-) -> Result<StructArray> {
+) -> KernelResult<StructArray> {
     let null_count_only_columns = interval_column_names(physical_schema, stats_columns);
     reduce_stats(&collect_stats_raw(
         batch,
@@ -625,7 +625,7 @@ fn collect_stats_raw(
 /// # use delta_kernel::expressions::column_name;
 /// # use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
 /// # use delta_kernel_default_engine::stats::FileStatsAccumulator;
-/// # fn main() -> delta_kernel::Result<()> {
+/// # fn main() -> delta_kernel::KernelResult<()> {
 /// let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 /// let row_group = |ids: Vec<i64>| {
 ///     RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(ids))])
@@ -688,7 +688,7 @@ impl FileStatsAccumulator {
     /// Returns an error if the accumulator already failed a merge, or if this one fails: `batch`
     /// has a different Arrow schema than the first batch merged, it produces a different statistics
     /// shape, or statistics collection fails.
-    pub fn merge(&mut self, batch: &RecordBatch) -> Result<()> {
+    pub fn merge(&mut self, batch: &RecordBatch) -> KernelResult<()> {
         // Catch every error path in one place, so no failure can leave publishable state behind.
         self.try_merge(batch)
             .inspect_err(|_| self.state = AccumulatorState::Failed)
@@ -738,7 +738,7 @@ impl FileStatsAccumulator {
     ///
     /// Returns `Err` if a merge failed, or if the accumulated statistics cannot be reduced into a
     /// single row.
-    pub fn finish(self) -> Result<Option<StructArray>> {
+    pub fn finish(self) -> KernelResult<Option<StructArray>> {
         let AccumulatorState::Open(row_groups) = self.state else {
             return Err(KernelError::stats_validation(FAILED));
         };
@@ -919,7 +919,10 @@ mod tests {
 
     use super::*;
 
-    fn collect_stats(batch: &RecordBatch, stats_columns: &[ColumnName]) -> Result<StructArray> {
+    fn collect_stats(
+        batch: &RecordBatch,
+        stats_columns: &[ColumnName],
+    ) -> KernelResult<StructArray> {
         super::collect_stats_for_test(batch, stats_columns)
     }
 
@@ -2531,7 +2534,7 @@ mod tests {
 
     // A malformed stats tree is a kernel bug, not bad caller input, so the guards report
     // `InternalError`.
-    fn assert_internal_error(result: Result<impl std::fmt::Debug>, needle: &str) {
+    fn assert_internal_error(result: KernelResult<impl std::fmt::Debug>, needle: &str) {
         let err = result.expect_err("must be rejected");
         // `KernelError::internal_error` captures a backtrace, which wraps the variant in
         // `Backtraced`.
@@ -2738,7 +2741,7 @@ mod tests {
             acc: FileStatsAccumulator,
         }
         impl Writer {
-            fn write_row_group(&mut self, batch: &RecordBatch) -> Result<()> {
+            fn write_row_group(&mut self, batch: &RecordBatch) -> KernelResult<()> {
                 self.acc.merge(batch)
             }
         }

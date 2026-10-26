@@ -44,7 +44,8 @@ pub unsafe extern "C" fn new_update_table_txn_builder(
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let engine = unsafe { engine.as_ref() };
-    let engine_info: Result<String> = unsafe { TryFromStringSlice::try_from_slice(&engine_info) };
+    let engine_info: KernelResult<String> =
+        unsafe { TryFromStringSlice::try_from_slice(&engine_info) };
     engine_info
         .map(|engine_info| {
             let snapshot = unsafe { snapshot.clone_as_arc() };
@@ -73,8 +74,9 @@ pub unsafe extern "C" fn new_update_table_txn_builder_with_custom_operation(
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let engine = unsafe { engine.as_ref() };
-    let operation: Result<String> = unsafe { TryFromStringSlice::try_from_slice(&operation) };
-    let engine_info: Result<String> = unsafe { TryFromStringSlice::try_from_slice(&engine_info) };
+    let operation: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&operation) };
+    let engine_info: KernelResult<String> =
+        unsafe { TryFromStringSlice::try_from_slice(&engine_info) };
     operation
         .and_then(|operation| {
             let engine_info = engine_info?;
@@ -138,7 +140,7 @@ fn update_table_txn_builder_build_with_committer_impl(
     builder: UpdateTableTransactionBuilder,
     extern_engine: &dyn ExternEngine,
     committer: Box<dyn Committer>,
-) -> Result<Handle<ExclusiveUpdateTableTransaction>> {
+) -> KernelResult<Handle<ExclusiveUpdateTableTransaction>> {
     let engine = extern_engine.engine();
     let transaction = builder.build(engine.as_ref(), committer);
     Ok(Box::new(transaction?).into())
@@ -172,7 +174,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_correlation_id(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    let correlation_id: Result<String> =
+    let correlation_id: KernelResult<String> =
         unsafe { TryFromStringSlice::try_from_slice(&correlation_id) };
     correlation_id
         .map(|id| Box::new(builder.with_correlation_id(id)).into())
@@ -332,7 +334,7 @@ pub unsafe extern "C" fn update_table_txn_builder_add_column_at(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    let parent = unsafe { decode_column_name(parent) };
+    let parent = unsafe { parent.try_to_column_name() };
     parent
         .and_then(|parent| decode_single_field(field).map(|field| (parent, field)))
         .map(|(parent, field)| Box::new(builder.add_column_at(parent, field)).into())
@@ -353,16 +355,12 @@ pub unsafe extern "C" fn update_table_txn_builder_set_nullable(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    unsafe { decode_column_name(column) }
+    unsafe { column.try_to_column_name() }
         .map(|column| Box::new(builder.set_nullable(column)).into())
         .into_extern_result(&engine)
 }
 
-unsafe fn decode_column_name(column: &FfiColumnName) -> Result<ColumnName> {
-    Ok(ColumnName::new(unsafe { column.path.try_to_strings() }?))
-}
-
-fn decode_single_field(schema: &EngineSchema) -> Result<delta_kernel::schema::StructField> {
+fn decode_single_field(schema: &EngineSchema) -> KernelResult<delta_kernel::schema::StructField> {
     let mut fields = decode_engine_schema(schema)?.into_fields();
     match (fields.next(), fields.next()) {
         (Some(field), None) => Ok(field),
@@ -375,6 +373,32 @@ fn decode_single_field(schema: &EngineSchema) -> Result<delta_kernel::schema::St
 // ============================================================================
 // Existing-table transaction FFI functions
 // ============================================================================
+
+/// Adds a transaction identifier for application `app_id` at `version` before commit.
+///
+/// Returns the updated transaction handle, or an error if `app_id` is not valid UTF-8. The
+/// action's `lastUpdated` uses the transaction's commit timestamp. Each application id may occur
+/// only once, including ids added through the builder; duplicates are rejected at commit.
+///
+/// # Safety
+///
+/// `txn` and `engine` must be [valid][Handle#Validity] handles, and `app_id` must be a valid string
+/// slice. This call borrows `engine` and `app_id` for the call and unconditionally consumes `txn`,
+/// including on error. The caller must commit or free the returned handle.
+#[no_mangle]
+pub unsafe extern "C" fn update_table_txn_with_transaction_id(
+    txn: Handle<ExclusiveUpdateTableTransaction>,
+    app_id: KernelStringSlice,
+    version: i64,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveUpdateTableTransaction>> {
+    let txn = unsafe { *txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let app_id: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&app_id) };
+    app_id
+        .map(|app_id| Box::new(txn.with_transaction_id(app_id, version)).into())
+        .into_extern_result(&engine)
+}
 
 /// Replaces operation metrics after writing and before commit.
 ///
@@ -508,7 +532,7 @@ pub unsafe extern "C" fn update_table_txn_with_domain_metadata_removed(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransaction>> {
     let txn = unsafe { *txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    let domain: Result<String> = unsafe { TryFromStringSlice::try_from_slice(&domain) };
+    let domain: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&domain) };
     domain
         .map(|domain| Box::new(txn.with_domain_metadata_removed(domain)).into())
         .into_extern_result(&engine)
@@ -528,7 +552,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_domain_metadata_removed(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    let domain: Result<String> = unsafe { TryFromStringSlice::try_from_slice(&domain) };
+    let domain: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&domain) };
     domain
         .map(|domain| Box::new(builder.with_domain_metadata_removed(domain)).into())
         .into_extern_result(&engine)
@@ -563,7 +587,7 @@ pub unsafe extern "C" fn update_table_txn_with_row_tracking_high_water_mark(
 fn with_row_tracking_high_water_mark_impl(
     txn: Transaction,
     high_water_mark: i64,
-) -> Result<Handle<ExclusiveUpdateTableTransaction>> {
+) -> KernelResult<Handle<ExclusiveUpdateTableTransaction>> {
     Ok(Box::new(txn.with_row_tracking_high_water_mark(high_water_mark)?).into())
 }
 
@@ -589,7 +613,7 @@ pub unsafe extern "C" fn update_table_txn_with_root_manifest_file(
 fn with_root_manifest_file_impl(
     txn: Transaction,
     file: &FileMeta,
-) -> Result<Handle<ExclusiveUpdateTableTransaction>> {
+) -> KernelResult<Handle<ExclusiveUpdateTableTransaction>> {
     let path: &str = unsafe { TryFromStringSlice::try_from_slice(&file.path) }?;
     let location = Url::parse(path)?;
     let size = file
@@ -652,7 +676,7 @@ pub unsafe extern "C" fn update_table_txn_remove_files(
         let raw = unsafe { std::slice::from_raw_parts(selection_vector, selection_vector_len) };
         raw.iter().map(|&value| value != 0).collect()
     };
-    let result: Result<bool> = (|| {
+    let result: KernelResult<bool> = (|| {
         let filtered = FilteredEngineData::try_new(data, selection_vector)?;
         txn.remove_files(filtered);
         Ok(true)

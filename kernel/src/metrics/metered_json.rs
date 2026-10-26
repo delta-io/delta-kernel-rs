@@ -10,7 +10,7 @@ use crate::metrics::PrecountedMetricsIterator;
 use crate::schema::SchemaRef;
 use crate::{
     CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
-    FilteredEngineData, JsonHandler, PredicateRef, Result, ResultIterator,
+    FilteredEngineData, JsonHandler, KernelResult, KernelResultIterator, PredicateRef,
 };
 
 /// Decorator over an engine-provided `Arc<dyn JsonHandler>` that emits a
@@ -59,7 +59,7 @@ impl JsonHandler for MeteredJsonHandler {
         &self,
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
-    ) -> Result<Box<dyn EngineData>> {
+    ) -> KernelResult<Box<dyn EngineData>> {
         self.inner.parse_json(json_strings, output_schema)
     }
 
@@ -68,7 +68,7 @@ impl JsonHandler for MeteredJsonHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         let inner = self
             .inner
             .read_json_files(files, physical_schema, predicate)?;
@@ -81,7 +81,7 @@ impl JsonHandler for MeteredJsonHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         let inner = self.inner.read_json_files_with_cancellation(
             files,
             physical_schema,
@@ -94,9 +94,9 @@ impl JsonHandler for MeteredJsonHandler {
     fn write_json_file(
         &self,
         path: &url::Url,
-        data: ResultIterator<'_, FilteredEngineData>,
+        data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         overwrite: bool,
-    ) -> Result<FileSize> {
+    ) -> KernelResult<FileSize> {
         self.inner.write_json_file(path, data, overwrite)
     }
 }
@@ -134,7 +134,7 @@ mod tests {
             &self,
             _json_strings: Box<dyn EngineData>,
             _output_schema: SchemaRef,
-        ) -> Result<Box<dyn EngineData>> {
+        ) -> KernelResult<Box<dyn EngineData>> {
             Ok(empty_batch())
         }
 
@@ -143,7 +143,7 @@ mod tests {
             _files: &[FileMeta],
             _physical_schema: SchemaRef,
             _predicate: Option<PredicateRef>,
-        ) -> Result<FileDataReadResultIterator> {
+        ) -> KernelResult<FileDataReadResultIterator> {
             Ok(Box::new(std::iter::empty()))
         }
 
@@ -153,7 +153,7 @@ mod tests {
             _physical_schema: SchemaRef,
             _predicate: Option<PredicateRef>,
             _cancellation_token: Option<CancellationTokenRef>,
-        ) -> Result<FileDataReadResultIterator> {
+        ) -> KernelResult<FileDataReadResultIterator> {
             self.cancellation_read_called
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(Box::new(std::iter::empty()))
@@ -162,9 +162,9 @@ mod tests {
         fn write_json_file(
             &self,
             _path: &Url,
-            _data: ResultIterator<'_, FilteredEngineData>,
+            _data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
             _overwrite: bool,
-        ) -> Result<FileSize> {
+        ) -> KernelResult<FileSize> {
             self.write_size.ok_or_else(|| {
                 crate::KernelError::generic("StubJsonHandler does not support writes")
             })

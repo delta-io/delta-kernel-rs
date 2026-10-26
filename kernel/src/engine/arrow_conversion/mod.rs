@@ -303,7 +303,7 @@ fn kernel_field_into_arrow(
                 false, /* keys_sorted */
             ))
         }
-        DataType::Struct(_) | DataType::Primitive(_) | DataType::Variant(_) => {
+        DataType::Struct(_) | DataType::Primitive(_) | DataType::Variant(_) | DataType::File(_) => {
             datatype.try_into_arrow()
         }
     }
@@ -402,6 +402,17 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     )))
                 }
             }
+            DataType::File(s) => {
+                if *t == DataType::file_type() {
+                    Ok(ArrowDataType::Struct(
+                        try_kernel_struct_to_arrow_fields(s)?.into(),
+                    ))
+                } else {
+                    Err(ArrowError::SchemaError(format!(
+                        "Incorrect File Schema: {t}. Only the canonical file schema is supported."
+                    )))
+                }
+            }
         }
     }
 }
@@ -462,6 +473,15 @@ impl TryFromArrow<&ArrowField> for StructField {
                         ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
                         MetadataValue::Number(id),
                     ));
+                }
+                if k == ColumnMetadataKey::Collations.as_ref() {
+                    let value = serde_json::from_str(v).map_err(|error| {
+                        ArrowError::SchemaError(format!(
+                            "__COLLATIONS on field '{}' must be JSON: {error}",
+                            arrow_field.name()
+                        ))
+                    })?;
+                    return Ok((k.clone(), MetadataValue::Other(value)));
                 }
                 Ok((k.clone(), MetadataValue::from(v)))
             })
@@ -669,6 +689,7 @@ mod tests {
     use crate::engine::arrow_conversion::ArrowField;
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::schema::collation_utils::validate_collation_annotations;
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::EdgeInterpolationAlgorithm;
     use crate::schema::{
@@ -682,7 +703,7 @@ mod tests {
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::unit_test_utils::{geography_type, geometry_type};
-    use crate::Result;
+    use crate::KernelResult;
 
     #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
@@ -698,13 +719,13 @@ mod tests {
         true,
     )))]
     fn test_geo_type_arrow_conversion_unsupported(#[case] dt: DataType) {
-        let result: Result<ArrowDataType, _> = (&dt).try_into_arrow();
+        let result: KernelResult<ArrowDataType, _> = (&dt).try_into_arrow();
         let err = result.unwrap_err();
         assert!(matches!(err, ArrowError::SchemaError(_)), "got: {err:?}");
     }
 
     #[test]
-    fn test_metadata_string_conversion() -> Result<()> {
+    fn test_metadata_string_conversion() -> KernelResult<()> {
         let mut metadata = HashMap::new();
         metadata.insert("description", "hello world".to_owned());
         let struct_field = StructField::not_null("name", DataType::STRING).with_metadata(metadata);
@@ -719,10 +740,36 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    #[case::string(DataType::STRING, "field")]
+    #[case::array(ArrayType::new(DataType::STRING, true).into(), "field.element")]
+    #[case::map(MapType::new(DataType::STRING, DataType::STRING, true).into(), "field.value")]
+    fn collation_objects_round_trip_through_arrow(#[case] data_type: DataType, #[case] path: &str) {
+        let field = StructField::nullable("field", data_type).with_metadata([(
+            ColumnMetadataKey::Collations.as_ref(),
+            MetadataValue::Other(serde_json::json!({ path: "custom.name" })),
+        )]);
+        let kernel_schema = StructType::try_new([field]).unwrap();
+        let arrow: ArrowSchema = (&kernel_schema).try_into_arrow().unwrap();
+        let recovered = StructType::try_from_arrow(&arrow).unwrap();
+        assert_eq!(recovered, kernel_schema);
+        validate_collation_annotations(&recovered).unwrap();
+    }
+
+    #[test]
+    fn invalid_arrow_collation_json_is_rejected() {
+        let field = ArrowField::new("field", ArrowDataType::Utf8, true)
+            .with_metadata(HashMap::from([("__COLLATIONS".into(), "{invalid".into())]));
+        assert!(StructField::try_from_arrow(&field)
+            .unwrap_err()
+            .to_string()
+            .contains("__COLLATIONS"));
+    }
+
     // Delta tables can have void columns. The kernel should parse them and convert
     // to Arrow's Null type (and back).
     #[test]
-    fn test_void_type_roundtrip() -> Result<()> {
+    fn test_void_type_roundtrip() -> KernelResult<()> {
         let json = r#"
         {
             "name": "void_col",
@@ -751,7 +798,7 @@ mod tests {
     fn test_interval_type_arrow_conversion(
         #[case] kernel_type: DataType,
         #[case] expected: ArrowDataType,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         assert_eq!(ArrowDataType::try_from_kernel(&kernel_type)?, expected);
         Ok(())
     }
@@ -759,7 +806,7 @@ mod tests {
     // Millisecond-precision timestamps (e.g. from externally-written checkpoint stats)
     // must convert like microsecond/nanosecond: UTC tz -> TIMESTAMP, no tz -> TIMESTAMP_NTZ.
     #[test]
-    fn test_millisecond_timestamp_conversion() -> Result<()> {
+    fn test_millisecond_timestamp_conversion() -> KernelResult<()> {
         let utc = DataType::try_from_arrow(&ArrowDataType::Timestamp(
             TimeUnit::Millisecond,
             Some("UTC".into()),
@@ -776,7 +823,7 @@ mod tests {
     // We tolerate it on reads (be permissive), and the Arrow conversion still
     // produces ArrowDataType::Null. The field retains nullable=false as-is — no coercion.
     #[test]
-    fn test_void_type_not_nullable() -> Result<()> {
+    fn test_void_type_not_nullable() -> KernelResult<()> {
         let json = r#"
         {
             "name": "void_col",
@@ -802,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn test_void_field_in_struct() -> Result<()> {
+    fn test_void_field_in_struct() -> KernelResult<()> {
         // A struct schema with a void column should convert to Arrow with a Null field
         let schema = schema! {
             nullable "id": INTEGER,
@@ -826,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn test_variant_shredded_type_fail() -> Result<()> {
+    fn test_variant_shredded_type_fail() -> KernelResult<()> {
         let unshredded_variant = DataType::unshredded_variant();
         let unshredded_variant_arrow = ArrowDataType::try_from_kernel(&unshredded_variant)?;
         assert!(unshredded_variant_arrow == unshredded_variant_arrow_type());
@@ -867,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_into_arrow_threads_nested_ids_onto_arrow_schema() -> Result<()> {
+    fn test_try_into_arrow_threads_nested_ids_onto_arrow_schema() -> KernelResult<()> {
         let meta_key = ColumnMetadataKey::ColumnMappingNestedIds.as_ref();
         let fixture = complex_nested_with_field_ids(meta_key);
         let arrow_schema: ArrowSchema = (&fixture.kernel_schema).try_into_arrow()?;
@@ -897,7 +944,7 @@ mod tests {
     fn test_try_into_arrow_sets_field_ids_for_matched_nested_ids_only(
         #[case] schema: StructType,
         #[case] expected_field_ids: &[(&str, &str)],
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let arrow_schema: ArrowSchema = (&schema).try_into_arrow()?;
         let field_ids: HashMap<String, String> =
             collect_arrow_field_metadata(&arrow_schema, PARQUET_FIELD_ID_META_KEY)
@@ -940,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn test_recursive_field_id_transformation() -> Result<()> {
+    fn test_recursive_field_id_transformation() -> KernelResult<()> {
         // Create a complex nested structure with field IDs at multiple levels:
         // top_struct {
         //   simple_field: int (field_id=1)
@@ -1146,7 +1193,7 @@ mod tests {
     #[case::fixed_size_list(ArrowDataType::FixedSizeList(arc_elem_with_id(42), 3))]
     fn test_try_from_arrow_aggregates_nested_id_for_all_list_kinds(
         #[case] dt: ArrowDataType,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let arrow_field = ArrowField::new("arr", dt, true);
         let kernel = StructField::try_from_arrow(&arrow_field)?;
         assert_eq!(
@@ -1163,7 +1210,7 @@ mod tests {
     /// `Dictionary` is a transparent wrapper on the Arrow side (kernel collapses it to its value
     /// type), so a nested-ids walker must still descend through it.
     #[test]
-    fn test_try_from_arrow_aggregates_nested_id_through_dictionary() -> Result<()> {
+    fn test_try_from_arrow_aggregates_nested_id_through_dictionary() -> KernelResult<()> {
         let arrow_dict = ArrowDataType::Dictionary(
             Box::new(ArrowDataType::Int32),
             Box::new(ArrowDataType::List(arc_elem_with_id(7))),
@@ -1177,6 +1224,28 @@ mod tests {
             Some(&MetadataValue::Other(serde_json::json!({"arr.element": 7}))),
         );
         Ok(())
+    }
+
+    /// Only the canonical `file` schema converts to Arrow; a struct that merely resembles it, or a
+    /// file with a different field set, is rejected rather than silently converted.
+    #[test]
+    fn test_non_canonical_file_schema_is_rejected() {
+        let non_canonical = DataType::File(Box::new(crate::schema::StructType::new_unchecked([
+            crate::schema::StructField::nullable("uri", DataType::STRING),
+        ])));
+        let err = ArrowDataType::try_from_kernel(&non_canonical).unwrap_err();
+        assert!(
+            err.to_string().contains("Only the canonical file schema"),
+            "unexpected error: {err}"
+        );
+
+        // The canonical file converts to a struct of its six fields.
+        let ArrowDataType::Struct(fields) =
+            ArrowDataType::try_from_kernel(&DataType::file_type()).unwrap()
+        else {
+            panic!("expected a struct");
+        };
+        assert_eq!(fields.len(), 6);
     }
 
     fn arc_elem_with_id(id: i32) -> Arc<ArrowField> {

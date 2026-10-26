@@ -194,10 +194,7 @@ pub use delta_kernel_derive;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
-pub use error::{
-    Error, KernelError, KernelResult, KernelResultIterator, KernelResultIteratorStatic, Result,
-    ResultIterator, ResultIteratorStatic,
-};
+pub use error::{Error, KernelError, KernelResult, KernelResultIterator, Result};
 use expressions::Scalar;
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
@@ -212,6 +209,13 @@ pub use snapshot::{Snapshot, SnapshotRef};
     feature = "declarative-plans"
 ))]
 pub mod engine;
+
+#[cfg(not(any(
+    feature = "default-engine-base",
+    feature = "arrow-conversion",
+    feature = "declarative-plans"
+)))]
+pub(crate) mod engine;
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
@@ -233,7 +237,7 @@ pub type FileSlice = (Url, Option<Range<FileIndex>>);
 pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 
 /// An iterator of data read from specified files
-pub type FileDataReadResultIterator = ResultIteratorStatic<Box<dyn EngineData>>;
+pub type FileDataReadResultIterator = Box<dyn KernelResultIterator<Box<dyn EngineData>>>;
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,7 +265,7 @@ impl PartialOrd for FileMeta {
 impl TryFrom<DirEntry> for FileMeta {
     type Error = KernelError;
 
-    fn try_from(ent: DirEntry) -> Result<FileMeta> {
+    fn try_from(ent: DirEntry) -> KernelResult<FileMeta> {
         let metadata = ent.metadata()?;
         let last_modified = metadata
             .modified()?
@@ -452,7 +456,7 @@ pub trait ExpressionEvaluator: AsAny {
     /// Produces one value for each row of the input.
     /// The data type of the output is same as the type output of the expression this evaluator is
     /// using.
-    fn evaluate(&self, batch: &dyn EngineData) -> Result<Box<dyn EngineData>>;
+    fn evaluate(&self, batch: &dyn EngineData) -> KernelResult<Box<dyn EngineData>>;
 }
 
 /// Trait for implementing a Predicate evaluator.
@@ -464,7 +468,7 @@ pub trait PredicateEvaluator: AsAny {
     /// Evaluate the predicate on a given EngineData.
     ///
     /// Produces one boolean value for each row of the input.
-    fn evaluate(&self, batch: &dyn EngineData) -> Result<Box<dyn EngineData>>;
+    fn evaluate(&self, batch: &dyn EngineData) -> KernelResult<Box<dyn EngineData>>;
 }
 
 /// Provides expression evaluation capability to Delta Kernel.
@@ -494,7 +498,7 @@ pub trait EvaluationHandler: AsAny {
         input_schema: SchemaRef,
         expression: ExpressionRef,
         output_type: DataType,
-    ) -> Result<Arc<dyn ExpressionEvaluator>>;
+    ) -> KernelResult<Arc<dyn ExpressionEvaluator>>;
 
     /// Create a [`PredicateEvaluator`] that can evaluate the given [`Predicate`] on columnar
     /// batches with the given [`Schema`] to produce a column of boolean results.
@@ -511,7 +515,7 @@ pub trait EvaluationHandler: AsAny {
         &self,
         input_schema: SchemaRef,
         predicate: PredicateRef,
-    ) -> Result<Arc<dyn PredicateEvaluator>>;
+    ) -> KernelResult<Arc<dyn PredicateEvaluator>>;
 
     /// Create a multi-row [`EngineData`] by applying the given schema to multiple rows of values.
     ///
@@ -528,8 +532,11 @@ pub trait EvaluationHandler: AsAny {
     ///
     /// For a schema with fields `[add: Struct, remove: Struct]`, each row should contain exactly 2
     /// scalars: one for the `add` field and one for the `remove` field.
-    fn create_many(&self, schema: SchemaRef, rows: Vec<Vec<Scalar>>)
-        -> Result<Box<dyn EngineData>>;
+    fn create_many(
+        &self,
+        schema: SchemaRef,
+        rows: Vec<Vec<Scalar>>,
+    ) -> KernelResult<Box<dyn EngineData>>;
 }
 
 /// Creates one row containing a single scalar value.
@@ -566,7 +573,7 @@ pub trait StorageHandler: AsAny {
     ///   contains all files at or below that directory.
     /// - Otherwise, the parent is the directory containing `path`, and only files (at any depth
     ///   under that parent) whose full path sorts strictly greater than `path` are returned.
-    fn list_from(&self, path: &Url) -> Result<ResultIteratorStatic<FileMeta>>;
+    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
 
     /// Cancellation-aware variant of [`list_from`].
     ///
@@ -580,14 +587,17 @@ pub trait StorageHandler: AsAny {
         &self,
         path: &Url,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> Result<ResultIteratorStatic<FileMeta>> {
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         check_cancelled(cancellation_token.as_ref())?;
         let iter = self.list_from(path)?;
         Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
     }
 
     /// Read data specified by the start and end offset from the file.
-    fn read_files(&self, files: Vec<FileSlice>) -> Result<ResultIteratorStatic<Bytes>>;
+    fn read_files(
+        &self,
+        files: Vec<FileSlice>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>>;
 
     /// Cancellation-aware variant of [`read_files`].
     ///
@@ -601,7 +611,7 @@ pub trait StorageHandler: AsAny {
         &self,
         files: Vec<FileSlice>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> Result<ResultIteratorStatic<Bytes>> {
+    ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
         check_cancelled(cancellation_token.as_ref())?;
         let iter = self.read_files(files)?;
         Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
@@ -609,24 +619,24 @@ pub trait StorageHandler: AsAny {
 
     /// Copy a file atomically from source to destination. If the destination file already exists,
     /// it must return Err(KernelError::FileAlreadyExists).
-    fn copy_atomic(&self, src: &Url, dest: &Url) -> Result<()>;
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> KernelResult<()>;
 
     /// Write data to the specified path.
     ///
     /// If `overwrite` is false and the file already exists, this must return
     /// `Err(KernelError::FileAlreadyExists)`.
-    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> Result<()>;
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> KernelResult<()>;
 
     /// Perform a HEAD request for the given file at a Url, returning the file metadata.
     ///
     /// If the file does not exist, this must return an `Err` with [`KernelError::FileNotFound`].
-    fn head(&self, path: &Url) -> Result<FileMeta>;
+    fn head(&self, path: &Url) -> KernelResult<FileMeta>;
 
     /// Delete the file at the given path.
     ///
     /// This operation is idempotent: deleting a path that does not exist should return `Ok(())`.
     /// For any other error, this must propagate the corresponding error.
-    fn delete(&self, path: &Url) -> Result<()>;
+    fn delete(&self, path: &Url) -> KernelResult<()>;
 }
 
 /// Provides JSON handling functionality to Delta Kernel.
@@ -642,7 +652,7 @@ pub trait JsonHandler: AsAny {
         &self,
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
-    ) -> Result<Box<dyn EngineData>>;
+    ) -> KernelResult<Box<dyn EngineData>>;
 
     /// Read and parse the JSON format file at given locations and return the data as EngineData
     /// with the columns requested by physical schema. Note: The [`FileDataReadResultIterator`]
@@ -676,7 +686,7 @@ pub trait JsonHandler: AsAny {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> Result<FileDataReadResultIterator>;
+    ) -> KernelResult<FileDataReadResultIterator>;
 
     /// Cancellation-aware variant of [`read_json_files`].
     ///
@@ -692,7 +702,7 @@ pub trait JsonHandler: AsAny {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         check_cancelled(cancellation_token.as_ref())?;
         let iter = self.read_json_files(files, physical_schema, predicate)?;
         Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
@@ -734,9 +744,9 @@ pub trait JsonHandler: AsAny {
     fn write_json_file(
         &self,
         path: &Url,
-        data: ResultIterator<'_, FilteredEngineData>,
+        data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         overwrite: bool,
-    ) -> Result<FileSize>;
+    ) -> KernelResult<FileSize>;
 }
 
 /// Reserved field IDs for metadata columns in Delta tables.
@@ -899,8 +909,8 @@ pub trait ParquetHandler: AsAny {
     ///   satisfy the predicate.
     ///
     /// # Returns
-    /// A [`Result`] containing a [`FileDataReadResultIterator`].
-    /// Each element of the iterator is a [`Result`] of [`EngineData`]. The [`EngineData`]
+    /// A [`KernelResult`] containing a [`FileDataReadResultIterator`].
+    /// Each element of the iterator is a [`KernelResult`] of [`EngineData`]. The [`EngineData`]
     /// contains rows from `files` after any predicate push-down and must match the provided
     /// `physical_schema`.
     ///
@@ -926,7 +936,7 @@ pub trait ParquetHandler: AsAny {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> Result<FileDataReadResultIterator>;
+    ) -> KernelResult<FileDataReadResultIterator>;
 
     /// Cancellation-aware variant of [`read_parquet_files`].
     ///
@@ -942,7 +952,7 @@ pub trait ParquetHandler: AsAny {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         check_cancelled(cancellation_token.as_ref())?;
         let iter = self.read_parquet_files(files, physical_schema, predicate)?;
         Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
@@ -988,8 +998,8 @@ pub trait ParquetHandler: AsAny {
     fn write_parquet_file(
         &self,
         location: url::Url,
-        data: ResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> Result<FileSize>;
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<FileSize>;
 
     /// Read the footer metadata from a Parquet file without reading the data.
     ///
@@ -1005,8 +1015,8 @@ pub trait ParquetHandler: AsAny {
     ///
     /// # Returns
     ///
-    /// A [`Result`] containing a [`ParquetFooter`] with the Parquet file's metadata, including
-    /// the schema converted to Delta Kernel's format.
+    /// A [`KernelResult`] containing a [`ParquetFooter`] with the Parquet file's metadata,
+    /// including the schema converted to Delta Kernel's format.
     ///
     /// # Field IDs
     ///
@@ -1025,7 +1035,7 @@ pub trait ParquetHandler: AsAny {
     /// [`StructField`]: crate::schema::StructField
     /// [`StructField::get_config_value`]: crate::schema::StructField::get_config_value
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
-    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter>;
+    fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter>;
 
     /// Cancellation-aware variant of [`read_parquet_footer`].
     ///
@@ -1039,7 +1049,7 @@ pub trait ParquetHandler: AsAny {
         &self,
         file: &FileMeta,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> Result<ParquetFooter> {
+    ) -> KernelResult<ParquetFooter> {
         check_cancelled(cancellation_token.as_ref())?;
         self.read_parquet_footer(file)
     }
@@ -1077,7 +1087,7 @@ pub trait Engine: AsAny {
     ///
     /// Returns [`KernelError::Unsupported`] when [`plan_executor`](Self::plan_executor) is `None`.
     #[cfg(feature = "declarative-plans")]
-    fn require_plan_executor(&self) -> Result<Arc<dyn PlanExecutor>> {
+    fn require_plan_executor(&self) -> KernelResult<Arc<dyn PlanExecutor>> {
         self.plan_executor()
             .ok_or_else(|| KernelError::unsupported("this engine does not provide a PlanExecutor"))
     }

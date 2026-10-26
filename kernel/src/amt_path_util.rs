@@ -6,8 +6,8 @@
 use url::{ParseError, Url};
 
 use crate::path_encoding::uri_encode_path;
-use crate::utils::require;
-use crate::{KernelError, KernelResult};
+use crate::utils::{require, to_file_size};
+use crate::{FileMeta, KernelError, KernelResult};
 
 /// Resolve an AMT `path` (as stored in the log or a manifest) into an absolute [`Url`].
 ///
@@ -35,6 +35,26 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult
         }
         None => encode_and_join(path, table_root),
     }
+}
+
+/// Builds the [`FileMeta`] of an AMT manifest file referenced by `path` (absolute, or relative to
+/// `table_root`) with `size_in_bytes`. AMT references carry no modification time, so
+/// `last_modified` is `i64::MAX`.
+///
+/// # Errors
+/// Returns an error if `path` cannot be resolved (see [`resolve_amt_location`]), or if
+/// `size_in_bytes` is negative (the error names `context` and `path`).
+pub(crate) fn amt_manifest_filemeta(
+    path: &str,
+    size_in_bytes: i64,
+    table_root: &Url,
+    context: &str,
+) -> KernelResult<FileMeta> {
+    Ok(FileMeta {
+        location: resolve_amt_location(path, table_root)?,
+        last_modified: i64::MAX,
+        size: to_file_size(size_in_bytes, format_args!("{context} '{path}'"))?,
+    })
 }
 
 /// Resolve a strictly table-relative `path` into an absolute [`Url`] under `table_root`.

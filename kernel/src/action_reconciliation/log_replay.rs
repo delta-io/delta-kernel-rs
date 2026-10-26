@@ -40,7 +40,7 @@ use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector};
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, KernelResultIteratorStatic, Result};
+use crate::{KernelError, KernelResult, KernelResultIterator};
 
 /// Filters log segment actions for action reconciliation.
 pub(crate) struct ActionReconciliationProcessor {
@@ -129,13 +129,13 @@ impl ActionReconciliationIteratorState {
 /// This iterator yields a stream of [`FilteredEngineData`] items while, tracking action
 /// counts. Used by both checkpoint and log compaction workflows.
 pub struct ActionReconciliationIterator {
-    inner: KernelResultIteratorStatic<ActionReconciliationBatch>,
+    inner: Box<dyn KernelResultIterator<ActionReconciliationBatch>>,
     state: Arc<ActionReconciliationIteratorState>,
 }
 
 impl ActionReconciliationIterator {
     /// Create a new iterator with counters initialized to 0
-    pub(crate) fn new(inner: KernelResultIteratorStatic<ActionReconciliationBatch>) -> Self {
+    pub(crate) fn new(inner: Box<dyn KernelResultIterator<ActionReconciliationBatch>>) -> Self {
         Self {
             inner,
             state: Arc::new(ActionReconciliationIteratorState::default()),
@@ -177,7 +177,7 @@ impl std::fmt::Debug for ActionReconciliationIterator {
 }
 
 impl Iterator for ActionReconciliationIterator {
-    type Item = Result<FilteredEngineData>;
+    type Item = KernelResult<FilteredEngineData>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let batch = self.inner.next();
@@ -197,7 +197,7 @@ impl ActionReconciliationProcessor {
     pub(crate) fn process_actions_batch(
         &mut self,
         actions_batch: ActionsBatch,
-    ) -> Result<ActionReconciliationBatch> {
+    ) -> KernelResult<ActionReconciliationBatch> {
         let ActionsBatch {
             actions,
             is_log_batch,
@@ -672,7 +672,7 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         require!(
             getters.len() == 16,
             KernelError::InternalError(format!(
@@ -700,7 +700,7 @@ mod tests {
     use crate::KernelError;
 
     /// Helper function to create test batches from JSON strings
-    fn create_batch(json_strings: Vec<&str>) -> Result<ActionsBatch> {
+    fn create_batch(json_strings: Vec<&str>) -> KernelResult<ActionsBatch> {
         let actions = parse_json_batch(StringArray::from(json_strings));
         Ok(ActionsBatch::new(actions, true))
     }
@@ -709,7 +709,7 @@ mod tests {
     /// input batches and returns the results.
     fn run_action_reconciliation_test(
         input_batches: Vec<ActionsBatch>,
-    ) -> Result<(Vec<FilteredEngineData>, i64, i64)> {
+    ) -> KernelResult<(Vec<FilteredEngineData>, i64, i64)> {
         let mut processor = ActionReconciliationProcessor::new(0, None, None);
         let processed_batches: Vec<_> = input_batches
             .into_iter()
@@ -726,7 +726,7 @@ mod tests {
         Ok((filtered_data, total_count, add_count))
     }
     #[test]
-    fn test_action_reconciliation_visitor() -> Result<()> {
+    fn test_action_reconciliation_visitor() -> KernelResult<()> {
         let data = action_batch();
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
@@ -776,7 +776,8 @@ mod tests {
     /// - Remove actions with deletionTimestamp > minimumFileRetentionTimestamp (should be included)
     /// - Remove actions with missing deletionTimestamp (defaults to 0, should be excluded)
     #[test]
-    fn test_action_reconciliation_visitor_boundary_cases_for_tombstone_expiration() -> Result<()> {
+    fn test_action_reconciliation_visitor_boundary_cases_for_tombstone_expiration(
+    ) -> KernelResult<()> {
         let json_strings: StringArray = vec![
             r#"{"remove":{"path":"exactly_at_threshold","deletionTimestamp":100,"dataChange":true,"partitionValues":{}}}"#,
             r#"{"remove":{"path":"one_below_threshold","deletionTimestamp":99,"dataChange":true,"partitionValues":{}}}"#,
@@ -814,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn test_action_reconciliation_visitor_file_actions_in_batch() -> Result<()> {
+    fn test_action_reconciliation_visitor_file_actions_in_batch() -> KernelResult<()> {
         let json_strings: StringArray = vec![
             r#"{"add":{"path":"file1","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#,
         ]
@@ -851,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn test_action_reconciliation_visitor_file_actions_with_deletion_vectors() -> Result<()> {
+    fn test_action_reconciliation_visitor_file_actions_with_deletion_vectors() -> KernelResult<()> {
         let json_strings: StringArray = vec![
             // Add action for file1 with deletion vector
             r#"{"add":{"path":"file1","partitionValues":{},"size":635,"modificationTime":100,"dataChange":true,"deletionVector":{"storageType":"ONE","pathOrInlineDv":"dv1","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
@@ -890,7 +891,7 @@ mod tests {
     }
 
     #[test]
-    fn test_action_reconciliation_visitor_already_seen_non_file_actions() -> Result<()> {
+    fn test_action_reconciliation_visitor_already_seen_non_file_actions() -> KernelResult<()> {
         let json_strings: StringArray = vec![
             r#"{"txn":{"appId":"app1","version":1,"lastUpdated":123456789}}"#,
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
@@ -928,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn test_action_reconciliation_visitor_duplicate_non_file_actions() -> Result<()> {
+    fn test_action_reconciliation_visitor_duplicate_non_file_actions() -> KernelResult<()> {
         let json_strings: StringArray = vec![
             r#"{"txn":{"appId":"app1","version":1,"lastUpdated":123456789}}"#,
             r#"{"txn":{"appId":"app1","version":1,"lastUpdated":123456789}}"#, // Duplicate txn
@@ -972,7 +973,7 @@ mod tests {
     /// This test ensures that the processor correctly deduplicates and filters
     /// non-file actions (metadata, protocol, txn) across multiple batches.
     #[test]
-    fn test_action_reconciliation_actions_iter_non_file_actions() -> Result<()> {
+    fn test_action_reconciliation_actions_iter_non_file_actions() -> KernelResult<()> {
         // Batch 1: protocol, metadata, and txn actions
         let batch1 = vec![
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
@@ -1016,7 +1017,7 @@ mod tests {
     /// This test ensures that the processor correctly deduplicates and filters
     /// file actions (add, remove) across multiple batches.
     #[test]
-    fn test_action_reconciliation_actions_iter_file_actions() -> Result<()> {
+    fn test_action_reconciliation_actions_iter_file_actions() -> KernelResult<()> {
         // Batch 1: add action (file1) - new, should be included
         let batch1 = vec![
             r#"{"add":{"path":"file1","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#,
@@ -1056,7 +1057,8 @@ mod tests {
     /// This test ensures that the processor correctly deduplicates and filters
     /// file actions (add, remove) with deletion vectors across multiple batches.
     #[test]
-    fn test_action_reconciliation_actions_iter_file_actions_with_deletion_vectors() -> Result<()> {
+    fn test_action_reconciliation_actions_iter_file_actions_with_deletion_vectors(
+    ) -> KernelResult<()> {
         // Batch 1: add actions with deletion vectors
         let batch1 = vec![
             // (file1, DV_ONE) New, should be included
@@ -1089,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn test_action_reconciliation_visitor_txn_retention() -> Result<()> {
+    fn test_action_reconciliation_visitor_txn_retention() -> KernelResult<()> {
         let json_strings: StringArray = vec![
             // Transaction with old timestamp (should be filtered)
             r#"{"txn":{"appId":"app1","version":1,"lastUpdated":100}}"#,
@@ -1136,7 +1138,7 @@ mod tests {
     // neither reaches the checkpoint. Guards against resurrecting the older txn (a stale winner).
     #[test]
     fn test_action_reconciliation_expired_newest_txn_suppresses_older_txn_for_same_app(
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let json_strings: StringArray = vec![
             // Newest for "app" (visited first), expired.
             r#"{"txn":{"appId":"app","version":2,"lastUpdated":500}}"#,
@@ -1172,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn test_action_reconciliation_actions_iter_with_txn_retention() -> Result<()> {
+    fn test_action_reconciliation_actions_iter_with_txn_retention() -> KernelResult<()> {
         // Test that transaction retention works across multiple batches
         let batch1 = vec![
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
@@ -1242,7 +1244,7 @@ mod tests {
         }
 
         impl<'a> GetData<'a> for MockErrorGetData {
-            fn get_str(&'a self, _: usize, field_name: &str) -> Result<Option<&'a str>> {
+            fn get_str(&'a self, _: usize, field_name: &str) -> KernelResult<Option<&'a str>> {
                 if field_name == self.error_on_field && self.error_type == "str" {
                     Err(KernelError::UnexpectedColumnType(format!(
                         "{field_name} is not of type str"
@@ -1253,7 +1255,7 @@ mod tests {
                 }
             }
 
-            fn get_int(&'a self, _: usize, field_name: &str) -> Result<Option<i32>> {
+            fn get_int(&'a self, _: usize, field_name: &str) -> KernelResult<Option<i32>> {
                 if field_name == self.error_on_field && self.error_type == "int" {
                     Err(KernelError::UnexpectedColumnType(format!(
                         "{field_name} is not of type i32"
@@ -1271,7 +1273,7 @@ mod tests {
         }
 
         impl<'a> GetData<'a> for FlexibleMock {
-            fn get_str(&'a self, _: usize, field_name: &str) -> Result<Option<&'a str>> {
+            fn get_str(&'a self, _: usize, field_name: &str) -> KernelResult<Option<&'a str>> {
                 if field_name == "txn.appId" {
                     Ok(Some("test_app"))
                 } else if field_name == "remove.path" {
@@ -1281,7 +1283,7 @@ mod tests {
                 }
             }
 
-            fn get_long(&'a self, _: usize, field_name: &str) -> Result<Option<i64>> {
+            fn get_long(&'a self, _: usize, field_name: &str) -> KernelResult<Option<i64>> {
                 if field_name.contains(self.error_field) {
                     Err(KernelError::UnexpectedColumnType(format!(
                         "{field_name} is not of type i64"
@@ -1442,7 +1444,7 @@ mod tests {
     }
 
     #[test]
-    fn test_action_reconciliation_processor_error_propagation() -> Result<()> {
+    fn test_action_reconciliation_processor_error_propagation() -> KernelResult<()> {
         // Test that errors from the visitor are properly propagated by the processor
         let json_strings: StringArray = vec![
             // This will create valid data that parses correctly

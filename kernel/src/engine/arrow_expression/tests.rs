@@ -707,7 +707,7 @@ impl ArrowOpaqueExpressionOp for OpaqueLessThanOp {
         &self,
         _eval_expr: &ScalarExpressionEvaluator<'_>,
         _exprs: &[Expression],
-    ) -> Result<Scalar> {
+    ) -> KernelResult<Scalar> {
         unimplemented!() // OpaqueExpressionOp is already tested
     }
 
@@ -716,7 +716,7 @@ impl ArrowOpaqueExpressionOp for OpaqueLessThanOp {
         args: &[Expression],
         batch: &RecordBatch,
         result_type: Option<&KernelDataType>,
-    ) -> Result<ArrayRef> {
+    ) -> KernelResult<ArrayRef> {
         assert!(matches!(result_type, None | Some(&KernelDataType::BOOLEAN)));
         let result = self.eval_pred(args, batch, false)?;
         Ok(Arc::new(result))
@@ -733,7 +733,7 @@ impl ArrowOpaquePredicateOp for OpaqueLessThanOp {
         args: &[Expression],
         batch: &RecordBatch,
         inverted: bool,
-    ) -> Result<BooleanArray> {
+    ) -> KernelResult<BooleanArray> {
         self.eval_pred(args, batch, inverted)
     }
 
@@ -743,7 +743,7 @@ impl ArrowOpaquePredicateOp for OpaqueLessThanOp {
         _eval_pred: &DirectPredicateEvaluator<'_>,
         _exprs: &[Expression],
         _inverted: bool,
-    ) -> Result<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         unimplemented!() // OpaquePredicateOp is already tested
     }
 
@@ -851,7 +851,7 @@ fn test_create_many_rejects_null_in_non_nullable_field() {
 }
 
 #[test]
-fn test_scalar_map() -> Result<()> {
+fn test_scalar_map() -> KernelResult<()> {
     // making an 2-row array each with a map with 2 pairs.
     // result: { key1: 1, key2: null }, { key1: 1, key2: null }
     let map_type = MapType::new(KernelDataType::STRING, KernelDataType::INTEGER, true);
@@ -888,7 +888,7 @@ fn test_scalar_map() -> Result<()> {
 }
 
 #[test]
-fn test_null_scalar_map() -> Result<()> {
+fn test_null_scalar_map() -> KernelResult<()> {
     let map_type = MapType::new(KernelDataType::STRING, KernelDataType::STRING, false);
     let null_scalar_map = Scalar::null(map_type);
     let arrow_array = null_scalar_map.to_array(1)?;

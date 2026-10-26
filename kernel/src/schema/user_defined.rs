@@ -6,9 +6,10 @@ use serde::de::Error as _;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use super::file_utils::UsesFile;
 use super::{DataType, StructField};
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult};
 
 /// An engine-defined annotation over a physical Delta type.
 ///
@@ -54,12 +55,12 @@ impl UserDefinedType {
     ///
     /// # Errors
     ///
-    /// Returns an error if `sql_type` contains another UDT or a metadata column, or if `annotation`
-    /// contains the reserved key `type` or `sqlType`.
+    /// Returns an error if `sql_type` contains another UDT, a metadata column, or a `file`, or if
+    /// `annotation` contains the reserved key `type` or `sqlType`.
     pub fn try_new(
         sql_type: impl Into<DataType>,
         annotation: HashMap<String, Option<String>>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let sql_type = sql_type.into();
         if contains_udt(&sql_type) {
             return Err(KernelError::schema(
@@ -69,6 +70,13 @@ impl UserDefinedType {
         if contains_metadata_column(&sql_type) {
             return Err(KernelError::schema(
                 "A UDT sqlType must not contain a metadata column",
+            ));
+        }
+        // A `file` must be visible in the schema, so the table features and handling it requires
+        // apply; a UDT is visited as a leaf.
+        if UsesFile.transform(&sql_type).is_err() {
+            return Err(KernelError::schema(
+                "A UDT sqlType must not contain a `file`",
             ));
         }
         if annotation.contains_key("type") || annotation.contains_key("sqlType") {
@@ -96,7 +104,7 @@ impl UserDefinedType {
 }
 
 impl Serialize for UserDefinedType {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> KernelResult<S::Ok, S::Error> {
         // The required `type` and `sqlType` members are separate from the engine annotation.
         const REQUIRED_UDT_FIELD_COUNT: usize = 2;
 
@@ -112,7 +120,7 @@ impl Serialize for UserDefinedType {
 }
 
 impl<'de> Deserialize<'de> for UserDefinedType {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> KernelResult<Self, D::Error> {
         #[derive(Deserialize)]
         struct Repr {
             #[serde(rename = "type")]
@@ -133,9 +141,9 @@ impl<'de> Deserialize<'de> for UserDefinedType {
 struct ContainsUdt;
 
 impl<'a> SchemaTransform<'a> for ContainsUdt {
-    transform_output_type!(|'a, T| Result<(), ()>);
+    transform_output_type!(|'a, T| KernelResult<(), ()>);
 
-    fn transform_user_defined(&mut self, _: &'a UserDefinedType) -> Result<(), ()> {
+    fn transform_user_defined(&mut self, _: &'a UserDefinedType) -> KernelResult<(), ()> {
         Err(())
     }
 }
@@ -147,9 +155,9 @@ fn contains_udt(data_type: &DataType) -> bool {
 struct ContainsMetadataColumn;
 
 impl<'a> SchemaTransform<'a> for ContainsMetadataColumn {
-    transform_output_type!(|'a, T| Result<(), ()>);
+    transform_output_type!(|'a, T| KernelResult<(), ()>);
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), ()> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<(), ()> {
         if field.is_metadata_column() {
             Err(())
         } else {
@@ -470,6 +478,18 @@ mod tests {
         );
     }
 
+    /// A `file` inside a UDT would hide it from the `fileType` feature requirement.
+    #[rstest]
+    #[case::direct(DataType::file_type())]
+    #[case::nested(schema! { nullable "f": (DataType::file_type()) }.into())]
+    #[case::array_element(ArrayType::new(DataType::file_type(), true).into())]
+    fn construction_rejects_file(#[case] sql_type: DataType) {
+        assert!(UserDefinedType::try_new(sql_type, HashMap::new())
+            .unwrap_err()
+            .to_string()
+            .contains("must not contain a `file`"));
+    }
+
     #[test]
     fn construction_rejects_nested_udt() {
         let inner = UserDefinedType::try_new(DataType::LONG, HashMap::new()).unwrap();
@@ -485,11 +505,11 @@ mod tests {
     fn schema_transform_treats_udt_as_leaf() {
         struct RejectPrimitives;
         impl<'a> SchemaTransform<'a> for RejectPrimitives {
-            transform_output_type!(|'a, T| Result<(), ()>);
+            transform_output_type!(|'a, T| KernelResult<(), ()>);
             fn transform_primitive(
                 &mut self,
                 _: &'a super::super::PrimitiveType,
-            ) -> Result<(), ()> {
+            ) -> KernelResult<(), ()> {
                 Err(())
             }
         }

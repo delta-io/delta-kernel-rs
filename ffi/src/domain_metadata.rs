@@ -206,7 +206,7 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel::Result;
+    use delta_kernel::KernelResult;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use serde_json::json;
@@ -221,7 +221,7 @@ mod tests {
     use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice};
 
     #[tokio::test]
-    async fn test_domain_metadata() -> Result<()> {
+    async fn test_domain_metadata() -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
@@ -340,8 +340,8 @@ mod tests {
         ) {
             let ptr: *mut HashMap<String, String> = state.unwrap().as_ptr().cast();
             let collected_metadata = unsafe { &mut *ptr };
-            let key: Result<String> = unsafe { TryFromStringSlice::try_from_slice(&key) };
-            let value: Result<String> = unsafe { TryFromStringSlice::try_from_slice(&value) };
+            let key: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&key) };
+            let value: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&value) };
             collected_metadata.insert(key.unwrap(), value.unwrap());
         }
 
@@ -465,9 +465,9 @@ mod tests {
         ) {
             let ptr: *mut Vec<VisitedColumn> = state.unwrap().as_ptr().cast();
             let columns = unsafe { &mut *ptr };
-            let logical: Result<String> =
+            let logical: KernelResult<String> =
                 unsafe { TryFromStringSlice::try_from_slice(&logical_column) };
-            let physical: Result<String> =
+            let physical: KernelResult<String> =
                 unsafe { TryFromStringSlice::try_from_slice(&physical_column) };
             columns.push((
                 logical.unwrap(),
@@ -533,7 +533,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_clustering_domain_metadata_user_facing_path_still_rejects() -> Result<()> {
+    async fn test_get_clustering_domain_metadata_user_facing_path_still_rejects() -> KernelResult<()>
+    {
         let table_root = "memory:///test_clustering_user_facing_rejected/";
         let (engine, snapshot) = build_clustering_snapshot(
             table_root,
@@ -650,7 +651,7 @@ mod tests {
         #[case] follow_up: Option<(&str, bool)>,
         #[case] expected: Option<Vec<(&str, &str, u8)>>,
         #[case] table_root: &str,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let follow_up_commits: Vec<serde_json::Value> = follow_up
             .into_iter()
             .map(|(config, removed)| clustering_domain_action(config, removed))
@@ -691,7 +692,8 @@ mod tests {
 
     // Decimal is the only tag carrying a payload, so pin precision/scale explicitly.
     #[tokio::test]
-    async fn test_visit_clustering_columns_decimal_reports_precision_and_scale() -> Result<()> {
+    async fn test_visit_clustering_columns_decimal_reports_precision_and_scale() -> KernelResult<()>
+    {
         const TAG_DECIMAL: u8 = 12;
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
@@ -733,7 +735,7 @@ mod tests {
     // With column mapping the domain stores physical identifiers, so the visitor must report the
     // schema-resolved logical name alongside the physical one the domain (and per-file stats) use.
     #[tokio::test]
-    async fn test_visit_clustering_columns_column_mapping_reports_both_names() -> Result<()> {
+    async fn test_visit_clustering_columns_column_mapping_reports_both_names() -> KernelResult<()> {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
@@ -803,7 +805,7 @@ mod tests {
     // A clustering column absent from the schema cannot resolve to a logical name, so the
     // symbol surfaces an `ExternResult::Err` rather than reporting the table as unclustered.
     #[tokio::test]
-    async fn test_visit_clustering_columns_column_not_in_schema_errors() -> Result<()> {
+    async fn test_visit_clustering_columns_column_not_in_schema_errors() -> KernelResult<()> {
         let table_root = "memory:///test_clustering_col_missing/";
         // "ghost" is not one of id/val/addr in clustering_test_schema_json().
         let (engine, snapshot) = build_clustering_snapshot(

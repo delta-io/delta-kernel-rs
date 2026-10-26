@@ -6,7 +6,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 #[cfg(test)]
-use delta_kernel::{object_store::memory::InMemory, Engine};
+use delta_kernel::{object_store::memory::InMemory, Engine, KernelResult};
 #[cfg(test)]
 use delta_kernel_default_engine::DefaultEngineBuilder;
 #[cfg(test)]
@@ -163,13 +163,10 @@ pub(crate) fn engine_handle_for_store(
 #[cfg(test)]
 pub(crate) async fn setup_snapshot(
     commit_data: String,
-) -> Result<
-    (
-        crate::handle::Handle<crate::SharedExternEngine>,
-        crate::handle::Handle<crate::SharedSnapshot>,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> KernelResult<(
+    crate::handle::Handle<crate::SharedExternEngine>,
+    crate::handle::Handle<crate::SharedSnapshot>,
+)> {
     let table_root = "memory:///";
     let storage = Arc::new(InMemory::new());
     add_commit(table_root, storage.as_ref(), 0, commit_data).await?;

@@ -31,26 +31,27 @@ static MANDATORY_REMOVE_FILE_COLUMNS: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| MANDATORY_REMOVE_FILE_SCHEMA.leaves(None));
 
 impl StagedDataValidator {
-    pub(crate) fn staged_remove_file(row_tracking_enabled: bool) -> Self {
+    pub(crate) fn for_remove_files(row_tracking_enabled: bool) -> Self {
         StagedDataValidator::new(
             &MANDATORY_REMOVE_FILE_COLUMNS,
-            vec![Box::new(RemoveFileRequiredFields {
+            vec![Box::new(MandatoryRemoveFileValidation {
                 row_tracking_enabled,
             })],
         )
     }
 }
 
-/// Validates required `RemoveFile` fields: `path` must be present and non-empty, and `size`
-/// must be present and non-negative.
+/// Mandatory validations for every selected RemoveFile row.
+///
+/// `path` must be present and non-empty, and `size` must be present and non-negative.
 ///
 /// The protocol defines `size` as optional, but kernel requires it because its `RemoveFile`
 /// actions currently come only from `AddFile` actions, which provide `size`.
-struct RemoveFileRequiredFields {
+struct MandatoryRemoveFileValidation {
     row_tracking_enabled: bool,
 }
 
-impl Validation for RemoveFileRequiredFields {
+impl Validation for MandatoryRemoveFileValidation {
     fn validate_row<'a>(
         &mut self,
         row: usize,
@@ -207,7 +208,7 @@ mod tests {
             all_rows_selected(nullable_staged_remove_file()),
         ];
         removes[case_batch_index] = remove;
-        let result = remove_validator().validate_filtered(&removes);
+        let result = remove_validator().validate_selected_rows(&removes);
 
         if let Some(expected_error) = expected_error {
             assert_result_error_with_message(result, expected_error);
@@ -245,6 +246,6 @@ mod tests {
     }
 
     fn remove_validator() -> StagedDataValidator {
-        StagedDataValidator::staged_remove_file(false /* row_tracking_enabled */)
+        StagedDataValidator::for_remove_files(false /* row_tracking_enabled */)
     }
 }

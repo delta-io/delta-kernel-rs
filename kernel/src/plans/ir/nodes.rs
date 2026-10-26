@@ -16,7 +16,7 @@ use crate::error::add_scalar_path_context;
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
 use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema};
 use crate::utils::CollectInto;
-use crate::{FileMeta, KernelError, KernelResult, Result};
+use crate::{FileMeta, KernelError, KernelResult};
 
 // ============================================================================
 // Operator: enumerates every operator kind
@@ -384,7 +384,7 @@ where
 {
     type Error = KernelError;
 
-    fn try_from(Values { schema, rows }: Values) -> Result<Self> {
+    fn try_from(Values { schema, rows }: Values) -> KernelResult<Self> {
         rows.into_iter()
             .enumerate()
             .map(|(index, row)| {
@@ -554,7 +554,7 @@ impl DynamicScan {
         file_size_column: ColumnName,
         last_modified_column: ColumnName,
         dv_column: Option<ColumnName>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let schema = output_schema.into();
         let file_constant_columns = file_constant_columns
             .into_iter()
@@ -585,7 +585,7 @@ impl DynamicScan {
     /// metadata column or a configured deletion-vector column is absent, has an incompatible type,
     /// or has invalid nullability; or when a file-constant column is absent from either schema, is
     /// a metadata column, or has different input and output types or nullability.
-    pub fn validate_input(&self, input_schema: &SchemaRef) -> Result<()> {
+    pub fn validate_input(&self, input_schema: &SchemaRef) -> KernelResult<()> {
         static DELETION_VECTOR_DATA_TYPE: LazyLock<DataType> =
             LazyLock::new(|| DataType::from(DeletionVectorDescriptor::to_schema()));
 
@@ -1089,7 +1089,7 @@ impl AggregateBuilder {
     ///
     /// Returns an error if a group key or an aggregate's operand column is not found in the input
     /// schema, or if two output columns would share a name (case-insensitive).
-    pub fn build(self) -> Result<Aggregate> {
+    pub fn build(self) -> KernelResult<Aggregate> {
         let mut fields = Vec::with_capacity(self.group_by.len() + self.aggs.len());
         for key in &self.group_by {
             fields.push(self.input_schema.field_at(key)?.clone());
@@ -1111,7 +1111,7 @@ impl AggregateBuilder {
 impl TryFrom<AggregateBuilder> for Aggregate {
     type Error = KernelError;
 
-    fn try_from(builder: AggregateBuilder) -> Result<Self> {
+    fn try_from(builder: AggregateBuilder) -> KernelResult<Self> {
         builder.build()
     }
 }

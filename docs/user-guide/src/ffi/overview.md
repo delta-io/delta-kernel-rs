@@ -98,7 +98,7 @@ scan_builder_with_predicate() ->  Handle<ExclusiveScanBuilder>
         |
 scan_builder_with_schema()    ->  Handle<ExclusiveScanBuilder>
         |
-scan_builder_with_stats()     ->  Handle<ExclusiveScanBuilder>
+scan_builder_with_stats()     ->  ExternResult<Handle<ExclusiveScanBuilder>>
         |
 scan_builder_with_partition_values()
                               ->  Handle<ExclusiveScanBuilder>

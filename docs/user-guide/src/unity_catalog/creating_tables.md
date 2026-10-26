@@ -15,12 +15,12 @@ Before reading this page, make sure you understand
 ## Prerequisites
 
 - A three-part table name, Delta schema, and target storage location.
-- A `UCClient` (from `unity-catalog-delta-rest-client`).
+- A `UCDeltaTableClient` (from `unity-catalog-delta-rest-client`).
 
 ## Step 1: Reserve the table in Unity Catalog
 
-Call `UCClient::create_staging_table`. UC allocates a table ID and storage location and returns
-temporary credentials for the initial commit.
+Call `UCDeltaTableClient::create_staging_table`. UC allocates a table ID and storage location and
+returns temporary credentials for the initial commit.
 
 ```rust,ignore
 use unity_catalog_delta_client_api::CreateStagingTableRequest;
@@ -70,7 +70,7 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel_unity_catalog::UCCommitter;
 use unity_catalog_delta_client_api::{Operation, TableIdentifier};
-use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCDeltaTableClient, UCUpdateTableRestClient};
 
 let config = ClientConfig::build(&endpoint, &token).with_additional_user_agent([("MyConnector", "1.0")]).build()?;
 let update_client = Arc::new(UCUpdateTableRestClient::new(config)?);
@@ -146,8 +146,8 @@ let create_req = build_uc_create_table_request(&post_commit_snapshot, &engine, "
 
 ## Step 5: Finalize the table in Unity Catalog
 
-Call `UCClient::create_table` with the request from Step 4 to register the table. It returns the
-registered table as a `LoadTableResponse`.
+Call `UCDeltaTableClient::create_table` with the request from Step 4 to register the table. It returns
+the registered table as a `LoadTableResponse`.
 
 ```rust,ignore
 uc_client

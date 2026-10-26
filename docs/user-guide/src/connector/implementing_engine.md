@@ -32,15 +32,15 @@ files (as bytes) from storage.
 
 ```rust,ignore
 pub trait StorageHandler {
-    fn list_from(&self, path: &Url) -> Result<ResultIteratorStatic<FileMeta>>;
+    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
 
-    fn read_files(&self, files: Vec<FileSlice>) -> Result<ResultIteratorStatic<Bytes>>;
+    fn read_files(&self, files: Vec<FileSlice>) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>>;
 
-    fn copy_atomic(&self, src: &Url, dest: &Url) -> Result<()>;
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> KernelResult<()>;
 
-    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> Result<()>;
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> KernelResult<()>;
 
-    fn head(&self, path: &Url) -> Result<FileMeta>;
+    fn head(&self, path: &Url) -> KernelResult<FileMeta>;
 }
 ```
 
@@ -77,21 +77,21 @@ pub trait JsonHandler {
         &self,
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
-    ) -> Result<Box<dyn EngineData>>;
+    ) -> KernelResult<Box<dyn EngineData>>;
 
     fn read_json_files(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> Result<FileDataReadResultIterator>;
+    ) -> KernelResult<FileDataReadResultIterator>;
 
     fn write_json_file(
         &self,
         path: &Url,
-        data: ResultIterator<'_, FilteredEngineData>,
+        data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         overwrite: bool,
-    ) -> Result<FileSize>;
+    ) -> KernelResult<FileSize>;
 }
 ```
 
@@ -126,15 +126,15 @@ pub trait ParquetHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> Result<FileDataReadResultIterator>;
+    ) -> KernelResult<FileDataReadResultIterator>;
 
     fn write_parquet_file(
         &self,
         location: Url,
-        data: ResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> Result<FileSize>;
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<FileSize>;
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter>;
+    fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter>;
 }
 ```
 
@@ -207,7 +207,7 @@ fn read_parquet_files_with_cancellation(
     physical_schema: SchemaRef,
     predicate: Option<PredicateRef>,
     cancellation_token: Option<CancellationTokenRef>,
-) -> Result<FileDataReadResultIterator> {
+) -> KernelResult<FileDataReadResultIterator> {
     // Kick off the async read as usual, then poll the read future and the token's
     // `cancelled_future()` together. If cancellation wins the race, drop the in-flight
     // work and yield `Err(KernelError::Cancelled)` as the iterator's terminal item.
@@ -244,19 +244,19 @@ pub trait EvaluationHandler {
         input_schema: SchemaRef,
         expression: ExpressionRef,
         output_type: DataType,
-    ) -> Result<Arc<dyn ExpressionEvaluator>>;
+    ) -> KernelResult<Arc<dyn ExpressionEvaluator>>;
 
     fn new_predicate_evaluator(
         &self,
         input_schema: SchemaRef,
         predicate: PredicateRef,
-    ) -> Result<Arc<dyn PredicateEvaluator>>;
+    ) -> KernelResult<Arc<dyn PredicateEvaluator>>;
 
     fn create_many(
         &self,
         schema: SchemaRef,
         rows: Vec<Vec<Scalar>>,
-    ) -> Result<Box<dyn EngineData>>;
+    ) -> KernelResult<Box<dyn EngineData>>;
 }
 ```
 
@@ -265,11 +265,11 @@ The returned evaluators are reusable objects. The kernel creates them once and c
 
 ```rust,ignore
 pub trait ExpressionEvaluator {
-    fn evaluate(&self, batch: &dyn EngineData) -> Result<Box<dyn EngineData>>;
+    fn evaluate(&self, batch: &dyn EngineData) -> KernelResult<Box<dyn EngineData>>;
 }
 
 pub trait PredicateEvaluator {
-    fn evaluate(&self, batch: &dyn EngineData) -> Result<Box<dyn EngineData>>;
+    fn evaluate(&self, batch: &dyn EngineData) -> KernelResult<Box<dyn EngineData>>;
 }
 ```
 

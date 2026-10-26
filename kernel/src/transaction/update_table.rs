@@ -39,7 +39,7 @@ use crate::table_features::TableFeature;
 use crate::utils::require;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::FileMeta;
-use crate::{DataType, Engine, Expression, KernelResult, Result};
+use crate::{DataType, Engine, Expression, KernelResult, KernelResultIterator};
 
 // =============================================================================
 // Update table transactions only
@@ -100,7 +100,7 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
     pub(crate) fn with_row_tracking_high_water_mark(
         mut self,
         high_water_mark: i64,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         if self.provided_row_tracking_high_water_mark.is_some() {
             return Err(KernelError::generic(
                 "Row-tracking high-water mark already specified in this transaction",
@@ -120,7 +120,7 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
     /// Returns an error if the table does not support the `adaptiveMetadata-preview` feature, or if
     /// a manifest (content-tree) commit was already staged.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub fn with_root_manifest_file(mut self, file: FileMeta) -> Result<Self> {
+    pub fn with_root_manifest_file(mut self, file: FileMeta) -> KernelResult<Self> {
         require!(
             !matches!(self.manifest_write, Some(ManifestWrite::Commit(_))),
             KernelError::invalid_transaction_state(
@@ -164,7 +164,7 @@ impl Transaction<UpdateTable, Imperative> {
     pub(crate) fn with_manifest_commit(
         &mut self,
         engine: &dyn Engine,
-    ) -> Result<&mut ManifestCommitState> {
+    ) -> KernelResult<&mut ManifestCommitState> {
         match &self.manifest_write {
             Some(ManifestWrite::RootFile(_)) => {
                 return Err(KernelError::invalid_transaction_state(
@@ -208,8 +208,8 @@ impl Transaction<UpdateTable, Imperative> {
     /// non-negative `baseRowId` and `defaultRowCommitVersion` in `fileConstantValues`.
     /// Note: We only validate these fields when row tracking is enabled. When row tracking is
     /// supported but not enabled, some rows may lack these fields. E.g., if row tracking support is
-    /// added partway through a table's history, files that existed before row tracking was supported
-    /// may not have been backfilled with these fields yet.
+    /// added partway through a table's history, files that existed before row tracking was
+    /// supported may not have been backfilled with these fields yet.
     ///
     /// # Example
     ///
@@ -218,7 +218,10 @@ impl Transaction<UpdateTable, Imperative> {
     /// # use delta_kernel::Engine;
     /// # use delta_kernel::snapshot::Snapshot;
     /// # use delta_kernel::committer::FileSystemCommitter;
-    /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::Result<()> {
+    /// # fn example(
+    /// #     engine: Arc<dyn Engine>,
+    /// #     table_url: url::Url,
+    /// # ) -> delta_kernel::KernelResult<()> {
     /// // Create a snapshot and transaction
     /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     /// let mut txn = snapshot
@@ -273,8 +276,8 @@ impl Transaction<UpdateTable, Imperative> {
     /// txn.update_deletion_vectors(dv_map, files_iter)?;
     /// ```
     pub fn scan_metadata_to_engine_data(
-        scan_metadata: impl Iterator<Item = Result<crate::scan::ScanMetadata>>,
-    ) -> impl Iterator<Item = Result<FilteredEngineData>> {
+        scan_metadata: impl KernelResultIterator<crate::scan::ScanMetadata>,
+    ) -> impl KernelResultIterator<FilteredEngineData> {
         scan_metadata.map(|result| result.map(|metadata| metadata.scan_files))
     }
 
@@ -347,8 +350,8 @@ impl Transaction<UpdateTable, Imperative> {
     pub(crate) fn update_deletion_vectors(
         &mut self,
         new_dv_descriptors: HashMap<String, DeletionVectorDescriptor>,
-        existing_data_files: impl Iterator<Item = Result<FilteredEngineData>>,
-    ) -> Result<()> {
+        existing_data_files: impl KernelResultIterator<FilteredEngineData>,
+    ) -> KernelResult<()> {
         if self.is_create_table() {
             return Err(KernelError::generic(
                 "Deletion vector operations require an existing table",
@@ -535,7 +538,7 @@ impl<STATE> Transaction<STATE, Imperative> {
     pub(super) fn generate_dv_update_actions<'a>(
         &'a self,
         engine: &'a dyn Engine,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<FilteredEngineData>> + Send + 'a> {
+    ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + 'a> {
         // Create-table transactions should not have any DV update actions
         if self.is_create_table() && !self.staged_data_changes.dv_matched_files.is_empty() {
             return Err(crate::error::KernelError::internal_error(
@@ -563,7 +566,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         &'a self,
         engine: &'a dyn Engine,
         file_metadata_batch: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<FilteredEngineData>> + Send + 'a> {
+    ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + 'a> {
         let evaluation_handler = engine.evaluation_handler();
         // Struct patch to replace the deletionVector field with the new DV/stats from
         // NEW_DELETION_VECTOR_NAME/NEW_STATS_NAME, then drop the
@@ -695,7 +698,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
         &mut self,
         getters: &[&'a dyn GetData<'a>],
         rows: RowIndexIterator<'_>,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         static DV_SCHEMA_FIELDS: LazyLock<Vec<StructField>> = LazyLock::new(|| {
             DeletionVectorDescriptor::to_schema()
                 .into_fields()

@@ -12,7 +12,7 @@ use crate::partition::hive::build_partition_path;
 use crate::path_encoding::uri_encode_path;
 use crate::schema::SchemaRef;
 use crate::table_features::ColumnMappingMode;
-use crate::{KernelError, Result};
+use crate::{KernelError, KernelResult};
 
 /// A write context for a specific partition or an unpartitioned table. Created by a
 /// [`BoundWriteContextBuilder`](super::BoundWriteContextBuilder).
@@ -220,7 +220,7 @@ impl BoundWriteContext {
     /// - `s3://bucket/table/year=2024/abc.parquet` -> `"year=2024/abc.parquet"`
     ///
     /// Returns an error if the file is not under the table root.
-    pub fn resolve_file_path(&self, file_location: &Url) -> Result<String> {
+    pub fn resolve_file_path(&self, file_location: &Url) -> KernelResult<String> {
         let relative = self
             .write_state
             .table_root
@@ -607,7 +607,7 @@ mod tests {
     #[case::error_different_host("s3://other-bucket/table/abc.parquet", Err(()))]
     #[case::error_outside_table_root("s3://bucket/other/abc.parquet", Err(()))]
     #[test]
-    fn test_resolve_file_path(#[case] file_url: &str, #[case] expected: Result<&str, ()>) {
+    fn test_resolve_file_path(#[case] file_url: &str, #[case] expected: KernelResult<&str, ()>) {
         let wc = make_write_context(ColumnMappingMode::None, vec![], HashMap::new(), false, 2);
         let file = Url::parse(file_url).unwrap();
         match expected {

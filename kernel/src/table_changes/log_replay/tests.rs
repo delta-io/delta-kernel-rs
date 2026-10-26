@@ -31,7 +31,7 @@ use crate::unit_test_utils::{
     assert_result_error_with_message, Action, LocalMockTable, MockProtocolBuilder,
     MockTableConfigurationBuilder,
 };
-use crate::{Engine, KernelError, KernelResult, Predicate, Result, Version};
+use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Predicate, Version};
 
 fn get_schema() -> SchemaRef {
     schema_ref! {
@@ -163,7 +163,7 @@ fn get_segment(
     Ok(log_segment.listed.ascending_commit_files)
 }
 
-fn result_to_sv(iter: impl Iterator<Item = KernelResult<TableChangesScanMetadata>>) -> Vec<bool> {
+fn result_to_sv(iter: impl KernelResultIterator<TableChangesScanMetadata>) -> Vec<bool> {
     iter.map_ok(|scan_metadata| scan_metadata.selection_vector.into_iter())
         .flatten_ok()
         .try_collect()
@@ -232,7 +232,7 @@ async fn cdf_not_enabled() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let res: Result<Vec<_>> =
+    let res: KernelResult<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
@@ -270,7 +270,7 @@ async fn unsupported_reader_feature() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let res: Result<Vec<_>> =
+    let res: KernelResult<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
@@ -347,7 +347,7 @@ async fn column_mapping_should_succeed() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let res: Result<Vec<_>> =
+    let res: KernelResult<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, cm_schema, None)
             .unwrap()
             .try_collect();
@@ -1188,7 +1188,7 @@ async fn failing_protocol() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let res: Result<Vec<_>> =
+    let res: KernelResult<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
@@ -1274,7 +1274,7 @@ async fn print_table_configuration() {
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
 
-    let _scan_batches: Result<Vec<_>> =
+    let _scan_batches: KernelResult<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
@@ -1339,7 +1339,7 @@ async fn print_table_info_post_phase1() {
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
 
-    let _scan_batches: Result<Vec<_>> =
+    let _scan_batches: KernelResult<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
@@ -1383,7 +1383,7 @@ async fn print_table_info_post_phase1_has_cdc() {
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
 
-    let _scan_batches: Result<Vec<_>> =
+    let _scan_batches: KernelResult<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
@@ -1438,7 +1438,7 @@ async fn print_table_info_post_phase1_has_dv() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let _scan_batches: Result<Vec<_>> =
+    let _scan_batches: KernelResult<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();

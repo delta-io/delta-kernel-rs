@@ -17,7 +17,7 @@ use delta_kernel::expressions::{
     StructData as KernelStructData,
 };
 use delta_kernel::schema::DataType as KernelDataType;
-use delta_kernel::{KernelError, KernelResult, Result};
+use delta_kernel::{KernelError, KernelResult};
 
 /// Converts a kernel [`Scalar`](KernelScalar) into the equivalent DataFusion
 /// [`ScalarValue`](DFScalarValue).
@@ -26,7 +26,7 @@ use delta_kernel::{KernelError, KernelResult, Result};
 /// Returns an error for interval scalars, which are not yet supported; for a type with no Arrow
 /// representation (e.g. a shredded variant); or if building the backing Arrow array for a nested
 /// container otherwise fails.
-pub fn to_df_scalar(scalar: &KernelScalar) -> Result<DFScalarValue> {
+pub fn to_df_scalar(scalar: &KernelScalar) -> KernelResult<DFScalarValue> {
     Ok(match scalar {
         KernelScalar::Integer(i) => DFScalarValue::Int32(Some(*i)),
         KernelScalar::Long(i) => DFScalarValue::Int64(Some(*i)),

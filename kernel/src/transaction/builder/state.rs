@@ -7,7 +7,7 @@ use crate::actions::DomainMetadata;
 use crate::schema::SchemaRef;
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::utils::require;
-use crate::{EngineData, KernelError, Result};
+use crate::{EngineData, KernelError, KernelResult};
 
 /// Shared transaction configuration collected before build.
 #[derive(Default)]
@@ -46,7 +46,7 @@ impl TransactionBuilderState {
         }
     }
 
-    pub(super) fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> KernelResult<()> {
         if let Some((commit_info, _)) = &self.engine_commit_info {
             require!(
                 commit_info.len() == 1,

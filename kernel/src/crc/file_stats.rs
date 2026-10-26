@@ -18,7 +18,7 @@ use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::expressions::column_name;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{EngineData, KernelError, KernelResult, Result, RowVisitor};
+use crate::{EngineData, KernelError, KernelResult, RowVisitor};
 
 /// File-level statistics for a table version: total file count, size, and histogram.
 ///
@@ -50,7 +50,7 @@ impl FileStats {
         num_files: i64,
         table_size_bytes: i64,
         file_size_histogram: Option<FileSizeHistogram>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         for (name, value) in [
             ("numFiles", num_files),
             ("tableSizeBytes", table_size_bytes),
@@ -254,7 +254,7 @@ impl RowVisitor for FileStatsVisitor<'_, '_> {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         require!(
             getters.len() == 1,
             KernelError::InternalError(format!(

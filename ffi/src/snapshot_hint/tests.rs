@@ -28,8 +28,9 @@ use crate::log_path::FfiLogPath;
 use crate::{
     engine_to_handle, free_engine, free_snapshot, get_snapshot_builder, get_snapshot_builder_from,
     snapshot_builder_build, snapshot_builder_with_incremental_crc_replay,
-    snapshot_builder_with_max_catalog_version, snapshot_builder_with_version, FfiFileStats,
-    FfiIncrementalReplay, KernelI64Slice, KernelStringSlice, OptionalValue, SharedExternEngine,
+    snapshot_builder_with_max_catalog_version, snapshot_builder_with_version,
+    snapshot_log_segment_stats, FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats,
+    KernelI64Slice, KernelStringSlice, OptionalValue, SharedExternEngine,
 };
 
 fn slice(value: &'static str) -> KernelStringSlice {
@@ -139,6 +140,70 @@ fn empty_crc() -> FfiCrc {
 
 fn test_engine() -> Handle<SharedExternEngine> {
     engine_to_handle(Arc::new(NoIoEngine), allocate_err)
+}
+
+#[rstest::rstest]
+#[case::ordinary(17, 23, Some(40))]
+#[case::unsigned(i64::MAX as u64, 1, Some(1 << 63))]
+#[case::overflow(u64::MAX, 1, None)]
+fn log_segment_stats_borrows_handles_and_propagates_errors_without_io(
+    #[case] first_size: u64,
+    #[case] second_size: u64,
+    #[case] expected_bytes: Option<u64>,
+) {
+    let engine = test_engine();
+    let paths = [
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+            0,
+            first_size,
+        ),
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000001.json"),
+            0,
+            second_size,
+        ),
+    ];
+    let hint = test_snapshot_hint(&paths, 1, FfiSnapshotHintFreshness::Latest);
+    let builder = unsafe {
+        ok_or_panic(snapshot_builder_with_snapshot_hint(
+            test_builder(&engine),
+            &hint,
+        ))
+    };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    for _ in 0..2 {
+        let result =
+            unsafe { snapshot_log_segment_stats(snapshot.shallow_copy(), engine.shallow_copy()) };
+        match expected_bytes {
+            Some(total_commit_file_bytes) => {
+                let stats = ok_or_panic(result);
+                assert_eq!(
+                    stats,
+                    FfiLogSegmentStats {
+                        num_commit_files: 2,
+                        total_commit_file_bytes,
+                    }
+                );
+                assert_eq!(
+                    stats,
+                    unsafe { snapshot.as_ref() }
+                        .log_segment_stats()
+                        .unwrap()
+                        .into()
+                );
+            }
+            None => assert_extern_result_error_contains(
+                result,
+                FFIKernelError::GenericError,
+                "commit file size overflow",
+            ),
+        }
+    }
+    unsafe {
+        free_snapshot(snapshot);
+        free_engine(engine);
+    }
 }
 
 struct NoIoEngine;

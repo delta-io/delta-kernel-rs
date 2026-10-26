@@ -225,7 +225,7 @@ impl EvaluationHandler for GeometryStatsHandler {
         input: SchemaRef,
         expr: ExpressionRef,
         output: DataType,
-    ) -> Result<Arc<dyn ExpressionEvaluator>> {
+    ) -> KernelResult<Arc<dyn ExpressionEvaluator>> {
         self.evaluation.new_expression_evaluator(
             Arc::new(GeometryAsBinary.transform_struct(&input).into_owned()),
             Arc::new(GeometryAsBinary.transform_expr(&expr).into_owned()),
@@ -237,7 +237,7 @@ impl EvaluationHandler for GeometryStatsHandler {
         &self,
         input: SchemaRef,
         predicate: PredicateRef,
-    ) -> Result<Arc<dyn PredicateEvaluator>> {
+    ) -> KernelResult<Arc<dyn PredicateEvaluator>> {
         self.evaluation.new_predicate_evaluator(
             Arc::new(GeometryAsBinary.transform_struct(&input).into_owned()),
             predicate,
@@ -248,7 +248,7 @@ impl EvaluationHandler for GeometryStatsHandler {
         &self,
         schema: SchemaRef,
         rows: Vec<Vec<Scalar>>,
-    ) -> Result<Box<dyn EngineData>> {
+    ) -> KernelResult<Box<dyn EngineData>> {
         self.evaluation.create_many(schema, rows)
     }
 }
@@ -259,7 +259,7 @@ impl ParquetHandler for GeometryStatsHandler {
         files: &[FileMeta],
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         self.parquet.read_parquet_files(
             files,
             Arc::new(GeometryAsBinary.transform_struct(&schema).into_owned()),
@@ -267,15 +267,15 @@ impl ParquetHandler for GeometryStatsHandler {
         )
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
         self.parquet.read_parquet_footer(file)
     }
 
     fn write_parquet_file(
         &self,
         location: Url,
-        data: ResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> Result<FileSize> {
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<FileSize> {
         self.parquet.write_parquet_file(location, data)
     }
 }
@@ -326,7 +326,7 @@ impl ArrowOpaqueExpressionOp for DecodePointStats {
         args: &[Expr],
         batch: &RecordBatch,
         _: Option<&DataType>,
-    ) -> Result<ArrayRef> {
+    ) -> KernelResult<ArrayRef> {
         let [json] = args else {
             panic!("expected one JSON argument")
         };
@@ -343,7 +343,11 @@ impl ArrowOpaqueExpressionOp for DecodePointStats {
         Ok(Arc::new(decoded))
     }
 
-    fn eval_expr_scalar(&self, _: &ScalarExpressionEvaluator<'_>, _: &[Expr]) -> Result<Scalar> {
+    fn eval_expr_scalar(
+        &self,
+        _: &ScalarExpressionEvaluator<'_>,
+        _: &[Expr],
+    ) -> KernelResult<Scalar> {
         Err(KernelError::unsupported(
             "The test Geometry JSON decoder does not support scalar evaluation",
         ))

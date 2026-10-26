@@ -1,9 +1,11 @@
-//! A simple, single threaded, test-only `Engine`.
+//! Synchronous I/O support for kernel tests and the test plan executor.
 //!
-//! All I/O goes through an `ObjectStore`. `SyncEngine::new` uses a [`LocalFileSystem`]
-//! built lazily per-URL (rooted at the URL's drive on Windows, or `/` on Unix), so any
-//! `file://` URL is supported. `SyncEngine::new_with_store` takes any other store
-//! (e.g. `InMemory`) and uses it directly for all URLs.
+//! `SyncEngine` is compiled only for kernel unit tests. The plan executor is also available to
+//! dependent crate tests through the test feature combination.
+//!
+//! All I/O goes through an `ObjectStore`. Without an explicit store, a [`LocalFileSystem`] is
+//! built lazily per-URL (rooted at the URL's drive on Windows, or `/` on Unix), so any `file://`
+//! URL is supported. An explicit store (e.g. `InMemory`) is used directly for all URLs.
 //!
 //! Async work is driven via [`futures::executor::block_on`], which is sufficient for stores
 //! that do not require a tokio reactor (`LocalFileSystem`, `InMemory`). Cloud-backed stores
@@ -20,15 +22,15 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
+#[cfg(test)]
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::object_store::local::LocalFileSystem;
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-use crate::{
-    Engine, EvaluationHandler, FileMeta, JsonHandler, KernelError, KernelResult, ParquetHandler,
-    PredicateRef, SchemaRef, StorageHandler,
-};
+#[cfg(test)]
+use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
+use crate::{FileMeta, KernelError, KernelResult, KernelResultIterator, PredicateRef, SchemaRef};
 
 pub(crate) mod json;
 mod parquet;
@@ -38,13 +40,14 @@ mod storage;
 mod aggs;
 
 #[cfg(feature = "declarative-plans")]
-pub(crate) mod plan;
+pub mod plan;
 
-#[cfg(feature = "declarative-plans")]
+#[cfg(all(test, feature = "declarative-plans"))]
 use plan::SyncPlanExecutor;
 
 /// A simple (test-only) implementation of [`Engine`]. See module docs for supported stores.
-pub(crate) struct SyncEngine {
+#[cfg(test)]
+pub struct SyncEngine {
     storage_handler: Arc<storage::SyncStorageHandler>,
     json_handler: Arc<json::SyncJsonHandler>,
     parquet_handler: Arc<parquet::SyncParquetHandler>,
@@ -53,16 +56,17 @@ pub(crate) struct SyncEngine {
     plan_executor: Arc<SyncPlanExecutor>,
 }
 
+#[cfg(test)]
 impl SyncEngine {
     /// Create a SyncEngine that reads from the local filesystem via [`LocalFileSystem`].
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::new_inner(None)
     }
 
     /// Create a SyncEngine backed by `store`. All I/O is performed synchronously via
     /// [`futures::executor::block_on`]. See module docs for the deadlock caveat on
     /// reactor-dependent stores.
-    pub(crate) fn new_with_store(store: Arc<DynObjectStore>) -> Self {
+    pub fn new_with_store(store: Arc<DynObjectStore>) -> Self {
         Self::new_inner(Some(store))
     }
 
@@ -78,6 +82,14 @@ impl SyncEngine {
     }
 }
 
+#[cfg(test)]
+impl Default for SyncEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
 impl Engine for SyncEngine {
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
         self.evaluation_handler.clone()
@@ -224,9 +236,9 @@ fn read_files_arrow<F, I>(
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
     mut try_create_from_bytes: F,
-) -> impl Iterator<Item = KernelResult<ArrowEngineData>> + Send + 'static
+) -> impl KernelResultIterator<ArrowEngineData> + 'static
 where
-    I: Iterator<Item = KernelResult<ArrowEngineData>> + Send + 'static,
+    I: KernelResultIterator<ArrowEngineData> + 'static,
     F: FnMut(Bytes, SchemaRef, Option<PredicateRef>, String) -> KernelResult<I> + Send + 'static,
 {
     debug!("Reading files: {files:#?} with schema {schema:#?} and predicate {predicate:#?}");

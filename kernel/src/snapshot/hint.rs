@@ -15,7 +15,7 @@ use crate::path::{LogPathFileType, ParsedLogPath, DELTA_LOG_DIR_WITH_SLASH};
 use crate::snapshot::{IncrementalReplay, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
-use crate::{KernelError, KernelResult, Result, Snapshot, Version};
+use crate::{KernelError, KernelResult, Snapshot, Version};
 
 /// The freshness claim for the version carried by a [`SnapshotHint`].
 ///
@@ -121,7 +121,7 @@ impl SnapshotHint {
         last_checkpoint_hint: Option<LastCheckpointHint>,
         crc: Option<Arc<Crc>>,
         freshness: SnapshotHintFreshness,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let log_root = try_parse_uri(table_root)?.join(DELTA_LOG_DIR_WITH_SLASH)?;
         let mut parsed_paths: Vec<ParsedLogPath> = log_paths.into_iter().map(Into::into).collect();
         require!(
@@ -447,8 +447,10 @@ mod tests {
 
     async fn snapshot_and_hint(
         freshness: SnapshotHintFreshness,
-    ) -> Result<(Arc<SyncEngine>, String, SnapshotRef, SnapshotHint), Box<dyn std::error::Error>>
-    {
+    ) -> KernelResult<
+        (Arc<SyncEngine>, String, SnapshotRef, SnapshotHint),
+        Box<dyn std::error::Error>,
+    > {
         let (engine, store, table_root) = setup_test();
         create_table(&store, &table_root).await?;
         let snapshot = SnapshotBuilder::new_for(&table_root).build(engine.as_ref())?;
@@ -472,7 +474,7 @@ mod tests {
         );
     }
 
-    fn assert_log_segment_hint_error(result: Result<SnapshotRef>, expected_source: &str) {
+    fn assert_log_segment_hint_error(result: KernelResult<SnapshotRef>, expected_source: &str) {
         let error = result.unwrap_err();
         assert_eq!(
             error.to_string(),
@@ -494,7 +496,7 @@ mod tests {
     async fn snapshot_to_hint_preserves_build_time_freshness(
         #[case] version: Option<Version>,
         #[case] expected: SnapshotHintFreshness,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         create_table(&store, &table_root).await?;
         let mut builder = Snapshot::builder_for(&table_root);
@@ -516,7 +518,7 @@ mod tests {
     async fn snapshot_to_hint_retains_only_matching_checkpoint_hint(
         #[case] hint_version: Version,
         #[case] expected_present: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, table_root, snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.log_segment_files.checkpoint_parts = vec![create_log_path(&format!(
@@ -549,7 +551,8 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn snapshot_to_hint_rejects_log_compaction() -> Result<(), Box<dyn std::error::Error>> {
+    async fn snapshot_to_hint_rejects_log_compaction(
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (_engine, table_root, snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.log_segment_files
@@ -627,7 +630,7 @@ mod tests {
         ]
         .into_iter()
         .map(|path| LogPath::try_new(create_log_path(path).location))
-        .collect::<Result<Vec<_>>>()
+        .collect::<KernelResult<Vec<_>>>()
         .unwrap();
         let hint = SnapshotHint::try_new(
             table_root,
@@ -693,7 +696,7 @@ mod tests {
         #[case] expected_published_version: Option<Version>,
         #[values(false, true)] foreign_table: bool,
         #[values(false, true)] reverse_paths: bool,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         const TABLE_ROOT: &str = "memory:///target/";
         const LOG_ROOT: &str = "memory:///target/_delta_log/";
 
@@ -709,7 +712,7 @@ mod tests {
         ]
         .into_iter()
         .map(|path| LogPath::try_new(create_log_path_with_size(path, 1).location))
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<KernelResult<Vec<_>>>()?;
         if reverse_paths {
             log_paths.reverse();
         }
@@ -970,7 +973,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn snapshot_hint_build_rejects_a_log_path_outside_the_table_log_root(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, table_root, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         let path = hint
@@ -1006,7 +1009,7 @@ mod tests {
     async fn complete_snapshot_hint_matches_storage_snapshot_without_child_loads(
         #[case] freshness: SnapshotHintFreshness,
         #[case] expected_built_as_latest: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, table_root, storage_snapshot, hint) = snapshot_and_hint(freshness).await?;
         assert!(storage_snapshot.crc_at_version().is_some());
 
@@ -1057,8 +1060,8 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn complete_snapshot_hint_without_crc_succeeds() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn complete_snapshot_hint_without_crc_succeeds(
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, table_root, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.crc = None;
@@ -1092,7 +1095,7 @@ mod tests {
         #[case] protocol: Protocol,
         #[case] expected_error: Option<&str>,
         #[values(false, true)] with_crc: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, table_root, snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.protocol = protocol.clone();
@@ -1115,7 +1118,7 @@ mod tests {
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn complete_snapshot_hint_preserves_checkpoint_state(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         create_table(&store, &table_root).await?;
         let snapshot = SnapshotBuilder::new_for(&table_root).build(engine.as_ref())?;
@@ -1154,7 +1157,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn snapshot_hint_rejects_staged_commit_without_catalog_version(
         #[case] include_replay_commit: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, table_root, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         let staged = create_log_path(concat!(
@@ -1192,7 +1195,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn snapshot_hint_rejects_published_version_after_hint_version(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, table_root, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.log_segment_files.max_published_version = Some(Version::MAX);
@@ -1207,7 +1210,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn snapshot_hint_rejects_malformed_log_segment_and_incompatible_table_state(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, table_root, _snapshot, hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
 
@@ -1262,7 +1265,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn snapshot_hint_rejects_checkpoint_free_history_not_starting_at_version_zero(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, table_root, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.crc = None;
@@ -1279,7 +1282,7 @@ mod tests {
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn snapshot_hint_internal_log_invariant_preserves_source(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         create_table(&store, &table_root).await?;
         let snapshot = SnapshotBuilder::new_for(&table_root).build(engine.as_ref())?;
@@ -1307,8 +1310,8 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn snapshot_hint_rejects_mismatched_crc_state() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn snapshot_hint_rejects_mismatched_crc_state(
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, table_root, _snapshot, hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         let matching_crc = hint.crc.as_ref().unwrap().as_ref().clone();
@@ -1354,7 +1357,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn snapshot_hint_rejects_conflicting_builder_options_and_reports_failure(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, table_root, snapshot, hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         let log_path = LogPath::try_new(
@@ -1418,7 +1421,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn snapshot_hint_version_must_match_log_segment_end_version(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, table_root, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.version -= 1;
@@ -1435,7 +1438,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn time_travel_snapshot_hint_accepts_later_max_catalog_version(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         add_commit(
             &table_root,
@@ -1507,7 +1510,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn snapshot_hint_accepts_staged_commit_with_catalog_version(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_catalog_managed_test().await;
         let actions = actions_to_string(vec![TestAction::Add("file_1.parquet".to_string())]);
         let staged_path = add_staged_commit(&table_root, store.as_ref(), 1, actions).await?;

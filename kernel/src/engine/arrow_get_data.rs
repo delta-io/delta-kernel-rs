@@ -15,102 +15,102 @@ use crate::engine_data::{
 };
 use crate::schema::ColumnName;
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 // actual impls (todo: could macro these)
 
 impl GetData<'_> for BooleanArray {
-    fn get_bool(&self, row_index: usize, _field_name: &str) -> Result<Option<bool>> {
+    fn get_bool(&self, row_index: usize, _field_name: &str) -> KernelResult<Option<bool>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
 
 impl GetData<'_> for PrimitiveArray<Int8Type> {
-    fn get_byte(&self, row_index: usize, _field_name: &str) -> Result<Option<i8>> {
+    fn get_byte(&self, row_index: usize, _field_name: &str) -> KernelResult<Option<i8>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
 
 impl GetData<'_> for PrimitiveArray<Int16Type> {
-    fn get_short(&self, row_index: usize, _field_name: &str) -> Result<Option<i16>> {
+    fn get_short(&self, row_index: usize, _field_name: &str) -> KernelResult<Option<i16>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
 
 impl GetData<'_> for PrimitiveArray<Int32Type> {
-    fn get_int(&self, row_index: usize, _field_name: &str) -> Result<Option<i32>> {
+    fn get_int(&self, row_index: usize, _field_name: &str) -> KernelResult<Option<i32>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
 
 impl GetData<'_> for PrimitiveArray<Int64Type> {
-    fn get_long(&self, row_index: usize, _field_name: &str) -> Result<Option<i64>> {
+    fn get_long(&self, row_index: usize, _field_name: &str) -> KernelResult<Option<i64>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
 
 impl GetData<'_> for PrimitiveArray<Float32Type> {
-    fn get_float(&self, row_index: usize, _field_name: &str) -> Result<Option<f32>> {
+    fn get_float(&self, row_index: usize, _field_name: &str) -> KernelResult<Option<f32>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
 
 impl GetData<'_> for PrimitiveArray<Float64Type> {
-    fn get_double(&self, row_index: usize, _field_name: &str) -> Result<Option<f64>> {
+    fn get_double(&self, row_index: usize, _field_name: &str) -> KernelResult<Option<f64>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
 
 impl GetData<'_> for PrimitiveArray<Date32Type> {
-    fn get_date(&self, row_index: usize, _field_name: &str) -> Result<Option<i32>> {
+    fn get_date(&self, row_index: usize, _field_name: &str) -> KernelResult<Option<i32>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
 
 impl GetData<'_> for PrimitiveArray<TimestampMicrosecondType> {
-    fn get_timestamp(&self, row_index: usize, _field_name: &str) -> Result<Option<i64>> {
+    fn get_timestamp(&self, row_index: usize, _field_name: &str) -> KernelResult<Option<i64>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
 
 impl GetData<'_> for PrimitiveArray<Decimal128Type> {
-    fn get_decimal(&self, row_index: usize, _field_name: &str) -> Result<Option<i128>> {
+    fn get_decimal(&self, row_index: usize, _field_name: &str) -> KernelResult<Option<i128>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
 
 impl<'a> GetData<'a> for GenericByteArray<GenericStringType<i32>> {
-    fn get_str(&'a self, row_index: usize, _field_name: &str) -> Result<Option<&'a str>> {
+    fn get_str(&'a self, row_index: usize, _field_name: &str) -> KernelResult<Option<&'a str>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
 
 impl<'a> GetData<'a> for GenericByteArray<GenericStringType<i64>> {
-    fn get_str(&'a self, row_index: usize, _field_name: &str) -> Result<Option<&'a str>> {
+    fn get_str(&'a self, row_index: usize, _field_name: &str) -> KernelResult<Option<&'a str>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
 
 impl<'a> GetData<'a> for StringViewArray {
-    fn get_str(&'a self, row_index: usize, _field_name: &str) -> Result<Option<&'a str>> {
+    fn get_str(&'a self, row_index: usize, _field_name: &str) -> KernelResult<Option<&'a str>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
 
 impl<'a> GetData<'a> for GenericByteArray<GenericBinaryType<i32>> {
-    fn get_binary(&'a self, row_index: usize, _field_name: &str) -> Result<Option<&'a [u8]>> {
+    fn get_binary(&'a self, row_index: usize, _field_name: &str) -> KernelResult<Option<&'a [u8]>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
 
 impl<'a> GetData<'a> for GenericByteArray<GenericBinaryType<i64>> {
-    fn get_binary(&'a self, row_index: usize, _field_name: &str) -> Result<Option<&'a [u8]>> {
+    fn get_binary(&'a self, row_index: usize, _field_name: &str) -> KernelResult<Option<&'a [u8]>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
 
 impl<'a> GetData<'a> for BinaryViewArray {
-    fn get_binary(&'a self, row_index: usize, _field_name: &str) -> Result<Option<&'a [u8]>> {
+    fn get_binary(&'a self, row_index: usize, _field_name: &str) -> KernelResult<Option<&'a [u8]>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
@@ -190,7 +190,7 @@ impl<T: ListLikeArray> StructListAccessor for T {
         row_index: usize,
         column_names: &[ColumnName],
         visitor: &mut dyn RowVisitor,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let offsets = self.row_offsets(row_index);
         let sliced = struct_elements(self, "struct-list")?.slice(offsets.start, offsets.len());
         // is_nullable means nulls may be present; a null element struct can't round-trip via
@@ -204,33 +204,41 @@ impl<T: ListLikeArray> StructListAccessor for T {
 }
 
 impl<'a, OffsetSize: OffsetSizeTrait> GetData<'a> for GenericListArray<OffsetSize> {
-    fn get_list(&'a self, row_index: usize, field_name: &str) -> Result<Option<ListItem<'a>>> {
+    fn get_list(
+        &'a self,
+        row_index: usize,
+        field_name: &str,
+    ) -> KernelResult<Option<ListItem<'a>>> {
         get_list_item(self, row_index, field_name)
     }
     fn get_struct_list(
         &'a self,
         row_index: usize,
         field_name: &str,
-    ) -> Result<Option<StructList<'a>>> {
+    ) -> KernelResult<Option<StructList<'a>>> {
         get_struct_list_item(self, row_index, field_name)
     }
 }
 
 impl<'a, OffsetSize: OffsetSizeTrait> GetData<'a> for GenericListViewArray<OffsetSize> {
-    fn get_list(&'a self, row_index: usize, field_name: &str) -> Result<Option<ListItem<'a>>> {
+    fn get_list(
+        &'a self,
+        row_index: usize,
+        field_name: &str,
+    ) -> KernelResult<Option<ListItem<'a>>> {
         get_list_item(self, row_index, field_name)
     }
     fn get_struct_list(
         &'a self,
         row_index: usize,
         field_name: &str,
-    ) -> Result<Option<StructList<'a>>> {
+    ) -> KernelResult<Option<StructList<'a>>> {
         get_struct_list_item(self, row_index, field_name)
     }
 }
 
 impl<'a> GetData<'a> for MapArray {
-    fn get_map(&'a self, row_index: usize, field_name: &str) -> Result<Option<MapItem<'a>>> {
+    fn get_map(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<MapItem<'a>>> {
         if !self.is_valid(row_index) {
             return Ok(None);
         }
@@ -276,7 +284,7 @@ fn validate_and_get_physical_index(
 /// This implementation supports multiple value types (strings, integers, booleans, etc.)
 /// by runtime downcasting of the values array.
 impl<'a> GetData<'a> for RunArray<Int64Type> {
-    fn get_str(&'a self, row_index: usize, field_name: &str) -> Result<Option<&'a str>> {
+    fn get_str(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<&'a str>> {
         let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
         let values = self
             .values()
@@ -292,7 +300,7 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
         Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
     }
 
-    fn get_int(&'a self, row_index: usize, field_name: &str) -> Result<Option<i32>> {
+    fn get_int(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<i32>> {
         let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
         let values = self
             .values()
@@ -307,7 +315,7 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
         Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
     }
 
-    fn get_long(&'a self, row_index: usize, field_name: &str) -> Result<Option<i64>> {
+    fn get_long(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<i64>> {
         let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
         let values = self
             .values()
@@ -322,7 +330,7 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
         Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
     }
 
-    fn get_bool(&'a self, row_index: usize, field_name: &str) -> Result<Option<bool>> {
+    fn get_bool(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<bool>> {
         let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
         let values = self.values().as_boolean_opt().ok_or_else(|| {
             KernelError::generic(format!(
@@ -334,7 +342,7 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
         Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
     }
 
-    fn get_binary(&'a self, row_index: usize, field_name: &str) -> Result<Option<&'a [u8]>> {
+    fn get_binary(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<&'a [u8]>> {
         let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
         let values = self
             .values()

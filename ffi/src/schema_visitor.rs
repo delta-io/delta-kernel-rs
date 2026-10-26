@@ -30,7 +30,7 @@ use delta_kernel::schema::{
 };
 #[cfg(feature = "geo-type-in-dev")]
 use delta_kernel::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
-use delta_kernel::{KernelError, KernelResult, Result};
+use delta_kernel::{KernelError, KernelResult};
 use tracing::warn;
 
 use crate::delta_types::FfiNullableStringMap;
@@ -140,7 +140,7 @@ fn visit_metadata_value_impl(
 pub fn extract_kernel_schema(
     state: &mut KernelSchemaVisitorState,
     schema_id: usize,
-) -> Result<StructType> {
+) -> KernelResult<StructType> {
     let schema_element = state
         .elements
         .take(schema_id)
@@ -559,11 +559,11 @@ pub unsafe extern "C" fn visit_field_geometry(
 #[cfg(feature = "geo-type-in-dev")]
 fn visit_field_geometry_impl(
     state: &mut KernelSchemaVisitorState,
-    name: Result<&str>,
-    crs: Result<&str>,
+    name: KernelResult<&str>,
+    crs: KernelResult<&str>,
     nullable: bool,
-    metadata: Result<HashMap<String, MetadataValue>>,
-) -> Result<usize> {
+    metadata: KernelResult<HashMap<String, MetadataValue>>,
+) -> KernelResult<usize> {
     let geometry = GeometryType::try_new(crs?)?;
     visit_field_primitive_impl(
         state,
@@ -607,12 +607,12 @@ pub unsafe extern "C" fn visit_field_geography(
 #[cfg(feature = "geo-type-in-dev")]
 fn visit_field_geography_impl(
     state: &mut KernelSchemaVisitorState,
-    name: Result<&str>,
-    crs: Result<&str>,
-    algorithm: Result<&str>,
+    name: KernelResult<&str>,
+    crs: KernelResult<&str>,
+    algorithm: KernelResult<&str>,
     nullable: bool,
-    metadata: Result<HashMap<String, MetadataValue>>,
-) -> Result<usize> {
+    metadata: KernelResult<HashMap<String, MetadataValue>>,
+) -> KernelResult<usize> {
     let algorithm = algorithm?
         .parse::<EdgeInterpolationAlgorithm>()
         .map_err(|err| {
@@ -702,7 +702,7 @@ pub unsafe extern "C" fn visit_field_struct(
     metadata: *const EngineMetadata,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name_str: Result<&str, KernelError> = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    let name_str: KernelResult<&str> = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
     let field_ids = unsafe { std::slice::from_raw_parts(field_ids, field_count) };
 
@@ -881,7 +881,7 @@ pub unsafe extern "C" fn visit_field_user_defined(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     #[cfg(feature = "udt-in-dev")]
-    let result = (|| -> Result<usize> {
+    let result = (|| -> KernelResult<usize> {
         let name = unsafe { name.try_to_string() }?;
         let annotation = unsafe { annotation.try_to_hash_map() }?;
         let metadata = visit_engine_metadata(unsafe { metadata.as_ref() })?;
@@ -895,7 +895,7 @@ pub unsafe extern "C" fn visit_field_user_defined(
         ))
     })();
     #[cfg(not(feature = "udt-in-dev"))]
-    let result: Result<usize> = {
+    let result: KernelResult<usize> = {
         let _ = (state, name, sql_type_id, annotation, nullable, metadata);
         Err(KernelError::unsupported(
             "UDT schema construction requires udt-in-dev",

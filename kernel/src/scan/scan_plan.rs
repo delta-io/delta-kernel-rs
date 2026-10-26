@@ -317,7 +317,7 @@ impl Scan {
         let has_partition_values_parsed =
             input_schema.contains_col([ADD_NAME, PARTITION_VALUES_PARSED_NAME]);
         let physical_partitions = self
-            .partition_values
+            .partition_values_options
             .parsed_struct
             .then_some(self.state_info.physical_partition_schema.as_ref())
             .flatten();
@@ -577,9 +577,9 @@ mod tests {
     use crate::unit_test_utils::{
         create_log_path, MockProtocolBuilder, MockTableConfigurationBuilder,
     };
-    use crate::{Engine as _, Result};
+    use crate::{Engine as _, KernelResult};
 
-    fn mock_snapshot(log_segment: LogSegment) -> Result<Arc<Snapshot>> {
+    fn mock_snapshot(log_segment: LogSegment) -> KernelResult<Arc<Snapshot>> {
         let table_configuration = MockTableConfigurationBuilder::new()
             .with_schema(partitioned_schema())
             .with_partition_columns(["p"])
@@ -666,7 +666,7 @@ mod tests {
     }
 
     // One add with JSON stats and no `stats_parsed`.
-    fn write_parquet_checkpoint(store: &Arc<InMemory>, path: &str) -> Result<()> {
+    fn write_parquet_checkpoint(store: &Arc<InMemory>, path: &str) -> KernelResult<()> {
         use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
         use crate::arrow::array::{
             Array, BooleanArray, Int64Array, RecordBatch, StringArray as SA,
@@ -769,7 +769,7 @@ mod tests {
         #[case] shape: CheckpointShape,
         #[case] file_type: FileType,
         #[case] checkpoint_arm_tags: Vec<&'static str>,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let segment = log_segment(
             log_root(),
             &["file:///_delta_log/00000000000000000001.json"],
@@ -795,7 +795,7 @@ mod tests {
         #[case] expect_native_partitions: bool,
         #[values(None, Some(struct_stats_schema()))] parsed_stats: Option<SchemaRef>,
         #[values(CheckpointType::Leaf, CheckpointType::Manifest)] checkpoint_type: CheckpointType,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let stats = StatsOptions::all();
         let partition_values = PartitionValuesOptions::with_struct();
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
@@ -858,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_plan_commits_only() -> Result<()> {
+    fn metadata_plan_commits_only() -> KernelResult<()> {
         let segment = log_segment(
             log_root(),
             &["file:///_delta_log/00000000000000000001.json"],
@@ -881,7 +881,7 @@ mod tests {
         #[case] shape: CheckpointShape,
         #[case] file_type: FileType,
         #[case] checkpoint_arm_tags: Vec<&'static str>,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(file_type)));
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
         let plan = scan.build_metadata_scan_plan(&shape)?.expect("non-empty");
@@ -890,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_plan_empty_is_none() -> Result<()> {
+    fn metadata_plan_empty_is_none() -> KernelResult<()> {
         let segment = log_segment(log_root(), &[], None);
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
         assert!(scan.build_metadata_scan_plan(&no_checkpoint())?.is_none());
@@ -898,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_plan_static_skip_all_is_none() -> Result<()> {
+    fn metadata_plan_static_skip_all_is_none() -> KernelResult<()> {
         let segment = log_segment(log_root(), &[], None);
         let scan = mock_snapshot(segment)?
             .scan_builder()
@@ -915,7 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_plan_executes_commit_dedup_with_sync_executor() -> Result<()> {
+    fn metadata_plan_executes_commit_dedup_with_sync_executor() -> KernelResult<()> {
         let store = Arc::new(InMemory::new());
         futures::executor::block_on(async {
             store
@@ -935,7 +935,7 @@ mod tests {
                     .into(),
                 )
                 .await?;
-            Result::<()>::Ok(())
+            KernelResult::<()>::Ok(())
         })?;
 
         let segment = log_segment(
@@ -986,7 +986,7 @@ mod tests {
     fn metadata_plan_executes_leaf_without_stats_parsed(
         #[case] lower_bound: i64,
         #[case] expected_rows: usize,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let store = Arc::new(InMemory::new());
         // A single-row parquet checkpoint carrying an `add` with a JSON `stats` string but no
         // `stats_parsed` column.

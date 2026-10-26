@@ -18,8 +18,8 @@ The `create_table` function returns a builder that you configure and then commit
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
-# use delta_kernel::Result;
-# fn example() -> Result<()> {
+# use delta_kernel::KernelResult;
+# fn example() -> KernelResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let schema = Arc::new(StructType::try_new([
@@ -53,8 +53,8 @@ Schemas are built from `StructField`s, each with a name, data type, and nullabil
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::Result;
-# fn example() -> Result<()> {
+# use delta_kernel::KernelResult;
+# fn example() -> KernelResult<()> {
 use std::sync::Arc;
 use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
@@ -105,8 +105,8 @@ You can set custom application properties on the table:
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
-# use delta_kernel::Result;
-# fn example() -> Result<()> {
+# use delta_kernel::KernelResult;
+# fn example() -> KernelResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let schema = Arc::new(StructType::try_new([
@@ -142,8 +142,8 @@ layout for queries that filter on the clustering columns:
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::transaction::data_layout::DataLayout;
-# use delta_kernel::Result;
-# fn example() -> Result<()> {
+# use delta_kernel::KernelResult;
+# fn example() -> KernelResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let schema = Arc::new(StructType::try_new([
@@ -198,8 +198,8 @@ entire directories when filtering on those columns.
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::transaction::data_layout::DataLayout;
-# use delta_kernel::Result;
-# fn example() -> Result<()> {
+# use delta_kernel::KernelResult;
+# fn example() -> KernelResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let schema = Arc::new(StructType::try_new([
@@ -353,8 +353,22 @@ Features enabled when specific column types or annotations appear in the schema.
 | Trigger | Reader/Writer feature | Writer feature | Properties set |
 |---------|-----------------------|----------------|----------------|
 | `VARIANT` type in schema | `variantType` | — | — |
+| `FILE` type in schema | `fileType-preview` | — | — |
 | `TIMESTAMP_NTZ` type in schema | `timestampNtz` | — | — |
 | Any field with `nullable: false` in schema | — | `invariants` | — |
+
+> [!NOTE]
+> Support for the `FILE` type is a preview. Kernel creates the table and reads a `FILE` column as
+> the struct of its six fields. It does not yet collect statistics for the column or resolve the
+> bytes a value refers to.
+>
+> The default engine's Parquet writer refuses to write a `FILE` column until it writes the
+> Parquet `FILE` logical-type annotation and the sub-field field ids. An engine that writes its
+> own Parquet files must write a `FILE` column as the protocol requires:
+>
+> - annotate the group with the Parquet `FILE` logical type, and
+> - under column mapping, set each sub-field's Parquet `field_id` to the column's field id plus
+>   its offset (`uri` +1, `offset` +2, `size` +3, `content_type` +4, `checksum` +5, `inline` +6).
 
 ### Feature-signal only
 

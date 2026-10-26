@@ -9,7 +9,7 @@ use delta_kernel::expressions::{
     JunctionPredicateOp, Predicate, Scalar, UnaryPredicateOp,
 };
 use delta_kernel::schema::{DataType, PrimitiveType};
-use delta_kernel::{KernelResult, Result};
+use delta_kernel::KernelResult;
 
 #[cfg(feature = "default-engine-base")]
 use crate::expressions::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
@@ -509,7 +509,7 @@ pub(crate) enum NullTypeTag {
 impl TryFrom<u8> for NullTypeTag {
     type Error = delta_kernel::KernelError;
 
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
+    fn try_from(value: u8) -> KernelResult<Self> {
         match value {
             0 => Ok(Self::Boolean),
             1 => Ok(Self::Byte),

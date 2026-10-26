@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use datafusion::common::DataFusionError;
+use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::LogicalPlan as DFLogicalPlan;
 use delta_kernel::plans::ir::plan::Plan as KernelPlan;
 use itertools::Itertools;
@@ -23,7 +23,7 @@ use crate::operator::lower_operator;
 ///
 /// # Errors
 /// Returns an error if `plan` has no nodes, or if lowering any individual node fails.
-pub(crate) fn to_df_plan(plan: &KernelPlan) -> Result<DFLogicalPlan, DataFusionError> {
+pub(crate) fn to_df_plan(plan: &KernelPlan) -> DFResult<DFLogicalPlan> {
     // A node is identified by its index, and `nodes` is topologically ordered: every input index is
     // strictly less than the node's own, so a single forward pass leaves each node's inputs already
     // lowered by the time it is reached.
@@ -92,7 +92,7 @@ mod tests {
         KernelPlanNode::new(KernelValues::new(test_schema(), rows), vec![])
     }
 
-    async fn execute(plan: &KernelPlan) -> Result<Vec<RecordBatch>, DataFusionError> {
+    async fn execute(plan: &KernelPlan) -> DFResult<Vec<RecordBatch>> {
         SessionContext::new()
             .execute_logical_plan(to_df_plan(plan)?)
             .await?

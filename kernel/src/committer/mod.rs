@@ -7,18 +7,19 @@
 //! By implementing the [`Committer`] trait, different catalogs can define what happens when the
 //! kernel needs to commit a transaction to a table. The goal terminal state of every
 //! [`Transaction`] is to be committed to the table. This means writing the changes (we call these
-//! actions) in the transaction as a new version of the table. The [`Committer`] trait exposes a
-//! single method, [`commit`] which takes an engine, an iterator of actions (as [`EngineData`]
-//! batches), and [`CommitMetadata`] (which includes critical commit metadata like the version to
-//! commit) to allow different catalogs to define what it means to 'commit' the actions to a table.
+//! actions) in the transaction as a new version of the table. The [`Committer`] trait exposes
+//! [`commit`] for engine data actions and, with declarative plans, `commit_declarative` for ordered
+//! relation references. Both take [`CommitMetadata`] (which includes critical commit metadata like
+//! the version to commit) to allow different catalogs to define what it means to 'commit' the
+//! actions to a table.
 //! For some, this may mean writing staged commits to object storage and retaining an in-memory list
 //! (server side) of commits. For others, this may mean writing new (version, actions) tuples to a
 //! database.
 //!
-//! The implementation of [`commit`] must ensure that the actions are committed atomically to the
+//! Implementations must ensure that actions are committed atomically to the
 //! table at the given version and either (1) persisted directly to object storage as published
 //! deltas as in non-catalog-managed tables or (2) persisted within the catalog and made available
-//! to readers during snapshot contstruction via the [`log_tail`] API.
+//! to readers during snapshot construction via the [`log_tail`] API.
 //!
 //! [`Transaction`]: crate::transaction::Transaction
 //! [`commit`]: crate::committer::Committer::commit
@@ -26,14 +27,22 @@
 //! [`EngineData`]: crate::EngineData
 
 mod commit_types;
+#[cfg(feature = "declarative-plans")]
+mod declarative;
 mod filesystem;
 mod publish_types;
 
 pub use commit_types::{CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType};
+#[cfg(feature = "declarative-plans")]
+pub use declarative::write_commit_json_declarative;
 pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
 
-use crate::{Engine, FilteredEngineData, Result, ResultIterator};
+#[cfg(feature = "declarative-plans")]
+use crate::plans::{RelationRef, ScopedPlanExecutor};
+#[cfg(feature = "declarative-plans")]
+use crate::KernelError;
+use crate::{Engine, FilteredEngineData, KernelResult, KernelResultIterator};
 
 /// A Committer is the system by which transactions are committed to a table. Transactions are
 /// effectively a collection of actions performed on the table at a specific version. The kernel
@@ -62,9 +71,27 @@ pub trait Committer: Send {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: ResultIterator<'_, FilteredEngineData>,
+        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         commit_metadata: CommitMetadata,
-    ) -> Result<CommitResponse>;
+    ) -> KernelResult<CommitResponse>;
+
+    /// Commits `actions`, at the version in `commit_metadata`, using a declarative plan `executor`.
+    ///
+    /// `actions` provides an *ordered* collection of RelationRefs that should be committed.
+    /// Each relation must have the same schema and remain valid within the provided `executor`
+    /// until this method returns.
+    /// Implementations must also provide the same atomicity and conflict behavior as `commit`.
+    #[cfg(feature = "declarative-plans")]
+    fn commit_declarative(
+        &self,
+        _executor: &dyn ScopedPlanExecutor,
+        _actions: Box<dyn Iterator<Item = RelationRef> + '_>,
+        _commit_metadata: CommitMetadata,
+    ) -> KernelResult<CommitResponse> {
+        Err(KernelError::unsupported(
+            "This committer does not support declarative commits",
+        ))
+    }
 
     /// Returns `true` if this committer is for a catalog-managed table, else `false`.
     fn is_catalog_committer(&self) -> bool;
@@ -103,5 +130,5 @@ pub trait Committer: Send {
     /// Returns an error if the publish operation fails.
     ///
     /// [`is_catalog_committer`]: Committer::is_catalog_committer
-    fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> Result<()>;
+    fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> KernelResult<()>;
 }

@@ -14,7 +14,7 @@ use itertools::Itertools;
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
-use crate::{Engine, EngineData, FileMeta, KernelResultIteratorStatic, Result};
+use crate::{Engine, EngineData, FileMeta, KernelResult, KernelResultIterator};
 
 /// Processes checkpoint leaf files in parallel using a shared processor.
 ///
@@ -34,7 +34,7 @@ use crate::{Engine, EngineData, FileMeta, KernelResultIteratorStatic, Result};
 #[internal_api]
 pub(crate) struct ParallelPhase<P: ParallelLogReplayProcessor> {
     processor: P,
-    leaf_checkpoint_reader: KernelResultIteratorStatic<ActionsBatch>,
+    leaf_checkpoint_reader: Box<dyn KernelResultIterator<ActionsBatch>>,
 }
 
 impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
@@ -52,7 +52,7 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
         processor: P,
         leaf_files: Vec<FileMeta>,
         read_schema: SchemaRef,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let leaf_checkpoint_reader = engine
             .parquet_handler()
             .read_parquet_files(&leaf_files, read_schema, None)?
@@ -76,7 +76,7 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
     #[allow(unused)]
     pub(crate) fn new_from_iter(
         processor: P,
-        iter: impl IntoIterator<Item = Result<Box<dyn EngineData>>, IntoIter: Send + 'static>,
+        iter: impl IntoIterator<Item = KernelResult<Box<dyn EngineData>>, IntoIter: Send + 'static>,
     ) -> Self {
         let leaf_checkpoint_reader = iter
             .into_iter()
@@ -105,12 +105,12 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
 /// the sequential phase) and returns the processed output.
 ///
 /// # Errors
-/// Returns `Result` errors for:
+/// Returns `KernelResult` errors for:
 /// - File reading failures
 /// - Parquet parsing errors
 /// - Processing errors from the processor
 impl<P: ParallelLogReplayProcessor> Iterator for ParallelPhase<P> {
-    type Item = Result<P::Output>;
+    type Item = KernelResult<P::Output>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.leaf_checkpoint_reader
@@ -164,7 +164,7 @@ mod tests {
         store: &Arc<InMemory>,
         path: &str,
         data: Box<dyn EngineData>,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let batch = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
 
@@ -195,7 +195,7 @@ mod tests {
     fn create_processor_with_seen_files(
         engine: &dyn crate::Engine,
         seen_paths: &[&str],
-    ) -> Result<ScanLogReplayProcessor> {
+    ) -> KernelResult<ScanLogReplayProcessor> {
         let state_info = Arc::new(get_simple_state_info(test_schema(), vec![])?);
 
         let seen_file_keys: HashSet<FileActionKey> = seen_paths
@@ -229,7 +229,7 @@ mod tests {
         add_paths: &[&str],
         seen_paths: &[&str],
         expected_paths: &[&str],
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
         let engine = SyncEngine::new_with_store(store.clone());
@@ -285,7 +285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parallel_phase_empty_hashmap_all_adds_pass() -> Result<()> {
+    async fn test_parallel_phase_empty_hashmap_all_adds_pass() -> KernelResult<()> {
         run_parallel_phase_test(
             &["file1.parquet", "file2.parquet", "file3.parquet"],
             &[],
@@ -295,7 +295,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parallel_phase_with_removes_filters_matching_adds() -> Result<()> {
+    async fn test_parallel_phase_with_removes_filters_matching_adds() -> KernelResult<()> {
         run_parallel_phase_test(
             &["file1.parquet", "file2.parquet", "file3.parquet"],
             &["file2.parquet"],
@@ -305,7 +305,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parallel_phase_all_files_removed() -> Result<()> {
+    async fn test_parallel_phase_all_files_removed() -> KernelResult<()> {
         run_parallel_phase_test(
             &["removed1.parquet", "removed2.parquet"],
             &["removed1.parquet", "removed2.parquet"],
@@ -315,7 +315,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parallel_phase_multiple_sidecars() -> Result<()> {
+    async fn test_parallel_phase_multiple_sidecars() -> KernelResult<()> {
         // This test uses multiple sidecar files, so we need custom logic
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
@@ -384,7 +384,7 @@ mod tests {
         engine: &dyn crate::Engine,
         snapshot: &SnapshotRef,
         predicate: Option<PredicateRef>,
-    ) -> Result<Vec<String>> {
+    ) -> KernelResult<Vec<String>> {
         let scan = snapshot
             .clone()
             .scan_builder()
@@ -407,7 +407,7 @@ mod tests {
         with_serde: bool,
         one_file_per_worker: bool,
         dispatcher: Option<tracing::Dispatch>,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
         let expected_paths = get_expected_paths(engine.as_ref(), &snapshot, predicate.clone())?;
@@ -453,7 +453,7 @@ mod tests {
                         let state = final_state.clone();
                         let dispatcher = dispatcher.clone();
 
-                        thread::spawn(move || -> Result<Vec<String>> {
+                        thread::spawn(move || -> KernelResult<Vec<String>> {
                             // Set the dispatcher in this thread to capture logs
                             let _guard = dispatcher.map(|d| tracing::dispatcher::set_default(&d));
 
@@ -508,7 +508,7 @@ mod tests {
     fn parallel_scan_metadata_phases_carry_correlation_id(
         #[case] with_serde: bool,
         #[case] expected_parallel: Option<&str>,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         // This table has checkpoint sidecars, so the sequential phase yields a parallel phase.
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
 
@@ -991,7 +991,7 @@ mod tests {
         #[case] test_case: ParallelLogReplayCase,
         #[values(false, true)] with_serde: bool,
         #[values(false, true)] one_file_per_worker: bool,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         use test_utils::LoggingTest;
 
         // Set up log capture
@@ -1021,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_with_skip_stats() -> Result<()> {
+    fn test_parallel_with_skip_stats() -> KernelResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
 
         // Get expected paths using single-node scan_metadata with skip_stats=true
@@ -1094,7 +1094,7 @@ mod tests {
     /// Sequential-only tables (single-part checkpoint, no sidecars) emit exactly one
     /// `ScanMetadataCompleted` event with `ScanType::SequentialPhase` when `finish()` is called.
     #[test]
-    fn sequential_done_phase_emits_sequential_scan_metadata_completed_event() -> Result<()> {
+    fn sequential_done_phase_emits_sequential_scan_metadata_completed_event() -> KernelResult<()> {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
@@ -1131,7 +1131,7 @@ mod tests {
     /// `ScanMetadataCompleted` events. The `operation_id` must be the same on both
     /// events so callers can correlate them.
     #[test]
-    fn parallel_scan_emits_correlated_sequential_and_parallel_events() -> Result<()> {
+    fn parallel_scan_emits_correlated_sequential_and_parallel_events() -> KernelResult<()> {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 

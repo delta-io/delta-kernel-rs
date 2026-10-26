@@ -10,7 +10,7 @@
 //! A generic trait [TaskExecutor] can be implemented with your preferred async
 //! runtime. Behind the `tokio` feature flag, we provide a both a single-threaded
 //! and multi-threaded executor based on Tokio.
-use delta_kernel::Result;
+use delta_kernel::KernelResult;
 use futures::future::BoxFuture;
 use futures::Future;
 
@@ -40,7 +40,7 @@ pub trait TaskExecutor: Send + Sync + 'static {
     where
         F: Future<Output = ()> + Send + 'static;
 
-    fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, Result<R>>
+    fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, KernelResult<R>>
     where
         T: FnOnce() -> R + Send + 'static,
         R: Send + 'static;
@@ -53,7 +53,7 @@ pub mod tokio {
     use std::mem::ManuallyDrop;
     use std::sync::mpsc::channel;
 
-    use delta_kernel::{KernelError, Result};
+    use delta_kernel::{KernelError, KernelResult};
     use futures::future::BoxFuture;
     use futures::{Future, TryFutureExt};
     use tokio::runtime::{EnterGuard, Handle, RuntimeFlavor};
@@ -174,7 +174,7 @@ pub mod tokio {
             self.send_future(Box::pin(task));
         }
 
-        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, Result<R>>
+        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, KernelResult<R>>
         where
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
@@ -227,7 +227,7 @@ pub mod tokio {
         pub fn new_owned_runtime(
             worker_threads: Option<usize>,
             max_blocking_threads: Option<usize>,
-        ) -> Result<Self> {
+        ) -> KernelResult<Self> {
             let mut builder = tokio::runtime::Builder::new_multi_thread();
             builder.enable_all();
 
@@ -299,7 +299,7 @@ pub mod tokio {
             self.handle.spawn(task);
         }
 
-        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, Result<R>>
+        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, KernelResult<R>>
         where
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,

@@ -20,7 +20,7 @@ use crate::parquet::data_type::{ByteArray, FixedLenByteArray};
 use crate::parquet::file::properties::WriterProperties;
 use crate::parquet::file::reader::FileReader;
 use crate::parquet::file::serialized_reader::SerializedFileReader;
-use crate::{Predicate, Result};
+use crate::{KernelResult, Predicate};
 
 /// Empty partition column set for tests that don't need partition columns.
 static NO_PARTITIONS: LazyLock<HashSet<String>> = LazyLock::new(HashSet::new);
@@ -969,7 +969,7 @@ impl OpaquePredicateOp for OpaqueLessThanOp {
         _evaluator: &DirectPredicateEvaluator<'_>,
         _exprs: &[Expression],
         _inverted: bool,
-    ) -> Result<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         unimplemented!("not needed for data skipping tests")
     }
 
@@ -1155,7 +1155,7 @@ fn checkpoint_filter_multi_row_group_skipping() {
 
     // Only RG1 (x in [400, 600]) survives: max(x) = 600 > 500.
     let reader = builder.build().unwrap();
-    let batches: Vec<_> = reader.into_iter().collect::<Result<_, _>>().unwrap();
+    let batches: Vec<_> = reader.into_iter().collect::<KernelResult<_, _>>().unwrap();
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 2);
 }

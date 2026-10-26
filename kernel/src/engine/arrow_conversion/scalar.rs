@@ -21,7 +21,7 @@ use crate::arrow::array::Array;
 use crate::arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
 use crate::expressions::Scalar;
 use crate::schema::DataType;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 /// Extracts a primitive kernel [`Scalar`] from the given row of an Arrow array.
 ///
@@ -37,7 +37,7 @@ use crate::{KernelError, KernelResult, Result};
 /// - The Arrow data type is not a supported primitive type (e.g., Struct, List, Map)
 /// - The Arrow data type is a `Timestamp` with a non-microsecond time unit
 /// - The decimal precision/scale is invalid
-pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> Result<Scalar> {
+pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> KernelResult<Scalar> {
     if row_idx >= array.len() {
         return Err(KernelError::generic(format!(
             "row index {row_idx} out of bounds for array of length {}",

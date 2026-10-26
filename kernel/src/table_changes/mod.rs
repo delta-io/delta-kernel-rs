@@ -55,7 +55,7 @@ use crate::table_properties::{
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult, Result, Version};
+use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Version};
 
 mod log_replay;
 mod net_changes;
@@ -257,7 +257,7 @@ impl TableChanges {
         engine: &dyn Engine,
         start_version: Version,
         end_version: Option<Version>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         Self::try_new_internal(
             table_root,
             engine,
@@ -298,7 +298,7 @@ impl TableChanges {
         engine: &dyn Engine,
         start_version: Version,
         end_version: Option<Version>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         Self::try_new_internal(
             table_root,
             engine,
@@ -432,7 +432,7 @@ impl TableChanges {
     /// [`TableChanges::try_new_row_tracking_cdf_listing`].
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
-    pub(crate) fn materialized_row_id_column_name(&self) -> Result<&str> {
+    pub(crate) fn materialized_row_id_column_name(&self) -> KernelResult<&str> {
         self.row_tracking_table_properties()?
             .materialized_row_id_column_name
             .as_deref()
@@ -451,7 +451,7 @@ impl TableChanges {
     /// [`TableChanges::try_new_row_tracking_cdf_listing`].
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
-    pub(crate) fn materialized_row_commit_version_column_name(&self) -> Result<&str> {
+    pub(crate) fn materialized_row_commit_version_column_name(&self) -> KernelResult<&str> {
         self.row_tracking_table_properties()?
             .materialized_row_commit_version_column_name
             .as_deref()
@@ -518,7 +518,7 @@ impl TableChanges {
         self: Arc<Self>,
         engine: Arc<dyn Engine>,
         mode: TableChangesListingMode,
-    ) -> Result<impl Iterator<Item = Result<TableChangesFileAction>>> {
+    ) -> KernelResult<impl KernelResultIterator<TableChangesFileAction>> {
         if self.mode != CdfMode::RowTracking {
             return Err(KernelError::unsupported(
                 "scan_file_listing is only supported for row-tracking change feeds; construct \

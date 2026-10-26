@@ -443,6 +443,10 @@ an opaque pointer when the API needs one.
 
 ### Error handling
 
+Rust helpers use `KernelResult<T>` and pass it to `IntoExternResult` to produce the C ABI's
+`ExternResult<T>`. Preserve `KernelError` variants through this conversion. `delta_kernel::Result<T>`
+uses the separate top-level `Error` envelope.
+
 There are two error directions, with opposite message owners:
 
 | Direction | Result envelope | Message construction | Final owner |
@@ -527,7 +531,7 @@ pub unsafe extern "C" fn set_metadata(
 unsafe fn set_metadata_impl(
     builder: *mut FfiBuilder,
     entries: CMetadataEntries,
-) -> Result<bool> {
+) -> KernelResult<bool> {
     let builder = unsafe { builder.as_mut() }
         .ok_or_else(|| KernelError::generic("builder must not be null"))?;
     let entries = match (entries.ptr.is_null(), entries.len) {
@@ -904,7 +908,9 @@ reuses `ScanMetadataArrowResult` with null `transforms`.
 ## Write Flow
 
 Rust builders are aliases for `TransactionBuilder<CreateTable>` and
-`TransactionBuilder<UpdateTable>`. Keep their concrete opaque FFI descriptors and explicit
+`TransactionBuilder<UpdateTable>`, both using the default `Imperative` execution mode. Rust callers
+can select another mode on the builder; the FFI descriptors expose imperative transactions.
+Keep their concrete opaque FFI descriptors and explicit
 `create_table_txn_builder_*` / `update_table_txn_builder_*` exports. Shared Rust setters do not imply
 a universal C handle; custom setters are exposed only for their applicable builder descriptor.
 Rust-only builder aliases carry `cbindgen:ignore` so header generation uses the descriptors rather
@@ -932,6 +938,13 @@ constructors likewise require engine info and `data_change`, with the operation 
 `CREATE TABLE`.
 
 `update_table_txn_commit()` and `create_table_txn_commit()` return a `Handle<ExclusiveCommittedTransaction>` that the caller can read via `committed_transaction_version` and `committed_transaction_post_commit_snapshot`, then must release with `free_committed_transaction`. The post-commit snapshot, when present, is a separate `SharedSnapshot` handle that must be freed with `free_snapshot`.
+
+Transaction identifiers can be added before build with the `*_txn_builder_with_transaction_id`
+setters, or after build with `update_table_txn_with_transaction_id` /
+`create_table_txn_with_transaction_id`. The post-build setters consume the transaction on success
+or error and return its replacement on success. Duplicate application ids among builder ids are
+rejected at build. Duplicates involving ids added after build, including collisions with builder
+ids, are rejected at commit.
 
 Write context: `update_table_txn_get_unpartitioned_write_context` covers unpartitioned tables. For partitioned tables, build a `PartitionValueMap` (`partition_value_map_new` + the typed `partition_value_map_insert_*` functions, one entry per partition column keyed by logical name) and pass it to `update_table_txn_get_partitioned_write_context` (consumes the map). Then use `get_write_dir` for the partition's target directory (Hive-style prefix or random prefix), `visit_partition_values` to read the physical `partitionValues` to record in each Add action, and `resolve_file_path` to turn a written file's URL into its relative `add.path`. The `create_table_*` variants apply the same flow to a create-table transaction whose partition columns were declared with `create_table_txn_builder_with_partition_columns`.
 

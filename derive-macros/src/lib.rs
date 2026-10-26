@@ -37,7 +37,7 @@ pub fn schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 pub fn try_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     // Wrap the block in a closure that anchors the block's `?` operators
     schema_macro::parse_schema(input, true, |block| {
-        quote! { (|| -> delta_kernel::Result<_> #block)() }
+        quote! { (|| -> delta_kernel::KernelResult<_> #block)() }
     })
 }
 
@@ -543,7 +543,7 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
 
             fn try_from(
                 value: delta_kernel::expressions::StructData,
-            ) -> delta_kernel::Result<Self> {
+            ) -> delta_kernel::KernelResult<Self> {
                 let mut fields =
                     delta_kernel::schema::derive_macro_utils::StructDataFields::try_new(
                         value,
@@ -569,7 +569,7 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
 
             fn try_from(
                 value: delta_kernel::expressions::Scalar,
-            ) -> delta_kernel::Result<Self> {
+            ) -> delta_kernel::KernelResult<Self> {
                 match value {
                     delta_kernel::expressions::Scalar::Struct(data) => data.try_into(),
                     other => Err(other.conversion_error(stringify!(#struct_name))),

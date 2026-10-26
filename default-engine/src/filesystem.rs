@@ -4,8 +4,8 @@ use bytes::Bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
 use delta_kernel::{
-    CancellationTokenRef, FileMeta, FileSlice, KernelError, KernelResult, Result,
-    ResultIteratorStatic, StorageHandler,
+    CancellationTokenRef, FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator,
+    StorageHandler,
 };
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
@@ -194,7 +194,7 @@ async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> KernelResult<FileMet
 }
 
 impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
-    fn list_from(&self, path: &Url) -> Result<ResultIteratorStatic<FileMeta>> {
+    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         self.list_from_with_cancellation(path, None)
     }
 
@@ -202,7 +202,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         path: &Url,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> Result<ResultIteratorStatic<FileMeta>> {
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         let future = list_from_impl(self.inner.clone(), path.clone());
         let iter = super::stream_future_to_cancellable_iter(
             self.task_executor.clone(),
@@ -218,7 +218,10 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
     ///
     /// Multiple reads may occur in parallel, depending on the configured readahead.
     /// See [`Self::with_readahead`].
-    fn read_files(&self, files: Vec<FileSlice>) -> Result<ResultIteratorStatic<Bytes>> {
+    fn read_files(
+        &self,
+        files: Vec<FileSlice>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
         self.read_files_with_cancellation(files, None)
     }
 
@@ -226,7 +229,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         files: Vec<FileSlice>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> Result<ResultIteratorStatic<Bytes>> {
+    ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
         let future = read_files_impl(self.inner.clone(), files, self.readahead);
         let iter = super::stream_future_to_cancellable_iter(
             self.task_executor.clone(),
@@ -236,25 +239,25 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         Ok(iter)
     }
 
-    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> Result<()> {
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> KernelResult<()> {
         let path = Path::from_url_path(path.path())?;
         self.task_executor
             .block_on(put_impl(self.inner.clone(), path, data, overwrite))
     }
 
-    fn copy_atomic(&self, src: &Url, dest: &Url) -> Result<()> {
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> KernelResult<()> {
         let src_path = Path::from_url_path(src.path())?;
         let dest_path = Path::from_url_path(dest.path())?;
         let future = copy_atomic_impl(self.inner.clone(), src_path, dest_path);
         self.task_executor.block_on(future)
     }
 
-    fn head(&self, path: &Url) -> Result<FileMeta> {
+    fn head(&self, path: &Url) -> KernelResult<FileMeta> {
         let future = head_impl(self.inner.clone(), path.clone());
         self.task_executor.block_on(future)
     }
 
-    fn delete(&self, path: &Url) -> Result<()> {
+    fn delete(&self, path: &Url) -> KernelResult<()> {
         let path = Path::from_url_path(path.path())?;
         self.task_executor
             .block_on(delete_impl(self.inner.clone(), path))

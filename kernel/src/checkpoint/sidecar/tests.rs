@@ -26,7 +26,7 @@ use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::schema::{schema, schema_ref, DataType, StructType};
 use crate::unit_test_utils::Action;
-use crate::{Engine, EngineData, KernelResult, Result, Snapshot};
+use crate::{Engine, EngineData, KernelResult, Snapshot};
 
 struct CheckpointParts {
     sidecar_files: Vec<Url>,
@@ -278,7 +278,7 @@ fn verify_non_file_batches(batches: &[Box<dyn EngineData>], expected: &ExpectedN
 /// Verifies: exactly 1 sidecar file, non-file batches buffered, iterator exhausted,
 /// action counts correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_generate_sidecars_single_sidecar() -> Result<()> {
+async fn test_generate_sidecars_single_sidecar() -> KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = new_sync_engine(store.clone());
 
@@ -341,7 +341,7 @@ async fn test_generate_sidecars_single_sidecar() -> Result<()> {
 /// batches with both file and non-file actions correctly split, and the row count of the
 /// file and non-file batches is correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
+async fn test_generate_sidecars_multiple_chunks() -> KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = new_sync_engine(store.clone());
 
@@ -451,7 +451,7 @@ async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
 /// V2 table with adds across multiple commits, hint=1 (very small).
 /// Verifies: produces multiple sidecar files, splitter is exhausted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_generate_sidecars_hint_one_per_batch() -> Result<()> {
+async fn test_generate_sidecars_hint_one_per_batch() -> KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = new_sync_engine(store.clone());
 
@@ -521,7 +521,7 @@ async fn test_generate_sidecars_hint_one_per_batch() -> Result<()> {
 /// 4. Validate the output schema includes `stats_parsed` and `partitionValues_parsed`.
 /// 5. Validate the actual values in `stats_parsed` and `partitionValues_parsed` match the input.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_generate_sidecars_stats_and_partition_values() -> Result<()> {
+async fn test_generate_sidecars_stats_and_partition_values() -> KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = new_sync_engine(store.clone());
 
@@ -633,7 +633,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> Result<()> {
 /// V2 table with only protocol + metadata (no adds/removes).
 /// Verifies: SidecarSplitter yields no file-action rows and buffers all non-file actions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_splitter_no_file_actions() -> Result<()> {
+async fn test_splitter_no_file_actions() -> KernelResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = new_sync_engine(store.clone());
 

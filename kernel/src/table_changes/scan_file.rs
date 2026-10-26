@@ -17,7 +17,7 @@ use crate::expressions::{col, lit, Expression};
 use crate::scan::state::DvInfo;
 use crate::schema::{lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, SchemaRef};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result, RowVisitor};
+use crate::{KernelError, KernelResult, KernelResultIterator, RowVisitor};
 
 // The type of action associated with a [`CdfScanFile`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,8 +197,8 @@ impl TableChangesScanFile {
 /// Transforms an iterator of [`TableChangesScanMetadata`] into an iterator of
 /// [`CdfScanFile`] by visiting the engine data.
 pub(crate) fn scan_metadata_to_scan_file(
-    scan_metadata: impl Iterator<Item = KernelResult<TableChangesScanMetadata>>,
-) -> impl Iterator<Item = KernelResult<CdfScanFile>> {
+    scan_metadata: impl KernelResultIterator<TableChangesScanMetadata>,
+) -> impl KernelResultIterator<CdfScanFile> {
     scan_metadata
         .map(|scan_metadata| -> KernelResult<_> {
             let scan_metadata = scan_metadata?;
@@ -336,7 +336,7 @@ fn read_file_side<'a>(
 }
 
 impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         require!(
             getters.len() == CDF_SCAN_FILE_GETTER_COUNT,
             KernelError::InternalError(format!(

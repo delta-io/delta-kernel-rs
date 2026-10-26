@@ -15,7 +15,7 @@
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::expressions::{DecimalData, Scalar};
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 /// The UNIX epoch (1970-01-01) expressed as a CE day number for chrono's
 /// `NaiveDate::from_num_days_from_ce_opt`, which counts from 0001-01-01.
@@ -77,7 +77,7 @@ pub(crate) fn would_serialize_to_null(value: &Scalar) -> bool {
 /// The inverse of [`PrimitiveType::parse_scalar`].
 ///
 /// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
-pub fn serialize_partition_value(value: &Scalar) -> Result<Option<String>> {
+pub fn serialize_partition_value(value: &Scalar) -> KernelResult<Option<String>> {
     match value {
         Scalar::Null(_) => Ok(None),
         Scalar::String(s) if s.is_empty() => Ok(None),

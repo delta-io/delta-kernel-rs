@@ -130,7 +130,7 @@ impl<I> CancellableIterator<I> {
 
 impl<I, T> Iterator for CancellableIterator<I>
 where
-    I: Iterator<Item = KernelResult<T>>,
+    I: Iterator<Item = KernelResult<T>> + Send,
 {
     type Item = KernelResult<T>;
 
@@ -153,6 +153,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+    use crate::KernelResultIterator;
 
     /// Minimal [`CancellationToken`] backed by an [`AtomicBool`], for tests.
     #[derive(Default)]
@@ -174,7 +175,7 @@ mod tests {
         }
     }
 
-    fn ok_iter(n: usize) -> impl Iterator<Item = KernelResult<usize>> {
+    fn ok_iter(n: usize) -> impl KernelResultIterator<usize> {
         (0..n).map(Ok)
     }
 

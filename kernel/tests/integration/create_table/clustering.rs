@@ -9,7 +9,7 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::Result;
+use delta_kernel::KernelResult;
 use rstest::rstest;
 use test_utils::{assert_result_error_with_message, test_table_setup};
 
@@ -18,7 +18,7 @@ use super::simple_schema;
 /// Builds a schema that supports clustering at depths 1, 2, and 5:
 ///   { id: int, name: string, address: { city: string, zip: string },
 ///     l1: { l2: { l3: { l4: { value: double } } } } }
-fn clustering_test_schema() -> Result<Arc<StructType>> {
+fn clustering_test_schema() -> KernelResult<Arc<StructType>> {
     Ok(schema_ref! {
         nullable "id": INTEGER,
         nullable "name": STRING,
@@ -45,7 +45,7 @@ fn clustering_test_schema() -> Result<Arc<StructType>> {
 #[case::nested_mismatched_casing(vec![vec!["ADDRESS", "CITY"]])]
 #[case::mixed(vec![vec!["id"], vec!["name"], vec!["address", "city"], vec!["address", "zip"], vec!["l1", "l2", "l3", "l4", "value"]])]
 #[tokio::test]
-async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> Result<()> {
+async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = clustering_test_schema()?;
     let input_cols: Vec<ColumnName> = col_paths
@@ -100,7 +100,7 @@ async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> Resul
 /// AND uses `DataLayout::Clustered`. Both would try to add DomainMetadata, but we should
 /// only have it once in the feature lists.
 #[tokio::test]
-async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> Result<()> {
+async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = simple_schema()?;
@@ -139,7 +139,7 @@ async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> Result<
 }
 
 #[tokio::test]
-async fn test_clustering_stats_columns_within_limit() -> Result<()> {
+async fn test_clustering_stats_columns_within_limit() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Build schema with 10 columns (cluster on column 5, within default 32 limit)
@@ -164,7 +164,7 @@ async fn test_clustering_stats_columns_within_limit() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_clustering_stats_columns_beyond_limit() -> Result<()> {
+async fn test_clustering_stats_columns_beyond_limit() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Build schema with 40 columns (cluster on column 35, beyond default 32 limit)
@@ -204,7 +204,7 @@ async fn test_clustering_stats_columns_beyond_limit() -> Result<()> {
 async fn test_clustering_column_error(
     #[case] col_path: Vec<&str>,
     #[case] expected_error: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = clustering_test_schema()?;
 

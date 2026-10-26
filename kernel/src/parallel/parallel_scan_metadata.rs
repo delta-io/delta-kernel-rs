@@ -12,7 +12,7 @@ use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 use crate::scan::log_replay::{ScanLogReplayProcessor, SerializableScanState};
 use crate::scan::ScanMetadata;
 use crate::schema::SchemaRef;
-use crate::{Engine, EngineData, FileMeta, KernelError, Result};
+use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult};
 
 /// Result of sequential scan metadata processing.
 ///
@@ -55,7 +55,7 @@ impl SequentialScanMetadata {
         }
     }
 
-    pub fn finish(self) -> Result<AfterSequentialScanMetadata> {
+    pub fn finish(self) -> KernelResult<AfterSequentialScanMetadata> {
         let _guard = self.span.enter();
         match self.sequential.finish()? {
             AfterSequential::Done(processor) => {
@@ -101,7 +101,7 @@ impl SequentialScanMetadata {
 }
 
 impl Iterator for SequentialScanMetadata {
-    type Item = Result<ScanMetadata>;
+    type Item = KernelResult<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let _guard = self.span.enter();
@@ -128,7 +128,10 @@ pub struct ParallelState {
 impl ParallelLogReplayProcessor for Arc<ParallelState> {
     type Output = ScanMetadata;
 
-    fn process_actions_batch_parallel(&self, actions_batch: ActionsBatch) -> Result<Self::Output> {
+    fn process_actions_batch_parallel(
+        &self,
+        actions_batch: ActionsBatch,
+    ) -> KernelResult<Self::Output> {
         self.inner.process_actions_batch_parallel(actions_batch)
     }
 }
@@ -185,7 +188,7 @@ impl ParallelState {
     /// Returns an error if the state cannot be serialized (e.g., contains opaque predicates).
     #[internal_api]
     #[allow(unused)]
-    pub(crate) fn into_serializable_state(self) -> Result<SerializableScanState> {
+    pub(crate) fn into_serializable_state(self) -> KernelResult<SerializableScanState> {
         self.inner.into_serializable_state()
     }
 
@@ -199,7 +202,7 @@ impl ParallelState {
     pub(crate) fn from_serializable_state(
         engine: &dyn Engine,
         state: SerializableScanState,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let inner = ScanLogReplayProcessor::from_serializable_state(engine, state)?;
         Ok(Self {
             inner,
@@ -220,7 +223,7 @@ impl ParallelState {
     /// # Errors
     /// Returns an error if the state cannot be serialized.
     #[allow(unused)]
-    pub fn into_bytes(self) -> Result<Vec<u8>> {
+    pub fn into_bytes(self) -> KernelResult<Vec<u8>> {
         let state = self.into_serializable_state()?;
         serde_json::to_vec(&state).map_err(|e| {
             KernelError::generic(format!("Failed to serialize ParallelState to bytes: {e}"))
@@ -236,7 +239,7 @@ impl ParallelState {
     /// - `engine`: Engine for creating evaluators and filters
     /// - `bytes`: The serialized bytes from a previous `into_bytes()` call
     #[allow(unused)]
-    pub fn from_bytes(engine: &dyn Engine, bytes: &[u8]) -> Result<Self> {
+    pub fn from_bytes(engine: &dyn Engine, bytes: &[u8]) -> KernelResult<Self> {
         let state: SerializableScanState =
             serde_json::from_slice(bytes).map_err(KernelError::MalformedJson)?;
         Self::from_serializable_state(engine, state)
@@ -253,7 +256,7 @@ impl ParallelScanMetadata {
         engine: Arc<dyn Engine>,
         state: Arc<ParallelState>,
         leaf_files: Vec<FileMeta>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let read_schema = state.file_read_schema();
         Ok(Self {
             processor: ParallelPhase::try_new(engine, state, leaf_files, read_schema)?,
@@ -264,7 +267,7 @@ impl ParallelScanMetadata {
 
     pub fn new_from_iter(
         state: Arc<ParallelState>,
-        iter: impl IntoIterator<Item = Result<Box<dyn EngineData>>, IntoIter: Send + 'static>,
+        iter: impl IntoIterator<Item = KernelResult<Box<dyn EngineData>>, IntoIter: Send + 'static>,
     ) -> Self {
         Self {
             processor: ParallelPhase::new_from_iter(state.clone(), iter),
@@ -275,7 +278,7 @@ impl ParallelScanMetadata {
 }
 
 impl Iterator for ParallelScanMetadata {
-    type Item = Result<ScanMetadata>;
+    type Item = KernelResult<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let _guard = self.span.enter();

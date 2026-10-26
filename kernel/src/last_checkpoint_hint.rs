@@ -17,7 +17,7 @@ use crate::actions::{
 use crate::cancellation::CancellationTokenRef;
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
-use crate::{FileMeta, KernelError, KernelResult, Result, StorageHandler, Version};
+use crate::{FileMeta, KernelError, KernelResult, StorageHandler, Version};
 
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
 /// created for the table. This file is used as a hint for the engine to quickly locate
@@ -117,7 +117,7 @@ pub(crate) enum CheckpointType {
 // fires if a read-in hint is ever serialized back -- in which case failing closed is correct.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl Serialize for CheckpointType {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> KernelResult<S::Ok, S::Error> {
         match self {
             CheckpointType::AdaptiveMetadataTree => {
                 serializer.serialize_str("AdaptiveMetadataTree")
@@ -296,7 +296,7 @@ impl LastCheckpointHint {
         checksum: Option<String>,
         tags: Option<HashMap<String, String>>,
         v2_checkpoint: Option<LastCheckpointV2>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let checkpoint_schema = checkpoint_schema
             .map(|schema| serde_json::from_str::<crate::schema::StructType>(&schema).map(Arc::new))
             .transpose()?;
@@ -427,7 +427,7 @@ impl LastCheckpointHint {
 
     /// Returns the path of the `_last_checkpoint` file given the log root of a table.
     #[internal_api]
-    pub(crate) fn path(log_root: &Url) -> Result<Url> {
+    pub(crate) fn path(log_root: &Url) -> KernelResult<Url> {
         Ok(log_root.join(LAST_CHECKPOINT_FILE_NAME)?)
     }
 
@@ -571,7 +571,7 @@ mod tests {
     use crate::schema::schema;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::create_log_path;
-    use crate::ResultIteratorStatic;
+    use crate::KernelResultIterator;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::{engine::sync::SyncEngine, object_store::memory::InMemory, Engine};
 
@@ -929,7 +929,7 @@ mod tests {
     /// cover.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn checkpoint_action_cross_serializes_between_log_and_hint() -> Result<()> {
+    fn checkpoint_action_cross_serializes_between_log_and_hint() -> KernelResult<()> {
         use crate::actions::ContentRoot;
         use crate::engine::to_json_bytes;
         use crate::engine_data::FilteredEngineData;
@@ -1329,7 +1329,7 @@ mod tests {
         created_time: 1739313200623,
         config: &[("delta.checkpointPolicy", "v2")],
     })]
-    fn v2_last_checkpoint_hint_contents(#[case] expected: ExpectedHint) -> Result<()> {
+    fn v2_last_checkpoint_hint_contents(#[case] expected: ExpectedHint) -> KernelResult<()> {
         use crate::unit_test_utils::load_test_table;
 
         let ExpectedHint {
@@ -1491,25 +1491,25 @@ mod tests {
     struct NoIoStorageHandler;
 
     impl StorageHandler for NoIoStorageHandler {
-        fn list_from(&self, _path: &Url) -> Result<ResultIteratorStatic<FileMeta>> {
+        fn list_from(&self, _path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
             panic!("list_from should not be called");
         }
         fn read_files(
             &self,
             _files: Vec<crate::FileSlice>,
-        ) -> Result<ResultIteratorStatic<bytes::Bytes>> {
+        ) -> KernelResult<Box<dyn KernelResultIterator<bytes::Bytes>>> {
             panic!("read_files should not be called");
         }
-        fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> Result<()> {
+        fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> KernelResult<()> {
             panic!("put should not be called");
         }
-        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> Result<()> {
+        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> KernelResult<()> {
             panic!("copy_atomic should not be called");
         }
-        fn head(&self, _path: &Url) -> Result<FileMeta> {
+        fn head(&self, _path: &Url) -> KernelResult<FileMeta> {
             panic!("head should not be called");
         }
-        fn delete(&self, _path: &Url) -> Result<()> {
+        fn delete(&self, _path: &Url) -> KernelResult<()> {
             panic!("delete should not be called");
         }
     }

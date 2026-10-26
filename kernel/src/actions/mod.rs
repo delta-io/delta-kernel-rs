@@ -15,7 +15,7 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::amt_path_util::resolve_amt_location;
+use crate::amt_path_util::amt_manifest_filemeta;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::Scalar;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -31,10 +31,10 @@ use crate::table_features::{
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
-use crate::utils::require;
+use crate::utils::{require, to_file_size};
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::{create_row, Engine};
-use crate::{EngineData, FileMeta, FileSize, KernelError, KernelResult, Result, RowVisitor as _};
+use crate::{create_row, Engine, Version};
+use crate::{EngineData, FileMeta, KernelError, KernelResult, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
@@ -399,7 +399,7 @@ impl Metadata {
         partition_columns: Vec<String>,
         created_time: i64,
         configuration: HashMap<String, String>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         // Validate that the schema does not contain metadata columns
         // Note: We don't have to look for nested metadata columns because that is already validated
         // when creating a StructType.
@@ -427,7 +427,7 @@ impl Metadata {
     }
 
     #[internal_api]
-    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> Result<Option<Metadata>> {
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> KernelResult<Option<Metadata>> {
         let mut visitor = MetadataVisitor::default();
         visitor.visit_rows_of(data)?;
         Ok(visitor.metadata)
@@ -489,7 +489,7 @@ impl Metadata {
     /// declares a type the kernel doesn't support, or [`KernelError::MalformedJson`] for other
     /// JSON decoding failures.
     #[internal_api]
-    pub(crate) fn parse_schema(&self) -> Result<StructType> {
+    pub(crate) fn parse_schema(&self) -> KernelResult<StructType> {
         // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
         serde_json::from_str(&self.schema_string).map_err(|error| {
             // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
@@ -614,7 +614,7 @@ struct ProtocolRaw {
 impl TryFrom<ProtocolRaw> for Protocol {
     type Error = KernelError;
 
-    fn try_from(protocol: ProtocolRaw) -> Result<Self> {
+    fn try_from(protocol: ProtocolRaw) -> KernelResult<Self> {
         Protocol::try_new(
             protocol.min_reader_version,
             protocol.min_writer_version,
@@ -668,7 +668,7 @@ impl Protocol {
         min_writer_version: i32,
         reader_features: Option<impl IntoIterator<Item = impl Into<TableFeature>>>,
         writer_features: Option<impl IntoIterator<Item = impl Into<TableFeature>>>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         require!(
             min_reader_version >= MIN_VALID_RW_VERSION,
             KernelError::InvalidProtocol(format!(
@@ -978,6 +978,14 @@ impl CommitInfo {
         self.data_change = Some(data_change);
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn set_last_manifest_commit(
+        &mut self,
+        last_manifest_commit: Option<LastManifestCommit>,
+    ) {
+        self.last_manifest_commit = last_manifest_commit;
+    }
+
     /// Merges the supplied tags into this CommitInfo's tags.
     ///
     /// Existing values take precedence when both maps contain the same key.
@@ -1090,7 +1098,7 @@ pub(crate) struct Add {
 
 fn deserialize_partition_values<'de, D>(
     deserializer: D,
-) -> Result<HashMap<String, String>, D::Error>
+) -> KernelResult<HashMap<String, String>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -1103,7 +1111,7 @@ where
             formatter.write_str("a map of nullable partition values")
         }
 
-        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        fn visit_map<A>(self, mut map: A) -> KernelResult<Self::Value, A::Error>
         where
             A: MapAccess<'de>,
         {
@@ -1447,7 +1455,7 @@ impl LastManifestCommit {
     /// pair can never be constructed. Mirrors the validation on `CheckpointAction`.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn new(version: i64, content_root_version: i64) -> Result<Self> {
+    pub(crate) fn new(version: i64, content_root_version: i64) -> KernelResult<Self> {
         let last_manifest_commit = LastManifestCommit {
             version,
             content_root_version,
@@ -1473,6 +1481,19 @@ impl LastManifestCommit {
             KernelError::generic(format!(
                 "lastManifestCommit contentRootVersion {} exceeds version {}",
                 self.content_root_version, self.version
+            ))
+        );
+        Ok(())
+    }
+
+    /// Errors unless this names a manifest commit at or before `commit_version`, the version of
+    /// the commit or CRC that carries it.
+    pub(crate) fn ensure_at_or_before(&self, commit_version: Version) -> KernelResult<()> {
+        require!(
+            u64::try_from(self.version).is_ok_and(|v| v <= commit_version),
+            KernelError::generic(format!(
+                "lastManifestCommit version {} exceeds commit version {commit_version}",
+                self.version
             ))
         );
         Ok(())
@@ -1578,7 +1599,7 @@ impl Serialize for CheckpointAction {
     /// `try_into_scalar` (`checkpointMetadata`, `contentRoot`, `protocol`, `metaData`,
     /// then `txn`, `domainMetadata`, and the `txn`/`domainMetadata` sidecars). Validates first,
     /// so an invalid action can never be written through serde either.
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> KernelResult<S::Ok, S::Error> {
         self.validate().map_err(serde::ser::Error::custom)?;
         let checkpoint_metadata = CheckpointMetadata {
             version: self.version,
@@ -1630,7 +1651,7 @@ impl<'de> Deserialize<'de> for CheckpointAction {
     /// checkpointMetadata.version` invariant. The one intended difference is unknown elements:
     /// this path fails closed on an unrecognized element key (see [`CheckpointActionElement`]),
     /// whereas the visitor skips it for forward compatibility.
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> KernelResult<Self, D::Error> {
         let elements = Vec::<CheckpointActionElement>::deserialize(deserializer)?;
         Self::from_elements(elements).map_err(serde::de::Error::custom)
     }
@@ -1762,7 +1783,7 @@ impl CheckpointAction {
 
     /// Serialize this checkpoint action into a single-row `EngineData`.
     #[internal_api]
-    pub(crate) fn into_engine_data(self, engine: &dyn Engine) -> Result<Box<dyn EngineData>> {
+    pub(crate) fn into_engine_data(self, engine: &dyn Engine) -> KernelResult<Box<dyn EngineData>> {
         create_row(
             engine,
             LOG_CHECKPOINT_SCHEMA.clone(),
@@ -1777,7 +1798,9 @@ impl CheckpointAction {
     /// element is missing or repeated, an element or sidecar `type` is unrecognized, or
     /// `contentRoot.version` exceeds `checkpointMetadata.version`.
     #[internal_api]
-    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> Result<Option<CheckpointAction>> {
+    pub(crate) fn try_new_from_data(
+        data: &dyn EngineData,
+    ) -> KernelResult<Option<CheckpointAction>> {
         let mut visitor = visitors::CheckpointVisitor::default();
         visitor.visit_rows_of(data)?;
         Ok(visitor.checkpoint)
@@ -1787,8 +1810,8 @@ impl CheckpointAction {
     /// action, mirroring [`visitors::CheckpointVisitor`]: the four required elements are singletons
     /// (missing or repeated is an error), `txn`/`domainMetadata` are collected, `sidecar` entries
     /// are split by their `type` (unknown types error), and the assembled action is validated.
-    fn from_elements(elements: Vec<CheckpointActionElement>) -> Result<Self> {
-        fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> Result<()> {
+    fn from_elements(elements: Vec<CheckpointActionElement>) -> KernelResult<Self> {
+        fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> KernelResult<()> {
             require!(
                 slot.replace(value).is_none(),
                 KernelError::generic(format!("duplicate `{name}` element in checkpoint action"))
@@ -1890,13 +1913,14 @@ impl CheckpointAction {
     ///
     /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
     #[internal_api]
-    pub(crate) fn root_filemeta(&self, table_root: &Url) -> Result<FileMeta> {
+    pub(crate) fn root_filemeta(&self, table_root: &Url) -> KernelResult<FileMeta> {
         let content_root = &self.content_root;
-        Ok(FileMeta {
-            location: resolve_amt_location(&content_root.path, table_root)?,
-            last_modified: i64::MAX,
-            size: to_file_size(content_root.size_in_bytes, "checkpoint contentRoot")?,
-        })
+        amt_manifest_filemeta(
+            &content_root.path,
+            content_root.size_in_bytes,
+            table_root,
+            "checkpoint contentRoot",
+        )
     }
 
     /// The table protocol embedded in this checkpoint action (at [`Self::version`]).
@@ -1938,16 +1962,6 @@ pub(crate) struct Sidecar {
     /// A map containing any additional metadata about the logical file. Values can be null.
     #[allow_null_container_values]
     pub tags: Option<HashMap<String, String>>,
-}
-
-/// Convert an `i64` byte count from a log action into a [`FileSize`], erroring with `context` (a
-/// short action name, e.g. `"sidecar"`) and the offending value when it is negative.
-fn to_file_size(bytes: i64, context: &str) -> KernelResult<FileSize> {
-    bytes.try_into().map_err(|_| {
-        KernelError::generic(format!(
-            "Failed to convert {context} size {bytes} to FileSize"
-        ))
-    })
 }
 
 impl Sidecar {
@@ -2099,6 +2113,8 @@ mod tests {
     use crate::expressions::{Scalar, StructData};
     use crate::schema::{schema, schema_ref, DataType, MapType, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::FileSize;
     use crate::{
         create_row, Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
     };
@@ -3233,14 +3249,14 @@ mod tests {
         "metadata/root.parquet",
         -1,
         "memory:///table/metadata/root.parquet",
-        Err("Failed to convert checkpoint contentRoot size -1")
+        Err("Failed to convert checkpoint contentRoot 'metadata/root.parquet' size -1")
     )]
     fn test_checkpoint_action_root_filemeta(
         #[case] table_root: &str,
         #[case] path: &str,
         #[case] size_in_bytes: i64,
         #[case] expected_location: &str,
-        #[case] expected: Result<FileSize, &str>,
+        #[case] expected: KernelResult<FileSize, &str>,
     ) {
         let table_root = Url::parse(table_root).unwrap();
         let checkpoint_action = CheckpointAction {
@@ -3304,7 +3320,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_scalar_round_trip() -> Result<()> {
+    fn test_checkpoint_action_scalar_round_trip() -> KernelResult<()> {
         let engine = ExprEngine::new();
         let action = sample_checkpoint_action();
         let scalar = action.clone().try_into_scalar()?;
@@ -3335,7 +3351,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_wire_format() -> Result<()> {
+    fn test_checkpoint_action_wire_format() -> KernelResult<()> {
         // Build the action's engine data, then write it out through the engine JSON writer and
         // pin the exact bytes. This is the only guard on the wire format: element order, camelCase
         // field names, the sidecar `type` discriminator, and the JSON writer's null omission (the
@@ -3371,7 +3387,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_try_new_from_data_returns_none_when_no_checkpoint_action() -> Result<()> {
+    fn test_try_new_from_data_returns_none_when_no_checkpoint_action() -> KernelResult<()> {
         // `action_batch` carries many action kinds but no `checkpoint` array, so parsing yields
         // `Ok(None)` rather than an error.
         let data = crate::unit_test_utils::action_batch();
@@ -3381,7 +3397,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_round_trip_multiple_and_empty_collections() -> Result<()> {
+    fn test_checkpoint_action_round_trip_multiple_and_empty_collections() -> KernelResult<()> {
         // Exercise the write loops and the reader's accumulation for count > 1 (two txns, two
         // domainMetadata, two same-type sidecars) and count 0 (empty domainMetadata sidecars).
         let sidecar = |path: &str| Sidecar {
@@ -3437,7 +3453,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_checkpoint_action_round_trip_protocol_with_features() -> Result<()> {
+    fn test_checkpoint_action_round_trip_protocol_with_features() -> KernelResult<()> {
         // A (3, 7) protocol with the same ReaderWriter feature in both lists (required by the
         // read-time feature-consistency check) must survive scalar conversion -> parse.
         let action = CheckpointAction {

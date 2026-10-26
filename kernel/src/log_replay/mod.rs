@@ -23,7 +23,7 @@ use url::Url;
 
 use crate::engine_data::GetData;
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
-use crate::{EngineData, KernelResult, Result};
+use crate::{EngineData, KernelResult};
 
 pub(crate) mod deduplicator;
 
@@ -245,7 +245,10 @@ impl ActionsBatch {
 #[internal_api]
 pub(crate) trait ParallelLogReplayProcessor {
     type Output;
-    fn process_actions_batch_parallel(&self, actions_batch: ActionsBatch) -> Result<Self::Output>;
+    fn process_actions_batch_parallel(
+        &self,
+        actions_batch: ActionsBatch,
+    ) -> KernelResult<Self::Output>;
 }
 
 impl<T> ParallelLogReplayProcessor for Arc<T>
@@ -254,7 +257,10 @@ where
 {
     type Output = T::Output;
 
-    fn process_actions_batch_parallel(&self, actions_batch: ActionsBatch) -> Result<Self::Output> {
+    fn process_actions_batch_parallel(
+        &self,
+        actions_batch: ActionsBatch,
+    ) -> KernelResult<Self::Output> {
         T::process_actions_batch_parallel(self, actions_batch)
     }
 }
@@ -278,7 +284,7 @@ mod tests {
     use crate::engine_data::GetData;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::Result;
+    use crate::KernelResult;
 
     /// Mock GetData implementation for testing
     struct MockGetData {
@@ -313,7 +319,7 @@ mod tests {
     }
 
     impl<'a> GetData<'a> for MockGetData {
-        fn get_str(&'a self, row_index: usize, field_name: &str) -> Result<Option<&'a str>> {
+        fn get_str(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<&'a str>> {
             if let Some(error_msg) = self.errors.get(&(row_index, field_name.to_string())) {
                 return Err(crate::KernelError::Generic(error_msg.clone()));
             }
@@ -323,7 +329,7 @@ mod tests {
                 .map(|s| s.as_str()))
         }
 
-        fn get_int(&'a self, row_index: usize, field_name: &str) -> Result<Option<i32>> {
+        fn get_int(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<i32>> {
             if let Some(error_msg) = self.errors.get(&(row_index, field_name.to_string())) {
                 return Err(crate::KernelError::Generic(error_msg.clone()));
             }
@@ -333,7 +339,7 @@ mod tests {
                 .cloned())
         }
 
-        fn get_long(&'a self, row_index: usize, field_name: &str) -> Result<Option<i64>> {
+        fn get_long(&'a self, row_index: usize, field_name: &str) -> KernelResult<Option<i64>> {
             if let Some(error_msg) = self.errors.get(&(row_index, field_name.to_string())) {
                 return Err(crate::KernelError::Generic(error_msg.clone()));
             }
@@ -416,7 +422,7 @@ mod tests {
         #[case] root: Option<&str>,
         #[case] expected_add_dv_id: &str,
         #[case] expect_cancelled: bool,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let mut seen = HashSet::new();
         let root = root.map(|r| Url::parse(r).unwrap());
         let mut deduplicator = create_deduplicator_with_root(&mut seen, true, root.clone());
@@ -485,7 +491,7 @@ mod tests {
     fn test_extract_file_action_add(
         #[case] raw_size: Option<i64>,
         #[case] expected_size: u64,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let mut seen = HashSet::new();
         let deduplicator = create_deduplicator(&mut seen, true);
 
@@ -507,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_file_action_remove() -> Result<()> {
+    fn test_extract_file_action_remove() -> KernelResult<()> {
         let mut seen = HashSet::new();
         let deduplicator = create_deduplicator(&mut seen, true);
 
@@ -525,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_file_action_with_deletion_vector() -> Result<()> {
+    fn test_extract_file_action_with_deletion_vector() -> KernelResult<()> {
         let mut seen = HashSet::new();
         let deduplicator = create_deduplicator(&mut seen, true);
 
@@ -549,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_file_action_skip_removes() -> Result<()> {
+    fn test_extract_file_action_skip_removes() -> KernelResult<()> {
         let mut seen = HashSet::new();
         let deduplicator = create_deduplicator(&mut seen, true);
 
@@ -571,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_file_action_no_action_found() -> Result<()> {
+    fn test_extract_file_action_no_action_found() -> KernelResult<()> {
         let mut seen = HashSet::new();
         let deduplicator = create_deduplicator(&mut seen, true);
 
@@ -649,7 +655,7 @@ mod tests {
     // ==================== CheckpointDeduplicator Tests ====================
 
     #[test]
-    fn test_checkpoint_extract_file_action_add() -> Result<()> {
+    fn test_checkpoint_extract_file_action_add() -> KernelResult<()> {
         let seen = HashSet::new();
         let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3, None)?;
 
@@ -668,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_extract_file_action_with_deletion_vector() -> Result<()> {
+    fn test_checkpoint_extract_file_action_with_deletion_vector() -> KernelResult<()> {
         let seen = HashSet::new();
         let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 1, 2, None)?;
 
@@ -693,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_deduplicator_filters_commit_duplicates() -> Result<()> {
+    fn test_checkpoint_deduplicator_filters_commit_duplicates() -> KernelResult<()> {
         let mut seen = HashSet::new();
 
         // Files "seen" during commit processing

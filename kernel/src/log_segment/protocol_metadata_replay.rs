@@ -35,7 +35,7 @@ use crate::schema::{
     column_name, schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
     StructField, StructType,
 };
-use crate::{Engine, EngineData, KernelError, KernelResult, Result, Version};
+use crate::{Engine, EngineData, KernelError, KernelResult, KernelResultIterator, Version};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -44,9 +44,8 @@ impl LogSegment {
     /// The `crc` parameter is the CRC eagerly resolved by the caller; it is used to
     /// short-circuit or seed the replay.
     ///
-    /// Under `adaptive-metadata-in-dev`, the result's `checkpoint_action` is a
-    /// [`CheckpointActionResolution`] describing how the latest AMT checkpoint action was resolved
-    /// (captured by replay, named by the CRC, or unresolved), for the caller to store on the
+    /// Under `adaptive-metadata-in-dev`, the result's `captured_checkpoint_action` is the latest
+    /// AMT checkpoint action when replay captured it, for the caller to store on the
     /// [`Snapshot`](crate::Snapshot).
     #[instrument(name = "log_seg.load_p_m", skip_all, fields(enable_call_frame), err)]
     pub(crate) fn read_protocol_metadata_opt(
@@ -91,11 +90,9 @@ impl LogSegment {
                 .filter(|(v, _)| *v > crc.version as i64)
                 .map(|(_, p)| p);
             // The pruned replay only reads commits after the CRC version, but a hit there is still
-            // the latest action: any action at or below the CRC is older. A miss stays `Unresolved`
-            // because the latest action may sit at or below the CRC, which this replay never reads.
+            // the latest action: any action at or below the CRC is older.
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            let checkpoint_action =
-                CheckpointActionResolution::from_replay(candidate.checkpoint.map(|(_, c)| c));
+            let captured_checkpoint_action = candidate.checkpoint.map(|(_, c)| Arc::new(c));
 
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 info!("Found P&M from pruned log replay");
@@ -104,7 +101,9 @@ impl LogSegment {
                     protocol: protocol_opt,
                     source: ProtocolMetadataSource::CrcSeededPmOnlyReplay,
                     #[cfg(feature = "adaptive-metadata-in-dev")]
-                    checkpoint_action,
+                    captured_checkpoint_action,
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    last_manifest_commit: LastManifestCommitResolution::Unresolved,
                 });
             }
 
@@ -117,7 +116,9 @@ impl LogSegment {
                 protocol: protocol_opt.or_else(|| Some(crc.protocol.clone())),
                 source: ProtocolMetadataSource::CrcSeededPmOnlyReplay,
                 #[cfg(feature = "adaptive-metadata-in-dev")]
-                checkpoint_action,
+                captured_checkpoint_action,
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                last_manifest_commit: LastManifestCommitResolution::Unresolved,
             });
         }
 
@@ -128,9 +129,9 @@ impl LogSegment {
             protocol: candidate.protocol.map(|(_, p)| p),
             source: ProtocolMetadataSource::FullReplay,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            checkpoint_action: CheckpointActionResolution::from_replay(
-                candidate.checkpoint.map(|(_, c)| c),
-            ),
+            captured_checkpoint_action: candidate.checkpoint.map(|(_, c)| Arc::new(c)),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit: LastManifestCommitResolution::Unresolved,
         })
     }
 
@@ -220,7 +221,7 @@ impl LogSegment {
     fn read_pm_batches_via_plan(
         &self,
         executor: &dyn PlanExecutor,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<VersionedBatch>> + Send> {
+    ) -> KernelResult<impl KernelResultIterator<VersionedBatch>> {
         let plan = self.build_pm_plan()?;
 
         let batches = executor
@@ -244,7 +245,7 @@ impl LogSegment {
     fn read_pm_batches(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<VersionedBatch>> + Send> {
+    ) -> KernelResult<impl KernelResultIterator<VersionedBatch>> {
         let (commit_schema, checkpoint_schema) = pm_replay_schemas();
         // Commit schema only: `_file` in the checkpoint schema would break its skipping predicate.
         let file_column =
@@ -283,37 +284,17 @@ impl LogSegment {
     }
 }
 
-/// How the latest AMT `checkpoint` action was resolved during P&M replay, stored on the
-/// [`Snapshot`](crate::Snapshot) so consumers can read it without re-scanning the log.
+/// How a snapshot's `lastManifestCommit` was resolved at build time, stored on the
+/// [`Snapshot`](crate::Snapshot) so consumers can read it without opening the log.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[derive(Debug)]
-pub(crate) enum CheckpointActionResolution {
-    /// The latest `checkpoint` action, captured during replay.
-    Captured(Arc<CheckpointAction>),
-    /// Not captured, but the CRC carries a [`LastManifestCommit`] naming the commit that emitted
-    /// the latest checkpoint action. The CRC is authoritative: a consumer reads that one commit
-    /// and never scans the log, and a commit that is missing from the segment or does not
-    /// carry the described action is an error (the CRC and the log are inconsistent).
-    Located(LastManifestCommit),
-    /// Replay did not settle it and no pointer is available -- a miss, which does not prove
-    /// absence since replay can stop early. Consumers fall back to a log scan.
+#[derive(Debug, Clone)]
+pub(crate) enum LastManifestCommitResolution {
+    /// Read from the CRC at the snapshot version or the committing transaction. `None` means the
+    /// table has no manifest commit at this version.
+    Resolved(Option<LastManifestCommit>),
+    /// The build never read the snapshot version's commitInfo; consumers read it from that
+    /// version's commit file.
     Unresolved,
-}
-
-#[cfg(feature = "adaptive-metadata-in-dev")]
-impl CheckpointActionResolution {
-    /// Resolves a replay's checkpoint-action find. A hit is the latest action: replay keeps the
-    /// highest `checkpointMetadata.version` across the batches it reaches, and checkpoint versions
-    /// strictly increase, so an earlier-stopping replay can only skip older actions. A miss does
-    /// not prove absence (the action may sit in a batch the replay stopped before, or at/below a
-    /// seeding CRC version), so it stays [`Unresolved`](Self::Unresolved) for the accessor to
-    /// settle by scanning.
-    fn from_replay(checkpoint: Option<CheckpointAction>) -> Self {
-        match checkpoint {
-            Some(action) => Self::Captured(Arc::new(action)),
-            None => Self::Unresolved,
-        }
-    }
 }
 
 /// Result of a P&M resolution (see [`LogSegment::read_protocol_metadata_opt`]).
@@ -322,25 +303,31 @@ pub(crate) struct PmResolution {
     pub(crate) protocol: Option<Protocol>,
     /// How the Protocol and Metadata were resolved.
     pub(crate) source: ProtocolMetadataSource,
-    /// How the latest AMT `checkpoint` action was resolved: captured during replay, named by the
-    /// CRC's `lastManifestCommit`, or unresolved. See [`CheckpointActionResolution`].
+    /// The latest AMT `checkpoint` action, when replay happened to read it. This only saves a
+    /// read: `lastManifestCommit`, which the CRC or the snapshot version's `commitInfo` always
+    /// carries, is the authority on the action and the snapshot follows it when this is `None`.
+    /// A hit is the latest action, since replay keeps the highest `checkpointMetadata.version`
+    /// it reaches and checkpoint versions strictly increase.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub(crate) checkpoint_action: CheckpointActionResolution,
+    pub(crate) captured_checkpoint_action: Option<Arc<CheckpointAction>>,
+    /// How the segment's `lastManifestCommit` was resolved. See [`LastManifestCommitResolution`].
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) last_manifest_commit: LastManifestCommitResolution,
 }
 
 impl PmResolution {
     /// P&M taken from a CRC that short-circuits replay. With no replay to capture the checkpoint
-    /// action, the CRC's [`LastManifestCommit`] pointer becomes a
-    /// [`Located`](CheckpointActionResolution::Located) when present, else it is `Unresolved`.
+    /// action, the CRC's [`LastManifestCommit`] is what later locates it.
     pub(crate) fn from_crc(crc: &Crc, source: ProtocolMetadataSource) -> Self {
         Self {
             metadata: Some(crc.metadata.clone()),
             protocol: Some(crc.protocol.clone()),
             source,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            checkpoint_action: crc.last_manifest_commit_opt.clone().map_or(
-                CheckpointActionResolution::Unresolved,
-                CheckpointActionResolution::Located,
+            captured_checkpoint_action: None,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit: LastManifestCommitResolution::Resolved(
+                crc.last_manifest_commit_opt.clone(),
             ),
         }
     }
@@ -366,7 +353,7 @@ struct VersionedBatch {
 
 /// The newest Protocol and Metadata across `batches`.
 fn resolve_pm_batches(
-    batches: impl Iterator<Item = KernelResult<VersionedBatch>>,
+    batches: impl KernelResultIterator<VersionedBatch>,
 ) -> KernelResult<PmCandidate> {
     let mut metadata: Option<(i64, Metadata)> = None;
     let mut protocol: Option<(i64, Protocol)> = None;
@@ -414,7 +401,11 @@ fn batch_version(data: &dyn EngineData) -> KernelResult<Version> {
                 LazyLock::new(|| (vec![column_name!("_file")], vec![DataType::STRING]).into());
             NAMES_AND_TYPES.as_ref()
         }
-        fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+        fn visit<'a>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'a dyn GetData<'a>],
+        ) -> KernelResult<()> {
             if self.file.is_none() && row_count > 0 {
                 self.file = getters[0].get_opt(0, "_file")?;
             }
@@ -494,7 +485,7 @@ fn pm_candidate(
         // captured solely from commits. The plan path instead projects every union input with one
         // schema that includes the column and marks all batches as log batches, so it can also
         // capture the action from checkpoint parts. Both land on the same answer because a non-plan
-        // miss falls back to the full log scan in `latest_checkpoint_action`.
+        // miss is resolved through `lastManifestCommit` in `latest_checkpoint_action`.
         let checkpoint = if batch.is_log_batch {
             CheckpointAction::try_new_from_data(actions)?
         } else {
@@ -541,7 +532,11 @@ fn pm_versions_from_plan_output(
             });
             NAMES_AND_TYPES.as_ref()
         }
-        fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+        fn visit<'a>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'a dyn GetData<'a>],
+        ) -> KernelResult<()> {
             if row_count > 0 {
                 self.protocol = getters[0].get_opt(0, "protocol_version")?;
                 self.metadata = getters[1].get_opt(0, "metadata_version")?;
@@ -574,14 +569,14 @@ mod tests {
     use crate::plans::{Operation, PlanExecutor, PlanResult};
     use crate::Snapshot;
     #[cfg(feature = "declarative-plans")]
-    use crate::{KernelError, Result};
+    use crate::{KernelError, KernelResult};
 
     #[cfg(feature = "declarative-plans")]
     struct FailingPlanExecutor;
 
     #[cfg(feature = "declarative-plans")]
     impl PlanExecutor for FailingPlanExecutor {
-        fn execute_op(&self, _op: Operation) -> Result<PlanResult> {
+        fn execute_op(&self, _op: Operation) -> KernelResult<PlanResult> {
             Err(KernelError::generic("plan executor deliberately failed"))
         }
     }

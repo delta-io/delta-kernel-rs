@@ -1,7 +1,7 @@
 //! Some utilities for working with arrow data types
 
-use crate::KernelResult;
 pub(crate) mod apply_schema;
+mod file_values;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -14,6 +14,7 @@ use itertools::Itertools;
 use tracing::debug;
 
 use self::apply_schema::apply_schema_to_struct;
+use self::file_values::validate_file_values;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
     make_array, new_null_array, Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray,
@@ -42,7 +43,7 @@ use crate::schema::{
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
-use crate::{EngineData, KernelError, Result};
+use crate::{EngineData, KernelError, KernelResult, KernelResultIterator};
 
 macro_rules! prim_array_cmp {
     ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
@@ -179,7 +180,7 @@ impl RowIndexBuilder {
     ///
     /// Returns an error if there are duplicate or out of bounds row group ordinals.
     #[internal_api]
-    pub(crate) fn build(self) -> Result<FlattenedRangeIterator<i64>> {
+    pub(crate) fn build(self) -> KernelResult<FlattenedRangeIterator<i64>> {
         let starting_offsets = match self.row_group_ordinals {
             Some(ordinals) => {
                 let mut seen_ordinals = HashSet::with_capacity(ordinals.len());
@@ -235,6 +236,9 @@ impl RowIndexBuilder {
 /// `DataTypeCompat::NeedsCast` into an actual `arrow::compute::cast`, so post-reorder leaf types
 /// are `Identical` to the kernel target.
 ///
+/// **File values.** A non-null `file` value that resolves to no referent (neither `uri` nor
+/// `inline` set, or `offset` set without `uri`) fails the read, as the File type requires.
+///
 /// **Cost.** O(F) per batch where F is the total number of fields (including nested). Row data
 /// (Arrow buffers, offsets, null buffers) is shared via `Arc` and never copied.
 #[internal_api]
@@ -244,11 +248,13 @@ pub(crate) fn fixup_parquet_read(
     row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
     file_location: Option<&str>,
     target_schema: Option<&SchemaRef>,
-) -> Result<ArrowEngineData> {
+) -> KernelResult<ArrowEngineData> {
     let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)?;
     let data = fix_nested_null_masks(data);
     let data = if let Some(schema) = target_schema {
-        apply_schema_to_struct(&data, schema)?
+        let data = apply_schema_to_struct(&data, schema)?;
+        validate_file_values(&data, schema)?;
+        data
     } else {
         data
     };
@@ -520,7 +526,8 @@ fn get_indices(
             match field.data_type() {
                 ArrowDataType::Struct(fields) => {
                     if let DataType::Struct(requested_schema)
-                    | DataType::Variant(requested_schema) = requested_type
+                    | DataType::Variant(requested_schema)
+                    | DataType::File(requested_schema) = requested_type
                     {
                         let mask_before = mask_indices.len();
                         let (parquet_advance, children) = get_indices(
@@ -853,7 +860,7 @@ fn match_parquet_fields<'k, 'p>(
 pub(crate) fn parquet_read_plan(
     requested_schema: &SchemaRef,
     file_metadata: &ArrowReaderMetadata,
-) -> Result<(Vec<ReorderIndex>, Option<ProjectionMask>)> {
+) -> KernelResult<(Vec<ReorderIndex>, Option<ProjectionMask>)> {
     let (indices, reorder) = get_requested_indices(requested_schema, file_metadata.schema())?;
     let mask = generate_mask(file_metadata.parquet_schema(), &indices);
     Ok((reorder, mask))
@@ -1227,7 +1234,7 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
 pub(crate) fn parse_json(
     json_strings: Box<dyn EngineData>,
     schema: SchemaRef,
-) -> Result<Box<dyn EngineData>> {
+) -> KernelResult<Box<dyn EngineData>> {
     let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
     let result = parse_json_impl(json_strings.column(0).as_ref(), schema)?;
     Ok(Box::new(ArrowEngineData::new(result)))
@@ -1410,7 +1417,14 @@ fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> KernelResult
 /// [`MAP_ROOT_DEFAULT`]: crate::engine::arrow_conversion::MAP_ROOT_DEFAULT
 /// [`LIST_ARRAY_ROOT`]: crate::engine::arrow_conversion::LIST_ARRAY_ROOT
 /// [`arrow_conversion`]: crate::engine::arrow_conversion
-#[cfg(test)]
+#[cfg(any(
+    test,
+    all(
+        feature = "test-utils",
+        feature = "declarative-plans",
+        feature = "default-engine-base"
+    )
+))]
 pub(crate) fn coerce_columns_to_schema(
     columns: Vec<ArrowArrayRef>,
     target: &ArrowSchemaRef,
@@ -1499,7 +1513,7 @@ impl EncoderFactory for NullValueMapEncoderFactory {
         field: &'a ArrowFieldRef,
         array: &'a dyn ArrowArray,
         _options: &'a EncoderOptions,
-    ) -> Result<Option<NullableEncoder<'a>>, crate::arrow::error::ArrowError> {
+    ) -> KernelResult<Option<NullableEncoder<'a>>, crate::arrow::error::ArrowError> {
         // `make_encoder` needs a new `EncoderOptions` in order to set `with_explicit_nulls`. The
         // lifetime of the created encoder becomes tied to the lifetime of the `EncoderOptions`,
         // and local options would be freed here. We also can't put the options inside the
@@ -1540,8 +1554,8 @@ impl Encoder for NullMapPlaceholderEncoder {
 // TODO (zach): this should stream data to the JSON writer and output an iterator.
 #[internal_api]
 pub(crate) fn to_json_bytes(
-    data: impl Iterator<Item = Result<FilteredEngineData>> + Send,
-) -> Result<Vec<u8>> {
+    data: impl KernelResultIterator<FilteredEngineData>,
+) -> KernelResult<Vec<u8>> {
     let builder = WriterBuilder::new().with_encoder_factory(Arc::new(NullValueMapEncoderFactory));
     let mut writer = builder.build::<_, LineDelimited>(Vec::new());
     for chunk in data {
@@ -1562,7 +1576,7 @@ pub(crate) fn fixup_json_read(
     batch: RecordBatch,
     reorder_indices: &[ReorderIndex],
     file_location: &str,
-) -> Result<ArrowEngineData> {
+) -> KernelResult<ArrowEngineData> {
     let data = reorder_struct_array(batch.into(), reorder_indices, None, Some(file_location))?;
     Ok(data.into())
 }
@@ -1582,7 +1596,7 @@ pub(crate) fn fixup_json_read(
 /// - Use [`json_arrow_schema`] to strip metadata columns before passing the schema to the JSON
 ///   reader.
 #[internal_api]
-pub(crate) fn build_json_reorder_indices(schema: &StructType) -> Result<Vec<ReorderIndex>> {
+pub(crate) fn build_json_reorder_indices(schema: &StructType) -> KernelResult<Vec<ReorderIndex>> {
     // Real columns: position in reorder_indices IS the source column index (0..N in schema
     // order), and reorder_index.index carries the output position.
     let mut reorder_indices = Vec::with_capacity(schema.num_fields());
@@ -1618,7 +1632,7 @@ pub(crate) fn build_json_reorder_indices(schema: &StructType) -> Result<Vec<Reor
 /// once on the same schema and apply `reorder_struct_array` to each resulting batch to
 /// insert the synthesized metadata columns at their correct positions.
 #[internal_api]
-pub(crate) fn json_arrow_schema(schema: &StructType) -> Result<ArrowSchema> {
+pub(crate) fn json_arrow_schema(schema: &StructType) -> KernelResult<ArrowSchema> {
     let json_fields = schema.with_fields_filtered(|f| f.get_metadata_column_spec().is_none())?;
     Ok(ArrowSchema::try_from_kernel(&json_fields)?)
 }
@@ -3847,7 +3861,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_json() -> Result<()> {
+    fn test_write_json() -> KernelResult<()> {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "string",
             ArrowDataType::Utf8,
@@ -3868,7 +3882,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_json_bytes_filters_data() -> Result<()> {
+    fn test_to_json_bytes_filters_data() -> KernelResult<()> {
         // Create test data with 4 rows
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "value",

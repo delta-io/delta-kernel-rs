@@ -89,8 +89,14 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
 - `arrow-conversion`, `arrow-expression`: Arrow interop (auto-enabled by `default-engine-base`)
 - `prettyprint`: enables Arrow pretty-print helpers (primarily test/example oriented)
 - `schema-diff`: experimental schema diffing
-- `check-constraints-in-dev`: enables the internal SQL tokenizer and single-comparison parser for
-  check-constraint development
+- `check-constraints-in-dev`: CHECK constraints support (experimental, in development). Gates
+  `KernelSupport::Supported` for the `checkConstraints` writer feature (without it, writes to
+  tables that support the feature, including legacy writer version 3 and above, are blocked). With
+  it, kernel discovers constraints and exposes their raw SQL through `check_constraints()` on
+  `Snapshot` and `Transaction`, and on a constrained table `write_state` and every commit require
+  `Transaction::ack_check_constraints`. Kernel does not evaluate constraint SQL, so enforcement is
+  the connector's responsibility. CREATE TABLE rejects `delta.constraints.*` properties in every
+  build. Also gates the internal SQL tokenizer and parser.
 - `adaptive-metadata-in-dev`: adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature. Without it, reads and writes to tables listing
@@ -118,8 +124,11 @@ table at a specific version. From it you build a `Scan` (reads) or `Transaction`
 
 
 **Write path:** `Snapshot` -> `UpdateTableTransactionBuilder` -> `Transaction` -> `commit()`.
-`UpdateTableTransactionBuilder` aliases `TransactionBuilder<UpdateTable>`; the create-table
-builder aliases `TransactionBuilder<CreateTable>`. Common setters have one generic implementation.
+`UpdateTableTransactionBuilder<MODE>` aliases `TransactionBuilder<UpdateTable, MODE>`; the
+create-table builder aliases `TransactionBuilder<CreateTable, MODE>`. The mode defaults to
+`Imperative`. Both entry points return imperative builders; with `declarative-plans`,
+`with_execution_mode::<MODE>()` selects the mode returned by `build()`. Common setters have one
+generic implementation.
 The sealed `TransactionType` trait selects opaque type-specific state; specialized implementations
 provide constructors, custom setters, and build validation.
 `Snapshot::update_table(operation, engine_info, data_change)` requires all three values at
@@ -303,8 +312,8 @@ is the source of truth. Key concepts:
   `icebergCompatV3`, `identityColumns`, `inCommitTimestamp`, `invariants`,
   `materializePartitionColumns`, `rowTracking`
 - Reader + writer: `adaptiveMetadata-preview`, `catalogManaged`, `catalogOwned-preview`,
-  `columnMapping`, `deletionVectors`, `geospatial`, `timestampNtz`,
-  `typeWidening`, `typeWidening-preview`, `v2Checkpoint`, `vacuumProtocolCheck`,
+  `columnMapping`, `deletionVectors`, `fileType`, `fileType-preview`, `geospatial`,
+  `timestampNtz`, `typeWidening`, `typeWidening-preview`, `v2Checkpoint`, `vacuumProtocolCheck`,
   `variantShredding`, `variantShredding-preview`, `variantType`, `variantType-preview`
 
 Keep this list updated when new protocol features are added to kernel.
@@ -359,9 +368,13 @@ Keep this list updated when new protocol features are added to kernel.
     binding/field, a `[DataType]`/`Vec<DataType>` element, or a `&DataType` argument),
     prefer `DataType::from(ArrayType::new(...))` over
     `DataType::Array(Box::new(ArrayType::new(...)))`.
-- Prefer the `ResultIterator<'a, T>` / `ResultIteratorStatic<T>` aliases over
-  hand-rolled `Box<dyn Iterator<Item = Result<T>> + Send (+ 'a)>`.
-  Private kernel-error streams use `KernelResultIterator` / `KernelResultIteratorStatic`.
+- Kernel APIs use `KernelResult<T, E = KernelError>`, which defaults to `KernelError` and permits
+  an explicit error type. `Result<T>` is reserved for the top-level `Error` envelope. Wrap kernel
+  errors explicitly with `Error::Kernel` when returning it.
+- Prefer the `KernelResultIterator<T>` marker trait over spelling
+  `Iterator<Item = KernelResult<T>> + Send`, including in public APIs. Use
+  `impl KernelResultIterator<T>` for unboxed streams and `Box<dyn KernelResultIterator<T>>`
+  (`'static`) or `Box<dyn KernelResultIterator<T> + '_>` (borrowed) at dyn/storage boundaries.
 - Prefer the `lit` / `null_lit` constructors over `Expression::literal(...)` / `lit(Scalar::Null(...))`
   when building expressions inline. They take `impl Into<Scalar>` and `impl Into<DataType>`,
   respectively. Prefer `Predicate::TRUE` / `FALSE` / `NULL` for predicates whose value is statically

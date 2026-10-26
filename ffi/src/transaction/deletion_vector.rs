@@ -8,7 +8,7 @@ use std::os::raw::c_int;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::transaction::Transaction;
-use delta_kernel::{KernelError, KernelResult, Result};
+use delta_kernel::{KernelError, KernelResult};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use super::ExclusiveUpdateTableTransaction;
@@ -102,7 +102,7 @@ impl From<KernelDvStorageType> for DeletionVectorStorageType {
 impl TryFrom<c_int> for KernelDvStorageType {
     type Error = KernelError;
 
-    fn try_from(value: c_int) -> Result<Self> {
+    fn try_from(value: c_int) -> KernelResult<Self> {
         match value {
             0 => Ok(Self::PersistedRelative),
             1 => Ok(Self::Inline),

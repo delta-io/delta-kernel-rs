@@ -4,7 +4,7 @@ use delta_kernel::transaction::CommitResult;
 
 use super::ExclusiveCommittedTransaction;
 use crate::handle::Handle;
-use crate::{OptionalValue, Result, SharedSnapshot};
+use crate::{KernelResult, OptionalValue, SharedSnapshot};
 
 /// Converts a [`CommitResult`] to an owned FFI handle, or returns an error when the commit was not
 /// successful.
@@ -13,8 +13,8 @@ use crate::{OptionalValue, Result, SharedSnapshot};
 /// [`free_committed_transaction`].
 // TODO(#3504): Preserve retryable and conflicted transaction state across the FFI boundary.
 pub(super) fn commit_result_to_committed_handle<STATE>(
-    result: Result<CommitResult<STATE>>,
-) -> Result<Handle<ExclusiveCommittedTransaction>> {
+    result: KernelResult<CommitResult<STATE>>,
+) -> KernelResult<Handle<ExclusiveCommittedTransaction>> {
     match result? {
         CommitResult::Committed(committed) => Ok(Box::new(committed).into()),
         CommitResult::Retryable(_) => Err(delta_kernel::KernelError::unsupported(

@@ -17,7 +17,7 @@ use crate::schema::{
     MapType, PrimitiveType, StructField, StructType,
 };
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 /// Pairs [`Into<Scalar>`] with [`ToDataType`] for infallible container conversions.
 ///
@@ -35,7 +35,7 @@ pub struct DecimalData {
 }
 
 impl DecimalData {
-    pub fn try_new(bits: impl Into<i128>, ty: DecimalType) -> Result<Self> {
+    pub fn try_new(bits: impl Into<i128>, ty: DecimalType) -> KernelResult<Self> {
         let bits = bits.into();
         require!(
             ty.precision() >= get_decimal_precision(bits),
@@ -83,7 +83,7 @@ impl ArrayData {
     pub fn try_new(
         tpe: ArrayType,
         elements: impl IntoIterator<Item = impl Into<Scalar>>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let elements = elements
             .into_iter()
             .map(|v| {
@@ -160,7 +160,7 @@ impl MapData {
     pub fn try_new(
         data_type: MapType,
         values: impl IntoIterator<Item = (impl Into<Scalar>, impl Into<Scalar>)>,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let key_type = data_type.key_type();
         let val_type = data_type.value_type();
         let pairs = values
@@ -254,7 +254,7 @@ impl StructData {
     /// - if the number of fields and values do not match
     /// - if the data types of the values do not match the data types of the fields
     /// - if a null value is assigned to a non-nullable field
-    pub fn try_new(fields: Vec<StructField>, values: Vec<Scalar>) -> Result<Self> {
+    pub fn try_new(fields: Vec<StructField>, values: Vec<Scalar>) -> KernelResult<Self> {
         require!(
             fields.len() == values.len(),
             KernelError::invalid_struct_data(format!(
@@ -417,7 +417,7 @@ impl Scalar {
     }
 
     /// Constructs a Decimal value from raw parts
-    pub fn decimal(bits: impl Into<i128>, precision: u8, scale: u8) -> Result<Self> {
+    pub fn decimal(bits: impl Into<i128>, precision: u8, scale: u8) -> KernelResult<Self> {
         let dtype = DecimalType::try_new(precision, scale)?;
         let dval = DecimalData::try_new(bits, dtype)?;
         Ok(Self::Decimal(dval))
@@ -698,7 +698,7 @@ macro_rules! impl_try_from_scalar {
             impl TryFrom<Scalar> for $rust_type {
                 type Error = KernelError;
 
-                fn try_from(scalar: Scalar) -> Result<Self> {
+                fn try_from(scalar: Scalar) -> KernelResult<Self> {
                     match scalar {
                         Scalar::$variant(value) => Ok(value.into()),
                         other => Err(other.conversion_error(stringify!($rust_type))),
@@ -730,7 +730,7 @@ impl_try_from_scalar!(
 impl<T: TryFrom<Scalar, Error = KernelError> + ToDataType> TryFrom<Scalar> for Option<T> {
     type Error = KernelError;
 
-    fn try_from(scalar: Scalar) -> Result<Self> {
+    fn try_from(scalar: Scalar) -> KernelResult<Self> {
         match scalar {
             Scalar::Null(data_type) => {
                 let expected = T::to_data_type();
@@ -752,7 +752,7 @@ where
 {
     type Error = KernelError;
 
-    fn try_from(scalar: Scalar) -> Result<Self> {
+    fn try_from(scalar: Scalar) -> KernelResult<Self> {
         let array: ArrayData = scalar.try_into()?;
         let element = T::get_struct_field("element");
         let expected = ArrayType::new(element.data_type().clone(), element.is_nullable());
@@ -792,7 +792,7 @@ where
 {
     type Error = KernelError;
 
-    fn try_from(scalar: Scalar) -> Result<Self> {
+    fn try_from(scalar: Scalar) -> KernelResult<Self> {
         let map: MapData = scalar.try_into()?;
         let value = V::get_struct_field("value");
         let expected = MapType::new(
@@ -855,7 +855,7 @@ impl PrimitiveType {
     /// Returns [`KernelError::ParseError`] if `raw` is not a valid encoding of this type.
     ///
     /// [partition value serialization]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
-    pub fn parse_scalar(&self, raw: &str) -> Result<Scalar, KernelError> {
+    pub fn parse_scalar(&self, raw: &str) -> KernelResult<Scalar> {
         use PrimitiveType::*;
 
         if raw.is_empty() {
@@ -1273,7 +1273,7 @@ mod tests {
         expect_int: i128,
         expect_prec: u8,
         expect_scale: u8,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<()> {
         let s = PrimitiveType::decimal(expect_prec, expect_scale)?;
         match s.parse_scalar(raw)? {
             Scalar::Decimal(val) => {
@@ -1350,7 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_decimal() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_parse_decimal() -> KernelResult<()> {
         assert_decimal("0.999", 999, 3, 3)?;
         assert_decimal("0", 0, 1, 0)?;
         assert_decimal("0.00", 0, 3, 2)?;

@@ -57,8 +57,8 @@ use crate::unit_test_utils::{geography_type, geometry_type};
 use crate::Snapshot;
 use crate::{
     EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, KernelResult,
-    ParquetFooter, ParquetHandler, Predicate, PredicateRef, Result, ResultIteratorStatic,
-    RowVisitor, StorageHandler,
+    KernelResultIterator, ParquetFooter, ParquetHandler, Predicate, PredicateRef, RowVisitor,
+    StorageHandler,
 };
 
 /// Processes sidecar files for the given checkpoint batch.
@@ -71,7 +71,7 @@ fn process_sidecars(
     batch: &dyn EngineData,
     checkpoint_read_schema: SchemaRef,
     meta_predicate: Option<PredicateRef>,
-) -> KernelResult<Option<impl Iterator<Item = KernelResult<Box<dyn EngineData>>> + Send>> {
+) -> KernelResult<Option<impl KernelResultIterator<Box<dyn EngineData>>>> {
     // Visit the rows of the checkpoint batch to extract sidecar file references
     let mut visitor = SidecarVisitor::default();
     visitor.visit_rows_of(batch)?;
@@ -201,7 +201,7 @@ async fn write_multi_row_group_parquet_to_store(
 
 /// Returns the materialized row count and sorted paths of all materialized Add actions.
 fn collect_materialized_adds(
-    actions: impl Iterator<Item = KernelResult<ActionsBatch>>,
+    actions: impl KernelResultIterator<ActionsBatch>,
 ) -> KernelResult<(usize, Vec<String>)> {
     let mut rows = 0;
     let mut add_paths: Vec<String> = Vec::new();
@@ -242,19 +242,19 @@ impl ParquetHandler for IgnorePredicateParquetHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         self.0.read_parquet_files(files, physical_schema, None)
     }
 
     fn write_parquet_file(
         &self,
         location: Url,
-        data: ResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> Result<FileSize> {
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<FileSize> {
         self.0.write_parquet_file(location, data)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
         self.0.read_parquet_footer(file)
     }
 }
@@ -313,6 +313,171 @@ fn staged_commit_log_paths(versions: &[Version]) -> Vec<ParsedLogPath> {
         .map(|v| staged_commit_path_for_version(*v))
         .map(|path| create_log_path_with_size(&format!("memory:///{}", path.as_ref()), 100))
         .collect()
+}
+
+#[rstest]
+#[case::empty(vec![], false, Some(0))]
+#[case::version_zero(vec![0], false, Some(0))]
+#[case::different_sizes(vec![7, 13, 29], false, Some(49))]
+#[case::staged_and_published(vec![7, 13, 29], true, Some(49))]
+#[case::unsigned_total(vec![i64::MAX as u64, 1], false, Some(1 << 63))]
+#[case::maximum_total(vec![u64::MAX, 0], false, Some(u64::MAX))]
+#[case::overflow(vec![u64::MAX, 1], false, None)]
+fn log_segment_stats_counts_only_replay_commits(
+    #[case] sizes: Vec<u64>,
+    #[case] staged: bool,
+    #[case] expected_bytes: Option<u64>,
+) {
+    let commits: Vec<_> = sizes
+        .iter()
+        .enumerate()
+        .map(|(version, size)| {
+            let path = if staged && version > 0 {
+                staged_commit_path_for_version(version as u64)
+            } else {
+                delta_path_for_version(version as u64, "json")
+            };
+            create_log_path_with_size(&format!("memory:///{path}"), *size)
+        })
+        .collect();
+    let checkpoint_only = commits.is_empty();
+    let latest_commit_file = commits.last().cloned().unwrap_or_else(|| {
+        create_log_path_with_size("memory:///_delta_log/00000000000000000000.json", u64::MAX)
+    });
+    let segment = LogSegment {
+        end_version: sizes.len().saturating_sub(1) as u64,
+        checkpoint_version: checkpoint_only.then_some(0),
+        log_root: Url::parse("memory:///_delta_log/").unwrap(),
+        last_checkpoint_metadata: None,
+        listed: LogSegmentFiles {
+            ascending_commit_files: commits,
+            checkpoint_parts: if checkpoint_only {
+                vec![create_log_path_with_size(
+                    "memory:///_delta_log/00000000000000000000.checkpoint.parquet",
+                    u64::MAX,
+                )]
+            } else {
+                vec![]
+            },
+            latest_crc_file: Some(create_log_path_with_size(
+                "memory:///_delta_log/00000000000000000000.crc",
+                u64::MAX,
+            )),
+            latest_commit_file: Some(latest_commit_file),
+            ..Default::default()
+        },
+    };
+    match expected_bytes {
+        Some(total_commit_file_bytes) => assert_eq!(
+            segment.stats().unwrap(),
+            LogSegmentStats {
+                num_commit_files: sizes.len() as u64,
+                total_commit_file_bytes,
+            }
+        ),
+        None => assert_result_error_with_message(segment.stats(), "commit file size overflow"),
+    }
+}
+
+#[rstest]
+#[case::nested_same_start(
+    &[10, 10, 10, 10],
+    &[(1, 2, 7), (1, 3, 12)],
+    &[(1, 3), (0, 0)],
+    Some(22),
+)]
+#[case::uncovered_trailing_commits(
+    &[10, 10, 10, 10, 10],
+    &[(1, 2, 7)],
+    &[(4, 4), (3, 3), (1, 2), (0, 0)],
+    Some(37),
+)]
+#[case::disjoint_compactions(
+    &[10, 10, 10, 10, 10, 10, 10],
+    &[(0, 1, 7), (3, 4, 13)],
+    &[(6, 6), (5, 5), (3, 4), (2, 2), (0, 1)],
+    Some(50),
+)]
+#[case::maximum_total(
+    &[10, 10, 1],
+    &[(0, 1, u64::MAX - 1)],
+    &[(2, 2), (0, 1)],
+    Some(u64::MAX),
+)]
+#[case::overflow(
+    &[10, 10, 1],
+    &[(0, 1, u64::MAX)],
+    &[(2, 2), (0, 1)],
+    None,
+)]
+fn log_segment_stats_uses_selected_compactions(
+    #[case] commit_sizes: &[u64],
+    #[case] compactions: &[(Version, Version, u64)],
+    #[case] expected_cover: &[(Version, Version)],
+    #[case] expected_bytes: Option<u64>,
+) {
+    let segment = LogSegment {
+        end_version: commit_sizes.len() as u64 - 1,
+        checkpoint_version: None,
+        log_root: Url::parse("memory:///_delta_log/").unwrap(),
+        last_checkpoint_metadata: None,
+        listed: LogSegmentFiles {
+            ascending_commit_files: commit_sizes
+                .iter()
+                .enumerate()
+                .map(|(version, size)| {
+                    let path = delta_path_for_version(version as u64, "json");
+                    create_log_path_with_size(&format!("memory:///{path}"), *size)
+                })
+                .collect(),
+            ascending_compaction_files: compactions
+                .iter()
+                .map(|(start, end, size)| {
+                    let path = compacted_log_path_for_versions(*start, *end, "json");
+                    create_log_path_with_size(&format!("memory:///{path}"), *size)
+                })
+                .collect(),
+            ..Default::default()
+        },
+    };
+    let cover = segment.find_commit_cover();
+    let expected_locations = expected_cover
+        .iter()
+        .map(|(start, end)| {
+            let path = if start == end {
+                delta_path_for_version(*start, "json")
+            } else {
+                compacted_log_path_for_versions(*start, *end, "json")
+            };
+            format!("memory:///{path}")
+        })
+        .collect_vec();
+    assert_eq!(
+        cover
+            .iter()
+            .map(|file| file.location.to_string())
+            .collect_vec(),
+        expected_locations,
+    );
+    let cover_bytes = cover
+        .iter()
+        .try_fold(0u64, |total, file| total.checked_add(file.size));
+    assert_eq!(cover_bytes, expected_bytes);
+    match expected_bytes {
+        Some(total_commit_file_bytes) => {
+            let stats = segment.stats().unwrap();
+            assert_eq!(
+                stats,
+                LogSegmentStats {
+                    num_commit_files: expected_cover.len() as u64,
+                    total_commit_file_bytes,
+                }
+            );
+            assert_eq!(stats.num_commit_files, cover.len() as u64);
+            assert_eq!(Some(stats.total_commit_file_bytes), cover_bytes);
+        }
+        None => assert_result_error_with_message(segment.stats(), "commit file size overflow"),
+    }
 }
 
 /// Gets the file size from the store for use in FileMeta
@@ -1123,7 +1288,7 @@ async fn table_changes_fails_with_larger_start_version_than_end() {
 fn test_sidecar_to_filemeta_valid_paths(
     #[case] input_path: &str,
     #[case] expected_url: &str,
-) -> Result<()> {
+) -> KernelResult<()> {
     let log_root = Url::parse("file:///var/_delta_log/")?;
     let sidecar = Sidecar {
         path: expected_url.to_string(),
@@ -1142,7 +1307,7 @@ fn test_sidecar_to_filemeta_valid_paths(
 }
 
 #[test]
-fn test_checkpoint_batch_with_no_sidecars_returns_none() -> Result<()> {
+fn test_checkpoint_batch_with_no_sidecars_returns_none() -> KernelResult<()> {
     let (_, log_root) = new_in_memory_store();
     let engine = Arc::new(SyncEngine::new());
     let checkpoint_batch = add_batch_simple(get_all_actions_schema().clone());
@@ -1164,7 +1329,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> Result<()> {
+async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
@@ -1212,7 +1377,7 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> Result
 }
 
 #[test]
-fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> Result<()> {
+fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1242,7 +1407,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_reading_sidecar_files_with_predicate() -> Result<()> {
+async fn test_reading_sidecar_files_with_predicate() -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
@@ -1283,7 +1448,7 @@ async fn test_reading_sidecar_files_with_predicate() -> Result<()> {
 
 #[tokio::test]
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
-) -> Result<()> {
+) -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     add_checkpoint_to_store(
@@ -1338,7 +1503,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
 
 #[tokio::test]
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part(
-) -> Result<()> {
+) -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1417,7 +1582,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
 
 #[tokio::test]
 async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars(
-) -> Result<()> {
+) -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1502,7 +1667,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
     #[case] expected_rows_after_pruning: usize,
     #[case] expected_add_paths: &[&str],
     #[values(false, true)] ignore_predicate: bool,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
     let ignore_predicate_engine = ignore_predicate_engine(&sync_engine);
@@ -1560,7 +1725,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
 /// `SyncJsonHandler` ignores the checkpoint predicate, so replay must tolerate the returned remove
 /// row while still surfacing the live Add.
 #[tokio::test]
-async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> Result<()> {
+async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1616,7 +1781,7 @@ async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> Result<()
 async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
     #[case] ignore_predicate: bool,
     #[case] expected_materialized_rows: usize,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
     let ignore_predicate_engine = ignore_predicate_engine(&sync_engine);
@@ -1683,8 +1848,8 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
 }
 
 #[tokio::test]
-async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() -> Result<()>
-{
+async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars(
+) -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1748,7 +1913,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
 // - Each returned batch is correctly flagged with is_log_batch set to false
 #[tokio::test]
 async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
-) -> Result<()> {
+) -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1903,7 +2068,7 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
 }
 
 #[tokio::test]
-async fn test_list_log_files_with_version() -> Result<()> {
+async fn test_list_log_files_with_version() -> KernelResult<()> {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -3244,7 +3409,7 @@ fn test_log_segment_checkpoint_gap_rejects_version_overflow() {
 /// doc promises. Real V2 fixtures only carry non-empty sidecar lists, so this synthetic case is the
 /// only place it is exercised.
 #[test]
-fn checkpoint_sidecars_distinguishes_empty_from_absent() -> Result<()> {
+fn checkpoint_sidecars_distinguishes_empty_from_absent() -> KernelResult<()> {
     let (_store, log_root) = new_in_memory_store();
     let selected = "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet";
     let checkpoint_file = log_root.join(selected)?.to_string();
@@ -3360,7 +3525,7 @@ fn checkpoint_hint_sidecar_file_schema_resolution(
 async fn test_get_file_actions_schema_v1_parquet_with_hint(
     #[case] hint_version: u64,
     #[case] expect_hint_schema_used: bool,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -3441,7 +3606,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
 #[tokio::test]
 async fn test_get_file_actions_schema_v2_identity_filter(
     #[case] identity_matches: bool,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -3504,7 +3669,7 @@ async fn test_get_file_actions_schema_v2_identity_filter(
 #[case::with_hint(true)]
 #[case::without_hint(false)]
 #[tokio::test]
-async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> Result<()> {
+async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -3807,7 +3972,7 @@ async fn test_checkpoint_stream_resolves_stats_projection(
     #[case] include_json_stats: bool,
     #[case] expect_parsed_stats: bool,
     #[case] expect_json_stats: bool,
-) -> Result<()> {
+) -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     let checkpoint_schema = if include_parsed_stats {
@@ -4493,7 +4658,7 @@ fn add_batch_with_partition_values_parsed(output_schema: SchemaRef) -> Box<Arrow
 }
 
 #[tokio::test]
-async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> Result<()> {
+async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -4586,7 +4751,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> Result<()>
 }
 
 #[tokio::test]
-async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -> Result<()> {
+async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -5435,7 +5600,7 @@ fn new_for_version_zero_rejects_non_commit_file() {
 }
 
 #[test]
-fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error>> {
+fn test_commit_phase_processes_commits() -> KernelResult<()> {
     let (engine, snapshot, _tempdir) = load_test_table("app-txn-no-checkpoint")?;
     let log_segment = snapshot.log_segment();
 
@@ -5482,7 +5647,7 @@ fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn latest_checkpoint_action_returns_none_without_checkpoint() -> Result<()> {
+fn latest_checkpoint_action_returns_none_without_checkpoint() -> KernelResult<()> {
     let (engine, table_root) = setup_table()?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert!(snapshot.latest_checkpoint_action(&engine)?.is_none());
@@ -5492,7 +5657,7 @@ fn latest_checkpoint_action_returns_none_without_checkpoint() -> Result<()> {
 // The log is replayed newest-first, so the most recent `checkpoint` action wins.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn latest_checkpoint_action_returns_the_latest_of_multiple() -> Result<()> {
+fn latest_checkpoint_action_returns_the_latest_of_multiple() -> KernelResult<()> {
     let (engine, table_root) = setup_table()?;
     write_commit(
         &engine,
@@ -5522,7 +5687,7 @@ fn latest_checkpoint_action_returns_the_latest_of_multiple() -> Result<()> {
 // A fresh snapshot does observe it.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> Result<()> {
+fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> KernelResult<()> {
     let (engine, table_root) = setup_table()?;
     write_commit(
         &engine,
@@ -5644,7 +5809,7 @@ async fn amt_last_checkpoint_hint_bounds_listing(
 // the protocol and metadata come from the manifest commit's checkpoint action, not commit 0.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> Result<()> {
+fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> KernelResult<()> {
     let (engine, table_root) = setup_table()?;
     for version in 1..=2 {
         write_commit(

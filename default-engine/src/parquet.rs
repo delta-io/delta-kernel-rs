@@ -28,12 +28,12 @@ use delta_kernel::parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use delta_kernel::parquet::arrow::async_writer::AsyncArrowWriter;
 #[allow(deprecated)]
 use delta_kernel::parquet::arrow::async_writer::ParquetObjectWriter;
-use delta_kernel::schema::{SchemaRef, StructType};
+use delta_kernel::schema::{DataType as KernelDataType, SchemaRef, StructType};
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
     CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
-    FoldWithOption as _, KernelError, KernelResult, ParquetFooter, ParquetHandler, PredicateRef,
-    Result, ResultIteratorStatic,
+    FoldWithOption as _, KernelError, KernelResult, KernelResultIterator, ParquetFooter,
+    ParquetHandler, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
@@ -197,6 +197,12 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         stats_columns: &[ColumnName],
         physical_schema: &StructType,
     ) -> KernelResult<DataFileMetadata> {
+        if let Some(column) = find_file_column(physical_schema) {
+            return Err(KernelError::unsupported(format!(
+                "The default Parquet writer does not support writing `file` column '{column}'."
+            )));
+        }
+
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
 
@@ -254,7 +260,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         &self,
         data: Box<dyn EngineData>,
         write_context: &BoundWriteContext,
-    ) -> Result<Box<dyn EngineData>> {
+    ) -> KernelResult<Box<dyn EngineData>> {
         let file_metadata = self
             .write_parquet(
                 &write_context.write_dir(),
@@ -265,6 +271,34 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
             .await?;
         super::build_add_file_metadata(file_metadata, write_context)
     }
+}
+
+/// Returns the path of the first `file` column in `schema`, including one nested in a struct,
+/// array, or map.
+fn find_file_column(schema: &StructType) -> Option<ColumnName> {
+    fn visit_struct(struct_type: &StructType, path: &mut Vec<String>) -> bool {
+        struct_type.fields().any(|field| {
+            path.push(field.name().clone());
+            let found = visit(field.data_type(), path);
+            if !found {
+                path.pop();
+            }
+            found
+        })
+    }
+    fn visit(data_type: &KernelDataType, path: &mut Vec<String>) -> bool {
+        match data_type {
+            KernelDataType::File(_) => true,
+            KernelDataType::Struct(struct_type) => visit_struct(struct_type, path),
+            KernelDataType::Array(array) => visit(array.element_type(), path),
+            KernelDataType::Map(map) => {
+                visit(map.key_type(), path) || visit(map.value_type(), path)
+            }
+            _ => false,
+        }
+    }
+    let mut path = Vec::new();
+    visit_struct(schema, &mut path).then(|| ColumnName::new(path))
 }
 
 /// Internal async implementation of read_parquet_files
@@ -326,7 +360,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         self.read_parquet_files_with_cancellation(files, physical_schema, predicate, None)
     }
 
@@ -336,7 +370,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         let future = read_parquet_files_impl(
             self.store.clone(),
             files.to_vec(),
@@ -369,8 +403,8 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     fn write_parquet_file(
         &self,
         location: url::Url,
-        mut data: ResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> Result<FileSize> {
+        mut data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<FileSize> {
         let store = self.store.clone();
 
         self.task_executor.block_on(async move {
@@ -406,7 +440,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         })
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
         self.read_parquet_footer_with_cancellation(file, None)
     }
 
@@ -414,7 +448,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         &self,
         file: &FileMeta,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> Result<ParquetFooter> {
+    ) -> KernelResult<ParquetFooter> {
         let store = self.store.clone();
         let location = file.location.clone();
         let file_size = file.size;
@@ -544,7 +578,11 @@ impl PresignedUrlOpener {
 }
 
 impl FileOpener for PresignedUrlOpener {
-    fn open(&self, file_meta: FileMeta, _range: Option<Range<i64>>) -> Result<FileOpenFuture> {
+    fn open(
+        &self,
+        file_meta: FileMeta,
+        _range: Option<Range<i64>>,
+    ) -> KernelResult<FileOpenFuture> {
         let batch_size = self.batch_size;
         let table_schema = self.table_schema.clone();
         let predicate = self.predicate.clone();
@@ -614,7 +652,8 @@ mod tests {
     };
     use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use delta_kernel::schema::{
-        schema, schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        schema, schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue,
+        StructField, StructType,
     };
     use delta_kernel::EngineData;
     use delta_kernel_default_engine_test_utils::{
@@ -735,7 +774,7 @@ mod tests {
         }
     }
 
-    async fn read_all_rows_helper(file_meta: FileMeta) -> Result<Vec<RecordBatch>> {
+    async fn read_all_rows_helper(file_meta: FileMeta) -> KernelResult<Vec<RecordBatch>> {
         let store = Arc::new(LocalFileSystem::new());
         let path = Path::from_url_path(file_meta.location.path()).unwrap();
         #[allow(deprecated)]
@@ -772,7 +811,7 @@ mod tests {
             last_modified: 0,
             size: file_size,
         };
-        let data: delta_kernel::Result<_> = read_all_rows_helper(file_meta).await;
+        let data: delta_kernel::KernelResult<_> = read_all_rows_helper(file_meta).await;
         let data = data.unwrap();
 
         assert_eq!(data.len(), 1);
@@ -1154,6 +1193,60 @@ mod tests {
         assert_eq!(data[0].num_rows(), 3);
     }
 
+    /// The default writer refuses a `file` column wherever it appears, and writes nothing.
+    #[rstest::rstest]
+    #[case::top_level(schema! { nullable "f": (DataType::file_type()) }, "f")]
+    #[case::in_struct(schema! { nullable "s": { nullable "f": (DataType::file_type()) } }, "s.f")]
+    #[case::array_element(
+        StructType::new_unchecked([StructField::nullable(
+            "a",
+            ArrayType::new(DataType::file_type(), true),
+        )]),
+        "a"
+    )]
+    #[case::map_value(
+        StructType::new_unchecked([StructField::nullable(
+            "m",
+            MapType::new(DataType::STRING, DataType::file_type(), true),
+        )]),
+        "m"
+    )]
+    #[tokio::test]
+    async fn test_write_parquet_rejects_file_column(
+        #[case] physical_schema: StructType,
+        #[case] column: &str,
+    ) {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler =
+            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let data = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "a",
+                Arc::new(Int64Array::from(vec![1])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+
+        let error = parquet_handler
+            .write_parquet(
+                &Url::parse("memory:///data/").unwrap(),
+                data,
+                &[],
+                &physical_schema,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains(&format!(
+                "does not support writing `file` column '{column}'"
+            )),
+            "got: {error}"
+        );
+        assert!(store.list(None).next().await.is_none());
+    }
+
     #[tokio::test]
     async fn test_disallow_non_trailing_slash() {
         let store = Arc::new(InMemory::new());
@@ -1205,7 +1298,7 @@ mod tests {
         ));
 
         // Create iterator with single batch
-        let data_iter: ResultIteratorStatic<Box<dyn EngineData>> =
+        let data_iter: Box<dyn KernelResultIterator<Box<dyn EngineData>>> =
             Box::new(std::iter::once(Ok(engine_data)));
 
         // Test writing through the trait method
@@ -1412,7 +1505,7 @@ mod tests {
         ));
 
         // Create iterator with single batch
-        let data_iter: ResultIteratorStatic<Box<dyn EngineData>> =
+        let data_iter: Box<dyn KernelResultIterator<Box<dyn EngineData>>> =
             Box::new(std::iter::once(Ok(engine_data)));
 
         // Write the data
@@ -1803,7 +1896,7 @@ mod tests {
             )])
             .unwrap(),
         ));
-        let data_iter: ResultIteratorStatic<Box<dyn EngineData>> =
+        let data_iter: Box<dyn KernelResultIterator<Box<dyn EngineData>>> =
             Box::new(std::iter::once(Ok(engine_data)));
 
         // WHEN we write a parquet file to that path

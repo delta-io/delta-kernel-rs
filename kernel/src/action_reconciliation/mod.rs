@@ -139,10 +139,10 @@ mod tests {
     use derive_more::Constructor;
 
     use super::*;
-    use crate::Result;
+    use crate::KernelResult;
 
     #[test]
-    fn test_deleted_file_retention_timestamp_with_time() -> Result<()> {
+    fn test_deleted_file_retention_timestamp_with_time() -> KernelResult<()> {
         // Test with default retention (7 days)
         let reference_time = Duration::from_secs(1_000_000_000);
         let result = deleted_file_retention_timestamp_with_time(None, reference_time)?;
@@ -192,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_transaction_expiration_timestamp() -> Result<()> {
+    fn test_calculate_transaction_expiration_timestamp() -> KernelResult<()> {
         // No set_transaction_retention_duration
         let properties = TableProperties::default();
         let result = calculate_transaction_expiration_timestamp(&properties)?;
@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retention_calculator_trait_deleted_file_retention_timestamp() -> Result<()> {
+    fn test_retention_calculator_trait_deleted_file_retention_timestamp() -> KernelResult<()> {
         // Test with default retention
         let properties = TableProperties::default();
         let calculator = MockRetentionCalculator::new(properties);
@@ -276,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retention_calculator_trait_get_transaction_expiration_timestamp() -> Result<()> {
+    fn test_retention_calculator_trait_get_transaction_expiration_timestamp() -> KernelResult<()> {
         // Test with no transaction retention
         let properties = TableProperties::default();
         let calculator = MockRetentionCalculator::new(properties);

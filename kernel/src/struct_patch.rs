@@ -67,7 +67,7 @@ use serde::{Deserialize, Serialize};
 use crate::expressions::{ColumnName, Expression, ExpressionRef};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::utils::{CollectInto, FoldWithOption as _};
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 /// Projects a nested struct to `schema` while preserving a null source struct.
 ///
@@ -536,7 +536,7 @@ impl StructPatchBuilder<ExpressionRef> {
     /// Returns an error when builder calls request multiple drop/replace operations for the
     /// same field, or when a destructive operation on one field overlapped with an operation on a
     /// nested child field.
-    pub fn build(self) -> Result<ExpressionStructPatch> {
+    pub fn build(self) -> KernelResult<ExpressionStructPatch> {
         self.error?;
         Ok(self.root.to_expr_patch(self.input_path))
     }
@@ -545,7 +545,7 @@ impl StructPatchBuilder<ExpressionRef> {
 impl TryFrom<StructPatchBuilder<ExpressionRef>> for ExpressionStructPatch {
     type Error = KernelError;
 
-    fn try_from(builder: StructPatchBuilder<ExpressionRef>) -> Result<Self> {
+    fn try_from(builder: StructPatchBuilder<ExpressionRef>) -> KernelResult<Self> {
         builder.build()
     }
 }
@@ -632,7 +632,7 @@ impl StructPatchBuilder<StructField> {
     /// Returns an error if a builder call produced a conflicting operation, the input path cannot
     /// be resolved to a struct, a required field patch references a missing input field, a nested
     /// field patch targets a non-struct field, or the resulting output schema is invalid.
-    pub fn build(self, input_schema: &StructType) -> Result<StructType> {
+    pub fn build(self, input_schema: &StructType) -> KernelResult<StructType> {
         let (root, _input_path, source_schema) = self.begin_build(input_schema)?;
         StructType::try_new(schema_walk(root, source_schema)?)
     }
@@ -934,7 +934,7 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
     /// Returns an error if a `with_*` call produced a conflicting operation, the input path cannot
     /// be resolved to a struct, a required field patch references a missing input field, a nested
     /// field patch targets a non-struct field, or the resulting output schema is invalid.
-    pub fn build(self) -> Result<(SchemaRef, ExpressionRef)> {
+    pub fn build(self) -> KernelResult<(SchemaRef, ExpressionRef)> {
         let (root, input_path, source_schema) = self.inner.begin_build(self.input_schema)?;
         let patch = root.to_expr_patch(input_path);
         let schema = StructType::try_new(schema_walk(root, source_schema)?)?;

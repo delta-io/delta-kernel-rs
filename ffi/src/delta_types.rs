@@ -25,6 +25,7 @@ use delta_kernel::crc::{
     Crc, DeletedRecordCountsHistogram, DomainMetadataState, FileSizeHistogram, FileStats,
     FileStatsState, SetTransactionState,
 };
+use delta_kernel::expressions::ColumnName;
 use delta_kernel::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::snapshot::PublicationWatermark;
 use delta_kernel::table_features::TableFeature;
@@ -1004,6 +1005,33 @@ impl FfiStringArray {
         unsafe { self.try_as_slice() }?
             .iter()
             .map(|value| unsafe { value.try_to_string() })
+            .collect()
+    }
+}
+
+impl FfiColumnName {
+    /// Copy the borrowed logical field-name segments without parsing dotted names.
+    ///
+    /// # Safety
+    ///
+    /// The path and its nested string slices must follow the [`FfiSlice`] contract and remain
+    /// valid for this call.
+    pub(crate) unsafe fn try_to_column_name(&self) -> KernelResult<ColumnName> {
+        Ok(ColumnName::new(unsafe { self.path.try_to_strings() }?))
+    }
+}
+
+impl FfiColumnNameArray {
+    /// Copy the borrowed column paths into owned logical names.
+    ///
+    /// # Safety
+    ///
+    /// The array and all nested slices must follow the [`FfiSlice`] contract and remain valid
+    /// for this call.
+    pub(crate) unsafe fn try_to_column_names(&self) -> KernelResult<Vec<ColumnName>> {
+        unsafe { self.try_as_slice() }?
+            .iter()
+            .map(|column| unsafe { column.try_to_column_name() })
             .collect()
     }
 }

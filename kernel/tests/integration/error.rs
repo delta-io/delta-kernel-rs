@@ -1,8 +1,9 @@
 use std::backtrace::Backtrace;
 use std::error::Error as StdError;
 use std::io;
+use std::num::{IntErrorKind, ParseIntError};
 
-use delta_kernel::{Error, KernelError, KernelResult};
+use delta_kernel::{Error, KernelError, KernelResult, KernelResultIterator, Result};
 use rstest::rstest;
 
 #[rstest]
@@ -33,7 +34,7 @@ fn test_error_preserves_kernel_display_and_source(#[case] kernel: KernelError) {
 
 #[test]
 fn test_kernel_result_explicitly_maps_into_error() {
-    let propagate = |result: KernelResult<()>| -> Result<(), Error> {
+    let propagate = |result: KernelResult<()>| -> Result<()> {
         result.map_err(Error::Kernel)?;
         Ok(())
     };
@@ -43,6 +44,25 @@ fn test_kernel_result_explicitly_maps_into_error() {
     assert!(
         matches!(error, Error::Kernel(KernelError::FileNotFound(path)) if path == "missing.parquet")
     );
+}
+
+#[test]
+fn test_kernel_result_preserves_custom_error() {
+    let result: KernelResult<u64, ParseIntError> = "invalid".parse();
+    assert_eq!(result.unwrap_err().kind(), &IntErrorKind::InvalidDigit);
+}
+
+#[test]
+fn test_kernel_result_iterator_explicitly_maps_into_error() {
+    let kernel: Box<dyn KernelResultIterator<()>> = Box::new(std::iter::once(Err(
+        KernelError::file_not_found("missing.parquet"),
+    )));
+    let mut result = kernel.map(|item| item.map_err(Error::Kernel));
+    assert!(matches!(
+        result.next().unwrap(),
+        Err(Error::Kernel(KernelError::FileNotFound(path))) if path == "missing.parquet"
+    ));
+    assert!(result.next().is_none());
 }
 
 #[rstest]

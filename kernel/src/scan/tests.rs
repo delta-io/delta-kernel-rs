@@ -36,7 +36,7 @@ use crate::transaction::data_layout::DataLayout;
 use crate::unit_test_utils::TestCancellationToken;
 use crate::{
     CancellationTokenRef, Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
-    KernelResult, ParquetFooter, ParquetHandler, PredicateRef, ResultIteratorStatic, Snapshot,
+    KernelResult, KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
 };
 
 #[cfg(feature = "geo-type-in-dev")]
@@ -71,6 +71,23 @@ fn assert_stats_schemas_aligned(logical: &StructType, physical: &StructType) {
             (logical, physical) => assert_eq!(logical, physical),
         }
     }
+}
+
+#[rstest]
+fn map_to_struct_options_preserves_timezone(
+    #[values(
+        None,
+        Some("UTC"),
+        Some("America/Los_Angeles"),
+        Some("+05:30"),
+        Some("Not/AZone")
+    )]
+    timezone: Option<&str>,
+) {
+    assert_eq!(
+        map_to_struct_options(timezone).timestamp_timezone(),
+        timezone
+    );
 }
 
 #[test]
@@ -700,6 +717,51 @@ fn test_scan_metadata_from_same_version() {
     assert_eq!(new_files.len(), 1);
 }
 
+#[rstest]
+fn scan_metadata_from_requires_timezone_support_only_for_timestamp_partitions(
+    #[values("UTC", "America/Los_Angeles", "+05:30")] timezone: &str,
+    #[values(false, true)] parsed_struct: bool,
+    #[values(false, true)] timestamp_partition: bool,
+) {
+    let table_root = "memory:///test_table/";
+    let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+    let partition_type = if timestamp_partition {
+        DataType::TIMESTAMP
+    } else {
+        DataType::STRING
+    };
+    let schema = schema_ref! {
+        (StructField::nullable("p", partition_type)),
+        nullable "value": INTEGER,
+    };
+    let snapshot = create_table(table_root, schema, "SyncEngine", true)
+        .with_data_layout(DataLayout::partitioned(["p"]))
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(&engine)
+        .unwrap()
+        .unwrap_post_commit_snapshot();
+    let version = snapshot.version();
+    let options = if parsed_struct {
+        PartitionValuesOptions::with_struct()
+    } else {
+        PartitionValuesOptions::string_map_only()
+    };
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(options.with_timestamp_timezone(timezone))
+        .build()
+        .unwrap();
+
+    let result = scan.scan_metadata_from(&engine, version, Vec::new(), None);
+    if timestamp_partition {
+        assert_result_error_with_message(result, "with_timestamp_timezone in scan_metadata_from");
+    } else {
+        let metadata: Vec<_> = result.unwrap().try_collect().unwrap();
+        assert!(metadata.is_empty());
+    }
+}
+
 #[test_log::test]
 fn scan_metadata_from_cancels_cached_metadata_consumption() {
     let path =
@@ -927,7 +989,7 @@ fn test_missing_column_row_group_skipping() {
 }
 
 #[test_log::test]
-fn test_scan_with_checkpoint() -> Result<()> {
+fn test_scan_with_checkpoint() -> KernelResult<()> {
     let path = std::fs::canonicalize(PathBuf::from(
         "./tests/data/with_checkpoint_no_last_checkpoint/",
     ))?;
@@ -999,7 +1061,7 @@ fn test_scan_metadata_with_stats_columns() {
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<KernelResult<Vec<_>>>()
         .unwrap();
 
     assert!(
@@ -1588,7 +1650,7 @@ fn surviving_ids(parquet_bytes: Bytes, pred: &Pred) -> Vec<i64> {
     let mut ids: Vec<i64> = builder
         .build()
         .unwrap()
-        .map(Result::unwrap)
+        .map(KernelResult::unwrap)
         .flat_map(|batch| {
             let add = batch
                 .column(0)
@@ -1770,7 +1832,7 @@ impl ParquetHandler for RecordingParquetHandler {
         files: &[FileMeta],
         physical_schema: schema::SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         self.reads.lock().unwrap().push(RecordedParquetRead {
             files: files.to_vec(),
             physical_schema: physical_schema.clone(),
@@ -1780,15 +1842,15 @@ impl ParquetHandler for RecordingParquetHandler {
             .read_parquet_files(files, physical_schema, predicate)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
         self.inner.read_parquet_footer(file)
     }
 
     fn write_parquet_file(
         &self,
         location: url::Url,
-        data: ResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> Result<FileSize> {
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<FileSize> {
         self.inner.write_parquet_file(location, data)
     }
 }
@@ -1943,7 +2005,7 @@ fn test_all_struct_parses_json_commit_stats() {
     for scan_metadata in scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<KernelResult<Vec<_>>>()
         .unwrap()
     {
         let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
@@ -2032,7 +2094,7 @@ fn test_skip_stats_disables_data_skipping() {
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<KernelResult<Vec<_>>>()
         .unwrap();
 
     let mut selected_file_count = 0;
@@ -2066,7 +2128,7 @@ fn test_with_stats_last_call_wins() {
     for scan_metadata in scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<KernelResult<Vec<_>>>()
         .unwrap()
     {
         let (underlying_data, _) = scan_metadata.scan_files.into_parts();
@@ -2097,7 +2159,7 @@ fn test_default_stats_options_no_struct_output() {
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<KernelResult<Vec<_>>>()
         .unwrap();
 
     assert!(
@@ -2699,19 +2761,19 @@ impl ParquetHandler for EmptyParquetHandler {
         _files: &[FileMeta],
         _schema: schema::SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         Ok(Box::new(std::iter::empty()))
     }
 
-    fn read_parquet_footer(&self, _file: &FileMeta) -> Result<ParquetFooter> {
+    fn read_parquet_footer(&self, _file: &FileMeta) -> KernelResult<ParquetFooter> {
         unimplemented!()
     }
 
     fn write_parquet_file(
         &self,
         _location: url::Url,
-        _data: ResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> Result<FileSize> {
+        _data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<FileSize> {
         unimplemented!()
     }
 }

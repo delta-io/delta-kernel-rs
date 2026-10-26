@@ -9,8 +9,8 @@ use crate::metrics::events::emit_parquet_read_completed;
 use crate::metrics::PrecountedMetricsIterator;
 use crate::schema::SchemaRef;
 use crate::{
-    CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
-    ParquetFooter, ParquetHandler, PredicateRef, Result, ResultIteratorStatic,
+    CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize, KernelResult,
+    KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef,
 };
 
 /// Decorator over an engine-provided `Arc<dyn ParquetHandler>` that emits a
@@ -61,7 +61,7 @@ impl ParquetHandler for MeteredParquetHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         let inner = self
             .inner
             .read_parquet_files(files, physical_schema, predicate)?;
@@ -74,7 +74,7 @@ impl ParquetHandler for MeteredParquetHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         let inner = self.inner.read_parquet_files_with_cancellation(
             files,
             physical_schema,
@@ -87,12 +87,12 @@ impl ParquetHandler for MeteredParquetHandler {
     fn write_parquet_file(
         &self,
         location: url::Url,
-        data: ResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> Result<FileSize> {
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<FileSize> {
         self.inner.write_parquet_file(location, data)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
         self.inner.read_parquet_footer(file)
     }
 
@@ -100,7 +100,7 @@ impl ParquetHandler for MeteredParquetHandler {
         &self,
         file: &FileMeta,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> Result<ParquetFooter> {
+    ) -> KernelResult<ParquetFooter> {
         self.inner
             .read_parquet_footer_with_cancellation(file, cancellation_token)
     }
@@ -130,7 +130,7 @@ mod tests {
             _files: &[FileMeta],
             _physical_schema: SchemaRef,
             _predicate: Option<PredicateRef>,
-        ) -> Result<FileDataReadResultIterator> {
+        ) -> KernelResult<FileDataReadResultIterator> {
             Ok(Box::new(std::iter::empty()))
         }
 
@@ -140,7 +140,7 @@ mod tests {
             _physical_schema: SchemaRef,
             _predicate: Option<PredicateRef>,
             _cancellation_token: Option<CancellationTokenRef>,
-        ) -> Result<FileDataReadResultIterator> {
+        ) -> KernelResult<FileDataReadResultIterator> {
             self.cancellation_read_called
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(Box::new(std::iter::empty()))
@@ -149,12 +149,12 @@ mod tests {
         fn write_parquet_file(
             &self,
             _location: Url,
-            _data: ResultIteratorStatic<Box<dyn EngineData>>,
-        ) -> Result<FileSize> {
+            _data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+        ) -> KernelResult<FileSize> {
             Ok(0)
         }
 
-        fn read_parquet_footer(&self, _file: &FileMeta) -> Result<ParquetFooter> {
+        fn read_parquet_footer(&self, _file: &FileMeta) -> KernelResult<ParquetFooter> {
             unreachable!("not exercised in these tests")
         }
     }

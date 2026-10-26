@@ -8,7 +8,6 @@ use std::sync::Arc;
 use tracing::{error, instrument};
 
 use super::{IncrementalReplay, PreparedSnapshot, Snapshot};
-use crate::cancellation::CancellationTokenRef;
 use crate::log_segment::{LogSegment, PmResolution};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
@@ -111,7 +110,6 @@ impl Snapshot {
         incremental_replay: IncrementalReplay,
         checkpoint_handling: CheckpointHandling,
         built_as_latest: bool,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<Arc<Self>> {
         let requested_version = target_version.into();
         let mut current_segment = None;
@@ -124,7 +122,6 @@ impl Snapshot {
             incremental_replay,
             checkpoint_handling,
             built_as_latest,
-            cancellation_token,
             &mut current_segment,
         );
         result.inspect_err(|error| {
@@ -151,7 +148,6 @@ impl Snapshot {
         incremental_replay: IncrementalReplay,
         checkpoint_handling: CheckpointHandling,
         built_as_latest: bool,
-        cancellation_token: Option<&CancellationTokenRef>,
         current_segment: &mut Option<LogSegment>,
     ) -> KernelResult<Arc<Self>> {
         let existing_snapshot_version = existing_snapshot.version();
@@ -185,7 +181,6 @@ impl Snapshot {
             log_tail,
             requested_version,
             checkpoint_handling,
-            cancellation_token,
         )
         .inspect_err(|_| emit_log_segment_load_failure(metric_context))?
         {
@@ -209,7 +204,9 @@ impl Snapshot {
                     table_configuration,
                     crc,
                     #[cfg(feature = "adaptive-metadata-in-dev")]
-                    checkpoint_action,
+                    captured_checkpoint_action,
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    last_manifest_commit,
                 } = Self::prepare_new_from_log_segment(
                     existing_snapshot.table_root(),
                     segment,
@@ -228,7 +225,9 @@ impl Snapshot {
                     built_as_latest,
                     false, /* skipped_new_checkpoints */
                     #[cfg(feature = "adaptive-metadata-in-dev")]
-                    checkpoint_action,
+                    captured_checkpoint_action,
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    last_manifest_commit,
                 );
                 return Ok(Arc::new(snapshot));
             }
@@ -249,8 +248,9 @@ impl Snapshot {
         // `incremental_replay`. Time from here so the CRC-advance cost lands in the P&M duration,
         // matching the fresh path.
         let pm_start = std::time::Instant::now();
-        let base_crc =
-            combined_log_segment.pick_latest_base_crc(engine, existing_snapshot.base_crc());
+        let base_crc = combined_log_segment
+            .pick_latest_base_crc(engine, existing_snapshot.base_crc())
+            .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
         let crc_at_version = combined_log_segment
             .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
             .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
@@ -308,7 +308,9 @@ impl Snapshot {
             built_as_latest,
             skipped_new_checkpoints,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            resolution.checkpoint_action,
+            resolution.captured_checkpoint_action,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            resolution.last_manifest_commit,
         );
         Ok(Arc::new(snapshot))
     }
@@ -327,7 +329,6 @@ impl Snapshot {
         log_tail: Vec<ParsedLogPath>,
         requested_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<NewSegment> {
         let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
@@ -356,7 +357,7 @@ impl Snapshot {
             Some(listing_start),
             requested_version,
             checkpoint_handling,
-            cancellation_token,
+            None,
         )?;
 
         // NB: we need to check both checkpoints and commits since we filter commits at and below
@@ -605,7 +606,7 @@ mod tests {
     use crate::unit_test_utils::{
         install_thread_local_metrics_reporter, string_array_to_engine_data, CapturingReporter,
     };
-    use crate::Result;
+    use crate::{Engine, KernelResult};
 
     // ============================================================================
     // Helpers
@@ -647,7 +648,7 @@ mod tests {
         table_root: impl AsRef<str>,
         store: &InMemory,
         num_commits: u64,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         // Commit 0: protocol + metadata + first file.
         commit(
             table_root.as_ref(),
@@ -670,7 +671,7 @@ mod tests {
     }
 
     // Helper: write a compaction file
-    async fn write_compaction_file(store: &InMemory, start: u64, end: u64) -> Result<()> {
+    async fn write_compaction_file(store: &InMemory, start: u64, end: u64) -> KernelResult<()> {
         let content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
         store
             .put(
@@ -687,7 +688,7 @@ mod tests {
         engine: Arc<SyncEngine>,
     }
 
-    fn setup_incremental_snapshot_test() -> Result<IncrementalSnapshotTestContext> {
+    fn setup_incremental_snapshot_test() -> KernelResult<IncrementalSnapshotTestContext> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
         let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
@@ -733,7 +734,7 @@ mod tests {
     // ============================================================================
 
     #[test]
-    fn test_try_new_from_empty_log_tail() -> Result<()> {
+    fn test_try_new_from_empty_log_tail() -> KernelResult<()> {
         let table = TestTableBuilder::new().build().unwrap();
         let engine = SyncEngine::new_with_store(table.store().clone());
 
@@ -750,7 +751,6 @@ mod tests {
             IncrementalReplay::Disabled,
             CheckpointHandling::Adopt,
             true, /* built_as_latest */
-            None, /* cancellation_token */
         )?;
         assert_eq!(result, base_snapshot);
         // `PartialEq` ignores `built_as_latest`, so assert it explicitly.
@@ -760,7 +760,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_new_from_latest_commit_preservation() -> Result<()> {
+    async fn test_try_new_from_latest_commit_preservation() -> KernelResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
         let engine = SyncEngine::new_with_store(store.clone());
@@ -832,7 +832,6 @@ mod tests {
             IncrementalReplay::Disabled,
             CheckpointHandling::Adopt,
             false, /* built_as_latest */
-            None,  /* cancellation_token */
         )?;
 
         // Latest commit should now be version 2
@@ -850,7 +849,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_new_from_version_boundary_cases() -> Result<()> {
+    async fn test_try_new_from_version_boundary_cases() -> KernelResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
         let engine = SyncEngine::new_with_store(store.clone());
@@ -893,7 +892,6 @@ mod tests {
             IncrementalReplay::Disabled,
             CheckpointHandling::Adopt,
             false, /* built_as_latest */
-            None,  /* cancellation_token */
         )?;
         assert!(Arc::ptr_eq(&same_version, &base_snapshot));
 
@@ -907,7 +905,6 @@ mod tests {
             IncrementalReplay::Disabled,
             CheckpointHandling::Adopt,
             false, /* built_as_latest */
-            None,  /* cancellation_token */
         );
         assert!(matches!(
             older_version,
@@ -922,7 +919,8 @@ mod tests {
     // ============================================================================
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_skip_new_checkpoints_preserves_checkpoint_history_across_updates() -> Result<()> {
+    async fn test_skip_new_checkpoints_preserves_checkpoint_history_across_updates(
+    ) -> KernelResult<()> {
         // ===== GIVEN =====
         let ctx = setup_incremental_snapshot_test()?;
         let table_root = ctx.url.as_str();
@@ -1055,7 +1053,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_skip_new_checkpoints_preserves_incremental_builder_boundaries() -> Result<()> {
+    async fn test_skip_new_checkpoints_preserves_incremental_builder_boundaries() -> KernelResult<()>
+    {
         // ===== GIVEN =====
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 2).await?;
@@ -1142,7 +1141,7 @@ mod tests {
     #[tokio::test]
     async fn test_full_scan_warns_when_snapshot_skipped_new_checkpoints(
         #[values(false, true)] skip_new_checkpoints: bool,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         // ===== GIVEN =====
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?;
@@ -1181,7 +1180,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_clears_skipped_new_checkpoints_warning() -> Result<()> {
+    async fn test_checkpoint_clears_skipped_new_checkpoints_warning() -> KernelResult<()> {
         // ===== GIVEN =====
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?;
@@ -1218,7 +1217,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_skip_new_checkpoints_rejects_missing_history_hidden_by_newer_checkpoint(
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         // ===== GIVEN =====
         let ctx = setup_incremental_snapshot_test()?;
         let table_root = ctx.url.as_str();
@@ -1257,8 +1256,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_snapshot_picks_up_checkpoint_written_at_current_version() -> Result<()>
-    {
+    async fn test_incremental_snapshot_picks_up_checkpoint_written_at_current_version(
+    ) -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
 
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 2).await?;
@@ -1284,7 +1283,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_snapshot_picks_up_newer_checkpoint_below_current_version(
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
 
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
@@ -1318,7 +1317,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_explicit_same_version_request_keeps_existing_snapshot_after_checkpoint_write(
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
 
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 2).await?;
@@ -1352,7 +1351,7 @@ mod tests {
     /// and existing_snapshot_version (v3); the incremental update must preserve it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_at_or_below_snapshot_version_preserves_pm_from_commits_in_between(
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         let table_root = ctx.url.as_str();
 
@@ -1453,7 +1452,7 @@ mod tests {
     //     iii. commits have (no protocol, new metadata)
     //     iv. commits have (no protocol, no metadata)
     #[tokio::test]
-    async fn test_snapshot_new_from() -> Result<()> {
+    async fn test_snapshot_new_from() -> KernelResult<()> {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -1489,7 +1488,7 @@ mod tests {
         // - commit 1 -> final snapshots at this version
         //
         // in each test we will modify versions 1 and 2 to test different scenarios
-        fn test_new_from(store: Arc<InMemory>) -> Result<()> {
+        fn test_new_from(store: Arc<InMemory>) -> KernelResult<()> {
             let table_root = "memory:///";
             let engine = SyncEngine::new_with_store(store);
             let base_snapshot = Snapshot::builder_for(table_root)
@@ -1689,7 +1688,7 @@ mod tests {
         #[case] new_ckpt_v: u64,
         #[case] newly_listed_crc_v: Option<u64>,
         #[case] expected_crc_file_v: Option<u64>,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
 
@@ -1766,7 +1765,7 @@ mod tests {
         #[case] mode: IncrementalReplay,
         #[case] expected_crc_v: Option<u64>,
         #[values(false, true)] skip_new_checkpoints: bool,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?;
         ctx.store
@@ -1814,7 +1813,8 @@ mod tests {
     // rebuild would return Metadata from commit 2. `compare_snapshots` catches that on
     // `table_configuration`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_snapshot_drops_stale_crc_preserves_correct_metadata() -> Result<()> {
+    async fn test_incremental_snapshot_drops_stale_crc_preserves_correct_metadata(
+    ) -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         let table_root = ctx.url.as_str();
 
@@ -1902,7 +1902,7 @@ mod tests {
     // it would fall back to CRC@v1 and regress to the pre-v2 configuration.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_snapshot_preserves_metadata_when_below_checkpoint_crc_is_stale(
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         let table_root = ctx.url.as_str();
 
@@ -1986,8 +1986,8 @@ mod tests {
     // Verifies that a CRC carried through the v5 hop is dropped when the new checkpoint
     // invalidates it, so the rebuilt v10 snapshot has no CRC.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_snapshot_multi_hop_replay_then_rebuild_drops_stale_crc() -> Result<()>
-    {
+    async fn test_incremental_snapshot_multi_hop_replay_then_rebuild_drops_stale_crc(
+    ) -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 11).await?;
 
@@ -2035,7 +2035,7 @@ mod tests {
 
     // test new CRC in new log segment (old log segment has old CRC)
     #[tokio::test]
-    async fn test_snapshot_new_from_crc() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_snapshot_new_from_crc() -> KernelResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
         let engine = SyncEngine::new_with_store(store.clone());
@@ -2163,7 +2163,7 @@ mod tests {
 
     // TODO(#2337): remove this test when log compaction is re-enabled.
     #[tokio::test]
-    async fn test_compaction_files_ignored_on_read() -> Result<()> {
+    async fn test_compaction_files_ignored_on_read() -> KernelResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
         let engine = SyncEngine::new_with_store(store.clone());
@@ -2189,7 +2189,7 @@ mod tests {
 
     // TODO(#2337): remove this test when log compaction is re-enabled.
     #[tokio::test]
-    async fn test_incremental_snapshot_ignores_compaction_files() -> Result<()> {
+    async fn test_incremental_snapshot_ignores_compaction_files() -> KernelResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
         let engine = SyncEngine::new_with_store(store.clone());
@@ -2238,7 +2238,7 @@ mod tests {
     /// duplicates violated the sort invariant in LogSegmentFilesBuilder::build().
     #[tokio::test]
     #[ignore = "log compaction disabled (#2337)"]
-    async fn test_incremental_snapshot_with_compaction_files() -> Result<()> {
+    async fn test_incremental_snapshot_with_compaction_files() -> KernelResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
         let engine = SyncEngine::new_with_store(store.clone());
@@ -2294,7 +2294,7 @@ mod tests {
     /// (1) <= existing_snapshot_version (2).
     #[tokio::test]
     #[ignore = "log compaction disabled (#2337)"]
-    async fn test_incremental_snapshot_with_new_compaction_files() -> Result<()> {
+    async fn test_incremental_snapshot_with_new_compaction_files() -> KernelResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
         let engine = SyncEngine::new_with_store(store.clone());
@@ -2403,7 +2403,7 @@ mod tests {
         #[case] planted_crc_version: Option<u64>,
         #[case] mode: IncrementalReplay,
         #[case] expected_source: ProtocolMetadataSource,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
         if let Some(v) = planted_crc_version {
@@ -2477,7 +2477,7 @@ mod tests {
         #[case] planted_crc_version: Option<u64>,
         #[case] mode: IncrementalReplay,
         #[case] expected_source: ProtocolMetadataSource,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?;
         let base = Snapshot::builder_for(ctx.url.as_str())
@@ -2511,7 +2511,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_build_no_pm_change_classifies_full_replay() -> Result<()> {
+    async fn test_incremental_build_no_pm_change_classifies_full_replay() -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
 
@@ -2533,7 +2533,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fresh_build_missing_protocol_metadata_emits_failure() -> Result<()> {
+    async fn test_fresh_build_missing_protocol_metadata_emits_failure() -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         // A commit with only an add action: no protocol or metadata anywhere in the log.
         commit(
@@ -2569,7 +2569,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_build_replay_error_emits_failure() -> Result<()> {
+    async fn test_incremental_build_replay_error_emits_failure() -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?;
         let base = Snapshot::builder_for(ctx.url.as_str())
@@ -2608,7 +2608,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_version_regression_emits_log_segment_load_failure() -> Result<()> {
+    async fn test_incremental_version_regression_emits_log_segment_load_failure() -> KernelResult<()>
+    {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?; // v0..=v5
         let base = Snapshot::builder_for(ctx.url.as_str())
@@ -2647,7 +2648,8 @@ mod tests {
     // Case C.1: requesting a version beyond the log errors and emits a LogSegmentLoadFailure,
     // matching the fresh path (which also fails a request for an unavailable version).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_unavailable_version_emits_log_segment_load_failure() -> Result<()> {
+    async fn test_incremental_unavailable_version_emits_log_segment_load_failure(
+    ) -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?; // v0..=v2
         let base = Snapshot::builder_for(ctx.url.as_str())
@@ -2684,7 +2686,7 @@ mod tests {
     // Case D.1 (checkpoint strictly ahead of the base) rebuilds via the fresh emitter, but the
     // load was requested incrementally, so both events must still report Incremental.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_rebuild_reports_incremental_load_type() -> Result<()> {
+    async fn test_incremental_rebuild_reports_incremental_load_type() -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
 

@@ -17,7 +17,7 @@ use chrono_tz::Tz;
 
 use crate::arrow::compute::kernels::cast_utils::string_to_datetime;
 use crate::expressions::MapToStructOptions;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 /// A validated timezone used to interpret an offset-less `TIMESTAMP` value.
 ///
@@ -42,7 +42,7 @@ impl Default for TimestampTimezone {
 impl FromStr for TimestampTimezone {
     type Err = KernelError;
 
-    fn from_str(value: &str) -> Result<Self> {
+    fn from_str(value: &str) -> KernelResult<Self> {
         let timezone = if value.starts_with(['+', '-']) {
             parse_normalized_fixed_offset(value).map(Self::Fixed)
         } else {
@@ -110,7 +110,7 @@ fn parse_two_digits(value: &str) -> Option<i32> {
         return None;
     };
     (tens.is_ascii_digit() && ones.is_ascii_digit())
-        .then_some(i32::from(*tens - b'0') * 10 + i32::from(*ones - b'0'))
+        .then(|| i32::from(*tens - b'0') * 10 + i32::from(*ones - b'0'))
 }
 
 /// Parses with Arrow, resolving only named-zone clock transitions that Arrow rejects.
@@ -175,6 +175,8 @@ mod tests {
     #[case::past_limit_minutes("+18:30")]
     #[case::invalid_hours("+19:00")]
     #[case::extra_component("+05:00:00:00")]
+    #[case::nondigit_hours("+/0:00")]
+    #[case::nondigit_minutes("+00:/0")]
     #[case::unknown_name("Not/AZone")]
     fn rejects_noncanonical_reader_timezones(#[case] timezone: &str) {
         assert!(TimestampTimezone::try_from_options(&options(timezone)).is_err());

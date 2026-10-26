@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema as ArrowSchema;
-use datafusion::common::{DFSchema, DataFusionError, NullEquality};
+use datafusion::common::{DFSchema, DataFusionError, NullEquality, Result as DFResult};
 use datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
 use datafusion::functions_aggregate::first_last::first_value_udaf;
 use datafusion::logical_expr::{
@@ -43,7 +43,7 @@ use crate::utils::column_to_df_expr;
 pub(crate) fn lower_operator(
     op: &KernelOperator,
     inputs: &[Arc<DFLogicalPlan>],
-) -> Result<DFLogicalPlan, DataFusionError> {
+) -> DFResult<DFLogicalPlan> {
     let input_count_error = |expected: usize| {
         DataFusionError::Plan(format!(
             "{op} expects {expected} input(s), but received {}",
@@ -99,17 +99,14 @@ pub(crate) fn lower_operator(
 /// # Errors
 /// Returns an error if the Project expression is not a `Struct`/`StructPatch`, lowering a field or
 /// its nullability guard fails, or DataFusion cannot cast a field to its declared type.
-fn lower_project(
-    project: &KernelProject,
-    input: &Arc<DFLogicalPlan>,
-) -> Result<DFLogicalPlan, DataFusionError> {
+fn lower_project(project: &KernelProject, input: &Arc<DFLogicalPlan>) -> DFResult<DFLogicalPlan> {
     let input_schema: StructType = input.schema().as_arrow().try_into_kernel()?;
     let arrow_schema: ArrowSchema = project.schema.as_ref().try_into_arrow()?;
     let df_schema = Arc::new(DFSchema::try_from(arrow_schema)?);
     let columns = to_df_struct_columns(&project.expr, &input_schema, project.schema.as_ref())
         .map_err(|error| DataFusionError::External(Box::new(error)))?
         .into_guarded_columns();
-    let exprs: Result<Vec<DFExpr>, DataFusionError> = columns
+    let exprs: DFResult<Vec<DFExpr>> = columns
         .into_iter()
         .zip(project.schema.fields())
         .map(|((name, expr), field)| {
@@ -139,7 +136,7 @@ fn lower_semi_join(
     semi_join: &KernelSemiJoin,
     probe: &Arc<DFLogicalPlan>,
     build: &Arc<DFLogicalPlan>,
-) -> Result<DFLogicalPlan, DataFusionError> {
+) -> DFResult<DFLogicalPlan> {
     if semi_join.probe_keys.len() != semi_join.build_keys.len() {
         return Err(DataFusionError::Plan(format!(
             "SemiJoin declares {} probe key(s), but {} build key(s)",
@@ -150,7 +147,7 @@ fn lower_semi_join(
 
     let probe_schema = probe.schema().as_ref();
     let build_schema = build.schema().as_ref();
-    let join_keys: Result<Vec<_>, DataFusionError> = semi_join
+    let join_keys: DFResult<Vec<_>> = semi_join
         .probe_keys
         .iter()
         .zip(&semi_join.build_keys)
@@ -190,7 +187,7 @@ fn lower_semi_join(
 fn lower_union_all(
     _union_all: &KernelUnionAll,
     inputs: &[Arc<DFLogicalPlan>],
-) -> Result<DFLogicalPlan, DataFusionError> {
+) -> DFResult<DFLogicalPlan> {
     let [first, _, ..] = inputs else {
         return Err(DataFusionError::Plan(format!(
             "union_all expects at least 2 input(s), but received {}",
@@ -222,7 +219,7 @@ fn lower_union_all(
 fn lower_aggregate(
     aggregate: &KernelAggregate,
     input: &Arc<DFLogicalPlan>,
-) -> Result<DFLogicalPlan, DataFusionError> {
+) -> DFResult<DFLogicalPlan> {
     let input_schema = input.schema().as_ref();
     let output_fields = Vec::from_iter(aggregate.schema.fields());
     if aggregate.group_by.is_empty() && aggregate.aggs.is_empty() {
@@ -234,7 +231,7 @@ fn lower_aggregate(
         return Ok(DFLogicalPlan::EmptyRelation(empty));
     }
 
-    let group_exprs: Result<Vec<_>, DataFusionError> = aggregate
+    let group_exprs: DFResult<Vec<_>> = aggregate
         .group_by
         .iter()
         .enumerate()
@@ -243,7 +240,7 @@ fn lower_aggregate(
             cast_aggregate_output(expr, output_fields.get(index).copied(), input_schema)
         })
         .collect();
-    let aggregate_exprs: Result<Vec<_>, DataFusionError> = aggregate
+    let aggregate_exprs: DFResult<Vec<_>> = aggregate
         .aggs
         .iter()
         .enumerate()
@@ -269,7 +266,7 @@ fn cast_aggregate_output(
     expr: DFExpr,
     field: Option<&StructField>,
     input_schema: &DFSchema,
-) -> Result<DFExpr, DataFusionError> {
+) -> DFResult<DFExpr> {
     let Some(field) = field else {
         // No output field matches this expression; keep it for DataFusion's arity check.
         return Ok(expr);
@@ -279,10 +276,7 @@ fn cast_aggregate_output(
     Ok(expr.alias(field.name().clone()))
 }
 
-fn lower_aggregate_function(
-    agg: &KernelAgg,
-    input_schema: &DFSchema,
-) -> Result<DFExpr, DataFusionError> {
+fn lower_aggregate_function(agg: &KernelAgg, input_schema: &DFSchema) -> DFResult<DFExpr> {
     match agg {
         KernelAgg::Min(value) => Ok(min(column_to_df_expr(value, input_schema)?)),
         KernelAgg::Max(value) => Ok(max(column_to_df_expr(value, input_schema)?)),
@@ -313,7 +307,7 @@ fn lower_non_null_by(
     key: &KernelColumnName,
     input_schema: &DFSchema,
     ascending: bool,
-) -> Result<DFExpr, DataFusionError> {
+) -> DFResult<DFExpr> {
     let value = column_to_df_expr(value, input_schema)?;
     let null_sentinel = column_to_df_expr(null_sentinel, input_schema)?;
     let key = column_to_df_expr(key, input_schema)?;
@@ -327,10 +321,7 @@ fn lower_non_null_by(
 
 /// Lowers a [`Filter`](KernelFilter) node into a DataFusion [`Filter`](DFFilter) logical plan over
 /// its input.
-fn lower_filter(
-    filter: &KernelFilter,
-    input: &Arc<DFLogicalPlan>,
-) -> Result<DFLogicalPlan, DataFusionError> {
+fn lower_filter(filter: &KernelFilter, input: &Arc<DFLogicalPlan>) -> DFResult<DFLogicalPlan> {
     let input_schema: StructType = input.schema().as_arrow().try_into_kernel()?;
     let predicate = to_df_predicate_expr(&filter.predicate, &input_schema)
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
@@ -346,7 +337,7 @@ fn lower_filter(
 /// DataFusion's [`LogicalPlanBuilder::values_with_schema`] automatically inserts a cast whenever
 /// [`can_cast_types`](datafusion::arrow::compute::can_cast_types) accepts a type mismatch. Since
 /// this still conforms to Kernel's schema, it is accepted functionality.
-fn lower_values(values: &KernelValues) -> Result<DFLogicalPlan, DataFusionError> {
+fn lower_values(values: &KernelValues) -> DFResult<DFLogicalPlan> {
     let arrow_schema: ArrowSchema = values.schema.as_ref().try_into_arrow()?;
     let df_schema = Arc::new(arrow_schema.try_into()?);
 
@@ -358,8 +349,7 @@ fn lower_values(values: &KernelValues) -> Result<DFLogicalPlan, DataFusionError>
         return Ok(DFLogicalPlan::EmptyRelation(empty));
     }
 
-    let rows: Result<Vec<Vec<DFExpr>>, DataFusionError> =
-        values.rows.iter().map(|row| lower_row(row)).collect();
+    let rows: DFResult<Vec<Vec<DFExpr>>> = values.rows.iter().map(|row| lower_row(row)).collect();
     // The builder assigns column1, column2, ...; restore the names declared by the kernel schema.
     let field_aliases = df_schema
         .fields()
@@ -375,7 +365,7 @@ fn lower_values(values: &KernelValues) -> Result<DFLogicalPlan, DataFusionError>
 ///
 /// # Errors
 /// Returns an error for a literal with no DataFusion equivalent.
-fn lower_row(row: &[KernelScalar]) -> Result<Vec<DFExpr>, DataFusionError> {
+fn lower_row(row: &[KernelScalar]) -> DFResult<Vec<DFExpr>> {
     let lower_literal = |scalar| {
         let lowered =
             to_df_scalar(scalar).map_err(|err| DataFusionError::External(Box::new(err)))?;
@@ -420,12 +410,12 @@ mod tests {
     fn lower_values_node(
         schema: StructType,
         rows: Vec<Vec<KernelScalar>>,
-    ) -> Result<DFLogicalPlan, DataFusionError> {
+    ) -> DFResult<DFLogicalPlan> {
         let values = KernelValues::new(schema, rows);
         lower_operator(&KernelOperator::Values(values), &[])
     }
 
-    async fn execute(plan: DFLogicalPlan) -> Result<Vec<RecordBatch>, DataFusionError> {
+    async fn execute(plan: DFLogicalPlan) -> DFResult<Vec<RecordBatch>> {
         SessionContext::new()
             .execute_logical_plan(plan)
             .await?
@@ -469,7 +459,7 @@ mod tests {
     async fn execute_rows(
         schema: StructType,
         rows: Vec<Vec<KernelScalar>>,
-    ) -> Result<Vec<RecordBatch>, DataFusionError> {
+    ) -> DFResult<Vec<RecordBatch>> {
         execute(lower_values_node(schema, rows)?).await
     }
 
@@ -678,7 +668,7 @@ mod tests {
     async fn execute_filter(
         rows: Vec<Vec<KernelScalar>>,
         predicate: KernelPredicate,
-    ) -> Result<Vec<RecordBatch>, DataFusionError> {
+    ) -> DFResult<Vec<RecordBatch>> {
         let input = Arc::new(lower_values_node(test_schema(), rows)?);
         let filter = KernelFilter {
             predicate: predicate.into(),
@@ -839,7 +829,7 @@ mod tests {
         expr: impl Into<ExpressionRef>,
         schema: impl Into<SchemaRef>,
         parent: &Arc<DFLogicalPlan>,
-    ) -> Result<DFLogicalPlan, DataFusionError> {
+    ) -> DFResult<DFLogicalPlan> {
         lower_operator(
             &KernelOperator::Project(KernelProject {
                 expr: expr.into(),
@@ -1655,7 +1645,8 @@ mod tests {
             true,
         )]);
         let df_schema = Arc::new(DFSchema::try_from(arrow_schema).unwrap());
-        let kernel_schema: Result<StructType, _> = df_schema.as_arrow().try_into_kernel();
+        let kernel_schema: std::result::Result<StructType, _> =
+            df_schema.as_arrow().try_into_kernel();
         assert!(kernel_schema.is_err());
         let parent = Arc::new(DFLogicalPlan::EmptyRelation(EmptyRelation {
             produce_one_row: false,

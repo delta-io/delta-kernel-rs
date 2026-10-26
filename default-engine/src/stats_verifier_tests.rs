@@ -143,8 +143,7 @@ mod tests {
                 min_values,
                 max_values,
             );
-            let verifier =
-                StatsColumnVerifier::new(vec![(column_name!("col"), DataType::LONG)]);
+            let verifier = StatsColumnVerifier::new(vec![(column_name!("col"), DataType::LONG)]);
             let err_msg = verifier.verify(&[batch]).unwrap_err().to_string();
             assert!(err_msg.contains("file1.parquet"), "case: {category}");
             assert!(err_msg.contains(category), "case: {category}");
@@ -368,8 +367,7 @@ mod tests {
 
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(add_file_batch));
 
-        let verifier =
-            StatsColumnVerifier::new(vec![(column_name!("city"), DataType::STRING)]);
+        let verifier = StatsColumnVerifier::new(vec![(column_name!("city"), DataType::STRING)]);
         verifier.verify(&[engine_data]).unwrap();
     }
 

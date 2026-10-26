@@ -236,7 +236,7 @@ use delta_kernel::transaction::{
 use delta_kernel::{
     try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
     FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData, JsonHandler, KernelError,
-    KernelResult, LogPath, ParquetFooter, ParquetHandler, PredicateRef, Result, ResultIterator,
+    KernelResult, KernelResultIterator, LogPath, ParquetFooter, ParquetHandler, PredicateRef,
     Snapshot,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
@@ -256,10 +256,7 @@ use url::Url;
 
 /// unpack the test data from {test_parent_dir}/{test_name}.tar.zst into a temp dir, and return the
 /// dir it was unpacked into
-pub fn load_test_data(
-    test_parent_dir: &str,
-    test_name: &str,
-) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+pub fn load_test_data(test_parent_dir: &str, test_name: &str) -> KernelResult<tempfile::TempDir> {
     let path = format!("{test_parent_dir}/{test_name}.tar.zst");
     let tar = zstd::Decoder::new(std::fs::File::open(path)?)?;
     let mut archive = tar::Archive::new(tar);
@@ -284,10 +281,7 @@ pub fn load_test_data(
 /// This function copies ALL files and subdirectories, including any test artifacts
 /// that may have been created in the source directory. Ensure the source directory
 /// contains only the intended baseline data.
-pub fn copy_directory(
-    source: &std::path::Path,
-    dest: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub fn copy_directory(source: &std::path::Path, dest: &std::path::Path) -> KernelResult<()> {
     std::fs::create_dir_all(dest)?;
 
     for entry in std::fs::read_dir(source)? {
@@ -434,7 +428,7 @@ impl IntoArray for Vec<&'static str> {
 
 /// Generate a record batch from an iterator over (name, array) pairs. Each pair specifies a column
 /// name and the array to associate with it
-pub fn generate_batch<I, F>(items: I) -> Result<RecordBatch, ArrowError>
+pub fn generate_batch<I, F>(items: I) -> KernelResult<RecordBatch, ArrowError>
 where
     I: IntoIterator<Item = (F, ArrayRef)>,
     F: AsRef<str>,
@@ -444,7 +438,7 @@ where
 
 /// Generate a RecordBatch with two columns (id: int, val: str), with values "1,2,3" and "a,b,c"
 /// respectively
-pub fn generate_simple_batch() -> Result<RecordBatch, ArrowError> {
+pub fn generate_simple_batch() -> KernelResult<RecordBatch, ArrowError> {
     generate_batch(vec![
         ("id", vec![1, 2, 3].into_arrow_array()),
         ("val", vec!["a", "b", "c"].into_arrow_array()),
@@ -507,7 +501,7 @@ pub async fn add_commit(
     store: &DynObjectStore,
     version: u64,
     data: String,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> KernelResult<()> {
     let relative_path = delta_path_for_version(version, "json");
     let table_path = resolve_table_path(table_root, &relative_path)?;
     store.put(&table_path, data.into()).await?;
@@ -533,7 +527,7 @@ pub async fn add_staged_commit(
     store: &DynObjectStore,
     version: u64,
     data: String,
-) -> Result<Path, Box<dyn std::error::Error>> {
+) -> KernelResult<Path> {
     let relative_path = staged_commit_path_for_version(version);
     let table_path = resolve_table_path(table_root, &relative_path)?;
     store.put(&table_path, data.into()).await?;
@@ -652,7 +646,7 @@ pub fn replace_array_row(column: &ArrayRef, replacement: ArrayRef, row: usize) -
 
 pub fn create_default_engine(
     table_root: &url::Url,
-) -> Result<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
+) -> KernelResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
     create_default_engine_with_batch(table_root, None)
 }
 
@@ -662,7 +656,7 @@ pub fn create_default_engine(
 pub fn create_default_engine_with_batch(
     table_root: &url::Url,
     batch_size: Option<usize>,
-) -> Result<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
+) -> KernelResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
     let store = store_from_url(table_root)?;
     let mut builder = DefaultEngineBuilder::new(store);
     if let Some(batch_size) = batch_size {
@@ -676,7 +670,7 @@ pub fn create_default_engine_with_batch(
 /// Uses `TokioBackgroundExecutor` as the default executor.
 pub fn create_default_engine_mt_executor(
     table_root: &url::Url,
-) -> Result<Arc<DefaultEngine<TokioMultiThreadExecutor>>> {
+) -> KernelResult<Arc<DefaultEngine<TokioMultiThreadExecutor>>> {
     let store = store_from_url(table_root)?;
     let task_executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
@@ -699,7 +693,7 @@ pub fn create_default_engine_mt_executor(
 /// ```ignore
 /// let (_temp_dir, table_path, engine) = test_table_setup()?;
 /// ```
-pub fn test_table_setup() -> Result<(
+pub fn test_table_setup() -> KernelResult<(
     tempfile::TempDir,
     String,
     Arc<DefaultEngine<TokioBackgroundExecutor>>,
@@ -722,7 +716,7 @@ pub fn test_table_setup() -> Result<(
 ///
 /// Returns `(temp_dir, table_path, engine)` for use in integration tests.
 /// The `temp_dir` must be kept alive for the duration of the test to prevent cleanup.
-pub fn test_table_setup_mt() -> Result<(
+pub fn test_table_setup_mt() -> KernelResult<(
     tempfile::TempDir,
     String,
     Arc<DefaultEngine<TokioMultiThreadExecutor>>,
@@ -782,7 +776,7 @@ pub async fn create_table(
     use_37_protocol: bool,
     reader_features: Vec<&str>,
     writer_features: Vec<&str>,
-) -> Result<Url, Box<dyn std::error::Error>> {
+) -> KernelResult<Url> {
     create_table_impl(
         store,
         table_path,
@@ -808,7 +802,7 @@ pub async fn create_table_with_column_mapping_mode(
     reader_features: Vec<&str>,
     writer_features: Vec<&str>,
     column_mapping_mode: &str,
-) -> Result<Url, Box<dyn std::error::Error>> {
+) -> KernelResult<Url> {
     create_table_impl(
         store,
         table_path,
@@ -832,7 +826,7 @@ async fn create_table_impl(
     mut reader_features: Vec<&str>,
     mut writer_features: Vec<&str>,
     column_mapping_mode: &str,
-) -> Result<Url, Box<dyn std::error::Error>> {
+) -> KernelResult<Url> {
     let table_id = "test_id";
 
     // IcebergCompatV3 requires ColumnMapping, RowTracking, and DomainMetadata. Add them so callers
@@ -1042,7 +1036,7 @@ fn enable_adaptive_metadata_dependencies<'a>(
 pub fn schema_with_column_defaults(
     schema: &StructType,
     mut column_defaults: HashMap<&str, &str>,
-) -> Result<SchemaRef> {
+) -> KernelResult<SchemaRef> {
     let augmented_fields: Vec<_> = schema
         .fields()
         .map(|field| match column_defaults.remove(field.name.as_str()) {
@@ -1084,15 +1078,12 @@ pub async fn setup_test_table_p37(
     partition_columns: &[&str],
     local_directory: Option<&Url>,
     table_base_name: &str,
-) -> Result<
-    (
-        Url,
-        DefaultEngine<TokioBackgroundExecutor>,
-        Arc<DynObjectStore>,
-        &'static str,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> KernelResult<(
+    Url,
+    DefaultEngine<TokioBackgroundExecutor>,
+    Arc<DynObjectStore>,
+    &'static str,
+)> {
     let table_name = format!("{table_base_name}_37");
     let (store, engine, table_location) = engine_store_setup(table_name.as_str(), local_directory);
     Ok((
@@ -1120,14 +1111,13 @@ pub async fn setup_test_tables(
     partition_columns: &[&str],
     local_directory: Option<&Url>,
     table_base_name: &str,
-) -> Result<
+) -> KernelResult<
     Vec<(
         Url,
         DefaultEngine<TokioBackgroundExecutor>,
         Arc<DynObjectStore>,
         &'static str,
     )>,
-    Box<dyn std::error::Error>,
 > {
     let table_name_11 = format!("{table_base_name}_11");
     let (store_11, engine_11, table_location_11) =
@@ -1159,14 +1149,18 @@ pub async fn setup_test_tables(
     ])
 }
 
-pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> Result<Vec<RecordBatch>> {
+pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> KernelResult<Vec<RecordBatch>> {
     let scan_results = scan.execute(engine)?;
     scan_results
         .map(EngineDataArrowExt::try_into_record_batch)
         .try_collect()
 }
 
-pub fn test_read(expected: &ArrowEngineData, url: &Url, engine: Arc<dyn Engine>) -> Result<()> {
+pub fn test_read(
+    expected: &ArrowEngineData,
+    url: &Url,
+    engine: Arc<dyn Engine>,
+) -> KernelResult<()> {
     let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;
@@ -1199,7 +1193,7 @@ pub async fn insert_data<E: TaskExecutor>(
     snapshot: Arc<Snapshot>,
     engine: &Arc<DefaultEngine<E>>,
     columns: Vec<ArrayRef>,
-) -> Result<CommitResult> {
+) -> KernelResult<CommitResult> {
     insert_data_with(
         snapshot,
         engine,
@@ -1223,7 +1217,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
     operation: &str,
     data_change: bool,
     is_blind_append: bool,
-) -> Result<CommitResult> {
+) -> KernelResult<CommitResult> {
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
         .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
@@ -1255,7 +1249,10 @@ pub async fn insert_data_with<E: TaskExecutor>(
 }
 
 /// Starts a `WRITE` transaction using the passed snapshot and a [`FileSystemCommitter`].
-pub fn begin_transaction(snapshot: Arc<Snapshot>, engine: &dyn Engine) -> Result<Transaction> {
+pub fn begin_transaction(
+    snapshot: Arc<Snapshot>,
+    engine: &dyn Engine,
+) -> KernelResult<Transaction> {
     begin_transaction_with(
         snapshot,
         engine,
@@ -1278,7 +1275,7 @@ pub fn begin_transaction_with(
     engine_info: impl Into<String>,
     data_change: bool,
     configure: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
-) -> Result<Transaction> {
+) -> KernelResult<Transaction> {
     configure(snapshot.update_table(operation, engine_info, data_change))
         .build(engine, Box::new(FileSystemCommitter::new()))
 }
@@ -1291,9 +1288,9 @@ impl Committer for TestCatalogCommitter {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: ResultIterator<'_, FilteredEngineData>,
+        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         commit_metadata: CommitMetadata,
-    ) -> Result<CommitResponse> {
+    ) -> KernelResult<CommitResponse> {
         let path = commit_metadata.published_commit_path()?;
         let written_size =
             engine
@@ -1308,7 +1305,7 @@ impl Committer for TestCatalogCommitter {
         true
     }
 
-    fn publish(&self, _: &dyn Engine, _: PublishMetadata) -> Result<()> {
+    fn publish(&self, _: &dyn Engine, _: PublishMetadata) -> KernelResult<()> {
         Ok(())
     }
 }
@@ -1320,7 +1317,7 @@ impl Committer for TestCatalogCommitter {
 pub fn load_and_begin_transaction(
     table_url: impl AsRef<str>,
     engine: &dyn Engine,
-) -> Result<Transaction> {
+) -> KernelResult<Transaction> {
     load_and_begin_transaction_with(
         table_url,
         engine,
@@ -1343,7 +1340,7 @@ pub fn load_and_begin_transaction_with(
     engine_info: impl Into<String>,
     data_change: bool,
     configure: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
-) -> Result<Transaction> {
+) -> KernelResult<Transaction> {
     let snapshot = Snapshot::builder_for(table_url).build(engine)?;
     begin_transaction_with(
         snapshot,
@@ -1360,7 +1357,7 @@ pub fn set_json_value(
     value: &mut serde_json::Value,
     path: &str,
     new_value: serde_json::Value,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> KernelResult<(), Box<dyn std::error::Error>> {
     let mut path_string = path.replace(".", "/");
     path_string.insert(0, '/');
     let v = value
@@ -1373,7 +1370,7 @@ pub fn set_json_value(
 /// Returns a nested schema with 6 top-level fields including a nested struct:
 /// `[row_number: long, name: string, score: double, address: {street: string, city: string}, tag:
 /// string, value: int]`
-pub fn nested_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
+pub fn nested_schema() -> KernelResult<SchemaRef> {
     Ok(schema_ref! {
         nullable "row_number": LONG,
         nullable "name": STRING,
@@ -1391,7 +1388,7 @@ pub fn nested_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
 ///
 /// Batch 1: rows 1..3, names alice/bob/charlie, streets st1..st3
 /// Batch 2: rows 4..6, names dave/eve/frank, streets st4..st6
-pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
+pub fn nested_batches() -> KernelResult<Vec<RecordBatch>> {
     let schema = nested_schema()?;
     let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(schema.as_ref())?;
     let address_fields = match arrow_schema.field_with_name("address").unwrap().data_type() {
@@ -1406,7 +1403,7 @@ pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> 
                  cities: Vec<Option<&str>>,
                  tags: Vec<Option<&str>>,
                  values: Vec<Option<i32>>|
-     -> Result<RecordBatch, Box<dyn std::error::Error>> {
+     -> KernelResult<RecordBatch> {
         let address_array = StructArray::new(
             address_fields.clone(),
             vec![
@@ -1506,6 +1503,18 @@ pub fn multiple_variant_schema() -> SchemaRef {
     multi_schema_with_type(DataType::unshredded_variant())
 }
 
+pub fn top_level_file_schema() -> SchemaRef {
+    schema_with_type(DataType::file_type())
+}
+
+pub fn nested_file_schema() -> SchemaRef {
+    nested_schema_with_type(DataType::file_type())
+}
+
+pub fn multiple_file_schema() -> SchemaRef {
+    multi_schema_with_type(DataType::file_type())
+}
+
 /// Returns column mapping table properties for the given mode, or empty for `"none"`.
 pub fn cm_properties(mode: &str) -> Vec<(&str, &str)> {
     if mode == "none" {
@@ -1520,7 +1529,7 @@ pub fn cm_properties(mode: &str) -> Vec<(&str, &str)> {
 pub fn resolve_field<'a>(
     schema: &'a delta_kernel::schema::StructType,
     path: &[impl AsRef<str>],
-) -> Result<&'a delta_kernel::schema::StructField, String> {
+) -> KernelResult<&'a delta_kernel::schema::StructField, String> {
     let path_str: Vec<&str> = path.iter().map(|s| s.as_ref()).collect();
     let display = path_str.join(".");
     let (last, rest) = path.split_last().ok_or_else(|| "empty path".to_string())?;
@@ -1552,7 +1561,7 @@ pub fn assert_schema_has_field(schema: &delta_kernel::schema::StructType, path: 
     resolve_field(schema, path).unwrap();
 }
 
-pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {
+pub fn assert_result_error_with_message<T, E: ToString>(res: KernelResult<T, E>, message: &str) {
     match res {
         Ok(_) => panic!("Expected error, but got Ok result"),
         Err(error) => {
@@ -1599,7 +1608,7 @@ pub fn assert_row_ids_unique(batches: &[RecordBatch]) {
 pub fn create_add_files_metadata(
     add_files_schema: &SchemaRef,
     files: Vec<(&str, i64, i64, Option<i64>)>,
-) -> Result<Box<dyn delta_kernel::EngineData>, Box<dyn std::error::Error>> {
+) -> KernelResult<Box<dyn delta_kernel::EngineData>> {
     let num_files = files.len();
 
     // Build arrays for each file
@@ -1705,7 +1714,7 @@ pub async fn write_batch_to_table(
     engine: &DefaultEngine<impl delta_kernel_default_engine::executor::TaskExecutor>,
     data: RecordBatch,
     partition_values: HashMap<String, Scalar>,
-) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+) -> KernelResult<Arc<Snapshot>> {
     let mut txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "DefaultEngine", true)
@@ -1871,7 +1880,7 @@ impl JsonHandler for CapturingJsonHandler {
         &self,
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
-    ) -> Result<Box<dyn EngineData>> {
+    ) -> KernelResult<Box<dyn EngineData>> {
         self.inner.parse_json(json_strings, output_schema)
     }
 
@@ -1880,7 +1889,7 @@ impl JsonHandler for CapturingJsonHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         self.inner
             .read_json_files(files, physical_schema, predicate)
     }
@@ -1891,7 +1900,7 @@ impl JsonHandler for CapturingJsonHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         capture_first_token(&self.seen, &cancellation_token);
         self.inner.read_json_files_with_cancellation(
             files,
@@ -1904,9 +1913,9 @@ impl JsonHandler for CapturingJsonHandler {
     fn write_json_file(
         &self,
         path: &Url,
-        data: ResultIterator<'_, FilteredEngineData>,
+        data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         overwrite: bool,
-    ) -> Result<u64> {
+    ) -> KernelResult<u64> {
         self.inner.write_json_file(path, data, overwrite)
     }
 }
@@ -1922,7 +1931,7 @@ impl ParquetHandler for CapturingParquetHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         self.inner
             .read_parquet_files(files, physical_schema, predicate)
     }
@@ -1933,7 +1942,7 @@ impl ParquetHandler for CapturingParquetHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> Result<FileDataReadResultIterator> {
+    ) -> KernelResult<FileDataReadResultIterator> {
         capture_first_token(&self.seen, &cancellation_token);
         self.inner.read_parquet_files_with_cancellation(
             files,
@@ -1947,11 +1956,11 @@ impl ParquetHandler for CapturingParquetHandler {
         &self,
         location: Url,
         data: FileDataReadResultIterator,
-    ) -> Result<FileSize> {
+    ) -> KernelResult<FileSize> {
         self.inner.write_parquet_file(location, data)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> Result<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
         self.inner.read_parquet_footer(file)
     }
 }
@@ -1968,10 +1977,7 @@ impl ParquetHandler for CapturingParquetHandler {
 /// ```text
 /// vec![AddInfo { path: "part-00000.parquet", stats: Some({"numRecords": 10}) }]
 /// ```
-pub fn read_add_infos(
-    snapshot: &Snapshot,
-    engine: &impl Engine,
-) -> Result<Vec<AddInfo>, Box<dyn std::error::Error>> {
+pub fn read_add_infos(snapshot: &Snapshot, engine: &impl Engine) -> KernelResult<Vec<AddInfo>> {
     let schema = LOG_ADD_SCHEMA.clone();
     let batches = snapshot.log_segment().read_actions(engine, schema)?;
     let mut actions = Vec::new();
@@ -2017,7 +2023,7 @@ pub fn create_table_and_load_snapshot(
     schema: SchemaRef,
     engine: &dyn Engine,
     properties: &[(&str, &str)],
-) -> Result<Arc<Snapshot>> {
+) -> KernelResult<Arc<Snapshot>> {
     use delta_kernel::committer::FileSystemCommitter;
     use delta_kernel::transaction::create_table::create_table;
 
@@ -2079,7 +2085,7 @@ pub fn read_actions_from_commit(
     table_url: &Url,
     version: u64,
     action_type: &str,
-) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+) -> KernelResult<Vec<serde_json::Value>> {
     let table_path = table_url.to_file_path().expect("should be a file URL");
     let commit_path = table_path.join(format!("_delta_log/{version:020}.json"));
     let content = std::fs::read_to_string(commit_path)?;
@@ -2106,7 +2112,7 @@ pub struct AddActionRowTracking {
 pub fn get_row_tracking_add_actions(
     table_url: &Url,
     version: u64,
-) -> Result<Vec<AddActionRowTracking>, Box<dyn std::error::Error>> {
+) -> KernelResult<Vec<AddActionRowTracking>> {
     let mut actions: Vec<AddActionRowTracking> =
         read_actions_from_commit(table_url, version, "add")?
             .into_iter()
@@ -2132,7 +2138,7 @@ pub struct MaterializedRowTrackingColumnNames {
 pub fn get_materialized_row_tracking_column_names(
     table_url: &Url,
     version: u64,
-) -> Result<MaterializedRowTrackingColumnNames, Box<dyn std::error::Error>> {
+) -> KernelResult<MaterializedRowTrackingColumnNames> {
     let metadata_actions = read_actions_from_commit(table_url, version, "metaData")?;
     let config = metadata_actions
         .first()
@@ -2161,7 +2167,7 @@ pub fn get_materialized_row_tracking_column_names(
 pub async fn read_metadata_configuration_from_store(
     store: &DynObjectStore,
     version: u64,
-) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+) -> KernelResult<HashMap<String, String>> {
     let path =
         delta_kernel::object_store::path::Path::from(format!("_delta_log/{version:020}.json"));
     let get_result = store.get(&path).await?;
@@ -2185,9 +2191,11 @@ pub fn remove_all_and_get_remove_actions(
     snapshot: &Arc<Snapshot>,
     table_url: &Url,
     engine: &impl Engine,
-) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+) -> KernelResult<Vec<serde_json::Value>> {
     let scan = snapshot.clone().scan_builder().build()?;
-    let all_scan_metadata: Vec<_> = scan.scan_metadata(engine)?.collect::<Result<Vec<_>, _>>()?;
+    let all_scan_metadata: Vec<_> = scan
+        .scan_metadata(engine)?
+        .collect::<KernelResult<Vec<_>>>()?;
 
     let mut txn = snapshot
         .clone()

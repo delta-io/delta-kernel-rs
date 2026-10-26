@@ -16,7 +16,7 @@ use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as create_delta_table;
 use delta_kernel::transaction::{CommitResult, RetryableTransaction, UpdateTableOperation};
-use delta_kernel::{Engine, KernelError, KernelResult, Result, Snapshot, SnapshotRef};
+use delta_kernel::{Engine, KernelError, KernelResult, Snapshot, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use itertools::Itertools;
@@ -59,7 +59,7 @@ async fn main() -> ExitCode {
 }
 
 // TODO: Update the example once official write APIs are introduced (issue#1123)
-async fn try_main() -> Result<()> {
+async fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Write", "write", "");
 
     // Check if path is a directory and if not, create it
@@ -141,7 +141,7 @@ async fn create_or_get_base_snapshot(
     url: &Url,
     engine: &dyn Engine,
     schema_str: &str,
-) -> Result<SnapshotRef> {
+) -> KernelResult<SnapshotRef> {
     // Check if table already exists
     match Snapshot::builder_for(url.clone()).build(engine) {
         Ok(snapshot) => {

@@ -96,7 +96,7 @@ mod tests {
     use crate::engine::test_delegating::DelegatingEngine;
     use crate::metrics::MetricEvent;
     use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
-    use crate::{FileMeta, FileSlice, Result, ResultIteratorStatic};
+    use crate::{FileMeta, FileSlice, KernelResult, KernelResultIterator};
 
     /// Minimal storage handler used in tests: returns N preconfigured FileMeta items.
     #[derive(Debug)]
@@ -105,23 +105,26 @@ mod tests {
     }
 
     impl StorageHandler for StubStorageHandler {
-        fn list_from(&self, _path: &Url) -> Result<ResultIteratorStatic<FileMeta>> {
+        fn list_from(&self, _path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
             let results: Vec<_> = self.list_results.iter().cloned().map(Ok).collect();
             Ok(Box::new(results.into_iter()))
         }
-        fn read_files(&self, _files: Vec<FileSlice>) -> Result<ResultIteratorStatic<Bytes>> {
+        fn read_files(
+            &self,
+            _files: Vec<FileSlice>,
+        ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
             Ok(Box::new(std::iter::empty()))
         }
-        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> Result<()> {
+        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> KernelResult<()> {
             Ok(())
         }
-        fn put(&self, _path: &Url, _data: Bytes, _overwrite: bool) -> Result<()> {
+        fn put(&self, _path: &Url, _data: Bytes, _overwrite: bool) -> KernelResult<()> {
             Ok(())
         }
-        fn head(&self, _path: &Url) -> Result<FileMeta> {
+        fn head(&self, _path: &Url) -> KernelResult<FileMeta> {
             unreachable!("not exercised")
         }
-        fn delete(&self, _path: &Url) -> Result<()> {
+        fn delete(&self, _path: &Url) -> KernelResult<()> {
             Ok(())
         }
     }

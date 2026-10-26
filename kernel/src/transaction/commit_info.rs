@@ -225,7 +225,7 @@ mod tests {
     use crate::transaction::Transaction;
     use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
     use crate::utils::FoldWithOption as _;
-    use crate::{Engine, EngineData, KernelResult, Result, RowVisitor};
+    use crate::{Engine, EngineData, KernelResult, RowVisitor};
 
     // ── build_commit_info tests ────────────────────────────────────────────────
 
@@ -347,7 +347,7 @@ mod tests {
     /// no engine_commit_info -- output is the kernel CommitInfo wrapped in a "commitInfo"
     /// outer struct, matching the Delta log action format produced by `LOG_COMMIT_INFO_SCHEMA`.
     #[test]
-    fn test_build_commit_info_none_branch() -> Result<()> {
+    fn test_build_commit_info_none_branch() -> KernelResult<()> {
         let (engine, txn) = make_txn(None)?;
         let result = ArrowEngineData::try_from_engine_data(
             txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
@@ -365,7 +365,7 @@ mod tests {
     /// engine schema has fields that are fully disjoint from CommitInfo -- all CommitInfo
     /// fields are appended after the engine-only fields, in CommitInfo schema order.
     #[test]
-    fn test_build_commit_info_disjoint_schemas() -> Result<()> {
+    fn test_build_commit_info_disjoint_schemas() -> KernelResult<()> {
         let (data, schema) = make_engine_commit_info(
             vec![
                 ArrowField::new("customApp", ArrowDataType::Utf8, false),
@@ -411,7 +411,7 @@ mod tests {
     /// engine schema contains every kernel's CommitInfo field.
     /// All overlapping fields must be replaced by kernel values, no new fields added.
     #[test]
-    fn test_build_commit_info_full_overlap() -> Result<()> {
+    fn test_build_commit_info_full_overlap() -> KernelResult<()> {
         let mut map_builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         map_builder.keys().append_value("stale_key");
         map_builder.values().append_value("stale_value");
@@ -514,7 +514,7 @@ mod tests {
     /// fields pass through, and remaining CommitInfo fields are appended after the last engine
     /// field.
     #[test]
-    fn test_build_commit_info_partial_overlap() -> Result<()> {
+    fn test_build_commit_info_partial_overlap() -> KernelResult<()> {
         let (data, schema) = make_engine_commit_info(
             vec![
                 ArrowField::new("timestamp", ArrowDataType::Int64, true),
@@ -557,7 +557,7 @@ mod tests {
     /// engine schema has overlapping fields with different DataTypes than kernel expects.
     /// Kernel replacement must win, so each output field has the kernel's type.
     #[test]
-    fn test_build_commit_info_type_conflict_replaced_by_kernel() -> Result<()> {
+    fn test_build_commit_info_type_conflict_replaced_by_kernel() -> KernelResult<()> {
         let (data, schema) = make_engine_commit_info(
             vec![
                 ArrowField::new("timestamp", ArrowDataType::Utf8, true),
@@ -608,7 +608,7 @@ mod tests {
     fn test_build_commit_info_empty_engine_schema(
         #[case] row_count: usize,
         #[case] succeeds: bool,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let empty_batch = RecordBatch::try_new_with_options(
             Arc::new(ArrowSchema::empty()),
             vec![],
@@ -647,7 +647,7 @@ mod tests {
     fn test_build_commit_info_data_change(
         #[values(None, Some(true), Some(false))] txn_data_change: Option<bool>,
         #[values(false, true)] engine_conflicting_data_change: bool,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         // Always differs from the txn value so an override is observable.
         let engine_commit_info = engine_conflicting_data_change.then(|| {
             let conflicting_value = !txn_data_change.unwrap_or(false);
@@ -689,10 +689,11 @@ mod tests {
 
         let (engine, txn) = make_txn(None).unwrap();
         let mut commit_info = make_kernel_commit_info();
-        commit_info.last_manifest_commit =
-            last_manifest_commit.map(|(version, content_root_version)| {
+        commit_info.set_last_manifest_commit(last_manifest_commit.map(
+            |(version, content_root_version)| {
                 LastManifestCommit::new(version, content_root_version).unwrap()
-            });
+            },
+        ));
 
         let result = ArrowEngineData::try_from_engine_data(
             txn.generate_commit_info(engine.as_ref(), commit_info)

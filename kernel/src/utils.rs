@@ -1,5 +1,6 @@
 //! Various utility functions/macros used throughout the kernel
 use std::borrow::Cow;
+use std::fmt::Display;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -8,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use delta_kernel_derive::internal_api;
 use url::Url;
 
-use crate::{KernelError, KernelResult, Result};
+use crate::{FileSize, KernelError, KernelResult};
 
 /// Phantom type parameter `T`: The containing type mentions but does not own any instance of `T`.
 ///
@@ -70,7 +71,7 @@ impl<I: IntoIterator, T: FromIterator<I::Item>> CollectInto<T> for I {
 /// like `/local/paths`, and even `../relative/paths`.
 #[allow(unused)]
 #[internal_api]
-pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> Result<Url> {
+pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> KernelResult<Url> {
     let uri = uri.as_ref();
     let uri_type = resolve_uri_type(uri)?;
     let url = match uri_type {
@@ -154,6 +155,16 @@ pub(crate) fn current_time_ms() -> KernelResult<i64> {
         .map_err(|_| KernelError::generic("Current timestamp exceeds i64 millisecond range"))
 }
 
+/// Convert an `i64` byte count into a [`FileSize`], erroring with `context` (a short description
+/// of the source, e.g. `"sidecar"`) and the offending value when it is negative.
+pub(crate) fn to_file_size(bytes: i64, context: impl Display) -> KernelResult<FileSize> {
+    bytes.try_into().map_err(|_| {
+        KernelError::generic(format!(
+            "Failed to convert {context} size {bytes} to FileSize"
+        ))
+    })
+}
+
 /// Extension trait for folding zero or one value from an [`Option`] into a base value.
 #[internal_api]
 pub(crate) trait FoldWithOption: Sized {
@@ -175,8 +186,8 @@ pub(crate) trait FoldWithOption: Sized {
     fn try_fold_with<U, E>(
         self,
         opt: Option<U>,
-        f: impl FnOnce(Self, U) -> Result<Self, E>,
-    ) -> Result<Self, E> {
+        f: impl FnOnce(Self, U) -> KernelResult<Self, E>,
+    ) -> KernelResult<Self, E> {
         match opt {
             Some(value) => f(self, value),
             None => Ok(self),

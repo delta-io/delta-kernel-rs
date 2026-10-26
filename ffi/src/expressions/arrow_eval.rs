@@ -26,7 +26,7 @@ use delta_kernel::kernel_predicates::{
     IndirectDataSkippingPredicateEvaluator, KernelPredicateEvaluator,
 };
 use delta_kernel::schema::DataType;
-use delta_kernel::{KernelError, KernelResult, Predicate, Result};
+use delta_kernel::{KernelError, KernelResult, Predicate};
 
 use super::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
 use crate::engine_data::ArrowFFIData;
@@ -310,7 +310,7 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
         args: &[Expression],
         batch: &RecordBatch,
         inverted: bool,
-    ) -> Result<BooleanArray> {
+    ) -> KernelResult<BooleanArray> {
         // Materialize the args batch. StatsMode pruning is best-effort: if the rewrite referenced a
         // stats column the batch doesn't carry, abstain (keep every file) rather than abort the
         // scan. RowMode has no safe abstain, so its errors propagate.
@@ -343,7 +343,7 @@ impl ArrowOpaquePredicateOp for FfiOpaquePredicateOp {
         _eval_pred: &DirectPredicateEvaluator<'_>,
         _exprs: &[Expression],
         _inverted: bool,
-    ) -> Result<Option<bool>> {
+    ) -> KernelResult<Option<bool>> {
         // Abstains from scalar evaluation (e.g. partition pruning).
         // TODO: support it by invoking the engine callback with a one-row stats batch.
         Ok(None)

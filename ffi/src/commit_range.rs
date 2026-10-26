@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use delta_kernel::commit_range::{CommitAction, CommitRange, DeltaAction as KernelDeltaAction};
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{KernelError, KernelResult, KernelResultIteratorStatic, LogPath, Version};
+use delta_kernel::{KernelError, KernelResult, KernelResultIterator, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
@@ -174,7 +174,7 @@ fn commit_range_builder_build_impl(
         kernel_builder = kernel_builder.with_log_tail(builder.log_tail, max_catalog_version);
     } else {
         return Err(KernelError::MaxCatalogVersion(
-            "Max catalog version is required when providing staged commits.".to_string(),
+            "Max catalog version is required when providing a log tail.".to_string(),
         ));
     }
     let range = kernel_builder.build(engine.as_ref())?;
@@ -336,7 +336,7 @@ pub unsafe extern "C" fn free_commit_action(commit_action: Handle<SharedCommitAc
     commit_action.drop_handle();
 }
 
-type CommitActionIter = KernelResultIteratorStatic<CommitAction>;
+type CommitActionIter = Box<dyn KernelResultIterator<CommitAction>>;
 
 /// Iterator handle returned by [`commit_range_commits`]. Holds the boxed kernel iterator behind a
 /// mutex (so it is safe to share across threads) plus an engine reference for error allocation.
@@ -487,7 +487,7 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel::Result;
+    use delta_kernel::KernelResult;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use test_utils::{actions_to_string, add_commit, TestAction};
@@ -580,7 +580,7 @@ mod tests {
     async fn test_commit_range_builder_build_succeeds(
         #[case] builder_end_version: Option<Version>,
         #[case] expected_end_version: Version,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<()> {
         let (engine, table_root) = setup_engine_with_commits(3).await;
 
         let builder = unsafe {
@@ -609,8 +609,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commit_range_builder_accepts_catalog_log_tail(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_commit_range_builder_accepts_catalog_log_tail() -> KernelResult<()> {
         let (engine, table_root) = setup_engine_with_commits(1).await;
         let builder = unsafe {
             ok_or_panic(commit_range_builder_for(
@@ -666,8 +665,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commit_range_builder_rejects_non_contiguous_catalog_log_tail(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_commit_range_builder_rejects_non_contiguous_catalog_log_tail() -> KernelResult<()>
+    {
         let (engine, table_root) = setup_engine_with_commits(0).await;
         let builder = unsafe {
             ok_or_panic(commit_range_builder_for(
@@ -702,8 +701,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commit_range_builder_max_catalog_version_bounds_filesystem(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_commit_range_builder_max_catalog_version_bounds_filesystem() -> KernelResult<()> {
         let (engine, table_root) = setup_engine_with_commits(3).await;
         let builder = unsafe {
             ok_or_panic(commit_range_builder_for(
@@ -722,8 +720,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commit_range_builder_for_invalid_path_errors(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_commit_range_builder_for_invalid_path_errors() -> KernelResult<()> {
         let (engine, _) = setup_engine_with_commits(0).await;
 
         let invalid_path = "not a valid url!";
@@ -741,7 +738,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_free_commit_range_builder() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_free_commit_range_builder() -> KernelResult<()> {
         let (engine, table_root) = setup_engine_with_commits(3).await;
 
         let builder = unsafe {
@@ -758,8 +755,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commit_range_builder_build_errors_on_empty_range(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_commit_range_builder_build_errors_on_empty_range() -> KernelResult<()> {
         // Table has only v=0, but we request a range starting at v=5: nothing at all is
         // available in [5, latest], so this is EmptyLog, not MissingVersion -- the latter is
         // reserved for a range where something was found, just not starting at v=5.
@@ -784,8 +780,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commit_range_builder_build_errors_on_start_version_not_found(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_commit_range_builder_build_errors_on_start_version_not_found() -> KernelResult<()>
+    {
         // Non-contiguous log: v0 and v2 exist, v1 does not. Requesting start=1 is unavailable but a
         // later version remains -> StartVersionNotFound, distinct from EmptyLog.
         let table_root = "memory:///snf_table/";
@@ -853,7 +849,7 @@ mod tests {
         #[case] range_start: u64,
         #[case] range_end: u64,
         #[case] expected: Option<Vec<u64>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> KernelResult<()> {
         let (engine, table_root) = setup_engine_with_commits(last_version).await;
         let range =
             unsafe { build_range(table_root, range_start, range_end, engine.shallow_copy()) };
@@ -888,7 +884,11 @@ mod tests {
                 unsafe { free_commit_actions_iter(iter) }
             }
             None => {
-                assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
+                assert_extern_result_error_with_message(
+                    result,
+                    FFIKernelError::CommitRangeError,
+                    None,
+                );
             }
         }
 
@@ -901,8 +901,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commit_range_commits_errors_on_empty_actions(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_commit_range_commits_errors_on_empty_actions() -> KernelResult<()> {
         let (engine, table_root) = setup_engine_with_commits(1).await;
         let range = unsafe { build_range(table_root, 0, 1, engine.shallow_copy()) };
 
@@ -914,7 +913,7 @@ mod tests {
                 0,
             )
         };
-        assert_extern_result_error_with_message(result, FFIKernelError::GenericError, None);
+        assert_extern_result_error_with_message(result, FFIKernelError::CommitRangeError, None);
 
         unsafe { free_commit_range(range) }
         unsafe { free_engine(engine) }
@@ -954,8 +953,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commit_action_get_actions_yields_action_batches(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_commit_action_get_actions_yields_action_batches() -> KernelResult<()> {
         let (engine, table_root) = setup_engine_with_commits(1).await;
         let range = unsafe { build_range(table_root, 0, 1, engine.shallow_copy()) };
 

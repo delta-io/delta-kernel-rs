@@ -19,7 +19,7 @@ use crate::engine_data::RowVisitor;
 use crate::schema::lazy_schema_ref;
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult, Result, Version};
+use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult, Version};
 
 /// The delta log subdirectory with a trailing slash for directory URL joins.
 pub(crate) const DELTA_LOG_DIR_WITH_SLASH: &str = "_delta_log/";
@@ -36,7 +36,7 @@ const UUID_PART_LEN: usize = 36;
 /// The subdirectory name within the table root where the delta log resides
 const DELTA_LOG_DIR: &str = "_delta_log";
 /// The subdirectory name within the delta log where staged commits reside
-const STAGED_COMMITS_DIR: &str = "_staged_commits/";
+pub(crate) const STAGED_COMMITS_DIR: &str = "_staged_commits/";
 /// The subdirectory name within the delta log where checkpoint sidecars reside
 const SIDECAR_DIR_WITH_SLASH: &str = "_sidecars/";
 
@@ -216,7 +216,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     // NOTE: We can't actually impl TryFrom because Option<T> is a foreign struct even if T is
     // local.
     #[internal_api]
-    pub(crate) fn try_from(location: Location) -> Result<Option<ParsedLogPath<Location>>> {
+    pub(crate) fn try_from(location: Location) -> KernelResult<Option<ParsedLogPath<Location>>> {
         let url = location.as_url();
         let Some(mut path_segments) = url.path_segments() else {
             return Ok(None);
@@ -411,7 +411,6 @@ impl ParsedLogPath<FileMeta> {
     /// the `lastManifestCommit` is invalid, including a pointer to a manifest commit newer than
     /// this commit.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[cfg_attr(not(test), allow(dead_code))]
     #[tracing::instrument(skip(engine), ret, fields(version = self.version, path = %self.location.as_url()))]
     pub(crate) fn read_ict_and_last_manifest_commit(
         &self,
@@ -428,13 +427,7 @@ impl ParsedLogPath<FileMeta> {
         let mut visitor = LastManifestCommitVisitor::default();
         visitor.visit_rows_of(actions.as_ref())?;
         if let Some(last_manifest_commit) = &visitor.last_manifest_commit {
-            require!(
-                u64::try_from(last_manifest_commit.version).is_ok_and(|v| v <= self.version),
-                KernelError::generic(format!(
-                    "lastManifestCommit version {} exceeds commit version {}",
-                    last_manifest_commit.version, self.version
-                ))
-            );
+            last_manifest_commit.ensure_at_or_before(self.version)?;
         }
         Ok((in_commit_timestamp, visitor.last_manifest_commit))
     }
@@ -529,7 +522,7 @@ impl ParsedLogPath<Url> {
 
     /// Create a new `ParsedLogPath<Url>` for a version checksum (CRC) file.
     #[internal_api]
-    pub(crate) fn new_crc(table_root: &Url, version: Version) -> Result<Self> {
+    pub(crate) fn new_crc(table_root: &Url, version: Version) -> KernelResult<Self> {
         let filename = format!("{version:020}.crc");
         let path = Self::create_path(table_root, filename)?;
         if !matches!(path.file_type, LogPathFileType::Crc) {

@@ -14,7 +14,7 @@ use delta_kernel::expressions::{
     UnaryPredicateOp as KernelUnaryPredicateOp,
 };
 use delta_kernel::schema::{DataType, StructType};
-use delta_kernel::{KernelError, KernelResult, Result};
+use delta_kernel::{KernelError, KernelResult};
 
 use crate::expression::to_df_expr;
 use crate::scalar::to_df_scalar;
@@ -27,7 +27,10 @@ use crate::scalar::to_df_scalar;
 /// for an `IN` whose right side is neither a literal array nor an array-typed column. Also
 /// propagates errors from child expressions, such as an unresolved column or an interval literal
 /// (which has no Arrow equivalent).
-pub fn to_df_predicate_expr(pred: &KernelPredicate, input_schema: &StructType) -> Result<DFExpr> {
+pub fn to_df_predicate_expr(
+    pred: &KernelPredicate,
+    input_schema: &StructType,
+) -> KernelResult<DFExpr> {
     match pred {
         KernelPredicate::BooleanExpression(expr) => to_df_expr(expr, input_schema, None),
         KernelPredicate::Not(inner) => {

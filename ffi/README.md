@@ -2,6 +2,17 @@
 
 This crate provides a C foreign function interface (ffi) for delta-kernel-rs.
 
+## Selecting scan statistics
+
+Pass `FfiStatsOptions` to `scan_builder_with_stats` to choose JSON output, indexed structured
+statistics, or logical column paths through `StructColumns` and `AllStructWithExtraIndexed`.
+The setter replaces previous statistics options, borrows the engine and options, and copies column
+paths before returning. It consumes the builder on success and error.
+
+`FfiStatsOptions` is now a tagged union rather than a scalar enum. The setter takes a pointer to
+the options and an engine handle, and returns an `ExternResult`. This changes the C ABI: rebuild
+connectors against the regenerated headers and update their calls together with the native library.
+
 ## Building an update transaction
 
 Connectors configure transaction intent on a builder and use the built transaction for

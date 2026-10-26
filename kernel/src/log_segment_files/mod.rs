@@ -24,7 +24,7 @@ use crate::path::LogPathFileType::*;
 use crate::path::{
     may_begin_listable_log_path, CheckpointInstance, LogPathFileType, ParsedLogPath,
 };
-use crate::{KernelError, KernelResult, Result, StorageHandler, Version};
+use crate::{KernelError, KernelResult, KernelResultIterator, StorageHandler, Version};
 
 #[cfg(test)]
 mod tests;
@@ -75,7 +75,7 @@ pub(crate) fn list_delta_log_from_storage(
     start_version: Version,
     end_version: Version,
     cancellation_token: Option<&CancellationTokenRef>,
-) -> Result<impl Iterator<Item = Result<ParsedLogPath>>> {
+) -> KernelResult<impl KernelResultIterator<ParsedLogPath>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
     let log_root_str = log_root.to_string();
     let files = storage
@@ -429,14 +429,14 @@ impl LogSegmentFiles {
     /// - `end_version`: upper bound (inclusive) on versions to include, `None` means no bound
     /// - `checkpoint_handling`: whether complete checkpoints replace the replay base
     pub(crate) fn build_log_segment_files(
-        fs_files: impl Iterator<Item = KernelResult<ParsedLogPath>>,
+        fs_files: impl KernelResultIterator<ParsedLogPath>,
         log_tail: Vec<ParsedLogPath>,
         start_version: Version,
         end_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
     ) -> KernelResult<Self> {
-        // check log_tail is only commits
-        // note that LogSegment checks no gaps/duplicates so we don't duplicate that here
+        // `validate_catalog_managed_log_tail` enforces that log_tail is only commits, and
+        // LogSegment checks no gaps/duplicates, so we don't duplicate that here
         debug_assert!(
             log_tail.iter().all(|entry| entry.is_commit()),
             "log_tail should only contain commits"

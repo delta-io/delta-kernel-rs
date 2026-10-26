@@ -42,10 +42,10 @@ use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
-use delta_kernel::{Result, Snapshot};
+use delta_kernel::{KernelResult, Snapshot};
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> KernelResult<()> {
     let table_path = std::env::args()
         .nth(1)
         .expect("usage: delta_write_example <TABLE_DIR>");
@@ -114,10 +114,10 @@ async fn main() -> Result<()> {
     let scan = snapshot.scan_builder().build()?;
     let batches: Vec<RecordBatch> = scan
         .execute(Arc::new(engine))?
-        .map(|data| -> Result<RecordBatch> {
+        .map(|data| -> KernelResult<RecordBatch> {
             Ok(data?.try_into_record_batch()?)
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<KernelResult<Vec<_>>>()?;
     print_batches(&batches)?;
 
     Ok(())

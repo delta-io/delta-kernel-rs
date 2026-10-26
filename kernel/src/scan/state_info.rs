@@ -694,7 +694,7 @@ pub(crate) mod tests {
     use crate::unit_test_utils::{
         assert_result_error_with_message, MockProtocolBuilder, MockTableConfigurationBuilder,
     };
-    use crate::Result;
+    use crate::KernelResult;
 
     #[test]
     fn stats_schemas_can_both_be_absent() {
@@ -769,7 +769,7 @@ pub(crate) mod tests {
     pub(crate) fn get_simple_state_info(
         schema: SchemaRef,
         partition_columns: Vec<String>,
-    ) -> Result<StateInfo> {
+    ) -> KernelResult<StateInfo> {
         get_state_info(schema, partition_columns, None, &[], HashMap::new(), vec![])
     }
 
@@ -782,7 +782,7 @@ pub(crate) mod tests {
         features: &[TableFeature],
         metadata_configuration: HashMap<String, String>,
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
-    ) -> Result<StateInfo> {
+    ) -> KernelResult<StateInfo> {
         get_state_info_with_stats(
             schema,
             partition_columns,
@@ -802,7 +802,7 @@ pub(crate) mod tests {
         metadata_configuration: HashMap<String, String>,
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
         stats: StatsOptions,
-    ) -> Result<StateInfo> {
+    ) -> KernelResult<StateInfo> {
         get_state_info_with_options(
             schema,
             partition_columns,
@@ -825,7 +825,7 @@ pub(crate) mod tests {
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
         stats: StatsOptions,
         partition_values: PartitionValuesOptions,
-    ) -> Result<StateInfo> {
+    ) -> KernelResult<StateInfo> {
         let builder = MockTableConfigurationBuilder::new()
             .with_schema(schema.clone())
             .with_partition_columns(partition_columns)

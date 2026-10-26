@@ -7,7 +7,7 @@ use delta_kernel_derive::pub_macro;
 use derive_more::Deref;
 
 use crate::utils::CollectInto;
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 /// A (possibly nested) column name.
 ///
@@ -63,7 +63,7 @@ impl ColumnName {
     ///     &[ColumnName::new(["a", "b"]), ColumnName::new(["c", "d , e", "f"])]
     /// );
     /// ```
-    pub fn parse_column_name_list(names: impl AsRef<str>) -> Result<Vec<ColumnName>> {
+    pub fn parse_column_name_list(names: impl AsRef<str>) -> KernelResult<Vec<ColumnName>> {
         let names = names.as_ref();
         let chars = &mut names.chars().peekable();
 
@@ -270,7 +270,7 @@ fn drop_leading_whitespace(iter: &mut Peekable<impl Iterator<Item = char>>) {
 impl std::str::FromStr for ColumnName {
     type Err = KernelError;
 
-    fn from_str(s: &str) -> Result<Self> {
+    fn from_str(s: &str) -> KernelResult<Self> {
         match parse_column_name(&mut s.chars().peekable())? {
             (_, FieldEnding::NextColumn) => {
                 Err(KernelError::generic("Trailing comma in column name"))
@@ -683,7 +683,7 @@ mod test {
             ("a`.b``", None),
         ];
         for (input, expected_output) in cases {
-            let output: Result<ColumnName> = input.parse();
+            let output: KernelResult<ColumnName> = input.parse();
             match (&output, &expected_output) {
                 (Ok(output), Some(expected_output)) => {
                     assert_eq!(output, expected_output, "from {input}")

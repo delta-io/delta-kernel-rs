@@ -30,7 +30,7 @@ use crate::schema::{
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
-use crate::{FileMeta, FileSlice, KernelError, Result};
+use crate::{FileMeta, FileSlice, KernelError, KernelResult};
 
 // === Helpers ===
 
@@ -668,6 +668,9 @@ impl From<&DataType> for proto_schema::DataType {
                         .collect(),
                 }))
             }
+            // The proto `FileType` is empty: a `file` has a fixed, canonical set of sub-fields, so
+            // the type identity alone is enough to reconstruct it.
+            DataType::File(_) => DataTypeKind::File(proto_schema::FileType {}),
         };
         proto_schema::DataType { kind: Some(kind) }
     }
@@ -809,12 +812,12 @@ impl From<&MetadataValue> for proto_schema::MetadataValue {
 
 impl TryFrom<proto_schema::StructType> for StructType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::StructType) -> Result<Self> {
+    fn try_from(proto: proto_schema::StructType) -> KernelResult<Self> {
         let fields = proto
             .fields
             .into_iter()
             .map(StructField::try_from)
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<KernelResult<Vec<_>>>()?;
         StructType::try_new(fields)
     }
 }
@@ -822,7 +825,7 @@ impl TryFrom<proto_schema::StructType> for StructType {
 impl TryFrom<proto_schema::StructField> for StructField {
     type Error = KernelError;
 
-    fn try_from(proto: proto_schema::StructField) -> Result<Self> {
+    fn try_from(proto: proto_schema::StructField) -> KernelResult<Self> {
         let data_type = proto
             .data_type
             .ok_or_else(|| KernelError::schema("StructField proto missing data_type"))?;
@@ -830,7 +833,7 @@ impl TryFrom<proto_schema::StructField> for StructField {
             .metadata
             .into_iter()
             .map(|(key, value)| Ok::<_, KernelError>((key, MetadataValue::try_from(value)?)))
-            .collect::<Result<std::collections::HashMap<_, _>>>()?;
+            .collect::<KernelResult<std::collections::HashMap<_, _>>>()?;
         Ok(StructField {
             name: proto.name,
             data_type: DataType::try_from(data_type)?,
@@ -842,7 +845,7 @@ impl TryFrom<proto_schema::StructField> for StructField {
 
 impl TryFrom<proto_schema::DataType> for DataType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::DataType) -> Result<Self> {
+    fn try_from(proto: proto_schema::DataType) -> KernelResult<Self> {
         let kind = proto
             .kind
             .ok_or_else(|| KernelError::schema("DataType proto missing kind"))?;
@@ -874,6 +877,7 @@ impl TryFrom<proto_schema::DataType> for DataType {
                     return Err(KernelError::unsupported("UDT requires udt-in-dev"));
                 }
             }
+            DataTypeKind::File(_) => DataType::file_type(),
         };
         Ok(data_type)
     }
@@ -881,7 +885,7 @@ impl TryFrom<proto_schema::DataType> for DataType {
 
 impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::PrimitiveType) -> Result<Self> {
+    fn try_from(proto: proto_schema::PrimitiveType) -> KernelResult<Self> {
         let kind = proto
             .kind
             .ok_or_else(|| KernelError::schema("PrimitiveType proto missing kind"))?;
@@ -935,7 +939,7 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
 
 impl TryFrom<proto_schema::DecimalType> for DecimalType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::DecimalType) -> Result<Self> {
+    fn try_from(proto: proto_schema::DecimalType) -> KernelResult<Self> {
         let precision = u8::try_from(proto.precision).map_err(|_| {
             KernelError::invalid_decimal(format!("precision out of range: {}", proto.precision))
         })?;
@@ -949,7 +953,7 @@ impl TryFrom<proto_schema::DecimalType> for DecimalType {
 #[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<proto_schema::GeometryType> for GeometryType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::GeometryType) -> Result<Self> {
+    fn try_from(proto: proto_schema::GeometryType) -> KernelResult<Self> {
         GeometryType::try_new(&proto.crs)
     }
 }
@@ -957,7 +961,7 @@ impl TryFrom<proto_schema::GeometryType> for GeometryType {
 #[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<proto_schema::GeographyType> for GeographyType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::GeographyType) -> Result<Self> {
+    fn try_from(proto: proto_schema::GeographyType) -> KernelResult<Self> {
         let algorithm = EdgeAlgo::try_from(proto.algorithm)
             .map_err(|_| {
                 KernelError::invalid_geo_params(format!(
@@ -973,7 +977,7 @@ impl TryFrom<proto_schema::GeographyType> for GeographyType {
 #[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
     type Error = KernelError;
-    fn try_from(proto: EdgeAlgo) -> Result<Self> {
+    fn try_from(proto: EdgeAlgo) -> KernelResult<Self> {
         let algorithm = match proto {
             EdgeAlgo::Spherical => EdgeInterpolationAlgorithm::Spherical,
             EdgeAlgo::Vincenty => EdgeInterpolationAlgorithm::Vincenty,
@@ -992,7 +996,7 @@ impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
 
 impl TryFrom<proto_schema::ArrayType> for ArrayType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::ArrayType) -> Result<Self> {
+    fn try_from(proto: proto_schema::ArrayType) -> KernelResult<Self> {
         let element_type = proto
             .element_type
             .ok_or_else(|| KernelError::schema("ArrayType proto missing element_type"))?;
@@ -1005,7 +1009,7 @@ impl TryFrom<proto_schema::ArrayType> for ArrayType {
 
 impl TryFrom<proto_schema::MapType> for MapType {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::MapType) -> Result<Self> {
+    fn try_from(proto: proto_schema::MapType) -> KernelResult<Self> {
         let key_type = proto
             .key_type
             .ok_or_else(|| KernelError::schema("MapType proto missing key_type"))?;
@@ -1022,7 +1026,7 @@ impl TryFrom<proto_schema::MapType> for MapType {
 
 impl TryFrom<proto_schema::MetadataValue> for MetadataValue {
     type Error = KernelError;
-    fn try_from(proto: proto_schema::MetadataValue) -> Result<Self> {
+    fn try_from(proto: proto_schema::MetadataValue) -> KernelResult<Self> {
         let value = proto
             .value
             .ok_or_else(|| KernelError::schema("MetadataValue proto missing value"))?;
@@ -1076,7 +1080,7 @@ mod tests {
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
-    use crate::{FileMeta, FileSlice, Result};
+    use crate::{FileMeta, FileSlice, KernelResult};
 
     // === Test helpers ===
 
@@ -1091,7 +1095,7 @@ mod tests {
             &self,
             _eval_expr: &ScalarExpressionEvaluator<'_>,
             _exprs: &[Expression],
-        ) -> Result<Scalar> {
+        ) -> KernelResult<Scalar> {
             Ok(Scalar::Integer(0))
         }
     }
@@ -1109,7 +1113,7 @@ mod tests {
             _eval_pred: &DirectPredicateEvaluator<'_>,
             _exprs: &[Expression],
             _inverted: bool,
-        ) -> Result<Option<bool>> {
+        ) -> KernelResult<Option<bool>> {
             Ok(Some(true))
         }
         fn eval_as_data_skipping_predicate(
@@ -1564,7 +1568,7 @@ mod tests {
         #[case] base_url: Url,
         #[case] expected_base_url: &str,
         #[case] dv_column: Option<ColumnName>,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         let expect_dv_column = dv_column.is_some();
         let node = DynamicScan::try_new(
             &sample_dynamic_scan_input_schema(),
@@ -2241,6 +2245,7 @@ mod tests {
     #[case(DataType::from(schema! { nullable "a": INTEGER }), "struct")]
     #[case(MapType::new(DataType::STRING, DataType::INTEGER, true).into(), "map")]
     #[case(DataType::unshredded_variant(), "variant")]
+    #[case(DataType::file_type(), "file")]
     fn from_data_type(#[case] value: DataType, #[case] expected: &str) {
         use proto_schema::data_type::Kind;
         let kind = match proto_schema::DataType::from(&value).kind.unwrap() {
@@ -2250,6 +2255,7 @@ mod tests {
             Kind::Map(_) => "map",
             Kind::Variant(_) => "variant",
             Kind::UserDefined(_) => "udt",
+            Kind::File(_) => "file",
         };
         assert_eq!(kind, expected);
     }
@@ -2532,6 +2538,22 @@ mod tests {
             decoded.expect("decode succeeds"),
             DataType::unshredded_variant()
         );
+    }
+
+    /// A `file` keeps its logical type on the wire: it must decode back to a `file`, not to the
+    /// plain struct it is physically stored as. Covers a top-level column and nested positions.
+    #[test]
+    fn file_round_trips() {
+        use crate::schema::StructField;
+        let schema = StructType::new_unchecked([
+            StructField::nullable("f", DataType::file_type()),
+            StructField::nullable("arr", ArrayType::new(DataType::file_type(), true)),
+            StructField::nullable(
+                "m",
+                MapType::new(DataType::STRING, DataType::file_type(), true),
+            ),
+        ]);
+        assert_schema_round_trips(schema);
     }
 
     // Builds a proto `DataType::Primitive` with the given (possibly malformed) primitive kind.

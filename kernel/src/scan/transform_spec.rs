@@ -265,7 +265,7 @@ mod tests {
     use crate::expressions::{col, BinaryExpressionOp};
     use crate::schema::{schema, schema_ref, DataType, PrimitiveType};
     use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::Result;
+    use crate::KernelResult;
 
     // Tests for parse_partition_value function
     #[test]
@@ -690,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn get_transform_expr_generates_stable_row_commit_versions() -> Result<()> {
+    fn get_transform_expr_generates_stable_row_commit_versions() -> KernelResult<()> {
         let transform_spec = vec![FieldTransformSpec::GenerateRowCommitVersion {
             field_name: "row_commit_version_col".to_string(),
         }];

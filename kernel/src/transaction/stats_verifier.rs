@@ -13,7 +13,7 @@ use crate::error::KernelError;
 use crate::expressions::{column_name, ColumnName};
 use crate::schema::{ColumnNamesAndTypes, DataType, DecimalType, PrimitiveType};
 use crate::utils::require;
-use crate::{KernelResult, Result};
+use crate::KernelResult;
 
 /// Verifies that add file statistics contain required columns.
 ///
@@ -34,7 +34,7 @@ impl StatsColumnVerifier {
 
     /// Verify that all files in the provided batches have required statistics.
     #[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
-    pub fn verify(&self, add_files: &[Box<dyn crate::EngineData>]) -> Result<()> {
+    pub fn verify(&self, add_files: &[Box<dyn crate::EngineData>]) -> KernelResult<()> {
         if self.required_columns.is_empty() {
             return Ok(());
         }
@@ -43,7 +43,7 @@ impl StatsColumnVerifier {
             .required_columns
             .iter()
             .map(|(column, data_type)| ColumnStatsValidator::try_new(column, data_type))
-            .collect::<Result<_>>()?;
+            .collect::<KernelResult<_>>()?;
 
         for batch in add_files {
             for (column_names, validator) in &mut validators {
@@ -59,7 +59,7 @@ impl StatsColumnVerifier {
 }
 
 impl ColumnStatsValidator {
-    fn try_new(column: &ColumnName, data_type: &DataType) -> Result<(Vec<ColumnName>, Self)> {
+    fn try_new(column: &ColumnName, data_type: &DataType) -> KernelResult<(Vec<ColumnName>, Self)> {
         let column_names = vec![
             column_name!("path"),
             column_name!("stats", NUM_RECORDS),
@@ -79,7 +79,7 @@ impl ColumnStatsValidator {
         Ok((column_names, validator))
     }
 
-    fn finish(self) -> Result<()> {
+    fn finish(self) -> KernelResult<()> {
         let Self {
             column,
             missing_null_count,
@@ -211,7 +211,8 @@ fn column_types_for(dt: &DataType) -> KernelResult<&'static ColumnNamesAndTypes>
         | DataType::Struct(_)
         | DataType::Array(_)
         | DataType::Map(_)
-        | DataType::Variant(_) => Err(KernelError::internal_error(format!(
+        | DataType::Variant(_)
+        | DataType::File(_) => Err(KernelError::internal_error(format!(
             "Unsupported data type for stats validation: {dt}"
         ))),
     }
@@ -258,7 +259,8 @@ fn is_stat_present<'b>(
         | DataType::Struct(_)
         | DataType::Array(_)
         | DataType::Map(_)
-        | DataType::Variant(_) => Err(KernelError::internal_error(format!(
+        | DataType::Variant(_)
+        | DataType::File(_) => Err(KernelError::internal_error(format!(
             "Unsupported data type for stats presence check: {data_type}"
         ))),
     }
@@ -280,7 +282,7 @@ impl RowVisitor for ColumnStatsValidator {
         self.types.as_ref()
     }
 
-    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> Result<()> {
+    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> KernelResult<()> {
         require!(
             getters.len() == 5,
             KernelError::internal_error(format!(
@@ -316,7 +318,7 @@ impl RowVisitor for ColumnStatsValidator {
 /// Verify that every `add` action has `stats.numRecords` populated. Short-circuits on the first
 /// violation and returns an error containing the `add.path`.
 #[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
-pub fn verify_num_records_present(add_files: &[Box<dyn crate::EngineData>]) -> Result<()> {
+pub fn verify_num_records_present(add_files: &[Box<dyn crate::EngineData>]) -> KernelResult<()> {
     let column_names = vec![column_name!("path"), column_name!("stats", NUM_RECORDS)];
     let mut first_missing: Option<String> = None;
     for batch in add_files {
@@ -348,7 +350,7 @@ impl RowVisitor for NumRecordsValidator<'_> {
         NUM_RECORDS_TYPES.as_ref()
     }
 
-    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> Result<()> {
+    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> KernelResult<()> {
         require!(
             getters.len() == 2,
             KernelError::internal_error(format!(

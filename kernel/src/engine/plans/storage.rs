@@ -8,9 +8,7 @@ use itertools::Itertools as _;
 use url::Url;
 
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
-use crate::{
-    FileMeta, FileSlice, KernelError, KernelResult, Result, ResultIteratorStatic, StorageHandler,
-};
+use crate::{FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator, StorageHandler};
 
 /// A [`StorageHandler`] that delegates to a [`PlanExecutor`].
 #[derive(Constructor)]
@@ -25,34 +23,37 @@ impl PlanBasedStorageHandler {
 }
 
 impl StorageHandler for PlanBasedStorageHandler {
-    fn list_from(&self, path: &Url) -> Result<ResultIteratorStatic<FileMeta>> {
+    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         self.execute_io(IoOperation::file_listing(path.clone()))?
             .into_file_meta()
     }
 
-    fn read_files(&self, files: Vec<FileSlice>) -> Result<ResultIteratorStatic<Bytes>> {
+    fn read_files(
+        &self,
+        files: Vec<FileSlice>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
         self.execute_io(IoOperation::read_bytes(files))?
             .into_bytes()
     }
 
-    fn copy_atomic(&self, src: &Url, dest: &Url) -> Result<()> {
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> KernelResult<()> {
         self.execute_io(IoOperation::atomic_copy(src.clone(), dest.clone()))?
             .into_unit()
     }
 
-    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> Result<()> {
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> KernelResult<()> {
         self.execute_io(IoOperation::write_bytes(path.clone(), data, overwrite))?
             .into_unit()
     }
 
-    fn head(&self, path: &Url) -> Result<FileMeta> {
+    fn head(&self, path: &Url) -> KernelResult<FileMeta> {
         self.execute_io(IoOperation::head_file(path.clone()))?
             .into_file_meta()?
             .exactly_one()
             .map_err(|e| KernelError::generic(format!("Expected exactly one file meta: {e}")))?
     }
 
-    fn delete(&self, _path: &Url) -> Result<()> {
+    fn delete(&self, _path: &Url) -> KernelResult<()> {
         // TODO(#2820): implement here once supported as IoOperation.
         // Intentionally do not use a fallback because we expect this SHOULD be implemented via
         // plan-execution.

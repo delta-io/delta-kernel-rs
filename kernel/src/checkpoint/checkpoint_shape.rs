@@ -329,7 +329,7 @@ mod tests {
     use crate::unit_test_utils::{
         copy_test_table, create_log_path, create_log_path_with_size, load_test_table,
     };
-    use crate::Result;
+    use crate::KernelResult;
 
     /// Counts I/O operations and verifies that sidecar discovery queries filter out null paths.
     struct CountingExecutor {
@@ -349,7 +349,7 @@ mod tests {
     }
 
     impl PlanExecutor for CountingExecutor {
-        fn execute_op(&self, op: Operation) -> Result<PlanResult> {
+        fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
             match &op {
                 Operation::QueryPlan(plan) => {
                     let predicate = plan.nodes.iter().find_map(|node| match &node.op {

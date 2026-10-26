@@ -48,12 +48,13 @@ static DV_MATCHED_FILE_COLUMNS: LazyLock<KernelResult<ColumnNamesAndTypes>> = La
     Ok((names, types).into())
 });
 
-struct DvMatchedFileRequiredFields {
+/// Mandatory validations for every selected DV-update row.
+struct MandatoryDvUpdateValidation {
     physical_partition_columns: HashSet<String>,
     row_tracking_enabled: bool,
 }
 
-impl Validation for DvMatchedFileRequiredFields {
+impl Validation for MandatoryDvUpdateValidation {
     fn validate_row<'a>(
         &mut self,
         row: usize,
@@ -106,7 +107,7 @@ impl StagedDataValidator {
     /// Creates a validator for selected rows staged for deletion-vector updates.
     ///
     /// Errors if the required columns are absent from the scan-row schema.
-    pub(crate) fn staged_dv_matched_file(
+    pub(crate) fn for_dv_updates(
         physical_partition_columns: impl IntoIterator<Item = String>,
         row_tracking_enabled: bool,
     ) -> KernelResult<Self> {
@@ -117,7 +118,7 @@ impl StagedDataValidator {
         })?;
         Ok(StagedDataValidator::new(
             columns,
-            vec![Box::new(DvMatchedFileRequiredFields {
+            vec![Box::new(MandatoryDvUpdateValidation {
                 physical_partition_columns: physical_partition_columns.into_iter().collect(),
                 row_tracking_enabled,
             })],
@@ -226,12 +227,12 @@ mod tests {
             Arc::new(Int64Array::from(vec![value])),
         );
         let batches = [make_staged_dv_from_addfile(batch, vec![true])];
-        StagedDataValidator::staged_dv_matched_file(
+        StagedDataValidator::for_dv_updates(
             std::iter::empty(),
             false, /* row_tracking_enabled */
         )
         .expect("DV validator should use the scan-row schema")
-        .validate_filtered(&batches)
+        .validate_selected_rows(&batches)
         .expect("protocol-valid boundary value should be accepted");
     }
 
@@ -258,12 +259,12 @@ mod tests {
             })
             .collect();
         assert_result_error_with_message(
-            StagedDataValidator::staged_dv_matched_file(
+            StagedDataValidator::for_dv_updates(
                 std::iter::empty(),
                 false, /* row_tracking_enabled */
             )
             .expect("DV validator should use the scan-row schema")
-            .validate_filtered(&batches),
+            .validate_selected_rows(&batches),
             field,
         );
     }
@@ -284,12 +285,12 @@ mod tests {
             batch,
             selection_vector.to_vec(),
         )];
-        let result = StagedDataValidator::staged_dv_matched_file(
+        let result = StagedDataValidator::for_dv_updates(
             ["p1".to_string(), "p2".to_string()],
             false, /* row_tracking_enabled */
         )
         .expect("DV validator should use the scan-row schema")
-        .validate_filtered(&batches);
+        .validate_selected_rows(&batches);
         if let Some(expected_error) = expected_error {
             assert_result_error_with_message(result, expected_error);
         } else {

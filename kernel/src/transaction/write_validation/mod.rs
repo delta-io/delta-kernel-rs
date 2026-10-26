@@ -17,7 +17,7 @@ use crate::engine_data::{
 };
 use crate::expressions::ColumnName;
 use crate::schema::{ColumnNamesAndTypes, DataType};
-use crate::{EngineData, KernelResult, Result};
+use crate::{EngineData, KernelResult};
 
 /// A single row-level validation.
 pub(crate) trait Validation {
@@ -37,7 +37,7 @@ pub(crate) struct StagedDataValidator {
 
 impl StagedDataValidator {
     /// Run every validation against each batch. Returns the first validation error encountered.
-    pub(crate) fn validate(mut self, batches: &[Box<dyn EngineData>]) -> KernelResult<()> {
+    pub(crate) fn validate_batches(mut self, batches: &[Box<dyn EngineData>]) -> KernelResult<()> {
         for batch in batches {
             RowVisitor::visit_rows_of(&mut self, batch.as_ref())?;
         }
@@ -45,7 +45,10 @@ impl StagedDataValidator {
     }
 
     /// Runs every validation against each selected staged-data row.
-    pub(crate) fn validate_filtered(mut self, batches: &[FilteredEngineData]) -> KernelResult<()> {
+    pub(crate) fn validate_selected_rows(
+        mut self,
+        batches: &[FilteredEngineData],
+    ) -> KernelResult<()> {
         for batch in batches {
             FilteredRowVisitor::visit_rows_of(&mut self, batch)?;
         }
@@ -71,7 +74,7 @@ impl RowVisitor for StagedDataValidator {
         self.columns_and_types.as_ref()
     }
 
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> Result<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         self.validate_rows(0..row_count, getters)
     }
 }
@@ -85,7 +88,7 @@ impl FilteredRowVisitor for StagedDataValidator {
         &mut self,
         getters: &[&'a dyn GetData<'a>],
         rows: RowIndexIterator<'_>,
-    ) -> Result<()> {
+    ) -> KernelResult<()> {
         self.validate_rows(rows, getters)
     }
 }

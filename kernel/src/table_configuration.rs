@@ -21,6 +21,7 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
+pub(crate) use crate::schema::file_utils::validate_file_type_feature_support;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
@@ -40,7 +41,7 @@ use crate::table_features::{
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Result, Version};
+use crate::{KernelError, KernelResult, Version};
 
 /// Logical and physical schemas for the structured statistics emitted by a scan.
 ///
@@ -340,7 +341,7 @@ impl TableConfiguration {
         protocol: Protocol,
         table_root: Url,
         version: Version,
-    ) -> Result<Self> {
+    ) -> KernelResult<Self> {
         let logical_schema = Arc::new(metadata.parse_schema()?);
         Self::try_new_inner(metadata, protocol, table_root, version, logical_schema)
     }
@@ -428,6 +429,7 @@ impl TableConfiguration {
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
+        validate_file_type_feature_support(&table_config)?;
         // Reject corrupt column-default metadata (a non-string `CURRENT_DEFAULT`, or a non-`NULL`
         // default on a Variant column) and retain whether the validated schema declares any column
         // defaults.
@@ -1042,7 +1044,7 @@ impl TableConfiguration {
     /// - For `SnapshotLoad`, `Scan` and `Cdf`: checks reader version and reader features
     /// - For `Write` operations: checks writer version and writer features
     #[internal_api]
-    pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> Result<()> {
+    pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> KernelResult<()> {
         match operation {
             Operation::SnapshotLoad | Operation::Scan | Operation::Cdf => {
                 self.ensure_read_supported(operation)
@@ -1365,7 +1367,11 @@ mod test {
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::CheckConstraints])
             .build(),
-        WriteSupport::Unsupported
+        if cfg!(feature = "check-constraints-in-dev") {
+            WriteSupport::Supported
+        } else {
+            WriteSupport::Unsupported
+        }
     )]
     #[case::legacy_writer_below_min_version(
         &[("delta.constraints.positive", "amount > 0")],
@@ -1375,7 +1381,11 @@ mod test {
     #[case::legacy_writer_at_min_version(
         &[("delta.constraints.positive", "amount > 0")],
         MockProtocolBuilder::new().with_versions(1, 3).build(),
-        WriteSupport::Unsupported
+        if cfg!(feature = "check-constraints-in-dev") {
+            WriteSupport::Supported
+        } else {
+            WriteSupport::Unsupported
+        }
     )]
     // Unusual names, accepted only because other Delta writers can store and enforce them.
     #[case::bare_prefix(
@@ -1390,6 +1400,20 @@ mod test {
         ],
         MockProtocolBuilder::new().with_versions(1, 2).build(),
         WriteSupport::InvalidProtocol
+    )]
+    #[case::names_differing_only_in_case_with_feature(
+        &[
+            ("delta.constraints.positive", "amount > 0"),
+            ("delta.constraints.POSITIVE", "amount > 1"),
+        ],
+        MockProtocolBuilder::new()
+            .with_writer_features([TableFeature::CheckConstraints])
+            .build(),
+        if cfg!(feature = "check-constraints-in-dev") {
+            WriteSupport::Supported
+        } else {
+            WriteSupport::Unsupported
+        }
     )]
     // No CHECK constraint keys.
     #[case::no_properties(
@@ -1506,6 +1530,33 @@ mod test {
             .build();
         assert!(table_config.is_feature_supported(&TableFeature::DeletionVectors));
         assert!(table_config.is_feature_enabled(&TableFeature::DeletionVectors));
+    }
+
+    #[rstest]
+    #[case::no_constraint(&[])]
+    #[case::named_constraint(&[("delta.constraints.positive", "amount > 0")])]
+    #[case::non_lowercase_prefix(&[("DELTA.CONSTRAINTS.positive", "amount > 0")])]
+    #[case::bare_prefix_empty_name(&[("delta.constraints.", "1 > 0")])]
+    #[case::whitespace_only_name(&[("delta.constraints.   ", "1 > 0")])]
+    fn check_constraints_enabled_exactly_when_supported(
+        #[case] properties: &[(&str, &str)],
+        #[values(true, false)] feature_listed: bool,
+    ) {
+        let writer_features = if feature_listed {
+            vec![TableFeature::CheckConstraints]
+        } else {
+            vec![]
+        };
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_properties(properties)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_writer_features(writer_features)
+                    .build(),
+            )
+            .build();
+        let is_enabled = table_config.is_feature_enabled(&TableFeature::CheckConstraints);
+        assert_eq!(is_enabled, feature_listed);
     }
 
     #[rstest]

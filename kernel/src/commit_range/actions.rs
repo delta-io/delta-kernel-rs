@@ -11,7 +11,7 @@ use crate::path::ParsedLogPath;
 use crate::schema::{lazy_schema_ref, SchemaRef};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{ensure_table_can_be_read, Operation};
-use crate::{Engine, FileDataReadResultIterator, KernelError, KernelResult, Result, Version};
+use crate::{Engine, FileDataReadResultIterator, KernelError, KernelResult, Version};
 
 /// A Delta log action kind.
 ///
@@ -217,7 +217,7 @@ impl CommitAction {
     ///
     /// Batches contain raw actions exactly as recorded in the commit JSON; no column-mapping
     /// translation is applied.
-    pub fn get_actions(&self, engine: &dyn Engine) -> Result<FileDataReadResultIterator> {
+    pub fn get_actions(&self, engine: &dyn Engine) -> KernelResult<FileDataReadResultIterator> {
         engine.json_handler().read_json_files(
             slice::from_ref(&self.log_path.location),
             self.read_schema.clone(),
