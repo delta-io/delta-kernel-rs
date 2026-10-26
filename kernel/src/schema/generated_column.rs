@@ -7,9 +7,8 @@ use crate::KernelResult;
 /// A [generated column]: a top-level column whose value is defined by a SQL expression over the
 /// row's other columns.
 ///
-/// The expression is stored in the column's `delta.generationExpression` metadata. Only top-level
-/// columns of a table whose protocol supports the `generatedColumns` writer feature are generated
-/// columns.
+/// The expression is stored in the column's `delta.generationExpression` metadata. Only tables
+/// whose protocol supports the `generatedColumns` writer feature have generated columns.
 ///
 /// [generated column]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#generated-columns
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,9 +38,9 @@ impl GeneratedColumn {
 /// Returns a schema error if a top-level column's `delta.generationExpression` metadata is not a
 /// string.
 pub(crate) fn collect_generated_columns(schema: &StructType) -> KernelResult<Vec<GeneratedColumn>> {
+    let key = ColumnMetadataKey::GenerationExpression;
     let mut generated_columns = Vec::new();
     for field in schema.fields() {
-        let key = ColumnMetadataKey::GenerationExpression;
         if let Some(raw_sql) = field.get_string_config_value(&key)? {
             generated_columns.push(GeneratedColumn {
                 name: field.name().clone(),
@@ -79,7 +78,7 @@ mod tests {
 
         let generated_columns = collect_generated_columns(&schema).unwrap();
 
-        let discovered: Vec<_> = generated_columns
+        let column_pairs: Vec<_> = generated_columns
             .iter()
             .map(|column| (column.name(), column.raw_sql()))
             .collect();
@@ -87,11 +86,11 @@ mod tests {
             ("event_year", "YEAR(event_time)"),
             ("event_date", "CAST(event_time AS DATE)"),
         ];
-        assert_eq!(discovered, expected);
+        assert_eq!(column_pairs, expected);
     }
 
     #[test]
-    fn rejects_non_string_generation_expression() {
+    fn non_string_generation_expression_fails_collection() {
         let schema = schema! {
             (field_with_generation_expression("event_year", DataType::INTEGER, 7_i64)),
         };
