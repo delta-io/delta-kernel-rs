@@ -400,7 +400,6 @@ impl StateInfo {
             && Arc::ptr_eq(&logical_read_schema, &table_configuration.logical_schema())
             && logical_read_schema.metadata_columns().next().is_none())
         .then(|| table_configuration.physical_data_schema_without_partition_columns());
-        let full_physical_schema = table_configuration.physical_schema();
         let mut read_fields = Vec::with_capacity(if cached_physical_schema.is_some() {
             0
         } else {
@@ -494,13 +493,10 @@ impl StateInfo {
                         // just add them as if they're normal physical
                         // columns
                         let (physical_name, physical_field) = if cached_physical_schema.is_some() {
-                            let field =
-                                full_physical_schema.field_at_index(index).ok_or_else(|| {
-                                    KernelError::internal_error(
-                                        "Cached physical schema is missing a field",
-                                    )
-                                })?;
-                            (field.name.clone(), None)
+                            (
+                                logical_field.physical_name(column_mapping_mode).to_owned(),
+                                None,
+                            )
                         } else {
                             let field = logical_field.make_physical(column_mapping_mode)?;
                             debug!("\n\n{logical_field:#?}\nAfter mapping: {field:#?}\n\n");
