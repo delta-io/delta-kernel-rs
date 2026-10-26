@@ -645,6 +645,7 @@ mod tests {
     };
     use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::expressions::{col, lit, Predicate, Scalar};
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::{
@@ -932,14 +933,33 @@ mod tests {
     #[rstest::rstest]
     #[case::millis(
         TimeUnit::Millisecond,
-        &[1_700_000_000_123],
+        vec![vec![1_700_000_000_123]],
+        None,
         &[1_700_000_000_123_000]
     )]
-    #[case::nanos(TimeUnit::Nanosecond, &[1_999, -1_999, 999, -999], &[1, -1, 0, 0])]
+    #[case::nanos(
+        TimeUnit::Nanosecond,
+        vec![vec![1_999, -1_999, 999, -999]],
+        None,
+        &[1, -1, 0, 0]
+    )]
+    #[case::millis_pruning(
+        TimeUnit::Millisecond,
+        vec![vec![0, 1_000], vec![10_000, 11_000]],
+        Some(5_000_000),
+        &[10_000_000, 11_000_000]
+    )]
+    #[case::nanos_pruning(
+        TimeUnit::Nanosecond,
+        vec![vec![0, 1_000_000_000], vec![10_000_000_000, 11_000_000_000]],
+        Some(5_000_000),
+        &[10_000_000, 11_000_000]
+    )]
     #[tokio::test]
     async fn test_read_timestamp_units_as_microseconds(
         #[case] unit: TimeUnit,
-        #[case] values: &[i64],
+        #[case] row_groups: Vec<Vec<i64>>,
+        #[case] lower_bound_us: Option<i64>,
         #[case] expected_us: &[i64],
     ) {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -953,24 +973,26 @@ mod tests {
             ),
             Field::new("ts_ntz", ArrowDataType::Timestamp(unit, None), true),
         ]));
-        let values = Int64Array::from(values.to_vec());
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            arrow_schema
-                .fields()
-                .iter()
-                .map(|field| cast(&values, field.data_type()).unwrap())
-                .collect(),
-        )
-        .unwrap();
-
         let mut writer = ArrowWriter::try_new(
             std::fs::File::create(&file_path).unwrap(),
-            arrow_schema,
+            arrow_schema.clone(),
             None,
         )
         .unwrap();
-        writer.write(&batch).unwrap();
+        for values in row_groups {
+            let values = Int64Array::from(values);
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                arrow_schema
+                    .fields()
+                    .iter()
+                    .map(|field| cast(&values, field.data_type()).unwrap())
+                    .collect(),
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.flush().unwrap();
+        }
         writer.close().unwrap();
 
         let file_size = std::fs::metadata(&file_path).unwrap().len();
@@ -997,8 +1019,18 @@ mod tests {
             "row group skipping assumes timestamps are read as microseconds",
         );
 
+        let predicate = lower_bound_us.map(|bound| {
+            Arc::new(Predicate::gt(
+                col!("ts_ntz"),
+                lit(Scalar::TimestampNtz(bound)),
+            ))
+        });
         let data: Vec<RecordBatch> = handler
-            .read_parquet_files(slice::from_ref(&file_meta), footer.schema.clone(), None)
+            .read_parquet_files(
+                slice::from_ref(&file_meta),
+                footer.schema.clone(),
+                predicate,
+            )
             .unwrap()
             .map(into_record_batch)
             .try_collect()

@@ -309,14 +309,13 @@ fn timestamp_from_date(days: Option<&i32>) -> Option<Scalar> {
     Some(Scalar::TimestampNtz(timestamp.num_microseconds()?))
 }
 
-/// Rescales footer timestamps to microseconds.
+/// Converts an INT64 footer timestamp bound to the microsecond value the reader returns.
 ///
-/// When the requested type is Timestamp or TimestampNtz, Kernel's Arrow reader casts unannotated
-/// INT64 values to microsecond timestamps without rescaling. Footer bounds must match that
-/// interpretation so pruning stays consistent with the values the reader returns. Millisecond
-/// bounds are treated as exact, which holds for spec-compliant `partitionValues_parsed` timestamps.
+/// Keep returned bounds consistent with the casts allowed by `check_cast_compat` in
+/// `engine/ensure_data_types.rs`: timestamp annotations determine the source unit, and unannotated
+/// INT64 values are interpreted as microseconds.
 ///
-/// Returns `None` for unsupported annotations or scaling overflow, so that bound cannot justify
+/// Returns `None` for non-timestamp annotations or scaling overflow, so that bound cannot justify
 /// skipping a row group.
 fn timestamp_stat_as_micros(value: i64, column: &ColumnDescriptor) -> Option<i64> {
     match column.logical_type_ref() {

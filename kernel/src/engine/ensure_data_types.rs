@@ -299,6 +299,8 @@ fn check_cast_compat(
         //
         // Keep these date/timestamp rules aligned with
         // `PrimitiveType::is_checkpoint_cast_compatible` in `schema/mod.rs`.
+        // Timestamp bounds returned by `timestamp_stat_as_micros` in
+        // `engine/parquet_row_group_skipping.rs` must agree with the reader's casts.
         (Int32, Date32) => Ok(DataTypeCompat::NeedsCast(target_type)),
         (Int64, Timestamp(TimeUnit::Microsecond, _)) => Ok(DataTypeCompat::NeedsCast(target_type)),
         _ => Err(make_arrow_error(format!(
