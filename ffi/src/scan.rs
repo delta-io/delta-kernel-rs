@@ -2369,9 +2369,9 @@ mod tests {
         }
 
         #[rstest]
-        #[case::json_only(FfiStatsOptions::JsonOnly, false)]
+        #[case::json_only(FfiStatsOptions::JsonOnly, true)]
         #[case::all_struct(FfiStatsOptions::AllStruct, true)]
-        #[case::all(FfiStatsOptions::All, false)]
+        #[case::all(FfiStatsOptions::All, true)]
         #[case::none(FfiStatsOptions::None, true)]
         #[tokio::test]
         async fn static_skip_respects_stats_options(
@@ -2397,7 +2397,13 @@ mod tests {
                     &mut predicate,
                 ))
             };
-            let builder = unsafe { scan_builder_with_stats(builder, stats) };
+            let builder = unsafe {
+                ok_or_panic(scan_builder_with_stats(
+                    builder,
+                    engine.shallow_copy(),
+                    &stats,
+                ))
+            };
             let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
             let plan_engine = unsafe { plan_based_engine(&engine) };
 

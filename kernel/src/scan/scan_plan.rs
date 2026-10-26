@@ -25,8 +25,8 @@ use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
 use crate::schema::{
-    lazy_schema_ref, schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder,
-    StructField, StructType,
+    lazy_schema_ref, schema, schema_ref, CheckpointFieldKind, DataType, SchemaRef,
+    SchemaStructPatchBuilder, StructField, StructType,
 };
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{transform_output_type, ExpressionTransform};
@@ -82,7 +82,7 @@ impl<'a> MetadataPlanner<'a> {
             )
         };
         let parsed_partition_schema =
-            if stats_filter.is_some() || scan.partition_values.parsed_struct {
+            if stats_filter.is_some() || scan.partition_values_options.parsed_struct {
                 scan.state_info.physical_partition_schema.as_ref()
             } else {
                 None
@@ -161,7 +161,12 @@ impl<'a> MetadataPlanner<'a> {
         {
             // Parsed statistics are requested and present in the file
             (Some(required), Some(DataType::Struct(native)))
-                if LogSegment::structs_have_compatible_types(native, required, STATS_PARSED) =>
+                if LogSegment::structs_have_compatible_types(
+                    native,
+                    required,
+                    STATS_PARSED,
+                    CheckpointFieldKind::Stats,
+                ) =>
             {
                 let stats_parsed_field = StructField::nullable(STATS_PARSED, required.clone());
                 let patch = patch.drop(STATS).insert_after(STATS, stats_parsed_field);
@@ -195,6 +200,7 @@ impl<'a> MetadataPlanner<'a> {
                     native,
                     required,
                     PARTITION_VALUES_PARSED,
+                    CheckpointFieldKind::PartitionValues,
                 ) =>
             {
                 let field = StructField::nullable(PARTITION_VALUES_PARSED, required.clone());
@@ -326,7 +332,9 @@ impl<'a> MetadataPlanner<'a> {
             }
 
             // If parsed partitions is present but was not requested, drop it.
-            if self.parsed_partition_schema.is_some() && !self.scan.partition_values.parsed_struct {
+            if self.parsed_partition_schema.is_some()
+                && !self.scan.partition_values_options.parsed_struct
+            {
                 patch = patch.drop_at([ADD_NAME], PARTITION_VALUES_PARSED);
             }
 
@@ -416,7 +424,7 @@ impl Scan {
     /// checkpoint exists.
     ///
     /// ## SQL equivalent:
-    //
+    ///
     /// SELECT PATCH_STRUCT(add, <needed parsed fields>, <unrequested field drops>) AS add,
     ///        file_key(add) AS key
     /// FROM checkpoint_actions

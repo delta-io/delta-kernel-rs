@@ -1326,7 +1326,10 @@ impl Scan {
         fields(enable_call_frame),
         err
     )]
-    pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> KernelResult<Option<Plan>> {
+    pub fn declarative_metadata_scan_plan(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<Plan>> {
         // TODO(#3609): Support connector-supplied timezone in declarative metadata scans.
         require!(
             !table_requires_timestamp_timezone_support(
