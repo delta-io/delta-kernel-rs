@@ -47,7 +47,7 @@ enum GatedOp {
 /// A schema with `id`, `age`, and `event_time` columns followed by one INTEGER column per
 /// `(name, raw_sql)` pair in `generated`, each carrying its SQL as `delta.generationExpression`
 /// metadata.
-fn test_schema(generated: &[(&str, &str)]) -> SchemaRef {
+fn schema_with_generated_columns(generated: &[(&str, &str)]) -> SchemaRef {
     let generated_fields = generated.iter().map(|(name, raw_sql)| {
         StructField::nullable(*name, DataType::INTEGER).add_metadata([(
             ColumnMetadataKey::GenerationExpression.as_ref(),
@@ -76,7 +76,7 @@ async fn write_table(
     create_table(
         Arc::new(LocalFileSystem::new()),
         table_url,
-        test_schema(generated),
+        schema_with_generated_columns(generated),
         &[],
         true,
         vec![],
@@ -165,7 +165,7 @@ async fn mapped_and_partitioned_tables_return_logical_names_and_require_ack_for_
     let table_url = create_table(
         Arc::new(LocalFileSystem::new()),
         Url::from_directory_path(&table_path).expect("table path must be a URL"),
-        test_schema(EVENT_YEAR),
+        schema_with_generated_columns(EVENT_YEAR),
         partition_columns,
         true,
         reader_features,
@@ -255,17 +255,27 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_generated_colum
 }
 
 #[tokio::test]
+async fn expressions_without_feature_define_no_generated_columns_and_txn_build_fails(
+) -> KernelResult<()> {
+    let (_tmp, table_path, engine) = test_table_setup()?;
+    let table_url = write_table(&table_path, &[], EVENT_YEAR).await?;
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let generated_columns = snapshot.generated_columns()?;
+    assert!(generated_columns.is_empty());
+
+    let result = begin_transaction(snapshot, engine.as_ref());
+    let rejected_as_malformed = matches!(result, Err(KernelError::InvalidProtocol(_)));
+    assert!(rejected_as_malformed);
+    Ok(())
+}
+
+#[tokio::test]
 async fn protocol_upgrade_turns_existing_expressions_into_generated_columns_that_require_ack(
 ) -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = write_table(&table_path, &[], EVENT_YEAR).await?;
     let before_upgrade = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let write_before_upgrade = begin_transaction(before_upgrade.clone(), engine.as_ref());
-    let rejected = matches!(write_before_upgrade, Err(KernelError::InvalidProtocol(_)));
-    assert!(
-        rejected,
-        "expected an invalid protocol error before the upgrade"
-    );
     let protocol = json!({"protocol": {
         "minReaderVersion": 3,
         "minWriterVersion": 7,

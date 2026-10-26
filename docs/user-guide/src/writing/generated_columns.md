@@ -1,9 +1,9 @@
 # Generated columns
 
-A **generated column** is a column whose value a Delta table defines by a SQL expression over the
-row's other columns. To write to a table with generated columns, you discover the generated
-columns, acknowledge that your connector enforces them, compute or verify their values in each
-batch before writing it, and commit.
+A **generated column** is a column whose value is defined by a SQL expression over the row's other
+columns. To write to a table with generated columns, you discover the generated columns, acknowledge
+that your connector enforces them, compute or verify their values in each batch before writing it,
+and commit.
 
 Before reading this page, make sure you understand [Appending data](./append.md).
 

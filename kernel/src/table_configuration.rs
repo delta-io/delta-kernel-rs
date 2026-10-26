@@ -1143,7 +1143,7 @@ impl TableConfiguration {
             )
         );
 
-        // Connectors enforce generation expressions as SQL text, so a non-string expression blocks
+        // Connectors receive generation expressions as SQL text, so a non-string expression blocks
         // writes.
         #[cfg(feature = "generated-columns-in-dev")]
         self.generated_columns()?;
@@ -1544,13 +1544,12 @@ mod test {
         }
     }
 
-    /// The write support of a table whose protocol supports generated columns.
-    const GENERATED_COLUMNS_WRITE_SUPPORT: WriteSupport =
-        if cfg!(feature = "generated-columns-in-dev") {
-            WriteSupport::Supported
-        } else {
-            WriteSupport::Unsupported
-        };
+    /// The write support of a table that lists the `generatedColumns` writer feature.
+    const WITH_FEATURE_WRITE_SUPPORT: WriteSupport = if cfg!(feature = "generated-columns-in-dev") {
+        WriteSupport::Supported
+    } else {
+        WriteSupport::Unsupported
+    };
 
     /// The write support of a legacy writer version 4 table, whose protocol implies
     /// `checkConstraints` and `generatedColumns` among other features.
@@ -1563,9 +1562,9 @@ mod test {
         WriteSupport::Unsupported
     };
 
-    /// The write support of a table whose protocol supports generated columns and whose generation
-    /// expression is a non-string value.
-    const NON_STRING_GENERATED_COLUMN_WRITE_SUPPORT: WriteSupport =
+    /// The write support of a table that lists the `generatedColumns` writer feature and whose
+    /// generation expression is a non-string value.
+    const NON_STRING_WITH_FEATURE_WRITE_SUPPORT: WriteSupport =
         if cfg!(feature = "generated-columns-in-dev") {
             WriteSupport::InvalidSchema
         } else {
@@ -1592,7 +1591,7 @@ mod test {
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        GENERATED_COLUMNS_WRITE_SUPPORT
+        WITH_FEATURE_WRITE_SUPPORT
     )]
     #[case::legacy_writer_at_min_version(
         generated_event_year_schema(),
@@ -1606,7 +1605,7 @@ mod test {
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        GENERATED_COLUMNS_WRITE_SUPPORT
+        WITH_FEATURE_WRITE_SUPPORT
     )]
     // Connectors receive generation expressions as SQL text, so with `generated-columns-in-dev`
     // kernel rejects a non-string expression.
@@ -1615,7 +1614,7 @@ mod test {
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        NON_STRING_GENERATED_COLUMN_WRITE_SUPPORT
+        NON_STRING_WITH_FEATURE_WRITE_SUPPORT
     )]
     #[case::empty_expression_without_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "")) },
@@ -1633,7 +1632,7 @@ mod test {
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        GENERATED_COLUMNS_WRITE_SUPPORT
+        WITH_FEATURE_WRITE_SUPPORT
     )]
     #[case::no_generation_expression(
         schema_ref! { nullable "event_time": TIMESTAMP },
@@ -1766,7 +1765,7 @@ mod test {
     #[cfg(feature = "generated-columns-in-dev")]
     #[rstest]
     // Protocols supporting generated columns.
-    #[case::table_feature(
+    #[case::with_feature(
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
@@ -1777,7 +1776,7 @@ mod test {
         &[("event_year", "YEAR(event_time)")]
     )]
     // Protocols without support, whose generation expressions define no generated columns.
-    #[case::table_features_without_feature(MockProtocolBuilder::new().build(), &[])]
+    #[case::without_feature(MockProtocolBuilder::new().build(), &[])]
     #[case::legacy_writer_below_min_version(
         MockProtocolBuilder::new().with_versions(1, 3).build(),
         &[]
@@ -1793,11 +1792,11 @@ mod test {
 
         let generated_columns = table_config.generated_columns().unwrap();
 
-        let discovered: Vec<_> = generated_columns
+        let column_pairs: Vec<_> = generated_columns
             .iter()
             .map(|column| (column.name(), column.raw_sql()))
             .collect();
-        assert_eq!(discovered, expected);
+        assert_eq!(column_pairs, expected);
     }
 
     #[test]
