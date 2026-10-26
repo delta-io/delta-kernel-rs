@@ -381,8 +381,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         self.check_constraints_acknowledged = true;
     }
 
-    /// The table's [`GeneratedColumn`]s once this transaction commits, in schema order. Empty when
-    /// the table has none.
+    /// The effective [`GeneratedColumn`]s of this transaction, in schema order. Empty when the
+    /// table has none.
     ///
     /// Each generated column's value is defined by a SQL expression over the row's other columns.
     /// See [`Self::ack_generated_columns`] for what a connector must do before writing to a table
@@ -412,9 +412,9 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// - Compute each generated column from its expression when the write omits the column, and
     ///   reject a row whose supplied value doesn't match.
     ///
-    /// The acknowledgement covers whatever this transaction commits. Without it, on a table that
-    /// has generated columns once this transaction commits,
-    /// [`write_state`](Transaction::write_state) and [`commit`](Self::commit) fail.
+    /// The acknowledgement covers whatever this transaction commits. Without it,
+    /// [`write_state`](Transaction::write_state) and [`commit`](Self::commit) fail whenever this
+    /// transaction has effective generated columns.
     #[cfg(feature = "generated-columns-in-dev")]
     pub fn ack_generated_columns(&mut self) {
         self.generated_columns_acknowledged = true;
@@ -1007,9 +1007,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         Ok(())
     }
 
-    /// Fails `write_state` and commits on a table with generated columns until the connector
-    /// acknowledges enforcing them. The table's generated columns are those it has once this
-    /// transaction commits.
+    /// Fails `write_state` and commits when this transaction has effective generated columns and
+    /// the connector hasn't acknowledged enforcing them.
     #[cfg(feature = "generated-columns-in-dev")]
     fn ensure_generated_columns_acknowledged(&self) -> KernelResult<()> {
         require!(

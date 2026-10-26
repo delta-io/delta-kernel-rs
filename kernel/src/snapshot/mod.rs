@@ -690,7 +690,7 @@ impl Snapshot {
     ///
     /// A connector writing to the table discovers them from
     /// [`Transaction::generated_columns`](crate::transaction::Transaction::generated_columns)
-    /// instead, which returns the generated columns the table has once the transaction commits.
+    /// instead.
     ///
     /// # Errors
     ///

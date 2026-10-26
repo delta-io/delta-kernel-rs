@@ -60,7 +60,7 @@ txn.commit(..)               fails on a table with generated columns without the
 ### Discovering generated columns
 
 `Snapshot::generated_columns()` returns a table's generated columns at the snapshot's version, and
-`Transaction::generated_columns()` returns the ones the table has once the transaction commits.
+`Transaction::generated_columns()` returns the effective generated columns of the transaction.
 Each `GeneratedColumn` provides the column's name through `name()` and its generation expression,
 verbatim from the table, through `raw_sql()`.
 

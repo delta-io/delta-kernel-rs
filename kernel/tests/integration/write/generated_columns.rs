@@ -8,7 +8,7 @@ use delta_kernel::schema::{
     ColumnMetadataKey, DataType, GeneratedColumn, MetadataValue, SchemaRef, StructField, StructType,
 };
 use delta_kernel::transaction::{Transaction, UpdateTableOperation};
-use delta_kernel::{Engine, KernelError, KernelResult, Snapshot};
+use delta_kernel::{KernelError, KernelResult, Snapshot};
 use rstest::rstest;
 use serde_json::json;
 use test_utils::{
@@ -36,9 +36,10 @@ const TESTING_GENERATED_COLUMNS: &[(&str, &str)] = &[
 ];
 
 /// The operation whose generated-column acknowledgement gate is under test.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum GatedOp {
     CommitWithData,
+    RemoveOnlyCommit,
     MetadataOnlyCommit,
     WriteState,
 }
@@ -63,9 +64,9 @@ fn test_schema(generated: &[(&str, &str)]) -> SchemaRef {
     Arc::new(StructType::try_new(fields).expect("test schema must be valid"))
 }
 
-/// Writes version 0 of an unpartitioned table at `table_path` whose protocol lists
-/// `writer_features` and whose schema declares the `generated` columns. Writing the commit directly
-/// controls the protocol's writer features.
+/// Writes version 0 of an unpartitioned table at `table_path` with a table-features protocol
+/// listing `writer_features` and a schema declaring the `generated` columns. This builds a table in
+/// any generated-column and feature state without going through CREATE TABLE.
 async fn write_table(
     table_path: &str,
     writer_features: &[&str],
@@ -93,29 +94,13 @@ fn stage_one_file(txn: &mut Transaction) -> KernelResult<()> {
     Ok(())
 }
 
-/// Performs `op` on `txn` and returns the result of the step the acknowledgement gate guards.
-fn run_gated_op(op: GatedOp, mut txn: Transaction, engine: &dyn Engine) -> KernelResult<()> {
-    match op {
-        GatedOp::CommitWithData => {
-            stage_one_file(&mut txn)?;
-            txn.commit(engine).map(|committed| {
-                let _committed = committed.unwrap_committed();
-            })
-        }
-        GatedOp::MetadataOnlyCommit => txn
-            .with_transaction_id("app_id".to_string(), 1)
-            .commit(engine)
-            .map(|committed| {
-                let _committed = committed.unwrap_committed();
-            }),
-        GatedOp::WriteState => txn.write_state().map(|_write_state| ()),
-    }
-}
-
 /// Asserts `result` failed with the acknowledgement gate error.
 fn assert_gate_error<T: std::fmt::Debug>(result: KernelResult<T>) {
     let err = result.expect_err("acknowledgement gate must reject this operation");
-    let is_gate_error = matches!(err, KernelError::InvalidTransactionState(_));
+    let is_gate_error = matches!(
+        &err,
+        KernelError::InvalidTransactionState(msg) if msg.contains("ack_generated_columns")
+    );
     assert!(
         is_gate_error,
         "expected the acknowledgement gate error, got: {err:?}"
@@ -123,17 +108,19 @@ fn assert_gate_error<T: std::fmt::Debug>(result: KernelResult<T>) {
 }
 
 /// The `(name, raw_sql)` pairs of `generated_columns`, in order.
-fn discovered(generated_columns: &[GeneratedColumn]) -> Vec<(&str, &str)> {
+fn generated_column_pairs(generated_columns: &[GeneratedColumn]) -> Vec<(&str, &str)> {
     generated_columns
         .iter()
         .map(|column| (column.name(), column.raw_sql()))
         .collect()
 }
 
-#[tokio::test]
-async fn discovers_generated_columns_from_snapshot_and_transaction(
-) -> KernelResult<(), Box<dyn std::error::Error>> {
-    let (_tmp, table_path, engine) = test_table_setup()?;
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_and_transaction_return_stored_generated_columns_in_schema_order(
+    #[values(false, true)] checkpoint: bool,
+) -> KernelResult<()> {
+    let (_tmp, table_path, engine) = test_table_setup_mt()?;
     let table_url = write_table(
         &table_path,
         GENERATED_COLUMNS_FEATURE,
@@ -141,25 +128,32 @@ async fn discovers_generated_columns_from_snapshot_and_transaction(
     )
     .await?;
 
-    // Discovery keeps schema order and needs no acknowledgement.
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let mut snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    if checkpoint {
+        snapshot.checkpoint(engine.as_ref(), None)?;
+        // A reloaded snapshot reads Metadata from the checkpoint instead of the commit.
+        snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    }
     let snapshot_columns = snapshot.generated_columns()?;
-    let from_snapshot = discovered(&snapshot_columns);
+    let from_snapshot = generated_column_pairs(&snapshot_columns);
     assert_eq!(from_snapshot, TESTING_GENERATED_COLUMNS);
 
-    let txn = begin_transaction(snapshot, engine.as_ref())?;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
     let txn_columns = txn.generated_columns()?;
-    let from_txn = discovered(&txn_columns);
+    let from_txn = generated_column_pairs(&txn_columns);
     assert_eq!(from_txn, TESTING_GENERATED_COLUMNS);
+
+    stage_one_file(&mut txn)?;
+    assert_gate_error(txn.commit(engine.as_ref()));
     Ok(())
 }
 
 #[rstest]
 #[tokio::test]
-async fn discovers_logical_names_of_mapped_and_partition_generated_columns(
+async fn mapped_and_partitioned_tables_return_logical_names_and_require_ack_for_write_state(
     #[values(true, false)] column_mapping: bool,
     #[values(true, false)] partitioned: bool,
-) -> KernelResult<(), Box<dyn std::error::Error>> {
+) -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let mut reader_features = vec![];
     let mut writer_features = GENERATED_COLUMNS_FEATURE.to_vec();
@@ -181,7 +175,7 @@ async fn discovers_logical_names_of_mapped_and_partition_generated_columns(
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let generated_columns = snapshot.generated_columns()?;
-    let from_snapshot = discovered(&generated_columns);
+    let from_snapshot = generated_column_pairs(&generated_columns);
     assert_eq!(from_snapshot, EVENT_YEAR);
 
     let txn = begin_transaction(snapshot, engine.as_ref())?;
@@ -191,31 +185,68 @@ async fn discovers_logical_names_of_mapped_and_partition_generated_columns(
 
 #[rstest]
 #[tokio::test]
-async fn generated_column_table_write_requires_acknowledgement(
+async fn write_state_and_commits_require_ack_only_on_tables_with_generated_columns(
     #[values(
         GatedOp::CommitWithData,
+        GatedOp::RemoveOnlyCommit,
         GatedOp::MetadataOnlyCommit,
         GatedOp::WriteState
     )]
     op: GatedOp,
+    #[values(true, false)] declares_generated_columns: bool,
     #[values(true, false)] acknowledge: bool,
     #[values(true, false)] discover_first: bool,
-) -> KernelResult<(), Box<dyn std::error::Error>> {
+) -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
-    let table_url = write_table(&table_path, GENERATED_COLUMNS_FEATURE, EVENT_YEAR).await?;
+    let generated = if declares_generated_columns {
+        EVENT_YEAR
+    } else {
+        &[]
+    };
+    let table_url = write_table(&table_path, GENERATED_COLUMNS_FEATURE, generated).await?;
 
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
+    let mut snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    if op == GatedOp::RemoveOnlyCommit {
+        let mut seed_txn = begin_transaction(snapshot, engine.as_ref())?;
+        seed_txn.ack_generated_columns();
+        stage_one_file(&mut seed_txn)?;
+        snapshot = seed_txn
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+    }
+
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?;
     // Discovery alone must not count as an acknowledgement.
     if discover_first {
-        let _discovered = txn.generated_columns()?;
+        let _generated_columns = txn.generated_columns()?;
     }
     if acknowledge {
         txn.ack_generated_columns();
     }
+    let mut txn = txn
+        .with_transaction_id("app_id".to_string(), 1)
+        .with_operation_metrics([("numFiles", Some("1"))]);
 
-    let result = run_gated_op(op, txn, engine.as_ref());
-    if acknowledge {
+    match op {
+        GatedOp::CommitWithData => stage_one_file(&mut txn)?,
+        GatedOp::RemoveOnlyCommit => {
+            let scan_files = get_scan_files(snapshot, engine.as_ref())?;
+            let found_files = !scan_files.is_empty();
+            assert!(found_files);
+            for scan_file in scan_files {
+                txn.remove_files(scan_file);
+            }
+        }
+        GatedOp::MetadataOnlyCommit | GatedOp::WriteState => {}
+    }
+    let result = if op == GatedOp::WriteState {
+        txn.write_state().map(|_write_state| ())
+    } else {
+        txn.commit(engine.as_ref()).map(|committed| {
+            let _committed = committed.unwrap_committed();
+        })
+    };
+    if acknowledge || !declares_generated_columns {
         result?;
     } else {
         assert_gate_error(result);
@@ -223,36 +254,9 @@ async fn generated_column_table_write_requires_acknowledgement(
     Ok(())
 }
 
-#[rstest]
-#[case::without_feature(&[])]
-#[case::with_feature(GENERATED_COLUMNS_FEATURE)]
 #[tokio::test]
-async fn table_without_generated_columns_needs_no_acknowledgement(
-    #[case] writer_features: &[&str],
-    #[values(
-        GatedOp::CommitWithData,
-        GatedOp::MetadataOnlyCommit,
-        GatedOp::WriteState
-    )]
-    op: GatedOp,
-) -> KernelResult<(), Box<dyn std::error::Error>> {
-    let (_tmp, table_path, engine) = test_table_setup()?;
-    let table_url = write_table(&table_path, writer_features, &[]).await?;
-
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let snapshot_columns = snapshot.generated_columns()?;
-    assert!(snapshot_columns.is_empty());
-
-    let txn = begin_transaction(snapshot, engine.as_ref())?;
-    let txn_columns = txn.generated_columns()?;
-    assert!(txn_columns.is_empty());
-    run_gated_op(op, txn, engine.as_ref())?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn protocol_upgrade_turns_existing_generation_expressions_into_generated_columns(
-) -> KernelResult<(), Box<dyn std::error::Error>> {
+async fn protocol_upgrade_turns_existing_expressions_into_generated_columns_that_require_ack(
+) -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = write_table(&table_path, &[], EVENT_YEAR).await?;
     let before_upgrade = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -278,7 +282,7 @@ async fn protocol_upgrade_turns_existing_generation_expressions_into_generated_c
 
     let incremental = Snapshot::builder_from(before_upgrade).build(engine.as_ref())?;
     let incremental_columns = incremental.generated_columns()?;
-    let from_incremental = discovered(&incremental_columns);
+    let from_incremental = generated_column_pairs(&incremental_columns);
     assert_eq!(from_incremental, EVENT_YEAR);
 
     let time_travel = Snapshot::builder_for(table_url)
@@ -295,82 +299,9 @@ async fn protocol_upgrade_turns_existing_generation_expressions_into_generated_c
 
 #[rstest]
 #[tokio::test]
-async fn remove_only_commit_on_generated_column_table_requires_acknowledgement(
+async fn alter_table_commit_succeeds_only_with_ack_and_keeps_generated_columns(
     #[values(true, false)] acknowledge: bool,
-) -> KernelResult<(), Box<dyn std::error::Error>> {
-    let (_tmp, table_path, engine) = test_table_setup()?;
-    let table_url = write_table(&table_path, GENERATED_COLUMNS_FEATURE, EVENT_YEAR).await?;
-
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let mut add_txn = begin_transaction(snapshot, engine.as_ref())?;
-    add_txn.ack_generated_columns();
-    stage_one_file(&mut add_txn)?;
-    let snapshot = add_txn
-        .commit(engine.as_ref())?
-        .unwrap_post_commit_snapshot();
-
-    let scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
-    let mut remove_txn = begin_transaction(snapshot, engine.as_ref())?;
-    for scan_file in scan_files {
-        remove_txn.remove_files(scan_file);
-    }
-    if acknowledge {
-        remove_txn.ack_generated_columns();
-    }
-
-    let result = remove_txn.commit(engine.as_ref());
-    if acknowledge {
-        result?.unwrap_committed();
-    } else {
-        assert_gate_error(result);
-    }
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn discovers_generated_columns_after_checkpoint(
-) -> KernelResult<(), Box<dyn std::error::Error>> {
-    let (_tmp, table_path, engine) = test_table_setup_mt()?;
-    let table_url = write_table(&table_path, GENERATED_COLUMNS_FEATURE, EVENT_YEAR).await?;
-
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    snapshot.checkpoint(engine.as_ref(), None)?;
-
-    // A fresh snapshot reads Metadata from the checkpoint (via the `_last_checkpoint` hint), so
-    // discovery and the ack gate must still see the generated column.
-    let reloaded = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let reloaded_columns = reloaded.generated_columns()?;
-    let from_reloaded = discovered(&reloaded_columns);
-    assert_eq!(from_reloaded, EVENT_YEAR);
-
-    let mut txn = begin_transaction(reloaded, engine.as_ref())?;
-    stage_one_file(&mut txn)?;
-    assert_gate_error(txn.commit(engine.as_ref()));
-    Ok(())
-}
-
-#[tokio::test]
-async fn acknowledgement_survives_later_builder_calls(
-) -> KernelResult<(), Box<dyn std::error::Error>> {
-    let (_tmp, table_path, engine) = test_table_setup()?;
-    let table_url = write_table(&table_path, GENERATED_COLUMNS_FEATURE, EVENT_YEAR).await?;
-
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
-    txn.ack_generated_columns();
-    let mut txn = txn
-        .with_transaction_id("app_id".to_string(), 1)
-        .with_operation_metrics([("numFiles", Some("1"))]);
-    stage_one_file(&mut txn)?;
-    txn.commit(engine.as_ref())?.unwrap_committed();
-    Ok(())
-}
-
-#[rstest]
-#[tokio::test]
-async fn alter_table_on_generated_column_table_requires_acknowledgement(
-    #[values(true, false)] acknowledge: bool,
-) -> KernelResult<(), Box<dyn std::error::Error>> {
+) -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = write_table(
         &table_path,
@@ -396,13 +327,13 @@ async fn alter_table_on_generated_column_table_requires_acknowledgement(
     txn.ack_generated_columns();
     let altered = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
     let altered_columns = altered.generated_columns()?;
-    let from_altered = discovered(&altered_columns);
+    let from_altered = generated_column_pairs(&altered_columns);
     assert_eq!(from_altered, TESTING_GENERATED_COLUMNS);
 
     // The ALTER commit rewrites the schema, so a fresh load reads the expressions kernel wrote.
     let reloaded = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let reloaded_columns = reloaded.generated_columns()?;
-    let from_reloaded = discovered(&reloaded_columns);
+    let from_reloaded = generated_column_pairs(&reloaded_columns);
     assert_eq!(from_reloaded, TESTING_GENERATED_COLUMNS);
     Ok(())
 }

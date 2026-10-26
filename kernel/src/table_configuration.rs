@@ -1771,7 +1771,7 @@ mod test {
         MockProtocolBuilder::new().with_versions(1, 3).build(),
         &[]
     )]
-    fn generated_columns_require_protocol_support(
+    fn generated_columns_returns_columns_only_with_protocol_support(
         #[case] protocol: Protocol,
         #[case] expected: &[(&str, &str)],
     ) {
