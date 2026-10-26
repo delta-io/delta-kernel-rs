@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use delta_kernel_derive::internal_api;
 
@@ -10,15 +10,12 @@ use crate::actions::{
     CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction, MAX_VALUES, MIN_VALUES,
     NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
-use crate::committer::{
-    CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
-};
+use crate::committer::{CommitMetadata, CommitProtocolMetadata, CommitType, Committer};
 use crate::crc::{CrcDelta, FileStatsDelta};
-use crate::engine_data::FilteredEngineData;
 use crate::error::KernelError;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
-use crate::metrics::{CommitFailureReason, MetricId};
+use crate::metrics::MetricId;
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::scan::log_replay::STATS_NAME;
 use crate::schema::void_utils::validate_schema_for_write;
@@ -1223,72 +1220,6 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         );
     }
 
-    /// Submits actions and returns the committer's response with its elapsed time.
-    fn perform_commit(
-        &self,
-        engine: &dyn Engine,
-        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
-        commit_metadata: CommitMetadata,
-    ) -> (KernelResult<CommitResponse>, Duration) {
-        let committer_start = Instant::now();
-        let commit_response = self.committer.commit(engine, actions, commit_metadata);
-        (commit_response, committer_start.elapsed())
-    }
-
-    /// Translates a commit response, retaining the transaction on recoverable failures.
-    /// File statistics are computed only when the committer reports success.
-    fn translate_commit_result<F>(
-        self,
-        commit_response: KernelResult<CommitResponse>,
-        post_commit_inputs: PostCommitInputs,
-        prepare_duration: Duration,
-        committer_duration: Duration,
-        compute_file_stats: F,
-    ) -> KernelResult<CommitResult<STATE, MODE>>
-    where
-        F: FnOnce(&Self) -> KernelResult<(FileStatsDelta, u64)>,
-    {
-        match commit_response {
-            Ok(CommitResponse::Committed { file_meta }) => {
-                let PostCommitInputs {
-                    commit_info,
-                    dm_changes,
-                    #[cfg(feature = "adaptive-metadata-in-dev")]
-                    checkpoint_action,
-                } = post_commit_inputs;
-                // TODO(#2717): the commit already succeeded atomically; the post-commit `?`
-                //              below must not fail the txn (and must not mislabel the metric).
-                let (file_stats, num_dv_updates) = compute_file_stats(&self)?;
-                self.record_commit_success_metrics(
-                    &file_stats,
-                    num_dv_updates,
-                    prepare_duration,
-                    committer_duration,
-                );
-                let crc_delta = self.build_crc_delta(file_stats, commit_info, dm_changes)?;
-                Ok(CommitResult::Committed(self.into_committed(
-                    file_meta,
-                    crc_delta,
-                    #[cfg(feature = "adaptive-metadata-in-dev")]
-                    checkpoint_action,
-                )?))
-            }
-            Ok(CommitResponse::Conflict { version }) => {
-                tracing::Span::current()
-                    .record("failure_reason", CommitFailureReason::Conflict.as_ref());
-                Ok(CommitResult::Conflicted(self.into_conflicted(version)))
-            }
-            // TODO: we may want to be more or less selective about what is retryable (this is tied
-            // to the idea of "what kind of Errors should write_json_file return?")
-            Err(e @ KernelError::IOError(_)) => {
-                tracing::Span::current()
-                    .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
-                Ok(CommitResult::Retryable(self.into_retryable(e)))
-            }
-            Err(e) => Err(e),
-        }
-    }
-
     fn into_committed(
         self,
         file_meta: FileMeta,
@@ -1566,39 +1497,33 @@ mod tests {
     use rstest::rstest;
     use url::Url;
 
-    use super::imperative::{build_add_action_projection, build_remove_struct_patch};
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::CommitInfo;
-    use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
     use crate::arrow::array::{
-        new_null_array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, NullArray,
-        StringArray, StructArray,
+        ArrayRef, Float64Array, Int32Array, Int64Array, NullArray, StringArray,
     };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::arrow::record_batch::RecordBatch;
-    use crate::committer::{FileSystemCommitter, PublishMetadata};
+    use crate::committer::{CommitResponse, FileSystemCommitter, PublishMetadata};
     use crate::engine::arrow_conversion::{TryFromArrow, TryIntoArrow};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
+    use crate::engine_data::FilteredEngineData;
     use crate::expressions::{
-        col, lit, null_lit, ArrayData, ExpressionStructPatchBuilder, MapData, Scalar, StructData,
+        ArrayData, ExpressionStructPatchBuilder, MapData, Scalar, StructData,
     };
-    use crate::metrics::{MetricEvent, TableType, TransactionCommitFailure};
+    use crate::metrics::{CommitFailureReason, MetricEvent, TableType, TransactionCommitFailure};
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
-    use crate::scan::log_replay::{
-        FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
-    };
-    use crate::scan::scan_row_schema;
     use crate::scan::state_info::tests::RowTrackingState;
     use crate::schema::{column_name, schema, schema_ref, ArrayType, MapType, StructType};
     use crate::table_features::{ColumnMappingMode, TableFeature};
-    use crate::table_properties::{APPEND_ONLY, ENABLE_CHANGE_DATA_FEED, ENABLE_ROW_TRACKING};
+    use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_ROW_TRACKING};
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
     use crate::transaction::exec_mode::StagedDataChanges;
@@ -1612,7 +1537,7 @@ mod tests {
         test_schema_flat, test_schema_nested, test_schema_with_array, test_schema_with_map,
         CapturingReporter, MockProtocolBuilder, MockTableConfigurationBuilder,
     };
-    use crate::{EvaluationHandler, Expression, KernelResultIterator, Predicate, Snapshot};
+    use crate::{EvaluationHandler, Expression, KernelResultIterator, Snapshot};
 
     #[rstest]
     fn transaction_constructor_initializes_all_defaults(
@@ -1787,15 +1712,6 @@ mod tests {
         assert_eq!(commit_info_schema, expected_commit_info_schema);
         assert!(!transaction.data_change);
         Ok(())
-    }
-
-    impl Transaction {
-        /// Set clustering columns for testing purposes without needing a table
-        /// with the ClusteredTable feature enabled.
-        fn with_clustering_columns_for_test(mut self, columns: Vec<ColumnName>) -> Self {
-            self.physical_clustering_columns = Some(columns);
-            self
-        }
     }
 
     /// A mock committer that always returns an IOError, used to test the retryable error path.
@@ -1987,99 +1903,6 @@ mod tests {
             },
         };
         assert_eq!(*schema, expected.into());
-        Ok(())
-    }
-
-    #[rstest]
-    #[case::base(false)]
-    #[case::row_tracking(true)]
-    fn test_add_action_projection_schema(#[case] row_tracking: bool) -> KernelResult<()> {
-        let input_schema = if row_tracking {
-            with_row_tracking_cols(&BASE_ADD_FILES_SCHEMA)?
-        } else {
-            BASE_ADD_FILES_SCHEMA.clone()
-        };
-        let (schema, _) = build_add_action_projection(input_schema.as_ref(), true)?;
-        let field_names: Vec<_> = schema.fields().map(|f| f.name().as_str()).collect();
-        let expected_field_names = if row_tracking {
-            vec![
-                "path",
-                "partitionValues",
-                "size",
-                "modificationTime",
-                "dataChange",
-                "stats",
-                "baseRowId",
-                "defaultRowCommitVersion",
-            ]
-        } else {
-            vec![
-                "path",
-                "partitionValues",
-                "size",
-                "modificationTime",
-                "dataChange",
-                "stats",
-            ]
-        };
-        assert_eq!(field_names, expected_field_names);
-        assert_eq!(
-            schema.field("dataChange"),
-            Some(&StructField::not_null("dataChange", DataType::BOOLEAN))
-        );
-        assert_eq!(
-            schema.field("stats").unwrap().data_type(),
-            &DataType::STRING
-        );
-        Ok(())
-    }
-
-    /// Verifies the Remove projection's `deletionTimestamp` and `extendedFileMetadata` fields.
-    /// `extendedFileMetadata` is always a presence predicate; `deletionTimestamp` derives from the
-    /// input outside adaptiveMetadata and is fixed to null under it per the RFC.
-    #[rstest]
-    #[case::standard(false)]
-    #[case::adaptive_metadata(true)]
-    fn test_remove_action_projection_deletion_timestamp_and_extended_metadata(
-        #[case] adaptive_metadata_enabled: bool,
-    ) -> KernelResult<()> {
-        let commit_timestamp = 123;
-        let patch = build_remove_struct_patch(
-            commit_timestamp,
-            true,  /* data_change */
-            &[],   /* columns_to_drop */
-            false, /* coalesce_stats_with_parsed */
-            adaptive_metadata_enabled,
-        )?;
-        let path_patch = patch
-            .field_patches
-            .get("path")
-            .expect("path should have inserted fields");
-        // Insertions preserve `insert_after` call order: deletionTimestamp, dataChange,
-        // extendedFileMetadata, partitionValues.
-        let deletion_timestamp = path_patch
-            .insertions
-            .first()
-            .expect("deletionTimestamp should be the first inserted field");
-        let extended_file_metadata = path_patch
-            .insertions
-            .get(2)
-            .expect("extendedFileMetadata should follow deletionTimestamp and dataChange");
-
-        let expected_deletion_timestamp = if adaptive_metadata_enabled {
-            null_lit(DataType::LONG)
-        } else {
-            lit(commit_timestamp)
-        };
-        let expected_extended_file_metadata = Expression::from_pred(Predicate::and_from([
-            col!(SIZE_NAME).is_not_null(),
-            col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME).is_not_null(),
-        ]));
-        assert_eq!(deletion_timestamp.as_ref(), &expected_deletion_timestamp);
-        assert_eq!(
-            extended_file_metadata.as_ref(),
-            &expected_extended_file_metadata
-        );
         Ok(())
     }
 
@@ -2911,92 +2734,6 @@ mod tests {
         txn.add_files(Box::new(ArrowEngineData::new(batch)));
     }
 
-    #[derive(Clone, Copy, Debug)]
-    enum DataRemoval {
-        RemoveFile,
-        DeletionVectorUpdate,
-    }
-
-    fn set_append_only(txn: &mut Transaction, enabled: bool) -> KernelResult<()> {
-        let metadata = txn
-            .effective_table_config
-            .metadata()
-            .clone()
-            .with_configuration_entry(APPEND_ONLY, enabled.to_string());
-        let table_config = TableConfiguration::try_new_from(
-            &txn.effective_table_config,
-            Some(metadata),
-            None,
-            txn.effective_table_config.version(),
-        )?;
-        txn.replace_effective_table_config(table_config);
-        Ok(())
-    }
-
-    fn make_scan_files(selection_vector: &[bool]) -> FilteredEngineData {
-        let schema: ArrowSchema = scan_row_schema().as_ref().try_into_arrow().unwrap();
-        let row_count = selection_vector.len();
-        let columns = schema
-            .fields()
-            .iter()
-            .map(|field| {
-                if field.name() == PATH_NAME {
-                    Arc::new(StringArray::from_iter_values(
-                        (0..row_count).map(|index| format!("file-{index}.parquet")),
-                    )) as ArrayRef
-                } else if field.name() == SIZE_NAME {
-                    Arc::new(Int64Array::from(vec![1; row_count]))
-                } else if field.name() == FILE_CONSTANT_VALUES_NAME {
-                    let ArrowDataType::Struct(fields) = field.data_type() else {
-                        panic!("fileConstantValues should be a struct");
-                    };
-                    let child_arrays = fields
-                        .iter()
-                        .map(|field| {
-                            if field.name() == PARTITION_VALUES_NAME {
-                                let names = MapFieldNames {
-                                    entry: "key_value".to_string(),
-                                    key: "key".to_string(),
-                                    value: "value".to_string(),
-                                };
-                                let mut builder = MapBuilder::new(
-                                    Some(names),
-                                    StringBuilder::new(),
-                                    StringBuilder::new(),
-                                );
-                                for _ in 0..row_count {
-                                    builder.append(true).unwrap();
-                                }
-                                Arc::new(builder.finish()) as ArrayRef
-                            } else {
-                                new_null_array(field.data_type(), row_count)
-                            }
-                        })
-                        .collect();
-                    Arc::new(StructArray::new(fields.clone(), child_arrays, None))
-                } else {
-                    new_null_array(field.data_type(), row_count)
-                }
-            })
-            .collect();
-        let batch = RecordBatch::try_new(Arc::new(schema), columns).unwrap();
-        FilteredEngineData::try_new(
-            Box::new(ArrowEngineData::new(batch)),
-            selection_vector.to_vec(),
-        )
-        .unwrap()
-    }
-
-    fn stage_data_removal(txn: &mut Transaction, removal: DataRemoval, selection_vector: &[bool]) {
-        let data = make_scan_files(selection_vector);
-        match removal {
-            DataRemoval::RemoveFile => txn.remove_files(data),
-            DataRemoval::DeletionVectorUpdate => {
-                txn.staged_data_changes.dv_matched_files.push(data)
-            }
-        }
-    }
-
     /// Build a transaction on a writable copy of the `table-without-dv-small` fixture.
     fn create_existing_table_txn() -> KernelResult<(Arc<dyn Engine>, Transaction, tempfile::TempDir)>
     {
@@ -3098,95 +2835,6 @@ mod tests {
             create_existing_table_txn_with(true, UpdateTableTransactionBuilder::with_blind_append)?;
         add_dummy_file(&mut txn);
         txn.validate_blind_append_semantics()?;
-        Ok(())
-    }
-
-    #[rstest]
-    fn create_table_add_actions_preserve_data_change(
-        #[values(false, true)] data_change: bool,
-    ) -> KernelResult<()> {
-        let tempdir = tempfile::tempdir()?;
-        let engine = SyncEngine::new();
-        let mut transaction = create_table(
-            tempdir.path().to_string_lossy(),
-            test_schema_flat(),
-            "test-engine",
-            data_change,
-        )
-        .build(&engine, Box::new(FileSystemCommitter::new()))?;
-        add_dummy_file(&mut transaction);
-
-        let (mut adds, _) = transaction.generate_adds(&engine, 0)?;
-        let add = ArrowEngineData::try_from_engine_data(adds.next().expect("Add action")?)?;
-        let add = get_column!(add.record_batch(), "add", StructArray);
-        assert_eq!(
-            get_column!(add, "dataChange", BooleanArray).value(0),
-            data_change
-        );
-        assert!(adds.next().is_none());
-        Ok(())
-    }
-
-    #[rstest]
-    #[case::append_only_disabled(
-        false, /* append_only */
-        true, /* data_change */
-        &[true, true, true], /* selection_vector */
-        false, /* expected_error */
-    )]
-    #[case::no_data_change(
-        true, /* append_only */
-        false, /* data_change */
-        &[true, true, true], /* selection_vector */
-        false, /* expected_error */
-    )]
-    #[case::all_unselected(
-        true, /* append_only */
-        true, /* data_change */
-        &[false, false, false], /* selection_vector */
-        false, /* expected_error */
-    )]
-    #[case::partial_selected(
-        true, /* append_only */
-        true, /* data_change */
-        &[false, true, false], /* selection_vector */
-        true, /* expected_error */
-    )]
-    #[case::all_selected(
-        true, /* append_only */
-        true, /* data_change */
-        &[true, true, true], /* selection_vector */
-        true, /* expected_error */
-    )]
-    fn append_only_rejects_data_removal_when_data_change(
-        #[values(DataRemoval::RemoveFile, DataRemoval::DeletionVectorUpdate)] removal: DataRemoval,
-        #[values(0, 1)] batch_index: usize,
-        #[case] append_only: bool,
-        #[case] data_change: bool,
-        #[case] selection_vector: &[bool],
-        #[case] expected_error: bool,
-    ) -> KernelResult<()> {
-        let (_engine, mut txn, _tempdir) =
-            create_existing_table_txn_with(data_change, |builder| builder)?;
-        set_append_only(&mut txn, append_only)?;
-        for index in 0..2 {
-            let selection_vector = if index == batch_index {
-                selection_vector
-            } else {
-                &[false, false, false]
-            };
-            stage_data_removal(&mut txn, removal, selection_vector);
-        }
-
-        let result = txn.validate_append_only_semantics();
-        if expected_error {
-            assert!(matches!(
-                result,
-                Err(KernelError::InvalidTransactionState(_))
-            ));
-        } else {
-            result?;
-        }
         Ok(())
     }
 
@@ -3603,185 +3251,6 @@ mod tests {
             )?)
         );
         Ok(())
-    }
-
-    // =========================================================================
-    // Stats validation tests for clustering columns
-    // =========================================================================
-
-    /// Per-file stats configuration for test add file helpers.
-    enum TestFileStats {
-        /// No stats (null stats struct)
-        None,
-        /// Normal stats with non-null min/max
-        Present,
-        /// All-null column: nullCount == numRecords, null min/max
-        AllNull,
-    }
-
-    /// Creates test add file metadata with configurable stats for the "value" column.
-    fn create_test_add_files(paths: Vec<&str>, stats: Vec<TestFileStats>) -> Box<dyn EngineData> {
-        let value_schema = schema! { nullable "value": LONG };
-        let value_fields = value_schema.fields().cloned().collect::<Vec<_>>();
-        let value_struct_type = DataType::from(value_schema);
-        let stats_schema = schema! {
-            nullable NUM_RECORDS: LONG,
-            nullable NULL_COUNT: (value_struct_type.clone()),
-            nullable MIN_VALUES: (value_struct_type.clone()),
-            nullable MAX_VALUES: (value_struct_type.clone()),
-        };
-        let stats_fields = stats_schema.fields().cloned().collect::<Vec<_>>();
-        let stats_type = DataType::from(stats_schema);
-        let schema = schema_ref! {
-            not_null "path": STRING,
-            not_null "partitionValues": { STRING => nullable STRING },
-            not_null "size": LONG,
-            not_null "modificationTime": LONG,
-            nullable "stats": (stats_type.clone()),
-        };
-
-        let empty_map = Scalar::Map(
-            MapData::try_new(
-                MapType::new(DataType::STRING, DataType::STRING, true),
-                Vec::<(&str, &str)>::new(),
-            )
-            .unwrap(),
-        );
-
-        let rows: Vec<Vec<Scalar>> = paths
-            .iter()
-            .zip(stats.iter())
-            .map(|(path, stat)| {
-                let stats_scalar = match stat {
-                    TestFileStats::None => Scalar::Null(stats_type.clone()),
-                    TestFileStats::Present | TestFileStats::AllNull => {
-                        let value_struct = |v: Option<i64>| {
-                            let scalar = v.map_or(Scalar::Null(DataType::LONG), |n| n.into());
-                            Scalar::Struct(
-                                StructData::try_new(value_fields.clone(), vec![scalar]).unwrap(),
-                            )
-                        };
-                        let (null_count, min, max) = match stat {
-                            TestFileStats::Present => (
-                                value_struct(Some(0)),
-                                value_struct(Some(1)),
-                                value_struct(Some(100)),
-                            ),
-                            _ => (
-                                value_struct(Some(100)),
-                                value_struct(None),
-                                value_struct(None),
-                            ),
-                        };
-                        Scalar::Struct(
-                            StructData::try_new(
-                                stats_fields.clone(),
-                                vec![100i64.into(), null_count, min, max],
-                            )
-                            .unwrap(),
-                        )
-                    }
-                };
-                vec![
-                    (*path).into(),
-                    empty_map.clone(),
-                    1024i64.into(),
-                    1000000i64.into(),
-                    stats_scalar,
-                ]
-            })
-            .collect();
-        ArrowEvaluationHandler.create_many(schema, rows).unwrap()
-    }
-
-    #[test]
-    fn test_stats_validation_allows_all_null_clustering_column() {
-        let (engine, snapshot) = setup_non_dv_table();
-        let txn = snapshot
-            .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))
-            .unwrap()
-            .with_clustering_columns_for_test(vec![column_name!("value")]);
-
-        let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::AllNull]);
-
-        let result = txn.validate_add_files_stats(&[add_files]);
-
-        assert!(
-            result.is_ok(),
-            "Stats validation should pass for all-null clustering columns, got: {result:?}",
-        );
-    }
-
-    #[test]
-    fn test_stats_validation_when_clustering_cols_missing_stats() {
-        let (engine, snapshot) = setup_non_dv_table();
-        let txn = snapshot
-            .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))
-            .unwrap()
-            // Enable clustering columns for this test
-            .with_clustering_columns_for_test(vec![column_name!("value")]);
-
-        // Add files WITHOUT stats
-        let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::None]);
-
-        // Directly test the validation method instead of committing
-        let result = txn.validate_add_files_stats(&[add_files]);
-
-        assert!(
-            result.is_err(),
-            "Expected validation to fail when stats are missing for clustering columns"
-        );
-
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("Stats validation error") || err_msg.contains("no stats"),
-            "Expected stats validation error, got: {err_msg}"
-        );
-    }
-
-    #[test]
-    fn test_stats_validation_when_clustering_stats_present() {
-        let (engine, snapshot) = setup_non_dv_table();
-        let txn = snapshot
-            .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))
-            .unwrap()
-            // Enable clustering columns for this test
-            .with_clustering_columns_for_test(vec![column_name!("value")]);
-
-        // Add files WITH stats
-        let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::Present]);
-
-        // Directly test the validation method
-        let result = txn.validate_add_files_stats(&[add_files]);
-
-        assert!(
-            result.is_ok(),
-            "Stats validation should pass when stats are present, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_stats_validation_skipped_without_clustering() {
-        let (engine, snapshot) = setup_non_dv_table();
-        let txn = snapshot
-            .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))
-            .unwrap();
-        // No clustering columns set (default)
-
-        // Add files WITHOUT stats
-        let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::None]);
-
-        // Directly test the validation method - should pass because no clustering
-        let result = txn.validate_add_files_stats(&[add_files]);
-
-        assert!(
-            result.is_ok(),
-            "Stats validation should be skipped without clustering, got: {result:?}"
-        );
     }
 
     #[test]
