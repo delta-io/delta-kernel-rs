@@ -601,13 +601,13 @@ mod tests {
     use bytes::Bytes;
     use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
     use delta_kernel::arrow::array::{
-        Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-        Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+        Array, AsArray, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+        Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
         TimestampMicrosecondArray,
     };
     use delta_kernel::arrow::compute::cast;
     use delta_kernel::arrow::datatypes::{
-        DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit,
+        DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit, TimestampMicrosecondType,
     };
     use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -950,15 +950,16 @@ mod tests {
             Arc::new(TokioBackgroundExecutor::new()),
         );
 
-        // Native nanosecond reads require updating timestamp_stat_as_micros and row-group pruning.
         let footer = handler.read_parquet_footer(&file_meta).unwrap();
         assert_eq!(
             footer.schema.field("ts_utc").unwrap().data_type(),
-            &DataType::TIMESTAMP
+            &DataType::TIMESTAMP,
+            "row group skipping assumes timestamps are read as microseconds",
         );
         assert_eq!(
             footer.schema.field("ts_ntz").unwrap().data_type(),
-            &DataType::TIMESTAMP_NTZ
+            &DataType::TIMESTAMP_NTZ,
+            "row group skipping assumes timestamps are read as microseconds",
         );
 
         let data: Vec<RecordBatch> = handler
@@ -968,22 +969,18 @@ mod tests {
             .try_collect()
             .unwrap();
 
+        let expected: Vec<_> = expected_us.iter().copied().map(Some).collect();
         for col_idx in 0..2 {
-            let mut actual = Vec::new();
-            for batch in &data {
-                let col = batch
-                    .column(col_idx)
-                    .as_any()
-                    .downcast_ref::<TimestampMicrosecondArray>()
-                    .expect("reader output must use microseconds");
-                assert_eq!(
-                    col.null_count(),
-                    0,
-                    "column {col_idx} must preserve non-null inputs",
-                );
-                actual.extend_from_slice(col.values());
-            }
-            assert_eq!(actual, expected_us, "column {col_idx}");
+            let actual: Vec<_> = data
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(col_idx)
+                        .as_primitive_opt::<TimestampMicrosecondType>()
+                        .expect("reader output must use microseconds")
+                })
+                .collect();
+            assert_eq!(actual, expected, "column {col_idx}");
         }
     }
 

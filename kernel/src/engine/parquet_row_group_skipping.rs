@@ -123,8 +123,7 @@ impl<'a> RowGroupFilter<'a> {
         RowGroupFilter::new(row_group, predicate).eval_sql_where(predicate) != Some(false)
     }
 
-    /// Returns column chunk metadata, or `None` if the column doesn't exist.
-    /// An existing column may still have no statistics.
+    /// Returns the column chunk metadata, or `None` if the column doesn't exist.
     fn get_column(&self, col: &ColumnName) -> Option<&ColumnChunkMetaData> {
         self.field_indices
             .get(col)
@@ -165,7 +164,8 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
 }
 
 /// Extracts the minimum stat value from parquet footer statistics, converting from the physical
-/// parquet type to the requested logical Delta type.
+/// parquet type to the requested logical Delta type. `column` supplies the Parquet annotation used
+/// to rescale INT64 timestamp stats to microseconds.
 fn extract_min_scalar(
     data_type: &DataType,
     stats: &Statistics,
@@ -222,7 +222,8 @@ fn extract_min_scalar(
 }
 
 /// Extracts the maximum stat value from parquet footer statistics, converting from the physical
-/// parquet type to the requested logical Delta type.
+/// parquet type to the requested logical Delta type. `column` supplies the Parquet annotation used
+/// to rescale INT64 timestamp stats to microseconds.
 fn extract_max_scalar(
     data_type: &DataType,
     stats: &Statistics,
@@ -312,7 +313,8 @@ fn timestamp_from_date(days: Option<&i32>) -> Option<Scalar> {
 ///
 /// When the requested type is Timestamp or TimestampNtz, Kernel's Arrow reader casts unannotated
 /// INT64 values to microsecond timestamps without rescaling. Footer bounds must match that
-/// interpretation so pruning stays consistent with the values the reader returns.
+/// interpretation so pruning stays consistent with the values the reader returns. Millisecond
+/// bounds are treated as exact, which holds for spec-compliant `partitionValues_parsed` timestamps.
 ///
 /// Returns `None` for unsupported annotations or scaling overflow, so that bound cannot justify
 /// skipping a row group.

@@ -7,10 +7,11 @@ use bytes::Bytes;
 use rstest::rstest;
 
 use super::*;
-use crate::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, StructArray};
+use crate::arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch, StringArray, StructArray};
 use crate::arrow::compute::cast;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema, TimeUnit as ArrowTimeUnit,
+    TimestampMicrosecondType,
 };
 use crate::expressions::{
     col, column_name, column_pred, lit, Expression, OpaquePredicateOp, ScalarExpressionEvaluator,
@@ -484,133 +485,131 @@ fn timestamp_row_group_skipping_rescales_footer_units(
     )]
     unit: ArrowTimeUnit,
     #[values(None, Some("UTC"))] timezone: Option<&str>,
-    #[values(false, true)] checkpoint_partition: bool,
 ) {
-    let values = [-1_999_000, -1_001_000, 0, 1_001_000, 1_999_000].map(|micros| match unit {
-        ArrowTimeUnit::Millisecond => micros / 1_000,
-        ArrowTimeUnit::Microsecond => micros,
-        ArrowTimeUnit::Nanosecond => micros * 1_000,
-        ArrowTimeUnit::Second => unreachable!(),
-    });
-    let col_path: &[&str] = if checkpoint_partition {
-        &["add", "partitionValues_parsed", "ts"]
-    } else {
-        &["ts"]
-    };
+    let values = [-1_999_000, -1_001_000, 0, 1_001_000, 1_999_000]
+        .map(|micros| micros_to_unit(micros, unit));
+    let col_path = ["add", "partitionValues_parsed", "ts"];
     let bytes = write_timestamp_parquet(
         unit,
         timezone,
-        col_path,
+        &col_path,
         &[&values[..2], &values[2..3], &values[3..]],
     );
-    let bound = if timezone.is_some() {
-        Scalar::Timestamp(bound)
-    } else {
-        Scalar::TimestampNtz(bound)
-    };
-    let predicate = comparison(
-        Expression::column(col_path.iter().copied()),
-        lit(bound.clone()),
-    );
-    let rows: usize = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
-        .unwrap()
-        .with_row_group_filter(&predicate, None)
-        .build()
-        .unwrap()
-        .map(|batch| batch.unwrap().num_rows())
-        .sum();
-    assert_eq!(rows, expected_rows);
-
-    if checkpoint_partition {
-        let predicate = comparison(col!("ts"), lit(bound));
-        let rows: usize = ParquetRecordBatchReaderBuilder::try_new(bytes)
-            .unwrap()
-            .with_checkpoint_row_group_filter(&predicate, &HashSet::from(["ts".into()]), None)
+    let (_, scalar) = timestamp_kind(timezone);
+    let bound = lit(scalar(bound));
+    let count_rows = |builder: ParquetRecordBatchReaderBuilder<Bytes>| -> usize {
+        builder
             .build()
             .unwrap()
             .map(|batch| batch.unwrap().num_rows())
-            .sum();
-        assert_eq!(rows, expected_rows);
-    }
+            .sum()
+    };
+    let builder = || ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).unwrap();
+
+    let predicate = comparison(Expression::column(col_path), bound.clone());
+    assert_eq!(
+        count_rows(builder().with_row_group_filter(&predicate, None)),
+        expected_rows
+    );
+
+    let predicate = comparison(col!("ts"), bound);
+    let partition_columns = HashSet::from(["ts".into()]);
+    assert_eq!(
+        count_rows(builder().with_checkpoint_row_group_filter(
+            &predicate,
+            &partition_columns,
+            None
+        )),
+        expected_rows
+    );
 }
 
 #[rstest]
-#[case::millis(
-    ArrowTimeUnit::Millisecond,
-    &[1_580_544_550_000],
-    [Some(1_580_544_550_000_000); 2]
-)]
-#[case::negative_millis(ArrowTimeUnit::Millisecond, &[-1], [Some(-1_000); 2])]
-#[case::millis_overflow(
-    ArrowTimeUnit::Millisecond,
-    &[-1, i64::MAX / 1_000 + 1],
-    [Some(-1_000), None]
-)]
-#[case::millis_underflow(
-    ArrowTimeUnit::Millisecond,
-    &[i64::MIN / 1_000 - 1, 1],
-    [None, Some(1_000)]
-)]
-#[case::micros_max(ArrowTimeUnit::Microsecond, &[i64::MAX], [Some(i64::MAX); 2])]
-#[case::micros_min(ArrowTimeUnit::Microsecond, &[i64::MIN], [Some(i64::MIN); 2])]
-#[case::nanos(ArrowTimeUnit::Nanosecond, &[1_999], [Some(1); 2])]
-#[case::negative_nanos(ArrowTimeUnit::Nanosecond, &[-1_999], [Some(-1); 2])]
-#[case::sub_microsecond(ArrowTimeUnit::Nanosecond, &[999], [Some(0); 2])]
-#[case::negative_sub_microsecond(ArrowTimeUnit::Nanosecond, &[-999], [Some(0); 2])]
-fn timestamp_footer_stats_match_engine_casts(
+#[case::millis(ArrowTimeUnit::Millisecond, 1_580_544_550_000, 1_580_544_550_000_000)]
+#[case::negative_millis(ArrowTimeUnit::Millisecond, -1, -1_000)]
+#[case::micros_max(ArrowTimeUnit::Microsecond, i64::MAX, i64::MAX)]
+#[case::micros_min(ArrowTimeUnit::Microsecond, i64::MIN, i64::MIN)]
+#[case::nanos(ArrowTimeUnit::Nanosecond, 1_999, 1)]
+#[case::negative_nanos(ArrowTimeUnit::Nanosecond, -1_999, -1)]
+#[case::sub_microsecond(ArrowTimeUnit::Nanosecond, 999, 0)]
+#[case::negative_sub_microsecond(ArrowTimeUnit::Nanosecond, -999, 0)]
+fn timestamp_footer_stats_match_arrow_microsecond_cast(
     #[case] unit: ArrowTimeUnit,
-    #[case] raw: &[i64],
-    #[case] expected: [Option<i64>; 2],
+    #[case] raw: i64,
+    #[case] expected: i64,
     #[values(None, Some("UTC"))] timezone: Option<&str>,
 ) {
-    let bytes = write_timestamp_parquet(unit, timezone, &["ts"], &[raw]);
+    let bytes = write_timestamp_parquet(unit, timezone, &["ts"], &[&[raw]]);
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
     let predicate = column_pred!("ts");
     let filter = RowGroupFilter::new(builder.metadata().row_group(0), &predicate);
-    let (data_type, scalar) = if timezone.is_some() {
-        (DataType::TIMESTAMP, Scalar::Timestamp as fn(i64) -> Scalar)
-    } else {
-        (
-            DataType::TIMESTAMP_NTZ,
-            Scalar::TimestampNtz as fn(i64) -> Scalar,
-        )
-    };
-    let expected_scalar = expected.map(|stat| stat.map(scalar));
+    let (data_type, scalar) = timestamp_kind(timezone);
     assert_eq!(
         filter.get_min_stat(&column_name!("ts"), &data_type),
-        expected_scalar[0]
+        Some(scalar(expected))
     );
     assert_eq!(
         filter.get_max_stat(&column_name!("ts"), &data_type),
-        expected_scalar[1]
+        Some(scalar(expected))
     );
 
-    if expected.contains(&None) {
-        let bound = scalar(0);
-        let comparisons: [fn(Expression, Expression) -> Predicate; 3] =
-            [Predicate::lt, Predicate::gt, Predicate::eq];
-        for comparison in comparisons {
-            assert!(RowGroupFilter::apply(
-                builder.metadata().row_group(0),
-                &comparison(col!("ts"), lit(bound.clone())),
-            ));
-        }
-        for (comparison, bound) in comparisons[..2].iter().zip(expected_scalar) {
-            if let Some(bound) = bound {
-                assert!(!RowGroupFilter::apply(
-                    builder.metadata().row_group(0),
-                    &comparison(col!("ts"), lit(bound)),
-                ));
-            }
-        }
-    } else {
-        let batch = builder.build().unwrap().next().unwrap().unwrap();
-        let micros_type =
-            ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, timezone.map(Into::into));
-        let micros = cast(batch.column(0), &micros_type).unwrap();
-        let values = cast(&micros, &ArrowDataType::Int64).unwrap();
-        let values = values.as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(Some(values.value(0)), expected[0]);
+    let batch = builder.build().unwrap().next().unwrap().unwrap();
+    let micros_type =
+        ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, timezone.map(Into::into));
+    let micros = cast(batch.column(0), &micros_type).unwrap();
+    assert_eq!(
+        micros.as_primitive::<TimestampMicrosecondType>().value(0),
+        expected
+    );
+}
+
+#[rstest]
+#[case::max_overflow(&[-1, i64::MAX / 1_000 + 1], Some(-1_000), None)]
+#[case::min_underflow(&[i64::MIN / 1_000 - 1, 1], None, Some(1_000))]
+fn timestamp_footer_stat_overflow_keeps_row_group(
+    #[case] raw: &[i64],
+    #[case] expected_min: Option<i64>,
+    #[case] expected_max: Option<i64>,
+    #[values(None, Some("UTC"))] timezone: Option<&str>,
+) {
+    let bytes = write_timestamp_parquet(ArrowTimeUnit::Millisecond, timezone, &["ts"], &[raw]);
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+    let row_group = builder.metadata().row_group(0);
+    let predicate = column_pred!("ts");
+    let filter = RowGroupFilter::new(row_group, &predicate);
+    let (data_type, scalar) = timestamp_kind(timezone);
+    assert_eq!(
+        filter.get_min_stat(&column_name!("ts"), &data_type),
+        expected_min.map(scalar)
+    );
+    assert_eq!(
+        filter.get_max_stat(&column_name!("ts"), &data_type),
+        expected_max.map(scalar)
+    );
+
+    assert!(RowGroupFilter::apply(
+        row_group,
+        &Predicate::lt(col!("ts"), lit(scalar(0)))
+    ));
+    assert!(RowGroupFilter::apply(
+        row_group,
+        &Predicate::gt(col!("ts"), lit(scalar(0)))
+    ));
+    assert!(RowGroupFilter::apply(
+        row_group,
+        &Predicate::eq(col!("ts"), lit(scalar(0)))
+    ));
+    if let Some(min) = expected_min {
+        assert!(!RowGroupFilter::apply(
+            row_group,
+            &Predicate::lt(col!("ts"), lit(scalar(min)))
+        ));
+    }
+    if let Some(max) = expected_max {
+        assert!(!RowGroupFilter::apply(
+            row_group,
+            &Predicate::gt(col!("ts"), lit(scalar(max)))
+        ));
     }
 }
 
@@ -643,6 +642,7 @@ fn timestamp_footer_stats_respect_annotations(
     #[case] logical_type: Option<LogicalType>,
     #[case] converted_type: ConvertedType,
     #[case] expected: Option<i64>,
+    #[values(None, Some("UTC"))] timezone: Option<&str>,
 ) {
     let builder = Type::primitive_type_builder("ts", PhysicalType::INT64)
         .with_logical_type(logical_type.clone())
@@ -660,19 +660,13 @@ fn timestamp_footer_stats_respect_annotations(
     );
     assert_eq!(column.logical_type_ref(), logical_type.as_ref());
     let stats = Statistics::int64(Some(1_000), Some(1_000), None, Some(0), false);
-    for data_type in [DataType::TIMESTAMP, DataType::TIMESTAMP_NTZ] {
-        let scalar = if data_type == DataType::TIMESTAMP {
-            Scalar::Timestamp as fn(i64) -> Scalar
-        } else {
-            Scalar::TimestampNtz as fn(i64) -> Scalar
-        };
-        let expected = expected.map(scalar);
-        assert_eq!(
-            extract_min_scalar(&data_type, &stats, &column),
-            expected.clone()
-        );
-        assert_eq!(extract_max_scalar(&data_type, &stats, &column), expected);
-    }
+    let (data_type, scalar) = timestamp_kind(timezone);
+    let expected = expected.map(scalar);
+    assert_eq!(
+        extract_min_scalar(&data_type, &stats, &column),
+        expected.clone()
+    );
+    assert_eq!(extract_max_scalar(&data_type, &stats, &column), expected);
 }
 
 #[rstest]
@@ -686,30 +680,17 @@ fn timestamp_checkpoint_stats_rescale_before_widening(
     #[values(None, Some("UTC"))] timezone: Option<&str>,
     #[values(MIN_VALUES, MAX_VALUES)] stat: &str,
 ) {
-    let value = match unit {
-        ArrowTimeUnit::Millisecond => 1_001,
-        ArrowTimeUnit::Microsecond => 1_001_000,
-        ArrowTimeUnit::Nanosecond => 1_001_000_000,
-        ArrowTimeUnit::Second => unreachable!(),
-    };
     let bytes = write_timestamp_parquet(
         unit,
         timezone,
         &["add", "stats_parsed", stat, "ts"],
-        &[&[value]],
+        &[&[micros_to_unit(1_001_000, unit)]],
     );
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
     let predicate = column_pred!("ts");
     let filter =
         CheckpointRowGroupFilter::new(builder.metadata().row_group(0), &predicate, &NO_PARTITIONS);
-    let (data_type, scalar) = if timezone.is_some() {
-        (DataType::TIMESTAMP, Scalar::Timestamp as fn(i64) -> Scalar)
-    } else {
-        (
-            DataType::TIMESTAMP_NTZ,
-            Scalar::TimestampNtz as fn(i64) -> Scalar,
-        )
-    };
+    let (data_type, scalar) = timestamp_kind(timezone);
     let (actual, expected) = if stat == MIN_VALUES {
         (
             filter.get_min_stat(&column_name!("ts"), &data_type),
@@ -744,6 +725,22 @@ fn write_timestamp_parquet(
         writer.flush().unwrap();
     }
     writer.unwrap().into_inner().unwrap().into()
+}
+
+fn timestamp_kind(timezone: Option<&str>) -> (DataType, fn(i64) -> Scalar) {
+    match timezone {
+        Some(_) => (DataType::TIMESTAMP, Scalar::Timestamp),
+        None => (DataType::TIMESTAMP_NTZ, Scalar::TimestampNtz),
+    }
+}
+
+fn micros_to_unit(micros: i64, unit: ArrowTimeUnit) -> i64 {
+    match unit {
+        ArrowTimeUnit::Millisecond => micros / 1_000,
+        ArrowTimeUnit::Microsecond => micros,
+        ArrowTimeUnit::Nanosecond => micros * 1_000,
+        ArrowTimeUnit::Second => unreachable!(),
+    }
 }
 
 // A missing footer null count decodes to `None`; an exact zero is preserved as `Some(0)`. Parquet
@@ -811,21 +808,18 @@ fn test_interval_skipping_unsupported_for_any_footer_stats() {
 
 /// Wraps a leaf array in nested StructArrays matching the given column path.
 ///
-/// For `col_path = &["a", "b"]` and a leaf array `[10, 20]`, produces the Arrow structure:
+/// For `col_path = &["a", "b"]` and an Int64 leaf array `[10, 20]`, produces the Arrow structure:
 ///   `a: Struct { b: Int64 }` with values `[{b: 10}, {b: 20}]`.
 ///
 /// Returns the outermost `(field, array)` pair for embedding in a parent struct.
-fn wrap_in_nested_struct(
-    col_path: &[&str],
-    values: ArrayRef,
-) -> (Arc<Field>, Arc<dyn crate::arrow::array::Array>) {
+fn wrap_in_nested_struct(col_path: &[&str], values: ArrayRef) -> (Arc<Field>, ArrayRef) {
     assert!(!col_path.is_empty());
     let mut field = Arc::new(Field::new(
         *col_path.last().unwrap(),
         values.data_type().clone(),
         true,
     ));
-    let mut array: Arc<dyn crate::arrow::array::Array> = values;
+    let mut array: ArrayRef = values;
     for &name in col_path[..col_path.len() - 1].iter().rev() {
         let struct_array = StructArray::from(vec![(field.clone(), array)]);
         field = Arc::new(Field::new(
