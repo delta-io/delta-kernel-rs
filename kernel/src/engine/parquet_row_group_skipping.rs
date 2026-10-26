@@ -314,22 +314,21 @@ fn timestamp_from_date(days: Option<&i32>) -> Option<Scalar> {
 /// Returns `None` for unsupported annotations or scaling overflow, so that bound cannot justify
 /// skipping a row group.
 fn timestamp_stat_as_micros(value: i64, column: &ColumnDescriptor) -> Option<i64> {
-    let unit = match column.logical_type_ref() {
-        Some(LogicalType::Timestamp(timestamp)) => Some(&timestamp.unit),
-        None => None,
-        Some(_) => return None,
-    };
-    match unit {
-        Some(TimeUnit::MILLIS) => value.checked_mul(1_000),
-        Some(TimeUnit::MICROS) => Some(value),
-        // Match the reader's microsecond cast, which truncates toward zero even for negatives.
-        // Pruning could drop matching rows if predicates were evaluated at nanosecond precision.
-        Some(TimeUnit::NANOS) => Some(value / 1_000),
+    match column.logical_type_ref() {
+        Some(LogicalType::Timestamp(timestamp)) => match timestamp.unit {
+            TimeUnit::MILLIS => value.checked_mul(1_000),
+            TimeUnit::MICROS => Some(value),
+            // Match the reader's microsecond cast, which truncates toward zero even for negatives.
+            // Pruning could drop matching rows if predicates were evaluated at nanosecond
+            // precision.
+            TimeUnit::NANOS => Some(value / 1_000),
+        },
         None => match column.converted_type() {
             ConvertedType::TIMESTAMP_MILLIS => value.checked_mul(1_000),
             ConvertedType::TIMESTAMP_MICROS | ConvertedType::NONE => Some(value),
             _ => None,
         },
+        Some(_) => None,
     }
 }
 
