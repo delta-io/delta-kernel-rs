@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use itertools::Itertools;
 use serde::Serialize;
 use tempfile::TempDir;
+use test_utils::table_builder::{FeatureSet, LogState, TestTable, TestTableBuilder};
 use test_utils::{
     copy_directory, delta_path_for_version, load_test_data, modify_add_file_partition_keys,
     replace_array_row, AddFilePartitionKeyModify,
@@ -17,7 +18,10 @@ use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use url::Url;
 
-use crate::actions::{get_all_actions_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
+use crate::actions::{
+    get_all_actions_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove,
+    CHECKPOINT_METADATA_NAME, SIDECAR_NAME,
+};
 use crate::arrow::array::{
     new_empty_array, new_null_array, ArrayRef, Int64Array, MapArray, RecordBatch, StringArray,
     StructArray,
@@ -1318,6 +1322,39 @@ pub(crate) fn load_test_table(
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
     Ok((engine, snapshot, tempdir))
+}
+
+/// Builds an in-memory table with commits 0 to 2 and a checkpoint at version 1 that kernel wrote,
+/// with the `v2Checkpoint` feature (so a V2 checkpoint without sidecars) if `v2_checkpoint`.
+pub(crate) fn kernel_checkpoint_table(v2_checkpoint: bool) -> TestTable {
+    let features = FeatureSet::empty();
+    TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(2).with_checkpoint_at([1]))
+        .with_features(if v2_checkpoint {
+            features.v2_checkpoint()
+        } else {
+            features
+        })
+        .build()
+        .unwrap()
+}
+
+/// Asserts that the footer schema of the snapshot's checkpoint, which kernel wrote, has a `sidecar`
+/// column, and a `checkpointMetadata` column only if `v2_checkpoint`. Returns the footer schema.
+pub(crate) fn assert_kernel_checkpoint_schema(
+    engine: &dyn Engine,
+    snapshot: &Snapshot,
+    v2_checkpoint: bool,
+) -> SchemaRef {
+    let checkpoint = &snapshot.log_segment().listed.checkpoint_parts[0].location;
+    let schema = engine
+        .parquet_handler()
+        .read_parquet_footer(checkpoint)
+        .unwrap()
+        .schema;
+    assert!(schema.contains(SIDECAR_NAME));
+    assert_eq!(schema.contains(CHECKPOINT_METADATA_NAME), v2_checkpoint);
+    schema
 }
 
 pub(crate) mod column_mapping_physical_name_dedup_fixtures {

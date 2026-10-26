@@ -11,8 +11,8 @@ use super::*;
 use crate::actions::visitors::{AddVisitor, SidecarVisitor};
 use crate::actions::{
     get_all_actions_schema, get_commit_schema, Add, CheckpointMetadata, Remove, Sidecar, ADD_NAME,
-    COMMIT_INFO_NAME, LOG_METADATA_SCHEMA, MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS,
-    REMOVE_NAME, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
+    CHECKPOINT_METADATA_NAME, COMMIT_INFO_NAME, LOG_METADATA_SCHEMA, MAX_VALUES, METADATA_NAME,
+    MIN_VALUES, NUM_RECORDS, REMOVE_NAME, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
 };
 use crate::arrow::array::{StringArray, StructArray};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
@@ -3742,6 +3742,66 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> K
     );
     assert!(sidecars.is_empty(), "Multi-part V1 should have no sidecars");
 
+    Ok(())
+}
+
+/// The checkpoint holds a `sidecar` action, so a sidecar lookup would find it.
+#[rstest]
+#[tokio::test]
+async fn test_sidecar_lookup_requires_checkpoint_metadata_column(
+    #[values(false, true)] has_checkpoint_metadata: bool,
+    #[values(false, true)] schema_from_hint: bool,
+) -> KernelResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    let sidecar_name = "sidecarfile1.parquet";
+    let sidecar = add_sidecar_to_store(
+        &store,
+        add_batch_simple(COMMIT_READ_SCHEMA.clone()),
+        sidecar_name,
+    )
+    .await?;
+    let mut checkpoint_fields = vec![ADD_NAME, SIDECAR_NAME];
+    checkpoint_fields.extend(has_checkpoint_metadata.then_some(CHECKPOINT_METADATA_NAME));
+    let checkpoint_schema = get_all_actions_schema().project(&checkpoint_fields)?;
+    let checkpoint_name = "00000000000000000001.checkpoint.parquet";
+    add_checkpoint_to_store(
+        &store,
+        sidecar_batch_with_given_paths_and_sizes(
+            vec![(sidecar_name, sidecar.size)],
+            checkpoint_schema.clone(),
+        ),
+        checkpoint_name,
+    )
+    .await?;
+    let checkpoint_size = get_file_size(&store, &format!("_delta_log/{checkpoint_name}")).await;
+    let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
+
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        schema_from_hint.then(|| LastCheckpointHint {
+            version: 1,
+            checkpoint_schema: Some(checkpoint_schema.clone()),
+            ..Default::default()
+        }),
+    )?;
+    assert_eq!(
+        log_segment.checkpoint_hint_schema().is_some(),
+        schema_from_hint
+    );
+
+    let (file_actions_schema, sidecars) =
+        log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
+    assert_eq!(sidecars.len(), usize::from(has_checkpoint_metadata));
+    if !has_checkpoint_metadata {
+        assert_eq!(file_actions_schema, Some(checkpoint_schema));
+    }
     Ok(())
 }
 

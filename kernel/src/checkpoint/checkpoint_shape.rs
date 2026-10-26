@@ -118,8 +118,7 @@ impl CheckpointShape {
                     Some(schema) => schema,
                     None => read_parquet_footer_schema(exec, root_checkpoint.clone())?,
                 };
-                // No `sidecar` column means the file actions are inline, so this is a leaf.
-                if !cp_schema.contains(SIDECAR_NAME) {
+                if !LogSegment::schema_may_reference_sidecars(&cp_schema) {
                     return Ok(Self::new_leaf(needs_leaf_schema.then_some(cp_schema)));
                 }
                 // The `sidecar` column may still be all-null (not a manifest), so scan it to
@@ -327,7 +326,8 @@ mod tests {
     use crate::plans::{IoOperation, PlanResult};
     use crate::schema::{schema, schema_ref};
     use crate::unit_test_utils::{
-        copy_test_table, create_log_path, create_log_path_with_size, load_test_table,
+        assert_kernel_checkpoint_schema, copy_test_table, create_log_path,
+        create_log_path_with_size, kernel_checkpoint_table, load_test_table,
     };
     use crate::KernelResult;
 
@@ -340,8 +340,12 @@ mod tests {
 
     impl CountingExecutor {
         fn new() -> Self {
+            Self::with_inner(SyncPlanExecutor::default())
+        }
+
+        fn with_inner(inner: SyncPlanExecutor) -> Self {
             Self {
-                inner: SyncPlanExecutor::default(),
+                inner,
                 query_scans: AtomicUsize::new(0),
                 footer_reads: AtomicUsize::new(0),
             }
@@ -604,6 +608,54 @@ mod tests {
                 .compatible_stats_parsed_schema(&probe_stats_schema())
                 .is_some(),
             expect_parsed_stats
+        );
+    }
+
+    /// Long `sidecarFiles` lists are dropped from the hint, so large manifests take this path.
+    #[test]
+    fn manifest_hint_without_sidecar_files_drains_by_hint_schema() {
+        let (_engine, snapshot, _tempdir) =
+            load_test_table("v2-parquet-sidecars-struct-stats-only").unwrap();
+        let mut log_segment = snapshot.log_segment().clone();
+        let hint = log_segment.last_checkpoint_metadata.as_mut().unwrap();
+        hint.v2_checkpoint.as_mut().unwrap().sidecar_files = None;
+        let snapshot = Snapshot::new(log_segment, snapshot.table_configuration().clone()).unwrap();
+        let exec = CountingExecutor::new();
+
+        let shape = CheckpointShape::try_new(&exec, &snapshot).unwrap();
+
+        assert_eq!(shape.checkpoint_type, CheckpointType::Manifest);
+        assert_eq!(exec.query_scans.load(Ordering::Relaxed), 1);
+        assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[rstest]
+    fn kernel_checkpoint_drains_sidecar_column_only_if_v2(
+        #[values(false, true)] v2_checkpoint: bool,
+        #[values(false, true)] schema_from_hint: bool,
+    ) {
+        let table = kernel_checkpoint_table(v2_checkpoint);
+        let engine = SyncEngine::new_with_store(table.store().clone());
+        let snapshot = Snapshot::builder_for(table.table_root())
+            .build(&engine)
+            .unwrap();
+        let footer_schema = assert_kernel_checkpoint_schema(&engine, &snapshot, v2_checkpoint);
+        let mut log_segment = snapshot.log_segment().clone();
+        let hint = log_segment.last_checkpoint_metadata.as_mut().unwrap();
+        hint.checkpoint_schema = schema_from_hint.then_some(footer_schema);
+        let snapshot = Snapshot::new(log_segment, snapshot.table_configuration().clone()).unwrap();
+        let exec = CountingExecutor::with_inner(SyncPlanExecutor::new(Some(table.store().clone())));
+
+        let shape = CheckpointShape::try_new(&exec, &snapshot).unwrap();
+
+        assert_eq!(shape.checkpoint_type, CheckpointType::Leaf);
+        assert_eq!(
+            exec.query_scans.load(Ordering::Relaxed),
+            usize::from(v2_checkpoint)
+        );
+        assert_eq!(
+            exec.footer_reads.load(Ordering::Relaxed),
+            usize::from(!schema_from_hint)
         );
     }
 
