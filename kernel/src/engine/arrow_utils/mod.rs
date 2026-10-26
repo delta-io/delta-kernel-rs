@@ -1114,7 +1114,7 @@ fn reorder_list<O: OffsetSizeTrait>(
     children: &[ReorderIndex],
 ) -> KernelResult<FieldArrayOpt> {
     let (values_field, offset_buffer, values, null_buf) = list_array.into_parts();
-    let (new_values_field, values) = reorder_list_values(values_field, values, children)?;
+    let (new_values_field, values) = reorder_list_struct_fields(values_field, values, children)?;
     let list = Arc::new(GenericListArray::try_new(
         new_values_field,
         offset_buffer,
@@ -1137,7 +1137,7 @@ fn reorder_list_view<O: OffsetSizeTrait>(
     children: &[ReorderIndex],
 ) -> KernelResult<FieldArrayOpt> {
     let (values_field, offsets, sizes, values, null_buf) = list_view_array.into_parts();
-    let (new_values_field, values) = reorder_list_values(values_field, values, children)?;
+    let (new_values_field, values) = reorder_list_struct_fields(values_field, values, children)?;
     let list_view = Arc::new(GenericListViewArray::try_new(
         new_values_field,
         offsets,
@@ -1154,11 +1154,11 @@ fn reorder_list_view<O: OffsetSizeTrait>(
     Ok(Some((new_field, list_view)))
 }
 
-/// Reorders the struct values of a list or list-view column.
+/// Reorders the struct fields within the values of a list or list-view column.
 ///
 /// The element field keeps its name, declared nullability, and metadata; only its data type is
 /// replaced with the reordered struct.
-fn reorder_list_values(
+fn reorder_list_struct_fields(
     values_field: Arc<ArrowField>,
     values: Arc<dyn ArrowArray>,
     children: &[ReorderIndex],
@@ -3820,8 +3820,9 @@ mod tests {
         // The element field is declared nullable and carries metadata, but no element is null.
         // Reorder must preserve both rather than inferring them from the data.
         let item_field = Arc::new(
-            ArrowField::new("item", values.data_type().clone(), true)
-                .with_metadata([("custom".to_string(), "metadata".to_string())]),
+            ArrowField::new("item", values.data_type().clone(), true).with_metadata(HashMap::from(
+                [("custom".to_string(), "metadata".to_string())],
+            )),
         );
         let list_view = Arc::new(
             GenericListViewArray::<O>::try_new(
