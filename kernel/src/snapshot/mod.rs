@@ -1331,9 +1331,11 @@ impl Snapshot {
     /// [`MetadataPolicy::Patch`] preserves unspecified metadata, including properties and
     /// protocol. An empty patch replaces only the data files, without emitting a metadata action.
     /// Properties referencing dropped columns remain unchanged; schemas requiring a new table
-    /// feature are rejected. Under `internal-api`, a data layout supplied to the builder replaces
-    /// the current partitioning; otherwise it is inherited. The builder stages old-file removals
-    /// during build.
+    /// feature are rejected. CDF, append-only, clustered, Iceberg-compatible, column-default, and
+    /// adaptive-metadata tables cannot be replaced. Under `internal-api`, a data layout supplied
+    /// to the builder replaces the current partitioning; otherwise it is inherited. The builder
+    /// stages old-file removals during build. It can enumerate files from an empty-schema table
+    /// through a metadata-only scan, but row scans of that table remain unsupported.
     pub fn replace_table(
         self: Arc<Self>,
         metadata_policy: MetadataPolicy,

@@ -43,12 +43,13 @@ fn test_create_table_partitioned_basic(#[case] partition_col: &str) -> KernelRes
 }
 
 #[test]
-fn test_create_table_partition_column_unicode_case() -> Result<()> {
+fn test_create_table_partition_column_unicode_case() -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     create_table(
         &table_path,
         schema_ref! { nullable "É": STRING, nullable "amount": INTEGER },
         "Test/1.0",
+        false,
     )
     .with_data_layout(DataLayout::partitioned(["é"]))
     .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?

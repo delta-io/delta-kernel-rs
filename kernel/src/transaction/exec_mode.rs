@@ -34,8 +34,6 @@ pub(crate) trait StagedDataChanges {
 pub struct Imperative {
     pub(super) add_files_metadata: Vec<Box<dyn EngineData>>,
     pub(super) remove_files_metadata: Vec<FilteredEngineData>,
-    // Removals planned by REPLACE; any later removal batch must be rejected at commit.
-    pub(super) replace_removal_batches: usize,
     // Matched scan files with new DV descriptors and rewritten statistics appended.
     pub(super) dv_matched_files: Vec<FilteredEngineData>,
     // Number of selected files within dv_matched_files (after selection vector is applied)

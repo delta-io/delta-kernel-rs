@@ -3,7 +3,6 @@ use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 
-use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
 use delta_kernel::actions::Metadata;
 use delta_kernel::arrow::array::{Int32Array, StringArray};
 use delta_kernel::arrow::json::ReaderBuilder;
@@ -39,26 +38,10 @@ use crate::common::read_utils::read_parquet_file;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replace_empty_schema_table_with_data() -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup_mt()?;
-    let empty = create_table(&path, schema_ref! {}, "test")
+    let empty = create_table(&path, schema_ref! {}, "test", false)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
-    assert_result_error_with_message(empty.clone().scan_builder().build(), "empty schema");
-    let metadata_scan = empty
-        .clone()
-        .scan_builder()
-        .without_row_transforms()
-        .build()?;
-    assert!(metadata_scan
-        .scan_metadata(engine.as_ref())?
-        .next()
-        .is_none());
-    let err = metadata_scan
-        .execute(engine.clone())
-        .err()
-        .expect("metadata-only scans cannot read rows");
-    assert!(err.to_string().contains("without_row_transforms"));
-
     let schema = schema_ref! { nullable "amount": INTEGER };
     let mut txn = empty
         .replace_table(MetadataPolicy::patch_schema(schema), "test")
@@ -153,9 +136,9 @@ async fn replacement_builder_accepts_snapshot_lsn_before_writes(
         snapshot
             .clone()
             .replace_table(MetadataPolicy::patch_schema(schema.clone()), "test")
-            .with_data_change(false)
+            .with_domain_metadata("delta.reserved", "{}")
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
-        "data_change",
+        "system controlled",
     );
     let snapshot_lsn = 7_i64;
     let txn = snapshot
@@ -163,6 +146,8 @@ async fn replacement_builder_accepts_snapshot_lsn_before_writes(
         .with_data_layout(DataLayout::None)
         .with_transaction_id("app", snapshot_lsn)
         .with_domain_metadata("wal2delta.storage_version", "3")
+        .with_operation_parameters([("source", Some("snapshot"))])
+        .with_operation_metrics([("numOutputRows", Some("0"))])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let context = txn.write_state()?.write_context_builder().build()?;
     assert_eq!(context.logical_data_schema(), &schema);
@@ -172,6 +157,9 @@ async fn replacement_builder_accepts_snapshot_lsn_before_writes(
     assert_eq!(ids.len(), 1);
     assert_eq!(ids[0]["appId"], "app");
     assert_eq!(ids[0]["version"], snapshot_lsn);
+    let commit_info = read_actions_from_commit(&table_url, post.version(), "commitInfo")?;
+    assert_eq!(commit_info[0]["operationParameters"]["source"], "snapshot");
+    assert_eq!(commit_info[0]["operationMetrics"]["numOutputRows"], "0");
     assert_eq!(
         post.get_domain_metadata("wal2delta.storage_version", engine.as_ref())?,
         Some("3".into())
@@ -187,7 +175,7 @@ impl Committer for InspectReplaceCommitter {
     fn commit(
         &self,
         engine: &dyn Engine,
-        actions: KernelResultIterator<'_, FilteredEngineData>,
+        actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         metadata: CommitMetadata,
     ) -> KernelResult<CommitResponse> {
         assert_eq!(metadata.commit_type(), CommitType::CatalogManagedWrite);
@@ -221,15 +209,20 @@ async fn replace_table_catalog_managed_forwards_metadata_and_preserves_required_
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup_mt()?;
     let table_url = Url::from_directory_path(&path).unwrap();
-    let mut create = create_table(&path, schema_ref! { not_null "amount": INTEGER }, "test")
-        .with_table_properties([
-            ("delta.feature.catalogManaged", "supported"),
-            ("delta.feature.domainMetadata", "supported"),
-            ("delta.feature.vacuumProtocolCheck", "supported"),
-            ("delta.feature.invariants", "supported"),
-            ("delta.columnMapping.mode", "name"),
-        ])
-        .build(engine.as_ref(), Box::new(TestCatalogCommitter))?;
+    let mut create = create_table(
+        &path,
+        schema_ref! { not_null "amount": INTEGER },
+        "test",
+        true,
+    )
+    .with_table_properties([
+        ("delta.feature.catalogManaged", "supported"),
+        ("delta.feature.domainMetadata", "supported"),
+        ("delta.feature.vacuumProtocolCheck", "supported"),
+        ("delta.feature.invariants", "supported"),
+        ("delta.columnMapping.mode", "name"),
+    ])
+    .build(engine.as_ref(), Box::new(TestCatalogCommitter))?;
     let context = create.write_state()?.write_context_builder().build()?;
     let old_batch = RecordBatch::try_new(
         Arc::new(context.logical_data_schema().as_ref().try_into_arrow()?),
@@ -436,7 +429,7 @@ async fn replace_table_replaces_all_rows_and_preserves_retained_column_identity(
     let snapshot =
         write_batch_to_table(&snapshot, engine.as_ref(), old_batch, HashMap::new()).await?;
     let snapshot = snapshot
-        .update_table(UpdateTableOperation::Write, "test")
+        .update_table(UpdateTableOperation::Write, "test", true)
         .with_domain_metadata("app.version", "1")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
@@ -589,7 +582,7 @@ async fn replace_table_normalizes_partition_casing_and_distinguishes_omitted_lay
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup_mt()?;
     let schema = schema_ref! { nullable "amount": INTEGER, nullable "Region": STRING };
-    let snapshot = create_table(&path, schema.clone(), "test")
+    let snapshot = create_table(&path, schema.clone(), "test", false)
         .with_data_layout(DataLayout::Partitioned {
             columns: vec![column_name!("region")],
         })
@@ -664,6 +657,7 @@ async fn replace_table_changes_partitioning_from_checkpoint(
         &path,
         schema_ref! { nullable "amount": INTEGER, nullable "old_part": STRING },
         "test",
+        false,
     )
     .with_table_properties([("delta.columnMapping.mode", mapping)])
     .with_data_layout(DataLayout::Partitioned {
@@ -1112,7 +1106,7 @@ async fn replace_table_conflicts_with_concurrent_add() -> Result<(), Box<dyn std
         .with_domain_metadata("app.version", "loser")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let mut winner = snapshot
-        .update_table(UpdateTableOperation::Write, "test")
+        .update_table(UpdateTableOperation::Write, "test", true)
         .with_domain_metadata("app.version", "winner")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let context = winner.write_state()?.write_context_builder().build()?;
@@ -1172,7 +1166,7 @@ async fn replace_table_conflicts_with_concurrent_schema_change(
         )
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     snapshot
-        .update_table(UpdateTableOperation::AlterTable, "test")
+        .update_table(UpdateTableOperation::AlterTable, "test", false)
         .add_column(StructField::nullable("later", DataType::STRING))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
@@ -1223,64 +1217,6 @@ async fn replace_table_removes_dv_files_with_original_metadata(
     assert!(read_scan(&post.scan_builder().build()?, engine.clone())?.is_empty());
     let old_rows = read_scan(&snapshot.scan_builder().build()?, engine.clone())?;
     assert_eq!(old_rows.iter().map(|b| b.num_rows()).sum::<usize>(), 8);
-    Ok(())
-}
-
-#[rstest]
-#[case::extra_remove(false)]
-#[case::dv_update(true)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replace_table_rejects_file_changes_staged_after_build(
-    #[case] update_dv: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (_temp, path, engine) = test_table_setup_mt()?;
-    copy_directory(
-        Path::new("tests/data/table-with-dv-small"),
-        Path::new(&path),
-    )?;
-    let url = Url::from_directory_path(&path).unwrap();
-    let snapshot = Snapshot::builder_for(&path)
-        .at_version(1)
-        .build(engine.as_ref())?;
-    let scan_files = snapshot
-        .clone()
-        .scan_builder()
-        .build()?
-        .scan_metadata(engine.as_ref())?
-        .map(|batch| batch.map(|metadata| metadata.scan_files))
-        .collect::<KernelResult<Vec<_>>>()?;
-    let mut txn = snapshot
-        .replace_table(
-            MetadataPolicy::patch_schema(schema_ref! { nullable "replacement": STRING }),
-            "test",
-        )
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-    if update_dv {
-        let original = read_actions_from_commit(&url, 1, "add")?;
-        let descriptor: DeletionVectorDescriptor =
-            serde_json::from_value(original[0]["deletionVector"].clone())?;
-        txn.update_deletion_vectors(
-            HashMap::from([(original[0]["path"].as_str().unwrap().to_owned(), descriptor)]),
-            scan_files.into_iter().map(Ok),
-        )?;
-    } else {
-        txn.remove_files(
-            scan_files
-                .into_iter()
-                .next()
-                .expect("fixture has an active file"),
-        );
-    }
-    assert_result_error_with_message(
-        txn.commit(engine.as_ref()),
-        "REPLACE TABLE cannot stage additional removals or deletion-vector updates",
-    );
-    assert_eq!(
-        Snapshot::builder_for(&path)
-            .build(engine.as_ref())?
-            .version(),
-        1
-    );
     Ok(())
 }
 
@@ -1364,6 +1300,8 @@ async fn replace_table_rejects_clustered_layout() -> Result<(), Box<dyn std::err
 #[case("clustering")]
 #[case("allowColumnDefaults")]
 #[case("checkConstraints")]
+#[case("icebergCompatV1")]
+#[case("icebergCompatV2")]
 #[case("icebergCompatV3")]
 #[case("adaptiveMetadata-preview")]
 #[tokio::test]

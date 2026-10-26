@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
@@ -24,9 +25,9 @@ use crate::table_features::{
 };
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transaction::data_layout::DataLayout;
-use crate::transaction::{ReplaceTable, Transaction, UpdateTableOperation};
+use crate::transaction::{CommitOperation, Imperative, ReplaceTable, Transaction};
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::utils::require;
+use crate::utils::{current_time_ms, require};
 use crate::{Engine, FilteredEngineData, KernelError, KernelResult};
 
 /// Metadata changes to apply while replacing all data files.
@@ -49,7 +50,9 @@ impl MetadataPatch {
 #[non_exhaustive]
 pub enum MetadataPolicy {
     /// Retains the existing table identity, properties, protocol, and column-mapping mode while
-    /// applying the specified changes. An empty patch leaves metadata unchanged. Retained fields
+    /// applying the specified changes. Preserves `Metadata.id`, `name`, `description`, `format`,
+    /// and `createdTime`; these fields cannot be changed through this policy. An empty patch
+    /// leaves metadata unchanged. Retained fields
     /// keep their mapping IDs and physical names even for incompatible type changes, unlike Spark
     /// overwrite. Historical files may therefore have different physical types under the same
     /// path; readers must use the schema of each table version. New fields get unique paths.
@@ -95,16 +98,13 @@ impl TransactionBuilder<ReplaceTable> {
         engine_info: String,
     ) -> Self {
         Self {
-            common_state: TransactionBuilderState {
-                engine_info,
-                data_change: Some(true),
-                ..TransactionBuilderState::default()
-            },
+            common_state: TransactionBuilderState::new(engine_info, true),
             local_state: ReplaceTableBuilderState {
                 snapshot,
                 metadata_policy,
                 data_layout: None,
             },
+            _mode: PhantomData,
         }
     }
 
@@ -123,7 +123,7 @@ impl TransactionBuilder<ReplaceTable> {
     ///
     /// # Errors
     ///
-    /// Rejects `dataChange = false`, invalid or empty schemas, invalid partition columns,
+    /// Rejects invalid or empty schemas, invalid partition columns,
     /// conflicting mapping metadata, and schema features absent from the existing protocol;
     /// replacement does not upgrade it.
     /// CDF and append-only must be disabled.
@@ -135,12 +135,8 @@ impl TransactionBuilder<ReplaceTable> {
         self,
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
-    ) -> KernelResult<Transaction> {
+    ) -> KernelResult<Transaction<ReplaceTable>> {
         self.common_state.validate()?;
-        require!(
-            self.common_state.data_change != Some(false),
-            KernelError::invalid_transaction_state("REPLACE TABLE requires data_change to be true")
-        );
         let ReplaceTableBuilderState {
             snapshot,
             metadata_policy,
@@ -163,17 +159,29 @@ impl TransactionBuilder<ReplaceTable> {
                 Ok(FilteredEngineData::with_all_rows_selected(selected))
             })
             .collect::<KernelResult<Vec<_>>>()?;
-        // Reuse Write's source validation and commit setup, then replace its operation and config.
-        let mut builder = snapshot.update_table(
-            UpdateTableOperation::Write,
-            self.common_state.engine_info.clone(),
+        let span = tracing::info_span!(
+            "txn",
+            path = %snapshot.table_root(),
+            read_version = snapshot.version(),
         );
-        builder.common_state = self.common_state;
-        let transaction = builder.build(engine, committer)?.with_table_replacement(
-            config,
-            removals,
-            emit_metadata,
-        );
+        let transaction = Transaction {
+            read_snapshot_opt: Some(snapshot),
+            should_emit_metadata: emit_metadata,
+            staged_data_changes: Imperative {
+                remove_files_metadata: removals,
+                ..Imperative::default()
+            },
+            // Every old row is removed, so no prior row-tracking values need preservation.
+            row_tracking_preservation_acknowledged: true,
+            ..Transaction::new(
+                self.common_state,
+                config,
+                committer,
+                CommitOperation::Replace,
+                span,
+                current_time_ms()?,
+            )
+        };
         transaction.validate_domain_metadata_operations()?;
         Ok(transaction)
     }
@@ -188,6 +196,7 @@ fn patch_existing_config(
         TableFeature::ChangeDataFeed,
         TableFeature::AppendOnly,
         TableFeature::ClusteredTable,
+        TableFeature::CheckConstraints,
         TableFeature::IcebergCompatV1,
         TableFeature::IcebergCompatV2,
         TableFeature::IcebergCompatV3,
@@ -344,7 +353,7 @@ impl<'a> SchemaTransform<'a> for TransferMappings<'_> {
                     require!(
                         key != ColumnMetadataKey::GenerationExpression.as_ref()
                             && !key.starts_with("delta.identity.")
-                            && key != "CURRENT_DEFAULT"
+                            && key != ColumnMetadataKey::CurrentDefault.as_ref()
                             && key != "EXISTS_DEFAULT",
                         KernelError::unsupported(format!(
                             "REPLACE TABLE does not support column metadata '{key}'"
@@ -437,12 +446,117 @@ impl<'a> SchemaTransform<'a> for TransferMappings<'_> {
 
 #[cfg(test)]
 mod tests {
-    use test_utils::{actions_to_string, add_commit, engine_store_setup, TestAction};
+    use std::sync::Arc;
+
+    use test_utils::{
+        actions_to_string, add_commit, assert_result_error_with_message, engine_store_setup,
+        TestAction,
+    };
+    use url::Url;
 
     use super::MetadataPolicy;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
+    use crate::engine::test_delegating::DelegatingEngine;
+    use crate::schema::SchemaRef;
     use crate::snapshot::Snapshot;
+    use crate::{
+        Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData,
+        JsonHandler, KernelError, KernelResult, KernelResultIterator, PredicateRef,
+    };
+
+    struct FailAfterFirstJsonBatch {
+        inner: Arc<dyn JsonHandler>,
+    }
+
+    impl JsonHandler for FailAfterFirstJsonBatch {
+        fn parse_json(
+            &self,
+            json_strings: Box<dyn EngineData>,
+            output_schema: SchemaRef,
+        ) -> KernelResult<Box<dyn EngineData>> {
+            self.inner.parse_json(json_strings, output_schema)
+        }
+
+        fn read_json_files(
+            &self,
+            files: &[FileMeta],
+            physical_schema: SchemaRef,
+            predicate: Option<PredicateRef>,
+        ) -> KernelResult<FileDataReadResultIterator> {
+            let mut batches = self
+                .inner
+                .read_json_files(files, physical_schema, predicate)?;
+            let first = batches
+                .next()
+                .ok_or_else(|| KernelError::generic("expected a source-log batch"))?;
+            Ok(Box::new(std::iter::once(first).chain(std::iter::once(
+                Err(KernelError::generic("injected source-log read failure")),
+            ))))
+        }
+
+        fn write_json_file(
+            &self,
+            path: &Url,
+            data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
+            overwrite: bool,
+        ) -> KernelResult<FileSize> {
+            self.inner.write_json_file(path, data, overwrite)
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_table_rejects_source_log_failure_after_first_scan_batch(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (store, _unused_engine, table_url) = engine_store_setup("partial_removals", None);
+        let base = Arc::new(SyncEngine::new_with_store(store.clone()));
+        add_commit(
+            table_url.as_str(),
+            store.as_ref(),
+            0,
+            actions_to_string(vec![
+                TestAction::Metadata,
+                TestAction::Add("first.parquet".into()),
+            ]),
+        )
+        .await?;
+        add_commit(
+            table_url.as_str(),
+            store.as_ref(),
+            1,
+            actions_to_string(vec![TestAction::Add("second.parquet".into())]),
+        )
+        .await?;
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(base.as_ref())?;
+        let failing = DelegatingEngine::new(base.clone()).with_json_handler(Arc::new(
+            FailAfterFirstJsonBatch {
+                inner: base.json_handler(),
+            },
+        ));
+        let mut batches = snapshot
+            .clone()
+            .scan_builder()
+            .without_row_transforms()
+            .build()?
+            .scan_metadata(&failing)?;
+        assert!(batches.next().transpose()?.is_some());
+        assert_result_error_with_message(batches.next().transpose(), "injected source-log");
+
+        assert_result_error_with_message(
+            snapshot
+                .clone()
+                .replace_table(MetadataPolicy::patch_schema(snapshot.schema()), "test")
+                .build(&failing, Box::new(FileSystemCommitter::new())),
+            "injected source-log",
+        );
+        assert_eq!(
+            Snapshot::builder_for(table_url)
+                .build(base.as_ref())?
+                .version(),
+            1
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn replace_table_compacts_unselected_scan_files_before_retaining_removals(
@@ -475,7 +589,7 @@ mod tests {
             .build()?;
         let batches = scan
             .scan_metadata(&engine)?
-            .collect::<crate::Result<Vec<_>>>()?;
+            .collect::<crate::KernelResult<Vec<_>>>()?;
         assert!(batches
             .iter()
             .any(|batch| batch.scan_files.selection_vector().contains(&false)));

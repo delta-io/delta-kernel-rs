@@ -537,6 +537,7 @@ impl Metadata {
         })
     }
 
+    /// Returns new metadata with the partition columns replaced.
     pub(crate) fn with_partition_columns(self, partition_columns: Vec<String>) -> Self {
         Self {
             partition_columns,

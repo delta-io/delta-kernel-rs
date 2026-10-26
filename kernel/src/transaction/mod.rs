@@ -205,7 +205,15 @@ pub struct UpdateTable;
 #[derive(Debug)]
 pub struct CreateTable;
 
-/// Marker type for full-table replacement builders.
+/// Marker type for full-table replacements. Selective file removals and deletion-vector updates
+/// are unavailable because the builder already stages every active file for removal.
+///
+/// ```compile_fail,E0599
+/// # use delta_kernel::transaction::{ReplaceTable, Transaction};
+/// fn remove_more_files(txn: &mut Transaction<ReplaceTable>) {
+///     txn.remove_files(unimplemented!());
+/// }
+/// ```
 #[derive(Debug)]
 pub struct ReplaceTable;
 
@@ -217,6 +225,7 @@ pub struct ReplaceTable;
 /// - [`UpdateTable`] (default): Full API for modifying existing tables.
 /// - [`CreateTable`]: Restricted API for table creation (see
 ///   [`CreateTableTransaction`](create_table::CreateTableTransaction)).
+/// - [`ReplaceTable`]: Full-table replacement without selective file removals or DV updates.
 ///
 /// The independent type parameter `MODE` selects the [`ExecutionMode`], which provides an
 /// abstraction over 1) how staged changes are represented and 2) how to inspect the changes. The
@@ -646,24 +655,6 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// [`stats_schema`]: Transaction::stats_schema
     pub fn add_files_schema(&self) -> &'static SchemaRef {
         &BASE_ADD_FILES_SCHEMA
-    }
-}
-
-impl Transaction<UpdateTable> {
-    pub(super) fn with_table_replacement(
-        mut self,
-        config: TableConfiguration,
-        removals: Vec<FilteredEngineData>,
-        emit_metadata: bool,
-    ) -> Self {
-        self.effective_table_config = config;
-        self.should_emit_metadata = emit_metadata;
-        self.operation = CommitOperation::Replace;
-        self.staged_data_changes.replace_removal_batches = removals.len();
-        self.staged_data_changes.remove_files_metadata = removals;
-        // Replacing every row leaves no old row IDs or commit versions to preserve.
-        self.row_tracking_preservation_acknowledged = true;
-        self
     }
 }
 
@@ -1626,16 +1617,6 @@ impl<STATE> Transaction<STATE, Imperative> {
 
     /// Validates the rows and required fields in staged addFile, removeFile, and dv updates.
     fn validate_file_actions(&self) -> KernelResult<()> {
-        if self.operation == CommitOperation::Replace {
-            require!(
-                self.staged_data_changes.remove_files_metadata.len()
-                    == self.staged_data_changes.replace_removal_batches
-                    && self.staged_data_changes.dv_matched_files.is_empty(),
-                KernelError::invalid_transaction_state(
-                    "REPLACE TABLE cannot stage additional removals or deletion-vector updates"
-                )
-            );
-        }
         self.validate_append_only_semantics()?;
 
         // Validate protocol-required add-file statistics.
@@ -2388,7 +2369,6 @@ mod tests {
                 Imperative {
                     add_files_metadata,
                     remove_files_metadata,
-                    replace_removal_batches,
                     dv_matched_files,
                     num_dv_updates,
                 },
@@ -2425,7 +2405,6 @@ mod tests {
         assert!(engine_commit_info.is_none());
         assert!(add_files_metadata.is_empty());
         assert!(remove_files_metadata.is_empty());
-        assert_eq!(replace_removal_batches, 0);
         assert!(set_transactions.is_empty());
         assert_eq!(commit_timestamp, expected_commit_timestamp);
         assert!(user_domain_metadata_additions.is_empty());

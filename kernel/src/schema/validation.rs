@@ -125,7 +125,7 @@ impl<'a> SchemaTransform<'a> for SchemaValidator {
         // column names can contain literal dots when column mapping is enabled. A dot
         // separator would make column "a.b" indistinguishable from nested field b in
         // struct a. Null bytes cannot appear in column names, so they are safe to use.
-        self.current_path.push(field.name().to_ascii_lowercase());
+        self.current_path.push(field.name().to_lowercase());
 
         // Reject `delta.invariants` metadata on any field. Kernel cannot evaluate SQL
         // expression invariants, so reject at create time with a clear, path-aware error.
@@ -463,6 +463,14 @@ mod tests {
     #[case::array_nested_bad_char(schema_array_bad_char(), ColumnMappingMode::None, &["invalid character"])]
     #[case::map_nested_bad_char(schema_map_bad_char(), ColumnMappingMode::None, &["invalid character"])]
     #[case::top_level_dup(schema_top_level_dup(), ColumnMappingMode::None, &["duplicate"])]
+    #[case::unicode_dup(
+        StructType::new_unchecked(vec![
+            StructField::not_null("É", DataType::INTEGER),
+            StructField::nullable("é", DataType::STRING),
+        ]),
+        ColumnMappingMode::None,
+        &["duplicate"]
+    )]
     #[case::array_element_dup(schema_array_dup(), ColumnMappingMode::None, &["duplicate"])]
     #[case::multi_error(schema_multi_bad(), ColumnMappingMode::None, &["bad column", "col;name"])]
     #[case::malformed_collation_metadata(
