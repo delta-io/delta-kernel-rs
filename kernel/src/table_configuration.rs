@@ -842,6 +842,8 @@ impl TableConfiguration {
 
     /// Whether any top-level column of the logical schema carries `delta.generationExpression`
     /// metadata.
+    ///
+    /// Only top-level columns can be generated columns, so nested fields are ignored.
     pub(crate) fn has_generation_expressions(&self) -> bool {
         self.logical_schema.fields().any(|field| {
             field
