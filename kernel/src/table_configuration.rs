@@ -1552,6 +1552,17 @@ mod test {
             WriteSupport::Unsupported
         };
 
+    /// The write support of a legacy writer version 4 table, whose protocol implies
+    /// `checkConstraints` and `generatedColumns` among other features.
+    const LEGACY_WRITER_V4_WRITE_SUPPORT: WriteSupport = if cfg!(all(
+        feature = "check-constraints-in-dev",
+        feature = "generated-columns-in-dev"
+    )) {
+        WriteSupport::Supported
+    } else {
+        WriteSupport::Unsupported
+    };
+
     /// The write support of a table whose protocol supports generated columns and whose generation
     /// expression is a non-string value.
     const NON_STRING_GENERATED_COLUMN_WRITE_SUPPORT: WriteSupport =
@@ -1586,7 +1597,7 @@ mod test {
     #[case::legacy_writer_at_min_version(
         generated_event_year_schema(),
         MockProtocolBuilder::new().with_versions(1, 4).build(),
-        WriteSupport::Unsupported
+        LEGACY_WRITER_V4_WRITE_SUPPORT
     )]
     // Write support depends only on the protocol, so empty and non-string expression values get the
     // same results as a regular expression.
