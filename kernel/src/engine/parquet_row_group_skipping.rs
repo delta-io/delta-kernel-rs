@@ -133,13 +133,11 @@ impl<'a> RowGroupFilter<'a> {
 
 impl ParquetStatsProvider for RowGroupFilter<'_> {
     fn get_parquet_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
-        let column = self.get_column(col)?;
-        extract_min_scalar(data_type, column.statistics()?, column.column_descr())
+        extract_min_scalar(data_type, self.get_column(col)?)
     }
 
     fn get_parquet_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
-        let column = self.get_column(col)?;
-        extract_max_scalar(data_type, column.statistics()?, column.column_descr())
+        extract_max_scalar(data_type, self.get_column(col)?)
     }
 
     fn get_parquet_nullcount_stat(&self, col: &ColumnName) -> Option<i64> {
@@ -163,16 +161,12 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
     }
 }
 
-/// Extracts the minimum stat value from parquet footer statistics, converting from the physical
-/// parquet type to the requested logical Delta type. `column` supplies the Parquet annotation used
-/// to rescale INT64 timestamp stats to microseconds.
-fn extract_min_scalar(
-    data_type: &DataType,
-    stats: &Statistics,
-    column: &ColumnDescriptor,
-) -> Option<Scalar> {
+/// Extracts the minimum stat value from a parquet column chunk, converting from the physical
+/// parquet type to the requested logical Delta type. INT64 timestamp stats are rescaled to
+/// microseconds using the column's Parquet annotation.
+fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Option<Scalar> {
     use PrimitiveType::*;
-    let value = match (data_type.as_primitive_opt()?, stats) {
+    let value = match (data_type.as_primitive_opt()?, column.statistics()?) {
         (String, Statistics::ByteArray(s)) => s.min_opt()?.as_utf8().ok()?.into(),
         (String, Statistics::FixedLenByteArray(s)) => s.min_opt()?.as_utf8().ok()?.into(),
         (String, _) => return None,
@@ -197,13 +191,15 @@ fn extract_min_scalar(
         (Binary, _) => return None,
         (Date, Statistics::Int32(s)) => Scalar::Date(*s.min_opt()?),
         (Date, _) => return None,
-        (Timestamp, Statistics::Int64(s)) => {
-            Scalar::Timestamp(timestamp_stat_as_micros(*s.min_opt()?, column)?)
-        }
+        (Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(timestamp_stat_as_micros(
+            *s.min_opt()?,
+            column.column_descr(),
+        )?),
         (Timestamp, _) => return None, // TODO: Int96 timestamps
-        (TimestampNtz, Statistics::Int64(s)) => {
-            Scalar::TimestampNtz(timestamp_stat_as_micros(*s.min_opt()?, column)?)
-        }
+        (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(timestamp_stat_as_micros(
+            *s.min_opt()?,
+            column.column_descr(),
+        )?),
         (TimestampNtz, Statistics::Int32(s)) => timestamp_from_date(s.min_opt())?,
         (TimestampNtz, _) => return None, // TODO: Int96 timestamps
         (IntervalYearMonth | IntervalDayTime, _) => return None,
@@ -221,16 +217,12 @@ fn extract_min_scalar(
     Some(value)
 }
 
-/// Extracts the maximum stat value from parquet footer statistics, converting from the physical
-/// parquet type to the requested logical Delta type. `column` supplies the Parquet annotation used
-/// to rescale INT64 timestamp stats to microseconds.
-fn extract_max_scalar(
-    data_type: &DataType,
-    stats: &Statistics,
-    column: &ColumnDescriptor,
-) -> Option<Scalar> {
+/// Extracts the maximum stat value from a parquet column chunk, converting from the physical
+/// parquet type to the requested logical Delta type. INT64 timestamp stats are rescaled to
+/// microseconds using the column's Parquet annotation.
+fn extract_max_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Option<Scalar> {
     use PrimitiveType::*;
-    let value = match (data_type.as_primitive_opt()?, stats) {
+    let value = match (data_type.as_primitive_opt()?, column.statistics()?) {
         (String, Statistics::ByteArray(s)) => s.max_opt()?.as_utf8().ok()?.into(),
         (String, Statistics::FixedLenByteArray(s)) => s.max_opt()?.as_utf8().ok()?.into(),
         (String, _) => return None,
@@ -255,13 +247,15 @@ fn extract_max_scalar(
         (Binary, _) => return None,
         (Date, Statistics::Int32(s)) => Scalar::Date(*s.max_opt()?),
         (Date, _) => return None,
-        (Timestamp, Statistics::Int64(s)) => {
-            Scalar::Timestamp(timestamp_stat_as_micros(*s.max_opt()?, column)?)
-        }
+        (Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(timestamp_stat_as_micros(
+            *s.max_opt()?,
+            column.column_descr(),
+        )?),
         (Timestamp, _) => return None, // TODO: Int96 timestamps
-        (TimestampNtz, Statistics::Int64(s)) => {
-            Scalar::TimestampNtz(timestamp_stat_as_micros(*s.max_opt()?, column)?)
-        }
+        (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(timestamp_stat_as_micros(
+            *s.max_opt()?,
+            column.column_descr(),
+        )?),
         (TimestampNtz, Statistics::Int32(s)) => timestamp_from_date(s.max_opt())?,
         (TimestampNtz, _) => return None, // TODO: Int96 timestamps
         (IntervalYearMonth | IntervalDayTime, _) => return None,
@@ -444,7 +438,7 @@ impl<'a> CheckpointRowGroupFilter<'a> {
         col: &ColumnName,
         data_type: &DataType,
         get_index: impl FnOnce(&StatsColumnIndices) -> Option<usize>,
-        extract: impl FnOnce(&DataType, &Statistics, &ColumnDescriptor) -> Option<Scalar>,
+        extract: impl FnOnce(&DataType, &ColumnChunkMetaData) -> Option<Scalar>,
     ) -> Option<Scalar> {
         let indices = self.stats_column_indices.get(col)?;
         let stat_index = get_index(indices)?;
@@ -453,8 +447,7 @@ impl<'a> CheckpointRowGroupFilter<'a> {
         if column_has_nulls(self.row_group, stat_index) {
             return None;
         }
-        let column = self.row_group.column(stat_index);
-        extract(data_type, column.statistics()?, column.column_descr())
+        extract(data_type, self.row_group.column(stat_index))
     }
 }
 
@@ -462,8 +455,7 @@ impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
     fn get_parquet_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
         if is_top_level_partition_column(col, self.partition_columns) {
             let &idx = self.partition_column_indices.get(col)?;
-            let column = self.row_group.column(idx);
-            return extract_min_scalar(data_type, column.statistics()?, column.column_descr());
+            return extract_min_scalar(data_type, self.row_group.column(idx));
         }
         self.get_guarded_stat(col, data_type, |i| i.min_index, extract_min_scalar)
     }
@@ -471,8 +463,7 @@ impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
     fn get_parquet_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
         if is_top_level_partition_column(col, self.partition_columns) {
             let &idx = self.partition_column_indices.get(col)?;
-            let column = self.row_group.column(idx);
-            return extract_max_scalar(data_type, column.statistics()?, column.column_descr());
+            return extract_max_scalar(data_type, self.row_group.column(idx));
         }
         let max = self.get_guarded_stat(col, data_type, |i| i.max_index, extract_max_scalar)?;
         Some(adjust_stats_for_truncation(max))

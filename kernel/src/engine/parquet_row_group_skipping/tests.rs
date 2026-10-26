@@ -660,13 +660,14 @@ fn timestamp_footer_stats_respect_annotations(
     );
     assert_eq!(column.logical_type_ref(), logical_type.as_ref());
     let stats = Statistics::int64(Some(1_000), Some(1_000), None, Some(0), false);
+    let column = ColumnChunkMetaData::builder(Arc::new(column))
+        .set_statistics(stats)
+        .build()
+        .unwrap();
     let (data_type, scalar) = timestamp_kind(timezone);
     let expected = expected.map(scalar);
-    assert_eq!(
-        extract_min_scalar(&data_type, &stats, &column),
-        expected.clone()
-    );
-    assert_eq!(extract_max_scalar(&data_type, &stats, &column), expected);
+    assert_eq!(extract_min_scalar(&data_type, &column), expected.clone());
+    assert_eq!(extract_max_scalar(&data_type, &column), expected);
 }
 
 #[rstest]
@@ -775,16 +776,6 @@ fn test_row_group_filter_is_null_prunes_when_nullcount_is_zero() {
 // Intervals are unsupported for skipping under any footer encoding, so extraction returns None.
 #[test]
 fn test_interval_skipping_unsupported_for_any_footer_stats() {
-    let column = ColumnDescriptor::new(
-        Arc::new(
-            Type::primitive_type_builder("x", PhysicalType::INT64)
-                .build()
-                .unwrap(),
-        ),
-        0,
-        0,
-        ColumnPath::from("x"),
-    );
     let interval_flba = FixedLenByteArray::from(ByteArray::from(vec![0u8; 12]));
     let variants = [
         Statistics::int32(Some(0), Some(1), None, Some(0), false),
@@ -797,11 +788,27 @@ fn test_interval_skipping_unsupported_for_any_footer_stats() {
             false,
         ),
     ];
-    for dt in [DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME] {
-        for stats in &variants {
+    for stats in variants {
+        let builder = Type::primitive_type_builder("x", stats.physical_type());
+        let builder = if stats.physical_type() == PhysicalType::FIXED_LEN_BYTE_ARRAY {
+            builder.with_length(12)
+        } else {
+            builder
+        };
+        let column = ColumnDescriptor::new(
+            Arc::new(builder.build().unwrap()),
+            0,
+            0,
+            ColumnPath::from("x"),
+        );
+        let column = ColumnChunkMetaData::builder(Arc::new(column))
+            .set_statistics(stats)
+            .build()
+            .unwrap();
+        for dt in [DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME] {
             // Call the extractor directly: the fixture has no interval column for get_min_stat
-            assert_eq!(extract_min_scalar(&dt, stats, &column), None);
-            assert_eq!(extract_max_scalar(&dt, stats, &column), None);
+            assert_eq!(extract_min_scalar(&dt, &column), None);
+            assert_eq!(extract_max_scalar(&dt, &column), None);
         }
     }
 }
