@@ -846,6 +846,7 @@ fn scan_metadata_from_binds_token_to_new_reads(
         .at_version(snapshot_version)
         .build(&base_engine)
         .unwrap();
+    // No read triggers cancellation; `pre_cancelled` cancels the token up front.
     let reads = RecordingReads::new(None);
     if pre_cancelled {
         reads.token.cancel();

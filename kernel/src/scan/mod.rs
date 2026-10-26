@@ -1073,7 +1073,7 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
-        self.with_bound_engine(engine, |engine| self.scan_metadata_with_engine(engine))
+        self.with_cancellable_engine(engine, |engine| self.scan_metadata_with_engine(engine))
     }
 
     fn scan_metadata_with_engine(
@@ -1142,7 +1142,7 @@ impl Scan {
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
         existing_predicate: Option<PredicateRef>,
     ) -> KernelResult<Box<dyn KernelResultIterator<ScanMetadata>>> {
-        self.with_bound_engine(engine, |engine| {
+        self.with_cancellable_engine(engine, |engine| {
             self.scan_metadata_from_with_engine(
                 engine,
                 existing_version,
@@ -1278,7 +1278,7 @@ impl Scan {
         )?))
     }
 
-    fn with_bound_engine<T>(
+    fn with_cancellable_engine<T>(
         &self,
         engine: &dyn Engine,
         operation: impl FnOnce(&dyn Engine) -> T,
