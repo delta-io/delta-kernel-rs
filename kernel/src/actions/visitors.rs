@@ -1062,6 +1062,7 @@ fn visit_content_root_at<'a>(
         path,
         size_in_bytes: getters[1].get(row_index, "contentRoot.sizeInBytes")?,
         version: getters[2].get(row_index, "contentRoot.version")?,
+        timestamp: getters[3].get_opt(row_index, "contentRoot.timestamp")?,
     }))
 }
 
@@ -1262,6 +1263,7 @@ mod tests {
                 path: "s3://bucket/manifest".to_string(),
                 size_in_bytes: 512,
                 version: 5,
+                timestamp: None,
             },
             protocol: Protocol::new_unchecked(1, 2, None, None),
             metadata: Metadata::default(),
@@ -1487,6 +1489,29 @@ mod tests {
             .expect("checkpoint action should be present");
         assert_eq!(checkpoint.version, 42);
         assert_eq!(checkpoint.content_root.version, 42);
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest::rstest]
+    #[case::absent(checkpoint_elements::CONTENT_ROOT, None)]
+    #[case::present(
+        r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":40,"timestamp":1234}}"#,
+        Some(1234)
+    )]
+    fn test_parse_checkpoint_action_content_root_timestamp(
+        #[case] content_root: &str,
+        #[case] expected: Option<i64>,
+    ) -> KernelResult<()> {
+        let data = checkpoint_commit(&[
+            checkpoint_elements::CHECKPOINT_METADATA,
+            content_root,
+            checkpoint_elements::PROTOCOL,
+            checkpoint_elements::METADATA,
+        ]);
+        let checkpoint = CheckpointAction::try_new_from_data(data.as_ref())?
+            .expect("checkpoint action should be present");
+        assert_eq!(checkpoint.content_root.timestamp, expected);
         Ok(())
     }
 

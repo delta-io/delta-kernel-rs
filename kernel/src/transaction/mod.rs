@@ -1067,6 +1067,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         &self,
         engine: &dyn Engine,
         commit_version: Version,
+        in_commit_timestamp: Option<i64>,
         dm_changes: &[DomainMetadata],
     ) -> KernelResult<Option<CheckpointAction>> {
         let Some(ManifestWrite::RootFile(root_manifest_file)) = &self.manifest_write else {
@@ -1075,6 +1076,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         let action = root_manifest_file.compute_checkpoint_action(
             engine,
             commit_version,
+            in_commit_timestamp,
             &self.effective_table_config,
             dm_changes,
             &self.set_transactions,
@@ -1643,6 +1645,8 @@ impl<STATE> Transaction<STATE, Imperative> {
         let set_transaction_actions = set_transactions
             .into_iter()
             .map(|txn| create_row(engine, LOG_TXN_SCHEMA.clone(), txn));
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let in_commit_timestamp = kernel_commit_info.in_commit_timestamp;
         let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
         let protocol_action = protocol
             .map(|protocol| create_row(engine, LOG_PROTOCOL_SCHEMA.clone(), protocol.clone()))
@@ -1671,8 +1675,12 @@ impl<STATE> Transaction<STATE, Imperative> {
         )?;
 
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let checkpoint_action =
-            self.generate_checkpoint_action(engine, commit_version, &dm_changes)?;
+        let checkpoint_action = self.generate_checkpoint_action(
+            engine,
+            commit_version,
+            in_commit_timestamp,
+            &dm_changes,
+        )?;
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let checkpoint_action_data = checkpoint_action
             .clone()
