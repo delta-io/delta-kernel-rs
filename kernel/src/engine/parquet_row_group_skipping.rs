@@ -308,9 +308,11 @@ fn timestamp_from_date(days: Option<&i32>) -> Option<Scalar> {
     Some(Scalar::TimestampNtz(timestamp.num_microseconds()?))
 }
 
-/// Rescales footer timestamps to microseconds. For checkpoint compatibility, the Arrow reader casts
-/// unannotated INT64 values to microsecond timestamps without rescaling. Footer bounds must match
-/// that interpretation so pruning stays consistent with the values the reader returns.
+/// Rescales footer timestamps to microseconds.
+///
+/// When the requested type is Timestamp or TimestampNtz, Kernel's Arrow reader casts unannotated
+/// INT64 values to microsecond timestamps without rescaling. Footer bounds must match that
+/// interpretation so pruning stays consistent with the values the reader returns.
 ///
 /// Returns `None` for unsupported annotations or scaling overflow, so that bound cannot justify
 /// skipping a row group.
