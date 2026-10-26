@@ -435,8 +435,8 @@ impl LogSegmentFiles {
         end_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
     ) -> KernelResult<Self> {
-        // check log_tail is only commits
-        // note that LogSegment checks no gaps/duplicates so we don't duplicate that here
+        // `validate_catalog_managed_log_tail` enforces that log_tail is only commits, and
+        // LogSegment checks no gaps/duplicates, so we don't duplicate that here
         debug_assert!(
             log_tail.iter().all(|entry| entry.is_commit()),
             "log_tail should only contain commits"

@@ -174,7 +174,7 @@ fn commit_range_builder_build_impl(
         kernel_builder = kernel_builder.with_log_tail(builder.log_tail, max_catalog_version);
     } else {
         return Err(KernelError::MaxCatalogVersion(
-            "Max catalog version is required when providing staged commits.".to_string(),
+            "Max catalog version is required when providing a log tail.".to_string(),
         ));
     }
     let range = kernel_builder.build(engine.as_ref())?;
