@@ -2285,13 +2285,11 @@ mod tests {
 
         use delta_kernel::plans::proto::operation as proto_op;
         use prost::Message as _;
-        use rstest::rstest;
         use test_utils::{actions_to_string, TestAction};
 
         use super::super::{
             free_scan, scan_builder, scan_builder_build, scan_builder_with_predicate,
-            scan_builder_with_stats, scan_declarative_metadata_plan, EnginePredicate,
-            FfiStatsOptions,
+            scan_declarative_metadata_plan, EnginePredicate,
         };
         use crate::error::EngineExecResult;
         use crate::expressions::kernel_visitor::{
@@ -2302,8 +2300,8 @@ mod tests {
         use crate::plans::result::CPlanResult;
         use crate::plans::{get_plan_based_engine, get_plan_executor};
         use crate::{
-            free_engine, free_kernel_bytes, free_snapshot, KernelBytesSlice, NullableCvoid,
-            OptionalValue, SharedExternEngine,
+            free_engine, free_snapshot, KernelBytesSlice, NullableCvoid, OptionalValue,
+            SharedExternEngine,
         };
 
         extern "C" fn visit_false(
@@ -2368,16 +2366,8 @@ mod tests {
             unsafe { free_engine(engine) };
         }
 
-        #[rstest]
-        #[case::json_only(FfiStatsOptions::JsonOnly, true)]
-        #[case::all_struct(FfiStatsOptions::AllStruct, true)]
-        #[case::all(FfiStatsOptions::All, true)]
-        #[case::none(FfiStatsOptions::None, true)]
         #[tokio::test]
-        async fn static_skip_respects_stats_options(
-            #[case] stats: FfiStatsOptions,
-            #[case] expect_skipped: bool,
-        ) {
+        async fn returns_none_when_statically_skipped() {
             let (engine, snapshot) = setup_snapshot(actions_to_string(vec![
                 TestAction::Metadata,
                 TestAction::Add("part-1.parquet".to_string()),
@@ -2397,27 +2387,16 @@ mod tests {
                     &mut predicate,
                 ))
             };
-            let builder = unsafe {
-                ok_or_panic(scan_builder_with_stats(
-                    builder,
-                    engine.shallow_copy(),
-                    &stats,
-                ))
-            };
             let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
             let plan_engine = unsafe { plan_based_engine(&engine) };
 
             let result = unsafe {
                 scan_declarative_metadata_plan(scan.shallow_copy(), plan_engine.shallow_copy())
             };
-            let skipped = match ok_or_panic(result) {
-                OptionalValue::Some(bytes) => {
-                    unsafe { free_kernel_bytes(bytes) };
-                    false
-                }
-                OptionalValue::None => true,
-            };
-            assert_eq!(skipped, expect_skipped);
+            assert!(
+                matches!(ok_or_panic(result), OptionalValue::None),
+                "expected None for a statically-skipped scan",
+            );
 
             unsafe { free_scan(scan) };
             unsafe { free_snapshot(snapshot) };

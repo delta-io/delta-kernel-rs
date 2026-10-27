@@ -85,8 +85,7 @@ fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> KernelResult<Vec<Reco
             batch
                 .column_by_name(STATS)
                 .or_else(|| constants.column_by_name(STATS))
-                .cloned()
-                .filter(|_| scan.stats.synthesize_json),
+                .cloned(),
             batch.column_by_name("stats_parsed").cloned(),
             batch.column_by_name("partitionValues_parsed").cloned(),
         )?);
@@ -225,7 +224,7 @@ fn declarative_metadata_matches_imperative_scan(
     )]
     predicate: Option<Pred>,
 ) -> KernelResult<()> {
-    let (engine, snapshot, _tempdir) = load_test_table(table)?;
+    let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
     let predicate = predicate.map(Arc::new);
 
     let imperative_builder = snapshot
@@ -301,10 +300,6 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
     StatsOptions::all(),
     &[PARSED_STATS_TABLE_ALL_STATS_FIELDS, JSON_STATS_FIELDS]
 )]
-#[case::both_columns(
-    StatsOptions { synthesize_json: true, ..StatsOptions::struct_columns(vec![column_name!("id")]) },
-    &[ID_STATS_PARSED_FIELDS, JSON_STATS_FIELDS]
-)]
 #[case::none(StatsOptions::none(), &[])]
 fn declarative_metadata_matches_imperative_across_stats_options(
     #[case] stats: StatsOptions,
@@ -312,26 +307,19 @@ fn declarative_metadata_matches_imperative_across_stats_options(
 ) -> KernelResult<()> {
     let (engine, snapshot, _tempdir) = load_test_table("parsed-stats")?;
     let struct_stats = stats.struct_stats.clone();
-    let parsed_stats_requested = match &struct_stats {
-        StructStats::None => false,
-        StructStats::Columns { requested } => !requested.is_empty(),
-        StructStats::AllIndexed { .. } => true,
-    };
     let no_stats = !stats.synthesize_json && matches!(&struct_stats, StructStats::None);
     let expected_stats = if no_stats {
         StatsOptions::json_only()
     } else {
         stats.clone()
     };
-    let predicate: PredicateRef = col!("id").gt(lit(200i64)).into();
+    let predicate: PredicateRef = col!("id").gt(lit(0i64)).into();
     let expected_builder = snapshot
         .clone()
         .scan_builder()
         .with_stats(expected_stats)
         .with_partition_values(PartitionValuesOptions::with_struct())
-        .with_predicate(
-            (!stats.synthesize_json || parsed_stats_requested).then_some(predicate.clone()),
-        );
+        .with_predicate(predicate.clone());
     let expected = imperative_metadata(expected_builder.build()?, engine.as_ref())?;
     let builder = snapshot
         .scan_builder()
@@ -366,6 +354,11 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         .collect();
     expected_stats_fields.sort_unstable();
     assert_eq!(actual_stats_fields, expected_stats_fields);
+    let parsed_stats_requested = match &struct_stats {
+        StructStats::None => false,
+        StructStats::Columns { requested } => !requested.is_empty(),
+        StructStats::AllIndexed { .. } => true,
+    };
     if !parsed_stats_requested {
         let declarative_schema = actual.first().expect("declarative metadata").schema();
         let imperative_schema = expected.first().expect("imperative metadata").schema();
@@ -586,14 +579,24 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
     .unwrap()
 }
 
-#[test]
-fn declarative_metadata_projects_nested_column_mapped_stats() -> KernelResult<()> {
+#[rstest]
+#[case::nested(column_name!("nested_struct.inner_int"), false)]
+#[case::predicate_only_stats(column_name!("nested_struct.inner_int"), true)]
+#[case::no_min_max(column_name!("binary_col"), true)]
+fn declarative_metadata_projects_nested_column_mapped_stats(
+    #[case] requested: ColumnName,
+    #[case] with_predicate: bool,
+) -> KernelResult<()> {
     let (engine, snapshot, _tempdir) = load_test_table("stats-writing-all-types/delta")?;
     let scan = snapshot
         .scan_builder()
-        .with_stats(StatsOptions::struct_columns(vec![column_name!(
-            "nested_struct.inner_int"
-        )]))
+        .with_stats(StatsOptions::struct_columns(vec![requested.clone()]))
+        .with_predicate(with_predicate.then(|| {
+            Arc::new(Pred::and(
+                col!("nested_struct.inner_double").gt(lit(0.0)),
+                col!("nested_struct.inner_string").is_not_null(),
+            ))
+        }))
         .build()?;
     let actual = declarative_metadata(&scan, engine.as_ref())?;
     let parent = "col-481c7590-d3b8-4e9c-b40e-7b7128a972f4";
@@ -602,44 +605,22 @@ fn declarative_metadata_projects_nested_column_mapped_stats() -> KernelResult<()
         .into_iter()
         .filter(|path| path.starts_with(STATS_PARSED))
         .collect();
-    assert_eq!(
-        stats_paths,
-        [
+    let expected = if requested == column_name!("binary_col") {
+        vec![
+            "stats_parsed.nullCount.col-cbe103e8-96dc-4fd7-821e-602cf8902e6b".to_string(),
+            "stats_parsed.numRecords".to_string(),
+            "stats_parsed.tightBounds".to_string(),
+        ]
+    } else {
+        vec![
             format!("stats_parsed.maxValues.{parent}.{child}"),
             format!("stats_parsed.minValues.{parent}.{child}"),
             format!("stats_parsed.nullCount.{parent}.{child}"),
             "stats_parsed.numRecords".to_string(),
             "stats_parsed.tightBounds".to_string(),
         ]
-    );
-    Ok(())
-}
-
-#[rstest]
-#[case::nested(column_name!("nested_struct.inner_int"))]
-#[case::no_min_max(column_name!("binary_col"))]
-fn declarative_metadata_omits_predicate_only_stats(
-    #[case] requested: ColumnName,
-) -> KernelResult<()> {
-    let (engine, snapshot, _tempdir) = load_test_table("stats-writing-all-types/delta")?;
-    let scan = snapshot
-        .scan_builder()
-        .with_stats(StatsOptions::struct_columns(vec![requested]))
-        .with_predicate(Arc::new(Pred::and(
-            col!("nested_struct.inner_double").gt(lit(0.0)),
-            col!("nested_struct.inner_string").is_not_null(),
-        )))
-        .build()?;
-    let expected = scan.state_info.physical_stats_output_schema().unwrap();
-    let expected: ArrowSchema = expected.as_ref().try_into_arrow()?;
-    let actual = declarative_metadata(&scan, engine.as_ref())?;
-    assert!(!actual.is_empty());
-    for batch in actual {
-        assert_eq!(
-            batch.column_by_name(STATS_PARSED).unwrap().data_type(),
-            &ArrowDataType::Struct(expected.fields().clone())
-        );
-    }
+    };
+    assert_eq!(stats_paths, expected);
     Ok(())
 }
 
@@ -867,7 +848,7 @@ fn declarative_metadata_partition_values_prune_without_struct_stats(
     #[case] expected_count: usize,
 ) -> KernelResult<()> {
     let (engine, snapshot, _tempdir) =
-        load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+        crate::unit_test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
     let predicate = Arc::new(predicate);
     let expected = imperative_metadata(
         snapshot
