@@ -2302,8 +2302,8 @@ mod tests {
         use crate::plans::result::CPlanResult;
         use crate::plans::{get_plan_based_engine, get_plan_executor};
         use crate::{
-            free_engine, free_snapshot, KernelBytesSlice, NullableCvoid, OptionalValue,
-            SharedExternEngine,
+            free_engine, free_kernel_bytes, free_snapshot, KernelBytesSlice, NullableCvoid,
+            OptionalValue, SharedExternEngine,
         };
 
         extern "C" fn visit_false(
@@ -2412,7 +2412,7 @@ mod tests {
             };
             let skipped = match ok_or_panic(result) {
                 OptionalValue::Some(bytes) => {
-                    unsafe { bytes.into_vec() };
+                    unsafe { free_kernel_bytes(bytes) };
                     false
                 }
                 OptionalValue::None => true,
