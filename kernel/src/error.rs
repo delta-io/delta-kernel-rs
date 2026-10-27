@@ -21,7 +21,7 @@ pub use delta_error_condition::DeltaErrorCondition;
 
 /// An error returned by a Delta Kernel operation.
 #[derive(Debug, thiserror::Error)]
-// TODO(#2630): An exhaustive envelope also requires the Engine variant.
+// TODO(#2630): Remove non_exhaustive once the Engine variant is introduced.
 #[non_exhaustive]
 pub enum Error {
     /// A stable, user-facing Delta failure.

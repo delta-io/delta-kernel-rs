@@ -11,10 +11,12 @@ use super::DeltaErrorCondition;
 /// Match on [`Self::condition`] and [`Self::sql_state`], not on diagnostic messages or parameter
 /// values. A failure does not invalidate the snapshot or require engine shutdown.
 ///
+/// The condition's classification accessors ([`Self::name`], [`Self::sql_state`]) are mirrored
+/// here; catalog template details stay on [`DeltaErrorCondition`].
+///
 /// [`fmt::Display`] renders only the catalog message. The original cause is available through
-/// [`StdError::source`], and [`fmt::Debug`] includes the cause and backtrace. Diagnostic values are
-/// not redacted; connectors are responsible for redacting telemetry.
-#[derive(Debug)]
+/// [`StdError::source`], and [`fmt::Debug`] includes the message, cause, and backtrace. Diagnostic
+/// values are not redacted; connectors are responsible for redacting telemetry.
 pub struct DeltaError {
     condition: DeltaErrorCondition,
     parameters: Box<[DeltaErrorParameter]>,
@@ -25,16 +27,21 @@ pub struct DeltaError {
 /// A named, stringified diagnostic value for a [`DeltaError`] message template.
 ///
 /// The name is a stable catalog identifier; the value is diagnostic text, not a classification key.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeltaErrorParameter {
     name: &'static str,
     value: String,
 }
 
 impl DeltaError {
-    /// Returns the typed Delta condition; [`DeltaErrorCondition::name`] provides its stable name.
+    /// Returns the typed Delta condition.
     pub fn condition(&self) -> DeltaErrorCondition {
         self.condition
+    }
+
+    /// Returns the condition's stable catalog name.
+    pub fn name(&self) -> &'static str {
+        self.condition.name()
     }
 
     /// Returns the condition's five-character SQLSTATE, if the catalog defines one.
@@ -47,15 +54,17 @@ impl DeltaError {
         &self.parameters
     }
 
-    /// Renders the catalog message, inserting parameter values verbatim.
+    /// Returns the rendered catalog message; equivalent to `self.to_string()`.
     ///
-    /// Inserted values are not interpreted as further placeholders. The message excludes the cause
-    /// and backtrace and is diagnostic text, not a stable classification key.
+    /// See the [`fmt::Display`] implementation for the rendering contract.
     pub fn message(&self) -> String {
         self.to_string()
     }
 
     /// Returns the backtrace captured at construction, subject to Rust's backtrace configuration.
+    ///
+    /// Every construction calls [`Backtrace::capture`]; there is no per-error opt-out. Capture is
+    /// disabled unless `RUST_BACKTRACE` or `RUST_LIB_BACKTRACE` enables it.
     pub fn backtrace(&self) -> &Backtrace {
         &self.backtrace
     }
@@ -66,13 +75,22 @@ impl DeltaError {
     /// Condition-specific factories must maintain this invariant.
     #[allow(
         dead_code,
-        reason = "Construction is reserved for condition-specific factories."
+        reason = "Reserved for condition-specific factories; see #3421."
     )]
     fn new(
         condition: DeltaErrorCondition,
         parameters: Vec<DeltaErrorParameter>,
         source: Option<Box<dyn StdError + Send + Sync + 'static>>,
     ) -> Self {
+        debug_assert!(
+            parameters
+                .iter()
+                .map(DeltaErrorParameter::name)
+                .eq(condition.parameter_names().iter().copied()),
+            "{} requires parameters {:?}",
+            condition.name(),
+            condition.parameter_names(),
+        );
         Self {
             condition,
             parameters: parameters.into_boxed_slice(),
@@ -82,6 +100,10 @@ impl DeltaError {
     }
 }
 
+/// Renders the catalog message, inserting parameter values verbatim.
+///
+/// Inserted values are not interpreted as further placeholders. The message excludes the cause
+/// and backtrace and is diagnostic text, not a stable classification key.
 impl fmt::Display for DeltaError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         render_template(
@@ -89,6 +111,19 @@ impl fmt::Display for DeltaError {
             &self.parameters,
             formatter,
         )
+    }
+}
+
+impl fmt::Debug for DeltaError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeltaError")
+            .field("message", &format_args!("{self}"))
+            .field("condition", &self.condition)
+            .field("parameters", &self.parameters)
+            .field("source", &self.source)
+            .field("backtrace", &self.backtrace)
+            .finish()
     }
 }
 
@@ -111,7 +146,7 @@ impl DeltaErrorParameter {
 
     #[allow(
         dead_code,
-        reason = "Construction is reserved for condition-specific factories."
+        reason = "Reserved for condition-specific factories; see #3421."
     )]
     fn new(name: &'static str, value: impl ToString) -> Self {
         Self {

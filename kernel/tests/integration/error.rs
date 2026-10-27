@@ -88,7 +88,7 @@ fn test_kernel_error_without_backtrace(#[case] wrapper_count: usize) {
 #[test]
 fn test_error_trait_bounds() {
     fn assert_error<T: StdError + Send + Sync + 'static>() {}
-    fn assert_parameter<T: std::fmt::Debug + Eq + Send + Sync + 'static>() {}
+    fn assert_parameter<T: Clone + std::fmt::Debug + Eq + Send + Sync + 'static>() {}
     assert_error::<Error>();
     assert_error::<DeltaError>();
     assert_parameter::<DeltaErrorParameter>();
