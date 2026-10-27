@@ -1758,6 +1758,62 @@ pub unsafe extern "C" fn snapshot_log_segment_stats(
         .into_extern_result(&engine_ref)
 }
 
+/// Borrowed description of checkpoint files sharing a physical schema.
+#[repr(C)]
+pub struct FfiCheckpointFileGroup {
+    /// Number of files carrying file actions.
+    pub num_files: u64,
+    /// Delta schema JSON, or an empty string for a JSON checkpoint without sidecars.
+    /// Valid only for the duration of the callback.
+    pub parquet_schema_json: KernelStringSlice,
+}
+
+/// Visits all checkpoint file-action groups in one borrowed slice.
+///
+/// Resolves sidecars and physical schemas through `engine`, without replaying file actions.
+/// Calls `visit` once on success, including for an empty result. Both handles remain owned
+/// by the caller; the callback must copy any data it retains.
+///
+/// # Errors
+///
+/// Returns an error if checkpoint metadata cannot be read, decoded, or serialized.
+///
+/// # Safety
+///
+/// Both handles must be valid. `visit` must be valid for one synchronous call with `context`,
+/// must not unwind, and must not retain the borrowed slice or its strings.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_checkpoint_file_groups(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+    context: NullableCvoid,
+    visit: unsafe extern "C" fn(NullableCvoid, FfiSlice<FfiCheckpointFileGroup>),
+) -> ExternResult<()> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.as_ref() };
+    let result = (|| -> KernelResult<()> {
+        let groups = snapshot.checkpoint_file_groups(engine_ref.engine().as_ref())?;
+        let schemas: Vec<String> = groups
+            .iter()
+            .map(|group| match &group.parquet_schema {
+                Some(schema) => serde_json::to_string(schema),
+                None => Ok(String::new()),
+            })
+            .collect::<Result<_, _>>()?;
+        let views: Vec<_> = groups
+            .iter()
+            .zip(&schemas)
+            .map(|(group, schema)| FfiCheckpointFileGroup {
+                num_files: group.num_files,
+                parquet_schema_json: kernel_string_slice!(schema),
+            })
+            .collect();
+        unsafe { visit(context, FfiSlice::new_unsafe(views.as_slice())) };
+        Ok(())
+    })();
+    result.into_extern_result(&engine_ref)
+}
+
 /// File-level statistics for a snapshot, sourced from the snapshot's CRC.
 ///
 /// Pass-by-value mirror of the scalar fields of kernel's [`FileStats`]. The variable-length file

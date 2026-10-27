@@ -30,8 +30,9 @@ use crate::{
     engine_to_handle, free_engine, free_snapshot, get_snapshot_builder, get_snapshot_builder_from,
     snapshot_builder_build, snapshot_builder_with_incremental_crc_replay,
     snapshot_builder_with_max_catalog_version, snapshot_builder_with_version,
-    snapshot_log_segment_stats, FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats,
-    KernelI64Slice, KernelStringSlice, OptionalValue, SharedExternEngine,
+    snapshot_checkpoint_file_groups, snapshot_log_segment_stats, FfiCheckpointFileGroup,
+    FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats, FfiSlice, KernelI64Slice,
+    KernelStringSlice, OptionalValue, SharedExternEngine,
 };
 
 fn slice(value: &'static str) -> KernelStringSlice {
@@ -205,6 +206,76 @@ fn log_segment_stats_borrows_handles_and_propagates_errors_without_io(
         free_snapshot(snapshot);
         free_engine(engine);
     }
+}
+
+#[rstest::rstest]
+#[case::commits_only(false)]
+#[case::physical_schema(true)]
+fn checkpoint_file_groups_copy_borrowed_schemas(#[case] checkpoint_present: bool) {
+    type Groups = Vec<(u64, String)>;
+    unsafe extern "C" fn collect(context: NullableCvoid, groups: FfiSlice<FfiCheckpointFileGroup>) {
+        let output = unsafe { context.unwrap().cast::<Groups>().as_mut() };
+        for group in unsafe { groups.try_as_slice().unwrap() } {
+            let schema = unsafe { group.parquet_schema_json.try_to_string().unwrap() };
+            output.push((group.num_files, schema.to_owned()));
+        }
+    }
+    let engine = test_engine();
+    let path = if checkpoint_present {
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet")
+    } else {
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.json")
+    };
+    let paths = [FfiLogPath::new(path, 0, 1)];
+    let checkpoint = FfiLastCheckpoint {
+        version: 0,
+        size: 1,
+        parts: OptionalValue::None,
+        size_in_bytes: none_i64(),
+        num_of_add_files: none_i64(),
+        checkpoint_schema: OptionalValue::Some(slice(CHECKPOINT_SCHEMA)),
+        checksum: none_string(),
+        tags: none_map(),
+        v2_checkpoint: std::ptr::null(),
+    };
+    let mut hint = test_snapshot_hint(&paths, 0, FfiSnapshotHintFreshness::Latest);
+    if checkpoint_present {
+        hint.last_checkpoint = &checkpoint;
+    }
+    let builder = unsafe {
+        ok_or_panic(snapshot_builder_with_snapshot_hint(
+            test_builder(&engine),
+            &hint,
+        ))
+    };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let mut output = Groups::new();
+    for _ in 0..2 {
+        output.clear();
+        unsafe {
+            ok_or_panic(snapshot_checkpoint_file_groups(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+                Some(NonNull::from(&mut output).cast()),
+                collect,
+            ));
+        }
+        if checkpoint_present {
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0].0, 1);
+            let actual: serde_json::Value = serde_json::from_str(&output[0].1).unwrap();
+            let expected: serde_json::Value = serde_json::from_str(CHECKPOINT_SCHEMA).unwrap();
+            assert_eq!(actual, expected);
+        } else {
+            assert!(output.is_empty());
+        }
+    }
+    unsafe {
+        free_snapshot(snapshot);
+        free_engine(engine);
+    }
+    // The copied schema outlives both native owners.
+    assert_eq!(output.len(), usize::from(checkpoint_present));
 }
 
 struct NoIoEngine;

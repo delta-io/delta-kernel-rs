@@ -1860,6 +1860,13 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None,
         None,
     )?;
+    assert_eq!(
+        log_segment.checkpoint_file_groups(&engine)?,
+        vec![CheckpointFileGroup {
+            num_files: 1,
+            parquet_schema: None,
+        }]
+    );
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema,

@@ -66,7 +66,7 @@ pub(crate) use hint::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness}
 use snapshot_crc::SnapshotCrc;
 
 pub use crate::error::SnapshotHintError;
-pub use crate::log_segment::LogSegmentStats;
+pub use crate::log_segment::{CheckpointFileGroup, LogSegmentStats};
 
 /// A shared, thread-safe reference to a [`Snapshot`].
 pub type SnapshotRef = Arc<Snapshot>;
@@ -561,6 +561,22 @@ impl Snapshot {
     /// Returns an error if the total commit file size exceeds [`u64::MAX`].
     pub fn log_segment_stats(&self) -> KernelResult<LogSegmentStats> {
         self.log_segment.stats()
+    }
+
+    /// Returns the checkpoint file-action groups selected for this snapshot.
+    ///
+    /// Uses `engine` to resolve sidecars and read physical Parquet schemas when necessary.
+    /// Returns an empty vector when no checkpoint was selected. JSON checkpoints without
+    /// sidecars have no Parquet schema. Does not read commit files or replay file actions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint or sidecar metadata cannot be read or decoded.
+    pub fn checkpoint_file_groups(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Vec<CheckpointFileGroup>> {
+        self.log_segment.checkpoint_file_groups(engine)
     }
 
     /// Captures retained snapshot state as an owned hint without engine I/O.
@@ -1785,8 +1801,39 @@ mod tests {
     };
     use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
     use crate::transaction::create_table::create_table;
-    use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+    use crate::unit_test_utils::{
+        assert_result_error_with_message, load_test_table, string_array_to_engine_data,
+    };
     use crate::utils::FoldWithOption as _;
+
+    #[rstest]
+    #[case("table-without-dv-small", 0)]
+    #[case("v1-single-part-struct-stats-only", 1)]
+    #[case("v1-multi-part-struct-stats-only", 3)]
+    #[case("v1-multi-part-partitioned-struct-stats-only", 3)]
+    #[case("v2-json-sidecars-struct-stats-only", 1)]
+    #[case("v2-parquet-sidecars-struct-stats-only", 1)]
+    #[case("v2-classic-parquet-struct-stats-only", 1)]
+    fn checkpoint_file_groups_describe_file_actions(
+        #[case] table: &str,
+        #[case] expected_files: u64,
+    ) -> KernelResult<()> {
+        let (engine, snapshot, _temp) = load_test_table(table)?;
+        let groups = snapshot.checkpoint_file_groups(engine.as_ref())?;
+        if expected_files == 0 {
+            assert!(groups.is_empty());
+        } else {
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].num_files, expected_files);
+            let schema = groups[0].parquet_schema.as_ref().unwrap();
+            let DataType::Struct(add) = schema.field("add").unwrap().data_type() else {
+                panic!("checkpoint add field must be a struct");
+            };
+            assert!(add.field("stats_parsed").is_some());
+            assert!(add.field("path").is_some());
+        }
+        Ok(())
+    }
 
     /// Helper function to create a commitInfo action with optional ICT
     fn create_commit_info(timestamp: i64, ict: Option<i64>) -> serde_json::Value {

@@ -75,6 +75,18 @@ pub struct LogSegmentStats {
     pub total_commit_file_bytes: u64,
 }
 
+/// A group of checkpoint files carrying file actions with a common physical schema.
+///
+/// Sidecars replace the top-level checkpoint in this description when present. Multipart
+/// checkpoints form one group, using the first part's schema as required by the protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointFileGroup {
+    /// Number of files in the group, excluding a top-level checkpoint that references sidecars.
+    pub num_files: u64,
+    /// Physical Parquet schema, or `None` for a JSON checkpoint without sidecars.
+    pub parquet_schema: Option<SchemaRef>,
+}
+
 /// Information about checkpoint reading for data skipping optimization.
 ///
 /// Returned alongside the actions iterator from checkpoint reading functions.
@@ -1174,6 +1186,25 @@ impl LogSegment {
             .map(Some)
     }
 
+    pub(crate) fn checkpoint_file_groups(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Vec<CheckpointFileGroup>> {
+        if self.listed.checkpoint_parts.is_empty() {
+            return Ok(vec![]);
+        }
+        let (parquet_schema, sidecars) = self.get_file_actions_schema_and_sidecars(engine)?;
+        let num_files = if sidecars.is_empty() {
+            self.listed.checkpoint_parts.len()
+        } else {
+            sidecars.len()
+        };
+        Ok(vec![CheckpointFileGroup {
+            num_files: num_files as u64,
+            parquet_schema,
+        }])
+    }
+
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.
     ///
     /// This function analyzes the checkpoint to determine:
@@ -1255,9 +1286,18 @@ impl LogSegment {
         checkpoint: &ParsedLogPath<FileMeta>,
         checkpoint_schema: Option<&SchemaRef>,
     ) -> KernelResult<(Option<SchemaRef>, Vec<FileMeta>)> {
-        let sidecar_files = self.extract_sidecar_refs(engine, checkpoint)?;
+        let sidecar_files = match self.checkpoint_hint_sidecars() {
+            Some(sidecars) => sidecars
+                .iter()
+                .map(|sidecar| sidecar.to_filemeta(&self.log_root))
+                .collect::<KernelResult<Vec<_>>>()?,
+            None => self.extract_sidecar_refs(engine, checkpoint)?,
+        };
         let file_actions_schema = match sidecar_files.first() {
-            Some(first) => Some(Self::read_footer_schema(engine, first)?),
+            Some(first) => Some(match self.checkpoint_hint_sidecar_file_schema() {
+                Some(schema) => Arc::new(schema),
+                None => Self::read_footer_schema(engine, first)?,
+            }),
             None => checkpoint_schema.cloned(),
         };
         Ok((file_actions_schema, sidecar_files))
