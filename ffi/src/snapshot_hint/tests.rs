@@ -3,6 +3,7 @@ use std::error::Error as _;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+use delta_kernel::actions::Metadata;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::actions::{Add, LastManifestCommit};
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -271,17 +272,17 @@ unsafe fn with_minimal_hint(
     unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) }
 }
 
-fn read_snapshot_metadata(snapshot: &Handle<SharedSnapshot>) -> delta_kernel::actions::Metadata {
+fn read_snapshot_metadata(snapshot: &Handle<SharedSnapshot>) -> Metadata {
     extern "C" fn collect(context: NullableCvoid, metadata: *const FfiMetadata) {
         let result = unsafe {
             context
                 .unwrap()
-                .cast::<Option<KernelResult<delta_kernel::actions::Metadata>>>()
+                .cast::<Option<KernelResult<Metadata>>>()
                 .as_mut()
         };
         *result = Some(unsafe { (*metadata).try_to_kernel() });
     }
-    let mut result: Option<KernelResult<delta_kernel::actions::Metadata>> = None;
+    let mut result: Option<KernelResult<Metadata>> = None;
     unsafe {
         crate::snapshot_visit_metadata(
             snapshot.shallow_copy(),
