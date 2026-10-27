@@ -393,10 +393,7 @@ impl DeletionVectorDescriptor {
     /// - `'i'` -> marker `i`, path = `path_or_inline_dv`, unchanged. `adaptiveMetadata` forbids new
     ///   inline DVs, but the log may still hold ones from before the feature was enabled.
     ///
-    /// `offset` is kept because a single file may pack multiple DVs. An absent offset on a
-    /// persisted DV is treated as 1, the byte its blob is read from, so it matches the explicit
-    /// offset an AMT content entry always carries. An inline DV's offset is ignored, since the
-    /// protocol requires it to be absent.
+    /// `offset` is kept because a single file may pack multiple DVs.
     ///
     /// # Errors
     ///
@@ -417,8 +414,6 @@ impl DeletionVectorDescriptor {
         );
         let (marker, path) =
             Self::normalized_marker_and_path(storage_type, path_or_inline_dv, table_root)?;
-        let offset =
-            (storage_type != DeletionVectorStorageType::Inline).then(|| offset.unwrap_or(1));
         Ok(Self::unique_id_from_parts(marker, &path, offset))
     }
 
@@ -825,9 +820,6 @@ fn normalized_absolute_marker_and_path(
         .flatten();
     match relative {
         Some(relative) => ("r", relative),
-        // TODO(#2423): an out-of-root path is compared verbatim, so a `p` read back from an AMT
-        // (raw location, re-encoded by `uri_encode_path`) does not match a writer that encoded it
-        // differently (e.g. Delta-Spark leaves non-ASCII raw).
         None => ("p", original.to_string()),
     }
 }
@@ -1493,21 +1485,21 @@ mod tests {
         "s3://bucket/t/data/dv.bin",
         None,
         "s3://bucket/t/",
-        "rdata/dv.bin@1"
+        "rdata/dv.bin"
     )]
     #[case::absolute_encoded_space_decoded(
         DeletionVectorStorageType::PersistedAbsolute,
         "s3://mytable/a%20b/dv.bin",
         None,
         "s3://mytable/",
-        "ra b/dv.bin@1"
+        "ra b/dv.bin"
     )]
     #[case::absolute_alternate_root_encoding(
         DeletionVectorStorageType::PersistedAbsolute,
         "s3://bucket/%74/dv.bin",
         None,
         "s3://bucket/t/",
-        "rdv.bin@1"
+        "rdv.bin"
     )]
     #[case::absolute_different_host(
         DeletionVectorStorageType::PersistedAbsolute,
@@ -1521,84 +1513,84 @@ mod tests {
         "gs://mytable/dv.bin",
         None,
         "s3://mytable/",
-        "pgs://mytable/dv.bin@1"
+        "pgs://mytable/dv.bin"
     )]
     #[case::absolute_parent_of_root(
         DeletionVectorStorageType::PersistedAbsolute,
         "s3://bucket/x",
         None,
         "s3://bucket/x/y/",
-        "ps3://bucket/x@1"
+        "ps3://bucket/x"
     )]
     #[case::absolute_sibling_of_root(
         DeletionVectorStorageType::PersistedAbsolute,
         "s3://bucket/other/dv.bin",
         None,
         "s3://bucket/t/",
-        "ps3://bucket/other/dv.bin@1"
+        "ps3://bucket/other/dv.bin"
     )]
     #[case::absolute_sibling_sharing_root_prefix(
         DeletionVectorStorageType::PersistedAbsolute,
         "s3://bucket/table2/dv.bin",
         None,
         "s3://bucket/table/",
-        "ps3://bucket/table2/dv.bin@1"
+        "ps3://bucket/table2/dv.bin"
     )]
     #[case::absolute_equal_to_root(
         DeletionVectorStorageType::PersistedAbsolute,
         "s3://bucket/t/",
         None,
         "s3://bucket/t/",
-        "ps3://bucket/t/@1"
+        "ps3://bucket/t/"
     )]
     #[case::absolute_with_query(
         DeletionVectorStorageType::PersistedAbsolute,
         "s3://mytable/dv.bin?x=1",
         None,
         "s3://mytable/",
-        "ps3://mytable/dv.bin?x=1@1"
+        "ps3://mytable/dv.bin?x=1"
     )]
     #[case::absolute_with_fragment(
         DeletionVectorStorageType::PersistedAbsolute,
         "s3://mytable/dv.bin#x",
         None,
         "s3://mytable/",
-        "ps3://mytable/dv.bin#x@1"
+        "ps3://mytable/dv.bin#x"
     )]
     #[case::absolute_encoded_hash_decoded(
         DeletionVectorStorageType::PersistedAbsolute,
         "s3://mytable/dv.bin%23x",
         None,
         "s3://mytable/",
-        "rdv.bin#x@1"
+        "rdv.bin#x"
     )]
     #[case::absolute_invalid_utf8_stays_absolute(
         DeletionVectorStorageType::PersistedAbsolute,
         "s3://mytable/%FF.bin",
         None,
         "s3://mytable/",
-        "ps3://mytable/%FF.bin@1"
+        "ps3://mytable/%FF.bin"
     )]
     #[case::absolute_other_container_same_account(
         DeletionVectorStorageType::PersistedAbsolute,
         "abfss://c1@acct.dfs.core.windows.net/t/dv.bin",
         None,
         "abfss://c2@acct.dfs.core.windows.net/t/",
-        "pabfss://c1@acct.dfs.core.windows.net/t/dv.bin@1"
+        "pabfss://c1@acct.dfs.core.windows.net/t/dv.bin"
     )]
     #[case::absolute_out_of_root_kept_encoded(
         DeletionVectorStorageType::PersistedAbsolute,
         "s3://other/a%20b/dv.bin",
         None,
         "s3://mytable/",
-        "ps3://other/a%20b/dv.bin@1"
+        "ps3://other/a%20b/dv.bin"
     )]
-    #[case::uuid_relative_absent_offset_matches_explicit_one(
+    #[case::uuid_relative_absent_offset(
         DeletionVectorStorageType::PersistedRelative,
         "ab^-aqEH.-t@S}K{vb[*k^",
         None,
         "s3://mytable/",
-        "rab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin@1"
+        "rab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
     )]
     #[case::inline(
         DeletionVectorStorageType::Inline,

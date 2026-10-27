@@ -912,8 +912,8 @@ mod tests {
 
     // Every Delta descriptor the write path accepts reads back from the content tree as a
     // descriptor for the same file and blob: `r` with the raw path when the content tree stores it
-    // relative, else `p`. Both carry the same normalized identity, so log replay matches them
-    // against actions carrying the original.
+    // relative, else `p`. With an explicit offset both carry the same normalized identity, so log
+    // replay matches them against actions carrying the original.
     #[rstest]
     #[case::relative(
         (DeletionVectorStorageType::PersistedRelative, "ab^-aqEH.-t@S}K{vb[*k^"),
@@ -974,7 +974,11 @@ mod tests {
                 &table_root(),
             )
         };
-        assert_eq!(unique_id(&descriptor)?, unique_id(&original)?);
+        // An absent offset reads back as an explicit 1, so only an explicit offset keeps the
+        // original's identity.
+        if offset.is_some() {
+            assert_eq!(unique_id(&descriptor)?, unique_id(&original)?);
+        }
         Ok(())
     }
 

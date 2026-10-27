@@ -320,15 +320,6 @@ impl EntryConverter {
     /// A [`FilteredEngineData`] over an `Add`-action batch (one row per input entry, schema
     /// [`crate::actions::LOG_ADD_SCHEMA`]), whose selection vector keeps only the entries that read
     /// as live data files.
-    ///
-    /// # Errors
-    /// Returns an error if an entry carries an unknown content-type or tracking-status value, if a
-    /// delete manifest entry is live, if a selected (live `Data`) entry is not Parquet, has a
-    /// non-zero partition spec id, carries column files, or carries a `modifiedSnapshotId` without
-    /// a deletion vector (none yet supported by the read path), if a selected entry's deletion
-    /// vector cannot be represented as a [`DeletionVectorDescriptor`] (see
-    /// [`AddDeletionVector::try_new`]), if the evaluator fails to evaluate, or if the selection
-    /// vector length exceeds the batch.
     fn convert(&self, entries: &dyn EngineData) -> KernelResult<FilteredEngineData> {
         let mut visitor = AddSelectionVisitor::default();
         visitor.visit_rows_of(entries)?;
