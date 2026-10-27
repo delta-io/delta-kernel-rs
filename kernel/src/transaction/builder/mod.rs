@@ -176,9 +176,8 @@ impl<T: TransactionType> TransactionBuilder<T> {
     /// each batch passed to [`add_files`], e.g. with [`EngineData::append_columns`]. Commit fails
     /// for a batch without it.
     ///
-    /// The field belongs to the `clustering` writer feature, so build rejects this option when the
-    /// table does not support that feature: a new table must have a clustered data layout, and an
-    /// existing table's protocol must list `clustering`.
+    /// Build rejects this option if the table's protocol does not support the `clustering` writer
+    /// feature.
     ///
     /// [`add_files_schema`]: crate::transaction::Transaction::add_files_schema
     /// [`add_files`]: crate::transaction::Transaction::add_files

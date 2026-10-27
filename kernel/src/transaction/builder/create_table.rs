@@ -952,7 +952,7 @@ impl TransactionBuilder<CreateTable> {
     /// - Connector commit information does not contain exactly one row
     /// - An application transaction identifier occurs more than once
     /// - [`with_add_file_clustering_provider`](Self::with_add_file_clustering_provider) is set
-    ///   without a clustered data layout
+    ///   when the new table's protocol does not support the `clustering` writer feature
     #[internal_api]
     pub(crate) fn build(
         self,

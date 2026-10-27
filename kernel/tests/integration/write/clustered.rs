@@ -414,10 +414,11 @@ async fn write_new_files_to_clustered_table(
 
 #[rstest::rstest]
 #[tokio::test]
-async fn test_add_file_tags_and_clustering_provider_written_to_add_actions(
+async fn test_add_file_tags_and_clustering_provider_match_opted_in_schema(
     #[values(false, true)] row_tracking: bool,
     #[values(false, true)] tags: bool,
     #[values(false, true)] clustering_provider: bool,
+    #[values(false, true)] extra_columns: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let NewFilesSetup {
         _tmp_dir,
@@ -435,7 +436,7 @@ async fn test_add_file_tags_and_clustering_provider_written_to_add_actions(
 
     let mut fields = Vec::new();
     let mut columns = Vec::new();
-    if tags {
+    if tags || extra_columns {
         let tags_type = MapType::new(DataType::STRING, DataType::STRING, true);
         fields.push(StructField::nullable("tags", tags_type.clone()));
         columns.push(ArrayData::try_new(
@@ -453,7 +454,7 @@ async fn test_add_file_tags_and_clustering_provider_written_to_add_actions(
             ],
         )?);
     }
-    if clustering_provider {
+    if clustering_provider || extra_columns {
         fields.push(StructField::nullable(
             "clusteringProvider",
             DataType::STRING,
@@ -473,10 +474,12 @@ async fn test_add_file_tags_and_clustering_provider_written_to_add_actions(
     } else {
         add_files_metadata.append_columns(Arc::new(StructType::try_new(fields)?), columns)?
     });
-    let version = txn
-        .commit(engine.as_ref())?
-        .unwrap_committed()
-        .commit_version();
+    let result = txn.commit(engine.as_ref());
+    if extra_columns && (!tags || !clustering_provider) {
+        assert_result_error_with_message(result, "Too few fields in output schema");
+        return Ok(());
+    }
+    let version = result?.unwrap_committed().commit_version();
 
     let adds = read_actions_from_commit(&table_url, version, "add")?;
     let read_back = |name: &str| adds.iter().map(|add| add.get(name).cloned()).collect_vec();
