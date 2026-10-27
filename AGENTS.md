@@ -47,8 +47,8 @@ cargo check-no-default-kernel
 cargo check-no-default-engine
 cargo clippy-no-default-kernel-leaves
 
-# Regenerate DeltaErrorCondition (default: fetch delta-io/delta master; --offline: from the vendored
-# catalog; --check: fail if stale, writing nothing)
+# Regenerate DeltaErrorCondition from the pinned local catalog and selected-conditions.json.
+# All modes use local inputs; --check fails if stale, writing nothing.
 cargo xtask update-delta-error-catalog [--offline] [--check]
 
 # Quick pre-push check (mimics CI)

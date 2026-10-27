@@ -1,70 +1,63 @@
-//! `cargo xtask update-delta-error-catalog`: vendors Delta's error catalog and generates
-//! `DeltaErrorCondition` from it.
+//! Generates `DeltaErrorCondition` for the allowlisted leaves of the pinned Delta error catalog.
+//! Catalog updates are explicit changes to the checked-in inputs; generation never fetches data.
 //!
 //! Leaf conditions follow Spark's `ErrorClassesJsonReader`: message lines join with `"\n"`, a
 //! subclass template is the parent template + `" "` + the subclass template, a subclass inherits
 //! its parent's SQLSTATE unless it sets its own, and only subclasses of a family are conditions.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use anyhow::{bail, ensure, Context};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::codegen::{add_preamble, ensure_file_contents};
 
 const COMMAND: &str = "update-delta-error-catalog";
-const REPOSITORY: &str = "https://github.com/delta-io/delta";
-const BRANCH: &str = "refs/heads/master";
-const UPSTREAM_PATH: &str = "spark/src/main/resources/error/delta-error-classes.json";
 const CATALOG: &str = "kernel/error_catalog/delta-error-classes.json";
 const SOURCE: &str = "kernel/error_catalog/source.json";
+const SELECTION: &str = "kernel/error_catalog/selected-conditions.json";
 const DESTINATION: &str = "kernel/src/error/delta_error_condition/generated.rs";
 
 #[derive(clap::Args)]
 pub(crate) struct UpdateArgs {
-    /// Regenerate from the vendored catalog instead of fetching delta-io/delta master.
-    #[arg(long)]
-    offline: bool,
-    /// Fail if the vendored catalog or generated code is stale instead of writing them.
-    /// Implies `--offline`.
+    /// Use the checked-in inputs (also the default; accepted for explicit offline workflows).
+    #[arg(long = "offline")]
+    _offline: bool,
+    /// Fail if generated code differs from the checked-in inputs, without writing files.
     #[arg(long)]
     check: bool,
 }
 
-/// Runs the command against the workspace rooted at `root`.
+/// Generates selected conditions in the workspace rooted at `root`.
+/// Returns an error for invalid inputs, failed file operations, or stale output in check mode.
 pub(crate) fn update(root: &Path, args: UpdateArgs) -> anyhow::Result<()> {
-    let (catalog, source) = if args.offline || args.check {
-        load_vendored(root)?
-    } else {
-        fetch_master()?
-    };
-    write_outputs(root, &catalog, &source, args.check)
+    let (catalog, source) = load_vendored(root)?;
+    let selection_path = root.join(SELECTION);
+    let selection = fs::read(&selection_path)
+        .with_context(|| format!("reading {}", selection_path.display()))?;
+    let conditions = select_conditions(parse_catalog(&catalog)?, &selection)?;
+    let generated = add_preamble(COMMAND, &render(&source, &conditions)?);
+    ensure_file_contents(COMMAND, &root.join(DESTINATION), &generated, args.check)?;
+    eprintln!(
+        "{} selected Delta error conditions from delta-io/delta@{}",
+        conditions.len(),
+        source.commit
+    );
+    Ok(())
 }
 
 /// Where the vendored catalog came from, recorded in `source.json`.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Source {
     repository: String,
     commit: String,
     path: String,
     sha256: String,
-}
-
-impl Source {
-    fn new(commit: String, catalog: &[u8]) -> Self {
-        Self {
-            repository: REPOSITORY.to_string(),
-            commit,
-            path: UPSTREAM_PATH.to_string(),
-            sha256: sha256_hex(catalog),
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -102,69 +95,23 @@ fn load_vendored(root: &Path) -> anyhow::Result<(Vec<u8>, Source)> {
     let source: Source = serde_json::from_str(&source)
         .with_context(|| format!("parsing {}", source_path.display()))?;
     ensure!(
+        source.repository == "https://github.com/delta-io/delta"
+            && source.path == "spark/src/main/resources/error/delta-error-classes.json"
+            && source.commit.len() == 40
+            && source
+                .commit
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "{} must identify the Delta error catalog at a full lowercase commit SHA",
+        source_path.display()
+    );
+    ensure!(
         sha256_hex(&catalog) == source.sha256,
-        "{} does not match the sha256 in {}; rerun `cargo xtask {COMMAND}` without `--offline` \
-         to re-vendor it",
+        "{} does not match the sha256 in {}; update the catalog and its source metadata together",
         catalog_path.display(),
         source_path.display(),
     );
     Ok((catalog, source))
-}
-
-fn fetch_master() -> anyhow::Result<(Vec<u8>, Source)> {
-    let ls_remote = run(
-        "git",
-        &[
-            "ls-remote",
-            "--exit-code",
-            &format!("{REPOSITORY}.git"),
-            BRANCH,
-        ],
-    )?;
-    let commit = parse_ls_remote(&String::from_utf8(ls_remote)?)?;
-    let url = format!("https://raw.githubusercontent.com/delta-io/delta/{commit}/{UPSTREAM_PATH}");
-    let catalog = run(
-        "curl",
-        &["--fail", "--silent", "--show-error", "--location", &url],
-    )?;
-    let source = Source::new(commit, &catalog);
-    Ok((catalog, source))
-}
-
-/// Validates `catalog` and then writes the vendored catalog, `source.json`, and generated code.
-fn write_outputs(root: &Path, catalog: &[u8], source: &Source, check: bool) -> anyhow::Result<()> {
-    let conditions = parse_catalog(catalog)?;
-    let generated = add_preamble(COMMAND, &render(source, &conditions)?);
-    let catalog = std::str::from_utf8(catalog).context("the catalog is not UTF-8")?;
-    let mut source_json = serde_json::to_string_pretty(source)?;
-    source_json.push('\n');
-    ensure_file_contents(COMMAND, &root.join(CATALOG), catalog, check)?;
-    ensure_file_contents(COMMAND, &root.join(SOURCE), &source_json, check)?;
-    ensure_file_contents(COMMAND, &root.join(DESTINATION), &generated, check)?;
-    eprintln!(
-        "{} Delta error conditions from delta-io/delta@{}",
-        conditions.len(),
-        source.commit
-    );
-    Ok(())
-}
-
-/// Returns the commit of [`BRANCH`] from `git ls-remote` output.
-fn parse_ls_remote(output: &str) -> anyhow::Result<String> {
-    let Some(commit) = output.lines().find_map(|line| {
-        let (commit, reference) = line.split_once('\t')?;
-        (reference == BRANCH).then_some(commit)
-    }) else {
-        bail!("`git ls-remote` did not report {BRANCH}: {output:?}");
-    };
-    ensure!(
-        commit.len() == 40
-            && commit
-                .bytes()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
-        "`git ls-remote` reported an invalid commit for {BRANCH}: {commit:?}"
-    );
-    Ok(commit.to_string())
 }
 
 /// Flattens and validates the catalog into leaf conditions, ordered by name.
@@ -193,6 +140,32 @@ fn parse_catalog(catalog: &[u8]) -> anyhow::Result<Vec<Condition>> {
     }
     conditions.sort_by(|a, b| a.name.cmp(&b.name));
 
+    Ok(conditions)
+}
+
+/// Selects exact leaf names, rejecting duplicate or unknown entries and Rust variant collisions.
+/// The output retains catalog order so reordering the allowlist does not change generated code.
+fn select_conditions(
+    conditions: Vec<Condition>,
+    selection: &[u8],
+) -> anyhow::Result<Vec<Condition>> {
+    let names: Vec<String> =
+        serde_json::from_slice(selection).context("parsing the Delta error condition selection")?;
+    let mut selected = BTreeSet::new();
+    for name in names {
+        ensure!(
+            selected.insert(name.clone()),
+            "duplicate selected condition {name:?}"
+        );
+    }
+    let conditions: Vec<_> = conditions
+        .into_iter()
+        .filter(|condition| selected.remove(&condition.name))
+        .collect();
+    ensure!(
+        selected.is_empty(),
+        "selected conditions are not catalog leaves: {selected:?}"
+    );
     let mut variants = HashMap::new();
     for condition in &conditions {
         if let Some(other) = variants.insert(condition.variant.as_str(), condition.name.as_str()) {
@@ -299,7 +272,7 @@ fn render(source: &Source, conditions: &[Condition]) -> Result<String, std::fmt:
     writeln!(out)?;
     writeln!(
         out,
-        "/// A stable error condition from the Delta error catalog."
+        "/// A stable error condition selected for Kernel from the Delta error catalog."
     )?;
     writeln!(out, "///")?;
     writeln!(
@@ -322,7 +295,7 @@ fn render(source: &Source, conditions: &[Condition]) -> Result<String, std::fmt:
     writeln!(out, "impl DeltaErrorCondition {{")?;
     writeln!(
         out,
-        "    // Lets invariant tests check metadata for every condition in the catalog."
+        "    // Lets invariant tests check metadata for every selected condition."
     )?;
     writeln!(out, "    #[cfg(test)]")?;
     writeln!(out, "    pub(super) const ALL: &'static [Self] = &[")?;
@@ -365,22 +338,6 @@ fn render(source: &Source, conditions: &[Condition]) -> Result<String, std::fmt:
     writeln!(out, "    }}")?;
     writeln!(out, "}}")?;
     Ok(out)
-}
-
-/// Runs `program` and returns its stdout, failing on a non-zero exit.
-fn run(program: &str, args: &[&str]) -> anyhow::Result<Vec<u8>> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("running `{program}`; it must be on PATH"))?;
-    ensure!(
-        output.status.success(),
-        "`{program} {}` failed ({}): {}",
-        args.join(" "),
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(output.stdout)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -496,10 +453,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case::variant_collision(
-        r#"{"A_B": {"message": ["x"]}, "A": {"message": ["x"], "subClass": {"B": {"message": ["y"]}}}}"#,
-        "A.B and A_B both map to the Rust variant AB"
-    )]
     #[case::unknown_class_field(r#"{"A": {"message": ["x"], "extra": 1}}"#, "parsing")]
     #[case::unknown_subclass_field(
         r#"{"A": {"message": ["x"], "subClass": {"B": {"message": ["y"], "extra": 1}}}}"#,
@@ -519,18 +472,55 @@ mod tests {
     }
 
     #[rstest]
-    #[case::master(&format!("{COMMIT}\trefs/heads/master\n"), Some(COMMIT))]
-    #[case::empty("", None)]
-    #[case::other_ref(&format!("{COMMIT}\trefs/heads/main\n"), None)]
-    #[case::short_sha("0123abc\trefs/heads/master\n", None)]
-    #[case::uppercase_sha(&format!("{}\trefs/heads/master\n", COMMIT.to_uppercase()), None)]
-    fn ls_remote_parsing(#[case] output: &str, #[case] expected: Option<&str>) {
-        assert_eq!(parse_ls_remote(output).ok().as_deref(), expected);
+    #[case::top_level(r#"["TOP_LEVEL"]"#, &["TOP_LEVEL"])]
+    #[case::subclass(r#"["FAMILY.INHERITS"]"#, &["FAMILY.INHERITS"])]
+    #[case::unsorted(r#"["TOP_LEVEL", "FAMILY.INHERITS"]"#, &["FAMILY.INHERITS", "TOP_LEVEL"])]
+    #[case::sorted(r#"["FAMILY.INHERITS", "TOP_LEVEL"]"#, &["FAMILY.INHERITS", "TOP_LEVEL"])]
+    #[case::empty("[]", &[])]
+    fn selection_preserves_metadata_in_catalog_order(
+        #[case] selection: &str,
+        #[case] expected: &[&str],
+    ) {
+        let selected = select_conditions(conditions(FIXTURE), selection.as_bytes()).unwrap();
+        let expected: Vec<_> = expected
+            .iter()
+            .map(|name| condition_named(FIXTURE, name))
+            .collect();
+        assert_eq!(selected, expected);
+    }
+
+    #[rstest]
+    #[case::unknown(r#"["MISSING"]"#, "not catalog leaves")]
+    #[case::parent(r#"["FAMILY"]"#, "not catalog leaves")]
+    #[case::duplicate(r#"["TOP_LEVEL", "TOP_LEVEL"]"#, "duplicate selected condition")]
+    #[case::malformed("{}", "parsing")]
+    fn rejects_invalid_selection(#[case] selection: &str, #[case] needle: &str) {
+        let err = select_conditions(conditions(FIXTURE), selection.as_bytes()).unwrap_err();
+        assert!(format!("{err:#}").contains(needle), "{err:#}");
+    }
+
+    #[rstest]
+    #[case::selected_collision(r#"["A.B", "A_B"]"#, true)]
+    #[case::unselected_collision(r#"["A.B"]"#, false)]
+    fn only_selected_variant_collisions_are_rejected(#[case] selection: &str, #[case] fails: bool) {
+        let catalog = r#"{
+            "A_B": {"message": ["x"]},
+            "A": {"message": ["p"], "subClass": {"B": {"message": ["s"]}}}
+        }"#;
+        let result = select_conditions(conditions(catalog), selection.as_bytes());
+        if fails {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("both map to the Rust variant AB"));
+        } else {
+            assert_eq!(result.unwrap(), [condition_named(catalog, "A.B")]);
+        }
     }
 
     #[test]
     fn render_emits_metadata() {
-        let source = Source::new(COMMIT.to_string(), FIXTURE.as_bytes());
+        let source = fixture_source();
         let rendered = render(&source, &conditions(FIXTURE)).unwrap();
         assert!(rendered.contains(&format!("at `{COMMIT}`")));
         assert!(
@@ -547,32 +537,55 @@ mod tests {
 
     // === End to end on a tempdir workspace root ===
 
+    fn fixture_source() -> Source {
+        Source {
+            repository: "https://github.com/delta-io/delta".to_string(),
+            commit: COMMIT.to_string(),
+            path: "spark/src/main/resources/error/delta-error-classes.json".to_string(),
+            sha256: sha256_hex(FIXTURE.as_bytes()),
+        }
+    }
+
     fn write_fixture(root: &Path) {
-        let source = Source::new(COMMIT.to_string(), FIXTURE.as_bytes());
-        write_outputs(root, FIXTURE.as_bytes(), &source, false).unwrap();
+        fs::create_dir_all(root.join(CATALOG).parent().unwrap()).unwrap();
+        fs::write(root.join(CATALOG), FIXTURE).unwrap();
+        let source = fixture_source();
+        fs::write(
+            root.join(SOURCE),
+            serde_json::json!({
+                "repository": source.repository,
+                "commit": source.commit,
+                "path": source.path,
+                "sha256": source.sha256,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(root.join(SELECTION), r#"["TOP_LEVEL", "FAMILY.INHERITS"]"#).unwrap();
+        update_offline(root, false).unwrap();
     }
 
     fn update_offline(root: &Path, check: bool) -> anyhow::Result<()> {
         update(
             root,
             UpdateArgs {
-                offline: true,
+                _offline: false,
                 check,
             },
         )
     }
 
     fn read_all(root: &Path) -> Vec<String> {
-        [CATALOG, SOURCE, DESTINATION]
+        [CATALOG, SOURCE, SELECTION, DESTINATION]
             .map(|path| fs::read_to_string(root.join(path)).unwrap())
             .into()
     }
 
     #[test]
-    fn write_mode_creates_all_files_and_check_passes() {
+    fn generates_from_local_inputs_and_check_passes() {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path());
-        let [catalog, source, generated]: [String; 3] = read_all(dir.path()).try_into().unwrap();
+        let [catalog, source, _, generated]: [String; 4] = read_all(dir.path()).try_into().unwrap();
         assert_eq!(catalog, FIXTURE);
         let source: Source = serde_json::from_str(&source).unwrap();
         assert_eq!(source.commit, COMMIT);
@@ -581,20 +594,44 @@ mod tests {
         update(
             dir.path(),
             UpdateArgs {
-                offline: false,
+                _offline: false,
                 check: true,
             },
         )
         .unwrap();
     }
 
-    #[test]
-    fn offline_rewrites_nothing() {
+    #[rstest]
+    fn regeneration_does_not_change_inputs(#[values(false, true)] offline: bool) {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path());
         let before = read_all(dir.path());
-        update_offline(dir.path(), false).unwrap();
+        update(
+            dir.path(),
+            UpdateArgs {
+                _offline: offline,
+                check: false,
+            },
+        )
+        .unwrap();
         assert_eq!(read_all(dir.path()), before);
+    }
+
+    #[test]
+    fn selection_change_requires_regeneration_and_check_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path());
+        fs::write(dir.path().join(SELECTION), r#"["FAMILY.INHERITS"]"#).unwrap();
+        let before = read_all(dir.path());
+        let err = update_offline(dir.path(), true).unwrap_err();
+        assert!(err.to_string().contains("is not up to date"), "{err:#}");
+        assert_eq!(read_all(dir.path()), before);
+        update_offline(dir.path(), false).unwrap();
+        let after = read_all(dir.path());
+        assert_eq!(after[..3], before[..3]);
+        assert!(after[3].contains("FamilyInherits"));
+        assert!(!after[3].contains("TopLevel"));
+        update_offline(dir.path(), true).unwrap();
     }
 
     #[test]

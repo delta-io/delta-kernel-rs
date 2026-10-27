@@ -1,8 +1,8 @@
-//! Error conditions from the Delta error catalog.
+//! Selected error conditions from the Delta error catalog.
 //!
 //! A condition is a stable identity from Delta's error catalog that connectors match on instead
-//! of message text. [`DeltaErrorCondition`] is generated from the vendored catalog in
-//! `kernel/error_catalog/` by `cargo xtask update-delta-error-catalog`.
+//! of message text. [`DeltaErrorCondition`] is generated from the pinned catalog and explicit
+//! allowlist in `kernel/error_catalog/` by `cargo xtask update-delta-error-catalog`.
 
 mod generated;
 

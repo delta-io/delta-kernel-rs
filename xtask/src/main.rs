@@ -2,8 +2,8 @@
 //!
 //! See <https://github.com/matklad/cargo-xtask> for the pattern. Commands:
 //!
-//! - `update-delta-error-catalog [--offline] [--check]`: vendor the Delta error catalog and
-//!   regenerate `DeltaErrorCondition` from it.
+//! - `update-delta-error-catalog [--offline] [--check]`: regenerate selected `DeltaErrorCondition`
+//!   variants from the checked-in catalog and allowlist. All modes use local inputs.
 
 use std::path::{Path, PathBuf};
 
@@ -20,8 +20,7 @@ struct Xtask {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Vendor the Delta error catalog from delta-io/delta master and regenerate
-    /// `DeltaErrorCondition` from it.
+    /// Regenerate selected `DeltaErrorCondition` variants from the pinned local catalog.
     UpdateDeltaErrorCatalog(delta_error_catalog::UpdateArgs),
 }
 
