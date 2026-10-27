@@ -180,11 +180,13 @@ fn render_template(
 
 #[cfg(test)]
 mod tests {
+    use std::backtrace::{Backtrace, BacktraceStatus};
     use std::fmt;
 
     use rstest::rstest;
 
-    use super::{render_template, DeltaErrorParameter};
+    use super::{render_template, DeltaError, DeltaErrorParameter};
+    use crate::{DeltaErrorCondition, Error};
 
     struct LimitedWriter {
         remaining_bytes: usize,
@@ -208,6 +210,34 @@ mod tests {
         let parameter = DeltaErrorParameter::new("version", value);
         assert_eq!(parameter.name(), "version");
         assert_eq!(parameter.value(), expected);
+    }
+
+    #[test]
+    fn constructor_captures_backtrace_and_envelope_preserves_it() {
+        let ambient = Backtrace::capture().status();
+        if ambient != BacktraceStatus::Captured {
+            eprintln!("skipping: backtrace capture is {ambient:?}; set RUST_BACKTRACE=1 to run");
+            return;
+        }
+
+        let delta = DeltaError::new(
+            DeltaErrorCondition::TestOnly,
+            vec![
+                DeltaErrorParameter::new("first", "one"),
+                DeltaErrorParameter::new("second", "two"),
+            ],
+            None,
+        );
+        assert_eq!(delta.backtrace().status(), BacktraceStatus::Captured);
+        let backtrace = delta.backtrace().to_string();
+        assert!(backtrace.contains("DeltaError::new"), "{backtrace}");
+
+        let error: Error = delta.into();
+        let Error::Delta(delta) = error else {
+            panic!("expected a Delta error");
+        };
+        assert_eq!(delta.backtrace().to_string(), backtrace);
+        assert!(format!("{delta:?}").contains(&format!("{:?}", delta.backtrace())));
     }
 
     #[rstest]
