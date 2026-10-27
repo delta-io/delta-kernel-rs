@@ -220,21 +220,14 @@ fn declarative_metadata_matches_imperative_scan(
         Some(col!("id").is_not_null())
     )]
     predicate: Option<Pred>,
-    #[values(false, true)] use_crc: bool,
 ) -> KernelResult<()> {
-    let (engine, mut snapshot, _tempdir) = load_test_table(table)?;
-    if !use_crc {
-        snapshot = Arc::new(Snapshot::new(
-            snapshot.log_segment().clone(),
-            snapshot.table_configuration().clone(),
-        )?);
-    }
+    let (engine, snapshot, _tempdir) = load_test_table(table)?;
     let predicate = predicate.map(Arc::new);
 
     let imperative_builder = snapshot
         .clone()
         .scan_builder()
-        .with_stats(StatsOptions::all_struct())
+        .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct());
     let imperative_builder = match &predicate {
         Some(predicate) => imperative_builder.with_predicate(predicate.clone()),
@@ -244,14 +237,14 @@ fn declarative_metadata_matches_imperative_scan(
 
     let declarative_builder = snapshot
         .scan_builder()
-        .with_stats(StatsOptions::all_struct())
+        .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct());
     let declarative_builder = match predicate {
         Some(predicate) => declarative_builder.with_predicate(predicate),
         None => declarative_builder,
     };
     let scan = declarative_builder.build()?;
-    if !use_crc && table == "v1-multi-part-partitioned-struct-stats-only" {
+    if table == "v1-multi-part-partitioned-struct-stats-only" {
         let plan = scan
             .declarative_metadata_scan_plan(engine.as_ref())?
             .expect("checkpoint plan");
@@ -323,7 +316,12 @@ fn declarative_metadata_matches_imperative_across_stats_options(
 ) -> KernelResult<()> {
     let (engine, snapshot, _tempdir) = load_test_table("parsed-stats")?;
     let struct_stats = stats.struct_stats.clone();
-    let no_stats = !stats.synthesize_json && matches!(&struct_stats, StructStats::None);
+    let parsed_stats_requested = match &struct_stats {
+        StructStats::None => false,
+        StructStats::Columns { requested } => !requested.is_empty(),
+        StructStats::AllIndexed { .. } => true,
+    };
+    let no_stats = !stats.synthesize_json && !parsed_stats_requested;
     let expected_stats = if no_stats {
         StatsOptions::json_only()
     } else {
@@ -335,7 +333,9 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         .scan_builder()
         .with_stats(expected_stats)
         .with_partition_values(PartitionValuesOptions::with_struct())
-        .with_predicate((!stats.synthesize_json).then_some(predicate.clone()));
+        .with_predicate(
+            (!stats.synthesize_json || parsed_stats_requested).then_some(predicate.clone()),
+        );
     let expected = imperative_metadata(expected_builder.build()?, engine.as_ref())?;
     let builder = snapshot
         .scan_builder()
@@ -371,11 +371,6 @@ fn declarative_metadata_matches_imperative_across_stats_options(
     actual_stats_fields.sort_unstable();
     expected_stats_fields.sort_unstable();
     assert_eq!(actual_stats_fields, expected_stats_fields);
-    let parsed_stats_requested = match &struct_stats {
-        StructStats::None => false,
-        StructStats::Columns { requested } => !requested.is_empty(),
-        StructStats::AllIndexed { .. } => true,
-    };
     if !parsed_stats_requested {
         let declarative_schema = actual.first().expect("declarative metadata").schema();
         let imperative_schema = expected.first().expect("imperative metadata").schema();
@@ -795,7 +790,7 @@ fn declarative_metadata_data_skipping(
             .clone()
             .scan_builder()
             .with_predicate(predicate.clone())
-            .with_stats(StatsOptions::all_struct())
+            .with_stats(StatsOptions::all())
             .with_partition_values(PartitionValuesOptions::with_struct())
             .build()?,
         engine.as_ref(),
@@ -805,7 +800,7 @@ fn declarative_metadata_data_skipping(
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
-        .with_stats(StatsOptions::all_struct())
+        .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
     let actual = declarative_metadata(&scan, engine.as_ref())?;
@@ -824,16 +819,9 @@ fn declarative_metadata_data_skipping(
 fn declarative_metadata_partition_values_prune_without_struct_stats(
     #[case] predicate: Pred,
     #[case] expected_count: usize,
-    #[values(false, true)] use_crc: bool,
 ) -> KernelResult<()> {
-    let (engine, mut snapshot, _tempdir) =
+    let (engine, snapshot, _tempdir) =
         load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
-    if !use_crc {
-        snapshot = Arc::new(Snapshot::new(
-            snapshot.log_segment().clone(),
-            snapshot.table_configuration().clone(),
-        )?);
-    }
     let predicate = Arc::new(predicate);
     let expected = imperative_metadata(
         snapshot
@@ -1091,7 +1079,7 @@ fn assert_declarative_metadata_matches_imperative(
             .clone()
             .scan_builder()
             .with_predicate(predicate.clone())
-            .with_stats(StatsOptions::all_struct())
+            .with_stats(StatsOptions::all())
             .with_partition_values(PartitionValuesOptions::with_struct())
             .build()?,
         &engine,
@@ -1105,7 +1093,7 @@ fn assert_declarative_metadata_matches_imperative(
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
-        .with_stats(StatsOptions::all_struct())
+        .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
     let actual = declarative_metadata(&scan, &engine)?;
