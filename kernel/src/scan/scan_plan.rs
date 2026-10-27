@@ -57,7 +57,7 @@ const VERSION: &str = "version";
 /// 4. Projects metadata after filtering into the stats and partition shape requested by the user.
 pub(super) struct MetadataPlanner<'a> {
     scan: &'a Scan,
-    pre_filter_stats_schema: Option<&'a SchemaRef>,
+    stats_schema: Option<SchemaRef>,
     parsed_partition_schema: Option<&'a SchemaRef>,
     stats_filter: Option<Predicate>,
 }
@@ -72,10 +72,23 @@ enum StatsKind {
 
 impl<'a> MetadataPlanner<'a> {
     pub(super) fn try_new(scan: &'a Scan) -> KernelResult<Self> {
+        let stats_schema = if scan.stats.synthesize_json {
+            let config = scan.snapshot.table_configuration();
+            let columns = config
+                .physical_data_schema_without_partition_columns()
+                .leaves(None);
+            // JSON synthesis must retain stats outside the scan's requested and indexed columns.
+            let builder = config
+                .stats_schema_builder()
+                .with_required_physical_columns(Some(columns.as_ref().0))
+                .with_variant_min_max(scan.stats.variant_min_max);
+            #[cfg(feature = "geo-type-in-dev")]
+            let builder = builder.with_geometry_min_max(scan.stats.geometry_min_max);
+            Some(builder.build()?)
+        } else {
+            scan.state_info.physical_stats_read_schema().cloned()
+        };
         let enable_metadata_filter = !scan.stats.synthesize_json;
-        let pre_filter_stats_schema = enable_metadata_filter
-            .then(|| scan.state_info.physical_stats_read_schema())
-            .flatten();
         let stats_filter = enable_metadata_filter
             .then(|| stats_skipping_predicate(&scan.state_info))
             .flatten();
@@ -87,7 +100,7 @@ impl<'a> MetadataPlanner<'a> {
 
         Ok(Self {
             scan,
-            pre_filter_stats_schema,
+            stats_schema,
             parsed_partition_schema,
             stats_filter,
         })
@@ -96,9 +109,7 @@ impl<'a> MetadataPlanner<'a> {
     /// Whether [`CheckpointShape`] should inspect the leaf-level checkpoint schema to choose the
     /// statistics representation and identify compatible structured partition values.
     pub(super) fn requires_checkpoint_add_schema(&self) -> bool {
-        self.pre_filter_stats_schema.is_some()
-            || self.parsed_partition_schema.is_some()
-            || self.scan.stats.synthesize_json
+        self.stats_schema.is_some() || self.parsed_partition_schema.is_some()
     }
 
     /// Plans a metadata source using its physical schema. `source` must honor the supplied read
@@ -153,44 +164,27 @@ impl<'a> MetadataPlanner<'a> {
         // This patch transforms `ADD_SCHEMA` below for statistics and partition values.
         let patch = SchemaStructPatchBuilder::new();
 
-        let json_stats_schema = if self.scan.stats.synthesize_json && !add.contains(STATS) {
-            let config = self.scan.snapshot.table_configuration();
-            let columns = config
-                .physical_data_schema_without_partition_columns()
-                .leaves(None);
-            // JSON synthesis must retain stats outside the scan's requested and indexed columns.
-            let builder = config
-                .stats_schema_builder()
-                .with_required_physical_columns(Some(columns.as_ref().0))
-                .with_variant_min_max(self.scan.stats.variant_min_max);
-            #[cfg(feature = "geo-type-in-dev")]
-            let builder = builder.with_geometry_min_max(self.scan.stats.geometry_min_max);
-            Some(builder.build()?)
-        } else {
-            None
-        };
-        let stats_schema = self.pre_filter_stats_schema.or(json_stats_schema.as_ref());
+        let prefer_json_stats = self.scan.stats.synthesize_json && add.contains(STATS);
 
         // Decide what kind of stats to read from the file by transforming `ADD_SCHEMA` based on the
         // `file_schema` and table-derived stats schema.
-        let (add_patch, stats) = match (stats_schema, add_field_type(STATS_PARSED)) {
+        let (add_patch, stats) = match (self.stats_schema.as_ref(), add_field_type(STATS_PARSED)) {
             // Parsed statistics are requested and present in the file
             (Some(required), Some(DataType::Struct(native)))
-                if LogSegment::structs_have_compatible_types(
-                    native,
-                    required,
-                    STATS_PARSED,
-                    CheckpointFieldKind::Stats,
-                ) =>
+                if !prefer_json_stats
+                    && LogSegment::structs_have_compatible_types(
+                        native,
+                        required,
+                        STATS_PARSED,
+                        CheckpointFieldKind::Stats,
+                    ) =>
             {
                 let stats_parsed_field = StructField::nullable(STATS_PARSED, required.clone());
                 let patch = patch.drop(STATS).insert_after(STATS, stats_parsed_field);
                 (patch, StatsKind::Struct)
             }
             // Json stats are used either by the dataskipping filter or are requested by the user
-            _ if self.pre_filter_stats_schema.is_some() || self.scan.stats.synthesize_json => {
-                (patch, StatsKind::Json)
-            }
+            _ if self.stats_schema.is_some() => (patch, StatsKind::Json),
             // Neither the user nor the data skipping filter needs stats. Drop them.
             _ => (patch.drop(STATS), StatsKind::None),
         };
@@ -226,8 +220,7 @@ impl<'a> MetadataPlanner<'a> {
     /// Adds structured metadata needed by the stats filter or requested output when the source
     /// could not provide compatible native fields.
     ///
-    /// * `add.stats` is replaced by `add.stats_parsed` with the pre-filter stats schema when
-    ///   parsing is needed.
+    /// * `add.stats` is replaced by `add.stats_parsed` with `stats_schema` when parsing is needed.
     /// * `add.partitionValues_parsed` is inserted when parsed partition values is not already
     ///   present; the string map remains.
     /// * Dataskipping adds top-level `is_add`
@@ -239,7 +232,8 @@ impl<'a> MetadataPlanner<'a> {
     ) -> KernelResult<(PlanBuilder, StatsKind)> {
         let plan = plan.project_patch(|mut patch| {
             // Parse statistics from json if needed
-            if let (Some(schema), StatsKind::Json) = (self.pre_filter_stats_schema, stats) {
+            let parse_json_stats = stats == StatsKind::Json && !self.scan.stats.synthesize_json;
+            if let Some(schema) = self.stats_schema.as_ref().filter(|_| parse_json_stats) {
                 stats = StatsKind::Struct;
                 let field = StructField::nullable(STATS_PARSED, schema.clone());
                 let expr = Expr::parse_json(col!(ADD_NAME, STATS), Arc::clone(schema));
@@ -308,7 +302,8 @@ impl<'a> MetadataPlanner<'a> {
 
             // Recursively drop no-longer-needed stats columns by comparing the output schema with
             // current stats parsed schema.
-            if let (Some(read), Some(output)) = (self.pre_filter_stats_schema, output_stats_schema)
+            if let (StatsKind::Struct, Some(read), Some(output)) =
+                (stats, self.stats_schema.as_ref(), output_stats_schema)
             {
                 let mut parent = vec![ADD_NAME.into(), STATS_PARSED.into()];
                 patch = Self::project_filter_only_stats(patch, read, output, &mut parent);
