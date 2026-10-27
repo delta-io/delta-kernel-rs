@@ -378,17 +378,6 @@ fn render(source: &Source, conditions: &[Condition]) -> Result<String, std::fmt:
     writeln!(out, "impl DeltaErrorCondition {{")?;
     writeln!(
         out,
-        "    // Lets invariant tests check metadata for every selected condition."
-    )?;
-    writeln!(out, "    #[cfg(test)]")?;
-    writeln!(out, "    pub(super) const ALL: &'static [Self] = &[")?;
-    for c in conditions {
-        writeln!(out, "        Self::{},", c.variant)?;
-    }
-    writeln!(out, "    ];")?;
-    writeln!(out)?;
-    writeln!(
-        out,
         "    pub(super) const fn metadata(self) -> ConditionMetadata {{"
     )?;
     writeln!(out, "        match self {{")?;

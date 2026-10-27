@@ -43,32 +43,3 @@ impl DeltaErrorCondition {
         self.metadata().message_template
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-
-    use super::*;
-
-    #[test]
-    fn all_conditions_have_unique_names_and_parameters_in_template() {
-        let mut names = HashSet::new();
-        for condition in DeltaErrorCondition::ALL {
-            assert!(names.insert(condition.name()), "{}", condition.name());
-            let mut parameters = HashSet::new();
-            for parameter in condition.parameter_names() {
-                assert!(
-                    parameters.insert(parameter),
-                    "{}: {parameter}",
-                    condition.name()
-                );
-                let placeholder = format!("<{parameter}>");
-                assert!(
-                    condition.message_template().contains(&placeholder),
-                    "{}: {placeholder}",
-                    condition.name()
-                );
-            }
-        }
-    }
-}

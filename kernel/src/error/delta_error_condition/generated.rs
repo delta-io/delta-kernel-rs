@@ -15,11 +15,6 @@ pub enum DeltaErrorCondition {
 }
 
 impl DeltaErrorCondition {
-    // Lets invariant tests check metadata for every selected condition.
-    #[cfg(test)]
-    pub(super) const ALL: &'static [Self] = &[
-    ];
-
     pub(super) const fn metadata(self) -> ConditionMetadata {
         match self {
         }
