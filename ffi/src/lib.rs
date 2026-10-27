@@ -4077,18 +4077,6 @@ mod tests {
         state
     }
 
-    /// Visits metadata through `snapshot_visit_metadata`, copying it before the callback returns.
-    fn collect_visited_metadata(snap: &handle::Handle<SharedSnapshot>) -> Metadata {
-        extern "C" fn collect(ctx: NullableCvoid, metadata: *const delta_types::FfiMetadata) {
-            let result = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut Option<Metadata>) };
-            *result = Some(unsafe { (*metadata).try_to_kernel() }.unwrap());
-        }
-        let mut result: Option<Metadata> = None;
-        let ctx = NonNull::new(&mut result as *mut Option<Metadata> as *mut c_void);
-        unsafe { snapshot_visit_metadata(snap.shallow_copy(), ctx, collect) };
-        result.expect("visitor was not invoked")
-    }
-
     // === visit_protocol tests ===
 
     #[tokio::test]
@@ -4244,9 +4232,17 @@ mod tests {
                 .map(|(key, value)| (key.to_string(), value.to_string()))
                 .collect()
         }
+        // Copies the borrowed view into an owned `Metadata` before the callback returns.
+        extern "C" fn collect(ctx: NullableCvoid, metadata: *const delta_types::FfiMetadata) {
+            let result = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut Option<Metadata>) };
+            *result = Some(unsafe { (*metadata).try_to_kernel() }.unwrap());
+        }
         let (engine, snap) = setup_snapshot(metadata.to_string()).await?;
 
-        let visited = collect_visited_metadata(&snap);
+        let mut visited: Option<Metadata> = None;
+        let ctx = NonNull::new(&mut visited as *mut Option<Metadata> as *mut c_void);
+        unsafe { snapshot_visit_metadata(snap.shallow_copy(), ctx, collect) };
+        let visited = visited.expect("visitor was not invoked");
         assert_eq!(visited.id(), id);
         assert_eq!(visited.name(), name);
         assert_eq!(visited.description(), description);
