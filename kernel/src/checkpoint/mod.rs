@@ -122,7 +122,7 @@ use crate::actions::{
     DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
     SIDECAR_FIELD,
 };
-use crate::crc::Crc;
+use crate::crc::{Crc, DomainMetadataState};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::Scalar;
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -480,6 +480,7 @@ impl CheckpointWriter {
         // Process actions through reconciliation
         let crc = Arc::new(Mutex::new(Crc {
             version: self.snapshot.version(),
+            domain_metadata_state: DomainMetadataState::Complete(Default::default()),
             ..Default::default()
         }));
         let mut processor = ActionReconciliationProcessor::new(
@@ -552,8 +553,8 @@ impl CheckpointWriter {
 
     /// Finalizes checkpoint creation by saving metadata about the checkpoint.
     ///
-    /// If complete file statistics are available from both reconciliation and the snapshot's
-    /// at-version CRC, compares them. A mismatch emits a
+    /// Compares file statistics and domain metadata from reconciliation with the snapshot's
+    /// at-version CRC. Each comparison requires complete state on both sides. A mismatch emits a
     /// [`CrcValidationFailure`](crate::metrics::MetricEvent::CrcValidationFailure) metric and an
     /// error log without failing finalization.
     ///
@@ -578,7 +579,7 @@ impl CheckpointWriter {
         last_checkpoint_stats: &LastCheckpointHintStats,
     ) -> KernelResult<()> {
         if let Some(crc) = &last_checkpoint_stats.crc {
-            self.report_crc_file_stats_mismatch(crc);
+            self.report_crc_mismatch(crc);
         }
 
         // Skip writing `_last_checkpoint` if the existing hint already points to a newer
@@ -776,12 +777,13 @@ impl CheckpointWriter {
         })
     }
 
-    /// Compares file statistics from `replay_crc` with the snapshot's cached CRC.
+    /// Compares file statistics and domain metadata from `replay_crc` with the snapshot's cached
+    /// CRC.
     ///
     /// Mismatches emit a `CrcValidationFailure` metric and an error log.
-    /// Skips comparison if the cached CRC is absent, either side lacks complete
-    /// file statistics, or the replay CRC mutex is poisoned.
-    fn report_crc_file_stats_mismatch(&self, replay_crc: &Mutex<Crc>) {
+    /// Each comparison requires complete state on both sides. Skips validation if the cached CRC
+    /// is absent or the replay CRC mutex is poisoned.
+    fn report_crc_mismatch(&self, replay_crc: &Mutex<Crc>) {
         let Some(in_memory_crc) = self.snapshot.crc_at_version() else {
             return;
         };
@@ -792,15 +794,13 @@ impl CheckpointWriter {
                 return;
             }
         };
-        let (Some(in_memory_stats), Some(expected_stats)) =
+        let mut mismatch = false;
+        if let (Some(in_memory_stats), Some(expected_stats)) =
             (in_memory_crc.file_stats(), expected_crc.file_stats())
-        else {
-            return;
-        };
-        if in_memory_stats.num_files() != expected_stats.num_files()
-            || in_memory_stats.table_size_bytes() != expected_stats.table_size_bytes()
+            && (in_memory_stats.num_files() != expected_stats.num_files()
+                || in_memory_stats.table_size_bytes() != expected_stats.table_size_bytes())
         {
-            emit_crc_validation_failure();
+            mismatch = true;
             error!(
                 table_root = %self.snapshot.table_root(),
                 version = self.snapshot.version(),
@@ -810,6 +810,23 @@ impl CheckpointWriter {
                 actual_table_size_bytes = in_memory_stats.table_size_bytes(),
                 "Checkpoint CRC mismatch in numFiles or tableSizeBytes"
             );
+        }
+        if let (DomainMetadataState::Complete(actual), DomainMetadataState::Complete(expected)) = (
+            &in_memory_crc.domain_metadata_state,
+            &expected_crc.domain_metadata_state,
+        ) && actual != expected
+        {
+            mismatch = true;
+            error!(
+                table_root = %self.snapshot.table_root(),
+                version = self.snapshot.version(),
+                expected_domain_metadata = ?expected,
+                actual_domain_metadata = ?actual,
+                "Checkpoint CRC mismatch in domainMetadata"
+            );
+        }
+        if mismatch {
+            emit_crc_validation_failure();
         }
     }
 

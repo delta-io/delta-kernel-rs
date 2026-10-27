@@ -50,9 +50,6 @@ variants can carry success-only statistics or a failure-only reason without opti
 Existing success/failure event pairs also express that distinction; changing them requires an
 explicit compatibility decision.
 
-`CrcValidationFailure` reports a mismatch between the CRC computed by log replay and the cached
-in-memory CRC at the same version. The checkpoint validator logs the mismatch separately at ERROR.
-
 ## Adding an event
 
 1. Define the struct + `SPAN_NAME` in `events.rs`; add a `MetricEvent` variant and its
