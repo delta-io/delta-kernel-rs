@@ -17,13 +17,11 @@ use std::{iter, slice};
 use bytes::Bytes;
 use url::Url;
 
-use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{CheckpointAction, ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA};
 use crate::amt_path_util::amt_manifest_filemeta;
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::dv_conversion::{
-    add_deletion_vector_expression, AddDeletionVector, AddDeletionVectorColumns,
-    ADD_DV_HELPER_SCHEMA,
+    add_deletion_vector_expression, AddDeletionVectorColumns, ADD_DV_HELPER_SCHEMA,
 };
 use crate::content_tree::{
     struct_expr_from_schema, ColumnFile, ContentTreeNodeEntry, DataContentType, DataFileFormat,
@@ -35,7 +33,7 @@ use crate::content_tree::{
 use crate::engine_data::{
     EngineData, FilteredEngineData, GetData, RowVisitor, StructList, TypedGetData as _,
 };
-use crate::expressions::{lit, null_lit, ArrayData, ColumnName, Expression, MapData, Scalar};
+use crate::expressions::{lit, ArrayData, ColumnName, Expression, MapData, Scalar};
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DATA_CHANGE_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, DELETION_VECTOR_NAME,
     MODIFICATION_TIME_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
@@ -294,12 +292,9 @@ static LEAF_INPUT_SCHEMA: LazyLock<SchemaRef> =
 /// Converts content-tree entry batches into `Add`-action batches. The entry->`Add` evaluator is
 /// built once, so one converter can be reused across every batch of a manifest.
 struct EntryConverter {
-    /// Evaluates a batch with no selected deletion vector as-is, leaving `Add.deletionVector`
-    /// null.
+    /// Evaluates a batch plus the [`ADD_DV_HELPER_SCHEMA`] columns `Add.deletionVector` is built
+    /// from (see [`add_deletion_vector_expression`]).
     evaluator: Arc<dyn ExpressionEvaluator>,
-    /// Evaluates a batch holding a selected deletion vector, plus the [`ADD_DV_HELPER_SCHEMA`]
-    /// columns `Add.deletionVector` is built from (see [`add_deletion_vector_expression`]).
-    deletion_vector_evaluator: Arc<dyn ExpressionEvaluator>,
 }
 
 impl EntryConverter {
@@ -323,16 +318,11 @@ impl EntryConverter {
     fn convert(&self, entries: &dyn EngineData) -> KernelResult<FilteredEngineData> {
         let mut visitor = AddSelectionVisitor::default();
         visitor.visit_rows_of(entries)?;
-        let actions = if visitor.deletion_vectors.has_deletion_vector() {
-            let augmented = entries.append_columns(
-                ADD_DV_HELPER_SCHEMA.clone(),
-                visitor.deletion_vectors.into_columns()?,
-            )?;
-            self.deletion_vector_evaluator
-                .evaluate(augmented.as_ref())?
-        } else {
-            self.evaluator.evaluate(entries)?
-        };
+        let augmented = entries.append_columns(
+            ADD_DV_HELPER_SCHEMA.clone(),
+            visitor.deletion_vectors.into_columns()?,
+        )?;
+        let actions = self.evaluator.evaluate(augmented.as_ref())?;
         FilteredEngineData::try_new(actions, visitor.selection)
     }
 }
@@ -609,8 +599,7 @@ impl RowVisitor for FilePathVisitor {
 ///
 /// `input_schema` is the schema of the batches passed to [`EntryConverter::convert`] -- the entry
 /// schema for a root batch, or an augmented schema when a caller appends helper columns. The
-/// deletion vector transform evaluates against it plus the [`ADD_DV_HELPER_SCHEMA`] columns
-/// `convert` appends.
+/// transform evaluates against it plus the [`ADD_DV_HELPER_SCHEMA`] columns `convert` appends.
 fn make_entry_converter(
     engine: &dyn Engine,
     ctx: &ReadContext,
@@ -618,28 +607,19 @@ fn make_entry_converter(
     input_schema: SchemaRef,
 ) -> KernelResult<EntryConverter> {
     let output_type = DataType::from(LOG_ADD_SCHEMA.as_ref().clone());
-    let handler = engine.evaluation_handler();
-    let null_dv = null_lit(DeletionVectorDescriptor::to_schema());
-    let expr = build_entry_to_add_expression(ctx, sources, null_dv)?;
-    let dv_expr = build_entry_to_add_expression(ctx, sources, add_deletion_vector_expression())?;
-    let dv_schema = StructType::new_unchecked(
+    let expr = build_entry_to_add_expression(ctx, sources)?;
+    let evaluated_schema = StructType::new_unchecked(
         input_schema
             .fields()
             .chain(ADD_DV_HELPER_SCHEMA.fields())
             .cloned(),
     );
-    Ok(EntryConverter {
-        evaluator: handler.new_expression_evaluator(
-            input_schema,
-            Arc::new(expr),
-            output_type.clone(),
-        )?,
-        deletion_vector_evaluator: handler.new_expression_evaluator(
-            Arc::new(dv_schema),
-            Arc::new(dv_expr),
-            output_type,
-        )?,
-    })
+    let evaluator = engine.evaluation_handler().new_expression_evaluator(
+        Arc::new(evaluated_schema),
+        Arc::new(expr),
+        output_type,
+    )?;
+    Ok(EntryConverter { evaluator })
 }
 
 /// Validates each leaf entry and resolves its `firstRowId`, starting from `seed`. Returns the
@@ -663,12 +643,10 @@ fn validate_and_assign_first_row_ids(
 /// [`crate::actions::LOG_ADD_SCHEMA`].
 ///
 /// `ctx` supplies the fields the AMT entry cannot; `sources` supplies the row-tracking fields
-/// whose derivation differs between root and leaf entries; `deletion_vector` computes
-/// `Add.deletionVector`.
+/// whose derivation differs between root and leaf entries.
 fn build_entry_to_add_expression(
     ctx: &ReadContext,
     sources: &AddFieldSources,
-    deletion_vector: Expression,
 ) -> KernelResult<Expression> {
     // TODO(#3320): read partition values from the entry's `partition` tuple once the read path
     // carries a partition spec; the AMT root written by the minimal blind-append path is
@@ -697,7 +675,7 @@ fn build_entry_to_add_expression(
             // The AMT entry carries neither of these; both come from the caller's `ReadContext`.
             n if n == MODIFICATION_TIME_NAME => lit(ctx.modification_time),
             n if n == DATA_CHANGE_NAME => lit(ctx.data_change),
-            n if n == DELETION_VECTOR_NAME => deletion_vector.clone(),
+            n if n == DELETION_VECTOR_NAME => add_deletion_vector_expression(),
             n if n == BASE_ROW_ID_NAME => sources.base_row_id.clone(),
             n if n == DEFAULT_ROW_COMMIT_VERSION_NAME => sources.default_row_commit_version.clone(),
             _ => return None,
@@ -734,7 +712,9 @@ fn partition_values_map_type() -> KernelResult<MapType> {
 /// - a live delete manifest entry, since dropping it would read the rows it deletes back as live;
 /// - a selected entry that is not Parquet or has a non-zero partition spec id;
 /// - a selected entry that carries column files, whose updated values a plain `Add` would drop;
-/// - a selected entry whose deletion vector has no [`DeletionVectorDescriptor`] equivalent.
+/// - a selected entry whose deletion vector has no
+///   [`DeletionVectorDescriptor`](crate::actions::deletion_vector::DeletionVectorDescriptor)
+///   equivalent.
 #[derive(Default)]
 struct AddSelectionVisitor {
     selection: Vec<bool>,
@@ -795,13 +775,12 @@ impl RowVisitor for AddSelectionVisitor {
                     false
                 }
             };
-            let deletion_vector = if selected {
-                check_selected_entry(row, location, getters)?
+            if selected {
+                check_selected_entry(row, location, getters, &mut self.deletion_vectors)?;
             } else {
-                None
-            };
+                self.deletion_vectors.push_null();
+            }
             self.selection.push(selected);
-            self.deletion_vectors.push(deletion_vector);
         }
         Ok(())
     }
@@ -857,12 +836,14 @@ impl RowVisitor for LeafRefVisitor<'_> {
 }
 
 /// Rejects a selected (live `Data`) entry carrying a field the read path cannot yet translate into
-/// its `Add`, and returns its deletion vector. `getters` is [`AddSelectionVisitor`]'s column order.
+/// its `Add`, and appends its deletion vector to `deletion_vectors`. `getters` is
+/// [`AddSelectionVisitor`]'s column order.
 fn check_selected_entry<'a>(
     row: usize,
     location: &str,
     getters: &[&'a dyn GetData<'a>],
-) -> KernelResult<Option<AddDeletionVector>> {
+    deletion_vectors: &mut AddDeletionVectorColumns,
+) -> KernelResult<()> {
     let file_format: &str = getters[3].get(row, FILE_FORMAT)?;
     let parquet = DataFileFormat::Parquet.name();
     if !file_format.eq_ignore_ascii_case(parquet) {
@@ -878,8 +859,7 @@ fn check_selected_entry<'a>(
              '{location}' has {PARTITION_SPEC_ID} {spec_id}"
         )));
     }
-    let deletion_vector =
-        AddDeletionVector::try_from_getters(row, &getters[ADD_SELECTION_DV_START..])?;
+    let has_deletion_vector = deletion_vectors.try_push(row, &getters[ADD_SELECTION_DV_START..])?;
     let unsupported_modification = |field: &str| {
         KernelError::unsupported(format!(
             "AMT read path does not yet support a live entry with column files or an \
@@ -893,10 +873,10 @@ fn check_selected_entry<'a>(
     // only one this path recognizes, so a DV-less entry carrying one has an unrecognized
     // modification.
     let modified_snapshot_id: Option<i64> = getters[5].get_opt(row, MODIFIED_SNAPSHOT_ID)?;
-    if modified_snapshot_id.is_some() && deletion_vector.is_none() {
+    if modified_snapshot_id.is_some() && !has_deletion_vector {
         return Err(unsupported_modification(MODIFIED_SNAPSHOT_ID));
     }
-    Ok(deletion_vector)
+    Ok(())
 }
 
 /// Whether `column_files` holds at least one column file: an empty list carries no column updates.
@@ -1040,7 +1020,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::actions::deletion_vector::{DeletionVectorPath, DeletionVectorStorageType};
+    use crate::actions::deletion_vector::{
+        DeletionVectorDescriptor, DeletionVectorPath, DeletionVectorStorageType,
+    };
     use crate::actions::deletion_vector_writer::{
         KernelDeletionVector, StreamingDeletionVectorWriter,
     };

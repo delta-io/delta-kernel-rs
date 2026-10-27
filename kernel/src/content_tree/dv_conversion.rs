@@ -96,7 +96,7 @@ pub(crate) static ADD_DV_HELPER_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// applying a parent struct's null mask, so keying it off a helper the caller nulls for every entry
 /// it drops keeps each leaf null exactly where the descriptor is. The casts null out a value that
 /// overflows an i32, so the caller must validate the entries it keeps with
-/// [`AddDeletionVector::try_from_getters`].
+/// [`AddDeletionVectorColumns::try_push`].
 pub(crate) fn add_deletion_vector_expression() -> Expression {
     let dv_field = |field: &str| Expression::column([DV_INFO, field]);
     Expression::struct_with_nullability_from(
@@ -118,23 +118,23 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
     )
 }
 
-/// An AMT content entry's deletion vector, validated as representable in `Add.deletionVector`:
-/// the per-row values [`add_deletion_vector_expression`] cannot compute.
-#[derive(Debug, PartialEq)]
-pub(crate) struct AddDeletionVector {
-    storage_type: DeletionVectorStorageType,
-    /// The percent-encoded URI of an absolute location; `None` for a relative one, whose raw
-    /// location is the descriptor's path verbatim.
-    absolute_path: Option<String>,
+/// Accumulates the [`ADD_DV_HELPER_SCHEMA`] columns for one entry batch, one row per entry: the
+/// per-row values [`add_deletion_vector_expression`] cannot compute.
+#[derive(Default)]
+pub(crate) struct AddDeletionVectorColumns {
+    storage_types: Vec<Scalar>,
+    absolute_paths: Vec<Scalar>,
 }
 
-impl AddDeletionVector {
-    /// Converts one row's AMT `deletionVector` struct, read from `getters` in [`DV_INFO_COLUMNS`]
-    /// order. Returns `None` if the struct is null.
-    pub(crate) fn try_from_getters<'a>(
+impl AddDeletionVectorColumns {
+    /// Validates the next entry's AMT `deletionVector` struct, read from `getters` in
+    /// [`DV_INFO_COLUMNS`] order, and appends its row. Returns whether the entry has a deletion
+    /// vector; a null struct appends a null row.
+    pub(crate) fn try_push<'a>(
+        &mut self,
         row: usize,
         getters: &[&'a dyn GetData<'a>],
-    ) -> KernelResult<Option<Self>> {
+    ) -> KernelResult<bool> {
         let expected = DV_INFO_COLUMNS.as_ref().0.len();
         if getters.len() != expected {
             return Err(KernelError::internal_error(format!(
@@ -145,27 +145,46 @@ impl AddDeletionVector {
         // `location` is a required field of the struct, so it reads null iff the whole
         // `deletionVector` struct is null.
         let Some(location) = getters[0].get_opt(row, LOCATION)? else {
-            return Ok(None);
+            self.push_null();
+            return Ok(false);
         };
         let key_metadata: Option<&[u8]> = getters[4].get_opt(row, KEY_METADATA)?;
-        Self::try_new(
+        self.try_push_parts(
             location,
             getters[1].get(row, DV_INFO_OFFSET)?,
             getters[2].get(row, DV_INFO_SIZE_IN_BYTES)?,
             getters[3].get(row, DV_INFO_CARDINALITY)?,
             key_metadata.is_some(),
-        )
-        .map(Some)
+        )?;
+        Ok(true)
     }
 
-    /// Validates an AMT deletion vector from its parts (see [`DeletionVectorInfo`]).
-    pub(crate) fn try_new(
+    /// Appends a null row, for an entry that is dropped or has no deletion vector.
+    pub(crate) fn push_null(&mut self) {
+        self.storage_types.push(Scalar::Null(DataType::STRING));
+        self.absolute_paths.push(Scalar::Null(DataType::STRING));
+    }
+
+    /// The helper columns, matching [`ADD_DV_HELPER_SCHEMA`].
+    pub(crate) fn into_columns(self) -> KernelResult<Vec<ArrayData>> {
+        let string_column =
+            |values| ArrayData::try_new(ArrayType::new(DataType::STRING, true), values);
+        Ok(vec![
+            string_column(self.storage_types)?,
+            string_column(self.absolute_paths)?,
+        ])
+    }
+
+    /// Validates an AMT deletion vector from its parts (see [`DeletionVectorInfo`]) and appends
+    /// its row. Nothing is appended on error.
+    fn try_push_parts(
+        &mut self,
         location: &str,
         offset: i64,
         size_in_bytes: i64,
         cardinality: i64,
         has_key_metadata: bool,
-    ) -> KernelResult<Self> {
+    ) -> KernelResult<()> {
         if has_key_metadata {
             return Err(KernelError::unsupported(format!(
                 "Encrypted deletion vectors are not supported (deletion vector '{location}' has \
@@ -190,64 +209,23 @@ impl AddDeletionVector {
         if cardinality < 0 {
             return Err(invalid(format!("cardinality {cardinality} is negative")));
         }
-        Ok(match parse_absolute_amt_location(location)? {
-            Some(url) => Self {
-                storage_type: DeletionVectorStorageType::PersistedAbsolute,
-                absolute_path: Some(url.into()),
-            },
+        let (storage_type, absolute_path) = match parse_absolute_amt_location(location)? {
+            Some(url) => (
+                DeletionVectorStorageType::PersistedAbsolute,
+                Scalar::String(url.into()),
+            ),
             None => {
                 validate_table_relative(location)?;
                 reject_dot_segments(location)?;
-                Self {
-                    storage_type: DeletionVectorStorageType::PersistedUnencodedRelative,
-                    absolute_path: None,
-                }
-            }
-        })
-    }
-}
-
-/// Accumulates the [`ADD_DV_HELPER_SCHEMA`] columns for one entry batch, one row per entry.
-#[derive(Default)]
-pub(crate) struct AddDeletionVectorColumns {
-    storage_types: Vec<Scalar>,
-    absolute_paths: Vec<Scalar>,
-    has_deletion_vector: bool,
-}
-
-impl AddDeletionVectorColumns {
-    /// Appends the next entry's row: its validated deletion vector, or `None` for an entry that is
-    /// dropped or has none.
-    pub(crate) fn push(&mut self, deletion_vector: Option<AddDeletionVector>) {
-        let (storage_type, absolute_path) = match deletion_vector {
-            Some(dv) => {
-                self.has_deletion_vector = true;
                 (
-                    Scalar::String(dv.storage_type.to_string()),
-                    dv.absolute_path.map(Scalar::String),
+                    DeletionVectorStorageType::PersistedUnencodedRelative,
+                    Scalar::Null(DataType::STRING),
                 )
             }
-            None => (Scalar::Null(DataType::STRING), None),
         };
-        self.storage_types.push(storage_type);
-        self.absolute_paths
-            .push(absolute_path.unwrap_or(Scalar::Null(DataType::STRING)));
-    }
-
-    /// Whether any pushed entry has a deletion vector. If not, `Add.deletionVector` is null
-    /// throughout and the helper columns need not be built.
-    pub(crate) fn has_deletion_vector(&self) -> bool {
-        self.has_deletion_vector
-    }
-
-    /// The helper columns, matching [`ADD_DV_HELPER_SCHEMA`].
-    pub(crate) fn into_columns(self) -> KernelResult<Vec<ArrayData>> {
-        let string_column =
-            |values| ArrayData::try_new(ArrayType::new(DataType::STRING, true), values);
-        Ok(vec![
-            string_column(self.storage_types)?,
-            string_column(self.absolute_paths)?,
-        ])
+        self.storage_types.push(storage_type.into());
+        self.absolute_paths.push(absolute_path);
+        Ok(())
     }
 }
 
@@ -867,16 +845,15 @@ mod tests {
     /// the helper columns. A trailing DV-less row checks that the descriptor (and so each of its
     /// leaves) is null there.
     fn descriptor_from_info(info: &DeletionVectorInfo) -> KernelResult<DeletionVectorDescriptor> {
-        let dv = AddDeletionVector::try_new(
+        let mut columns = AddDeletionVectorColumns::default();
+        columns.try_push_parts(
             &info.location,
             info.offset,
             info.size_in_bytes,
             info.cardinality,
             info.key_metadata.is_some(),
         )?;
-        let mut columns = AddDeletionVectorColumns::default();
-        columns.push(Some(dv));
-        columns.push(None);
+        columns.push_null();
         let entry_schema = schema_ref! { nullable DV_INFO: (DeletionVectorInfo::to_schema()) };
         let rows = vec![
             vec![info.clone().into()],
