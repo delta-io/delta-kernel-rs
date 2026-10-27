@@ -6,6 +6,7 @@
 #![allow(unreachable_pub, dead_code)]
 
 pub mod create_table;
+pub mod replace_table;
 mod state;
 pub mod update_table;
 
@@ -16,7 +17,7 @@ pub(super) use self::state::TransactionBuilderState;
 use crate::actions::DomainMetadata;
 use crate::schema::SchemaRef;
 use crate::transaction::commit_info::collect_operation_metadata;
-use crate::transaction::{CreateTable, ExecutionMode, Imperative, UpdateTable};
+use crate::transaction::{CreateTable, ExecutionMode, Imperative, ReplaceTable, UpdateTable};
 use crate::EngineData;
 
 /// A transaction type supported by [`TransactionBuilder`].
@@ -32,11 +33,13 @@ pub trait TransactionType: private::Sealed {
 /// Configures a transaction of type `T` and execution mode `MODE`.
 ///
 /// Shared setters preserve the transaction type. Constructors, type-specific setters, and
-/// `build` are provided by the specialized implementations for [`CreateTable`] and [`UpdateTable`].
-/// Use [`create_table`](super::create_table::create_table) or
-/// [`Snapshot::update_table`](crate::Snapshot::update_table) to obtain a builder.
-/// Both entry points select [`Imperative`]. With `declarative-plans`, use `with_execution_mode`
-/// to select another mode before building the transaction.
+/// `build` are provided by specialized implementations for [`CreateTable`], [`UpdateTable`], and
+/// [`ReplaceTable`].
+/// Use [`create_table`](super::create_table::create_table),
+/// [`Snapshot::update_table`](crate::Snapshot::update_table), or
+/// [`Snapshot::replace_table`](crate::Snapshot::replace_table) to obtain a builder.
+/// These entry points select [`Imperative`]. With `declarative-plans`, create and update builders
+/// can use `with_execution_mode` to select another mode before building the transaction.
 ///
 /// The operation cannot be changed on a builder:
 ///
@@ -168,8 +171,13 @@ impl TransactionType for UpdateTable {
     type BuilderState = update_table::UpdateTableBuilderState;
 }
 
+impl TransactionType for ReplaceTable {
+    type BuilderState = replace_table::ReplaceTableBuilderState;
+}
+
 impl private::Sealed for CreateTable {}
 impl private::Sealed for UpdateTable {}
+impl private::Sealed for ReplaceTable {}
 
 mod private {
     pub trait Sealed {}

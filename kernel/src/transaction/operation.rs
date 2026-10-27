@@ -88,6 +88,7 @@ impl fmt::Display for UpdateTableOperation {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CommitOperation {
     CreateTable,
+    Replace,
     UpdateTable(UpdateTableOperation),
 }
 
@@ -95,6 +96,7 @@ impl CommitOperation {
     pub(crate) fn as_str(&self) -> &str {
         match self {
             Self::CreateTable => "CREATE TABLE",
+            Self::Replace => "REPLACE TABLE",
             Self::UpdateTable(operation) => operation.as_str(),
         }
     }
@@ -102,13 +104,13 @@ impl CommitOperation {
     pub(crate) fn validate(&self) -> Result<(), String> {
         match self {
             Self::UpdateTable(operation) => operation.validate(),
-            Self::CreateTable => Ok(()),
+            Self::CreateTable | Self::Replace => Ok(()),
         }
     }
 
     pub(crate) fn is_incremental_safe(&self) -> bool {
         match self {
-            Self::CreateTable => is_incremental_safe_operation(self.as_str()),
+            Self::CreateTable | Self::Replace => is_incremental_safe_operation(self.as_str()),
             Self::UpdateTable(operation) => operation.is_incremental_safe(),
         }
     }
@@ -244,7 +246,8 @@ mod tests {
     }
 
     #[test]
-    fn create_table_operations_are_incremental_safe() {
+    fn table_creation_and_replacement_are_incremental_safe() {
         assert!(CommitOperation::CreateTable.is_incremental_safe());
+        assert!(CommitOperation::Replace.is_incremental_safe());
     }
 }

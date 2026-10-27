@@ -98,7 +98,7 @@ file listing without re-scanning the table.
 
 ## Write Path
 
-`Snapshot` -> `UpdateTableTransactionBuilder` -> `Transaction` -> (`WriteState` ->
+`Snapshot` -> transaction builder -> `Transaction` -> (`WriteState` ->
 `BoundWriteContextBuilder` -> `BoundWriteContext`) -> commit
 
 `TransactionBuilder<T, MODE>` shares configuration setters across transaction types and execution
@@ -109,12 +109,12 @@ each type supplies its own constructors, custom setters, and build validation.
 `snapshot.update_table(operation, engine_info, data_change)`, requiring all three values.
 `CreateTableTransactionBuilder<MODE>` aliases `TransactionBuilder<CreateTable, MODE>` and builds
 `Transaction<CreateTable, MODE>`. Its constructor requires the path, schema, engine info, and
-`data_change` and fixes the operation to `CREATE TABLE`. These inputs cannot be changed on either
-builder or transaction. Kernel preserves `data_change`, including for empty commits.
-`build()` rejects ALTER with `true` and blind append with `false`; `commit()` retains
-operation and staged-file validation.
-Schema changes use `UpdateTable`, including the
-`UpdateTableOperation::AlterTable` operation.
+`data_change` and fixes the operation to `CREATE TABLE`. `ReplaceTableTransactionBuilder` aliases
+`TransactionBuilder<ReplaceTable>` and builds `Transaction<ReplaceTable>`; it takes a metadata
+policy and engine info and fixes `data_change` to `true`. These inputs cannot be changed on a
+built transaction. Kernel preserves `data_change`, including for empty commits. `build()` rejects
+ALTER with `true` and blind append with `false`; `commit()` retains operation and staged-file
+validation. Incremental schema changes use `UpdateTableOperation::AlterTable`.
 
 Both entry points construct imperative builders. With `declarative-plans`,
 `with_execution_mode::<Declarative>()` selects declarative staging before calling the same `build()`
@@ -130,8 +130,8 @@ directory. The transaction registers the resulting files, enforces protocol comp
 commit actions, and delegates the atomic commit to a `Committer`.
 
 **Data-write steps:**
-1. Configure an `UpdateTableTransactionBuilder` from a snapshot and build it with a `Committer`
-   (e.g. `FileSystemCommitter`)
+1. Configure an `UpdateTableTransactionBuilder` (or `ReplaceTableTransactionBuilder` for full
+   replacement) from a snapshot and build it with a `Committer` (e.g. `FileSystemCommitter`)
 2. Call `txn.write_state()`, then use
    `WriteState::write_context_builder()` to bind partition values and build a `BoundWriteContext`.
    Distributed writers can encode the state and decode it on each worker before binding partition
@@ -141,8 +141,8 @@ commit actions, and delegates the atomic commit to a `Committer`.
 5. Commit: returns `CommitResult::Committed`, `Conflicted`, or `Retryable`
 
 - **Transaction** (`kernel/src/transaction/`): blind append writes, file removals, deletion-vector
-  updates, table creation (including clustered tables via `DataLayout`), and limited schema
-  evolution
+  updates, table creation (including clustered tables via `DataLayout`), full-table replacement,
+  and limited schema evolution
 - **Committer** (`kernel/src/committer/`): commit coordination. `FileSystemCommitter` for
   filesystem tables (atomic put-if-absent to `_delta_log/`); custom `Committer` implementations
   for catalog-managed tables (staging, ratifying, publishing).

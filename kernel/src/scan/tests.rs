@@ -557,6 +557,20 @@ fn test_without_row_transforms_scan_metadata_lists_files_column_mapping() {
 }
 
 #[test]
+fn empty_schema_supports_metadata_only_scan() -> KernelResult<()> {
+    let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+    let snapshot = create_table("memory:///empty-schema/", schema_ref! {}, "test", false)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    assert_result_error_with_message(snapshot.clone().scan_builder().build(), "empty schema");
+    let scan = snapshot.scan_builder().without_row_transforms().build()?;
+    assert!(scan.scan_metadata(engine.as_ref())?.next().is_none());
+    assert_result_error_with_message(scan.execute(engine), "without_row_transforms");
+    Ok(())
+}
+
+#[test]
 fn test_without_row_transforms_rejects_execute() {
     let (engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
     let scan = snapshot

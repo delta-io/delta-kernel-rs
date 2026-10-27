@@ -8,7 +8,7 @@ use delta_kernel::{KernelError, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::{json, Deserializer};
-use test_utils::{assert_result_error_with_message, set_json_value, setup_test_tables};
+use test_utils::{set_json_value, setup_test_tables};
 
 use crate::common::write_utils::{get_simple_int_schema, validate_txn_id, ZERO_UUID};
 
@@ -45,7 +45,11 @@ async fn test_write_txn_actions(
                 .with_transaction_id("app_id1".to_string(), 0)
                 .build(&engine, Box::new(FileSystemCommitter::new()))?
                 .with_transaction_id("app_id1".to_string(), 1);
-            assert_result_error_with_message(txn.commit(&engine), "app_id app_id1");
+            assert!(matches!(
+                txn.commit(&engine),
+                Err(KernelError::Generic(msg))
+                    if msg.contains("app_id app_id1 already exists in transaction")
+            ));
         }
 
         let builder = snapshot.update_table(UpdateTableOperation::Write, "default engine", true);

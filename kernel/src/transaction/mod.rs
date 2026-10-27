@@ -72,6 +72,7 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
+pub use builder::replace_table::{MetadataPatch, MetadataPolicy, ReplaceTableTransactionBuilder};
 pub use builder::update_table::UpdateTableTransactionBuilder;
 use builder::TransactionBuilderState;
 pub use builder::{TransactionBuilder, TransactionType};
@@ -204,6 +205,18 @@ pub struct UpdateTable;
 #[derive(Debug)]
 pub struct CreateTable;
 
+/// Marker type for full-table replacements. Selective file removals and deletion-vector updates
+/// are unavailable because the builder already stages every active file for removal.
+///
+/// ```compile_fail,E0599
+/// # use delta_kernel::transaction::{ReplaceTable, Transaction};
+/// fn remove_more_files(txn: &mut Transaction<ReplaceTable>) {
+///     txn.remove_files(unimplemented!());
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ReplaceTable;
+
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
 /// changes to the table.
@@ -212,6 +225,7 @@ pub struct CreateTable;
 /// - [`UpdateTable`] (default): Full API for modifying existing tables.
 /// - [`CreateTable`]: Restricted API for table creation (see
 ///   [`CreateTableTransaction`](create_table::CreateTableTransaction)).
+/// - [`ReplaceTable`]: Full-table replacement without selective file removals or DV updates.
 ///
 /// The independent type parameter `MODE` selects the [`ExecutionMode`], which provides an
 /// abstraction over 1) how staged changes are represented and 2) how to inspect the changes. The
@@ -1247,6 +1261,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
                 ))
             }
             (false, CommitOperation::UpdateTable(_)) => Ok(()),
+            (false, CommitOperation::Replace) => Ok(()),
             (true, _) => Err(KernelError::invalid_transaction_state(
                 "create-table transactions must use the CREATE TABLE operation",
             )),

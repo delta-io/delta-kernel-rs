@@ -45,7 +45,10 @@ use crate::table_features::{physical_to_logical_column_name_and_type, Operation,
 #[cfg(feature = "check-constraints-in-dev")]
 use crate::table_properties::CheckConstraint;
 use crate::table_properties::TableProperties;
-use crate::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
+use crate::transaction::{
+    MetadataPolicy, ReplaceTableTransactionBuilder, UpdateTableOperation,
+    UpdateTableTransactionBuilder,
+};
 use crate::utils::require;
 use crate::{Engine, KernelError, KernelResult, LogCompactionWriter, Version};
 
@@ -1319,6 +1322,26 @@ impl Snapshot {
         data_change: bool,
     ) -> UpdateTableTransactionBuilder {
         UpdateTableTransactionBuilder::new(self, operation, engine_info.into(), data_change)
+    }
+
+    /// Creates a builder that replaces all active data files and changes the table definition.
+    ///
+    /// `engine_info` records the connector name and version in `commitInfo`.
+    ///
+    /// [`MetadataPolicy::Patch`] preserves unspecified metadata, including properties and
+    /// protocol. An empty patch replaces only the data files, without emitting a metadata action.
+    /// Properties referencing dropped columns remain unchanged; schemas requiring a new table
+    /// feature are rejected. CDF, append-only, clustered, Iceberg-compatible, column-default, and
+    /// adaptive-metadata tables cannot be replaced. Under `internal-api`, a data layout supplied
+    /// to the builder replaces the current partitioning; otherwise it is inherited. The builder
+    /// stages old-file removals during build. It can enumerate files from an empty-schema table
+    /// through a metadata-only scan, but row scans of that table remain unsupported.
+    pub fn replace_table(
+        self: Arc<Self>,
+        metadata_policy: MetadataPolicy,
+        engine_info: impl Into<String>,
+    ) -> ReplaceTableTransactionBuilder {
+        ReplaceTableTransactionBuilder::new(self, metadata_policy, engine_info.into())
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.

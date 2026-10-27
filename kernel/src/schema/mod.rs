@@ -1634,9 +1634,10 @@ pub(crate) fn normalize_column_names_to_schema_casing(
             let mut normalized: Vec<String> = Vec::with_capacity(path.len());
             let mut current_schema = schema;
             for (i, field_name) in path.iter().enumerate() {
+                let lowered = field_name.to_lowercase();
                 match current_schema
                     .fields()
-                    .find(|f| f.name().eq_ignore_ascii_case(field_name))
+                    .find(|f| f.name().to_lowercase() == lowered)
                 {
                     Some(f) => {
                         normalized.push(f.name().to_string());
@@ -4846,6 +4847,7 @@ mod tests {
         let schema = schema! {
             not_null "id": INTEGER,
             not_null "EventDate": DATE,
+            not_null "É": INTEGER,
             not_null "Address": {
                 not_null "City": STRING,
             },
@@ -4856,6 +4858,12 @@ mod tests {
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["EventDate"]
+        );
+
+        let cols = vec![ColumnName::new(["é"])];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["É"]
         );
 
         // Nested path -> each field name normalized
