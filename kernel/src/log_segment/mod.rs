@@ -2036,3 +2036,21 @@ fn validate_crc(
     );
     Ok(())
 }
+
+impl crate::snapshot::memory::HeapSize for LogSegment {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.log_root.heap_size(context)
+            + crate::snapshot::memory::sampled_paths(&self.listed.ascending_commit_files, context)
+            + crate::snapshot::memory::sampled_paths(
+                &self.listed.ascending_compaction_files,
+                context,
+            )
+            + crate::snapshot::memory::sampled_paths(&self.listed.checkpoint_parts, context)
+            + self.listed.latest_crc_file.heap_size(context)
+            + self.listed.latest_commit_file.heap_size(context)
+            + self.last_checkpoint_metadata.heap_size(context)
+    }
+}

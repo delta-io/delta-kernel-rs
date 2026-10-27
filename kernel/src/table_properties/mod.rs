@@ -428,6 +428,31 @@ pub(crate) fn strip_check_constraint_prefix(key: &str) -> Option<&str> {
     key.strip_prefix(CHECK_CONSTRAINT_PREFIX)
 }
 
+impl crate::snapshot::memory::HeapSize for CheckConstraint {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.name.heap_size(context) + self.raw_sql.heap_size(context)
+    }
+}
+
+impl crate::snapshot::memory::HeapSize for TableProperties {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.data_skipping_stats_columns.heap_size(context)
+            + self.materialized_row_id_column_name.heap_size(context)
+            + self
+                .materialized_row_commit_version_column_name
+                .heap_size(context)
+            + self.parquet_format_version.heap_size(context)
+            + self.check_constraints.heap_size(context)
+            + self.unknown_properties.heap_size(context)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

@@ -2091,6 +2091,89 @@ impl DomainMetadata {
     }
 }
 
+impl crate::snapshot::memory::HeapSize for Metadata {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.id.heap_size(context)
+            + self.name.heap_size(context)
+            + self.description.heap_size(context)
+            + self.format.heap_size(context)
+            + self.schema_string.heap_size(context)
+            + self.partition_columns.heap_size(context)
+            + self.configuration.heap_size(context)
+    }
+}
+
+impl crate::snapshot::memory::HeapSize for Format {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.provider.heap_size(context) + self.options.heap_size(context)
+    }
+}
+
+impl crate::snapshot::memory::HeapSize for Protocol {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.reader_features.heap_size(context) + self.writer_features.heap_size(context)
+    }
+}
+
+impl crate::snapshot::memory::HeapSize for Add {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.path.heap_size(context)
+            + self.partition_values.heap_size(context)
+            + self.stats.heap_size(context)
+            + self.tags.heap_size(context)
+            + self.deletion_vector.heap_size(context)
+            + self.clustering_provider.heap_size(context)
+    }
+}
+
+impl crate::snapshot::memory::HeapSize for SetTransaction {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.app_id.heap_size(context)
+    }
+}
+
+impl crate::snapshot::memory::HeapSize for DomainMetadata {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.domain.heap_size(context) + self.configuration.heap_size(context)
+    }
+}
+
+impl crate::snapshot::memory::HeapSize for Sidecar {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.path.heap_size(context) + self.tags.heap_size(context)
+    }
+}
+
+impl crate::snapshot::memory::HeapSize for CheckpointMetadata {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.tags.heap_size(context)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

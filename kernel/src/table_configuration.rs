@@ -1286,6 +1286,26 @@ impl TableConfiguration {
     }
 }
 
+impl crate::snapshot::memory::HeapSize for TableConfiguration {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.metadata.heap_size(context)
+            + self.protocol.heap_size(context)
+            + self.logical_schema.heap_size(context)
+            + self
+                .logical_schema_without_partition_columns
+                .heap_size(context)
+            + self.physical_schema.heap_size(context)
+            + self
+                .physical_data_schema_without_partition_columns
+                .heap_size(context)
+            + self.table_properties.heap_size(context)
+            + self.table_root.heap_size(context)
+    }
+}
+
 #[cfg(test)]
 mod test {
 

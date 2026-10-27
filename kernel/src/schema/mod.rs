@@ -20,6 +20,9 @@ use tracing::warn;
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
+use crate::snapshot::memory::{
+    hash_table_bytes, index_map_bytes, HeapSize, Memory, SizeContext, Unavailable,
+};
 use crate::table_features::{
     validate_and_extract_column_mapping_annotations, validate_column_mapping_id, ColumnMappingMode,
     StaleAnnotationPolicy,
@@ -34,6 +37,8 @@ pub(crate) use column_default::{try_collect_column_defaults, validate_column_def
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
+#[cfg(test)]
+mod memory_tests;
 
 pub(crate) mod collation_utils;
 #[cfg(feature = "internal-api")]
@@ -836,8 +841,9 @@ impl Display for StructField {
 
 /// A struct is used to represent both the top-level schema of the table
 /// as well as struct columns that contain nested columns.
-#[derive(Debug, PartialEq, Clone, Eq)]
+#[derive(Eq)]
 pub struct StructType {
+    retained_memory: Memory,
     type_name: String,
     /// The fields stored in this struct
     // We use indexmap to preserve the order of fields as they are defined in the schema
@@ -887,6 +893,53 @@ impl StructTypeBuilder {
     }
 }
 
+impl Debug for StructType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StructType")
+            .field("type_name", &self.type_name)
+            .field("fields", &self.fields)
+            .field("metadata_columns", &self.metadata_columns)
+            .finish()
+    }
+}
+
+impl PartialEq for StructType {
+    fn eq(&self, other: &Self) -> bool {
+        self.type_name == other.type_name
+            && self.fields == other.fields
+            && self.metadata_columns == other.metadata_columns
+    }
+}
+
+impl Clone for StructType {
+    fn clone(&self) -> Self {
+        let mut retained_memory = Memory::ZERO;
+        let mut context = SizeContext::default();
+        // Retain the source's reservation and hasher instead of compacting the cloned map.
+        let mut fields = IndexMap::with_capacity_and_hasher(
+            self.fields.capacity(),
+            self.fields.hasher().clone(),
+        );
+        fields.extend(self.fields.iter().map(|(key, field)| {
+            let key = key.clone();
+            let field = field.clone();
+            retained_memory += key.heap_size(&mut context) + field.heap_size(&mut context);
+            (key, field)
+        }));
+        let type_name = self.type_name.clone();
+        let metadata_columns = self.metadata_columns.clone();
+        retained_memory += type_name.heap_size(&mut context)
+            + index_map_bytes::<String, StructField>(fields.capacity())
+            + hash_table_bytes::<(MetadataColumnSpec, usize)>(metadata_columns.capacity());
+        Self {
+            type_name,
+            fields,
+            metadata_columns,
+            retained_memory,
+        }
+    }
+}
+
 impl StructType {
     /// Creates a new [`StructType`] from the given fields.
     ///
@@ -896,6 +949,8 @@ impl StructType {
     /// - the schema contains duplicate metadata columns
     /// - the schema contains nested metadata columns
     pub fn try_new(fields: impl IntoIterator<Item = StructField>) -> KernelResult<Self> {
+        let mut retained_memory = Memory::ZERO;
+        let mut context = SizeContext::default();
         let mut field_map = IndexMap::new();
         let mut metadata_columns = HashMap::new();
         let mut seen_lowercase_names = HashSet::new();
@@ -926,10 +981,16 @@ impl StructType {
                 )));
             }
 
-            field_map.insert(field.name.clone(), field);
+            let key = field.name.clone();
+            retained_memory += key.heap_size(&mut context) + field.heap_size(&mut context);
+            field_map.insert(key, field);
         }
 
         Ok(Self {
+            retained_memory: retained_memory
+                + Memory::precise("struct".len())
+                + index_map_bytes::<String, StructField>(field_map.capacity())
+                + hash_table_bytes::<(MetadataColumnSpec, usize)>(metadata_columns.capacity()),
             type_name: "struct".into(),
             fields: field_map,
             metadata_columns,
@@ -959,6 +1020,8 @@ impl StructType {
     /// Refer to [`StructType::try_new`] for more details on the validation checks.
     #[internal_api]
     pub(crate) fn new_unchecked(fields: impl IntoIterator<Item = StructField>) -> Self {
+        let mut retained_memory = Memory::ZERO;
+        let mut context = SizeContext::default();
         let mut field_map = IndexMap::new();
         let mut metadata_columns = HashMap::new();
 
@@ -966,10 +1029,19 @@ impl StructType {
             if let Some(metadata_column_spec) = field.get_metadata_column_spec() {
                 metadata_columns.insert(metadata_column_spec, i);
             }
-            field_map.insert(field.name.clone(), field);
+            let key = field.name.clone();
+            retained_memory += key.heap_size(&mut context) + field.heap_size(&mut context);
+            if field_map.insert(key, field).is_some() {
+                // The unchecked constructor permits replacement; avoid counting the old field.
+                retained_memory = Memory::unavailable(Unavailable::MutatedSchema);
+            }
         }
 
         Self {
+            retained_memory: retained_memory
+                + Memory::precise("struct".len())
+                + index_map_bytes::<String, StructField>(field_map.capacity())
+                + hash_table_bytes::<(MetadataColumnSpec, usize)>(metadata_columns.capacity()),
             type_name: "struct".into(),
             fields: field_map,
             metadata_columns,
@@ -1149,6 +1221,7 @@ impl StructType {
 
     /// Gets a mutable reference to the underlying field map.
     pub(crate) fn field_map_mut(&mut self) -> &mut IndexMap<String, StructField> {
+        self.retained_memory = Memory::unavailable(Unavailable::MutatedSchema);
         &mut self.fields
     }
 
@@ -2793,6 +2866,46 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
     }
 }
 
+impl crate::snapshot::memory::HeapSize for StructType {
+    fn heap_size(
+        &self,
+        _: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.retained_memory
+    }
+}
+
+impl crate::snapshot::memory::HeapSize for StructField {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.name.heap_size(context)
+            + self.data_type.heap_size(context)
+            + self.metadata.heap_size(context)
+    }
+}
+
+impl crate::snapshot::memory::HeapSize for ArrayType {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.type_name.heap_size(context) + self.element_type.heap_size(context)
+    }
+}
+
+impl crate::snapshot::memory::HeapSize for MapType {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.type_name.heap_size(context)
+            + self.key_type.heap_size(context)
+            + self.value_type.heap_size(context)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -4359,6 +4472,7 @@ mod tests {
         let nested_field_with_metadata =
             StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
         let nested_struct = StructType {
+            retained_memory: Memory::unavailable(Unavailable::MutatedSchema),
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),
@@ -4384,6 +4498,7 @@ mod tests {
         let nested_field_with_metadata =
             StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
         let nested_struct = StructType {
+            retained_memory: Memory::unavailable(Unavailable::MutatedSchema),
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),
@@ -4410,6 +4525,7 @@ mod tests {
         let nested_field_with_metadata =
             StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
         let nested_struct = StructType {
+            retained_memory: Memory::unavailable(Unavailable::MutatedSchema),
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),

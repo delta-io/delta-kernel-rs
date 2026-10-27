@@ -283,6 +283,17 @@ impl FileSizeHistogram {
     }
 }
 
+impl crate::snapshot::memory::HeapSize for FileSizeHistogram {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.sorted_bin_boundaries.heap_size(context)
+            + self.file_counts.heap_size(context)
+            + self.total_bytes.heap_size(context)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;

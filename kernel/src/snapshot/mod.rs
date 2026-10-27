@@ -1,6 +1,11 @@
 //! In-memory representation of snapshots of tables (snapshot is a table at given point in time, it
 //! has schema etc.)
 
+#[cfg(feature = "internal-api")]
+pub mod memory;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod memory;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -96,6 +101,8 @@ pub enum CheckpointWriteResult {
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
 pub struct Snapshot {
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    retained_memory_at_creation: memory::SnapshotMemoryAtCreation,
     span: tracing::Span,
     log_segment: LogSegment,
     table_configuration: TableConfiguration,
@@ -249,6 +256,18 @@ impl Snapshot {
         )
     }
 
+    /// Returns the cached estimate of native allocations retained at construction completion.
+    ///
+    /// This constant-time accessor performs no allocation, I/O, locking, or traversal. The estimate
+    /// includes shared objects once within this snapshot and is not additive across snapshots.
+    /// It excludes construction peaks and later lazy state, and is not an RSS or hard-limit bound.
+    /// See [`memory::SnapshotMemoryAtCreation`] for component coverage and unavailable results.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn retained_memory_at_creation(&self) -> &memory::SnapshotMemoryAtCreation {
+        &self.retained_memory_at_creation
+    }
+
     /// `captured_checkpoint_action` is the latest checkpoint action when the build already has it
     /// in hand; `None` means not captured, not known absent. A captured action is trusted as is,
     /// without checking it against `lastManifestCommit`.
@@ -280,7 +299,24 @@ impl Snapshot {
             (None, LastManifestCommitResolution::Resolved(resolved)) => OnceLock::from(resolved),
             (None, LastManifestCommitResolution::Unresolved) => OnceLock::new(),
         };
+        let mut context = memory::SizeContext::default();
+        let retained_memory_at_creation = memory::SnapshotMemoryAtCreation {
+            root: memory::arc_allocation_bytes::<Self>(),
+            configuration: memory::HeapSize::heap_size(&table_configuration, &mut context),
+            log: memory::HeapSize::heap_size(&log_segment, &mut context),
+            crc: memory::HeapSize::heap_size(&crc.base(), &mut context),
+        };
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let retained_memory_at_creation = memory::SnapshotMemoryAtCreation {
+            root: if captured_checkpoint_action.is_some() {
+                memory::Memory::unavailable(memory::Unavailable::AdaptiveMetadata)
+            } else {
+                retained_memory_at_creation.root
+            },
+            ..retained_memory_at_creation
+        };
         Self {
+            retained_memory_at_creation,
             span,
             log_segment,
             table_configuration,
