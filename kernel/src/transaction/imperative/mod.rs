@@ -234,10 +234,20 @@ impl<STATE> Transaction<STATE, Imperative> {
                 } = post_commit_inputs;
                 // TODO(#2717): the commit already succeeded atomically; the post-commit `?`
                 //              below must not fail the txn (and must not mislabel the metric).
-                let (file_stats, num_dv_updates) = self.compute_file_stats()?;
+                let bin_boundaries = self
+                    .read_snapshot_opt
+                    .as_ref()
+                    .and_then(|snap| snap.get_file_stats_if_present())
+                    .and_then(|s| s.file_size_histogram)
+                    .map(|h| h.sorted_bin_boundaries);
+                let file_stats = FileStatsDelta::try_compute_for_txn(
+                    &self.staged_data_changes.add_files_metadata,
+                    &self.staged_data_changes.remove_files_metadata,
+                    bin_boundaries.as_deref(),
+                )?;
                 self.record_commit_success_metrics(
                     &file_stats,
-                    num_dv_updates,
+                    self.staged_data_changes.num_dv_updates as u64,
                     prepare_duration,
                     committer_duration,
                 );
@@ -391,22 +401,6 @@ impl<STATE> Transaction<STATE, Imperative> {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             checkpoint_action,
         })
-    }
-
-    /// Computes file statistics for a successful imperative commit.
-    fn compute_file_stats(&self) -> KernelResult<(FileStatsDelta, u64)> {
-        let bin_boundaries = self
-            .read_snapshot_opt
-            .as_ref()
-            .and_then(|snap| snap.get_file_stats_if_present())
-            .and_then(|s| s.file_size_histogram)
-            .map(|h| h.sorted_bin_boundaries);
-        let file_stats = FileStatsDelta::try_compute_for_txn(
-            &self.staged_data_changes.add_files_metadata,
-            &self.staged_data_changes.remove_files_metadata,
-            bin_boundaries.as_deref(),
-        )?;
-        Ok((file_stats, self.staged_data_changes.num_dv_updates as u64))
     }
 
     /// Validate that add files carry the per-file statistics required by the table's protocol.
