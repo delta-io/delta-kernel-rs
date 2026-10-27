@@ -13,6 +13,8 @@ use url::Url;
 
 use super::tests::add_checkpoint_to_store;
 use super::{LastManifestCommitResolution, LogSegment};
+#[cfg(feature = "declarative-plans")]
+use crate::actions::SetTransaction;
 use crate::actions::{CheckpointAction, CommitInfo, ContentRoot, LastManifestCommit, Protocol};
 use crate::arrow::array::StringArray;
 use crate::committer::FileSystemCommitter;
@@ -90,6 +92,12 @@ fn standalone_pm_commit(schema: SchemaRef) -> String {
         serde_json::json!({ "protocol": config.protocol() }),
         serde_json::json!({ "metaData": config.metadata() }),
     )
+}
+
+// Builds a commit holding only a `txn` action: no commitInfo, Protocol, or Metadata.
+#[cfg(feature = "declarative-plans")]
+fn txn_commit() -> String {
+    serde_json::json!({ "txn": SetTransaction::new("app".to_string(), 1, None) }).to_string()
 }
 
 // Builds a top-level `protocol` commit line with the given reader/writer versions (no features).
@@ -501,19 +509,25 @@ async fn plan_replay_without_pointer_skips_older_checkpoint_action() {
     "commit 1 carries a checkpoint action but no lastManifestCommit"
 )]
 #[tokio::test]
-async fn plan_replay_errors_when_pointed_commit_lacks_matching_action(
+async fn plan_replay_errors_on_invalid_pointer(
     #[case] commits: Vec<String>,
     #[case] expected_error: &str,
 ) {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
-    for (version, commit) in commits.into_iter().enumerate() {
-        add_commit(table_root.as_str(), store.as_ref(), version as u64, commit)
-            .await
-            .unwrap();
-    }
+    assert_replay_errors(&commits, expected_error, |store| {
+        SyncEngine::new_with_store(store)
+    })
+    .await;
+}
 
-    let engine = SyncEngine::new_with_store(store);
+#[cfg(feature = "declarative-plans")]
+async fn assert_replay_errors<E: Engine>(
+    commits: &[String],
+    expected_error: &str,
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let (store, table_root) = commit_table(commits).await;
+
+    let engine = make_engine(store);
     let result = Snapshot::builder_for(table_root).build(&engine);
     assert!(matches!(&result, Err(KernelError::InvalidLogSegment(_))));
     assert_result_error_with_message(result, expected_error);
@@ -1217,8 +1231,7 @@ async fn plan_replay_rejects_pointer_after_newest_commit(
         checkpoint_commit(1, &[], test_schema_flat_with_column_mapping()),
         commit_info(Some((1, 1))),
     ],
-    (1, 2),
-    1
+    (1, 1)
 )]
 #[case::covers_manifest_commit_past_its_content_root(
     vec![
@@ -1229,66 +1242,98 @@ async fn plan_replay_rejects_pointer_after_newest_commit(
         ),
         commit_info(Some((2, 1))),
     ],
-    (2, 3),
-    2
+    (2, 1)
 )]
 #[tokio::test]
 async fn plan_replay_reads_commits_a_compaction_covers(
     #[case] later_commits: Vec<String>,
-    #[case] (compaction_start, compaction_end): (u64, u64),
-    #[case] pointer_version: i64,
+    #[case] (pointer_version, content_root_version): (i64, i64),
 ) {
-    let (store, table_root) = manifest_commit_table(&later_commits).await;
-    let compaction = compacted_log_path_for_versions(compaction_start, compaction_end, "json");
-    let txn = serde_json::json!({ "txn": { "appId": "app", "version": 1 } }).to_string();
-    store.put(&compaction, txn.into()).await.unwrap();
+    let pointer = LastManifestCommit::new(pointer_version, content_root_version).unwrap();
+    assert_compacted_replay(
+        &later_commits,
+        &test_schema_flat_with_column_mapping(),
+        &LastManifestCommitResolution::Resolved(Some(pointer)),
+        |store| SyncEngine::new_with_store(store),
+    )
+    .await;
+}
 
-    let engine = SyncEngine::new_with_store(store);
-    let storage = engine.storage_handler();
-    let log_root = table_root.join("_delta_log/").unwrap();
-    let mut log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
+#[cfg(feature = "declarative-plans")]
+async fn assert_compacted_replay<E: Engine>(
+    later_commits: &[String],
+    expected_schema: &SchemaRef,
+    expected_pointer: &LastManifestCommitResolution,
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let (store, table_root) = manifest_commit_table(later_commits).await;
+    let engine = make_engine(store.clone());
+    let log_segment =
+        segment_with_newest_two_compacted(&store, &table_root, &engine, later_commits.len()).await;
+
+    let resolution = log_segment
+        .read_protocol_metadata_opt(&engine, None)
+        .unwrap();
+    let schema = resolution.metadata.unwrap().parse_schema().unwrap();
+    assert_eq!(&schema, expected_schema.as_ref());
+    assert_eq!(&resolution.last_manifest_commit, expected_pointer);
+}
+
+// Writes a log compaction covering the newest two commits and returns a segment that uses it.
+// Compaction listing is disabled, so the compaction is added to the segment by hand.
+#[cfg(feature = "declarative-plans")]
+async fn segment_with_newest_two_compacted(
+    store: &InMemory,
+    table_root: &url::Url,
+    engine: &impl Engine,
+    newest_version: usize,
+) -> LogSegment {
+    let newest_version = newest_version as u64;
+    let compaction = compacted_log_path_for_versions(newest_version - 1, newest_version, "json");
+    store.put(&compaction, txn_commit().into()).await.unwrap();
+
+    let mut log_segment = latest_log_segment(table_root, engine);
     let compaction_location = table_root.join(compaction.as_ref()).unwrap();
     let compaction = ParsedLogPath::new(FileMeta::new(compaction_location, 0, 100)).unwrap();
     log_segment
         .listed
         .ascending_compaction_files
         .push(compaction);
-
-    let resolution = log_segment
-        .read_protocol_metadata_opt(&engine, None)
-        .unwrap();
-    let schema = resolution.metadata.unwrap().parse_schema().unwrap();
-    assert_eq!(&schema, test_schema_flat_with_column_mapping().as_ref());
-    let version = resolution
-        .captured_checkpoint_action
-        .map(|action| action.version);
-    assert_eq!(version, Some(1));
-    assert_eq!(
-        resolution.last_manifest_commit,
-        LastManifestCommitResolution::Resolved(Some(
-            LastManifestCommit::new(pointer_version, 1).unwrap()
-        ))
-    );
+    log_segment
 }
 
 // A plan-replayed snapshot serves `lastManifestCommit` from build-time state: it still resolves
-// after the commit file that carried it is deleted.
+// after the newest commit file is deleted.
 #[cfg(feature = "declarative-plans")]
+#[rstest]
+#[case::carried_pointer(commit_info(Some((0, 0))), Some((0, 0)))]
 #[tokio::test]
-async fn plan_replayed_snapshot_serves_last_manifest_commit_without_reading_the_log() {
-    let (store, table_root) = manifest_commit_table(&[commit_info(Some((0, 0)))]).await;
-    let engine = SyncEngine::new_with_store(store.clone());
+async fn plan_replayed_snapshot_serves_last_manifest_commit_without_reading_the_log(
+    #[case] newest_commit: String,
+    #[case] expected: Option<(i64, i64)>,
+) {
+    assert_snapshot_serves_last_manifest_commit(&newest_commit, expected, |store| {
+        SyncEngine::new_with_store(store)
+    })
+    .await;
+}
+
+#[cfg(feature = "declarative-plans")]
+async fn assert_snapshot_serves_last_manifest_commit<E: Engine>(
+    newest_commit: &str,
+    expected: Option<(i64, i64)>,
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let (store, table_root) = manifest_commit_table(&[newest_commit.to_string()]).await;
+    let engine = make_engine(store.clone());
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
     store
         .delete(&delta_path_for_version(1, "json"))
         .await
         .unwrap();
-    assert_eq!(
-        snapshot.last_manifest_commit(&engine).unwrap(),
-        Some(LastManifestCommit::new(0, 0).unwrap())
-    );
+    let expected = expected.map(|(v, c)| LastManifestCommit::new(v, c).unwrap());
+    assert_eq!(snapshot.last_manifest_commit(&engine).unwrap(), expected);
 }
 
 // A read snapshot loaded from a CRC never captures the checkpoint action, so a plain commit's
