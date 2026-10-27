@@ -1,0 +1,19 @@
+version: 0
+
+id: "00000000-0000-4000-8000-000000000001"
+name: "rich_metadata"
+description: "Rich \"metadata\" fixture"
+format_provider: "parquet"
+format_options: 3 entries
+  "alpha": "first"
+  "mid key": "tab\x09value"
+  "zeta": "last"
+schema_string: "{ \"type\" : \"struct\", \"fields\" : [ {\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}, {\"name\":\"day\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}, {\"name\":\"value\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}} ] }"
+partition_columns: 2 entries
+  "region"
+  "day"
+created_time: 0
+configuration: 3 entries
+  "app.version": "2"
+  "custom.empty": ""
+  "user.owner": "team-b"

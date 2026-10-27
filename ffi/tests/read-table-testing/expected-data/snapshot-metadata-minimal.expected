@@ -1,0 +1,11 @@
+version: 0
+
+id: "00000000-0000-4000-8000-000000000002"
+name: <absent>
+description: <absent>
+format_provider: "parquet"
+format_options: 0 entries
+schema_string: "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}"
+partition_columns: 0 entries
+created_time: <absent>
+configuration: 0 entries
