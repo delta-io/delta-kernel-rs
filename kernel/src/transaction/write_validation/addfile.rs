@@ -22,6 +22,7 @@ static ADD_FILE_COLUMNS_FOR_VALIDATION: LazyLock<ColumnNamesAndTypes> =
 /// Runs mandatory validations for every staged AddFile row. When `uniqueness_validator` is
 /// provided, also validates file-action (addFile, removeFile) uniqueness across `adds` and the
 /// actions already in `uniqueness_validator`, and records `adds` into it.
+/// For example, this can be used to detect duplicates between addFile and removeFile actions.
 pub(crate) fn validate_add_files(
     adds: &[Box<dyn EngineData>],
     physical_partition_columns: impl IntoIterator<Item = String>,
@@ -142,7 +143,7 @@ mod tests {
     };
 
     /// Test helper that provides an empty file-action (addFile, removeFile) uniqueness validator.
-    fn validate_add_files_with_empty_uniqueness_validator(
+    fn validate_add_files_unique(
         physical_partition_columns: &[&str],
         adds: &[Box<dyn EngineData>],
     ) -> KernelResult<()> {
@@ -233,10 +234,7 @@ mod tests {
             })
             .collect();
         assert_result_error_with_message(
-            validate_add_files_with_empty_uniqueness_validator(
-                &[], /* physical_partition_columns */
-                &adds,
-            ),
+            validate_add_files_unique(&[] /* physical_partition_columns */, &adds),
             &format!("missing required field '{field}'"),
         );
     }
@@ -286,10 +284,7 @@ mod tests {
             Arc::new(Int64Array::from(vec![modification_time])),
         );
         let adds = [Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>];
-        let result = validate_add_files_with_empty_uniqueness_validator(
-            &[], /* physical_partition_columns */
-            &adds,
-        );
+        let result = validate_add_files_unique(&[] /* physical_partition_columns */, &adds);
 
         if let Some(expected_error) = expected_error {
             assert_result_error_with_message(result, expected_error);
@@ -304,7 +299,7 @@ mod tests {
             &["file-0"],
             &[&[("p1", Some("a")), ("p2", Some("b"))]],
         );
-        validate_add_files_with_empty_uniqueness_validator(
+        validate_add_files_unique(
             &["p1", "p2"], /* physical_partition_columns */
             &as_engine_data(batch),
         )
@@ -315,7 +310,7 @@ mod tests {
     fn partition_value_null_still_counts_as_present() {
         let batch =
             add_files_with_partition_values(&["file-0"], &[&[("p1", Some("a")), ("p2", None)]]);
-        validate_add_files_with_empty_uniqueness_validator(
+        validate_add_files_unique(
             &["p1", "p2"], /* physical_partition_columns */
             &as_engine_data(batch),
         )
@@ -379,9 +374,8 @@ mod tests {
                 Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>
             })
             .collect();
-        let error =
-            validate_add_files_with_empty_uniqueness_validator(physical_partition_columns, &adds)
-                .expect_err("invalid partition values should be rejected");
+        let error = validate_add_files_unique(physical_partition_columns, &adds)
+            .expect_err("invalid partition values should be rejected");
         let KernelError::InvalidPartitionValues(message) = error else {
             panic!("expected InvalidPartitionValues, got {error:?}");
         };
@@ -395,7 +389,7 @@ mod tests {
     fn unpartitioned_table_rejects_partition_values() {
         let batch = add_files_with_partition_values(&["file-0"], &[&[("stray", Some("x"))]]);
         assert_result_error_with_message(
-            validate_add_files_with_empty_uniqueness_validator(
+            validate_add_files_unique(
                 &[], /* physical_partition_columns */
                 &as_engine_data(batch),
             ),

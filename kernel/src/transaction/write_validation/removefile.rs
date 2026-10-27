@@ -35,6 +35,7 @@ static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNamesAndT
 /// Runs mandatory validations for every selected RemoveFile row. When `uniqueness_validator` is
 /// provided, also checks and records each selected RemoveFile against the file actions (addFile,
 /// removeFile) already recorded in it.
+/// For example, this can detect a file staged for both removal and a DV update.
 pub(crate) fn validate_remove_files(
     removes: &[FilteredEngineData],
     uniqueness_validator: Option<&mut FileActionUniquenessValidator>,

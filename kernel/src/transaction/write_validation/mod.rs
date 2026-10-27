@@ -171,6 +171,38 @@ mod tests {
     use crate::unit_test_utils::assert_result_error_with_message;
 
     #[rstest]
+    #[case::duplicate_add_same_dv(
+        &[FileActionUniquenessValidatorTestCase::new(
+            TestFileActionType::Add,
+            "same_path" /* path */,
+            Some("dv"),
+        ); 2],
+        Some("multiple AddFile actions for path 'same_path'"),
+    )]
+    #[case::duplicate_add_without_dv(
+        &[FileActionUniquenessValidatorTestCase::new(
+            TestFileActionType::Add,
+            "same_path" /* path */,
+            None /* dv_id */,
+        ); 2],
+        Some("multiple AddFile actions for path 'same_path'"),
+    )]
+    #[case::duplicate_remove_same_dv(
+        &[FileActionUniquenessValidatorTestCase::new(
+            TestFileActionType::Remove,
+            "same_path" /* path */,
+            Some("dv"),
+        ); 2],
+        Some("multiple RemoveFile actions for path 'same_path'"),
+    )]
+    #[case::duplicate_remove_without_dv(
+        &[FileActionUniquenessValidatorTestCase::new(
+            TestFileActionType::Remove,
+            "same_path" /* path */,
+            None /* dv_id */,
+        ); 2],
+        Some("multiple RemoveFile actions for path 'same_path'"),
+    )]
     #[case::duplicate_add_different_dv(
         &[
             FileActionUniquenessValidatorTestCase::new(
@@ -184,7 +216,7 @@ mod tests {
                 Some("dv-2"),
             ),
         ],
-        Some("multiple AddFile actions"),
+        Some("multiple AddFile actions for path 'same_path'"),
     )]
     #[case::duplicate_remove_different_dv(
         &[
@@ -199,7 +231,7 @@ mod tests {
                 Some("dv-2"),
             ),
         ],
-        Some("multiple RemoveFile actions"),
+        Some("multiple RemoveFile actions for path 'same_path'"),
     )]
     #[case::add_remove_same_dv(
         &[
@@ -214,7 +246,22 @@ mod tests {
                 Some("dv"),
             ),
         ],
-        Some("same deletion vector ID"),
+        Some("actions for path 'same_path' with the same deletion vector ID 'dv'"),
+    )]
+    #[case::add_remove_without_dv(
+        &[
+            FileActionUniquenessValidatorTestCase::new(
+                TestFileActionType::Add,
+                "same_path" /* path */,
+                None /* dv_id */,
+            ),
+            FileActionUniquenessValidatorTestCase::new(
+                TestFileActionType::Remove,
+                "same_path" /* path */,
+                None /* dv_id */,
+            ),
+        ],
+        Some("AddFile and RemoveFile actions for path 'same_path' without a deletion vector"),
     )]
     #[case::remove_add_same_dv(
         &[
@@ -229,7 +276,7 @@ mod tests {
                 None /* dv_id */,
             ),
         ],
-        Some("without a deletion vector"),
+        Some("AddFile and RemoveFile actions for path 'same_path' without a deletion vector"),
     )]
     #[case::remove_add_same_non_null_dv(
         &[
@@ -244,7 +291,7 @@ mod tests {
                 Some("dv"),
             ),
         ],
-        Some("same deletion vector ID"),
+        Some("actions for path 'same_path' with the same deletion vector ID 'dv'"),
     )]
     #[case::remove_add_different_dv(
         &[
