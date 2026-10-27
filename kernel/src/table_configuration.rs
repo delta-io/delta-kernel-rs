@@ -25,8 +25,7 @@ pub(crate) use crate::schema::file_utils::validate_file_type_feature_support;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
-    schema_contains_non_null_fields, schema_has_invariants, validate_column_defaults_metadata,
-    SchemaRef, StructField, StructType,
+    schema_has_invariants, validate_column_defaults_metadata, SchemaRef, StructField, StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::table_features::validate_geospatial_feature_support;
@@ -1249,25 +1248,16 @@ impl TableConfiguration {
     /// A feature is enabled if:
     /// 1. It is supported in the protocol
     /// 2. The enablement check passes
-    ///
-    /// `Invariants` is only enabled if the schema has `delta.invariants` metadata or a non-null
-    /// field.
     #[internal_api]
     pub(crate) fn is_feature_enabled(&self, feature: &TableFeature) -> bool {
         if !self.is_feature_supported(feature) {
             return false;
         }
 
-        if *feature == TableFeature::Invariants {
-            // Invariants has no table property and legacy writers mark it supported on every
-            // table, so check whether the schema actually uses it.
-            let schema = self.logical_schema.as_ref();
-            return schema_has_invariants(schema) || schema_contains_non_null_fields(schema);
-        }
-
         match feature.info().enablement_check {
             EnablementCheck::AlwaysIfSupported => true,
             EnablementCheck::EnabledIf(check_fn) => check_fn(&self.table_properties),
+            EnablementCheck::EnabledIfSchema(check_fn) => check_fn(&self.logical_schema),
         }
     }
 
@@ -3406,44 +3396,17 @@ mod test {
     #[rstest]
     #[case::all_satisfied(
         vec![TableFeature::AdaptiveMetadataPreview, TableFeature::IcebergNativeV4Preview],
-        false,
         None
     )]
     #[case::missing_adaptive_metadata(
         vec![TableFeature::IcebergNativeV4Preview],
-        false,
         Some("requires 'adaptiveMetadata-preview' to be enabled")
-    )]
-    #[case::invariants_enabled(
-        vec![
-            TableFeature::AdaptiveMetadataPreview,
-            TableFeature::IcebergNativeV4Preview,
-            TableFeature::Invariants,
-        ],
-        true,
-        Some("requires 'invariants' to not be enabled")
-    )]
-    #[case::invariants_supported_but_unused(
-        vec![
-            TableFeature::AdaptiveMetadataPreview,
-            TableFeature::IcebergNativeV4Preview,
-            TableFeature::Invariants,
-        ],
-        false,
-        None
     )]
     fn test_iceberg_native_v4_feature_requirements(
         #[case] features: Vec<TableFeature>,
-        #[case] has_non_null_field: bool,
         #[case] expected_error_substring: Option<&str>,
     ) {
-        let schema = if has_non_null_field {
-            schema! { not_null "value": INTEGER }
-        } else {
-            schema! { nullable "value": INTEGER }
-        };
         let config = MockTableConfigurationBuilder::new()
-            .with_schema(schema)
             .with_protocol(MockProtocolBuilder::new().with_features(features).build())
             .build();
         let result = config.validate_feature_requirements(&TableFeature::IcebergNativeV4Preview);
@@ -3451,6 +3414,42 @@ mod test {
             Some(msg) => assert_result_error_with_message(result, msg),
             None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
         }
+    }
+
+    #[test]
+    fn test_iceberg_native_v4_with_invariants_enabled() {
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(schema! { not_null "value": INTEGER })
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::AdaptiveMetadataPreview,
+                        TableFeature::IcebergNativeV4Preview,
+                        TableFeature::Invariants,
+                    ])
+                    .build(),
+            )
+            .build();
+        let result = config.validate_feature_requirements(&TableFeature::IcebergNativeV4Preview);
+        assert_result_error_with_message(result, "requires 'invariants' to not be enabled");
+    }
+
+    #[test]
+    fn test_iceberg_native_v4_with_invariants_supported_but_not_enabled() {
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(schema! { nullable "value": INTEGER })
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::AdaptiveMetadataPreview,
+                        TableFeature::IcebergNativeV4Preview,
+                        TableFeature::Invariants,
+                    ])
+                    .build(),
+            )
+            .build();
+        let result = config.validate_feature_requirements(&TableFeature::IcebergNativeV4Preview);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
     // IcebergCompatV1/V2/V3 are pairwise mutually exclusive.

@@ -30,7 +30,7 @@ pub(crate) use timestamp_ntz::{
 use crate::actions::Protocol;
 use crate::expressions::Scalar;
 use crate::schema::derive_macro_utils::ToDataType;
-use crate::schema::DataType;
+use crate::schema::{schema_contains_non_null_fields, schema_has_invariants, DataType, Schema};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
@@ -239,6 +239,9 @@ pub(crate) enum EnablementCheck {
     /// Feature is enabled if supported AND the provided function returns true when checking table
     /// properties
     EnabledIf(fn(&TableProperties) -> bool),
+    /// Feature is enabled if supported AND the provided function returns true when checking the
+    /// logical table schema
+    EnabledIfSchema(fn(&Schema) -> bool),
 }
 
 /// Represents the type of operation being performed on a table
@@ -326,16 +329,18 @@ static APPEND_ONLY_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::EnabledIf(|props| props.append_only == Some(true)),
 };
 
-// Although kernel marks invariants as "Supported", invariants must NOT actually be present in the
-// table schema. Kernel will fail to write to any table that actually uses invariants (see check in
-// TableConfiguration::ensure_write_supported). This is to allow legacy tables with the Invariants
-// feature enabled but not in use.
+// Invariants has no table property, and legacy writers mark it supported on every table, so it
+// is enabled only if the schema has invariant metadata or a non-null field. Kernel marks it
+// "Supported" so it can write to tables that list it without using it, but fails to write to a
+// table with invariant metadata (see TableConfiguration::ensure_write_supported).
 static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 2)),
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
-    enablement_check: EnablementCheck::AlwaysIfSupported,
+    enablement_check: EnablementCheck::EnabledIfSchema(|s| {
+        schema_has_invariants(s) || schema_contains_non_null_fields(s)
+    }),
 };
 
 // Enabled whenever the writer protocol supports it, even if the table declares no constraint.
