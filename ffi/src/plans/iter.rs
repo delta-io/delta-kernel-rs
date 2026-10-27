@@ -389,8 +389,6 @@ unsafe impl Send for FfiFileMetaIter {}
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::ffi::c_void;
-    use std::ptr::NonNull;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -405,6 +403,7 @@ mod tests {
 
     use super::*;
     use crate::error::{EngineExecError, FFIKernelError};
+    use crate::handle::BoxExt;
     use crate::ExclusiveRustString;
 
     // === Shared Test Helpers ===
@@ -472,7 +471,7 @@ mod tests {
             ))),
             OptionalValue::Some(EngineExecResult::Success(make_data_handle(5))),
         ]);
-        let state = NonNull::new(Box::into_raw(mock_iter) as *mut c_void);
+        let state = Some(BoxExt::into_non_null(mock_iter).cast());
 
         extern "C" fn next(
             state: NullableCvoid,
@@ -542,7 +541,7 @@ mod tests {
             ))),
             OptionalValue::Some(EngineExecResult::Success(make_binary_ffi_array(b"world!"))),
         ]);
-        let state = NonNull::new(Box::into_raw(mock_iter) as *mut c_void);
+        let state = Some(BoxExt::into_non_null(mock_iter).cast());
 
         extern "C" fn next(
             state: NullableCvoid,
@@ -650,7 +649,7 @@ mod tests {
                 300,
             )]))),
         ]);
-        let state = NonNull::new(Box::into_raw(mock_iter) as *mut c_void);
+        let state = Some(BoxExt::into_non_null(mock_iter).cast());
 
         let mut iter = FfiFileMetaIter::new(CFileMetaIterator {
             state,
@@ -702,17 +701,16 @@ mod tests {
                 999,
             )]))),
         ]);
-        let state = NonNull::new(Box::into_raw(mock_iter) as *mut c_void);
+        let state = BoxExt::into_non_null(mock_iter);
 
         // Helper fn for checking the queue length from `state` pointer
         let queue_len = || {
-            let mock_iter =
-                unsafe { &*(state.unwrap().as_ptr() as *const MockIter<FFI_ArrowArray>) };
+            let mock_iter = unsafe { state.as_ref() };
             mock_iter.items.lock().unwrap().len()
         };
 
         let mut iter = FfiFileMetaIter::new(CFileMetaIterator {
-            state,
+            state: Some(state.cast()),
             next: file_meta_next,
             free: free_mock_iter::<FFI_ArrowArray>,
         });

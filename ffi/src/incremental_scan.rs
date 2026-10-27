@@ -425,6 +425,7 @@ pub unsafe extern "C" fn free_incremental_scan_summary(
 mod tests {
     use std::cell::RefCell;
     use std::ffi::c_void;
+    use std::ptr::NonNull;
     use std::sync::Arc;
 
     use delta_kernel::object_store::memory::InMemory;
@@ -524,7 +525,7 @@ mod tests {
         summary: &Handle<SharedIncrementalScanSummary>,
     ) -> Vec<(String, Option<String>)> {
         let keys = RefCell::new(Vec::new());
-        let ctx = std::ptr::NonNull::new(&keys as *const _ as *mut std::ffi::c_void);
+        let ctx = Some(NonNull::from(&keys).cast());
         unsafe {
             incremental_scan_summary_visit_live_adds(summary.shallow_copy(), ctx, collect_key)
         };
@@ -535,7 +536,7 @@ mod tests {
         summary: &Handle<SharedIncrementalScanSummary>,
     ) -> Vec<(String, Option<String>)> {
         let keys = RefCell::new(Vec::new());
-        let ctx = std::ptr::NonNull::new(&keys as *const _ as *mut std::ffi::c_void);
+        let ctx = Some(NonNull::from(&keys).cast());
         unsafe { incremental_scan_summary_visit_removes(summary.shallow_copy(), ctx, collect_key) };
         keys.into_inner()
     }

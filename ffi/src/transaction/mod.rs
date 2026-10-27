@@ -111,6 +111,7 @@ use create_table::{collect_create_table_columns, create_table_txn_builder_with_d
 #[cfg(test)]
 mod tests {
     use std::os::raw::c_void;
+    use std::ptr::NonNull;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -167,6 +168,7 @@ mod tests {
     use super::*;
     use crate::engine_funcs::{free_expression_evaluator, new_expression_evaluator};
     use crate::expressions::free_kernel_expression;
+    use crate::handle::BoxExt;
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema_visitor::visit_field_geometry;
     use crate::schema_visitor::{
@@ -601,10 +603,10 @@ mod tests {
                     .collect()
             })
             .collect();
-        std::ptr::NonNull::new(Box::into_raw(Box::new(columns)).cast())
+        Some(BoxExt::into_non_null(Box::new(columns)).cast())
     }
 
-    fn recover_column_names(ptr: std::ptr::NonNull<c_void>) -> Vec<Vec<String>> {
+    fn recover_column_names(ptr: NonNull<c_void>) -> Vec<Vec<String>> {
         *unsafe { Box::from_raw(ptr.as_ptr().cast()) }
     }
 
@@ -817,7 +819,7 @@ mod tests {
                 unsafe {
                     visit_partition_values(
                         context.shallow_copy(),
-                        std::ptr::NonNull::new((&mut collected as *mut Vec<_>).cast()),
+                        Some(NonNull::from(&mut collected).cast()),
                         collect_partition_value,
                     );
                 }
@@ -929,9 +931,7 @@ mod tests {
 
             // The serialized partition values surface the physical name and value.
             let mut collected: Vec<(String, String, bool)> = Vec::new();
-            let ctx = std::ptr::NonNull::new(
-                &mut collected as *mut Vec<(String, String, bool)> as *mut std::ffi::c_void,
-            );
+            let ctx = Some(NonNull::from(&mut collected).cast());
             unsafe {
                 visit_partition_values(write_context.shallow_copy(), ctx, collect_partition_value)
             };
@@ -1129,9 +1129,7 @@ mod tests {
             });
 
             let mut collected: Vec<(String, String, bool)> = Vec::new();
-            let ctx = std::ptr::NonNull::new(
-                &mut collected as *mut Vec<(String, String, bool)> as *mut std::ffi::c_void,
-            );
+            let ctx = Some(NonNull::from(&mut collected).cast());
             unsafe {
                 visit_partition_values(write_context.shallow_copy(), ctx, collect_partition_value)
             };
@@ -1194,9 +1192,7 @@ mod tests {
             });
 
             let mut collected: Vec<(String, String, bool)> = Vec::new();
-            let ctx = std::ptr::NonNull::new(
-                &mut collected as *mut Vec<(String, String, bool)> as *mut std::ffi::c_void,
-            );
+            let ctx = Some(NonNull::from(&mut collected).cast());
             unsafe {
                 visit_partition_values(write_context.shallow_copy(), ctx, collect_partition_value)
             };

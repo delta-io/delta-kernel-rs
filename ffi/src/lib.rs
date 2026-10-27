@@ -3240,7 +3240,7 @@ mod tests {
         }
 
         let mut collected: HashMap<String, String> = HashMap::new();
-        let ctx = NonNull::new(&mut collected as *mut _ as *mut c_void);
+        let ctx = Some(NonNull::from(&mut collected).cast());
         unsafe { visit_metadata_configuration(snap.shallow_copy(), ctx, collect_property) };
 
         assert_eq!(collected, expected);
@@ -4255,7 +4255,7 @@ mod tests {
     fn collect_protocol_state(snap: &handle::Handle<SharedSnapshot>) -> ProtocolVisitState {
         let proto = unsafe { snapshot_get_protocol(snap.shallow_copy()) };
         let mut state = ProtocolVisitState::new();
-        let ctx = NonNull::new(&mut state as *mut ProtocolVisitState as *mut c_void);
+        let ctx = Some(NonNull::from(&mut state).cast());
         unsafe {
             visit_protocol(
                 proto.shallow_copy(),
@@ -4332,7 +4332,7 @@ mod tests {
     fn collect_metadata_state(snap: &handle::Handle<SharedSnapshot>) -> MetadataVisitState {
         let meta = unsafe { snapshot_get_metadata(snap.shallow_copy()) };
         let mut state = MetadataVisitState::new();
-        let ctx = NonNull::new(&mut state as *mut MetadataVisitState as *mut c_void);
+        let ctx = Some(NonNull::from(&mut state).cast());
         unsafe { visit_metadata(meta.shallow_copy(), ctx, metadata_visit_cb) };
         unsafe { free_metadata(meta) };
         state
@@ -4343,7 +4343,7 @@ mod tests {
     ) -> HashMap<String, String> {
         let meta = unsafe { snapshot_get_metadata(snap.shallow_copy()) };
         let mut options = HashMap::new();
-        let ctx = NonNull::new(&mut options as *mut HashMap<String, String> as *mut c_void);
+        let ctx = Some(NonNull::from(&mut options).cast());
         unsafe {
             visit_metadata_format_options(meta.shallow_copy(), ctx, metadata_format_option_cb)
         };

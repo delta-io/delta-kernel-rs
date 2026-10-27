@@ -267,8 +267,6 @@ pub unsafe extern "C" fn free_uc_committer(commit_client: Handle<MutableCommitte
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::ffi::c_void;
-    use std::ptr::NonNull;
     use std::sync::Arc;
 
     use unity_catalog_delta_client_api::{
@@ -278,6 +276,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::ffi_test_utils::{allocate_err, ok_or_panic};
+    use crate::handle::BoxExt;
     use crate::{allocate_kernel_string, kernel_string_slice, OptionalValue};
 
     pub(crate) struct TestContext {
@@ -294,7 +293,7 @@ pub(crate) mod tests {
             last_staged_filename: None,
             should_fail_commit,
         });
-        NonNull::new(Box::into_raw(context) as *mut c_void)
+        Some(BoxExt::into_non_null(context).cast())
     }
 
     // take back ownership of the context. be aware that you therefore cannot call this twice with

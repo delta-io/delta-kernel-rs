@@ -151,7 +151,7 @@ mod tests {
             ok_or_panic(update_table_txn_visit_top_level_column_defaults(
                 txn.shallow_copy(),
                 engine.shallow_copy(),
-                NonNull::new((&mut collected as *mut Vec<VisitedDefault>).cast()),
+                Some(NonNull::from(&mut collected).cast()),
                 collect_default,
             ))
         };

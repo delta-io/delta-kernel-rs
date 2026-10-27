@@ -1065,6 +1065,21 @@ Feature flags:
   `*_native_bytes` / `alloc_tracking_enabled` getters (cdylib only; conflicts with
   another `#[global_allocator]` if linked as an rlib)
 
+## Test callback contexts
+
+Prefer `Some(NonNull::from(&mut state).cast())` for unit-test callback contexts. References are
+non-null, so avoid `NonNull::new`, `NonNull::new_unchecked`, and raw-pointer cast chains when
+constructing a context from a reference.
+
+Use `Some(NonNull::from(&state).cast())` for read-only state or interior-mutability types such as
+`Mutex` and `RefCell`. A pointer derived from a shared reference only permits mutation through
+interior mutability. Prefer local state for synchronous callbacks, and keep it alive at a stable
+address until the last callback finishes.
+
+When ownership of boxed test state passes to a cleanup callback, use
+`Some(BoxExt::into_non_null(state).cast())` with `crate::handle::BoxExt`. The cleanup must reclaim
+the allocation exactly once with `Box::from_raw`; borrowing the box would not transfer ownership.
+
 ## Testing under Miri
 
 CI runs this crate's tests under Miri (the `miri` job in `build.yml`) to catch undefined
