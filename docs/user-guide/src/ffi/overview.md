@@ -151,7 +151,8 @@ partition columns without building a scan.
 | `snapshot_timestamp` | Return the snapshot's commit timestamp (milliseconds since epoch) |
 | `snapshot_table_root` | Return the table root URL as an engine-allocated string |
 | `logical_schema` | Return the table's logical schema as a `Handle<SharedSchema>` |
-| `snapshot_get_metadata` | Clone the table metadata into a `Handle<SharedMetadata>` |
+| `snapshot_get_metadata` | Deprecated. Clone the table metadata into a `Handle<SharedMetadata>`. Use `snapshot_visit_metadata` instead (requires the `internal-api` feature) |
+| `snapshot_visit_metadata` | Visit the complete metadata action as one borrowed `FfiMetadata`, without allocating a metadata handle. Requires the `internal-api` feature. Copy any values you keep before the callback returns |
 | `snapshot_get_protocol` | Clone the protocol into a `Handle<SharedProtocol>` |
 | `get_partition_column_count` / `get_partition_columns` | Count partition columns and iterate their names as a `StringSliceIterator` |
 | `string_slice_next` / `free_string_slice_data` | Iterate and release a `StringSliceIterator` (e.g. returned by `get_partition_columns`) |
