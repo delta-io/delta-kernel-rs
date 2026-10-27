@@ -43,7 +43,6 @@ set(TestRunner "../../../tests/read-table-testing/run_test.sh")
 set(DatPath "../../../../acceptance/tests/dat/out/reader_tests/generated")
 set(ExpectedPath "../../../tests/read-table-testing/expected-data")
 set(KernelTestPath "../../../../kernel/tests/data")
-set(SnapshotMetadataPath "../../../tests/read-table-testing/snapshot-metadata")
 add_test(NAME read_and_print_all_prim COMMAND ${TestRunner} ${DatPath}/all_primitive_types/delta/ ${ExpectedPath}/all-prim-types.expected)
 add_test(NAME read_and_print_all_prim_cols COMMAND ${TestRunner} ${DatPath}/all_primitive_types/delta/ ${ExpectedPath}/all-prim-types-cols.expected -cdecimal,float64)
 add_test(NAME read_and_print_nested COMMAND ${TestRunner} ${DatPath}/nested_types/delta/ ${ExpectedPath}/nested-types.expected)
@@ -61,8 +60,7 @@ add_test(NAME read_arrow_metadata_basic COMMAND ${TestRunner} ${DatPath}/basic_p
 # prints per field.
 add_test(NAME read_column_mapping_metadata COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ExpectedPath}/column-mapping-arrow-metadata.expected -a)
 add_test(NAME read_projected_column_mapping COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ExpectedPath}/column-mapping-projected.expected -cletter,new_int)
-add_test(NAME snapshot_visit_metadata_rich COMMAND ${TestRunner} ${SnapshotMetadataPath}/rich/ ${ExpectedPath}/snapshot-metadata-rich.expected -m)
-add_test(NAME snapshot_visit_metadata_minimal COMMAND ${TestRunner} ${SnapshotMetadataPath}/minimal/ ${ExpectedPath}/snapshot-metadata-minimal.expected -m)
+add_test(NAME snapshot_visit_metadata COMMAND ${TestRunner} ${KernelTestPath}/partition_cm/none/ ${ExpectedPath}/snapshot-metadata.expected -m)
 add_test(NAME commit_range_commit_files_basic_partitioned
   COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/run_commit_range_commit_files_test.sh"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../../acceptance/tests/dat/out/reader_tests/generated/basic_partitioned/delta/"

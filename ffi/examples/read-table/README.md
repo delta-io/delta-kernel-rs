@@ -84,11 +84,10 @@ schema round trip, including annotation lifetimes after the source Rust schemas 
 
 ## Snapshot metadata tests
 
-`read_table -m path/to/table` prints the snapshot version and the complete metadata action from
-`snapshot_visit_metadata`, then exits without scanning. Map entries are sorted by key, strings are
-quoted with `\"`, `\\`, and non-printable bytes escaped, and absent optional values print as
-`<absent>`. `-m` can't be combined with `-a`, `-c`, or `-s`. Because no data files are read,
-these tests don't need Arrow GLib. Run these commands from the repository root:
+`read_table -m path/to/table` prints the snapshot version and every metadata field from
+`snapshot_visit_metadata`, then exits without scanning. Absent optional values print as `None`.
+`-m` can't be combined with `-a`, `-c`, or `-s`. Because no data files are read, the test doesn't
+need Arrow GLib. Run these commands from the repository root:
 
 ```sh
 cargo build -p delta_kernel_ffi --features tracing
@@ -96,7 +95,7 @@ mkdir -p ffi/examples/read-table/build
 cd ffi/examples/read-table/build
 cmake .. -DPRINT_DATA=OFF
 cmake --build . --target read_table
-ctest -R '^snapshot_visit_metadata_' --output-on-failure
+ctest -R '^snapshot_visit_metadata$' --output-on-failure
 ```
 
 [cmake]: https://cmake.org/
