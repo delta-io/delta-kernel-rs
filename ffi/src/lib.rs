@@ -1771,8 +1771,8 @@ pub struct FfiCheckpointFileGroup {
 /// Visits all checkpoint file-action groups in one borrowed slice.
 ///
 /// Resolves sidecars and physical schemas through `engine`, without replaying file actions.
-/// Calls `visit` once on success, including for an empty result. Both handles remain owned
-/// by the caller; the callback must copy any data it retains.
+/// Calls `visit` once and returns `true` on success, including for an empty result. Handles stay
+/// owned by the caller; the callback must copy any data it retains.
 ///
 /// # Errors
 ///
@@ -1788,10 +1788,10 @@ pub unsafe extern "C" fn snapshot_checkpoint_file_groups(
     engine: Handle<SharedExternEngine>,
     context: NullableCvoid,
     visit: unsafe extern "C" fn(NullableCvoid, FfiSlice<FfiCheckpointFileGroup>),
-) -> ExternResult<()> {
+) -> ExternResult<bool> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    let result = (|| -> KernelResult<()> {
+    let result = (|| -> KernelResult<bool> {
         let groups = snapshot.checkpoint_file_groups(engine_ref.engine().as_ref())?;
         let schemas: Vec<String> = groups
             .iter()
@@ -1809,7 +1809,7 @@ pub unsafe extern "C" fn snapshot_checkpoint_file_groups(
             })
             .collect();
         unsafe { visit(context, FfiSlice::new_unsafe(views.as_slice())) };
-        Ok(())
+        Ok(true)
     })();
     result.into_extern_result(&engine_ref)
 }
