@@ -32,48 +32,52 @@ use crate::{EngineData, KernelError, KernelResult};
 ///
 /// Note that [`FileActionDeduplicator`](crate::log_replay::FileActionDeduplicator) uses different
 /// rules: it deduplicates `(path, dv_id)` pairs during log replay.
-// TODO(#3692): Optimize by using only one map.
 #[derive(Default)]
 pub(super) struct FileActionUniquenessValidator {
-    add_paths: HashMap<String, Option<String>>,
-    remove_paths: HashMap<String, Option<String>>,
+    paths: HashMap<String, SeenActions>,
+}
+
+#[derive(Debug, PartialEq)]
+enum SeenActions {
+    Add(Option<String>),
+    Remove(Option<String>),
+    // Either action type is now a duplicate, so DV identities are no longer needed.
+    Both,
 }
 
 impl FileActionUniquenessValidator {
     fn record_add(&mut self, path: &str, dv_id: Option<String>) -> KernelResult<()> {
-        Self::record(
-            path,
-            dv_id,
-            "AddFile",
-            &mut self.add_paths,
-            &self.remove_paths,
-        )
+        self.record(path, SeenActions::Add(dv_id))
     }
 
     fn record_remove(&mut self, path: &str, dv_id: Option<String>) -> KernelResult<()> {
-        Self::record(
-            path,
-            dv_id,
-            "RemoveFile",
-            &mut self.remove_paths,
-            &self.add_paths,
-        )
+        self.record(path, SeenActions::Remove(dv_id))
     }
 
-    fn record(
-        path: &str,
-        dv_id: Option<String>,
-        action_name: &str,
-        same_type_actions: &mut HashMap<String, Option<String>>,
-        different_type_actions: &HashMap<String, Option<String>>,
-    ) -> KernelResult<()> {
-        let Entry::Vacant(entry) = same_type_actions.entry(path.to_owned()) else {
-            return Err(KernelError::invalid_transaction_state(format!(
-                "Transaction contains multiple {action_name} actions for path '{path}'"
-            )));
+    fn record(&mut self, path: &str, action: SeenActions) -> KernelResult<()> {
+        let mut entry = match self.paths.entry(path.to_owned()) {
+            Entry::Vacant(entry) => {
+                entry.insert(action);
+                return Ok(());
+            }
+            Entry::Occupied(entry) => entry,
+        };
+        let (previous_dv, dv_id) = match (entry.get(), &action) {
+            (SeenActions::Add(previous), SeenActions::Remove(current))
+            | (SeenActions::Remove(previous), SeenActions::Add(current)) => (previous, current),
+            _ => {
+                let action_name = match action {
+                    SeenActions::Add(_) => "AddFile",
+                    SeenActions::Remove(_) => "RemoveFile",
+                    SeenActions::Both => unreachable!("only individual actions can be recorded"),
+                };
+                return Err(KernelError::invalid_transaction_state(format!(
+                    "Transaction contains multiple {action_name} actions for path '{path}'"
+                )));
+            }
         };
         require!(
-            different_type_actions.get(path) != Some(&dv_id),
+            previous_dv != dv_id,
             KernelError::invalid_transaction_state(match dv_id.as_deref() {
                 Some(dv_id) => format!(
                     "Transaction contains AddFile and RemoveFile actions for path '{path}' with the \
@@ -85,7 +89,7 @@ impl FileActionUniquenessValidator {
                 ),
             })
         );
-        entry.insert(dv_id);
+        entry.insert(SeenActions::Both);
         Ok(())
     }
 }
@@ -356,6 +360,68 @@ mod tests {
         } else {
             result.expect("valid file-action combination should be accepted");
         }
+    }
+
+    #[rstest]
+    fn rejects_third_action_after_dv_update(
+        #[values(false, true)] remove_first: bool,
+        #[values(false, true)] remove_third: bool,
+        #[values(None, Some("old-dv"))] old_dv: Option<&str>,
+        #[values(None, Some("old-dv"), Some("new-dv"))] third_dv: Option<&str>,
+    ) -> KernelResult<()> {
+        let mut validator = FileActionUniquenessValidator::default();
+        let first = if remove_first {
+            TestFileActionType::Remove
+        } else {
+            TestFileActionType::Add
+        };
+        let second = if remove_first {
+            TestFileActionType::Add
+        } else {
+            TestFileActionType::Remove
+        };
+        first.record(&mut validator, "p", old_dv.map(str::to_owned))?;
+        second.record(&mut validator, "p", Some("new-dv".to_owned()))?;
+        assert_eq!(validator.paths.get("p"), Some(&SeenActions::Both));
+        let third = if remove_third {
+            TestFileActionType::Remove
+        } else {
+            TestFileActionType::Add
+        };
+        let error = third
+            .record(&mut validator, "p", third_dv.map(str::to_owned))
+            .unwrap_err();
+        let name = if remove_third {
+            "RemoveFile"
+        } else {
+            "AddFile"
+        };
+        assert_eq!(error.to_string(), format!("Invalid transaction state: Transaction contains multiple {name} actions for path 'p'"));
+        assert_eq!(validator.paths.get("p"), Some(&SeenActions::Both));
+        validator.record_add("other", None)?;
+        Ok(())
+    }
+
+    #[rstest]
+    fn rejected_cross_type_action_preserves_state(
+        #[values(false, true)] remove_first: bool,
+    ) -> KernelResult<()> {
+        let mut validator = FileActionUniquenessValidator::default();
+        let first = if remove_first {
+            TestFileActionType::Remove
+        } else {
+            TestFileActionType::Add
+        };
+        let second = if remove_first {
+            TestFileActionType::Add
+        } else {
+            TestFileActionType::Remove
+        };
+        first.record(&mut validator, "p", None)?;
+        assert!(second.record(&mut validator, "p", None).is_err());
+        second.record(&mut validator, "p", Some("dv".to_owned()))?;
+        assert_eq!(validator.paths.get("p"), Some(&SeenActions::Both));
+        Ok(())
     }
 
     #[derive(Clone, Copy)]
