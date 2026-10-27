@@ -271,7 +271,6 @@ unsafe fn with_minimal_hint(
     unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) }
 }
 
-#[cfg(feature = "internal-api")]
 fn read_snapshot_metadata(snapshot: &Handle<SharedSnapshot>) -> delta_kernel::actions::Metadata {
     extern "C" fn collect(context: NullableCvoid, metadata: *const FfiMetadata) {
         let result = unsafe {
@@ -293,7 +292,6 @@ fn read_snapshot_metadata(snapshot: &Handle<SharedSnapshot>) -> delta_kernel::ac
     result.unwrap().unwrap()
 }
 
-#[cfg(feature = "internal-api")]
 #[test]
 fn metadata_visit_preserves_original_schema_json_and_does_not_consume_snapshot() {
     let engine = test_engine();
@@ -1131,7 +1129,6 @@ fn typed_export_rejects_adaptive_crc_without_visiting_or_consuming_snapshot(
         unsafe { source.as_ref() }.crc_at_version().map(Arc::as_ref),
         Some(&expected_crc)
     );
-    #[cfg(feature = "internal-api")]
     assert_eq!(read_snapshot_metadata(&source), expected_crc.metadata);
     unsafe {
         crate::free_snapshot_builder(state.builder.take().unwrap());

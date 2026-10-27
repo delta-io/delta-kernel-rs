@@ -12,7 +12,7 @@ use std::os::raw::{c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use delta_kernel::actions::{Metadata, Protocol};
+use delta_kernel::actions::Protocol;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::history_manager::{
     first_version_after as kernel_first_version_after,
@@ -1282,9 +1282,6 @@ impl FfiCheckpointSpec {
 #[handle_descriptor(target=Protocol, mutable=false, sized=true)]
 pub struct SharedProtocol;
 
-#[handle_descriptor(target=Metadata, mutable=false, sized=true)]
-pub struct SharedMetadata;
-
 /// Opaque builder for constructing a [`SharedSnapshot`].
 ///
 /// Create with [`get_snapshot_builder`] (from a table path) or [`get_snapshot_builder_from`]
@@ -2179,7 +2176,7 @@ pub unsafe extern "C" fn visit_protocol(
     }
 }
 
-// === Metadata handle FFI ===
+// === Metadata FFI ===
 
 /// Visits the snapshot's complete metadata action without engine I/O.
 ///
@@ -2191,7 +2188,6 @@ pub unsafe extern "C" fn visit_protocol(
 ///
 /// `snapshot` must be a valid, live handle for the duration of the call. `visitor` must not unwind
 /// or invalidate the snapshot. Any non-null `context` must satisfy the visitor's requirements.
-#[cfg(feature = "internal-api")]
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_visit_metadata(
     snapshot: Handle<SharedSnapshot>,
@@ -2201,116 +2197,6 @@ pub unsafe extern "C" fn snapshot_visit_metadata(
     let snapshot = unsafe { snapshot.as_ref() };
     let backing = delta_types::MetadataBacking::new(snapshot.table_configuration().metadata());
     visitor(context, &backing.as_ffi());
-}
-
-/// Get the metadata for this snapshot. The returned handle must be freed with [`free_metadata`].
-///
-/// Deprecated: use `snapshot_visit_metadata`, which requires the `internal-api` feature and
-/// visits the complete metadata action in one callback without allocating a metadata handle.
-///
-/// # Safety
-/// Caller is responsible for providing a valid snapshot handle.
-#[deprecated(
-    note = "use `snapshot_visit_metadata` (requires the `internal-api` feature), which visits the \
-            complete metadata action without allocating a metadata handle"
-)]
-#[no_mangle]
-pub unsafe extern "C" fn snapshot_get_metadata(
-    snapshot: Handle<SharedSnapshot>,
-) -> Handle<SharedMetadata> {
-    let snapshot = unsafe { snapshot.as_ref() };
-    Arc::new(snapshot.table_configuration().metadata().clone()).into()
-}
-
-/// Free a metadata handle obtained from [`snapshot_get_metadata`].
-///
-/// # Safety
-/// Caller is responsible for providing a valid, non-freed metadata handle.
-#[no_mangle]
-pub unsafe extern "C" fn free_metadata(metadata: Handle<SharedMetadata>) {
-    metadata.drop_handle();
-}
-
-/// Visit all fields of the metadata in a single FFI call. String fields borrow from the metadata
-/// handle and are only valid for the duration of the callback.
-///
-/// The visitor receives:
-/// - `id`: always present
-/// - `name`: `OptionalValue::None` if not set
-/// - `description`: `OptionalValue::None` if not set
-/// - `format_provider`: always present
-/// - `has_created_time`: whether `created_time_ms` is meaningful
-/// - `created_time_ms`: milliseconds since epoch (only valid when `has_created_time` is true)
-///
-/// # Safety
-/// Caller is responsible for providing a valid metadata handle, a valid `context` pointer, and
-/// a valid `visit_metadata_fields` function pointer. String slices must not be retained past the
-/// callback return.
-#[no_mangle]
-pub unsafe extern "C" fn visit_metadata(
-    metadata: Handle<SharedMetadata>,
-    context: NullableCvoid,
-    visit_metadata_fields: extern "C" fn(
-        context: NullableCvoid,
-        id: KernelStringSlice,
-        name: OptionalValue<KernelStringSlice>,
-        description: OptionalValue<KernelStringSlice>,
-        format_provider: KernelStringSlice,
-        has_created_time: bool,
-        created_time_ms: i64,
-    ),
-) {
-    let metadata = unsafe { metadata.as_ref() };
-    let id_str = metadata.id();
-    let id = kernel_string_slice!(id_str);
-    let name = metadata.name().map(|s| kernel_string_slice!(s)).into();
-    let description = metadata
-        .description()
-        .map(|s| kernel_string_slice!(s))
-        .into();
-    let fp_str = metadata.format_provider();
-    let format_provider = kernel_string_slice!(fp_str);
-    let (has_created_time, created_time_ms) = match metadata.created_time() {
-        Some(t) => (true, t),
-        None => (false, 0),
-    };
-    visit_metadata_fields(
-        context,
-        id,
-        name,
-        description,
-        format_provider,
-        has_created_time,
-        created_time_ms,
-    );
-}
-
-/// Visit each format option in the metadata by invoking `visitor` once per key/value pair.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid metadata handle, a valid `engine_context` as an
-/// opaque pointer passed to each `visitor` invocation, and a valid `visitor` function pointer.
-/// This function borrows the metadata handle, so the caller remains responsible for releasing it
-/// with [`free_metadata`]. String slices must not be retained past the callback return.
-#[no_mangle]
-pub unsafe extern "C" fn visit_metadata_format_options(
-    metadata: Handle<SharedMetadata>,
-    engine_context: NullableCvoid,
-    visitor: extern "C" fn(
-        engine_context: NullableCvoid,
-        key: KernelStringSlice,
-        value: KernelStringSlice,
-    ),
-) {
-    let metadata = unsafe { metadata.as_ref() };
-    metadata.format_options().iter().for_each(|(key, value)| {
-        visitor(
-            engine_context,
-            kernel_string_slice!(key),
-            kernel_string_slice!(value),
-        );
-    });
 }
 
 // === Snapshot-level computed property FFI ===
@@ -2414,6 +2300,7 @@ mod tests {
     use std::collections::HashMap;
     use std::ptr::NonNull;
 
+    use delta_kernel::actions::Metadata;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
@@ -4274,88 +4161,7 @@ mod tests {
         state
     }
 
-    struct MetadataVisitState {
-        id: Option<String>,
-        name: Option<String>,
-        description: Option<String>,
-        format_provider: Option<String>,
-        has_created_time: bool,
-        created_time_ms: i64,
-    }
-
-    impl MetadataVisitState {
-        fn new() -> Self {
-            Self {
-                id: None,
-                name: None,
-                description: None,
-                format_provider: None,
-                has_created_time: false,
-                created_time_ms: 0,
-            }
-        }
-    }
-
-    /// Convert a [`KernelStringSlice`] to a [`String`] (test-only helper).
-    fn slice_to_string(slice: KernelStringSlice) -> String {
-        unsafe { String::try_from_slice(&slice) }.unwrap()
-    }
-
-    extern "C" fn metadata_visit_cb(
-        ctx: NullableCvoid,
-        id: KernelStringSlice,
-        name: OptionalValue<KernelStringSlice>,
-        description: OptionalValue<KernelStringSlice>,
-        format_provider: KernelStringSlice,
-        has_created_time: bool,
-        created_time_ms: i64,
-    ) {
-        let state = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut MetadataVisitState) };
-        state.id = Some(slice_to_string(id));
-        state.name = match name {
-            OptionalValue::Some(s) => Some(slice_to_string(s)),
-            OptionalValue::None => None,
-        };
-        state.description = match description {
-            OptionalValue::Some(s) => Some(slice_to_string(s)),
-            OptionalValue::None => None,
-        };
-        state.format_provider = Some(slice_to_string(format_provider));
-        state.has_created_time = has_created_time;
-        state.created_time_ms = created_time_ms;
-    }
-
-    extern "C" fn metadata_format_option_cb(
-        ctx: NullableCvoid,
-        key: KernelStringSlice,
-        value: KernelStringSlice,
-    ) {
-        let options = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut HashMap<String, String>) };
-        options.insert(slice_to_string(key), slice_to_string(value));
-    }
-
-    /// Collects metadata through the deprecated `SharedMetadata` handle path, which remains the
-    /// only way to reach `visit_metadata` and `visit_metadata_format_options`.
-    fn collect_metadata_via_handle(
-        snap: &handle::Handle<SharedSnapshot>,
-    ) -> (MetadataVisitState, HashMap<String, String>) {
-        // Compatibility coverage for the retained deprecated getter.
-        #[allow(deprecated)]
-        let meta = unsafe { snapshot_get_metadata(snap.shallow_copy()) };
-        let mut state = MetadataVisitState::new();
-        let ctx = NonNull::new(&mut state as *mut MetadataVisitState as *mut c_void);
-        unsafe { visit_metadata(meta.shallow_copy(), ctx, metadata_visit_cb) };
-        let mut options = HashMap::new();
-        let ctx = NonNull::new(&mut options as *mut HashMap<String, String> as *mut c_void);
-        unsafe {
-            visit_metadata_format_options(meta.shallow_copy(), ctx, metadata_format_option_cb)
-        };
-        unsafe { free_metadata(meta) };
-        (state, options)
-    }
-
     /// Visits metadata through `snapshot_visit_metadata`, copying it before the callback returns.
-    #[cfg(feature = "internal-api")]
     fn collect_visited_metadata(snap: &handle::Handle<SharedSnapshot>) -> Metadata {
         extern "C" fn collect(ctx: NullableCvoid, metadata: *const delta_types::FfiMetadata) {
             let result = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut Option<Metadata>) };
@@ -4503,25 +4309,13 @@ mod tests {
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect();
 
-        #[cfg(feature = "internal-api")]
-        {
-            let visited = collect_visited_metadata(&snap);
-            assert_eq!(visited.id(), id);
-            assert_eq!(visited.name(), name);
-            assert_eq!(visited.description(), description);
-            assert_eq!(visited.format_provider(), "parquet");
-            assert_eq!(visited.format_options(), &format_options);
-            assert_eq!(visited.created_time(), created_time);
-        }
-
-        let (state, options) = collect_metadata_via_handle(&snap);
-        assert_eq!(state.id.as_deref(), Some(id));
-        assert_eq!(state.name.as_deref(), name);
-        assert_eq!(state.description.as_deref(), description);
-        assert_eq!(state.format_provider.as_deref(), Some("parquet"));
-        assert_eq!(state.has_created_time, created_time.is_some());
-        assert_eq!(state.created_time_ms, created_time.unwrap_or(0));
-        assert_eq!(options, format_options);
+        let visited = collect_visited_metadata(&snap);
+        assert_eq!(visited.id(), id);
+        assert_eq!(visited.name(), name);
+        assert_eq!(visited.description(), description);
+        assert_eq!(visited.format_provider(), "parquet");
+        assert_eq!(visited.format_options(), &format_options);
+        assert_eq!(visited.created_time(), created_time);
 
         unsafe { free_snapshot(snap) };
         unsafe { free_engine(engine) };
