@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use delta_kernel::actions::DomainMetadata;
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
 use delta_kernel::checkpoint::{CheckpointSpec, LastCheckpointHintStats, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
@@ -92,6 +93,155 @@ async fn checkpoint_crc_mismatch_reports_without_blocking_write(
         failures,
         usize::from(matches!(field, Some("numFiles" | "tableSizeBytes")))
     );
+    Ok(())
+}
+
+#[rstest]
+#[case::matching(Some(json!([
+    {"domain": "updated", "configuration": "new", "removed": false}
+])), false)]
+#[case::configuration_mismatch(Some(json!([
+    {"domain": "updated", "configuration": "different", "removed": false}
+])), true)]
+#[case::missing_domain(Some(json!([])), true)]
+#[case::extra_domain(Some(json!([
+    {"domain": "updated", "configuration": "new", "removed": false},
+    {"domain": "extra", "configuration": "extra", "removed": false}
+])), true)]
+#[case::removed_domain(Some(json!([
+    {"domain": "updated", "configuration": "new", "removed": false},
+    {"domain": "removed", "configuration": "old", "removed": false}
+])), true)]
+#[case::unavailable(None, false)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_validates_domain_metadata_for_crc(
+    #[case] on_disk_crc_domain_metadata: Option<Value>,
+    #[case] mismatch: bool,
+    #[values(
+        CheckpointSpec::V1,
+        CheckpointSpec::V2(V2CheckpointConfig::NoSidecar),
+        CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+            file_actions_per_sidecar_hint: Some(1),
+        })
+    )]
+    spec: CheckpointSpec,
+    #[values(false, true)] indeterminate_file_stats: bool,
+) -> KernelResult<()> {
+    let (directory, table_path, engine) = test_table_setup_mt()?;
+    let reporter = Arc::new(CapturingReporter::default());
+    let log_path = directory.path().join("validation.log");
+    ensure_metrics_compatible_global_subscriber();
+    let _guard = tracing_subscriber::registry()
+        .with_metrics_reporter_layer(reporter.clone())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(std::fs::File::create(&log_path)?)
+                .with_filter(tracing_subscriber::filter::LevelFilter::ERROR),
+        )
+        .set_default();
+
+    // === Given a table and an on-disk CRC with the requested domain metadata ===
+    let builder = create_table(
+        &table_path,
+        schema_ref! { nullable "id": INTEGER },
+        "test",
+        true, /* data_change */
+    )
+    .with_table_properties([("delta.feature.domainMetadata", "supported")])
+    .with_domain_metadata("updated", "old")
+    .with_domain_metadata("removed", "old");
+    let builder = match spec {
+        CheckpointSpec::V1 => builder,
+        CheckpointSpec::V2(_) => {
+            builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")])
+        }
+    };
+    let snapshot = builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let snapshot = insert_data(snapshot, &engine, vec![Arc::new(Int32Array::from(vec![1]))])
+        .await?
+        .unwrap_post_commit_snapshot();
+    let (_, snapshot) = snapshot.checkpoint(engine.as_ref(), Some(&spec))?;
+    let snapshot = snapshot
+        .update_table(
+            UpdateTableOperation::Write,
+            "test",
+            true, /* data_change */
+        )
+        .with_domain_metadata("updated", "new")
+        .with_domain_metadata_removed("removed")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    snapshot.write_checksum(engine.as_ref())?;
+    let crc_path = crc_file_path(&table_path, snapshot.version());
+    if let Some(domains) = &on_disk_crc_domain_metadata {
+        modify_crc_on_disk(&crc_path, "domainMetadata", domains.clone())?;
+    } else {
+        strip_field_from_crc(&table_path, snapshot.version(), "domainMetadata");
+    }
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let snapshot = if indeterminate_file_stats {
+        snapshot
+            .update_table(
+                UpdateTableOperation::Custom("ANALYZE STATS".to_string()),
+                "test",
+                true, /* data_change */
+            )
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot()
+    } else {
+        snapshot
+    };
+    assert_eq!(
+        snapshot.get_file_stats_if_present().is_none(),
+        indeterminate_file_stats
+    );
+
+    // === When writing a checkpoint ===
+    let (result, _) = snapshot.checkpoint(engine.as_ref(), Some(&spec))?;
+
+    // === Expect successful writing, with a metric and error log only on mismatch ===
+    assert_eq!(result, CheckpointWriteResult::Written);
+    assert_eq!(
+        reporter
+            .events()
+            .iter()
+            .filter(|event| matches!(event, MetricEvent::CrcValidationFailure))
+            .count(),
+        usize::from(mismatch)
+    );
+    let logs = std::fs::read_to_string(log_path)?;
+    let errors: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("Checkpoint CRC mismatch in domainMetadata"))
+        .collect();
+    assert_eq!(errors.len(), usize::from(mismatch));
+    if let Some(error) = errors.first() {
+        assert!(error.contains("ERROR"));
+        assert!(error.contains(concat!(
+            r#"expected_domain_metadata={"updated": DomainMetadata { "#,
+            r#"domain: "updated", configuration: "new", removed: false }}"#,
+        )));
+
+        let actual = error.split_once("actual_domain_metadata=").unwrap().1;
+        let domains: Vec<DomainMetadata> = serde_json::from_value(on_disk_crc_domain_metadata.unwrap())?;
+        assert_eq!(actual.matches("DomainMetadata {").count(), domains.len());
+        for domain in domains {
+            assert!(actual.contains(&format!("{:?}: {domain:?}", domain.domain())));
+        }
+    }
+    std::fs::remove_file(crc_path)?;
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let domains = reloaded.get_all_domain_metadata(engine.as_ref())?;
+    assert_eq!(domains.len(), 1);
+    assert_eq!(domains[0].domain(), "updated");
+    assert_eq!(domains[0].configuration(), "new");
     Ok(())
 }
 

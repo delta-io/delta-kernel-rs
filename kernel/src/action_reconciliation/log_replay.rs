@@ -36,7 +36,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use tracing::warn;
 use url::Url;
 
-use crate::crc::{Crc, FileStatsState};
+use crate::actions::DomainMetadata;
+use crate::crc::{Crc, DomainMetadataState, FileStatsState};
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector};
@@ -64,7 +65,8 @@ pub(crate) struct ActionReconciliationProcessor {
     txn_expiration_timestamp: Option<i64>,
     /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
     dv_normalization_root: Option<Url>,
-    /// CRC computed during log replay, tracking only `numFiles` and `tableSizeBytes`.
+    /// CRC computed during log replay, tracking `numFiles`, `tableSizeBytes`, and
+    /// `domainMetadata`.
     // TODO(#3672): Validate the remaining CRC fields.
     crc: Option<Arc<Mutex<Crc>>>,
 }
@@ -100,9 +102,10 @@ pub struct ActionReconciliationIteratorState {
     actions_count: AtomicI64,
     add_actions_count: AtomicI64,
     is_exhausted: AtomicBool,
-    /// CRC computed during log replay, tracking only `numFiles` and `tableSizeBytes`.
-    /// Shared with the processor and passed through `LastCheckpointHintStats` to validate the
-    /// cached in-memory CRC at checkpoint finalization.
+    /// CRC computed during log replay, tracking `numFiles`, `tableSizeBytes`, and
+    /// `domainMetadata`. Shared with the processor and passed through
+    /// `LastCheckpointHintStats` to validate the cached in-memory CRC at checkpoint
+    /// finalization.
     // TODO(#3672): Track the remaining CRC fields.
     pub(crate) crc: Option<Arc<Mutex<Crc>>>,
 }
@@ -176,7 +179,10 @@ impl ActionReconciliationIterator {
         let batch = batch.inspect_err(|_| {
             if let Some(crc) = &self.state.crc {
                 match crc.lock() {
-                    Ok(mut crc) => crc.file_stats_state = FileStatsState::Indeterminate,
+                    Ok(mut crc) => {
+                        crc.file_stats_state = FileStatsState::Indeterminate;
+                        crc.domain_metadata_state = DomainMetadataState::default();
+                    }
                     Err(error) => {
                         // Log instead of replacing the original reconciliation error.
                         warn!(%error, "Cannot invalidate action reconciliation CRC: lock poisoned");
@@ -406,6 +412,8 @@ impl ActionReconciliationVisitor<'_> {
     const TXN_LAST_UPDATED: GetterColumn = GetterColumn::new(13, "txn.lastUpdated");
     const DOMAIN_METADATA_DOMAIN: GetterColumn = GetterColumn::new(14, "domainMetadata.domain");
     const DOMAIN_METADATA_REMOVED: GetterColumn = GetterColumn::new(15, "domainMetadata.removed");
+    const DOMAIN_METADATA_CONFIGURATION: GetterColumn =
+        GetterColumn::new(16, "domainMetadata.configuration");
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new<'seen>(
@@ -649,6 +657,17 @@ impl ActionReconciliationVisitor<'_> {
             return Ok(Some(false));
         }
 
+        if let Some(crc) = self.crc.as_deref_mut() {
+            if let DomainMetadataState::Complete(domains) = &mut crc.domain_metadata_state {
+                let configuration = getters[Self::DOMAIN_METADATA_CONFIGURATION.index]
+                    .get(i, Self::DOMAIN_METADATA_CONFIGURATION.name)?;
+                domains.insert(
+                    domain.to_string(),
+                    DomainMetadata::new(domain.to_string(), configuration),
+                );
+            }
+        }
+
         Ok(Some(true))
     }
 
@@ -730,6 +749,7 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
                 (LONG, column_name!("txn.lastUpdated")),
                 (STRING, column_name!("domainMetadata.domain")),
                 (BOOLEAN, column_name!("domainMetadata.removed")),
+                (STRING, column_name!("domainMetadata.configuration")),
             ];
             let (types, names) = types_and_names.into_iter().unzip();
             (names, types).into()
@@ -739,7 +759,7 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         require!(
-            getters.len() == 16,
+            getters.len() == 17,
             KernelError::InternalError(format!(
                 "Wrong number of visitor getters for ActionReconciliationVisitor: {}",
                 getters.len()
@@ -778,7 +798,10 @@ mod tests {
     fn reconciliation_error_is_preserved_and_invalidates_available_crc(
         #[values(false, true)] poisoned: bool,
     ) {
-        let crc = Arc::new(Mutex::new(Crc::default()));
+        let crc = Arc::new(Mutex::new(Crc {
+            domain_metadata_state: DomainMetadataState::Complete(Default::default()),
+            ..Default::default()
+        }));
         if poisoned {
             let _ = std::panic::catch_unwind(|| {
                 let _guard = crc.lock().unwrap();
@@ -796,6 +819,7 @@ mod tests {
             let crc = crc.lock().unwrap();
             assert_eq!(crc.file_stats_state, FileStatsState::Indeterminate);
             assert!(crc.file_stats().is_none());
+            assert_eq!(crc.domain_metadata_state, DomainMetadataState::default());
         }
     }
 
@@ -837,6 +861,53 @@ mod tests {
         assert_eq!(stats.num_files(), 3);
         assert_eq!(stats.table_size_bytes(), 30);
         assert!(stats.file_size_histogram().is_none());
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    fn checkpoint_crc_reconciles_active_domains_across_batches(
+        #[values(false, true)] indeterminate_file_stats: bool,
+    ) -> KernelResult<()> {
+        let batches = [
+            create_batch(vec![
+                r#"{"domainMetadata":{"domain":"updated","configuration":"new","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"removed","configuration":"old","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"restored","configuration":"new","removed":false}}"#,
+            ])?,
+            create_batch(vec![
+                r#"{"domainMetadata":{"domain":"updated","configuration":"old","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"removed","configuration":"old","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"restored","configuration":"old","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"unchanged",
+                    "configuration":"stable","removed":false}}"#,
+            ])?,
+        ];
+        let crc = Arc::new(Mutex::new(Crc {
+            file_stats_state: if indeterminate_file_stats {
+                FileStatsState::Indeterminate
+            } else {
+                FileStatsState::default()
+            },
+            domain_metadata_state: DomainMetadataState::Complete(Default::default()),
+            ..Default::default()
+        }));
+        let mut processor = ActionReconciliationProcessor::new(
+            0,    /* minimum_file_retention_timestamp */
+            None, /* txn_expiration_timestamp */
+            None, /* dv_normalization_root */
+            Some(Arc::clone(&crc)),
+        );
+        for batch in batches {
+            processor.process_actions_batch(batch)?;
+        }
+        assert_eq!(
+            crc.lock().unwrap().domain_metadata_state,
+            DomainMetadataState::try_complete([
+                DomainMetadata::new("updated".to_string(), "new".to_string()),
+                DomainMetadata::new("restored".to_string(), "new".to_string()),
+                DomainMetadata::new("unchanged".to_string(), "stable".to_string()),
+            ])?
+        );
         Ok(())
     }
 
@@ -1531,13 +1602,13 @@ mod tests {
         )
     }
 
-    /// Helper function to create 14 getters with one specific error getter at the given index
+    /// Creates getters with one specific error getter at the given index.
     fn create_getters_with_error_at_index(
         error_index: usize,
         error_field: &'static str,
         error_type: &'static str,
     ) -> Vec<MockErrorGetData> {
-        (0..16)
+        (0..17)
             .map(|i| {
                 if i == error_index {
                     MockErrorGetData::new(error_field, error_type)
@@ -1561,7 +1632,8 @@ mod tests {
             None, /* txn_expiration_timestamp */
         );
         let getter = MockErrorGetData::default();
-        let getters = vec![&getter as &dyn GetData<'_>; 5]; // Wrong count (should be 15)!
+        // Wrong getter count (should be 17).
+        let getters = vec![&getter as &dyn GetData<'_>; 5];
         let result = visitor.visit(1, &getters);
         assert!(result.is_err());
         assert!(result
@@ -1630,6 +1702,7 @@ mod tests {
         getters.push(&error_mock);
         getters.push(&domain_default); // domainMetadata.domain
         getters.push(&domain_removed_default); // domainMetadata.removed
+        getters.push(&domain_default);
         let result = visitor.visit(1, &getters);
         assert!(result.is_err());
         let err_str = result.unwrap_err().to_string();
@@ -1651,7 +1724,7 @@ mod tests {
         let error_mock = FlexibleMock {
             error_field: "deletionTimestamp",
         };
-        let defaults2 = (0..9)
+        let defaults2 = (0..10)
             .map(|_| MockErrorGetData::default())
             .collect::<Vec<_>>();
         let mut getters: Vec<&dyn GetData<'_>> =

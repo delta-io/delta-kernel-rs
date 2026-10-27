@@ -113,7 +113,7 @@ pub enum MetricEvent {
     StorageReadCompleted(StorageReadCompleted),
     StorageCopyCompleted(StorageCopyCompleted),
     /// The CRC computed by log replay disagrees with the in-memory CRC at the same version.
-    /// Only `numFiles` and `tableSizeBytes` are compared.
+    /// Compares `numFiles`, `tableSizeBytes`, and `domainMetadata` when their state is complete.
     CrcValidationFailure,
 }
 
