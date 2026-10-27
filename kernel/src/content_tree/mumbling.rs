@@ -121,10 +121,10 @@ impl MumblingBitmap {
 
     /// Whether position `pos` is set. Positions beyond the bitmap's containers are unset.
     pub(crate) fn contains(&self, pos: u32) -> bool {
-        let container = (pos >> 8) as usize;
+        let (container, value) = split_position(pos);
         self.containers
             .get(container)
-            .is_some_and(|c| c.contains(pos as u8))
+            .is_some_and(|c| c.contains(value))
     }
 
     /// The number of set bits.
@@ -139,17 +139,39 @@ impl MumblingBitmap {
 
     /// The set positions, in ascending order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.iter_from(0)
+    }
+
+    /// The set positions at or above `start`, in ascending order.
+    ///
+    /// Containers before the one holding `start` cover only lower positions, so they are skipped
+    /// without being scanned; only the set positions below `start` in that first container are
+    /// visited and dropped. This keeps repeated calls with increasing `start` (one per leaf batch)
+    /// from rescanning the bitmap from position 0.
+    pub(crate) fn iter_from(&self, start: u32) -> impl Iterator<Item = u32> + '_ {
+        let (first_container, _) = split_position(start);
         self.containers
             .iter()
             .enumerate()
-            .flat_map(|(container, c)| {
-                let base = (container as u32) << 8; // container index is the high 16 bits
-                c.iter().map(move |v| base + v as u32)
-            })
+            .skip(first_container)
+            .flat_map(|(container, c)| c.iter().map(move |v| join_position(container, v)))
+            .skip_while(move |&pos| pos < start)
     }
 }
 
 // === Helpers ===
+
+/// Splits bitmap position `pos` into its container index (the bits above the low 8) and its
+/// in-container value (the low 8 bits).
+fn split_position(pos: u32) -> (usize, u8) {
+    ((pos >> 8) as usize, pos as u8)
+}
+
+/// Joins a container index and an in-container value back into a bitmap position; the inverse of
+/// [`split_position`].
+fn join_position(container: usize, value: u8) -> u32 {
+    (container as u32) << 8 | value as u32
+}
 
 impl Container {
     /// Read the container described by `descriptor` from `bytes`.
@@ -300,8 +322,29 @@ fn take(bytes: &mut Bytes, n: usize) -> KernelResult<Bytes> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+
+    /// Encodes `positions` as a Mumbling bitmap, writing every non-empty container dense, so
+    /// tests outside this module can build bitmaps from positions alone.
+    pub(crate) fn encode_positions(positions: &[u32]) -> Bytes {
+        let container_count = positions
+            .iter()
+            .max()
+            .map_or(0, |&max| split_position(max).0 + 1);
+        let mut by_container: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+        for &pos in positions {
+            let (container, value) = split_position(pos);
+            by_container.entry(container).or_default().push(value);
+        }
+        let entries: Vec<(usize, Body)> = by_container
+            .into_iter()
+            .map(|(container, values)| (container, Body::Dense(dense_bytes(&values))))
+            .collect();
+        encode_bitmap(container_count, &entries, None)
+    }
 
     /// A container body for building test buffers.
     enum Body {
@@ -518,8 +561,6 @@ mod tests {
 
     #[test]
     fn round_trip_across_many_containers() {
-        use std::collections::BTreeMap;
-
         let positions = [0u32, 255, 256, 0x12345, 40000, 0x1FFFF];
         let container_count = (*positions.iter().max().unwrap() as usize / 256) + 1;
         let mut by_container: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
@@ -541,6 +582,18 @@ mod tests {
         let mut expected = positions.to_vec();
         expected.sort_unstable();
         assert_eq!(decoded, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::empty(&[])]
+    #[case::one_container(&[0, 7, 8, 255])]
+    #[case::gap_between_containers(&[0, 600])]
+    // Container 256 needs a second 256-descriptor PFOR chunk.
+    #[case::second_descriptor_chunk(&[3, 0x10000, 0x10001])]
+    fn encode_positions_round_trips(#[case] positions: &[u32]) {
+        let bitmap = MumblingBitmap::deserialize(encode_positions(positions)).unwrap();
+        assert_eq!(bitmap.iter().collect::<Vec<_>>(), positions);
+        assert_eq!(bitmap.cardinality(), positions.len());
     }
 
     #[test]
@@ -685,6 +738,27 @@ mod tests {
         let from_iter: Vec<u32> = bitmap.iter().collect();
         assert_eq!(from_iter, vec![3, 5, 255, 512, 612, 767, 0x12345]);
         assert_eq!(from_iter.len(), bitmap.cardinality());
+    }
+
+    #[rstest::rstest]
+    #[case::from_zero(0, &[3, 5, 255, 512, 612, 767, 0x12345])]
+    #[case::mid_container(5, &[5, 255, 512, 612, 767, 0x12345])]
+    #[case::skips_empty_container(256, &[512, 612, 767, 0x12345])]
+    #[case::inside_dense_container(613, &[767, 0x12345])]
+    #[case::exact_last_position(0x12345, &[0x12345])]
+    #[case::past_last_position(0x12346, &[])]
+    #[case::past_last_container(u32::MAX, &[])]
+    fn iter_from_yields_ascending_positions_at_or_above_start(
+        #[case] start: u32,
+        #[case] expected: &[u32],
+    ) {
+        let entries = vec![
+            (0, Body::Sparse(vec![3, 5, 255])),
+            (2, Body::Dense(dense_bytes(&[0, 100, 255]))),
+            (0x123, Body::Sparse(vec![0x45])),
+        ];
+        let bitmap = MumblingBitmap::deserialize(encode_bitmap(292, &entries, None)).unwrap();
+        assert_eq!(bitmap.iter_from(start).collect::<Vec<_>>(), expected);
     }
 
     #[test]

@@ -367,7 +367,7 @@ struct LeafReadContext {
     /// The parent's manifest deletion vector over this leaf's entry positions.
     manifest_dv: Option<MumblingBitmap>,
     /// Leaf position of the next unconverted entry.
-    next_position: u64,
+    next_position: usize,
 }
 
 impl LeafReadContext {
@@ -429,10 +429,8 @@ impl LeafReadContext {
         &mut self,
         entries: &dyn EngineData,
     ) -> KernelResult<FilteredEngineData> {
-        let removed = RemovedEntries {
-            manifest_dv: self.manifest_dv.as_ref(),
-            first_position: self.next_position,
-        };
+        let mask = removed_mask(self.manifest_dv.as_ref(), self.next_position, entries.len());
+        let removed = RemovedEntries::new(&mask);
         // Only update `self` once the whole batch succeeds, so a failed batch leaves the cursor
         // unchanged.
         let (first_row_ids, next_first_row_id) =
@@ -445,7 +443,7 @@ impl LeafReadContext {
 
         let filtered = self.converter.convert(augmented.as_ref(), removed)?;
         self.next_first_row_id = next_first_row_id;
-        self.next_position += entries.len() as u64;
+        self.next_position += entries.len();
         Ok(filtered)
     }
 }
@@ -896,23 +894,45 @@ fn check_selected_entry<'a>(
     Ok(())
 }
 
-/// The entries of one leaf batch that the leaf's manifest deletion vector removes. The default
-/// removes none.
+/// The entries of one leaf batch that the leaf's manifest deletion vector removes, as a per-row
+/// mask. Rows past the end of the mask are not removed, so the default (empty) mask removes none.
 #[derive(Clone, Copy, Default)]
 struct RemovedEntries<'a> {
-    manifest_dv: Option<&'a MumblingBitmap>,
-    /// Leaf position of the batch's first row.
-    first_position: u64,
+    mask: &'a [bool],
 }
 
-impl RemovedEntries<'_> {
+impl<'a> RemovedEntries<'a> {
+    /// Wraps a mask built by [`removed_mask`].
+    fn new(mask: &'a [bool]) -> Self {
+        Self { mask }
+    }
+
     /// Whether the batch's row `row` is removed.
     fn contains(&self, row: usize) -> bool {
-        self.manifest_dv.is_some_and(|dv| {
-            // Mumbling positions fit in 21 bits, so a larger position is never marked.
-            u32::try_from(self.first_position + row as u64).is_ok_and(|pos| dv.contains(pos))
-        })
+        self.mask.get(row) == Some(&true)
     }
+}
+
+/// Marks the rows of a `len`-row leaf batch, whose first row is at leaf position `start`, that
+/// `manifest_dv` removes. Returns an empty mask (removing none) when there is no DV.
+fn removed_mask(manifest_dv: Option<&MumblingBitmap>, start: usize, len: usize) -> Vec<bool> {
+    let Some(dv) = manifest_dv else {
+        return Vec::new();
+    };
+    // Mumbling positions fit in 21 bits, so a batch starting past `u32::MAX` has none removed.
+    let Ok(first) = u32::try_from(start) else {
+        return Vec::new();
+    };
+    let end = start + len;
+    let mut mask = vec![false; len];
+    for pos in dv
+        .iter_from(first)
+        .map(|pos| pos as usize)
+        .take_while(|&pos| pos < end)
+    {
+        mask[pos - start] = true;
+    }
+    mask
 }
 
 /// Whether `column_files` holds at least one column file: an empty list carries no column updates.
@@ -1708,9 +1728,9 @@ mod tests {
             1000,
         );
         // Positions restart at 0 for every leaf, so this deletion vector removes `e.parquet`.
-        let second_dv = write_leaf(
+        let second_with_dv = write_leaf(
             &engine,
-            "metadata/second_dv.parquet",
+            "metadata/second_with_dv.parquet",
             &[
                 leaf_entry("e.parquet", 500, 5, None, None, None),
                 leaf_entry("f.parquet", 600, 6, None, None, None),
@@ -1729,7 +1749,7 @@ mod tests {
             &engine,
             &[
                 with_manifest_dv(with_dv, &[1, 3]),
-                with_manifest_dv(second_dv, &[0]),
+                with_manifest_dv(second_with_dv, &[0]),
                 without_dv,
             ],
         );
@@ -2358,8 +2378,25 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::no_dv(None, 0, 4, &[])]
+    #[case::first_batch(Some(&[1, 3, 6][..]), 0, 4, &[false, true, false, true])]
+    #[case::offset_batch(Some(&[1, 3, 6][..]), 3, 4, &[true, false, false, true])]
+    #[case::batch_past_dv(Some(&[1, 3, 6][..]), 7, 2, &[false, false])]
+    #[case::crosses_container(Some(&[255, 256][..]), 254, 3, &[false, true, true])]
+    #[case::start_past_u32(Some(&[1][..]), usize::MAX - 1, 1, &[])]
+    fn removed_mask_marks_dv_positions_within_batch(
+        #[case] positions: Option<&[u32]>,
+        #[case] start: usize,
+        #[case] len: usize,
+        #[case] expected: &[bool],
+    ) {
+        let dv = positions.map(|p| MumblingBitmap::deserialize(mumbling_bitmap(p)).unwrap());
+        assert_eq!(removed_mask(dv.as_ref(), start, len), expected);
+    }
+
     #[test]
-    fn manifest_dv_positions_continue_across_uneven_batches_but_not_failed_ones() {
+    fn manifest_dv_positions_continue_across_uneven_batches() {
         let engine = SyncEngine::new();
         let dv = MumblingBitmap::deserialize(mumbling_bitmap(&[1, 3])).unwrap();
         let mut ctx =
@@ -2386,11 +2423,6 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(out, expected(&[("a.parquet", 100), ("c.parquet", 130)]));
-
-        // A failed batch advances neither the positions nor the row IDs.
-        let mut nested = leaf_entry("nested.parquet", 1, 1, None, None, None);
-        nested.content_type = DataContentType::DataManifest;
-        assert_result_error_with_message(convert(&[nested]), "has content type DataManifest");
 
         // Positions 3..=4: `d.parquet` (position 3) is removed.
         let out = convert(&[

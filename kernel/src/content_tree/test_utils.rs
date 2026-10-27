@@ -3,9 +3,10 @@
 use std::iter;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use url::Url;
 
+/// Encodes manifest deletion vector positions as a Mumbling bitmap.
+pub(crate) use crate::content_tree::mumbling::tests::encode_positions as mumbling_bitmap;
 use crate::content_tree::{
     ContentTreeNodeEntry, DataContentType, DataFileFormat, ManifestInfo, TrackingInfo,
     TrackingStatus, AMT_FORMAT_VERSION,
@@ -125,48 +126,12 @@ pub(crate) fn write_manifest(
     }
 }
 
-/// Encodes `positions` as a Mumbling bitmap (version 1), so tests can build manifest deletion
-/// vectors. Every non-empty container is written dense, and the descriptor array uses the trivial
-/// PFOR scheme (`b1 = 8`: one raw byte per descriptor, no exceptions).
-pub(crate) fn mumbling_bitmap(positions: &[u32]) -> Bytes {
-    const DENSE: u8 = 0x20;
-    let container_count = positions
-        .iter()
-        .max()
-        .map_or(0, |&max| (max >> 8) as usize + 1);
-    let mut descriptors = vec![0u8; container_count];
-    let mut blocks = vec![[0u8; 32]; container_count];
-    for &pos in positions {
-        let (container, value) = ((pos >> 8) as usize, pos as u8);
-        descriptors[container] = DENSE;
-        // Dense containers are MSB-first: value 0 is the high bit of byte 0.
-        blocks[container][value as usize / 8] |= 1 << (7 - value % 8);
-    }
-    let cardinality: u32 = blocks.iter().flatten().map(|b| b.count_ones()).sum();
-
-    let mut buf = vec![0x01]; // format version
-    buf.extend_from_slice(&cardinality.to_le_bytes()[..3]);
-    buf.extend_from_slice(&(container_count as u16).to_le_bytes());
-    for chunk in descriptors.chunks(256) {
-        buf.extend_from_slice(&[0x08, 0x00, 0x00]); // b1=8, b2=0, no exceptions, min=0
-        buf.extend_from_slice(chunk);
-    }
-    // An empty sparse container (descriptor 0) has no body.
-    for (_, block) in descriptors.iter().zip(&blocks).filter(|(&d, _)| d == DENSE) {
-        buf.extend_from_slice(block);
-    }
-    Bytes::from(buf)
-}
-
 mod tests {
     use std::slice;
-
-    use rstest::rstest;
 
     use super::*;
     use crate::arrow::array::RecordBatch;
     use crate::arrow::compute::{cast, concat_batches};
-    use crate::content_tree::mumbling::MumblingBitmap;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
@@ -259,17 +224,5 @@ mod tests {
         for (actual, expected) in read.columns().iter().zip(expected.columns()) {
             assert_eq!(&cast(actual, expected.data_type()).unwrap(), expected);
         }
-    }
-
-    #[rstest]
-    #[case::empty(&[])]
-    #[case::one_container(&[0, 7, 8, 255])]
-    #[case::gap_between_containers(&[0, 600])]
-    // Container 256 needs a second 256-descriptor PFOR chunk.
-    #[case::second_descriptor_chunk(&[3, 0x10000, 0x10001])]
-    fn mumbling_bitmap_round_trips(#[case] positions: &[u32]) {
-        let bitmap = MumblingBitmap::deserialize(mumbling_bitmap(positions)).unwrap();
-        assert_eq!(bitmap.iter().collect::<Vec<_>>(), positions);
-        assert_eq!(bitmap.cardinality(), positions.len());
     }
 }
