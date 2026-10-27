@@ -23,29 +23,32 @@ use crate::{FileMeta, KernelError, KernelResult};
 ///
 /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
 pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult<Url> {
-    match scheme_len(path) {
-        Some(scheme_len) => {
-            reject_dot_segments(path)?;
-            let (prefix, raw_path) = split_authority(path, scheme_len);
-            uri_with_encoded_path(prefix, raw_path).map_err(|e| {
-                KernelError::generic(format!(
-                    "Failed to parse absolute AMT location {path:?}: {e}"
-                ))
-            })
-        }
+    match parse_absolute_amt_location(path)? {
+        Some(url) => Ok(url),
         None => encode_and_join(path, table_root),
     }
+}
+
+/// Parses an absolute AMT `path` into a [`Url`] with its path component percent-encoded, as
+/// [`resolve_amt_location`] does, or returns `None` if `path` is relative (has no URI scheme).
+pub(crate) fn parse_absolute_amt_location(path: &str) -> KernelResult<Option<Url>> {
+    let Some(scheme_len) = scheme_len(path) else {
+        return Ok(None);
+    };
+    reject_dot_segments(path)?;
+    let (prefix, raw_path) = split_authority(path, scheme_len);
+    let url = uri_with_encoded_path(prefix, raw_path).map_err(|e| {
+        KernelError::generic(format!(
+            "Failed to parse absolute AMT location {path:?}: {e}"
+        ))
+    })?;
+    Ok(Some(url))
 }
 
 /// Converts an absolute, percent-encoded `uri` (such as a Delta `p` deletion vector path) into the
 /// raw form AMT locations are stored in: the inverse of [`resolve_amt_location`] for an absolute
 /// path. The `scheme:[//authority]` prefix is kept verbatim and the path component is
 /// percent-decoded.
-///
-/// # Errors
-///
-/// Returns an error if `uri` has no URI scheme, does not parse as a [`Url`], carries a query or
-/// fragment (which a raw location cannot represent), or if its decoded path is not valid UTF-8.
 pub(crate) fn raw_amt_location_from_uri(uri: &str) -> KernelResult<String> {
     let invalid =
         |reason: &str| KernelError::generic(format!("Invalid absolute URI {uri:?}: {reason}"));
@@ -196,7 +199,7 @@ fn uri_with_encoded_path(prefix: &str, raw_path: &str) -> Result<Url, ParseError
 
 /// Rejects a `path` containing a `.` or `..` segment: the Iceberg V4 path spec does not support
 /// relative navigation, and URL parsing would otherwise silently collapse such segments.
-fn reject_dot_segments(path: &str) -> KernelResult<()> {
+pub(crate) fn reject_dot_segments(path: &str) -> KernelResult<()> {
     require!(
         !path
             .split('/')

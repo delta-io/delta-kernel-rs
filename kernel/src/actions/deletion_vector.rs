@@ -418,7 +418,7 @@ impl DeletionVectorDescriptor {
         let (marker, path) =
             Self::normalized_marker_and_path(storage_type, path_or_inline_dv, table_root)?;
         let offset = match storage_type {
-            DeletionVectorStorageType::Inline => offset,
+            DeletionVectorStorageType::Inline => None,
             _ => offset.or(Some(1)),
         };
         Ok(Self::unique_id_from_parts(marker, &path, offset))

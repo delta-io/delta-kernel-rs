@@ -134,40 +134,9 @@ pub(crate) struct DeletionVectorInfo {
     pub(crate) key_metadata: Option<Bytes>,
 }
 
-/// The `deletionVector.*` leaf columns [`DeletionVectorInfo::try_from_getters`] reads, in getter
-/// order.
+/// The `deletionVector.*` leaf columns of a content entry, in [`DeletionVectorInfo`] field order.
 pub(crate) static DV_INFO_COLUMNS: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| DeletionVectorInfo::to_schema().leaves(DV_INFO));
-
-impl DeletionVectorInfo {
-    /// Parses one row's `deletionVector` struct from `getters`, which must follow
-    /// [`DV_INFO_COLUMNS`] order. Returns `None` if the struct is null.
-    pub(crate) fn try_from_getters<'a>(
-        row: usize,
-        getters: &[&'a dyn GetData<'a>],
-    ) -> KernelResult<Option<Self>> {
-        let expected = DV_INFO_COLUMNS.as_ref().0.len();
-        if getters.len() != expected {
-            return Err(KernelError::internal_error(format!(
-                "Expected {expected} AMT deletion vector getters, got {}",
-                getters.len()
-            )));
-        }
-        // `location` is a required field of the struct, so it reads null iff the whole
-        // `deletionVector` struct is null.
-        let Some(location) = getters[0].get_opt(row, LOCATION)? else {
-            return Ok(None);
-        };
-        let key_metadata: Option<&[u8]> = getters[4].get_opt(row, KEY_METADATA)?;
-        Ok(Some(Self {
-            location,
-            offset: getters[1].get(row, DV_INFO_OFFSET)?,
-            size_in_bytes: getters[2].get(row, DV_INFO_SIZE_IN_BYTES)?,
-            cardinality: getters[3].get(row, DV_INFO_CARDINALITY)?,
-            key_metadata: key_metadata.map(Bytes::copy_from_slice),
-        }))
-    }
-}
 
 /// Sub-struct of ContentTreeNodeEntry that tracks details
 /// of the history of a file in the AMT (its current state,
