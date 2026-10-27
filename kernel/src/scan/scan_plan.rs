@@ -72,21 +72,18 @@ enum StatsKind {
 
 impl<'a> MetadataPlanner<'a> {
     pub(super) fn try_new(scan: &'a Scan) -> KernelResult<Self> {
-        let (pre_filter_stats_schema, stats_filter) = if scan.stats.synthesize_json {
-            // JSON output disables metadata filtering
-            (None, None)
-        } else {
-            (
-                scan.state_info.physical_stats_read_schema(),
-                stats_skipping_predicate(&scan.state_info),
-            )
-        };
-        let parsed_partition_schema =
-            if stats_filter.is_some() || scan.partition_values_options.parsed_struct {
-                scan.state_info.physical_partition_schema.as_ref()
-            } else {
-                None
-            };
+        let enable_metadata_filter = !scan.stats.synthesize_json;
+        let pre_filter_stats_schema = enable_metadata_filter
+            .then(|| scan.state_info.physical_stats_read_schema())
+            .flatten();
+        let stats_filter = enable_metadata_filter
+            .then(|| stats_skipping_predicate(&scan.state_info))
+            .flatten();
+        let need_partition_schema =
+            stats_filter.is_some() || scan.partition_values_options.parsed_struct;
+        let parsed_partition_schema = need_partition_schema
+            .then(|| scan.state_info.physical_partition_schema.as_ref())
+            .flatten();
 
         Ok(Self {
             scan,
@@ -856,6 +853,7 @@ mod tests {
         #[values(1, 32)] width: usize,
     ) -> KernelResult<()> {
         let expect_struct_stats = native_stats && (!stats.synthesize_json || !source_json_stats);
+        let expect_stats_passthrough = expect_struct_stats && !stats.synthesize_json;
         let partition_values = PartitionValuesOptions::with_struct();
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
         let table_schema = StructType::new_unchecked(partitioned_schema().fields().cloned().chain(
@@ -934,10 +932,7 @@ mod tests {
             let expression = project.expr.to_string();
             parses_partitions |= expression.contains("MAP_TO_STRUCT");
             assert!(!expression.contains("COALESCE"));
-            if expect_struct_stats
-                && !scan.stats.synthesize_json
-                && project.schema.contains(ADD_NAME)
-            {
+            if expect_stats_passthrough && project.schema.contains(ADD_NAME) {
                 assert!(!expression.contains("PARSE_JSON"));
                 assert!(!expression.contains(STATS_PARSED));
                 let Expr::StructPatch(patch) = project.expr.as_ref() else {
