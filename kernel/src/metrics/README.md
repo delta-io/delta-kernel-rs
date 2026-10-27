@@ -26,7 +26,8 @@ layer sees `error` and flips the event via `MetricEvent::into_failure`.
 `CrcValidationFailure` reports a mismatch between the CRC computed by log replay and the cached
 in-memory CRC at the same version. The checkpoint validator logs the mismatch separately at ERROR.
 
-Note: Only `numFiles` and `tableSizeBytes` are compared currently.
+Validation compares `numFiles` and `tableSizeBytes` when both CRCs have complete file stats,
+and independently compares `domainMetadata` when both have complete domain sets.
 
 ## Adding an event
 

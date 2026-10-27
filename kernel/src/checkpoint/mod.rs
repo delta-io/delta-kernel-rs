@@ -119,7 +119,7 @@ use crate::actions::{
     DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
     SIDECAR_FIELD,
 };
-use crate::crc::Crc;
+use crate::crc::{Crc, DomainMetadataState};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, Scalar};
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -180,7 +180,7 @@ pub struct LastCheckpointHintStats {
     /// The number of Add-file actions in the checkpoint.
     num_of_add_files: i64,
     /// CRC computed during checkpoint writing to validate the cached in-memory CRC.
-    /// Tracks only `numFiles` and `tableSizeBytes`.
+    /// Tracks `numFiles`, `tableSizeBytes`, and `domainMetadata`.
     // TODO(#3672): Track the remaining CRC fields.
     crc: Option<Arc<Mutex<Crc>>>,
 }
@@ -479,6 +479,7 @@ impl CheckpointWriter {
         // Process actions through reconciliation
         let crc = Arc::new(Mutex::new(Crc {
             version: self.snapshot.version(),
+            domain_metadata_state: DomainMetadataState::Complete(Default::default()),
             ..Default::default()
         }));
         let mut processor = ActionReconciliationProcessor::new(
@@ -527,8 +528,9 @@ impl CheckpointWriter {
     /// Finalizes checkpoint creation by saving metadata about the checkpoint.
     ///
     /// Compares the CRC computed during checkpoint writing with the cached in-memory CRC at the
-    /// snapshot's version, checking only `numFiles` and `tableSizeBytes` when both have complete
-    /// file stats. A mismatch emits a
+    /// snapshot's version. Compares `numFiles` and `tableSizeBytes` when both have complete file
+    /// stats, and independently compares `domainMetadata` when both have complete domain sets.
+    /// A mismatch emits a
     /// [`CrcValidationFailure`](crate::metrics::MetricEvent::CrcValidationFailure) metric and an
     /// error log without failing finalization.
     ///
@@ -762,24 +764,42 @@ impl CheckpointWriter {
                 return;
             }
         };
-        let (Some(in_memory_stats), Some(expected_stats)) =
+        let mut mismatch = false;
+        if let (Some(in_memory_stats), Some(expected_stats)) =
             (in_memory_crc.file_stats(), expected_crc.file_stats())
-        else {
-            return;
-        };
-        if in_memory_stats.num_files() != expected_stats.num_files()
-            || in_memory_stats.table_size_bytes() != expected_stats.table_size_bytes()
         {
+            if in_memory_stats.num_files() != expected_stats.num_files()
+                || in_memory_stats.table_size_bytes() != expected_stats.table_size_bytes()
+            {
+                mismatch = true;
+                error!(
+                    table_root = %self.snapshot.table_root(),
+                    version = self.snapshot.version(),
+                    expected_num_files = expected_stats.num_files(),
+                    actual_num_files = in_memory_stats.num_files(),
+                    expected_table_size_bytes = expected_stats.table_size_bytes(),
+                    actual_table_size_bytes = in_memory_stats.table_size_bytes(),
+                    "Checkpoint CRC mismatch in numFiles or tableSizeBytes"
+                );
+            }
+        }
+        if let (DomainMetadataState::Complete(actual), DomainMetadataState::Complete(expected)) = (
+            &in_memory_crc.domain_metadata_state,
+            &expected_crc.domain_metadata_state,
+        ) {
+            if actual != expected {
+                mismatch = true;
+                error!(
+                    table_root = %self.snapshot.table_root(),
+                    version = self.snapshot.version(),
+                    expected_num_domains = expected.len(),
+                    actual_num_domains = actual.len(),
+                    "Checkpoint CRC mismatch in domainMetadata"
+                );
+            }
+        }
+        if mismatch {
             emit_crc_validation_failure();
-            error!(
-                table_root = %self.snapshot.table_root(),
-                version = self.snapshot.version(),
-                expected_num_files = expected_stats.num_files(),
-                actual_num_files = in_memory_stats.num_files(),
-                expected_table_size_bytes = expected_stats.table_size_bytes(),
-                actual_table_size_bytes = in_memory_stats.table_size_bytes(),
-                "Checkpoint CRC mismatch in numFiles or tableSizeBytes"
-            );
         }
     }
 

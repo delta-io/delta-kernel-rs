@@ -96,6 +96,119 @@ async fn checkpoint_crc_mismatch_reports_without_blocking_write(
 }
 
 #[rstest]
+#[case::matching(Some(json!([
+    {"domain": "updated", "configuration": "new", "removed": false}
+])), false)]
+#[case::configuration_mismatch(Some(json!([
+    {"domain": "updated", "configuration": "different", "removed": false}
+])), true)]
+#[case::missing_domain(Some(json!([])), true)]
+#[case::extra_domain(Some(json!([
+    {"domain": "updated", "configuration": "new", "removed": false},
+    {"domain": "extra", "configuration": "extra", "removed": false}
+])), true)]
+#[case::removed_domain(Some(json!([
+    {"domain": "updated", "configuration": "new", "removed": false},
+    {"domain": "removed", "configuration": "old", "removed": false}
+])), true)]
+#[case::unavailable(None, false)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_crc_validates_domain_metadata_independently_of_file_stats(
+    #[case] domains: Option<Value>,
+    #[case] mismatch: bool,
+    #[values(
+        CheckpointSpec::V1,
+        CheckpointSpec::V2(V2CheckpointConfig::NoSidecar),
+        CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+            file_actions_per_sidecar_hint: Some(1),
+        })
+    )]
+    spec: CheckpointSpec,
+    #[values(false, true)] indeterminate_file_stats: bool,
+) -> KernelResult<()> {
+    let (_directory, table_path, engine) = test_table_setup_mt()?;
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let builder = create_table(
+        &table_path,
+        schema_ref! { nullable "id": INTEGER },
+        "test",
+        true, /* data_change */
+    )
+    .with_table_properties([("delta.feature.domainMetadata", "supported")])
+    .with_domain_metadata("updated", "old")
+    .with_domain_metadata("removed", "old");
+    let builder = match spec {
+        CheckpointSpec::V1 => builder,
+        CheckpointSpec::V2(_) => {
+            builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")])
+        }
+    };
+    let snapshot = builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let snapshot = insert_data(snapshot, &engine, vec![Arc::new(Int32Array::from(vec![1]))])
+        .await?
+        .unwrap_post_commit_snapshot();
+    let (_, snapshot) = snapshot.checkpoint(engine.as_ref(), Some(&spec))?;
+    let snapshot = snapshot
+        .update_table(
+            UpdateTableOperation::Write,
+            "test",
+            true, /* data_change */
+        )
+        .with_domain_metadata("updated", "new")
+        .with_domain_metadata_removed("removed")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    snapshot.write_checksum(engine.as_ref())?;
+    let crc_path = crc_file_path(&table_path, snapshot.version());
+    if let Some(domains) = domains {
+        modify_crc_on_disk(&crc_path, "domainMetadata", domains)?;
+    } else {
+        strip_field_from_crc(&table_path, snapshot.version(), "domainMetadata");
+    }
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let snapshot = if indeterminate_file_stats {
+        snapshot
+            .update_table(
+                UpdateTableOperation::Custom("ANALYZE STATS".to_string()),
+                "test",
+                true, /* data_change */
+            )
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot()
+    } else {
+        snapshot
+    };
+    assert_eq!(
+        snapshot.get_file_stats_if_present().is_none(),
+        indeterminate_file_stats
+    );
+    let (result, _) = snapshot.checkpoint(engine.as_ref(), Some(&spec))?;
+
+    assert_eq!(result, CheckpointWriteResult::Written);
+    assert_eq!(
+        reporter
+            .events()
+            .iter()
+            .filter(|event| matches!(event, MetricEvent::CrcValidationFailure))
+            .count(),
+        usize::from(mismatch)
+    );
+    std::fs::remove_file(crc_path)?;
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let domains = reloaded.get_all_domain_metadata(engine.as_ref())?;
+    assert_eq!(domains.len(), 1);
+    assert_eq!(domains[0].domain(), "updated");
+    assert_eq!(domains[0].configuration(), "new");
+    Ok(())
+}
+
+#[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkpoint_crc_validation_uses_in_memory_crc_after_commit(
     #[values("numFiles", "tableSizeBytes")] field: &str,
