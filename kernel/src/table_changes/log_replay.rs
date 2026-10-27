@@ -14,7 +14,7 @@ use crate::actions::{
     REMOVE_FIELD,
 };
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{column_name, ColumnName};
+use crate::expressions::{column_name, ColumnName, MapToStructOptions};
 use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
@@ -95,6 +95,7 @@ pub(crate) fn table_changes_action_iter_with_mode(
             predicate,
             start_table_configuration,
             scan_schema.clone(),
+            MapToStructOptions::default(),
         )
     });
 

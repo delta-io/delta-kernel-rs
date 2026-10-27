@@ -317,7 +317,7 @@ impl Scan {
         let has_partition_values_parsed =
             input_schema.contains_col([ADD_NAME, PARTITION_VALUES_PARSED_NAME]);
         let physical_partitions = self
-            .partition_values
+            .partition_values_options
             .parsed_struct
             .then_some(self.state_info.physical_partition_schema.as_ref())
             .flatten();

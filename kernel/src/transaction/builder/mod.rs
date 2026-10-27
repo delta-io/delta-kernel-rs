@@ -9,13 +9,14 @@ pub mod create_table;
 mod state;
 pub mod update_table;
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 pub(super) use self::state::TransactionBuilderState;
 use crate::actions::DomainMetadata;
 use crate::schema::SchemaRef;
 use crate::transaction::commit_info::collect_operation_metadata;
-use crate::transaction::{CreateTable, UpdateTable};
+use crate::transaction::{CreateTable, ExecutionMode, Imperative, UpdateTable};
 use crate::EngineData;
 
 /// A transaction type supported by [`TransactionBuilder`].
@@ -28,12 +29,14 @@ pub trait TransactionType: private::Sealed {
     type BuilderState: Send;
 }
 
-/// Configures a transaction of type `T`.
+/// Configures a transaction of type `T` and execution mode `MODE`.
 ///
 /// Shared setters preserve the transaction type. Constructors, type-specific setters, and
 /// `build` are provided by the specialized implementations for [`CreateTable`] and [`UpdateTable`].
 /// Use [`create_table`](super::create_table::create_table) or
 /// [`Snapshot::update_table`](crate::Snapshot::update_table) to obtain a builder.
+/// Both entry points select [`Imperative`]. With `declarative-plans`, use `with_execution_mode`
+/// to select another mode before building the transaction.
 ///
 /// The operation cannot be changed on a builder:
 ///
@@ -54,12 +57,25 @@ pub trait TransactionType: private::Sealed {
 ///     let _ = builder.with_table_properties([("app.version", "1")]);
 /// }
 /// ```
-pub struct TransactionBuilder<T: TransactionType = UpdateTable> {
+pub struct TransactionBuilder<T: TransactionType = UpdateTable, MODE: ExecutionMode = Imperative> {
     common_state: TransactionBuilderState,
     local_state: T::BuilderState,
+    _mode: PhantomData<MODE>,
 }
 
-impl<T: TransactionType> TransactionBuilder<T> {
+impl<T: TransactionType, MODE: ExecutionMode> TransactionBuilder<T, MODE> {
+    /// Selects `NewMode` for the transaction, preserving all accumulated configuration.
+    ///
+    /// Returns a builder whose `build` method constructs a transaction in the selected mode.
+    #[cfg(feature = "declarative-plans")]
+    pub fn with_execution_mode<NewMode: ExecutionMode>(self) -> TransactionBuilder<T, NewMode> {
+        TransactionBuilder {
+            common_state: self.common_state,
+            local_state: self.local_state,
+            _mode: PhantomData,
+        }
+    }
+
     /// Adds an application transaction identifier to emit as a `txn` action.
     ///
     /// Returns the updated builder. The action's `lastUpdated` value uses the transaction's commit
@@ -161,9 +177,16 @@ mod private {
 
 #[cfg(test)]
 mod tests {
+    use std::marker::PhantomData;
+
+    use rstest::rstest;
+
     use super::{private, TransactionBuilder, TransactionBuilderState, TransactionType};
     use crate::arrow::array::StringArray;
     use crate::schema::schema_ref;
+    #[cfg(feature = "declarative-plans")]
+    use crate::transaction::Declarative;
+    use crate::transaction::{ExecutionMode, Imperative};
     use crate::unit_test_utils::string_array_to_engine_data;
 
     struct CustomType;
@@ -179,6 +202,7 @@ mod tests {
             Self {
                 common_state: TransactionBuilderState::new(engine_info.into(), false),
                 local_state: (),
+                _mode: PhantomData,
             }
         }
     }
@@ -198,10 +222,19 @@ mod tests {
             )
     }
 
-    #[test]
-    fn custom_type_supports_shared_setters_without_custom_state() {
+    #[rstest]
+    #[case::imperative(Imperative::default())]
+    #[cfg_attr(
+        feature = "declarative-plans",
+        case::declarative(Declarative::default())
+    )]
+    fn custom_type_supports_shared_setters_without_custom_state<MODE: ExecutionMode>(
+        #[case] _mode: MODE,
+    ) {
         let builder = TransactionBuilder::<CustomType>::new("test-engine");
         let builder = configure_shared_setters(builder);
+        #[cfg(feature = "declarative-plans")]
+        let builder = builder.with_execution_mode::<MODE>();
 
         assert_eq!(builder.common_state.engine_info, "test-engine");
         assert_eq!(

@@ -11,7 +11,9 @@ use crate::expressions::{column_name, ColumnName};
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
 use crate::log_replay::{FileActionDeduplicator, FileActionKey};
 use crate::scan::data_skipping::DataSkippingFilter;
-use crate::scan::{PhysicalPredicate, COMMIT_READ_SCHEMA};
+use crate::scan::{
+    map_to_struct_options, PartitionValuesOptions, PhysicalPredicate, COMMIT_READ_SCHEMA,
+};
 use crate::schema::{ColumnNamesAndTypes, DataType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
@@ -29,6 +31,7 @@ pub struct IncrementalScanBuilder {
     target_snapshot: SnapshotRef,
     base_version: Version,
     predicate: Option<PredicateRef>,
+    partition_values_options: PartitionValuesOptions,
 }
 
 impl IncrementalScanBuilder {
@@ -38,6 +41,7 @@ impl IncrementalScanBuilder {
             target_snapshot: target_snapshot.into(),
             base_version,
             predicate: None,
+            partition_values_options: PartitionValuesOptions::default(),
         }
     }
 
@@ -57,6 +61,21 @@ impl IncrementalScanBuilder {
     /// regardless.
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
+        self
+    }
+
+    /// Configure how partition values are interpreted when pruning with [`Self::with_predicate`].
+    /// The timezone option has no effect without a predicate on partition columns.
+    ///
+    /// Defaults to [`PartitionValuesOptions::default`].
+    ///
+    /// Kernel does not yet support [`PartitionValuesOptions::with_struct`] in incremental scans.
+    /// Passing it causes [`Self::build`] to return an error.
+    pub fn with_partition_values(
+        mut self,
+        partition_values_options: PartitionValuesOptions,
+    ) -> Self {
+        self.partition_values_options = partition_values_options;
         self
     }
 
@@ -80,6 +99,7 @@ impl IncrementalScanBuilder {
     ///
     /// # Errors
     /// - `Err` if `base_version >= target_snapshot.version()` (caller error).
+    /// - [`KernelError::Unsupported`] if typed partition value output is requested.
     /// - [`KernelError::MissingColumn`] if a [`with_predicate`](Self::with_predicate) predicate
     ///   references a column absent from the table schema.
     /// - `Err` if the target snapshot's protocol contains an unsupported reader feature.
@@ -96,6 +116,13 @@ impl IncrementalScanBuilder {
                 "IncrementalScanBuilder: base_version ({}) must be less than target_version ({})",
                 self.base_version, target_version
             ))
+        );
+        // TODO(#3702): Support returning parsed partition values in incremental scans.
+        require!(
+            !self.partition_values_options.parsed_struct,
+            KernelError::unsupported(
+                "Kernel does not yet support returning parsed partition values in incremental scans"
+            )
         );
         // Resolve the predicate into an Add-side skipping strategy up front so `build` can
         // fail fast on a malformed predicate (e.g. references to unknown columns), rather
@@ -190,11 +217,19 @@ impl IncrementalScanBuilder {
                 // parse stats from `add.stats` JSON and partition values from
                 // `add.partitionValues`, then skip against the shared `DataSkippingFilter`.
                 // `None` (predicate ineligible for skipping) degrades to keep-all.
+                //
+                // Here we pass the timezone to MapToStruct unconditionally, even if the predicate
+                // does not reference a TIMESTAMP partition column. As a result, data skipping fails
+                // for an invalid timezone whenever it evaluates a predicate on any partition
+                // column. This is an intentional choice to reduce branches.
                 let filter = DataSkippingFilter::for_raw_action_batch(
                     engine,
                     physical_predicate,
                     table_configuration,
                     COMMIT_READ_SCHEMA.clone(),
+                    map_to_struct_options(
+                        self.partition_values_options.timestamp_timezone.as_deref(),
+                    ),
                 );
                 Ok(filter.map_or(AddSkipping::KeepAll, |f| AddSkipping::Filter(Arc::new(f))))
             }

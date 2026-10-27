@@ -32,6 +32,13 @@ if(UDT_IN_DEV)
   add_test(NAME udt_annotation_round_trip COMMAND udt_annotation_test
     "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/udt-annotations/")
 endif()
+add_executable(commit_range_commit_files commit_range_commit_files.c ../common/kernel_utils.c)
+target_compile_definitions(commit_range_commit_files PUBLIC DEFINE_DEFAULT_ENGINE_BASE)
+target_include_directories(commit_range_commit_files PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/ffi-headers"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../common")
+target_link_directories(commit_range_commit_files PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/debug")
+target_link_libraries(commit_range_commit_files PUBLIC delta_kernel_ffi)
 set(TestRunner "../../../tests/read-table-testing/run_test.sh")
 set(DatPath "../../../../acceptance/tests/dat/out/reader_tests/generated")
 set(ExpectedPath "../../../tests/read-table-testing/expected-data")
@@ -53,6 +60,10 @@ add_test(NAME read_arrow_metadata_basic COMMAND ${TestRunner} ${DatPath}/basic_p
 # prints per field.
 add_test(NAME read_column_mapping_metadata COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ExpectedPath}/column-mapping-arrow-metadata.expected -a)
 add_test(NAME read_projected_column_mapping COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ExpectedPath}/column-mapping-projected.expected -cletter,new_int)
+add_test(NAME commit_range_commit_files_basic_partitioned
+  COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/run_commit_range_commit_files_test.sh"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../acceptance/tests/dat/out/reader_tests/generated/basic_partitioned/delta/"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/expected-data/commit-range-commit-files-basic-partitioned.expected")
 if(GEO_TYPE_IN_DEV)
   target_compile_definitions(read_table PUBLIC DEFINE_GEO_TYPE_IN_DEV)
   add_test(NAME read_and_print_geo COMMAND ${TestRunner} ${KernelTestPath}/table-with-geo/ ${ExpectedPath}/table-with-geo.expected)
@@ -67,12 +78,15 @@ endif(WIN32)
 if(MSVC)
   target_compile_options(read_table PRIVATE /W3 /WX)
   target_compile_options(udt_annotation_test PRIVATE /W3 /WX)
+  target_compile_options(commit_range_commit_files PRIVATE /W3 /WX)
 else()
   # no-strict-prototypes because arrow headers have fn defs without prototypes
   target_compile_options(read_table PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-strict-prototypes -g -fsanitize=address)
   target_link_options(read_table PRIVATE -g -fsanitize=address)
   target_compile_options(udt_annotation_test PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-strict-prototypes -g -fsanitize=address)
   target_link_options(udt_annotation_test PRIVATE -g -fsanitize=address)
+  target_compile_options(commit_range_commit_files PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-strict-prototypes -g -fsanitize=address)
+  target_link_options(commit_range_commit_files PRIVATE -g -fsanitize=address)
 endif()
 
 if(VERBOSE)
