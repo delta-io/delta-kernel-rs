@@ -1,14 +1,16 @@
+use std::collections::HashSet;
+use std::mem::size_of;
+
 use rstest::rstest;
 
 use super::*;
+use crate::snapshot::memory::{hash_table_bytes, index_map_bytes, HeapSize, Memory, SizeContext};
 
-// Independent recursive traversal is an oracle for cache maintenance, never a production path.
+// Independent recursive oracle; production measures roots alongside logical-default validation.
 fn walk_schema(schema: &StructType) -> Memory {
     schema.type_name.heap_size(&mut SizeContext::default())
         + index_map_bytes::<String, StructField>(schema.fields.capacity())
-        + schema
-            .metadata_columns
-            .heap_size(&mut SizeContext::default())
+        + hash_table_bytes::<(MetadataColumnSpec, usize)>(schema.metadata_columns.capacity())
         + schema
             .fields
             .iter()
@@ -37,90 +39,173 @@ fn walk_type(data_type: &DataType) -> Memory {
                 + walk_type(&map.key_type)
                 + walk_type(&map.value_type)
         }
-        _ => data_type.heap_size(&mut SizeContext::default()),
+        DataType::Primitive(primitive) => primitive.heap_size(&mut SizeContext::default()),
+        #[cfg(feature = "udt-in-dev")]
+        DataType::UserDefined(_) => {
+            Memory::unavailable(crate::snapshot::memory::Unavailable::UnsupportedType)
+        }
+    }
+}
+
+fn check_representations(logical: &StructType, partitioned: bool, mode: ColumnMappingMode) {
+    let physical = logical.make_physical(mode).unwrap();
+    let partitions: HashSet<&str> = if partitioned {
+        ["partition"].into()
+    } else {
+        HashSet::new()
+    };
+    let logical_subset = StructType::new_unchecked(
+        logical
+            .fields()
+            .filter(|field| !partitions.contains(field.name().as_str()))
+            .cloned(),
+    );
+    let physical_subset = StructType::new_unchecked(
+        logical
+            .fields()
+            .zip(physical.fields())
+            .filter(|(logical, _)| !partitions.contains(logical.name().as_str()))
+            .map(|(_, physical)| physical.clone()),
+    );
+    let schemas = [logical, &physical, &logical_subset, &physical_subset];
+    let (has_default, memory) =
+        validate_defaults_and_measure_schemas(schemas, &partitions).unwrap();
+    assert_eq!(
+        has_default,
+        validate_column_defaults_metadata(logical).unwrap()
+    );
+    for (schema, measured) in schemas.into_iter().zip(memory) {
+        assert_eq!(measured, walk_schema(schema));
     }
 }
 
 #[rstest]
-fn construction_and_clone_summaries_match_oracle(
-    #[values(0, 1, 17, 128)] fields: usize,
+fn construction_clone_and_mutation_match_oracle(
+    #[values(0, 1, 17, 128)] width: usize,
     #[values(false, true)] nested: bool,
-    #[values(false, true)] checked: bool,
+    #[values(false, true)] partitioned: bool,
 ) {
-    let fields = (0..fields).map(|i| {
-        let ty = if nested {
-            MapType::new(
-                DataType::STRING,
-                ArrayType::new(
-                    StructType::new_unchecked([StructField::nullable("nested", DataType::STRING)]),
+    let fields = (0..width)
+        .map(|i| {
+            let ty = if nested {
+                MapType::new(
+                    DataType::STRING,
+                    ArrayType::new(
+                        StructType::new_unchecked([StructField::nullable(
+                            "nested",
+                            DataType::STRING,
+                        )]),
+                        true,
+                    ),
                     true,
-                ),
-                true,
-            )
-            .into()
-        } else {
-            DataType::STRING
-        };
-        let mut field = StructField::nullable(format!("field_{i}"), ty);
-        field.name.reserve(99);
-        field.metadata.insert(
-            "json".into(),
-            MetadataValue::Other(serde_json::json!({
-                "object": {"nested": ["hello", {"key": "value"}]}
-            })),
-        );
-        field
-    });
-    let schema = if checked {
-        StructType::try_new(fields).unwrap()
-    } else {
-        StructType::new_unchecked(fields)
-    };
-    assert_eq!(schema.retained_memory, walk_schema(&schema));
+                )
+                .into()
+            } else {
+                DataType::STRING
+            };
+            let mut field = StructField::nullable(format!("field_{i}"), ty);
+            field.name.reserve(99);
+            field.metadata.insert(
+                "json".into(),
+                MetadataValue::Other(serde_json::json!({
+                    "object": {"nested": ["hello", {"key": "value"}]}
+                })),
+            );
+            field
+        })
+        .chain([StructField::nullable("partition", DataType::LONG)]);
+    let mut schema = StructType::try_new(fields).unwrap();
+    check_representations(&schema, partitioned, ColumnMappingMode::None);
     let cloned = schema.clone();
     assert_eq!(cloned, schema);
-    assert_eq!(cloned.retained_memory, walk_schema(&cloned));
+    check_representations(&cloned, partitioned, ColumnMappingMode::None);
     let parsed: StructType =
         serde_json::from_str(&serde_json::to_string(&schema).unwrap()).unwrap();
     assert_eq!(parsed, schema);
-    assert_eq!(parsed.retained_memory, walk_schema(&parsed));
-}
-
-#[test]
-fn mutating_nested_schema_invalidates_parent_and_clone_rebuilds_summary() {
-    let schema = StructType::new_unchecked([StructField::nullable(
-        "outer",
-        StructType::new_unchecked([StructField::nullable("leaf", DataType::LONG)]),
-    )]);
-    let mut ty = DataType::from(schema);
-    let inner = ty.struct_at_path(&["outer".into()]).unwrap();
-    let field = inner.field_map_mut().get_mut("leaf").unwrap();
-    field
+    check_representations(&parsed, partitioned, ColumnMappingMode::None);
+    schema
+        .field_map_mut()
+        .get_mut("partition")
+        .unwrap()
         .metadata
         .insert("comment".into(), MetadataValue::String("x".repeat(8192)));
-    let DataType::Struct(schema) = &ty else {
-        panic!("struct expected")
+    check_representations(&schema, partitioned, ColumnMappingMode::None);
+}
+
+#[rstest]
+#[case::primitive(DataType::LONG)]
+#[case::nested_array(ArrayType::new(StructType::new_unchecked([
+    column_default::field_with_default("nested", DataType::LONG, "7")
+]), true).into())]
+#[case::variant(DataType::unshredded_variant())]
+#[case::file(DataType::file_type())]
+fn default_validation_matches_existing_validator(#[case] data_type: DataType) {
+    let schema = StructType::new_unchecked([column_default::field_with_default(
+        "field", data_type, "NULL",
+    )]);
+    check_representations(&schema, false, ColumnMappingMode::None);
+}
+
+#[rstest]
+fn mapped_and_partition_excluded_roots_match_oracle(
+    #[values(ColumnMappingMode::Name, ColumnMappingMode::Id)] mode: ColumnMappingMode,
+) {
+    let mapped = |field: StructField, id: i64| {
+        field.add_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref().to_owned(),
+                MetadataValue::Number(id),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName
+                    .as_ref()
+                    .to_owned(),
+                MetadataValue::String(format!("physical_{id}")),
+            ),
+        ])
     };
-    assert_eq!(
-        schema.retained_memory.total_bytes(),
-        Err(Unavailable::MutatedSchema)
-    );
-    let cloned = schema.clone();
-    assert_eq!(schema.as_ref(), cloned.as_ref());
-    assert_eq!(cloned.retained_memory, walk_schema(&cloned));
-    assert!(cloned.retained_memory.total_bytes().unwrap() >= 8192);
+    let schema = StructType::new_unchecked([
+        mapped(
+            StructField::nullable(
+                "outer",
+                StructType::new_unchecked([mapped(
+                    StructField::nullable("child", DataType::STRING),
+                    2,
+                )]),
+            ),
+            1,
+        ),
+        mapped(StructField::nullable("partition", DataType::LONG), 3),
+    ]);
+    check_representations(&schema, true, mode);
 }
 
 #[test]
-fn unchecked_duplicate_field_does_not_report_the_replaced_allocation() {
-    let schema = StructType::new_unchecked([
-        StructField::nullable("same", DataType::LONG),
-        StructField::nullable("same", DataType::STRING),
-    ]);
+fn malformed_nested_default_is_still_rejected() {
+    let schema = StructType::new_unchecked([StructField::nullable(
+        "outer",
+        StructType::new_unchecked([column_default::field_with_invalid_default("bad")]),
+    )]);
+    let before = validate_column_defaults_metadata(&schema).unwrap_err();
+    let after = validate_defaults_and_measure_schemas([&schema; 4], &HashSet::new()).unwrap_err();
+    assert_eq!(before.to_string(), after.to_string());
+}
+
+#[test]
+fn incompatible_companion_shape_marks_only_that_estimate_unavailable() {
+    let logical = StructType::new_unchecked([StructField::nullable("x", DataType::LONG)]);
+    let incompatible = StructType::new_unchecked([StructField::nullable(
+        "x",
+        ArrayType::new(DataType::LONG, true),
+    )]);
+    let (_, memory) = validate_defaults_and_measure_schemas(
+        [&logical, &incompatible, &logical, &logical],
+        &HashSet::new(),
+    )
+    .unwrap();
+    assert_eq!(memory[0], walk_schema(&logical));
     assert_eq!(
-        schema.retained_memory.total_bytes(),
-        Err(Unavailable::MutatedSchema)
+        memory[1].total_bytes(),
+        Err(crate::snapshot::memory::Unavailable::SchemaShape)
     );
-    let cloned = schema.clone();
-    assert_eq!(cloned.retained_memory, walk_schema(&cloned));
 }

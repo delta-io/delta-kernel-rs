@@ -3,7 +3,7 @@
 //! # Invariants
 //!
 //! The rules Kernel applies to column defaults, and where each comes from. This applies to
-//! [`ColumnDefault::new`], [`validate_column_defaults_metadata`], and the IcebergCompatV3 warnings
+//! [`ColumnDefault::new`], [`try_collect_column_defaults`], and the IcebergCompatV3 warnings
 //! in [`crate::table_features`]. Rules that follow the protocol are stated plainly; only kernel
 //! divergences are called out as such.
 //!
@@ -207,6 +207,7 @@ impl<'a> SchemaTransform<'a> for ColumnDefaultCollector<'a> {
 ///
 /// Propagates any error from [`try_collect_column_defaults`]: a `CURRENT_DEFAULT` whose value is
 /// not a string, or a non-NULL default on a Variant column.
+#[cfg(test)]
 pub(crate) fn validate_column_defaults_metadata(schema: &StructType) -> KernelResult<bool> {
     Ok(!try_collect_column_defaults(schema)?.is_empty())
 }

@@ -1,9 +1,10 @@
 //! Construction-time accounting for retained snapshot allocations.
 //!
-//! Schema nodes accumulate their children's summaries while being assembled. Snapshot finalization
-//! reads those summaries and samples log paths; it does not traverse the schema or log-file list.
-//! Metadata maps and JSON metadata payloads are counted at assembly. These costs are proportional
-//! to those payloads. Container layouts and URL capacities remain models, not hard limits.
+//! Table configuration measures schema roots during column-default validation. Snapshot
+//! finalization reads those summaries and samples log paths; it does not traverse the schema or
+//! log-file list. Metadata maps and JSON metadata payloads are counted at assembly. These costs are
+//! proportional to those payloads. Container layouts and URL capacities remain models, not hard
+//! limits.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash};
@@ -20,7 +21,7 @@ use url::Url;
 use crate::crc::{DomainMetadataState, FileStatsState, SetTransactionState};
 use crate::last_checkpoint_hint::HintAction;
 use crate::path::ParsedLogPath;
-use crate::schema::{DataType, MetadataColumnSpec, MetadataValue, PrimitiveType};
+use crate::schema::{MetadataColumnSpec, MetadataValue, PrimitiveType};
 use crate::table_features::TableFeature;
 
 /// Why a complete retained-memory estimate could not be produced.
@@ -30,8 +31,10 @@ use crate::table_features::TableFeature;
 pub(crate) enum Unavailable {
     /// An arithmetic operation exceeded the platform's addressable size.
     Overflow,
-    /// A mutable schema was exposed after its construction summary was collected.
-    MutatedSchema,
+    /// A schema was retained outside the measured table-configuration construction path.
+    UnmeasuredSchema,
+    /// Corresponding retained schema representations have incompatible shapes.
+    SchemaShape,
     /// Accounting for this schema type is not implemented.
     UnsupportedType,
     /// Accounting for adaptive metadata is not implemented.
@@ -177,6 +180,17 @@ pub(crate) struct SizeContext {
     len: usize,
 }
 impl SizeContext {
+    pub(crate) fn include_arc<T>(&mut self, value: &Arc<T>, heap: Memory) -> Memory {
+        let pointer = Arc::as_ptr(value) as usize;
+        if self.contains(pointer) {
+            return Memory::ZERO;
+        }
+        if !self.insert(pointer) {
+            return Memory::unavailable(Unavailable::TooManySharedObjects);
+        }
+        arc_allocation_bytes::<T>() + heap
+    }
+
     fn contains(&self, ptr: usize) -> bool {
         self.seen[..self.len].contains(&ptr)
     }
@@ -325,19 +339,6 @@ impl HeapSize for ParsedLogPath {
     }
 }
 
-impl HeapSize for DataType {
-    fn heap_size(&self, context: &mut SizeContext) -> Memory {
-        match self {
-            Self::Primitive(value) => value.heap_size(context),
-            Self::Array(v) => v.heap_size(context),
-            Self::Map(v) => v.heap_size(context),
-            Self::Struct(v) | Self::Variant(v) | Self::File(v) => v.heap_size(context),
-            #[cfg(feature = "udt-in-dev")]
-            Self::UserDefined(_) => Memory::unavailable(Unavailable::UnsupportedType),
-        }
-    }
-}
-
 impl HeapSize for MetadataValue {
     fn heap_size(&self, context: &mut SizeContext) -> Memory {
         match self {
@@ -456,7 +457,7 @@ mod tests {
     use crate::crc::Crc;
     use crate::log_segment::LogSegment;
     use crate::log_segment_files::LogSegmentFiles;
-    use crate::schema::{StructField, StructType};
+    use crate::schema::StructType;
     use crate::snapshot::Snapshot;
     use crate::table_configuration::TableConfiguration;
     use crate::FileMeta;
@@ -476,17 +477,14 @@ mod tests {
     }
 
     #[test]
-    fn shared_schema_is_counted_once_regardless_of_other_owners() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "id",
-            DataType::LONG,
-        )]));
-        let other_owner = schema.clone();
+    fn shared_allocation_is_counted_once_regardless_of_other_owners() {
+        let value = Arc::new(String::from("shared"));
+        let other_owner = value.clone();
         let mut context = SizeContext::default();
-        let first = schema.heap_size(&mut context);
-        assert!(first.total_bytes().unwrap() > size_of::<StructType>());
+        let first = value.heap_size(&mut context);
+        assert!(first.total_bytes().unwrap() > size_of::<String>());
         assert_eq!(other_owner.heap_size(&mut context), Memory::ZERO);
-        assert_eq!(schema.heap_size(&mut SizeContext::default()), first);
+        assert_eq!(value.heap_size(&mut SizeContext::default()), first);
     }
 
     #[test]
@@ -508,6 +506,19 @@ mod tests {
         let result = roots.heap_size(&mut SizeContext::default());
         assert_eq!(result.total_bytes(), Err(Unavailable::TooManySharedObjects));
     }
+
+    #[test]
+    fn unmeasured_schema_is_unavailable_but_known_shared_root_is_not_counted_twice() {
+        let schema = Arc::new(StructType::new_unchecked([]));
+        assert_eq!(
+            schema.heap_size(&mut SizeContext::default()).total_bytes(),
+            Err(Unavailable::UnmeasuredSchema)
+        );
+        let mut context = SizeContext::default();
+        context.include_arc(&schema, Memory::precise(42));
+        assert_eq!(schema.heap_size(&mut context), Memory::ZERO);
+    }
+
     #[test]
     fn snapshot_counts_stale_crc_and_preserves_estimate_with_extra_owners() {
         let metadata: Metadata = serde_json::from_value(serde_json::json!({
