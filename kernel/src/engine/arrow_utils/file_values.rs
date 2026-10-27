@@ -26,18 +26,14 @@ pub(crate) fn validate_file_values(
     let Some(file_paths) = FilePaths::of_struct(kernel_schema) else {
         return Ok(());
     };
-    validate(
-        data,
-        &file_paths,
-        &rows_present(data, None),
-        &mut Vec::new(),
-    )
+    // The top-level rows are all present; `validate` combines this with `data`'s own validity.
+    validate(data, &file_paths, &vec![true; data.len()], &mut Vec::new())
 }
 
 /// The parts of a schema that lead to `file` values: each `file`, and the structs, arrays and maps
 /// that contain one. Other fields are left out, so validating walks only these paths.
 #[derive(Debug)]
-pub(crate) enum FilePaths {
+enum FilePaths {
     File,
     /// The fields of a struct that contain a `file`.
     Struct(Vec<(String, FilePaths)>),
@@ -51,7 +47,7 @@ pub(crate) enum FilePaths {
 impl FilePaths {
     /// Returns the paths to the `file` values in `schema`, or `None` if it has none. Each field is
     /// visited once.
-    pub(crate) fn of_struct(schema: &StructType) -> Option<Self> {
+    fn of_struct(schema: &StructType) -> Option<Self> {
         let fields: Vec<_> = schema
             .fields()
             .filter_map(|field| Some((field.name().clone(), Self::of(field.data_type())?)))
@@ -77,41 +73,51 @@ impl FilePaths {
 }
 
 /// Returns, for each row of `array`, whether it is present: valid itself, and present in its
-/// parent (`parent_present`, if any, has one entry per row of `array`).
-fn rows_present(array: &dyn Array, parent_present: Option<&[bool]>) -> Vec<bool> {
+/// parent (`parent_present` has one entry per row of `array`).
+fn rows_present(array: &dyn Array, parent_present: &[bool]) -> Vec<bool> {
     (0..array.len())
-        .map(|row| array.is_valid(row) && parent_present.is_none_or(|present| present[row]))
+        .map(|row| array.is_valid(row) && parent_present[row])
         .collect()
 }
 
 /// Returns, for each of the `len` child values of a list or map, whether a present row uses it.
-/// `ranges` gives the child values each row uses.
+/// `range_of` gives the child values a row uses; it is only called for present rows, and ranges are
+/// clamped to `len`.
 fn entries_present(
-    ranges: impl Iterator<Item = Range<usize>>,
     rows_present: &[bool],
     len: usize,
+    range_of: impl Fn(usize) -> Range<usize>,
 ) -> Vec<bool> {
-    let mut entries = vec![false; len];
-    for (range, _) in ranges.zip(rows_present).filter(|(_, present)| **present) {
-        entries[range].fill(true);
+    // Mark where each present row's range starts and ends; a running count above zero means a value
+    // is used. This stays linear even when list-view ranges overlap.
+    let mut starts_minus_ends = vec![0i64; len + 1];
+    for row in (0..rows_present.len()).filter(|&row| rows_present[row]) {
+        let range = range_of(row);
+        let (start, end) = (range.start.min(len), range.end.min(len));
+        if start < end {
+            starts_minus_ends[start] += 1;
+            starts_minus_ends[end] -= 1;
+        }
     }
-    entries
-}
-
-/// The child values each row of a list or map uses, from its offsets.
-fn offset_ranges<O: OffsetSizeTrait>(offsets: &[O]) -> impl Iterator<Item = Range<usize>> + '_ {
-    offsets.windows(2).map(|w| w[0].as_usize()..w[1].as_usize())
-}
-
-/// The child values each row of a list view uses, from its offsets and sizes.
-fn view_ranges<'a, O: OffsetSizeTrait>(
-    offsets: &'a [O],
-    sizes: &'a [O],
-) -> impl Iterator<Item = Range<usize>> + 'a {
-    offsets
+    let mut count = 0;
+    starts_minus_ends[..len]
         .iter()
-        .zip(sizes)
-        .map(|(offset, size)| offset.as_usize()..offset.as_usize() + size.as_usize())
+        .map(|delta| {
+            count += delta;
+            count > 0
+        })
+        .collect()
+}
+
+/// The child values row `row` of a list or map uses, from its offsets.
+fn offset_range<O: OffsetSizeTrait>(offsets: &[O], row: usize) -> Range<usize> {
+    offsets[row].as_usize()..offsets[row + 1].as_usize()
+}
+
+/// The child values row `row` of a list view uses, from its offset and size.
+fn view_range<O: OffsetSizeTrait>(offsets: &[O], sizes: &[O], row: usize) -> Range<usize> {
+    let start = offsets[row].as_usize();
+    start..start + sizes[row].as_usize()
 }
 
 /// Returns the child values of the list-like `array` and which of them a present row uses.
@@ -119,38 +125,42 @@ fn list_entries<'a>(
     array: &'a dyn Array,
     present: &[bool],
 ) -> KernelResult<(&'a dyn Array, Vec<bool>)> {
-    let entries = |values: &'a dyn Array, ranges: &mut dyn Iterator<Item = Range<usize>>| {
-        let entries = entries_present(ranges, present, values.len());
-        (values, entries)
-    };
     let list = match array.data_type() {
         ArrowDataType::List(_) => array.as_list_opt::<i32>().map(|list| {
-            entries(
-                list.values().as_ref(),
-                &mut offset_ranges(list.value_offsets()),
-            )
+            let offsets = list.value_offsets();
+            let entries = entries_present(present, list.values().len(), |row| {
+                offset_range(offsets, row)
+            });
+            (list.values().as_ref(), entries)
         }),
         ArrowDataType::LargeList(_) => array.as_list_opt::<i64>().map(|list| {
-            entries(
-                list.values().as_ref(),
-                &mut offset_ranges(list.value_offsets()),
-            )
+            let offsets = list.value_offsets();
+            let entries = entries_present(present, list.values().len(), |row| {
+                offset_range(offsets, row)
+            });
+            (list.values().as_ref(), entries)
         }),
         ArrowDataType::ListView(_) => array.as_list_view_opt::<i32>().map(|list| {
-            let mut ranges = view_ranges(list.value_offsets(), list.value_sizes());
-            entries(list.values().as_ref(), &mut ranges)
+            let (offsets, sizes) = (list.value_offsets(), list.value_sizes());
+            let entries = entries_present(present, list.values().len(), |row| {
+                view_range(offsets, sizes, row)
+            });
+            (list.values().as_ref(), entries)
         }),
         ArrowDataType::LargeListView(_) => array.as_list_view_opt::<i64>().map(|list| {
-            let mut ranges = view_ranges(list.value_offsets(), list.value_sizes());
-            entries(list.values().as_ref(), &mut ranges)
+            let (offsets, sizes) = (list.value_offsets(), list.value_sizes());
+            let entries = entries_present(present, list.values().len(), |row| {
+                view_range(offsets, sizes, row)
+            });
+            (list.values().as_ref(), entries)
         }),
         ArrowDataType::FixedSizeList(..) => array.as_fixed_size_list_opt().map(|list| {
             let length = list.value_length() as usize;
-            let mut ranges = (0..list.len()).map(|row| {
+            let entries = entries_present(present, list.values().len(), |row| {
                 let start = list.value_offset(row) as usize;
                 start..start + length
             });
-            entries(list.values().as_ref(), &mut ranges)
+            (list.values().as_ref(), entries)
         }),
         _ => None,
     };
@@ -170,7 +180,7 @@ fn validate(
     parent_present: &[bool],
     path: &mut Vec<String>,
 ) -> KernelResult<()> {
-    let current_present = rows_present(array, Some(parent_present));
+    let current_present = rows_present(array, parent_present);
     match file_paths {
         FilePaths::File => validate_file(as_struct(array)?, &current_present, path),
         FilePaths::Struct(fields) => {
@@ -196,11 +206,10 @@ fn validate(
             let map = array.as_map_opt().ok_or_else(|| {
                 make_arrow_error("Arrow claimed to be a map but isn't a MapArray")
             })?;
-            let entries = entries_present(
-                offset_ranges(map.value_offsets()),
-                &current_present,
-                map.entries().len(),
-            );
+            let offsets = map.value_offsets();
+            let entries = entries_present(&current_present, map.entries().len(), |row| {
+                offset_range(offsets, row)
+            });
             if let Some(key) = key {
                 validate(map.keys().as_ref(), key, &entries, path)?;
             }
@@ -231,17 +240,26 @@ fn validate_file(file: &StructArray, present: &[bool], path: &[String]) -> Kerne
     let (uri, inline) = (field("uri")?, field("inline")?);
     let (offset, size) = (int64("offset")?, int64("size")?);
     for row in (0..file.len()).filter(|&row| present[row]) {
+        // The rules of the Parquet `FILE` specification, quoted from its `offset` and `size`
+        // fields and its Resolution section.
         let problem = if uri.is_null(row) && inline.is_null(row) {
+            // Resolution: with neither set, the value resolves to "nothing - invalid".
             "neither `uri` nor `inline` is set"
         } else if uri.is_null(row) && offset.is_valid(row) {
+            // `offset`: "may only be set together with `uri`".
             "`offset` is set without `uri`"
         } else if uri.is_null(row) && size.is_valid(row) {
+            // Resolution: `size` without `uri` is "invalid", including alongside `inline`, whose
+            // locator fields "must form a locator valid on its own".
             "`size` is set without `uri`"
         } else if offset.is_valid(row) && size.is_null(row) {
+            // `size`: "must be set whenever `offset` is set".
             "`offset` is set without `size`"
         } else if offset.is_valid(row) && offset.value(row) < 0 {
+            // `offset`: "must not be < 0".
             "`offset` is negative"
         } else if size.is_valid(row) && size.value(row) < 0 {
+            // `size`: "must be zero or a positive integer if set".
             "`size` is negative"
         } else {
             continue;
@@ -262,8 +280,8 @@ mod tests {
 
     use super::*;
     use crate::arrow::array::{
-        ArrayRef, BinaryArray, FixedSizeListArray, Int64Array, LargeListArray, ListArray,
-        ListViewArray, MapArray, StringArray,
+        ArrayRef, BinaryArray, FixedSizeListArray, Int64Array, LargeListArray, LargeListViewArray,
+        ListArray, ListViewArray, MapArray, StringArray,
     };
     use crate::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{Field, Fields};
@@ -472,6 +490,49 @@ mod tests {
             ArrayType::new(DataType::file_type(), true),
         )]);
         (data, schema)
+    }
+
+    /// A slice that starts past the first row checks only the values its rows use, for a list and
+    /// for a fixed-size list wider than one value.
+    #[test]
+    fn slices_from_nonzero_start_check_only_their_values() {
+        let (data, schema) = list_of_files(file_array(&[INVALID, VALID]), &[0, 1, 2], None);
+        validate_file_values(&data.slice(1, 1), &schema).unwrap();
+        validate_file_values(&data, &schema).unwrap_err();
+
+        let file = file_array(&[INVALID, INVALID, VALID, VALID]);
+        let list = FixedSizeListArray::new(
+            Arc::new(Field::new("element", file.data_type().clone(), true)),
+            2,
+            Arc::new(file),
+            None,
+        );
+        let (data, schema) = array_column(Arc::new(list));
+        validate_file_values(&data.slice(1, 1), &schema).unwrap();
+        validate_file_values(&data, &schema).unwrap_err();
+    }
+
+    /// In a large list view, as in a list view, a row uses the values its offset and size give,
+    /// and overlapping views are checked once per value.
+    #[test]
+    fn large_list_view_values_follow_present_rows() {
+        let large_list_view = |offsets: Vec<i64>, sizes: Vec<i64>, nulls| {
+            let file = file_array(&[VALID, INVALID]);
+            let list = LargeListViewArray::new(
+                Arc::new(Field::new("element", file.data_type().clone(), true)),
+                ScalarBuffer::from(offsets),
+                ScalarBuffer::from(sizes),
+                Arc::new(file),
+                nulls,
+            );
+            array_column(Arc::new(list))
+        };
+        // Both rows view the valid value; only the null row's view reaches the invalid one.
+        let nulls = Some(NullBuffer::from(vec![false, true]));
+        let (data, schema) = large_list_view(vec![0, 0], vec![2, 1], nulls);
+        validate_file_values(&data, &schema).unwrap();
+        let (data, schema) = large_list_view(vec![0, 0], vec![2, 1], None);
+        validate_file_values(&data, &schema).unwrap_err();
     }
 
     /// In a list view, a row uses the values its offset and size give, in any order, so an invalid
