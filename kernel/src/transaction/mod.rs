@@ -1616,13 +1616,17 @@ impl<STATE> Transaction<STATE, Imperative> {
         )
         .validate_batches(&self.staged_data_changes.add_files_metadata)?;
 
+        let row_tracking_enabled = self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::RowTracking);
         write_validation::StagedDataValidator::for_dv_updates(
             self.effective_table_config.physical_partition_columns(),
+            row_tracking_enabled,
         )?
         .validate_selected_rows(&self.staged_data_changes.dv_matched_files)?;
 
         // Validate required fields for RemoveFile.
-        write_validation::StagedDataValidator::for_remove_files()
+        write_validation::StagedDataValidator::for_remove_files(row_tracking_enabled)
             .validate_selected_rows(&self.staged_data_changes.remove_files_metadata)?;
 
         Ok(())
