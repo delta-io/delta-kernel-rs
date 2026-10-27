@@ -9,7 +9,6 @@
 - `selected-conditions.json`: the allowlist of exact leaf condition names to expose in Kernel.
   Subclasses use `PARENT.SUB`; selecting a parent does not select its children.
 
-The allowlist starts with the schema and log-version conditions covered by the metadata tests.
 Add conditions alongside the factories and call sites that need them. Preserve upstream names,
 SQLSTATEs, message templates, and parameter names. Duplicate selections, unknown names, and
 selected names that map to the same Rust variant are rejected.

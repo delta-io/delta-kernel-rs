@@ -48,40 +48,7 @@ impl DeltaErrorCondition {
 mod tests {
     use std::collections::HashSet;
 
-    use rstest::rstest;
-
     use super::*;
-
-    #[rstest]
-    #[case::top_level(
-        DeltaErrorCondition::DeltaVersionsNotContiguous,
-        "DELTA_VERSIONS_NOT_CONTIGUOUS",
-        Some("KD00C"),
-        &["versionList", "startVersion", "endVersion", "versionToLoad"],
-        "Versions (<versionList>) are not contiguous. \nA gap in the delta log between versions \
-         <startVersion> and <endVersion> was detected while trying to load version \
-         <versionToLoad>."
-    )]
-    #[case::subclass_inherits_sql_state(
-        DeltaErrorCondition::DeltaCannotWriteEmptySchemaStructNoFields,
-        "DELTA_CANNOT_WRITE_EMPTY_SCHEMA.STRUCT_NO_FIELDS",
-        Some("428GU"),
-        &["columnPath"],
-        "The Delta table is not writable because parts of the schema are not supported.\nReason: \
-         The column <columnPath> is a struct with no fields."
-    )]
-    fn condition_metadata(
-        #[case] condition: DeltaErrorCondition,
-        #[case] name: &str,
-        #[case] sql_state: Option<&str>,
-        #[case] parameter_names: &[&str],
-        #[case] message_template: &str,
-    ) {
-        assert_eq!(condition.name(), name);
-        assert_eq!(condition.sql_state(), sql_state);
-        assert_eq!(condition.parameter_names(), parameter_names);
-        assert_eq!(condition.message_template(), message_template);
-    }
 
     #[test]
     fn all_conditions_have_unique_names_and_parameters_in_template() {

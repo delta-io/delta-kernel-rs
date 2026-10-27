@@ -12,34 +12,16 @@ use super::ConditionMetadata;
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DeltaErrorCondition {
-    /// `DELTA_CANNOT_WRITE_EMPTY_SCHEMA.STRUCT_NO_FIELDS` (SQLSTATE `428GU`).
-    DeltaCannotWriteEmptySchemaStructNoFields,
-    /// `DELTA_VERSIONS_NOT_CONTIGUOUS` (SQLSTATE `KD00C`).
-    DeltaVersionsNotContiguous,
 }
 
 impl DeltaErrorCondition {
     // Lets invariant tests check metadata for every selected condition.
     #[cfg(test)]
     pub(super) const ALL: &'static [Self] = &[
-        Self::DeltaCannotWriteEmptySchemaStructNoFields,
-        Self::DeltaVersionsNotContiguous,
     ];
 
     pub(super) const fn metadata(self) -> ConditionMetadata {
         match self {
-            Self::DeltaCannotWriteEmptySchemaStructNoFields => ConditionMetadata {
-                name: "DELTA_CANNOT_WRITE_EMPTY_SCHEMA.STRUCT_NO_FIELDS",
-                sql_state: Some("428GU"),
-                parameter_names: &["columnPath"],
-                message_template: "The Delta table is not writable because parts of the schema are not supported.\nReason: The column <columnPath> is a struct with no fields.",
-            },
-            Self::DeltaVersionsNotContiguous => ConditionMetadata {
-                name: "DELTA_VERSIONS_NOT_CONTIGUOUS",
-                sql_state: Some("KD00C"),
-                parameter_names: &["versionList", "startVersion", "endVersion", "versionToLoad"],
-                message_template: "Versions (<versionList>) are not contiguous. \nA gap in the delta log between versions <startVersion> and <endVersion> was detected while trying to load version <versionToLoad>.",
-            },
         }
     }
 }
