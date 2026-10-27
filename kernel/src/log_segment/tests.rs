@@ -5139,7 +5139,7 @@ async fn test_try_new_with_crc_file_rejects_invalid_path(
     })
     .await;
     let url = Url::parse(path).unwrap();
-    let crc_path = ParsedLogPath::try_from(url).unwrap().unwrap();
+    let crc_path = ParsedLogPath::new(url).unwrap();
     let result = log_segment.try_new_with_crc_file(crc_path);
     assert_result_error_with_message(result, expected_error);
 }
@@ -5153,7 +5153,7 @@ async fn test_try_new_with_crc_file_sets_crc_and_preserves_other_fields() {
     })
     .await;
     let url = Url::parse("file:///_delta_log/00000000000000000002.crc").unwrap();
-    let crc_path = ParsedLogPath::try_from(url).unwrap().unwrap();
+    let crc_path = ParsedLogPath::new(url).unwrap();
     let result = log_segment.try_new_with_crc_file(crc_path).unwrap();
 
     let crc_file = result.listed.latest_crc_file.as_ref().unwrap();
