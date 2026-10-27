@@ -28,6 +28,10 @@ pub(crate) trait ParquetRowGroupSkipping {
     ///
     /// If a [`RowIndexBuilder`] is provided, it will be updated to only include row indices of the
     /// row groups that survived the filter.
+    ///
+    /// Build the reader with [`crate::engine::reader_options`] (or equivalent options that ignore
+    /// embedded Arrow schema metadata) and cast timestamp output to Kernel's microsecond types.
+    /// Footer timestamp units come from Parquet annotations and must agree with decoded values.
     fn with_row_group_filter(
         self,
         predicate: &Predicate,
@@ -44,6 +48,9 @@ pub(crate) trait ParquetRowGroupSkipping {
     /// Statistics for data columns are null-guarded: if a stat column contains any null values
     /// in the row group (indicating some files lack that statistic), the stat is treated as
     /// unavailable to prevent false pruning.
+    ///
+    /// The reader must satisfy the options and timestamp-cast requirements of
+    /// [`Self::with_row_group_filter`].
     // TODO: remove #[allow(dead_code)] once production callers land
     #[allow(dead_code)]
     fn with_checkpoint_row_group_filter(
@@ -305,9 +312,10 @@ fn timestamp_from_date(days: Option<&i32>) -> Option<Scalar> {
 
 /// Converts an INT64 footer timestamp bound to the microsecond value the reader returns.
 ///
-/// Keep returned bounds consistent with the casts allowed by `check_cast_compat` in
-/// `engine/ensure_data_types.rs`: timestamp annotations determine the source unit, and unannotated
-/// INT64 values are interpreted as microseconds.
+/// Requires the metadata policy from [`crate::engine::reader_options`]: parquet-rs derives the
+/// decoded source type from Parquet annotations, ignoring the embedded Arrow schema. Bounds must
+/// match Arrow's cast to microseconds, allowed by `check_cast_compat` in
+/// `engine/ensure_data_types.rs`; unannotated INT64 values are reinterpreted as microseconds.
 ///
 /// Returns `None` for non-timestamp annotations or scaling overflow, so that bound cannot justify
 /// skipping a row group.

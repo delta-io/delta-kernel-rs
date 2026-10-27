@@ -13,6 +13,7 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema, TimeUnit as ArrowTimeUnit,
     TimestampMicrosecondType,
 };
+use crate::engine::reader_options;
 use crate::expressions::{
     col, column_name, column_pred, lit, Expression, OpaquePredicateOp, ScalarExpressionEvaluator,
 };
@@ -26,9 +27,10 @@ use crate::parquet::arrow::ArrowWriter;
 use crate::parquet::basic::Type as PhysicalType;
 use crate::parquet::data_type::{ByteArray, FixedLenByteArray};
 use crate::parquet::file::properties::WriterProperties;
-use crate::parquet::file::reader::FileReader;
+use crate::parquet::file::reader::{ChunkReader, FileReader};
 use crate::parquet::file::serialized_reader::SerializedFileReader;
 use crate::parquet::schema::types::{ColumnPath, Type};
+use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
 use crate::{KernelResult, Predicate};
 
 /// Empty partition column set for tests that don't need partition columns.
@@ -66,7 +68,7 @@ static NO_PARTITIONS: LazyLock<HashSet<String>> = LazyLock::new(HashSet::new);
 #[test]
 fn test_get_stat_values() {
     let file = File::open("./tests/data/parquet_row_group_skipping/part-00000-b92e017a-50ba-4676-8322-48fc371c2b59-c000.snappy.parquet").unwrap();
-    let metadata = ArrowReaderMetadata::load(&file, Default::default()).unwrap();
+    let metadata = ArrowReaderMetadata::load(&file, reader_options()).unwrap();
 
     // The predicate doesn't matter -- it just needs to mention all the columns we care about.
     let columns = Predicate::and_from(vec![
@@ -504,7 +506,7 @@ fn timestamp_row_group_skipping_rescales_footer_units(
             .map(|batch| batch.unwrap().num_rows())
             .sum()
     };
-    let builder = || ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).unwrap();
+    let builder = || parquet_reader(bytes.clone());
 
     let predicate = comparison(Expression::column(col_path), bound.clone());
     assert_eq!(
@@ -540,7 +542,7 @@ fn timestamp_footer_stats_match_arrow_microsecond_cast(
     #[values(None, Some("UTC"))] timezone: Option<&str>,
 ) {
     let bytes = write_timestamp_parquet(unit, timezone, &["ts"], &[&[raw]]);
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+    let builder = parquet_reader(bytes);
     let predicate = column_pred!("ts");
     let filter = RowGroupFilter::new(builder.metadata().row_group(0), &predicate);
     let (data_type, scalar) = timestamp_kind(timezone);
@@ -573,7 +575,7 @@ fn timestamp_footer_stat_overflow_keeps_row_group(
     #[values(None, Some("UTC"))] timezone: Option<&str>,
 ) {
     let bytes = write_timestamp_parquet(ArrowTimeUnit::Millisecond, timezone, &["ts"], &[raw]);
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+    let builder = parquet_reader(bytes);
     let row_group = builder.metadata().row_group(0);
     let predicate = column_pred!("ts");
     let filter = RowGroupFilter::new(row_group, &predicate);
@@ -630,7 +632,7 @@ fn timestamp_row_group_skipping_uses_only_available_bounds(
         &["ts"],
         &[&[1_000, 2_000]],
     );
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+    let builder = parquet_reader(bytes);
     let row_group = builder.metadata().row_group(0);
     let mut column =
         ColumnChunkMetaData::builder(row_group.column(0).column_descr_ptr()).set_num_values(2);
@@ -755,7 +757,7 @@ fn timestamp_checkpoint_stats_rescale_before_widening(
         &["add", "stats_parsed", stat, "ts"],
         &[&[micros_to_unit(1_001_000, unit)]],
     );
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+    let builder = parquet_reader(bytes);
     let predicate = column_pred!("ts");
     let filter =
         CheckpointRowGroupFilter::new(builder.metadata().row_group(0), &predicate, &NO_PARTITIONS);
@@ -772,6 +774,46 @@ fn timestamp_checkpoint_stats_rescale_before_widening(
         )
     };
     assert_eq!(actual, Some(scalar(expected)));
+}
+
+#[rstest]
+fn timestamp_checkpoint_meta_predicate_preserves_truncated_max(
+    #[values(
+        ArrowTimeUnit::Millisecond,
+        ArrowTimeUnit::Microsecond,
+        ArrowTimeUnit::Nanosecond
+    )]
+    unit: ArrowTimeUnit,
+    #[values(None, Some("UTC"))] timezone: Option<&str>,
+) {
+    let bytes = write_timestamp_parquet(
+        unit,
+        timezone,
+        &["stats_parsed", MAX_VALUES, "ts"],
+        &[
+            &[micros_to_unit(1_000_000, unit)],
+            &[micros_to_unit(1_001_000, unit)],
+        ],
+    );
+    let (_, scalar) = timestamp_kind(timezone);
+    let predicate = as_checkpoint_skipping_predicate(
+        &Predicate::gt(col!("ts"), lit(scalar(1_001_500))),
+        &HashSet::new(),
+        &HashSet::new(),
+        &HashSet::from([column_name!("ts")]),
+    )
+    .unwrap();
+    let rows: usize = parquet_reader(bytes)
+        .with_row_group_filter(&predicate, None)
+        .build()
+        .unwrap()
+        .map(|batch| batch.unwrap().num_rows())
+        .sum();
+    assert_eq!(rows, 1);
+}
+
+fn parquet_reader<T: ChunkReader + 'static>(data: T) -> ParquetRecordBatchReaderBuilder<T> {
+    ParquetRecordBatchReaderBuilder::try_new_with_options(data, reader_options()).unwrap()
 }
 
 fn write_timestamp_parquet(
@@ -828,7 +870,7 @@ fn test_extract_nullcount_distinguishes_missing_from_zero() {
 #[test]
 fn test_row_group_filter_is_null_prunes_when_nullcount_is_zero() {
     let file = File::open("./tests/data/parquet_row_group_skipping/part-00000-b92e017a-50ba-4676-8322-48fc371c2b59-c000.snappy.parquet").unwrap();
-    let metadata = ArrowReaderMetadata::load(&file, Default::default()).unwrap();
+    let metadata = ArrowReaderMetadata::load(&file, reader_options()).unwrap();
     let row_group = metadata.metadata().row_group(0);
 
     assert!(!RowGroupFilter::apply(
@@ -1512,9 +1554,7 @@ fn checkpoint_filter_multi_row_group_skipping() {
     writer.close().unwrap();
 
     let file = File::open(tmp.path()).unwrap();
-    let builder =
-        crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-            .unwrap();
+    let builder = parquet_reader(file);
     assert_eq!(builder.metadata().num_row_groups(), 2);
 
     let predicate = Predicate::gt(col!("x"), lit(500i64));

@@ -279,7 +279,8 @@ fn check_cast_compat(
     match (source_type, &target_type) {
         (source_type, target_type) if source_type == target_type => Ok(DataTypeCompat::Identical),
         (&ArrowDataType::Timestamp(_, _), &ArrowDataType::Timestamp(_, _)) => {
-            // timestamps are able to be cast between each other
+            // Timestamp bounds returned by `timestamp_stat_as_micros` in
+            // `engine/parquet_row_group_skipping.rs` must agree with the reader's casts.
             Ok(DataTypeCompat::NeedsCast(target_type))
         }
         // Allow up-casting to a larger type if it's safe and can't cause overflow or loss of
@@ -299,8 +300,6 @@ fn check_cast_compat(
         //
         // Keep these date/timestamp rules aligned with
         // `PrimitiveType::is_checkpoint_cast_compatible` in `schema/mod.rs`.
-        // Timestamp bounds returned by `timestamp_stat_as_micros` in
-        // `engine/parquet_row_group_skipping.rs` must agree with the reader's casts.
         (Int32, Date32) => Ok(DataTypeCompat::NeedsCast(target_type)),
         (Int64, Timestamp(TimeUnit::Microsecond, _)) => Ok(DataTypeCompat::NeedsCast(target_type)),
         _ => Err(make_arrow_error(format!(
