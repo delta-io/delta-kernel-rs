@@ -35,7 +35,6 @@ use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{lazy_schema_ref, ArrayType, SchemaRef, StructField, ToSchema};
 use crate::table_features::TableFeature;
-#[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::utils::require;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::FileMeta;
@@ -307,6 +306,8 @@ impl Transaction<UpdateTable, Imperative> {
     ///   `delta.enableDeletionVectors=true` table property
     /// - A file path in `new_dv_descriptors` is not found in `existing_data_files`
     /// - A matched file's scan metadata is missing or has invalid `stats.numRecords`
+    /// - A new deletion vector's cardinality is negative or exceeds the matched file's
+    ///   `stats.numRecords`
     /// - A matched file's `stats` is not valid JSON or is not a JSON object
     ///
     /// # Examples
@@ -727,16 +728,23 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                         "update_deletion_vectors: stats for {path} is not a JSON object"
                     ))
                 })?;
-                if stats_obj
+                let num_records = stats_obj
                     .get(NUM_RECORDS)
                     .and_then(serde_json::Value::as_u64)
-                    .is_none()
-                {
-                    return Err(KernelError::generic(format!(
-                        "update_deletion_vectors: stats for {path} is missing {NUM_RECORDS} \
-                         or it is not a non-negative integer"
-                    )));
-                }
+                    .ok_or_else(|| {
+                        KernelError::generic(format!(
+                            "update_deletion_vectors: stats for {path} is missing {NUM_RECORDS} \
+                             or it is not a non-negative integer"
+                        ))
+                    })?;
+                let cardinality = dv_result.cardinality;
+                require!(
+                    u64::try_from(cardinality).is_ok_and(|value| value <= num_records),
+                    KernelError::deletion_vector(format!(
+                        "Deletion vector for '{path}' has cardinality {cardinality}; \
+                         expected 0 <= cardinality <= stats.numRecords ({num_records})"
+                    ))
+                );
 
                 // Widen tightBounds to false (unless already false) instead of recomputing the
                 // stats.
@@ -789,15 +797,16 @@ mod tests {
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema};
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     const TEST_PATH: &str = "data/file.parquet";
 
-    /// Build a single-row scan-metadata-like batch. `path` and `stats` are addressed by name
+    /// Build a scan-metadata-like batch. `path` and `stats` are addressed by name
     /// (matching `DvMatchVisitor::selected_column_names_and_types`), so the surrounding
     /// `extra_columns` and their positions deliberately exercise name-based getter binding.
-    fn make_scan_metadata_row(
-        path: &str,
-        stats: Option<&str>,
+    fn make_scan_metadata_rows(
+        paths: &[&str],
+        stats: &[Option<&str>],
         extra_columns: &[&str],
     ) -> FilteredEngineData {
         let mut fields = vec![
@@ -805,12 +814,12 @@ mod tests {
             ArrowField::new("stats", ArrowDataType::Utf8, true),
         ];
         let mut columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(vec![Some(path)])),
-            Arc::new(StringArray::from(vec![stats])),
+            Arc::new(StringArray::from(paths.to_vec())),
+            Arc::new(StringArray::from(stats.to_vec())),
         ];
         for name in extra_columns {
             fields.push(ArrowField::new(*name, ArrowDataType::Utf8, true));
-            columns.push(Arc::new(StringArray::from(vec![Some("ignored")])));
+            columns.push(Arc::new(StringArray::from(vec!["ignored"; paths.len()])));
         }
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
         FilteredEngineData::with_all_rows_selected(Box::new(ArrowEngineData::new(batch)))
@@ -846,7 +855,7 @@ mod tests {
     ) {
         let dv_updates = dv_updates_for(TEST_PATH);
         let mut visitor = DvMatchVisitor::new(&dv_updates);
-        let data = make_scan_metadata_row(TEST_PATH, stats, extra_columns);
+        let data = make_scan_metadata_rows(&[TEST_PATH], &[stats], extra_columns);
 
         let result = visitor.visit_rows_of(&data);
         match expected_err {
@@ -862,11 +871,56 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::negative(-1, 3, &[true, true], Some("expected 0 <= cardinality"))]
+    #[case::zero(0, 3, &[true, true], None)]
+    #[case::partial(1, 3, &[true, true], None)]
+    #[case::all_rows(3, 3, &[true, true], None)]
+    #[case::too_many_rows(4, 3, &[true, true], Some("expected 0 <= cardinality"))]
+    #[case::empty_file(0, 0, &[true, true], None)]
+    #[case::nonempty_dv_for_empty_file(1, 0, &[true, true], Some("expected 0 <= cardinality"))]
+    #[case::negative_unselected(-1, 3, &[true, false], None)]
+    #[case::too_many_rows_unselected(4, 3, &[true, false], None)]
+    #[case::max_num_records(i64::MAX, u64::MAX, &[true, true], None)]
+    fn dv_match_visitor_validates_cardinality_bounds(
+        #[case] cardinality: i64,
+        #[case] num_records: u64,
+        #[case] selection_vector: &[bool],
+        #[case] expected_error: Option<&str>,
+    ) {
+        let other_path = "other/file.parquet";
+        let mut dv_updates = dv_updates_for(other_path);
+        dv_updates.extend(dv_updates_for(TEST_PATH));
+        dv_updates.get_mut(TEST_PATH).unwrap().cardinality = cardinality;
+        let mut visitor = DvMatchVisitor::new(&dv_updates);
+        let stats = format!(r#"{{"numRecords":{num_records}}}"#);
+        let data = make_scan_metadata_rows(
+            &[other_path, TEST_PATH],
+            &[Some(r#"{"numRecords":3}"#), Some(&stats)],
+            &[],
+        );
+        let (data, _) = data.into_parts();
+        let data = FilteredEngineData::try_new(data, selection_vector.to_vec()).unwrap();
+
+        let result = visitor.visit_rows_of(&data);
+        if let Some(expected_error) = expected_error {
+            assert_result_error_with_message(result, expected_error);
+        } else {
+            result.unwrap();
+            let expected_indexes = selection_vector
+                .iter()
+                .enumerate()
+                .filter_map(|(index, selected)| selected.then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(visitor.matched_file_indexes, expected_indexes);
+        }
+    }
+
     #[test]
     fn dv_match_visitor_skips_validation_for_unmatched_rows() {
         let dv_updates = dv_updates_for("other/file.parquet");
         let mut visitor = DvMatchVisitor::new(&dv_updates);
-        let data = make_scan_metadata_row(TEST_PATH, None, &[]);
+        let data = make_scan_metadata_rows(&[TEST_PATH], &[None], &[]);
 
         visitor
             .visit_rows_of(&data)

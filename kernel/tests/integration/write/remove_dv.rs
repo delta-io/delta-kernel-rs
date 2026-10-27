@@ -1031,6 +1031,60 @@ struct ScanFileModification {
     row_id: usize,
 }
 
+#[rstest]
+#[case::negative(-1, Some("expected 0 <= cardinality"))]
+#[case::zero(0, None)]
+#[case::all_rows(3, None)]
+#[case::too_many_rows(4, Some("expected 0 <= cardinality"))]
+#[tokio::test]
+async fn update_deletion_vectors_validates_cardinality_bounds(
+    #[case] cardinality: i64,
+    #[case] expected_error: Option<&str>,
+) -> KernelResult<()> {
+    let schema = schema_ref! { nullable "id": INTEGER };
+    let (_store, engine, table_url, file_paths) =
+        create_dv_table_with_files("dv_cardinality", schema, &[], &["file.parquet"]).await?;
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?;
+    let mut descriptor = DeletionVectorDescriptor::try_new(
+        DeletionVectorStorageType::PersistedAbsolute,
+        "memory:///dv.bin",
+        Some(0),
+        1, /* size_in_bytes */
+        0, /* cardinality */
+    )?;
+    descriptor.cardinality = cardinality;
+    let descriptors = HashMap::from([(file_paths[0].clone(), descriptor)]);
+    let result = txn.update_deletion_vectors(
+        descriptors,
+        get_scan_files(snapshot, engine.as_ref())?
+            .into_iter()
+            .map(Ok),
+    );
+
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, expected_error);
+        return Ok(());
+    }
+    result?;
+    txn.commit(engine.as_ref())?.unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+    let mut files = Vec::new();
+    for metadata in scan.scan_metadata(engine.as_ref())? {
+        files = metadata?.visit_scan_files(files, |files, file| files.push(file))?;
+    }
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, file_paths[0]);
+    assert_eq!(files[0].stats.as_ref().unwrap().num_records, 3);
+    assert_eq!(
+        files[0].dv_info.cardinality()?,
+        Some(u64::try_from(cardinality).unwrap())
+    );
+    Ok(())
+}
+
 #[rstest::rstest]
 #[case::missing_path(
     ScanFileModification {
@@ -1429,7 +1483,10 @@ async fn test_update_deletion_vectors_respects_selection_vector(
     // the test will fail.
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut setup_txn = begin_transaction(snapshot.clone(), engine.as_ref())?;
-    let initial_dvs = sequential_dv_descriptors(&file_paths);
+    let mut initial_dvs = sequential_dv_descriptors(&file_paths);
+    for descriptor in initial_dvs.values_mut() {
+        descriptor.cardinality = 1;
+    }
     let initial_dv_ids: HashMap<_, _> = initial_dvs
         .iter()
         .map(|(path, dv)| Ok((path.clone(), dv.unique_id_for(&snapshot)?)))
