@@ -329,10 +329,11 @@ static APPEND_ONLY_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::EnabledIf(|props| props.append_only == Some(true)),
 };
 
-// Invariants has no table property, and legacy writers mark it supported on every table, so it
-// is enabled only if the schema has invariant metadata or a non-null field. Kernel marks it
-// "Supported" so it can write to tables that list it without using it, but fails to write to a
-// table with invariant metadata (see TableConfiguration::ensure_write_supported).
+// Although kernel marks invariants as "Supported", invariants must NOT actually be present in the
+// table schema. Kernel will fail to write to any table that actually uses invariants (see check in
+// TableConfiguration::ensure_write_supported). This is to allow legacy tables with the Invariants
+// feature supported but not in use. It is enabled only if the schema has invariant metadata or a
+// non-null field, since it has no table property.
 static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 2)),
