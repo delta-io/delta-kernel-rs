@@ -1,4 +1,4 @@
-//! Validation of `file` values read from Parquet.
+//! Validation of `file` values read from or written to Parquet.
 
 use std::ops::Range;
 
@@ -23,17 +23,45 @@ pub(crate) fn validate_file_values(
     data: &StructArray,
     kernel_schema: &StructType,
 ) -> KernelResult<()> {
+    validate_root(data, kernel_schema, Mode::Read)
+}
+
+/// Fails if a `file` value in `data` is invalid for a writer to write: it breaks a rule
+/// [`validate_file_values`] applies, or its `checksum` is not of the form `<algorithm>:<digest>`
+/// with a digest of the encoding the Parquet `FILE` specification gives its algorithm. `ETAG`
+/// digests are opaque, and unknown algorithms are accepted, as readers ignore them.
+pub(crate) fn validate_file_values_for_write(
+    data: &StructArray,
+    kernel_schema: &StructType,
+) -> KernelResult<()> {
+    validate_root(data, kernel_schema, Mode::Write)
+}
+
+/// Which rules to apply: reads reject only what readers must, writes also check `checksum`.
+#[derive(Clone, Copy)]
+enum Mode {
+    Read,
+    Write,
+}
+
+fn validate_root(data: &StructArray, kernel_schema: &StructType, mode: Mode) -> KernelResult<()> {
     let Some(file_paths) = FilePaths::of_struct(kernel_schema) else {
         return Ok(());
     };
     // The top-level rows are all present; `validate` combines this with `data`'s own validity.
-    validate(data, &file_paths, &vec![true; data.len()], &mut Vec::new())
+    validate(
+        data,
+        &file_paths,
+        &vec![true; data.len()],
+        mode,
+        &mut Vec::new(),
+    )
 }
 
 /// The parts of a schema that lead to `file` values: each `file`, and the structs, arrays and maps
 /// that contain one. Other fields are left out, so validating walks only these paths.
 #[derive(Debug)]
-enum FilePaths {
+pub(crate) enum FilePaths {
     File,
     /// The fields of a struct that contain a `file`.
     Struct(Vec<(String, FilePaths)>),
@@ -47,7 +75,7 @@ enum FilePaths {
 impl FilePaths {
     /// Returns the paths to the `file` values in `schema`, or `None` if it has none. Each field is
     /// visited once.
-    fn of_struct(schema: &StructType) -> Option<Self> {
+    pub(crate) fn of_struct(schema: &StructType) -> Option<Self> {
         let fields: Vec<_> = schema
             .fields()
             .filter_map(|field| Some((field.name().clone(), Self::of(field.data_type())?)))
@@ -178,11 +206,12 @@ fn validate(
     array: &dyn Array,
     file_paths: &FilePaths,
     parent_present: &[bool],
+    mode: Mode,
     path: &mut Vec<String>,
 ) -> KernelResult<()> {
     let current_present = rows_present(array, parent_present);
     match file_paths {
-        FilePaths::File => validate_file(as_struct(array)?, &current_present, path),
+        FilePaths::File => validate_file(as_struct(array)?, &current_present, mode, path),
         FilePaths::Struct(fields) => {
             let array = as_struct(array)?;
             for (name, inner) in fields {
@@ -193,14 +222,14 @@ fn validate(
                         ColumnName::new(path.iter().cloned())
                     ))
                 })?;
-                validate(column.as_ref(), inner, &current_present, path)?;
+                validate(column.as_ref(), inner, &current_present, mode, path)?;
                 path.pop();
             }
             Ok(())
         }
         FilePaths::Array(element) => {
             let (values, entries) = list_entries(array, &current_present)?;
-            validate(values, element, &entries, path)
+            validate(values, element, &entries, mode, path)
         }
         FilePaths::Map { key, value } => {
             let map = array.as_map_opt().ok_or_else(|| {
@@ -211,10 +240,10 @@ fn validate(
                 offset_range(offsets, row)
             });
             if let Some(key) = key {
-                validate(map.keys().as_ref(), key, &entries, path)?;
+                validate(map.keys().as_ref(), key, &entries, mode, path)?;
             }
             if let Some(value) = value {
-                validate(map.values().as_ref(), value, &entries, path)?;
+                validate(map.values().as_ref(), value, &entries, mode, path)?;
             }
             Ok(())
         }
@@ -227,7 +256,12 @@ fn as_struct(array: &dyn Array) -> KernelResult<&StructArray> {
         .ok_or_else(|| make_arrow_error("Arrow claimed to be a struct but isn't a StructArray"))
 }
 
-fn validate_file(file: &StructArray, present: &[bool], path: &[String]) -> KernelResult<()> {
+fn validate_file(
+    file: &StructArray,
+    present: &[bool],
+    mode: Mode,
+    path: &[String],
+) -> KernelResult<()> {
     let field = |name: &str| {
         file.column_by_name(name)
             .ok_or_else(|| make_arrow_error(format!("`file` value is missing field '{name}'")))
@@ -239,6 +273,7 @@ fn validate_file(file: &StructArray, present: &[bool], path: &[String]) -> Kerne
     };
     let (uri, inline) = (field("uri")?, field("inline")?);
     let (offset, size) = (int64("offset")?, int64("size")?);
+    let checksum = field("checksum")?;
     for row in (0..file.len()).filter(|&row| present[row]) {
         // The rules of the Parquet `FILE` specification, quoted from its `offset` and `size`
         // fields and its Resolution section.
@@ -261,6 +296,12 @@ fn validate_file(file: &StructArray, present: &[bool], path: &[String]) -> Kerne
         } else if size.is_valid(row) && size.value(row) < 0 {
             // `size`: "must be zero or a positive integer if set".
             "`size` is negative"
+        } else if let Some(problem) = matches!(mode, Mode::Write)
+            .then(|| string_at(checksum.as_ref(), row))
+            .flatten()
+            .and_then(checksum_problem)
+        {
+            problem
         } else {
             continue;
         };
@@ -270,6 +311,41 @@ fn validate_file(file: &StructArray, present: &[bool], path: &[String]) -> Kerne
         )));
     }
     Ok(())
+}
+
+/// Returns the string at `row` of a string array, or `None` if it is null or not a string.
+fn string_at(array: &dyn Array, row: usize) -> Option<&str> {
+    if array.is_null(row) {
+        return None;
+    }
+    match array.data_type() {
+        ArrowDataType::Utf8 => Some(array.as_string::<i32>().value(row)),
+        ArrowDataType::LargeUtf8 => Some(array.as_string::<i64>().value(row)),
+        ArrowDataType::Utf8View => Some(array.as_string_view().value(row)),
+        _ => None,
+    }
+}
+
+/// Returns what is wrong with `checksum` under the Parquet `FILE` specification, if anything.
+fn checksum_problem(checksum: &str) -> Option<&'static str> {
+    let Some((algorithm, digest)) = checksum.split_once(':') else {
+        return Some("`checksum` is not of the form `<algorithm>:<digest>`");
+    };
+    if algorithm.is_empty() || digest.is_empty() {
+        return Some("`checksum` is not of the form `<algorithm>:<digest>`");
+    }
+    // Hex digest length per algorithm; `ETAG` is opaque and other algorithms are not checked.
+    let hex_length = match algorithm {
+        "MD5" => 32,
+        "CRC32" | "CRC32C" => 8,
+        "SHA-256" => 64,
+        _ => return None,
+    };
+    let is_lowercase_hex = digest
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    (digest.len() != hex_length || !is_lowercase_hex)
+        .then_some("`checksum` digest is not the lowercase hex its algorithm requires")
 }
 
 #[cfg(test)]
@@ -711,5 +787,45 @@ mod tests {
             error.contains("`file` column 'f' is missing from the data"),
             "got: {error}"
         );
+    }
+
+    /// Replaces the `checksum` field of `file` with `checksums`.
+    fn with_checksums(file: StructArray, checksums: &[Option<&str>]) -> StructArray {
+        let (fields, mut columns, nulls) = file.into_parts();
+        let index = fields.iter().position(|f| f.name() == "checksum").unwrap();
+        columns[index] = Arc::new(StringArray::from(checksums.to_vec()));
+        StructArray::try_new(fields, columns, nulls).unwrap()
+    }
+
+    /// Writes check the `checksum` format; reads do not, since readers ignore what they cannot use.
+    #[rstest]
+    #[case::md5(Some("MD5:d41d8cd98f00b204e9800998ecf8427e"), None)]
+    #[case::crc32c(Some("CRC32C:e3069283"), None)]
+    #[case::sha256(
+        Some("SHA-256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        None
+    )]
+    #[case::etag(Some("ETAG:\"0x8D9A\""), None)]
+    #[case::unknown_algorithm(Some("XXH64:anything"), None)]
+    #[case::null(None, None)]
+    #[case::no_separator(Some("d41d8cd98f00b204e9800998ecf8427e"), Some("not of the form"))]
+    #[case::empty_digest(Some("ETAG:"), Some("not of the form"))]
+    #[case::uppercase_hex(Some("MD5:D41D8CD98F00B204E9800998ECF8427E"), Some("lowercase hex"))]
+    #[case::wrong_length(Some("MD5:xyz"), Some("lowercase hex"))]
+    fn write_checks_checksum_format(#[case] checksum: Option<&str>, #[case] problem: Option<&str>) {
+        let (data, schema) = top_level(with_checksums(file_array(&[VALID]), &[checksum]));
+        validate_file_values(&data, &schema).unwrap();
+        let result = validate_file_values_for_write(&data, &schema);
+        match problem {
+            None => result.unwrap(),
+            Some(problem) => {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("Invalid value in `file` column 'f': `checksum`"),
+                    "got: {error}"
+                );
+                assert!(error.contains(problem), "got: {error}");
+            }
+        }
     }
 }

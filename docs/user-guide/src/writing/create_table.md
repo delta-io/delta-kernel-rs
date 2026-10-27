@@ -362,13 +362,18 @@ Features enabled when specific column types or annotations appear in the schema.
 > the struct of its six fields. It does not yet collect statistics for the column or resolve the
 > bytes a value refers to.
 >
-> The default engine's Parquet writer refuses to write a `FILE` column until it writes the
-> Parquet `FILE` logical-type annotation and the sub-field field ids. An engine that writes its
-> own Parquet files must write a `FILE` column as the protocol requires:
+> The default engine writes a `FILE` column as the protocol requires, which needs the `arrow-60`
+> feature; with `arrow-59` it refuses to write one. An engine that writes its own Parquet files
+> must write a `FILE` column the same way:
 >
-> - annotate the group with the Parquet `FILE` logical type, and
+> - annotate the group with the Parquet `FILE` logical type,
 > - under column mapping, set each sub-field's Parquet `field_id` to the column's field id plus
->   its offset (`uri` +1, `offset` +2, `size` +3, `content_type` +4, `checksum` +5, `inline` +6).
+>   its offset (`uri` +1, `offset` +2, `size` +3, `content_type` +4, `checksum` +5, `inline` +6),
+>   and
+> - in each non-null value, set `uri` or `inline`, set `size` only together with `uri`, set
+>   `offset` only together with `uri` and `size`, and never set a negative `offset` or `size`.
+>   Kernel rejects reads of values that break these rules, and the default engine rejects writes
+>   of them.
 
 ### Feature-signal only
 
