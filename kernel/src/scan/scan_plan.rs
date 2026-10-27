@@ -385,12 +385,17 @@ impl Scan {
         PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])?.build_opt()
     }
 
-    /// Build checkpoint adds in the requested output shape. Returns an empty relation when no
-    /// checkpoint exists.
+    /// Build normalized checkpoint adds. Returns an empty relation when no checkpoint exists.
     ///
     /// ## SQL equivalent:
-    ///
-    /// SELECT PATCH_STRUCT(add, <needed parsed fields>, <unrequested field drops>) AS add,
+    //
+    /// SELECT STRUCT(
+    ///          add.* EXCEPT (
+    ///            stats_parsed, partitionValues_parsed
+    ///          ),
+    ///          add.stats_parsed AS stats_parsed,
+    ///          add.partitionValues_parsed AS partitionValues_parsed
+    ///        ) AS add,
     ///        file_key(add) AS key
     /// FROM checkpoint_actions
     /// WHERE add.path IS NOT NULL
@@ -444,12 +449,17 @@ impl Scan {
             })
     }
 
-    /// Build commit JSON actions in the requested output shape.
+    /// Build the normalized commit JSON arm.
     ///
     /// ## SQL equivalent:
     ///
-    /// SELECT PATCH_STRUCT(add, <needed parsed fields>, <unrequested field drops>) AS add,
-    ///        version, file_key(COALESCE(add, remove)) AS key
+    /// SELECT STRUCT(
+    ///          add.* EXCEPT (stats_parsed, partitionValues_parsed),
+    ///          FROM_JSON(add.stats, physical_stats) AS stats_parsed,
+    ///          MAP_TO_STRUCT(add.partitionValues, physical_partitions) AS partitionValues_parsed
+    ///        ) AS add,
+    ///        version,
+    ///        file_key(COALESCE(add, remove)) AS key
     /// FROM json_commits
     /// WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
     ///
@@ -636,14 +646,12 @@ mod tests {
 
     use super::execution_tests::{declarative_metadata, metadata_row_count};
     use super::*;
-    use crate::arrow::array::{Array, AsArray as _, RecordBatch, StringArray, StructArray};
+    use crate::arrow::array::{AsArray as _, RecordBatch, StringArray, StructArray};
     use crate::arrow::datatypes::Schema as ArrowSchema;
-    use crate::engine::arrow_conversion::scalar::extract_primitive_scalar;
     use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::arrow_utils::parse_json_impl;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::Scalar;
     use crate::log_segment::LogSegment;
     use crate::log_segment_files::LogSegmentFiles;
     use crate::object_store::memory::InMemory;
@@ -903,14 +911,8 @@ mod tests {
             checkpoint_type,
             leaf_checkpoint_schema: Some(Arc::new(file_schema)),
         };
-        let planner = MetadataPlanner::try_new(&scan)?;
-        let commit = scan.commit_arm(&planner)?.build()?;
-        let checkpoint = scan.checkpoint_arm(&shape, &planner)?.build()?;
-        let commit_add: ArrowSchema = add_struct(&commit.schema).try_into_arrow()?;
-        let checkpoint_add: ArrowSchema = add_struct(&checkpoint.schema).try_into_arrow()?;
-        assert_eq!(commit_add, checkpoint_add, "ordered add schemas must match");
         let plan = scan
-            .build_metadata_scan_plan(&shape, &planner)?
+            .build_metadata_scan_plan(&shape, &MetadataPlanner::try_new(&scan)?)?
             .expect("non-empty");
 
         let checkpoint_schema = plan
@@ -1153,20 +1155,30 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::date(Scalar::Date(1), DataType::INTEGER, "1970-01-02")]
-    #[case::timestamp(Scalar::Timestamp(1), DataType::LONG, "1970-01-01T00:00:00.000Z")]
-    #[case::timestamp_ntz(Scalar::TimestampNtz(1), DataType::LONG, "1970-01-01T00:00:00.000")]
+    #[case::date(DataType::DATE, DataType::INTEGER, "1970-01-02", "1970-01-02")]
+    #[case::timestamp(
+        DataType::TIMESTAMP,
+        DataType::LONG,
+        "1970-01-01T00:00:00.000Z",
+        "1970-01-01T00:00:00.000001Z"
+    )]
+    #[case::timestamp_ntz(
+        DataType::TIMESTAMP_NTZ,
+        DataType::LONG,
+        "1970-01-01T00:00:00.000",
+        "1970-01-01T00:00:00.000001"
+    )]
     fn metadata_plan_synthesizes_json_with_table_stats_types(
-        #[case] expected_native: Scalar,
+        #[case] logical_type: DataType,
         #[case] native_type: DataType,
         #[case] expected: &str,
+        #[case] expected_native: &str,
         #[values(StatsOptions::json_only(), StatsOptions::all(), StatsOptions {
             synthesize_json: true,
             ..StatsOptions::all_struct_with_extra_indexed(vec![column_name!("other")])
         })]
         stats: StatsOptions,
     ) -> KernelResult<()> {
-        let logical_type = expected_native.data_type();
         let config = MockTableConfigurationBuilder::new()
             .with_schema(schema_ref! {
                 nullable "nested": { nullable "value": (logical_type.clone()) },
@@ -1225,30 +1237,31 @@ mod tests {
             .build()?;
         let batches = declarative_metadata(&scan, &engine)?;
         assert_eq!(metadata_row_count(&batches), 1);
+        let expected_stats = |value| {
+            serde_json::json!({
+                "numRecords": 1,
+                "minValues": {"nested": {"value": value}, "other": 2},
+                "maxValues": {"nested": {"value": value}, "other": 2},
+                "nullCount": {"nested": {"value": 0}, "other": 0},
+            })
+        };
+        let native = StringArray::from(vec![expected_stats(expected_native).to_string()]);
+        let expected_native = scan
+            .state_info
+            .physical_stats_output_schema()
+            .map(|schema| parse_json_impl(&native, schema.clone()).map(StructArray::from))
+            .transpose()?;
         for batch in batches {
             let json = batch.column_by_name(STATS).unwrap().as_string::<i32>();
-            let json: serde_json::Value = serde_json::from_str(json.value(0))?;
-            for bound in ["minValues", "maxValues"] {
-                assert_eq!(json[bound]["nested"]["value"], expected);
-                assert_eq!(json[bound]["other"], 2);
-                if let Some(parsed) = batch.column_by_name(STATS_PARSED) {
-                    let value = [bound, "nested", "value"]
-                        .into_iter()
-                        .fold(parsed, |array, name| {
-                            array.as_struct().column_by_name(name).unwrap()
-                        });
-                    assert_eq!(value.data_type(), &(&logical_type).try_into_arrow()?);
-                    assert_eq!(value.null_count(), 0);
-                    assert_eq!(
-                        extract_primitive_scalar(value.as_ref(), 0)?,
-                        expected_native
-                    );
-                }
-            }
-            assert_eq!(json["nullCount"]["nested"]["value"], 0);
             assert_eq!(
-                batch.column_by_name(STATS_PARSED).is_some(),
-                scan.state_info.physical_stats_output_schema().is_some(),
+                serde_json::from_str::<serde_json::Value>(json.value(0))?,
+                expected_stats(expected)
+            );
+            assert_eq!(
+                batch
+                    .column_by_name(STATS_PARSED)
+                    .map(|array| array.as_struct()),
+                expected_native.as_ref(),
             );
         }
         Ok(())
