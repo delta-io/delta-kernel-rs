@@ -8,7 +8,7 @@ use rstest::rstest;
 use serde_json::Value;
 
 use super::*;
-use crate::arrow::array::{Array, ArrayRef, BooleanArray, StringArray, StructArray};
+use crate::arrow::array::{Array, ArrayRef, AsArray as _, BooleanArray};
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use crate::arrow::record_batch::RecordBatch;
@@ -71,9 +71,7 @@ fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> KernelResult<Vec<Reco
         let constants = batch
             .column_by_name("fileConstantValues")
             .expect("file constants")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("file constants struct");
+            .as_struct();
         batches.push(normalized_metadata_batch(
             |name| {
                 batch
@@ -94,7 +92,10 @@ fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> KernelResult<Vec<Reco
     Ok(batches)
 }
 
-fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> KernelResult<Vec<RecordBatch>> {
+pub(super) fn declarative_metadata(
+    scan: &Scan,
+    engine: &dyn Engine,
+) -> KernelResult<Vec<RecordBatch>> {
     let Some(plan) = scan.declarative_metadata_scan_plan(engine)? else {
         return Ok(vec![]);
     };
@@ -115,9 +116,7 @@ fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> KernelResult<Vec<Re
         let add = batch
             .column_by_name(ADD_NAME)
             .expect("add column")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("add struct");
+            .as_struct();
         projected.push(normalized_metadata_batch(
             |name| {
                 add.column_by_name(name)
@@ -132,7 +131,7 @@ fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> KernelResult<Vec<Re
     Ok(projected)
 }
 
-fn metadata_row_count(batches: &[RecordBatch]) -> usize {
+pub(super) fn metadata_row_count(batches: &[RecordBatch]) -> usize {
     batches.iter().map(RecordBatch::num_rows).sum()
 }
 
@@ -434,74 +433,26 @@ const JSON_STATS_FIELDS: &[&str] = &["add.stats"];
 const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
 
 #[rstest]
-#[case::json_only_string_map(
-    StatsOptions::json_only(),
-    PartitionValuesOptions::string_map_only(),
-    &[JSON_STATS_FIELDS]
-)]
-#[case::json_only_with_struct(
-    StatsOptions::json_only(),
-    PartitionValuesOptions::with_struct(),
-    &[JSON_STATS_FIELDS]
-)]
-#[case::all_struct_string_map(
-    StatsOptions::all_struct(),
-    PartitionValuesOptions::string_map_only(),
-    &[ALL_STATS_PARSED_FIELDS]
-)]
-#[case::all_struct_with_struct(
-    StatsOptions::all_struct(),
-    PartitionValuesOptions::with_struct(),
-    &[ALL_STATS_PARSED_FIELDS]
-)]
-#[case::struct_columns_string_map(
+#[case::json_only(StatsOptions::json_only(), &[JSON_STATS_FIELDS])]
+#[case::all_struct(StatsOptions::all_struct(), &[ALL_STATS_PARSED_FIELDS])]
+#[case::struct_columns(
     StatsOptions::struct_columns(vec![column_name!("id")]),
-    PartitionValuesOptions::string_map_only(),
     &[ID_STATS_PARSED_FIELDS]
 )]
-#[case::struct_columns_with_struct(
-    StatsOptions::struct_columns(vec![column_name!("id")]),
-    PartitionValuesOptions::with_struct(),
-    &[ID_STATS_PARSED_FIELDS]
-)]
-#[case::empty_struct_columns_string_map(
-    StatsOptions::struct_columns(vec![]),
-    PartitionValuesOptions::string_map_only(),
-    &[]
-)]
-#[case::empty_struct_columns_with_struct(
-    StatsOptions::struct_columns(vec![]),
-    PartitionValuesOptions::with_struct(),
-    &[]
-)]
-#[case::all_string_map(
-    StatsOptions::all(),
-    PartitionValuesOptions::string_map_only(),
-    &[JSON_STATS_FIELDS, ALL_STATS_PARSED_FIELDS]
-)]
-#[case::all_with_struct(
-    StatsOptions::all(),
-    PartitionValuesOptions::with_struct(),
-    &[JSON_STATS_FIELDS, ALL_STATS_PARSED_FIELDS]
-)]
+#[case::empty_struct_columns(StatsOptions::struct_columns(vec![]), &[])]
+#[case::all(StatsOptions::all(), &[JSON_STATS_FIELDS, ALL_STATS_PARSED_FIELDS])]
 #[case::both_columns(
     StatsOptions { synthesize_json: true, ..StatsOptions::struct_columns(vec![column_name!("id")]) },
-    PartitionValuesOptions::with_struct(),
     &[JSON_STATS_FIELDS, ID_STATS_PARSED_FIELDS]
 )]
-#[case::none_string_map(
-    StatsOptions::none(),
-    PartitionValuesOptions::string_map_only(),
-    &[]
-)]
-#[case::none_with_struct(
-    StatsOptions::none(),
-    PartitionValuesOptions::with_struct(),
-    &[]
-)]
+#[case::none(StatsOptions::none(), &[])]
 fn declarative_metadata_has_exact_leaf_schema_across_output_options(
     #[case] stats: StatsOptions,
-    #[case] partition_values: PartitionValuesOptions,
+    #[values(
+        PartitionValuesOptions::string_map_only(),
+        PartitionValuesOptions::with_struct()
+    )]
+    partition_values: PartitionValuesOptions,
     #[case] expected_field_groups: &[&[&str]],
 ) {
     (|| -> KernelResult<()> {
@@ -530,15 +481,11 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
                 let add = batch
                     .column_by_name(ADD_NAME)
                     .expect("add column")
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .expect("add struct");
+                    .as_struct();
                 let stats = add
                     .column_by_name(STATS)
                     .expect("requested JSON stats")
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("JSON stats");
+                    .as_string::<i32>();
                 assert_eq!(
                     stats.null_count(),
                     0,
@@ -756,7 +703,7 @@ fn assert_metadata_output_options(
             let parsed = batch.column_by_name(PARTITION_VALUES_PARSED);
             assert_eq!(parsed.is_some(), parsed_partitions_requested);
             if let Some(parsed) = parsed {
-                let parsed = parsed.as_any().downcast_ref::<StructArray>().unwrap();
+                let parsed = parsed.as_struct();
                 assert_eq!(parsed.null_count(), 0, "requested parsed partitions");
                 for (field, values) in parsed.fields().iter().zip(parsed.columns()) {
                     assert_eq!(values.null_count(), 0, "partition {}", field.name());
@@ -768,10 +715,7 @@ fn assert_metadata_output_options(
     if json_requested {
         for batch in &actual {
             let stats = batch.column_by_name(STATS).expect("requested JSON stats");
-            let stats = stats
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("JSON stats");
+            let stats = stats.as_string::<i32>();
             assert_eq!(
                 stats.null_count(),
                 0,
@@ -902,9 +846,7 @@ fn declarative_metadata_partition_is_null_keeps_null_partition() -> KernelResult
     let path = batch
         .column_by_name("path")
         .expect("add.path")
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("add.path string");
+        .as_string::<i32>();
     assert_eq!(
         path.value(0),
         "tsNtzPartition=__HIVE_DEFAULT_PARTITION__/\
@@ -914,9 +856,7 @@ fn declarative_metadata_partition_is_null_keeps_null_partition() -> KernelResult
     let partitions = batch
         .column_by_name(PARTITION_VALUES_PARSED)
         .expect("add.partitionValues_parsed")
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .expect("add.partitionValues_parsed struct");
+        .as_struct();
     assert!(
         partitions
             .column_by_name("tsNtzPartition")
@@ -951,9 +891,7 @@ fn declarative_metadata_reconstructs_well_formed_stats_and_partitions() -> Kerne
         let add = batch
             .column_by_name(ADD_NAME)
             .expect("add column")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("add struct");
+            .as_struct();
         projected.push(RecordBatch::try_from_iter([
             (
                 "stats",
@@ -1042,9 +980,7 @@ fn declarative_metadata_pruning_keeps_remove_for_checkpoint_reconciliation() -> 
     let path = actual[0]
         .column_by_name("path")
         .expect("add.path")
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("add.path string");
+        .as_string::<i32>();
     assert_eq!(
         path.value(0),
         "part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet",
