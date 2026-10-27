@@ -4240,7 +4240,7 @@ mod tests {
         let (engine, snap) = setup_snapshot(metadata.to_string()).await?;
 
         let mut visited: Option<Metadata> = None;
-        let ctx = NonNull::new(&mut visited as *mut Option<Metadata> as *mut c_void);
+        let ctx = Some(NonNull::from(&mut visited).cast());
         unsafe { snapshot_visit_metadata(snap.shallow_copy(), ctx, collect) };
         let visited = visited.expect("visitor was not invoked");
         assert_eq!(visited.id(), id);
