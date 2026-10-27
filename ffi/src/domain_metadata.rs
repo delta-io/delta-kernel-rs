@@ -329,8 +329,7 @@ mod tests {
         // Secondly, we visit the entire domain metadata
 
         // Create visitor state
-        let visitor_state: Box<HashMap<String, String>> = Box::default();
-        let visitor_state_ptr = Box::into_raw(visitor_state);
+        let mut collected_metadata: HashMap<String, String> = HashMap::new();
 
         // Test visitor function
         extern "C" fn visitor(
@@ -350,16 +349,15 @@ mod tests {
             ok_or_panic(visit_domain_metadata(
                 snapshot.shallow_copy(),
                 engine.shallow_copy(),
-                Some(NonNull::new_unchecked(visitor_state_ptr).cast()),
+                Some(NonNull::from(&mut collected_metadata).cast()),
                 visitor,
             ))
         };
 
         // Confirm visitor picked up all entries in map
-        let collected_metadata = unsafe { Box::from_raw(visitor_state_ptr) };
         assert!(res);
-        assert!(collected_metadata.get("domain1").is_none());
-        assert!(collected_metadata.get("delta.domain3").is_none());
+        assert!(!collected_metadata.contains_key("domain1"));
+        assert!(!collected_metadata.contains_key("delta.domain3"));
         assert_eq!(
             collected_metadata.get("domain2").unwrap(),
             "domain2_commit1"
@@ -452,8 +450,7 @@ mod tests {
         snapshot: &crate::Handle<crate::SharedSnapshot>,
         engine: &crate::Handle<crate::SharedExternEngine>,
     ) -> (Option<usize>, Vec<VisitedColumn>) {
-        let collected: Box<Vec<VisitedColumn>> = Box::default();
-        let collected_ptr = Box::into_raw(collected);
+        let mut columns: Vec<VisitedColumn> = Vec::new();
 
         extern "C" fn visitor(
             state: NullableCvoid,
@@ -482,13 +479,12 @@ mod tests {
             visit_clustering_columns(
                 snapshot.shallow_copy(),
                 engine.shallow_copy(),
-                Some(NonNull::new_unchecked(collected_ptr).cast()),
+                Some(NonNull::from(&mut columns).cast()),
                 visitor,
             )
         })
         .into();
 
-        let columns = *unsafe { Box::from_raw(collected_ptr) };
         (count, columns)
     }
 

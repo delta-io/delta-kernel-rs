@@ -883,6 +883,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::FfiMapToStructOptions;
+    use crate::handle::BoxExt;
 
     #[rstest]
     #[case::default(None)]
@@ -1246,24 +1247,23 @@ mod tests {
     }
 
     /// RAII wrapper that frees the heap-allocated `IterState` backing an `EngineIterator`. Held as
-    /// a raw pointer via `Box::into_raw` so stacked borrows don't retag it while `it` holds the
-    /// pointer.
+    /// a raw pointer so stacked borrows don't retag it while `it` holds the pointer.
     struct IterStateBox(*mut IterState);
 
     impl Drop for IterStateBox {
         fn drop(&mut self) {
-            // SAFETY: produced by Box::into_raw in make_iter; reclaimed exactly once on drop.
+            // SAFETY: produced by BoxExt::into_non_null in make_iter; reclaimed once on drop.
             drop(unsafe { Box::from_raw(self.0) });
         }
     }
 
     fn make_iter(ids: Vec<usize>) -> (IterStateBox, EngineIterator) {
-        let raw = Box::into_raw(Box::new(IterState { ids, idx: 0 }));
+        let state = BoxExt::into_non_null(Box::new(IterState { ids, idx: 0 }));
         let it = EngineIterator {
-            data: NonNull::new(raw as *mut c_void).unwrap(),
+            data: state.cast(),
             get_next: iter_next_direct,
         };
-        (IterStateBox(raw), it)
+        (IterStateBox(state.as_ptr()), it)
     }
 
     fn make_two_literal_ids(state: &mut KernelExpressionVisitorState) -> (usize, usize) {

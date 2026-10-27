@@ -2269,13 +2269,11 @@ mod tests {
             ("G".into(), "H".into()),
         ]);
         let cmap: super::CStringMap = test_map.clone().into();
-        let context_map: Box<HashMap<String, String>> = Box::default();
-        let map_ptr: *mut HashMap<String, String> = Box::into_raw(context_map);
+        let mut final_map: HashMap<String, String> = HashMap::new();
         unsafe {
-            let ptr = NonNull::new_unchecked(map_ptr.cast());
+            let ptr = NonNull::from(&mut final_map).cast();
             super::visit_string_map(&cmap, Some(ptr), visit_entry);
         }
-        let final_map: HashMap<String, String> = *unsafe { Box::from_raw(map_ptr) };
         assert_eq!(test_map, final_map);
     }
 
@@ -2443,13 +2441,11 @@ mod tests {
         ]);
         let cmap: super::CMetadataMap = test_map.into();
 
-        let ctx: Box<HashMap<String, (super::CMetadataValueKind, String)>> = Box::default();
-        let ctx_ptr = Box::into_raw(ctx);
+        let mut out: HashMap<String, (super::CMetadataValueKind, String)> = HashMap::new();
         unsafe {
-            let ptr = NonNull::new_unchecked(ctx_ptr.cast());
+            let ptr = NonNull::from(&mut out).cast();
             super::visit_metadata_map(&cmap, Some(ptr), visit_metadata_entry);
         }
-        let out = *unsafe { Box::from_raw(ctx_ptr) };
 
         assert_eq!(out["num"], (MetadataNumber, "-7".to_string()));
         assert_eq!(out["str"], (MetadataString, "hi".to_string()));
@@ -2461,13 +2457,11 @@ mod tests {
     #[test]
     fn visit_metadata_map_empty_never_invokes_callback() {
         let cmap = super::CMetadataMap::default();
-        let ctx: Box<HashMap<String, (super::CMetadataValueKind, String)>> = Box::default();
-        let ctx_ptr = Box::into_raw(ctx);
+        let mut out: HashMap<String, (super::CMetadataValueKind, String)> = HashMap::new();
         unsafe {
-            let ptr = NonNull::new_unchecked(ctx_ptr.cast());
+            let ptr = NonNull::from(&mut out).cast();
             super::visit_metadata_map(&cmap, Some(ptr), visit_metadata_entry);
         }
-        let out = *unsafe { Box::from_raw(ctx_ptr) };
         assert!(out.is_empty());
     }
 

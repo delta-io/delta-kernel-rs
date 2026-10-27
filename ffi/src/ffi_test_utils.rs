@@ -13,6 +13,7 @@ use delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::add_commit;
 
 use crate::error::{AllocateError, AllocateErrorFn, EngineError, ExternResult, FFIKernelError};
+use crate::handle::BoxExt;
 #[cfg(test)]
 use crate::{
     engine_to_handle, free_snapshot, get_snapshot_builder, kernel_string_slice,
@@ -47,15 +48,13 @@ pub(crate) extern "C" fn allocate_err(
 #[no_mangle]
 pub(crate) extern "C" fn allocate_str(kernel_str: KernelStringSlice) -> NullableCvoid {
     let s = unsafe { String::try_from_slice(&kernel_str) };
-    let ptr = Box::into_raw(Box::new(s.unwrap())).cast(); // never null
-    let ptr = unsafe { NonNull::new_unchecked(ptr) };
-    Some(ptr)
+    Some(BoxExt::into_non_null(Box::new(s.unwrap())).cast())
 }
 
 #[no_mangle]
 pub(crate) extern "C" fn allocate_bytes(bytes: KernelBytesSlice) -> NullableCvoid {
     let bytes = unsafe { bytes.try_as_slice() }.unwrap().to_vec();
-    NonNull::new(Box::into_raw(Box::new(bytes)).cast())
+    Some(BoxExt::into_non_null(Box::new(bytes)).cast())
 }
 
 /// Recover an error from 'allocate_err'

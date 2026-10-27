@@ -102,7 +102,6 @@ fn decode_parquet_footer(footer: CParquetFooter) -> KernelResult<ParquetFooter> 
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::c_void;
     use std::ptr::NonNull;
     use std::sync::{Arc, Mutex};
 
@@ -146,7 +145,7 @@ mod tests {
     /// `expected_plan_result`, returning the raw result of `execute_op`.
     fn try_execute_dummy_op(expected_plan_result: CPlanResult) -> KernelResult<PlanResult> {
         let cell: Mutex<Option<CPlanResult>> = Mutex::new(Some(expected_plan_result));
-        let context = NonNull::new(&cell as *const Mutex<Option<CPlanResult>> as *mut c_void);
+        let context = Some(NonNull::from(&cell).cast());
         let executor = unsafe { get_plan_executor(context, mock_execute_op) };
         let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
 
