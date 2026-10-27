@@ -13,8 +13,8 @@ use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, Scan};
 use crate::actions::{
-    get_all_actions_schema, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME, SIDECAR_FIELD,
-    SIDECAR_NAME, STATS_PARSED,
+    get_all_actions_schema, ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME,
+    SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
@@ -141,7 +141,8 @@ impl<'a> MetadataPlanner<'a> {
         file_schema: &StructType,
         read_removes: bool,
     ) -> KernelResult<(SchemaRef, StatsKind, bool)> {
-        let add = match file_schema.field_at(&column_name!(ADD_NAME))?.data_type() {
+        let add_field = file_schema.field(ADD_NAME).unwrap_or(&ADD_FIELD);
+        let add = match add_field.data_type() {
             DataType::Struct(add) => add,
             data_type => {
                 return Err(KernelError::schema(format!(
@@ -670,7 +671,7 @@ mod tests {
     use super::*;
     use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
     use crate::arrow::array::{
-        Array, BooleanArray, Int64Array, RecordBatch, StringArray, StructArray,
+        Array, AsArray as _, BooleanArray, Int64Array, RecordBatch, StringArray, StructArray,
     };
     use crate::arrow::datatypes::{DataType as ADT, Field, Fields, Schema as ArrowSchema};
     use crate::engine::arrow_conversion::TryIntoArrow as _;
@@ -1121,6 +1122,71 @@ mod tests {
             .downcast_ref::<StringArray>()
             .expect("path string");
         assert_eq!(paths.value(0), "b.parquet");
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    fn metadata_plan_checkpoint_without_add(
+        #[values(false, true)] newer_commit: bool,
+    ) -> KernelResult<()> {
+        let store = Arc::new(InMemory::new());
+        let schema = SchemaStructPatchBuilder::new()
+            .drop(ADD_NAME)
+            .build(get_all_actions_schema())?;
+        let schema: ArrowSchema = (&schema).try_into_arrow()?;
+        let batch = RecordBatch::new_empty(Arc::new(schema));
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        futures::executor::block_on(store.put(
+            &Path::from("_delta_log/00000000000000000000.checkpoint.parquet"),
+            buf.into(),
+        ))?;
+        if newer_commit {
+            futures::executor::block_on(
+                store.put(
+                    &Path::from("_delta_log/00000000000000000001.json"),
+                    concat!(
+                        r#"{"add":{"path":"later.parquet","size":1,"modificationTime":1,"#,
+                        r#""dataChange":true,"partitionValues":{"p":"p"}}}"#,
+                    )
+                    .into(),
+                ),
+            )?;
+        }
+        let segment = log_segment(
+            Url::parse("memory:///_delta_log/")?,
+            if newer_commit {
+                &["memory:///_delta_log/00000000000000000001.json"]
+            } else {
+                &[]
+            },
+            Some("memory:///_delta_log/00000000000000000000.checkpoint.parquet"),
+        );
+        let scan = mock_snapshot(segment)?.scan_builder().build()?;
+        let engine = SyncEngine::new_with_store(store);
+        let plan = scan.declarative_metadata_scan_plan(&engine)?.unwrap();
+        let batches = engine
+            .plan_executor()
+            .unwrap()
+            .execute_op(PlanOperation::QueryPlan(plan))?
+            .into_data()?;
+        let mut paths = Vec::new();
+        for batch in batches {
+            let batch = batch?.try_into_record_batch()?;
+            let add = batch.column_by_name(ADD_NAME).unwrap().as_struct();
+            let column = add.column_by_name("path").unwrap().as_string::<i32>();
+            paths.extend(column.iter().map(|path| path.unwrap().to_owned()));
+        }
+        assert_eq!(
+            paths,
+            if newer_commit {
+                vec!["later.parquet"]
+            } else {
+                vec![]
+            }
+        );
         Ok(())
     }
 
