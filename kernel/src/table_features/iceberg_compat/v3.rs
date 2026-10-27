@@ -164,6 +164,13 @@ mod tests {
         // cannot consume an icebergCompatV3 table containing a void column.
         assert!(!is_v3_supported_type(&DataType::VOID));
     }
+
+    #[test]
+    fn is_v3_supported_type_rejects_file() {
+        // Iceberg has no equivalent of the `file` type in released versions, so it is not on the
+        // V3 allowlist.
+        assert!(!is_v3_supported_type(&DataType::file_type()));
+    }
 }
 
 #[cfg(test)]

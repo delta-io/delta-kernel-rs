@@ -42,6 +42,8 @@ use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{physical_to_logical_column_name_and_type, Operation, TableFeature};
+#[cfg(feature = "check-constraints-in-dev")]
+use crate::table_properties::CheckConstraint;
 use crate::table_properties::TableProperties;
 use crate::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
 use crate::utils::require;
@@ -668,6 +670,17 @@ impl Snapshot {
     /// Get the [`TableProperties`] for this [`Snapshot`].
     pub fn table_properties(&self) -> &TableProperties {
         self.table_configuration().table_properties()
+    }
+
+    /// The table's CHECK constraints at this snapshot's version, sorted by name and then SQL.
+    /// Empty when the table declares none.
+    ///
+    /// A connector writing to the table discovers them from
+    /// [`Transaction::check_constraints`](crate::transaction::Transaction::check_constraints)
+    /// instead.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn check_constraints(&self) -> &[CheckConstraint] {
+        &self.table_properties().check_constraints
     }
 
     /// Returns the protocol-derived table properties as a map of key-value pairs.
@@ -1937,7 +1950,7 @@ mod tests {
 
         let engine = SyncEngine::new();
         let storage = engine.storage_handler();
-        let cp = LastCheckpointHint::try_read(storage.as_ref(), &url, None).unwrap();
+        let cp = LastCheckpointHint::try_read(storage.as_ref(), &url).unwrap();
         assert!(cp.is_none());
     }
 
@@ -1991,8 +2004,8 @@ mod tests {
         let engine = SyncEngine::new_with_store(store);
         let storage = engine.storage_handler();
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = LastCheckpointHint::try_read(storage.as_ref(), &url, None)
-            .expect("read last checkpoint");
+        let invalid =
+            LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
@@ -2026,8 +2039,8 @@ mod tests {
         // valid, invalid and valid with tags.
         for (path_prefix, _, expected_result) in test_cases {
             let url = Url::parse(&format!("memory:///{path_prefix}/")).expect("valid url");
-            let result = LastCheckpointHint::try_read(storage.as_ref(), &url, None)
-                .expect("read last checkpoint");
+            let result =
+                LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
             assert_eq!(result, expected_result);
         }
     }

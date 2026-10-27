@@ -95,6 +95,9 @@ Bob, and Carol read back `NULL` for `country`. New writes can populate the
 column by including it in the `RecordBatch` they pass to
 `engine.write_parquet()`.
 
+If the table declares CHECK constraints, acknowledge that your connector enforces them before you
+commit. See [Check constraints](./check_constraints.md) for the acknowledgement.
+
 ## Validation rules
 
 `add_column()` checks the new field at `build()` time. If any rule is violated,

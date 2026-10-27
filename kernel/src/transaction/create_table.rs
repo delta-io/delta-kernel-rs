@@ -34,7 +34,7 @@
 // Re-export the builder so callers can still access it from this module path.
 pub use super::builder::create_table::CreateTableTransactionBuilder;
 use crate::schema::SchemaRef;
-use crate::transaction::{CreateTable, Transaction};
+use crate::transaction::{CreateTable, Imperative, Transaction};
 
 /// A type alias for create-table transactions.
 ///
@@ -72,7 +72,7 @@ use crate::transaction::{CreateTable, Transaction};
 /// # Ok(())
 /// # }
 /// ```
-pub type CreateTableTransaction = Transaction<CreateTable>;
+pub type CreateTableTransaction<MODE = Imperative> = Transaction<CreateTable, MODE>;
 
 /// Creates a builder for creating a new Delta table.
 ///

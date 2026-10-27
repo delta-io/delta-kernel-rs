@@ -101,6 +101,7 @@ impl FfiStatsOptions {
 /// The default behavior is `StringMapOnly`.
 ///
 /// cbindgen:prefix-with-name=true
+// TODO(#3609): Support connector-supplied timestamp timezones.
 #[repr(C)]
 pub enum FfiPartitionValuesOptions {
     /// Emit only the raw string map.

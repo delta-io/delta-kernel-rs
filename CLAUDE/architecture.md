@@ -101,20 +101,27 @@ file listing without re-scanning the table.
 `Snapshot` -> `UpdateTableTransactionBuilder` -> `Transaction` -> (`WriteState` ->
 `BoundWriteContextBuilder` -> `BoundWriteContext`) -> commit
 
-`TransactionBuilder<T>` shares configuration setters across transaction types. The sealed
-`TransactionType` trait selects `T::BuilderState`; each type supplies its own constructors, custom
-setters, and build validation. `UpdateTableTransactionBuilder` aliases
-`TransactionBuilder<UpdateTable>` and builds `Transaction<UpdateTable>`, the default transaction
-type. Construct it with `snapshot.update_table(operation, engine_info, data_change)`, requiring all
-three values.
-`CreateTableTransactionBuilder` aliases `TransactionBuilder<CreateTable>` and builds
-`Transaction<CreateTable>`. Its constructor requires the path, schema, engine info, and `data_change`
-and fixes the operation to `CREATE TABLE`. These inputs cannot be changed on either builder or
-transaction. Kernel preserves `data_change` even for empty commits rather than inferring it from
-staged files. `build()` rejects ALTER with `true` and blind append with `false`; `commit()` retains
+`TransactionBuilder<T, MODE>` shares configuration setters across transaction types and execution
+modes. `MODE` defaults to `Imperative`. The sealed `TransactionType` trait selects `T::BuilderState`;
+each type supplies its own constructors, custom setters, and build validation.
+`UpdateTableTransactionBuilder<MODE>` aliases `TransactionBuilder<UpdateTable, MODE>` and builds
+`Transaction<UpdateTable, MODE>`. Construct it with
+`snapshot.update_table(operation, engine_info, data_change)`, requiring all three values.
+`CreateTableTransactionBuilder<MODE>` aliases `TransactionBuilder<CreateTable, MODE>` and builds
+`Transaction<CreateTable, MODE>`. Its constructor requires the path, schema, engine info, and
+`data_change` and fixes the operation to `CREATE TABLE`. These inputs cannot be changed on either
+builder or transaction. Kernel preserves `data_change`, including for empty commits.
+`build()` rejects ALTER with `true` and blind append with `false`; `commit()` retains
 operation and staged-file validation.
 Schema changes use `UpdateTable`, including the
 `UpdateTableOperation::AlterTable` operation.
+
+Both entry points construct imperative builders. With `declarative-plans`,
+`with_execution_mode::<Declarative>()` selects declarative staging before calling the same `build()`
+method, preserving configured intent. Declarative transactions stage relation handles through
+`add_files_ref`, `remove_files_ref`, and `update_deletion_vectors_ref`;
+`commit_declarative(executor)` returns an unsupported error while plan-based commits are unimplemented.
+Staged relations must remain available in that executor until commit completes.
 
 Kernel captures table-wide configuration in a transportable `WriteState`. Each writer binds
 partition values and any logical materialized row-tracking columns to create a `BoundWriteContext`

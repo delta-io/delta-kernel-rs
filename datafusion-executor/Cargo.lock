@@ -1404,7 +1404,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "arrow",
  "bytes",
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_derive"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "proc-macro2",
  "quote",
