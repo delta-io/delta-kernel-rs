@@ -15,8 +15,9 @@ use std::sync::Arc;
 pub(super) use self::state::TransactionBuilderState;
 use crate::actions::DomainMetadata;
 use crate::schema::SchemaRef;
-use crate::transaction::commit_info::collect_operation_metadata;
-use crate::transaction::{CreateTable, ExecutionMode, Imperative, UpdateTable};
+use crate::transaction::{
+    collect_operation_metadata, CreateTable, ExecutionMode, Imperative, UpdateTable,
+};
 use crate::EngineData;
 
 /// A transaction type supported by [`TransactionBuilder`].

@@ -17,35 +17,33 @@ pub use utils::{
 /// Convert the inline `Commit`s returned by a UC `load_table` response into
 /// kernel `LogPath`s suitable for `Snapshot::builder_for(...).with_log_tail(...)`.
 ///
-/// Sorts commits by version because they may arrive out of order. Normalizes `table_root`
-/// with a trailing `/` for staged-commit path resolution.
+/// Sorts commits by version because they may arrive out of order. Each commit may name either a
+/// staged or an already-published commit file. A published filename asserts that its version and
+/// all lower versions are already published.
 ///
 /// # Errors
 ///
-/// Returns an error if a commit's `file_size` is negative (does not fit in `FileSize`) or if
-/// [`LogPath::staged_commit`] rejects the resolved path.
-pub fn log_tail_from_commits(
-    commits: &[Commit],
-    mut table_root: Url,
-) -> KernelResult<Vec<LogPath>> {
-    // `load_table` returns the location without a trailing slash, but staged-commit path
-    // resolution requires the table root to end in `/`.
-    if !table_root.path().ends_with('/') {
-        table_root.set_path(&format!("{}/", table_root.path()));
-    }
+/// Returns an error if a commit's `version` or `file_size` is negative, or if
+/// [`LogPath::from_commit_filename`] rejects its filename (including a filename whose version
+/// differs from the commit's `version`).
+pub fn log_tail_from_commits(commits: &[Commit], table_root: Url) -> KernelResult<Vec<LogPath>> {
     let mut sorted: Vec<&Commit> = commits.iter().collect();
     sorted.sort_by_key(|c| c.version);
     sorted
         .into_iter()
         .map(|c| {
+            let version = c.version.try_into().map_err(|_| {
+                KernelError::generic(format!("commit version {} is negative", c.version))
+            })?;
             let file_size = c.file_size.try_into().map_err(|_| {
                 KernelError::generic(format!(
                     "commit file_size {} does not fit in FileSize",
                     c.file_size
                 ))
             })?;
-            LogPath::staged_commit(
+            LogPath::from_commit_filename(
                 table_root.clone(),
+                version,
                 &c.file_name,
                 c.file_modification_timestamp,
                 file_size,
@@ -84,7 +82,7 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel::Snapshot;
+    use delta_kernel::{FileMeta, Snapshot};
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use unity_catalog_delta_client_api::{Commit, InMemoryUpdateTableClient, TableData};
@@ -164,29 +162,38 @@ mod tests {
         assert!(err.to_string().contains("invalid table location"));
     }
 
+    const UUID: &str = "3a0d65cd-4056-49b8-937b-95f9e3ee90e5";
+
     #[rstest]
-    #[case::missing_trailing_slash("memory:///my_table")]
-    #[case::has_trailing_slash("memory:///my_table/")]
-    fn log_tail_from_commits_sorts_and_normalizes(#[case] table_root: &str) {
-        let names = [
-            "00000000000000000000.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
-            "00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
-            "00000000000000000002.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
-        ];
-        // Insert out of order: 2, 0, 1.
+    fn log_tail_from_commits_sorts_normalizes_and_resolves_commit_forms(
+        #[values("memory:///my_table", "memory:///my_table/")] table_root: &str,
+    ) {
+        let staged_1 = format!("00000000000000000001.{UUID}.json");
+        // Out of order, mixing published and staged names.
         let commits = vec![
-            Commit::new(2, 0, names[2], 100, 0),
-            Commit::new(0, 0, names[0], 100, 0),
-            Commit::new(1, 0, names[1], 100, 0),
+            Commit::new(2, 0, "00000000000000000002.json", 100, 0),
+            Commit::new(0, 0, "00000000000000000000.json", 100, 0),
+            Commit::new(1, 0, &staged_1, 100, 0),
         ];
-        let normalized = Url::parse("memory:///my_table/").unwrap();
 
         let log_tail = log_tail_from_commits(&commits, Url::parse(table_root).unwrap()).unwrap();
 
-        let expected: Vec<LogPath> = names
-            .iter()
-            .map(|name| LogPath::staged_commit(normalized.clone(), name, 0, 100).unwrap())
-            .collect();
+        let normalized = Url::parse("memory:///my_table/").unwrap();
+        let expected: Vec<LogPath> = [
+            "_delta_log/00000000000000000000.json".to_string(),
+            format!("_delta_log/_staged_commits/{staged_1}"),
+            "_delta_log/00000000000000000002.json".to_string(),
+        ]
+        .iter()
+        .map(|rel_path| {
+            LogPath::try_new(FileMeta {
+                location: normalized.join(rel_path).unwrap(),
+                last_modified: 0,
+                size: 100,
+            })
+            .unwrap()
+        })
+        .collect();
         assert_eq!(log_tail, expected);
     }
 
@@ -196,19 +203,27 @@ mod tests {
         assert!(log_tail_from_commits(&[], table_root).unwrap().is_empty());
     }
 
-    #[test]
-    fn log_tail_from_commits_rejects_negative_file_size() {
-        let commits = vec![Commit::new(
-            0,
-            0,
-            "00000000000000000000.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
-            -1,
-            0,
-        )];
+    #[rstest]
+    #[case::negative_file_size(0, "00000000000000000000.json", -1, false)]
+    #[case::negative_version(-1, "00000000000000000000.json", 100, false)]
+    #[case::version_mismatch(1, "00000000000000000000.json", 100, true)]
+    #[case::not_a_commit(0, "00000000000000000000.crc", 100, true)]
+    fn log_tail_from_commits_rejects_invalid_commit(
+        #[case] version: i64,
+        #[case] file_name: &str,
+        #[case] file_size: i64,
+        #[case] expected_invalid_log_path_error: bool,
+    ) {
+        let commits = vec![Commit::new(version, 0, file_name, file_size, 0)];
         let table_root = Url::parse("memory:///my_table/").unwrap();
 
         let err = log_tail_from_commits(&commits, table_root).unwrap_err();
 
-        assert!(err.to_string().contains("does not fit in FileSize"));
+        let expected_kind = if expected_invalid_log_path_error {
+            matches!(err, KernelError::InvalidLogPath(_))
+        } else {
+            matches!(err, KernelError::Generic(_))
+        };
+        assert!(expected_kind, "{err:?}");
     }
 }

@@ -1,6 +1,6 @@
 //! Pre-commit validation of data staged on a [`Transaction`].
 //!
-//! [`Transaction`]: super::Transaction
+//! [`Transaction`]: crate::transaction::Transaction
 
 mod addfile;
 mod dv;

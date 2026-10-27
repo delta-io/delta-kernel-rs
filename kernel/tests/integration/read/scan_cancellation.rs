@@ -1,4 +1,4 @@
-//! Integration coverage for passing `ScanBuilder` cancellation through the real Default Engine.
+//! Integration coverage for scan cancellation through token-bound engine handlers.
 
 use std::sync::Arc;
 
@@ -44,7 +44,7 @@ async fn json_only_table() -> KernelResult<(Arc<InMemory>, &'static str)> {
     Ok((storage, table_root))
 }
 
-// End-to-end coverage that a scan passes an already-cancelled token to its commit read before
+// End-to-end coverage that a scan binds an already-cancelled token to its commit read before
 // producing metadata. Stats output changes the projected action schema and replay transforms;
 // cancellation must behave the same with either configuration.
 #[rstest]
@@ -137,8 +137,9 @@ async fn mid_stream_cancellation_yields_cancelled() -> KernelResult<()> {
     Ok(())
 }
 
-// A pre-cancelled scan over a table WITH a checkpoint surfaces `Err(Cancelled)` -- reaching the
-// checkpoint/sidecar/footer `check_cancelled` guards that the JSON-only fixtures never enter.
+// A pre-cancelled scan over a table WITH a checkpoint surfaces `Err(Cancelled)` -- the bound
+// Parquet handler checks the token on checkpoint, sidecar and footer reads that the JSON-only
+// fixtures never enter.
 // `packed` distinguishes a `.tar.zst` fixture (unpacked to a temp dir) from a plain directory.
 #[rstest]
 #[case::v1_checkpoint("with_checkpoint_no_last_checkpoint", false)]
@@ -214,9 +215,8 @@ async fn engine_receives_the_callers_token_by_identity_json() -> KernelResult<()
     Ok(())
 }
 
-// Same guarantee on the PARQUET read path, which the JSON-only fixture cannot reach. Checkpoint
-// replay threads the token through separate `.cloned()` call sites; a live (uncancelled) token lets
-// the read actually execute so the parquet handler observes it.
+// Same guarantee on the Parquet read path, which the JSON-only fixture cannot reach. A live token
+// lets the read execute so the Parquet handler can verify its identity.
 #[tokio::test]
 async fn engine_receives_the_callers_token_by_identity_parquet() -> KernelResult<()> {
     let table_name = "with_checkpoint_no_last_checkpoint";
