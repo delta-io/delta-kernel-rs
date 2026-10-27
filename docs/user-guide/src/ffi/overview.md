@@ -168,7 +168,6 @@ engine-owned memory.
 |----------|---------|
 | `visit_schema` | Walk a `SharedSchema` by invoking per-field callbacks on an `EngineSchemaVisitor` |
 | `visit_protocol` | Invoke a `visit_versions` callback, then a `visit_feature` callback per reader/writer feature |
-| `visit_metadata_configuration` | Iterate the `configuration` key/value map of a snapshot's metadata |
 | `visit_string_map` / `get_from_string_map` | Iterate or look up entries in an opaque `CStringMap` (used by both metadata and scan-metadata surfaces) |
 
 See [Visitor callbacks](#visitor-callbacks) below for the pattern.

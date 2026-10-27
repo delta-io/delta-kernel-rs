@@ -2082,37 +2082,6 @@ pub unsafe extern "C" fn get_partition_columns(
     iter.into()
 }
 
-/// Visit each metadata configuration (key/value pair) for the specified snapshot by invoking the
-/// provided `visitor` callback once per entry.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid snapshot handle, a valid `engine_context` as an
-/// opaque pointer passed to each `visitor` invocation, and a valid `visitor` function pointer.
-#[no_mangle]
-pub unsafe extern "C" fn visit_metadata_configuration(
-    snapshot: Handle<SharedSnapshot>,
-    engine_context: NullableCvoid,
-    visitor: extern "C" fn(
-        engine_context: NullableCvoid,
-        key: KernelStringSlice,
-        value: KernelStringSlice,
-    ),
-) {
-    let snapshot = unsafe { snapshot.as_ref() };
-    snapshot
-        .table_configuration()
-        .metadata()
-        .configuration()
-        .iter()
-        .for_each(|(key, value)| {
-            visitor(
-                engine_context,
-                kernel_string_slice!(key),
-                kernel_string_slice!(value),
-            );
-        });
-}
 // === Protocol handle FFI ===
 
 /// Get the protocol for this snapshot. The returned handle must be freed with [`free_protocol`].
@@ -3107,59 +3076,6 @@ mod tests {
             }
             Err(kind) => assert_extern_result_error_with_message(result, kind, None),
         }
-
-        unsafe { free_snapshot(snap) }
-        unsafe { free_engine(engine) }
-        Ok(())
-    }
-
-    #[rstest]
-    #[case(
-        METADATA_WITH_TABLE_PROPERTIES,
-        HashMap::from([
-            (String::from("delta.appendOnly"), String::from("true")),
-            (String::from("custom.key"), String::from("custom_value")),
-        ])
-    )]
-    #[case(METADATA, HashMap::new())]
-    #[tokio::test]
-    async fn test_visit_metadata_configuration(
-        #[case] metadata: &str,
-        #[case] expected: HashMap<String, String>,
-    ) -> KernelResult<()> {
-        let table_root = "memory:///";
-        let storage = Arc::new(InMemory::new());
-        add_commit(
-            table_root,
-            storage.as_ref(),
-            0,
-            actions_to_string_with_metadata(vec![TestAction::Metadata], metadata),
-        )
-        .await?;
-
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
-
-        let snap =
-            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
-
-        extern "C" fn collect_property(
-            engine_context: NullableCvoid,
-            key: KernelStringSlice,
-            value: KernelStringSlice,
-        ) {
-            let map =
-                unsafe { &mut *(engine_context.unwrap().as_ptr() as *mut HashMap<String, String>) };
-            let k = unsafe { String::try_from_slice(&key) }.unwrap();
-            let v = unsafe { String::try_from_slice(&value) }.unwrap();
-            map.insert(k, v);
-        }
-
-        let mut collected: HashMap<String, String> = HashMap::new();
-        let ctx = NonNull::new(&mut collected as *mut _ as *mut c_void);
-        unsafe { visit_metadata_configuration(snap.shallow_copy(), ctx, collect_property) };
-
-        assert_eq!(collected, expected);
 
         unsafe { free_snapshot(snap) }
         unsafe { free_engine(engine) }
@@ -4268,15 +4184,22 @@ mod tests {
         None,
         None,
         Some(1587968585495),
+        &[],
         &[]
     )]
-    #[case::with_name(
+    #[case::with_name_and_configuration(
         METADATA_WITH_FEATURES,
         "deadbeef-1234-5678-abcd-000000000000",
         Some("test_table"),
         None,
         Some(1234567890000),
-        &[]
+        &[],
+        &[
+            ("delta.columnMapping.mode", "name"),
+            ("delta.rowTracking.enabled", "true"),
+            ("delta.rowTracking.materializedRowIdColumnName", "_row_id"),
+            ("delta.rowTracking.materializedRowCommitVersionColumnName", "_row_commit_version"),
+        ]
     )]
     #[case::with_description_and_format_options(
         METADATA_WITH_FORMAT_OPTIONS,
@@ -4284,7 +4207,17 @@ mod tests {
         Some("my_table"),
         Some("A test table"),
         Some(1587968585495),
-        &[("compression", "zstd"), ("custom.option", "arbitrary value")]
+        &[("compression", "zstd"), ("custom.option", "arbitrary value")],
+        &[]
+    )]
+    #[case::with_table_properties(
+        METADATA_WITH_TABLE_PROPERTIES,
+        "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+        None,
+        None,
+        Some(1587968585495),
+        &[],
+        &[("delta.appendOnly", "true"), ("custom.key", "custom_value")]
     )]
     #[case::without_created_time(
         METADATA_WITHOUT_CREATED_TIME,
@@ -4292,6 +4225,7 @@ mod tests {
         None,
         None,
         None,
+        &[],
         &[]
     )]
     #[tokio::test]
@@ -4302,20 +4236,24 @@ mod tests {
         #[case] description: Option<&str>,
         #[case] created_time: Option<i64>,
         #[case] format_options: &[(&str, &str)],
+        #[case] configuration: &[(&str, &str)],
     ) -> KernelResult<()> {
+        fn to_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
+            entries
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        }
         let (engine, snap) = setup_snapshot(metadata.to_string()).await?;
-        let format_options: HashMap<String, String> = format_options
-            .iter()
-            .map(|(key, value)| (key.to_string(), value.to_string()))
-            .collect();
 
         let visited = collect_visited_metadata(&snap);
         assert_eq!(visited.id(), id);
         assert_eq!(visited.name(), name);
         assert_eq!(visited.description(), description);
         assert_eq!(visited.format_provider(), "parquet");
-        assert_eq!(visited.format_options(), &format_options);
+        assert_eq!(visited.format_options(), &to_map(format_options));
         assert_eq!(visited.created_time(), created_time);
+        assert_eq!(visited.configuration(), &to_map(configuration));
 
         unsafe { free_snapshot(snap) };
         unsafe { free_engine(engine) };
