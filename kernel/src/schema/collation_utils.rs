@@ -39,7 +39,7 @@ pub(crate) fn validate_collations_feature_support(
     }
     CollationAnnotationValidator.transform_struct(schema)?;
     require!(
-        table_config.has_collations(),
+        table_config.has_collations_feature(),
         KernelError::unsupported(
             "Table contains collation metadata but requires the 'collations' or \
              'collations-preview' table feature"
