@@ -1391,7 +1391,8 @@ mod test {
     }
 
     impl WriteSupport {
-        fn of(table_config: &TableConfiguration) -> Self {
+        /// Runs the write-support check on `table_config` and classifies its outcome.
+        fn for_table_config(table_config: &TableConfiguration) -> Self {
             match table_config.ensure_operation_supported(Operation::Write) {
                 Ok(()) => Self::Supported,
                 Err(KernelError::InvalidProtocol(_)) => Self::InvalidProtocol,
@@ -1492,7 +1493,7 @@ mod test {
             .with_protocol(protocol)
             .build();
 
-        let write_support = WriteSupport::of(&table_config);
+        let write_support = WriteSupport::for_table_config(&table_config);
         assert_eq!(write_support, expected_write_support);
 
         let read_supported = table_config
@@ -1613,7 +1614,7 @@ mod test {
             .with_protocol(protocol)
             .build();
 
-        let write_support = WriteSupport::of(&table_config);
+        let write_support = WriteSupport::for_table_config(&table_config);
         assert_eq!(write_support, expected_write_support);
 
         let read_supported = table_config
