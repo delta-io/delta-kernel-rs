@@ -220,8 +220,15 @@ fn declarative_metadata_matches_imperative_scan(
         Some(col!("id").is_not_null())
     )]
     predicate: Option<Pred>,
+    #[values(false, true)] use_crc: bool,
 ) -> KernelResult<()> {
-    let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
+    let (engine, mut snapshot, _tempdir) = load_test_table(table)?;
+    if !use_crc {
+        snapshot = Arc::new(Snapshot::new(
+            snapshot.log_segment().clone(),
+            snapshot.table_configuration().clone(),
+        )?);
+    }
     let predicate = predicate.map(Arc::new);
 
     let imperative_builder = snapshot
@@ -244,6 +251,14 @@ fn declarative_metadata_matches_imperative_scan(
         None => declarative_builder,
     };
     let scan = declarative_builder.build()?;
+    if !use_crc && table == "v1-multi-part-partitioned-struct-stats-only" {
+        let plan = scan
+            .declarative_metadata_scan_plan(engine.as_ref())?
+            .expect("checkpoint plan");
+        assert!(plan.nodes.iter().any(|node| {
+            matches!(&node.op, Operator::ScanParquet(scan) if scan.files.len() == 3)
+        }));
+    }
     let actual = declarative_metadata(&scan, engine.as_ref())?;
 
     if table.contains("struct-stats-only") {
@@ -809,9 +824,16 @@ fn declarative_metadata_data_skipping(
 fn declarative_metadata_partition_values_prune_without_struct_stats(
     #[case] predicate: Pred,
     #[case] expected_count: usize,
+    #[values(false, true)] use_crc: bool,
 ) -> KernelResult<()> {
-    let (engine, snapshot, _tempdir) =
-        crate::unit_test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+    let (engine, mut snapshot, _tempdir) =
+        load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+    if !use_crc {
+        snapshot = Arc::new(Snapshot::new(
+            snapshot.log_segment().clone(),
+            snapshot.table_configuration().clone(),
+        )?);
+    }
     let predicate = Arc::new(predicate);
     let expected = imperative_metadata(
         snapshot
