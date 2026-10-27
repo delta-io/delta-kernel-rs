@@ -14,7 +14,7 @@ use url::Url;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::amt_path_util::{resolve_table_relative, validate_table_relative};
-use crate::path_encoding::{uri_decode_path, uri_encode_path};
+use crate::path_encoding::uri_decode_path;
 use crate::schema::DataType;
 use crate::snapshot::Snapshot;
 use crate::utils::require;
@@ -389,14 +389,14 @@ impl DeletionVectorDescriptor {
     /// - `'u'` -> marker `r`, path = the z85-decoded `<prefix>/deletion_vector_<uuid>.bin`.
     /// - `'r'` -> marker `r`, path = the raw path, unchanged.
     /// - `'p'` -> marker `r` + the percent-decoded path relative to `table_root` if the URL names a
-    ///   file under the root, else marker `p` + the absolute path with its path component
-    ///   re-encoded canonically.
+    ///   file under the root, else marker `p` + the original absolute path.
     /// - `'i'` -> marker `i`, path = `path_or_inline_dv`, unchanged. `adaptiveMetadata` forbids new
     ///   inline DVs, but the log may still hold ones from before the feature was enabled.
     ///
     /// `offset` is kept because a single file may pack multiple DVs. An absent offset on a
     /// persisted DV is treated as 1, the byte its blob is read from, so it matches the explicit
-    /// offset an AMT content entry always carries.
+    /// offset an AMT content entry always carries. An inline DV's offset is ignored, since the
+    /// protocol requires it to be absent.
     ///
     /// # Errors
     ///
@@ -417,10 +417,8 @@ impl DeletionVectorDescriptor {
         );
         let (marker, path) =
             Self::normalized_marker_and_path(storage_type, path_or_inline_dv, table_root)?;
-        let offset = match storage_type {
-            DeletionVectorStorageType::Inline => None,
-            _ => offset.or(Some(1)),
-        };
+        let offset =
+            (storage_type != DeletionVectorStorageType::Inline).then(|| offset.unwrap_or(1));
         Ok(Self::unique_id_from_parts(marker, &path, offset))
     }
 
@@ -800,13 +798,11 @@ pub fn split_vector(
 }
 
 /// Normalizes a `'p'` DV `url` (parsed from `original`) to its `(marker, path)` identity: `r` + the
-/// percent-decoded root-relative path if it names a file under `table_root`, else `p` + the URL
-/// with its path re-encoded canonically.
+/// percent-decoded root-relative path if it names a file under `table_root`, else `p` + `original`.
 ///
 /// Paths are compared decoded so that alternate encodings of the same characters (e.g. `%74` vs
 /// `t`) agree, and the relative form matches the raw form of `'u'`/`'r'` paths. A URL with a query
-/// or fragment, or whose path is not valid UTF-8 once decoded, is treated as outside the root and
-/// keeps `original` verbatim.
+/// or fragment, or whose path is not valid UTF-8 once decoded, is treated as outside the root.
 fn normalized_absolute_marker_and_path(
     url: &Url,
     original: &str,
@@ -829,24 +825,11 @@ fn normalized_absolute_marker_and_path(
         .flatten();
     match relative {
         Some(relative) => ("r", relative),
-        None => (
-            "p",
-            canonical_absolute_dv_path(url).unwrap_or_else(|| original.to_string()),
-        ),
+        // TODO(#2423): an out-of-root path is compared verbatim, so a `p` read back from an AMT
+        // (raw location, re-encoded by `uri_encode_path`) does not match a writer that encoded it
+        // differently (e.g. Delta-Spark leaves non-ASCII raw).
+        None => ("p", original.to_string()),
     }
-}
-
-/// Re-encodes `url`'s path from its decoded form, so alternate encodings of the same file (e.g.
-/// `%7E` vs `~`) serialize identically. Returns `None` for a URL with a query or fragment, or whose
-/// path is not valid UTF-8 once decoded.
-fn canonical_absolute_dv_path(url: &Url) -> Option<String> {
-    if url.query().is_some() || url.fragment().is_some() {
-        return None;
-    }
-    let decoded = uri_decode_path(url.path())?;
-    let mut canonical = url.clone();
-    canonical.set_path(&uri_encode_path(&decoded));
-    Some(canonical.into())
 }
 
 #[cfg(test)]
@@ -1616,13 +1599,6 @@ mod tests {
         None,
         "s3://mytable/",
         "rab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin@1"
-    )]
-    #[case::absolute_out_of_root_noncanonical_encoding(
-        DeletionVectorStorageType::PersistedAbsolute,
-        "s3://other/a%7Eb%2Fc/d%20v.bin",
-        Some(4),
-        "s3://mytable/",
-        "ps3://other/a~b/c/d%20v.bin@4"
     )]
     #[case::inline(
         DeletionVectorStorageType::Inline,
