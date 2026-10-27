@@ -85,7 +85,8 @@ schema round trip, including annotation lifetimes after the source Rust schemas 
 ## Snapshot metadata tests
 
 `read_table -m path/to/table` prints the snapshot version and every metadata field from
-`snapshot_visit_metadata`, then exits without scanning. Absent optional values print as `None`.
+`snapshot_visit_metadata`, then exits without scanning. Map entries print sorted by key, and
+absent optional values print as `None`.
 `-m` can't be combined with `-a`, `-c`, or `-s`. Because no data files are read, the test doesn't
 need Arrow GLib. Run these commands from the repository root:
 

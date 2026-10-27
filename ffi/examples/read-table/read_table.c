@@ -340,16 +340,40 @@ static void print_optional_string(const char* label, OptionalValueKernelStringSl
   }
 }
 
+static int compare_map_keys(const void* a, const void* b) {
+  const KernelStringSlice* left = &(*(const FfiStringMapEntry* const*)a)->key;
+  const KernelStringSlice* right = &(*(const FfiStringMapEntry* const*)b)->key;
+  uintptr_t len = left->len < right->len ? left->len : right->len;
+  int cmp = len == 0 ? 0 : memcmp(left->ptr, right->ptr, len);
+  if (cmp != 0) {
+    return cmp;
+  }
+  return (left->len > right->len) - (left->len < right->len);
+}
+
 static void print_string_map(const char* label, FfiStringMap map) {
   printf("%s:\n", label);
+  if (map.len == 0) {
+    return;
+  }
+  const FfiStringMapEntry** sorted = malloc(sizeof(*sorted) * map.len);
+  if (sorted == NULL) {
+    fprintf(stderr, "Failed to allocate %s sort buffer\n", label);
+    exit(-1);
+  }
   for (uintptr_t i = 0; i < map.len; i++) {
-    const FfiStringMapEntry* entry = &map.ptr[i];
+    sorted[i] = &map.ptr[i];
+  }
+  qsort(sorted, map.len, sizeof(*sorted), compare_map_keys);
+  for (uintptr_t i = 0; i < map.len; i++) {
+    const FfiStringMapEntry* entry = sorted[i];
     printf("  %.*s: %.*s\n",
            (int)entry->key.len,
            entry->key.ptr,
            (int)entry->value.len,
            entry->value.ptr);
   }
+  free(sorted);
 }
 
 static void print_snapshot_metadata(NullableCvoid context, const FfiMetadata* metadata) {
