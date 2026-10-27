@@ -1606,11 +1606,12 @@ mod test {
     }
 
     /// The write support of a table that lists the `generatedColumns` writer feature.
-    const WITH_FEATURE_WRITE_SUPPORT: WriteSupport = if cfg!(feature = "generated-columns-in-dev") {
-        WriteSupport::Supported
-    } else {
-        WriteSupport::Unsupported
-    };
+    const GENERATED_COLUMNS_LISTED_WRITE_SUPPORT: WriteSupport =
+        if cfg!(feature = "generated-columns-in-dev") {
+            WriteSupport::Supported
+        } else {
+            WriteSupport::Unsupported
+        };
 
     /// The write support of a legacy writer version 4 table, whose protocol implies
     /// `checkConstraints` and `generatedColumns` among other features.
@@ -1625,7 +1626,7 @@ mod test {
 
     /// The write support of a table that lists the `generatedColumns` writer feature and whose
     /// generation expression is a non-string value.
-    const NON_STRING_WITH_FEATURE_WRITE_SUPPORT: WriteSupport =
+    const NON_STRING_EXPRESSION_LISTED_WRITE_SUPPORT: WriteSupport =
         if cfg!(feature = "generated-columns-in-dev") {
             WriteSupport::InvalidSchema
         } else {
@@ -1652,7 +1653,7 @@ mod test {
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        WITH_FEATURE_WRITE_SUPPORT
+        GENERATED_COLUMNS_LISTED_WRITE_SUPPORT
     )]
     #[case::legacy_writer_at_min_version(
         generated_event_year_schema(),
@@ -1666,7 +1667,7 @@ mod test {
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        WITH_FEATURE_WRITE_SUPPORT
+        GENERATED_COLUMNS_LISTED_WRITE_SUPPORT
     )]
     // Connectors receive generation expressions as SQL text, so with `generated-columns-in-dev`
     // kernel rejects a non-string expression.
@@ -1675,7 +1676,7 @@ mod test {
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        NON_STRING_WITH_FEATURE_WRITE_SUPPORT
+        NON_STRING_EXPRESSION_LISTED_WRITE_SUPPORT
     )]
     #[case::empty_expression_without_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "")) },
@@ -1693,7 +1694,7 @@ mod test {
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        WITH_FEATURE_WRITE_SUPPORT
+        GENERATED_COLUMNS_LISTED_WRITE_SUPPORT
     )]
     #[case::no_generation_expression(
         schema_ref! { nullable "event_time": TIMESTAMP },
