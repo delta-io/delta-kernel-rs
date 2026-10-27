@@ -95,7 +95,11 @@ impl LogSegment {
             let mut resolution = pruned
                 .replay_for_pm(engine)?
                 .newer_than(version_as_i64(crc.version)?)
-                .into_resolution(ProtocolMetadataSource::CrcSeededPmOnlyReplay);
+                .into_resolution(
+                    ProtocolMetadataSource::CrcSeededPmOnlyReplay,
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    pruned.newest_commit().is_some(),
+                );
             if resolution.metadata.is_some() && resolution.protocol.is_some() {
                 info!("Found P&M from pruned log replay");
                 return Ok(resolution);
@@ -121,7 +125,11 @@ impl LogSegment {
             Some(_) => self.replay_for_pm(engine)?,
             None => self.replay_for_pm_with_unbounded_segment(engine)?,
         };
-        Ok(candidate.into_resolution(ProtocolMetadataSource::FullReplay))
+        Ok(candidate.into_resolution(
+            ProtocolMetadataSource::FullReplay,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            self.newest_commit().is_some(),
+        ))
     }
 
     /// Replays the log segment for the latest Protocol and Metadata, each with its version, in one
@@ -611,12 +619,17 @@ pub(crate) enum LastManifestCommitResolution {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl LastManifestCommitResolution {
-    /// Resolves the `lastManifestCommit` that P&M replay read from the newest commit. A miss is
-    /// `Unresolved` because replay may not have read that commit's `commitInfo` (the non-plan
-    /// replay never does, and a segment ending on a checkpoint does not list that commit).
-    fn from_replay(captured: Option<LastManifestCommit>) -> Self {
+    /// Resolves the `lastManifestCommit` that P&M replay captured from the snapshot version's
+    /// commit.
+    ///
+    /// `newest_commit_listed` says whether the segment lists that commit file. Replay always reads
+    /// a listed newest commit, so if it is listed, a missing `captured` pointer resolves to
+    /// `Resolved(None)`. Otherwise it is `Unresolved` and is read from the commit file on first
+    /// use.
+    fn from_replay(captured: Option<LastManifestCommit>, newest_commit_listed: bool) -> Self {
         match captured {
             Some(pointer) => Self::Resolved(Some(pointer)),
+            None if newest_commit_listed => Self::Resolved(None),
             None => Self::Unresolved,
         }
     }
@@ -683,7 +696,12 @@ impl PmCandidate {
     }
 
     /// The resolution this replay result gives the snapshot, resolved through `source`.
-    fn into_resolution(self, source: ProtocolMetadataSource) -> PmResolution {
+    /// `newest_commit_listed` says whether the replayed segment lists its newest commit.
+    fn into_resolution(
+        self,
+        source: ProtocolMetadataSource,
+        #[cfg(feature = "adaptive-metadata-in-dev")] newest_commit_listed: bool,
+    ) -> PmResolution {
         PmResolution {
             metadata: self.metadata.map(|(_, m)| m),
             protocol: self.protocol.map(|(_, p)| p),
@@ -693,6 +711,7 @@ impl PmCandidate {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit: LastManifestCommitResolution::from_replay(
                 self.last_manifest_commit.map(|(_, pointer)| pointer),
+                newest_commit_listed,
             ),
         }
     }
