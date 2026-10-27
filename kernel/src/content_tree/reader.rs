@@ -52,7 +52,6 @@ use crate::{
 /// # Parameters
 /// - `engine`: provides the parquet and evaluation handlers.
 /// - `checkpoint`: the AMT `checkpoint` action whose content tree to read.
-/// - `table_root`: the table root URL relative manifest locations resolve against.
 /// - `ctx`: the per-read values the entries cannot supply (see [`ReadContext`]).
 /// - `cancellation_token`: when cancelled, stops the manifest reads with
 ///   [`KernelError::Cancelled`].
@@ -68,10 +67,10 @@ use crate::{
 pub(crate) fn read_add_actions_from_amt(
     engine: &dyn Engine,
     checkpoint: &CheckpointAction,
-    table_root: &Url,
     ctx: &ReadContext,
     cancellation_token: Option<&CancellationTokenRef>,
 ) -> KernelResult<Box<dyn KernelResultIterator<FilteredEngineData>>> {
+    let table_root = &ctx.table_root;
     let root = checkpoint.root_filemeta(table_root)?;
     let schemas = ManifestReadSchema::new();
     let converter = make_root_entry_converter(engine, ctx)?;
@@ -97,13 +96,15 @@ pub(crate) fn read_add_actions_from_amt(
     ))
 }
 
-/// Values the read path emits into every `Add` action but cannot derive from an AMT entry, so the
-/// caller must supply them.
+/// Values the read path needs but cannot derive from an AMT entry, so the caller must supply them.
 ///
-/// The AMT entry carries neither the data file's modification time nor a `dataChange` flag, so
-/// without this context the reader would have to invent both. Supplying them here keeps the
-/// function signature stable once a real source (e.g. the commit timestamp) is threaded through.
+/// The context carries the table root that relative entry locations resolve against. The AMT entry
+/// also lacks the data file's modification time and a `dataChange` flag, so without this context
+/// the reader would have to invent both. Supplying them here keeps the function signature
+/// stable once a real source (e.g. the commit timestamp) is threaded through.
 pub(crate) struct ReadContext {
+    /// The table root URL relative manifest locations resolve against.
+    pub(crate) table_root: Url,
     /// Emitted as `Add.modificationTime`.
     pub(crate) modification_time: i64,
     /// Emitted as `Add.dataChange`.
@@ -1020,6 +1021,7 @@ mod tests {
     /// Non-default values so a hard-coded `modificationTime` / `dataChange` would fail.
     fn read_ctx() -> ReadContext {
         ReadContext {
+            table_root: table_root(),
             modification_time: 1234,
             data_change: false,
         }
@@ -1406,7 +1408,7 @@ mod tests {
         engine: &dyn Engine,
         checkpoint: &CheckpointAction,
     ) -> KernelResult<Vec<RecordBatch>> {
-        read_add_actions_from_amt(engine, checkpoint, &table_root(), &read_ctx(), None)?
+        read_add_actions_from_amt(engine, checkpoint, &read_ctx(), None)?
             .map(|batch| filtered_to_batch(batch?).try_into_record_batch())
             .collect()
     }
@@ -1636,10 +1638,9 @@ mod tests {
             200,
         );
         let checkpoint = write_root(&engine, &[malformed, valid]);
-        let results: Vec<_> =
-            read_add_actions_from_amt(&engine, &checkpoint, &table_root(), &read_ctx(), None)
-                .unwrap()
-                .collect();
+        let results: Vec<_> = read_add_actions_from_amt(&engine, &checkpoint, &read_ctx(), None)
+            .unwrap()
+            .collect();
         let first_error = results.iter().position(Result::is_err).unwrap();
         let after = &results[first_error + 1..];
         assert!(!after.is_empty());
@@ -1683,13 +1684,7 @@ mod tests {
             &[added_data_entry("a.parquet", 100, 10, 0, 5), leaf],
         );
         let read = |token: CancellationTokenRef| {
-            read_add_actions_from_amt(
-                &engine,
-                &checkpoint,
-                &table_root(),
-                &read_ctx(),
-                Some(&token),
-            )
+            read_add_actions_from_amt(&engine, &checkpoint, &read_ctx(), Some(&token))
         };
 
         let cancelled = Arc::new(TestCancellationToken::cancelled());

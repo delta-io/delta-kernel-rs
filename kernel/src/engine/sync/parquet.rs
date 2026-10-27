@@ -231,6 +231,127 @@ mod tests {
         assert!(result.next().is_none());
     }
 
+    /// The Parquet `FILE` type lets a group define only the fields it uses. Reading such a file as
+    /// the canonical six-field `file` fills the fields the group omits with null.
+    /// Writes `group` as the Parquet column `f` and reads it back as a `file` column.
+    fn read_file_group(
+        group: crate::arrow::array::StructArray,
+    ) -> crate::KernelResult<RecordBatch> {
+        use crate::schema::{DataType, StructField};
+
+        let batch =
+            RecordBatch::try_from_iter(vec![("f", Arc::new(group) as Arc<dyn Array>)]).unwrap();
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("file_group.parquet");
+        let mut writer =
+            ArrowWriter::try_new(File::create(&file_path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let file_meta = FileMeta {
+            location: Url::from_file_path(&file_path).unwrap(),
+            last_modified: 0,
+            size: std::fs::metadata(&file_path).unwrap().len(),
+        };
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "f",
+            DataType::file_type(),
+        )]));
+        let engine_data = SyncParquetHandler::new(None)
+            .read_parquet_files(&[file_meta], schema, None)?
+            .next()
+            .unwrap()?;
+        Ok(ArrowEngineData::try_from_engine_data(engine_data)?
+            .record_batch()
+            .clone())
+    }
+
+    #[test]
+    fn test_read_file_column_with_partial_group() {
+        use crate::arrow::array::StructArray;
+        use crate::arrow::buffer::NullBuffer;
+        use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
+
+        // A group that defines only `uri` and `size`: an external whole-or-ranged reference,
+        // followed by a null `file` value.
+        let group = StructArray::try_new(
+            vec![
+                Field::new("uri", ArrowDataType::Utf8, true),
+                Field::new("size", ArrowDataType::Int64, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("s3://b/a.png"), None])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![Some(10), None])),
+            ],
+            Some(NullBuffer::from(vec![true, false])),
+        )
+        .unwrap();
+        let record_batch = read_file_group(group).unwrap();
+
+        let f = record_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let names: Vec<_> = f
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "uri",
+                "offset",
+                "size",
+                "content_type",
+                "checksum",
+                "inline"
+            ]
+        );
+        assert!(f.is_null(1));
+        let uri = f
+            .column_by_name("uri")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(uri.value(0), "s3://b/a.png");
+        let size = f
+            .column_by_name("size")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(size.value(0), 10);
+        for omitted in ["offset", "content_type", "checksum", "inline"] {
+            assert_eq!(
+                f.column_by_name(omitted).unwrap().null_count(),
+                2,
+                "omitted field {omitted} must read as null"
+            );
+        }
+    }
+
+    /// A non-null `file` value that resolves to no referent fails the read.
+    #[test]
+    fn test_read_file_column_without_referent_fails() {
+        use crate::arrow::array::StructArray;
+        use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
+
+        let group = StructArray::from(vec![(
+            Arc::new(Field::new("size", ArrowDataType::Int64, true)),
+            Arc::new(Int64Array::from(vec![Some(10)])) as Arc<dyn Array>,
+        )]);
+
+        let error = read_file_group(group).unwrap_err().to_string();
+        assert!(
+            error.contains("Invalid value in `file` column 'f': neither `uri` nor `inline` is set"),
+            "got: {error}"
+        );
+    }
+
     #[test]
     fn test_sync_write_parquet_file_multiple_batches() {
         let handler = SyncParquetHandler::new(None);

@@ -262,7 +262,6 @@ impl LogSegment {
                 None,
                 None,
                 None,
-                None,
             )?
             .actions;
         Ok(batches.map(move |batch| {

@@ -253,6 +253,10 @@ pub enum KernelError {
     #[error("Generic delta kernel error: {0}")]
     Generic(String),
 
+    /// Commit range configuration or construction failed.
+    #[error("Commit range error: {0}")]
+    CommitRange(String),
+
     /// A generic error wrapping another error
     #[error("Generic error: {source}")]
     GenericError {
