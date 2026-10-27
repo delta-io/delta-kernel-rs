@@ -215,8 +215,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// - Connector commit information that does not contain exactly one row.
     ///
     /// Schema changes are rejected when `icebergCompatV2`, `icebergCompatV3`, or
-    /// `allowColumnDefaults` is enabled. This applies to standalone ALTER TABLE transactions and
-    /// schema evolution during data-changing writes.
+    /// `allowColumnDefaults` is enabled, or when the table has generated columns. This applies to
+    /// standalone ALTER TABLE transactions and schema evolution during data-changing writes.
     pub fn build(
         self,
         engine: &dyn Engine,
@@ -376,6 +376,11 @@ fn apply_schema_changes(
     if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
         return Err(KernelError::unsupported(
             "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
+        ));
+    }
+    if table_config.has_generation_expressions() {
+        return Err(KernelError::unsupported(
+            "Schema changes are not yet supported on tables with generated columns",
         ));
     }
     evolve_table_config(&table_config, changes)

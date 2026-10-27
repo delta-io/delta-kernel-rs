@@ -113,8 +113,8 @@ commit. See [Check constraints](./check_constraints.md) for the acknowledgement.
 
 > [!NOTE]
 > Kernel rejects schema changes at `build()` when `icebergCompatV2`, `icebergCompatV3`, or
-> `allowColumnDefaults` is enabled. This restriction applies to both workflows, regardless of the
-> transaction operation or `dataChange` value.
+> `allowColumnDefaults` is enabled, or when the table has generated columns. This restriction
+> applies to both workflows, regardless of the transaction operation or `dataChange` value.
 
 ## Chaining multiple operations
 

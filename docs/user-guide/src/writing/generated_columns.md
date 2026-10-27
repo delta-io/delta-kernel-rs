@@ -29,8 +29,8 @@ Every row's value must match the expression, and the comparison is null-safe: a 
 matches a `NULL` expression result. For the protocol contract, see
 [Generated columns in the Delta protocol][generated-columns].
 
-Kernel's public create-table API can't enable generated columns. Create generated columns with
-another Delta writer. For example, in a SQL engine that supports Delta generated columns:
+Kernel's create-table API rejects generation expressions. Create generated columns with another
+Delta writer. For example, in a SQL engine that supports Delta generated columns:
 
 ```sql
 CREATE TABLE people (
@@ -203,8 +203,8 @@ that don't match it into the table. Handle the returned `CommitResult` as descri
 
 On a table that has generated columns, `write_state()` and `commit()` both fail with an
 `InvalidTransactionState` error until you call `ack_generated_columns()`. Kernel applies this to
-every commit, including schema changes and commits that only remove files or record a transaction
-identifier. The acknowledgement covers everything the transaction commits. A table that supports
+every commit, including commits that only remove files or record a transaction identifier. The
+acknowledgement covers everything the transaction commits. A table that supports
 the `generatedColumns` feature but has no generated columns needs no acknowledgement.
 
 The acknowledgement belongs to one transaction. Acknowledge again on each new transaction.
@@ -226,7 +226,9 @@ logical data, and let Kernel's write context handle the mapping to physical name
 
 ### Can I add or drop generated columns through Kernel?
 
-No. Use another Delta writer to add or drop generated columns.
+No. Kernel's create-table API rejects generation expressions, and `ALTER TABLE` and transaction
+schema changes are rejected on tables with generated columns, even if the requested change doesn't
+touch a generated column. Use another Delta writer for these operations.
 
 ### Why doesn't Kernel report a column that has a generation expression?
 
