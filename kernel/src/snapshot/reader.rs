@@ -30,7 +30,11 @@ use crate::{CancellationTokenRef, Engine, KernelResult};
 ///
 /// ```no_run
 /// # use delta_kernel::{CancellationTokenRef, Engine, KernelResult, Snapshot};
-/// # fn read_metadata(snapshot: &Snapshot, engine: &dyn Engine, token: CancellationTokenRef) -> KernelResult<()> {
+/// # fn read_metadata(
+/// #     snapshot: &Snapshot,
+/// #     engine: &dyn Engine,
+/// #     token: CancellationTokenRef,
+/// # ) -> KernelResult<()> {
 /// // Read synchronously with the engine's normal behavior.
 /// let domain = snapshot.reader().get_domain_metadata("my-domain", engine)?;
 /// // Share an operation's cancellation scope across related metadata reads.

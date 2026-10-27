@@ -1211,7 +1211,6 @@ impl Snapshot {
     /// See also [`get_in_commit_timestamp`] for ICT-only semantics.
     ///
     /// [`get_in_commit_timestamp`]: Self::get_in_commit_timestamp
-    #[allow(unused)]
     #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
     pub(crate) fn get_timestamp(&self, engine: &dyn Engine) -> KernelResult<i64> {
         match self

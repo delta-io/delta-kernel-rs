@@ -81,8 +81,41 @@ Reading the Delta log for a large table can touch many commit and checkpoint fil
 connector often wants to abandon that work when the request behind it goes away — a cancelled
 query, a dropped RPC, a closed session. Kernel supports this cooperatively through an optional
 [`CancellationToken`] that a caller attaches to a snapshot builder, snapshot metadata reader,
-or scan (see
-[Advanced reads with scan_metadata()](../reading/scan_metadata.md#cancelling-a-scan)).
+or scan.
+
+#### Attaching a token
+
+Attach the token separately to each operation whose storage reads you want to cancel. A metadata
+reader does not inherit the token used to build its `Snapshot`.
+
+```rust,no_run
+# extern crate delta_kernel;
+# use delta_kernel::{CancellationTokenRef, Engine, KernelResult, Snapshot};
+# fn read_metadata(
+#     engine: &dyn Engine,
+#     table_root: &str,
+#     token: CancellationTokenRef,
+# ) -> KernelResult<()> {
+let snapshot = Snapshot::builder_for(table_root)
+    .with_cancellation_token(token.clone())
+    .build(engine)?;
+
+let reader = snapshot.reader().with_cancellation_token(token.clone());
+let version = reader.get_app_id_version("my-app", engine)?;
+
+let scan = snapshot
+    .scan_builder()
+    .with_cancellation_token(token)
+    .build()?;
+# let _ = (version, scan);
+# Ok(())
+# }
+```
+
+`SnapshotReader` getters remain synchronous and may block. The token applies to handler-backed
+I/O, so a getter may return metadata already held by the `Snapshot` without checking cancellation.
+For more about cancelling scans, see
+[Advanced reads with `scan_metadata()`](../reading/scan_metadata.md#cancelling-a-scan).
 
 Cancellation-aware handlers respond at two boundaries:
 
