@@ -2202,7 +2202,7 @@ pub unsafe extern "C" fn free_metadata(metadata: Handle<SharedMetadata>) {
     metadata.drop_handle();
 }
 
-/// Visit all fields of the metadata in a single FFI call. String fields borrow from the metadata
+/// Visit the scalar metadata fields in a single FFI call. String fields borrow from the metadata
 /// handle and are only valid for the duration of the callback.
 ///
 /// The visitor receives:
@@ -2282,6 +2282,28 @@ pub unsafe extern "C" fn visit_metadata_format_options(
             kernel_string_slice!(value),
         );
     });
+}
+
+/// Copies the metadata's original schema JSON through `allocate_fn`, without reserialization or
+/// I/O.
+///
+/// Borrows `metadata` and invokes `allocate_fn` once with the original `schemaString`. Returns the
+/// pointer supplied by that callback, including null. The caller remains responsible for releasing
+/// the metadata handle with [`free_metadata`].
+///
+/// # Safety
+///
+/// `metadata` must be a valid, live handle for the duration of the call. `allocate_fn` must not
+/// unwind or invalidate the handle. The schema slice is borrowed only until the callback returns;
+/// the callback must copy any bytes it retains.
+#[no_mangle]
+pub unsafe extern "C" fn metadata_schema_string(
+    metadata: Handle<SharedMetadata>,
+    allocate_fn: AllocateStringFn,
+) -> NullableCvoid {
+    let metadata = unsafe { metadata.as_ref() };
+    let schema = metadata.schema_string();
+    allocate_fn(kernel_string_slice!(schema))
 }
 
 // === Snapshot-level computed property FFI ===
@@ -4349,6 +4371,36 @@ mod tests {
         };
         unsafe { free_metadata(meta) };
         options
+    }
+
+    #[rstest]
+    #[case(r#"{"type":"struct","fields":[]}"#)]
+    #[case("{ \"fields\" : [], \"type\" : \"struct\" }\n")]
+    #[case(concat!(
+        "{\"type\":\"struct\",\"fields\":[{\"name\":\"caf\u{e9}\",",
+        "\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"
+    ))]
+    fn metadata_schema_string_preserves_json_and_borrows_handle(#[case] schema: &str) {
+        let metadata = Metadata::from_parts(
+            "table-id".into(),
+            None,
+            None,
+            "parquet".into(),
+            HashMap::new(),
+            schema.into(),
+            Vec::new(),
+            None,
+            HashMap::new(),
+        );
+        let metadata: Handle<SharedMetadata> = Arc::new(metadata).into();
+        let first =
+            unsafe { metadata_schema_string(metadata.shallow_copy(), allocate_str) }.unwrap();
+        let second =
+            unsafe { metadata_schema_string(metadata.shallow_copy(), allocate_str) }.unwrap();
+        unsafe { free_metadata(metadata) };
+
+        assert_eq!(recover_string(first), schema);
+        assert_eq!(recover_string(second), schema);
     }
 
     // === visit_protocol tests ===
