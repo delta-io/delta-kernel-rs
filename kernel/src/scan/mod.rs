@@ -1394,7 +1394,7 @@ impl Scan {
     #[cfg(feature = "declarative-plans")]
     /// Whether JSON stats synthesis requires the checkpoint's collation stats schema.
     fn needs_collation_stats_schema(&self) -> bool {
-        self.stats.synthesize_json && self.snapshot.table_configuration().has_collations()
+        self.stats.synthesize_json && self.snapshot.table_configuration().has_collations_feature()
     }
 
     // Factored out to facilitate testing

@@ -832,7 +832,7 @@ impl TableConfiguration {
     }
 
     /// Returns whether the protocol declares stable or preview collation support.
-    pub(crate) fn has_collations(&self) -> bool {
+    pub(crate) fn has_collations_feature(&self) -> bool {
         self.protocol.has_table_feature(&"collations".into())
             || self
                 .protocol

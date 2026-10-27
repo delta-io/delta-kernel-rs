@@ -481,7 +481,7 @@ impl CheckpointWriter {
 
         let context = &self.schema_context;
         let (stats_schema, buffered) = if context.stats_config.write_stats_as_struct
-            && self.snapshot.table_configuration().has_collations()
+            && self.snapshot.table_configuration().has_collations_feature()
         {
             collation_stats::checkpoint_stats_schema(
                 &self.snapshot,
