@@ -614,6 +614,74 @@ fn timestamp_footer_stat_overflow_keeps_row_group(
 }
 
 #[rstest]
+#[case::missing_statistics(false, false, false)]
+#[case::missing_bounds(true, false, false)]
+#[case::min_only(true, true, false)]
+#[case::max_only(true, false, true)]
+fn timestamp_row_group_skipping_uses_only_available_bounds(
+    #[case] has_statistics: bool,
+    #[case] has_min: bool,
+    #[case] has_max: bool,
+    #[values(None, Some("UTC"))] timezone: Option<&str>,
+) {
+    let bytes = write_timestamp_parquet(
+        ArrowTimeUnit::Millisecond,
+        timezone,
+        &["ts"],
+        &[&[1_000, 2_000]],
+    );
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+    let row_group = builder.metadata().row_group(0);
+    let mut column =
+        ColumnChunkMetaData::builder(row_group.column(0).column_descr_ptr()).set_num_values(2);
+    if has_statistics {
+        column = column.set_statistics(Statistics::int64(
+            has_min.then_some(1_000),
+            has_max.then_some(2_000),
+            None,
+            Some(0),
+            false,
+        ));
+    }
+    let row_group = row_group
+        .clone()
+        .into_builder()
+        .set_column_metadata(vec![column.build().unwrap()])
+        .build()
+        .unwrap();
+    let predicate = column_pred!("ts");
+    let filter = RowGroupFilter::new(&row_group, &predicate);
+    let (data_type, scalar) = timestamp_kind(timezone);
+
+    assert_eq!(
+        filter.get_min_stat(&column_name!("ts"), &data_type),
+        has_min.then(|| scalar(1_000_000))
+    );
+    assert_eq!(
+        filter.get_max_stat(&column_name!("ts"), &data_type),
+        has_max.then(|| scalar(2_000_000))
+    );
+    assert!(RowGroupFilter::apply(
+        &row_group,
+        &Predicate::eq(col!("ts"), lit(scalar(1_000_000)))
+    ));
+    assert_eq!(
+        RowGroupFilter::apply(
+            &row_group,
+            &Predicate::lt(col!("ts"), lit(scalar(1_000_000)))
+        ),
+        !has_min
+    );
+    assert_eq!(
+        RowGroupFilter::apply(
+            &row_group,
+            &Predicate::gt(col!("ts"), lit(scalar(2_000_000)))
+        ),
+        !has_max
+    );
+}
+
+#[rstest]
 #[case::unannotated(None, ConvertedType::NONE, Some(1_000))]
 #[case::legacy_millis(None, ConvertedType::TIMESTAMP_MILLIS, Some(1_000_000))]
 #[case::legacy_micros(None, ConvertedType::TIMESTAMP_MICROS, Some(1_000))]
