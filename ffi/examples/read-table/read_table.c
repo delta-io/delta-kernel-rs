@@ -364,6 +364,7 @@ static void print_string_map(const char* label, FfiStringMap map) {
   for (uintptr_t i = 0; i < map.len; i++) {
     sorted[i] = &map.ptr[i];
   }
+  // Map order isn't guaranteed, so sort by key to keep the golden test output deterministic.
   qsort(sorted, map.len, sizeof(*sorted), compare_map_keys);
   for (uintptr_t i = 0; i < map.len; i++) {
     const FfiStringMapEntry* entry = sorted[i];
