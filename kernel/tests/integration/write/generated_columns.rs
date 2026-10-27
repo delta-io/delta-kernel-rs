@@ -307,43 +307,22 @@ async fn protocol_upgrade_turns_existing_expressions_into_generated_columns_that
     Ok(())
 }
 
-#[rstest]
 #[tokio::test]
-async fn alter_table_commit_succeeds_only_with_ack_and_keeps_generated_columns(
-    #[values(true, false)] acknowledge: bool,
-) -> KernelResult<()> {
+async fn alter_table_build_fails_on_tables_with_generated_columns() -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
-    let table_url = write_table(
-        &table_path,
-        GENERATED_COLUMNS_FEATURE,
-        TESTING_GENERATED_COLUMNS,
-    )
-    .await?;
+    let table_url = write_table(&table_path, GENERATED_COLUMNS_FEATURE, EVENT_YEAR).await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = begin_transaction_with(
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let result = begin_transaction_with(
         snapshot,
         engine.as_ref(),
         UpdateTableOperation::AlterTable,
         "Test/1.0",
         false,
         |builder| builder.add_column(StructField::nullable("note", DataType::STRING)),
-    )?;
-    if !acknowledge {
-        assert_gate_error(txn.commit(engine.as_ref()));
-        return Ok(());
-    }
+    );
 
-    txn.ack_generated_columns();
-    let altered = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
-    let altered_columns = altered.generated_columns()?;
-    let from_altered = generated_column_pairs(&altered_columns);
-    assert_eq!(from_altered, TESTING_GENERATED_COLUMNS);
-
-    // The ALTER commit rewrites the schema, so a fresh load reads the expressions kernel wrote.
-    let reloaded = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let reloaded_columns = reloaded.generated_columns()?;
-    let from_reloaded = generated_column_pairs(&reloaded_columns);
-    assert_eq!(from_reloaded, TESTING_GENERATED_COLUMNS);
+    let rejected = matches!(result, Err(KernelError::Unsupported(_)));
+    assert!(rejected);
     Ok(())
 }
