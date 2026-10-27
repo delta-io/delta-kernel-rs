@@ -391,7 +391,7 @@ impl PmPlanSegment {
         // is at or below where this segment starts, so whatever covers that start has P&M at least
         // as new; the snapshot reads that action through the pointer.
         let pointed_commit = match (&newest.checkpoint, &newest.last_manifest_commit) {
-            (None, Some(pointer)) => log_segment
+            (None, Some((_, pointer))) => log_segment
                 .find_pointed_commit(pointer)
                 .map(|commit| (commit.version, pointer.content_root_version)),
             _ => None,
@@ -584,9 +584,10 @@ struct PmCandidate {
     /// with its `checkpointMetadata.version` so it ranks the same way as Protocol and Metadata.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     checkpoint: Option<(i64, CheckpointAction)>,
-    /// The newest commit's `commitInfo.lastManifestCommit`, if replay read it.
+    /// The newest commit's `commitInfo.lastManifestCommit`, if replay read it, tagged with that
+    /// commit's version.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    last_manifest_commit: Option<LastManifestCommit>,
+    last_manifest_commit: Option<(Version, LastManifestCommit)>,
 }
 
 impl PmCandidate {
@@ -607,7 +608,7 @@ impl PmCandidate {
             captured_checkpoint_action: self.checkpoint.map(|(_, c)| Arc::new(c)),
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit: LastManifestCommitResolution::from_replay(
-                self.last_manifest_commit,
+                self.last_manifest_commit.map(|(_, pointer)| pointer),
             ),
         }
     }
@@ -625,7 +626,7 @@ impl PmCandidate {
     fn ensure_pointer_at_or_before(&self, version: Version) -> KernelResult<()> {
         self.last_manifest_commit
             .as_ref()
-            .map_or(Ok(()), |pointer| pointer.ensure_at_or_before(version))
+            .map_or(Ok(()), |(_, pointer)| pointer.ensure_at_or_before(version))
     }
 
     /// Folds `other`, parsed from a batch replay reached later, into this result. Each field keeps
@@ -637,9 +638,8 @@ impl PmCandidate {
             metadata: newer(self.metadata, other.metadata),
             #[cfg(feature = "adaptive-metadata-in-dev")]
             checkpoint: newer(self.checkpoint, other.checkpoint),
-            // Only the newest commit's batch yields a pointer, so at most one side holds it.
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            last_manifest_commit: self.last_manifest_commit.or(other.last_manifest_commit),
+            last_manifest_commit: newer(self.last_manifest_commit, other.last_manifest_commit),
         }
     }
 
@@ -651,9 +651,9 @@ impl PmCandidate {
         self.ensure_pointer_at_or_before(version)?;
         let version = version_as_i64(version)?;
         match &self.last_manifest_commit {
-            Some(pointer) if pointer.version == version => self.require_pointed_checkpoint(),
+            Some((_, pointer)) if pointer.version == version => self.require_pointed_checkpoint(),
             // The pointer names an older commit, yet this one carries an action of its own.
-            Some(pointer) if self.checkpoint.is_some() => {
+            Some((_, pointer)) if self.checkpoint.is_some() => {
                 Err(pointer.inconsistency(format!("commit {version} carries a checkpoint action")))
             }
             None if self.checkpoint.is_some() => Err(KernelError::invalid_log_segment(format!(
@@ -667,7 +667,7 @@ impl PmCandidate {
     /// replay read it from.
     #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
     fn require_pointed_checkpoint(mut self) -> KernelResult<Self> {
-        let Some(pointer) = &self.last_manifest_commit else {
+        let Some((_, pointer)) = &self.last_manifest_commit else {
             return Ok(self);
         };
         let action =
@@ -772,7 +772,7 @@ fn as_version(version: i64) -> KernelResult<Version> {
 }
 
 /// The higher-versioned of `a` and `b`; on a tie, `b` wins.
-fn newer<T>(a: Option<(i64, T)>, b: Option<(i64, T)>) -> Option<(i64, T)> {
+fn newer<V: Ord, T>(a: Option<(V, T)>, b: Option<(V, T)>) -> Option<(V, T)> {
     match (a, b) {
         (Some(a), Some(b)) => {
             if b.0 >= a.0 {
@@ -837,7 +837,7 @@ fn pm_candidate(batch: &VersionedBatch) -> KernelResult<PmCandidate> {
         let (checkpoint_protocol, checkpoint_metadata) =
             checkpoint.as_ref().map(checkpoint_pm).unzip();
         let last_manifest_commit = match batch.commit_info_version {
-            Some(_) => LastManifestCommit::try_new_from_data(actions)?,
+            Some(version) => LastManifestCommit::try_new_from_data(actions)?.map(|p| (version, p)),
             None => None,
         };
         Ok(PmCandidate {
@@ -1165,6 +1165,8 @@ mod tests {
         use rstest::rstest;
 
         use super::super::PmCandidate;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        use crate::actions::LastManifestCommit;
         use crate::actions::{Metadata, Protocol};
         use crate::metrics::ProtocolMetadataSource;
 
@@ -1255,6 +1257,28 @@ mod tests {
             assert_eq!(resolution.source, ProtocolMetadataSource::FullReplay);
             #[cfg(feature = "adaptive-metadata-in-dev")]
             assert!(resolution.captured_checkpoint_action.is_none());
+        }
+
+        // Merging keeps the pointer from the newest commit whichever order the batches arrive in.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        #[test]
+        fn test_merge_keeps_newest_last_manifest_commit() {
+            let candidate = |version: u64| PmCandidate {
+                last_manifest_commit: Some((
+                    version,
+                    LastManifestCommit::new(version as i64, 0).unwrap(),
+                )),
+                ..Default::default()
+            };
+            let newest = Some((2, LastManifestCommit::new(2, 0).unwrap()));
+            assert_eq!(
+                candidate(2).merge(candidate(1)).last_manifest_commit,
+                newest
+            );
+            assert_eq!(
+                candidate(1).merge(candidate(2)).last_manifest_commit,
+                newest
+            );
         }
     }
 }
