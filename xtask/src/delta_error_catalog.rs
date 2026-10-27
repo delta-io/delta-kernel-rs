@@ -1,5 +1,6 @@
-//! Generates `DeltaErrorCondition` for the allowlisted leaves of the pinned Delta error catalog.
-//! Catalog updates are explicit changes to the checked-in inputs; generation never fetches data.
+//! Downloads the upstream Delta error catalog and generates selected `DeltaErrorCondition`
+//! variants. Downloading updates only the catalog and source metadata; generation uses only local
+//! inputs.
 //!
 //! Leaf conditions follow Spark's `ErrorClassesJsonReader`: message lines join with `"\n"`, a
 //! subclass template is the parent template + `" "` + the subclass template, a subclass inherits
@@ -9,24 +10,25 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use anyhow::{bail, ensure, Context};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::codegen::{add_preamble, ensure_file_contents};
 
-const COMMAND: &str = "update-delta-error-catalog";
+const COMMAND: &str = "generate-delta-error-conditions";
+const REPOSITORY: &str = "https://github.com/delta-io/delta";
+const BRANCH: &str = "refs/heads/master";
+const UPSTREAM_PATH: &str = "spark/src/main/resources/error/delta-error-classes.json";
 const CATALOG: &str = "kernel/error_catalog/delta-error-classes.json";
 const SOURCE: &str = "kernel/error_catalog/source.json";
 const SELECTION: &str = "kernel/error_catalog/selected-conditions.json";
 const DESTINATION: &str = "kernel/src/error/delta_error_condition/generated.rs";
 
 #[derive(clap::Args)]
-pub(crate) struct UpdateArgs {
-    /// Use the checked-in inputs (also the default; accepted for explicit offline workflows).
-    #[arg(long = "offline")]
-    _offline: bool,
+pub(crate) struct GenerateArgs {
     /// Fail if generated code differs from the checked-in inputs, without writing files.
     #[arg(long)]
     check: bool,
@@ -34,7 +36,7 @@ pub(crate) struct UpdateArgs {
 
 /// Generates selected conditions in the workspace rooted at `root`.
 /// Returns an error for invalid inputs, failed file operations, or stale output in check mode.
-pub(crate) fn update(root: &Path, args: UpdateArgs) -> anyhow::Result<()> {
+pub(crate) fn generate(root: &Path, args: GenerateArgs) -> anyhow::Result<()> {
     let (catalog, source) = load_vendored(root)?;
     let selection_path = root.join(SELECTION);
     let selection = fs::read(&selection_path)
@@ -50,8 +52,30 @@ pub(crate) fn update(root: &Path, args: UpdateArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Downloads the latest catalog from Delta master into the workspace rooted at `root`.
+/// Records its resolved commit and hash without changing the allowlist or generated Rust.
+/// Returns an error if git, curl, catalog validation, or file operations fail.
+pub(crate) fn download(root: &Path) -> anyhow::Result<()> {
+    let remote = run(
+        "git",
+        &[
+            "ls-remote",
+            "--exit-code",
+            &format!("{REPOSITORY}.git"),
+            BRANCH,
+        ],
+    )?;
+    let commit = parse_ls_remote(std::str::from_utf8(&remote)?)?;
+    let url = format!("https://raw.githubusercontent.com/delta-io/delta/{commit}/{UPSTREAM_PATH}");
+    let catalog = run(
+        "curl",
+        &["--fail", "--silent", "--show-error", "--location", &url],
+    )?;
+    write_catalog(root, &commit, &catalog)
+}
+
 /// Where the vendored catalog came from, recorded in `source.json`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Source {
     repository: String,
@@ -95,8 +119,8 @@ fn load_vendored(root: &Path) -> anyhow::Result<(Vec<u8>, Source)> {
     let source: Source = serde_json::from_str(&source)
         .with_context(|| format!("parsing {}", source_path.display()))?;
     ensure!(
-        source.repository == "https://github.com/delta-io/delta"
-            && source.path == "spark/src/main/resources/error/delta-error-classes.json"
+        source.repository == REPOSITORY
+            && source.path == UPSTREAM_PATH
             && source.commit.len() == 40
             && source
                 .commit
@@ -112,6 +136,65 @@ fn load_vendored(root: &Path) -> anyhow::Result<(Vec<u8>, Source)> {
         source_path.display(),
     );
     Ok((catalog, source))
+}
+
+/// Validates a downloaded snapshot before replacing the catalog and its source metadata.
+fn write_catalog(root: &Path, commit: &str, catalog: &[u8]) -> anyhow::Result<()> {
+    parse_catalog(catalog)?;
+    let source = Source {
+        repository: REPOSITORY.to_string(),
+        commit: commit.to_string(),
+        path: UPSTREAM_PATH.to_string(),
+        sha256: sha256_hex(catalog),
+    };
+    let catalog_path = root.join(CATALOG);
+    if let Some(parent) = catalog_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // Preserve the upstream bytes: the recorded hash identifies the exact downloaded snapshot.
+    fs::write(&catalog_path, catalog)
+        .with_context(|| format!("writing {}", catalog_path.display()))?;
+    let source_path = root.join(SOURCE);
+    let source_json = format!("{}\n", serde_json::to_string_pretty(&source)?);
+    fs::write(&source_path, source_json)
+        .with_context(|| format!("writing {}", source_path.display()))?;
+    eprintln!("downloaded Delta error catalog from delta-io/delta@{commit}");
+    Ok(())
+}
+
+/// Resolves master to a full commit SHA before constructing the immutable catalog URL.
+fn parse_ls_remote(output: &str) -> anyhow::Result<String> {
+    let commit = output
+        .lines()
+        .find_map(|line| {
+            let (commit, reference) = line.split_once('\t')?;
+            (reference == BRANCH).then_some(commit)
+        })
+        .with_context(|| format!("`git ls-remote` did not report {BRANCH}"))?;
+    ensure!(
+        commit.len() == 40
+            && commit
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "`git ls-remote` reported an invalid commit for {BRANCH}: {commit:?}"
+    );
+    Ok(commit.to_string())
+}
+
+/// Returns command stdout, reporting missing tools and nonzero exits as errors.
+fn run(program: &str, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("running `{program}`; it must be on PATH"))?;
+    ensure!(
+        output.status.success(),
+        "`{program} {}` failed ({}): {}",
+        args.join(" "),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output.stdout)
 }
 
 /// Flattens and validates the catalog into leaf conditions, ordered by name.
@@ -518,6 +601,46 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::master(&format!("{COMMIT}\trefs/heads/master\n"), Some(COMMIT))]
+    #[case::empty("", None)]
+    #[case::other_ref(&format!("{COMMIT}\trefs/heads/main\n"), None)]
+    #[case::short_sha("0123abc\trefs/heads/master\n", None)]
+    #[case::uppercase_sha(&format!("{}\trefs/heads/master\n", COMMIT.to_uppercase()), None)]
+    fn ls_remote_parsing(#[case] output: &str, #[case] expected: Option<&str>) {
+        assert_eq!(parse_ls_remote(output).ok().as_deref(), expected);
+    }
+
+    #[test]
+    fn downloading_updates_only_catalog_and_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path());
+        let before = read_all(dir.path());
+        let catalog = FIXTURE
+            .replace("Parent", "Downloaded")
+            .replace("\n", "\r\n");
+        let commit = "1111111111111111111111111111111111111111";
+        write_catalog(dir.path(), commit, catalog.as_bytes()).unwrap();
+        let (downloaded, source) = load_vendored(dir.path()).unwrap();
+        assert_eq!(downloaded, catalog.as_bytes());
+        assert_eq!(source.commit, commit);
+        assert_eq!(source.sha256, sha256_hex(catalog.as_bytes()));
+        let after = read_all(dir.path());
+        assert_eq!(after[2..], before[2..]);
+        assert!(generate_local(dir.path(), true).is_err());
+        generate_local(dir.path(), false).unwrap();
+        generate_local(dir.path(), true).unwrap();
+    }
+
+    #[test]
+    fn invalid_download_preserves_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path());
+        let before = read_all(dir.path());
+        assert!(write_catalog(dir.path(), COMMIT, b"invalid catalog").is_err());
+        assert_eq!(read_all(dir.path()), before);
+    }
+
     #[test]
     fn render_emits_metadata() {
         let source = fixture_source();
@@ -562,17 +685,11 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join(SELECTION), r#"["TOP_LEVEL", "FAMILY.INHERITS"]"#).unwrap();
-        update_offline(root, false).unwrap();
+        generate_local(root, false).unwrap();
     }
 
-    fn update_offline(root: &Path, check: bool) -> anyhow::Result<()> {
-        update(
-            root,
-            UpdateArgs {
-                _offline: false,
-                check,
-            },
-        )
+    fn generate_local(root: &Path, check: bool) -> anyhow::Result<()> {
+        generate(root, GenerateArgs { check })
     }
 
     fn read_all(root: &Path) -> Vec<String> {
@@ -590,30 +707,18 @@ mod tests {
         let source: Source = serde_json::from_str(&source).unwrap();
         assert_eq!(source.commit, COMMIT);
         assert_eq!(source.sha256, sha256_hex(FIXTURE.as_bytes()));
-        assert!(generated.starts_with("//! Generated by `cargo xtask update-delta-error-catalog`"));
-        update(
-            dir.path(),
-            UpdateArgs {
-                _offline: false,
-                check: true,
-            },
-        )
-        .unwrap();
+        assert!(
+            generated.starts_with("//! Generated by `cargo xtask generate-delta-error-conditions`")
+        );
+        generate(dir.path(), GenerateArgs { check: true }).unwrap();
     }
 
-    #[rstest]
-    fn regeneration_does_not_change_inputs(#[values(false, true)] offline: bool) {
+    #[test]
+    fn regeneration_does_not_change_inputs() {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path());
         let before = read_all(dir.path());
-        update(
-            dir.path(),
-            UpdateArgs {
-                _offline: offline,
-                check: false,
-            },
-        )
-        .unwrap();
+        generate(dir.path(), GenerateArgs { check: false }).unwrap();
         assert_eq!(read_all(dir.path()), before);
     }
 
@@ -623,15 +728,15 @@ mod tests {
         write_fixture(dir.path());
         fs::write(dir.path().join(SELECTION), r#"["FAMILY.INHERITS"]"#).unwrap();
         let before = read_all(dir.path());
-        let err = update_offline(dir.path(), true).unwrap_err();
+        let err = generate_local(dir.path(), true).unwrap_err();
         assert!(err.to_string().contains("is not up to date"), "{err:#}");
         assert_eq!(read_all(dir.path()), before);
-        update_offline(dir.path(), false).unwrap();
+        generate_local(dir.path(), false).unwrap();
         let after = read_all(dir.path());
         assert_eq!(after[..3], before[..3]);
         assert!(after[3].contains("FamilyInherits"));
         assert!(!after[3].contains("TopLevel"));
-        update_offline(dir.path(), true).unwrap();
+        generate_local(dir.path(), true).unwrap();
     }
 
     #[test]
@@ -643,7 +748,7 @@ mod tests {
             FIXTURE.replace("Parent", "Changed"),
         )
         .unwrap();
-        let err = update_offline(dir.path(), true).unwrap_err();
+        let err = generate_local(dir.path(), true).unwrap_err();
         assert!(
             err.to_string().contains("does not match the sha256"),
             "{err:#}"
@@ -659,7 +764,7 @@ mod tests {
             .unwrap()
             .replace("TopLevel", "Edited");
         fs::write(&generated, edited).unwrap();
-        let err = update_offline(dir.path(), true).unwrap_err();
+        let err = generate_local(dir.path(), true).unwrap_err();
         assert!(err.to_string().contains("is not up to date"), "{err:#}");
     }
 }

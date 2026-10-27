@@ -2,8 +2,9 @@
 //!
 //! See <https://github.com/matklad/cargo-xtask> for the pattern. Commands:
 //!
-//! - `update-delta-error-catalog [--offline] [--check]`: regenerate selected `DeltaErrorCondition`
-//!   variants from the checked-in catalog and allowlist. All modes use local inputs.
+//! - `update-delta-error-catalog`: download the latest upstream catalog and source metadata.
+//! - `generate-delta-error-conditions [--check]`: generate Rust from the local catalog and
+//!   allowlist.
 
 use std::path::{Path, PathBuf};
 
@@ -20,14 +21,17 @@ struct Xtask {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Download the latest Delta error catalog from delta-io/delta master.
+    UpdateDeltaErrorCatalog,
     /// Regenerate selected `DeltaErrorCondition` variants from the pinned local catalog.
-    UpdateDeltaErrorCatalog(delta_error_catalog::UpdateArgs),
+    GenerateDeltaErrorConditions(delta_error_catalog::GenerateArgs),
 }
 
 fn main() -> anyhow::Result<()> {
     match Xtask::parse().command {
-        Command::UpdateDeltaErrorCatalog(args) => {
-            delta_error_catalog::update(&project_root(), args)
+        Command::UpdateDeltaErrorCatalog => delta_error_catalog::download(&project_root()),
+        Command::GenerateDeltaErrorConditions(args) => {
+            delta_error_catalog::generate(&project_root(), args)
         }
     }
 }

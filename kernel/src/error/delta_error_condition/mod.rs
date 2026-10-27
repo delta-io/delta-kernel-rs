@@ -2,7 +2,7 @@
 //!
 //! A condition is a stable identity from Delta's error catalog that connectors match on instead
 //! of message text. [`DeltaErrorCondition`] is generated from the pinned catalog and explicit
-//! allowlist in `kernel/error_catalog/` by `cargo xtask update-delta-error-catalog`.
+//! allowlist in `kernel/error_catalog/` by `cargo xtask generate-delta-error-conditions`.
 
 mod generated;
 

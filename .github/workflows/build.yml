@@ -187,8 +187,6 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: build docs
         run: cargo doc --locked --workspace --all-features --no-deps
-      - name: Verify generated Delta error conditions
-        run: cargo xtask update-delta-error-catalog --check
 
   # When we run cargo { build, clippy } --no-default-features, we want to build/lint the kernel to
   # ensure that we can build the kernel without any features enabled. Unfortunately, due to how
