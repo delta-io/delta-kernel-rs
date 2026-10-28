@@ -31,7 +31,6 @@ tracing-core = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [ "json" ] }
 url = "2"
 serde_json = "1.0.142"
-peak_alloc = { version = "0.3.0", optional = true }
 delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
 ] }
@@ -89,8 +88,8 @@ udt-in-dev = ["delta_kernel/udt-in-dev"]
 # Experimental, in-development feature flag gating Iceberg V4 adaptive metadata tree support.
 adaptive-metadata-in-dev = ["delta_kernel/adaptive-metadata-in-dev"]
 
-# Tracking global allocator for process-wide native live/peak bytes, readable via the
+# Tracking global allocator for process-wide native current/minimum/maximum bytes, readable via the
 # `*_native_bytes` FFI getters. Off by default. Only enable when building the cdylib:
 # this crate is also an rlib, so `#[global_allocator]` applies to any Rust binary that
 # links it and conflicts with a binary that installs its own (jemalloc, dhat, ...).
-alloc-tracking = ["dep:peak_alloc"]
+alloc-tracking = []
