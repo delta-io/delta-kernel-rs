@@ -22,10 +22,13 @@ use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
 pub(crate) use crate::schema::file_utils::validate_file_type_feature_support;
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+use crate::schema::has_concurrent_sequence_id;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
-    schema_has_invariants, validate_column_defaults_metadata, SchemaRef, StructField, StructType,
+    concurrent_identity_column, schema_has_invariants, validate_column_defaults_metadata,
+    SchemaRef, StructField, StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::table_features::validate_geospatial_feature_support;
@@ -303,6 +306,9 @@ pub(crate) struct TableConfiguration {
     logical_schema: SchemaRef,
     /// Whether any field in the logical schema declares a column default.
     has_column_with_default: bool,
+    /// Whether the logical schema has a top-level Concurrent Identity Column.
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    has_concurrent_identity_column: bool,
     /// The subset of the logical schema that remains after excluding partition columns.
     logical_schema_without_partition_columns: SchemaRef,
     /// Physical schema for all columns (field names respect column mapping mode).
@@ -401,6 +407,8 @@ impl TableConfiguration {
         let mut table_config = Self {
             logical_schema,
             has_column_with_default: false,
+            #[cfg(feature = "concurrent-identity-columns-in-dev")]
+            has_concurrent_identity_column: false,
             logical_schema_without_partition_columns,
             physical_schema,
             physical_data_schema_without_partition_columns,
@@ -435,6 +443,14 @@ impl TableConfiguration {
         // defaults.
         table_config.has_column_with_default =
             validate_column_defaults_metadata(&table_config.logical_schema)?;
+        // Detection only so a malformed CIC table stays readable.
+        #[cfg(feature = "concurrent-identity-columns-in-dev")]
+        {
+            table_config.has_concurrent_identity_column = table_config
+                .logical_schema
+                .fields()
+                .any(has_concurrent_sequence_id);
+        }
         // Reject tables with geo-typed columns that don't declare the `geospatial` feature.
         #[cfg(feature = "geo-type-in-dev")]
         validate_geospatial_feature_support(&table_config)?;
@@ -831,6 +847,12 @@ impl TableConfiguration {
         !self.table_properties.check_constraints.is_empty()
     }
 
+    /// Whether the logical schema has a top-level Concurrent Identity Column.
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    pub(crate) fn has_concurrent_identity_column(&self) -> bool {
+        self.has_concurrent_identity_column
+    }
+
     /// The physical schema ([`SchemaRef`]) of this table at this version.
     ///
     /// When column mapping is disabled, this is identical to
@@ -1116,6 +1138,31 @@ impl TableConfiguration {
             ));
         }
 
+        self.validate_concurrent_identity_columns()?;
+
+        Ok(())
+    }
+
+    /// Validates the Concurrent Identity Column invariants on a table that supports
+    /// `concurrentIdentityColumns`: the feature's requirements hold and every identity column is a
+    /// valid Concurrent Identity Column. Tables without the feature are not checked.
+    ///
+    /// Must hold for any configuration kernel commits, so kernel never commits a table that would
+    /// fail [`Self::ensure_operation_supported`] for writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `InvalidProtocol` error if the feature's requirements are not met, or a schema
+    /// error describing the first CIC rule violation.
+    pub(crate) fn validate_concurrent_identity_columns(&self) -> KernelResult<()> {
+        if !self.is_feature_supported(&TableFeature::ConcurrentIdentityColumns) {
+            return Ok(());
+        }
+        self.validate_feature_requirements(&TableFeature::ConcurrentIdentityColumns)?;
+        concurrent_identity_column::validate_concurrent_identity_columns(
+            &self.logical_schema,
+            self.metadata.partition_columns(),
+        )?;
         Ok(())
     }
 
@@ -1288,7 +1335,8 @@ mod test {
     use super::{InCommitTimestampEnablement, StatsOutputSchemas, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
     use crate::schema::{
-        column_name, schema, schema_ref, ColumnName, DataType, SchemaRef, StructField,
+        classic_identity_column, column_name, concurrent_identity_column, schema, schema_ref,
+        ColumnName, DataType, SchemaRef, StructField, StructType,
     };
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
@@ -1300,8 +1348,9 @@ mod test {
         ENABLE_ROW_TRACKING,
     };
     use crate::unit_test_utils::{
-        assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
-        test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
+        assert_result_error_with_message, concurrent_identity_config, test_schema_flat,
+        test_schema_flat_with_column_mapping, test_schema_nested,
+        test_schema_nested_with_column_mapping, test_schema_with_array,
         test_schema_with_array_and_column_mapping, test_schema_with_map,
         test_schema_with_map_and_column_mapping, MockProtocolBuilder,
         MockTableConfigurationBuilder,
@@ -2382,6 +2431,128 @@ mod test {
                 r#"Feature 'geospatial' is not supported for writes"#,
             );
         }
+    }
+
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    #[test]
+    fn concurrent_identity_columns_write_supported_when_all_concurrent() {
+        // `identityColumns`' custom check passes only because `concurrentIdentityColumns` is
+        // present.
+        let schema: StructType = StructType::try_new(vec![concurrent_identity_column(
+            "id", "seq-abc", 1, 1, false,
+        )])
+        .expect("valid schema");
+        let config = concurrent_identity_config(schema);
+        assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+    }
+
+    #[cfg(not(feature = "concurrent-identity-columns-in-dev"))]
+    #[test]
+    fn concurrent_identity_columns_write_rejected_without_cargo_feature_scan_allowed() {
+        let schema =
+            StructType::try_new([concurrent_identity_column("id", "seq-abc", 1, 1, false)])
+                .unwrap();
+        let config = concurrent_identity_config(schema);
+        // Which unsupported feature is reported first depends on the writer-feature order.
+        assert!(matches!(
+            config.ensure_operation_supported(Operation::Write),
+            Err(KernelError::Unsupported(_))
+        ));
+        config.ensure_operation_supported(Operation::Scan).unwrap();
+        config
+            .ensure_operation_supported(Operation::SnapshotLoad)
+            .unwrap();
+    }
+
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    #[test]
+    fn concurrent_identity_columns_write_requires_catalog_managed() {
+        // Dropping `catalogManaged` (and its inCommitTimestamp) leaves an incomplete CIC protocol;
+        // the write is rejected by the feature-requirement check.
+        let schema = StructType::try_new(vec![concurrent_identity_column(
+            "id", "seq-abc", 1, 1, false,
+        )])
+        .expect("valid schema");
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(schema)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::IdentityColumns,
+                        TableFeature::ConcurrentIdentityColumns,
+                    ])
+                    .build(),
+            )
+            .build();
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            "requires 'catalogManaged'",
+        );
+    }
+
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    #[rstest]
+    #[case::classic_without_high_water_mark(
+        classic_identity_column("legacy_id", None),
+        "must be concurrent"
+    )]
+    #[case::surviving_high_water_mark(
+        classic_identity_column("legacy_id", Some(42)),
+        "delta.identity.highWaterMark"
+    )]
+    #[case::step_zero(concurrent_identity_column("id2", "seq-2", 1, 0, false), "step 0")]
+    fn concurrent_identity_columns_write_rejected_but_scan_allowed(
+        #[case] field: StructField,
+        #[case] expected_error: &str,
+    ) {
+        let schema = StructType::try_new(vec![
+            concurrent_identity_column("id", "seq-abc", 1, 1, false),
+            field,
+        ])
+        .expect("valid schema");
+        let config = concurrent_identity_config(schema);
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            expected_error,
+        );
+        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+    }
+
+    #[rstest]
+    #[case::sequence_id(concurrent_identity_column("id", "seq-abc", 1, 1, false))]
+    #[case::nested_sequence_id(StructField::nullable(
+        "wrapper",
+        StructType::try_new(vec![concurrent_identity_column("id", "seq-abc", 1, 1, false)])
+            .unwrap(),
+    ))]
+    #[case::classic(classic_identity_column("id", Some(42)))]
+    fn identity_metadata_without_cic_feature_not_validated(#[case] field: StructField) {
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(StructType::try_new(vec![field]).unwrap())
+            .build();
+        config.ensure_operation_supported(Operation::Write).unwrap();
+        config.ensure_operation_supported(Operation::Scan).unwrap();
+    }
+
+    // `identityColumns` without `concurrentIdentityColumns` is classic high-water mark identity,
+    // which kernel does not implement: writes are rejected at the support layer.
+    #[test]
+    fn classic_identity_columns_write_rejected_scan_allowed() {
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(
+                StructType::try_new(vec![classic_identity_column("id", Some(42))]).unwrap(),
+            )
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::IdentityColumns])
+                    .build(),
+            )
+            .build();
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            "classic high-water mark identity",
+        );
+        config.ensure_operation_supported(Operation::Scan).unwrap();
     }
 
     #[cfg(not(feature = "geo-type-in-dev"))]

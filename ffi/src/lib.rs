@@ -54,6 +54,8 @@ mod alloc_stats;
 
 pub mod column_default;
 pub mod commit_range;
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+pub mod concurrent_identity_column;
 pub mod delta_types;
 mod domain_metadata;
 pub use domain_metadata::{
