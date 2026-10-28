@@ -58,6 +58,10 @@ pub struct WriteState {
     pub(super) iceberg_compat_v3_enabled: bool,
     pub(super) column_mapping_mode: ColumnMappingMode,
     pub(super) stats_columns: Vec<ColumnName>,
+    /// Whether new files' statistics should carry `tightStats`. See
+    /// [`BoundWriteContext::should_write_tight_stats`].
+    #[serde(default)]
+    pub(super) write_tight_stats: bool,
     /// Logical partition column names in metadata-defined order.
     pub(super) logical_partition_columns: Vec<String>,
     pub(super) materialize_partition_columns: bool,
@@ -397,6 +401,7 @@ impl WriteState {
             iceberg_compat_v3_enabled: table_config
                 .is_feature_enabled(&TableFeature::IcebergCompatV3),
             column_mapping_mode: table_config.column_mapping_mode(),
+            write_tight_stats: should_write_tight_stats(table_config, &stats_columns),
             stats_columns,
             logical_partition_columns: table_config.logical_partition_columns().to_vec(),
             materialize_partition_columns: table_config.should_materialize_partition_columns(),
@@ -443,6 +448,26 @@ impl WriteState {
     }
 }
 
+/// Whether new files on this table should carry `tightStats`: only adaptiveMetadata tables use it,
+/// and it requires full-precision timestamp bounds, which kernel does not yet write.
+// TODO: write `tightStats` for timestamp stats columns once stats JSON keeps full precision.
+fn should_write_tight_stats(
+    table_config: &TableConfiguration,
+    stats_columns: &[ColumnName],
+) -> bool {
+    if !table_config.is_feature_enabled(&TableFeature::AdaptiveMetadataPreview) {
+        return false;
+    }
+    let leaves = table_config
+        .physical_data_schema_without_partition_columns()
+        .leaves(None);
+    let (names, types) = leaves.as_ref();
+    !names.iter().zip(types).any(|(name, data_type)| {
+        (*data_type == DataType::TIMESTAMP || *data_type == DataType::TIMESTAMP_NTZ)
+            && stats_columns.contains(name)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZero;
@@ -453,10 +478,12 @@ mod tests {
     use super::*;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
+    use crate::expressions::column_name;
     use crate::object_store::memory::InMemory;
     use crate::schema::{schema_ref, MetadataValue};
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
+    use crate::unit_test_utils::{MockProtocolBuilder, MockTableConfigurationBuilder};
     use crate::Engine;
 
     fn partitioned_write_state(
@@ -959,5 +986,42 @@ mod tests {
 
         let error = WriteState::decode(&serde_json::to_vec(&encoded).unwrap()).unwrap_err();
         assert!(error.to_string().contains("unknown field `unknown_field`"));
+    }
+
+    #[rstest]
+    #[case::not_adaptive_metadata(false, DataType::LONG, true, false)]
+    #[case::no_timestamp(true, DataType::LONG, true, true)]
+    #[case::timestamp_stats(true, DataType::TIMESTAMP, true, false)]
+    #[case::timestamp_ntz_stats(true, DataType::TIMESTAMP_NTZ, true, false)]
+    #[case::timestamp_without_stats(true, DataType::TIMESTAMP, false, true)]
+    fn write_tight_stats_requires_adaptive_metadata_without_timestamp_stats(
+        #[case] adaptive_metadata: bool,
+        #[case] second_type: DataType,
+        #[case] second_has_stats: bool,
+        #[case] expected: bool,
+    ) {
+        let features = adaptive_metadata
+            .then_some(TableFeature::AdaptiveMetadataPreview)
+            .into_iter()
+            .chain(
+                (second_type == DataType::TIMESTAMP_NTZ)
+                    .then_some(TableFeature::TimestampWithoutTimezone),
+            );
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(StructType::new_unchecked([
+                StructField::nullable("id", DataType::LONG),
+                StructField::nullable("second", second_type),
+            ]))
+            .with_protocol(MockProtocolBuilder::new().with_features(features).build())
+            .build();
+        let mut stats_columns = vec![column_name!("id")];
+        if second_has_stats {
+            stats_columns.push(column_name!("second"));
+        }
+
+        let state = WriteState::new(&config, stats_columns);
+        assert_eq!(state.write_tight_stats, expected);
+        let decoded = WriteState::decode(&state.encode().unwrap()).unwrap();
+        assert_eq!(decoded.write_tight_stats, expected);
     }
 }

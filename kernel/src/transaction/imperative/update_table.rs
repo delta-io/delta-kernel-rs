@@ -10,7 +10,7 @@ use super::{Imperative, Transaction, UpdateTable};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::BackReference;
-use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
+use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS, TIGHT_STATS};
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };
@@ -120,7 +120,8 @@ impl Transaction<UpdateTable, Imperative> {
     /// succeed for metadata that commit later rejects, including an empty path, negative size,
     /// or incorrect physical partition keys.
     ///
-    /// On commit, each matched file's add action carries `stats.tightBounds: false`.
+    /// On commit, each matched file's add action carries `stats.tightBounds: false`, and
+    /// `stats.tightStats: false` when the file's stats carry `tightStats`.
     ///
     /// # Arguments
     ///
@@ -206,7 +207,7 @@ impl Transaction<UpdateTable, Imperative> {
             matched_dv_files += visitor.matched_file_indexes.len();
 
             // Append two temporary columns to the scan data: the new DV descriptor and the
-            // rewritten stats (with `tightBounds: false`).
+            // rewritten stats (with widened tightness flags).
             let (dv_entries, stats_entries): (Vec<Scalar>, Vec<Scalar>) = visitor
                 .new_entries
                 .drain(..)
@@ -479,8 +480,8 @@ struct DvMatchVisitor<'a> {
     /// Map from file path to the new deletion vector descriptor for that file
     dv_updates: &'a HashMap<String, DeletionVectorDescriptor>,
     /// Accumulated (DV descriptor, rewritten stats) pairs for each visited row, in visit order.
-    /// Matched rows carry the new DV and their original stats with `tightBounds` forced to
-    /// `false`.
+    /// Matched rows carry the new DV and their original stats with `tightBounds` (and
+    /// `tightStats`, when present) forced to `false`.
     new_entries: Vec<DvUpdateEntry>,
     /// Indexes of rows that matched a file path in dv_update. These must be in
     /// ascending order
@@ -570,16 +571,21 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                     )));
                 }
 
-                // Widen tightBounds to false (unless already false) instead of recomputing the
-                // stats.
-                let already_wide = stats_obj
-                    .get(TIGHT_BOUNDS)
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(false);
-                let new_stats = if already_wide {
+                // Widen the tightness flags to false instead of recomputing the stats. Only
+                // adaptiveMetadata stats carry `tightStats`, so it is not added when absent.
+                let is_wide =
+                    |flag| stats_obj.get(flag).and_then(serde_json::Value::as_bool) == Some(false);
+                let widen_bounds = !is_wide(TIGHT_BOUNDS);
+                let widen_stats = stats_obj.contains_key(TIGHT_STATS) && !is_wide(TIGHT_STATS);
+                let new_stats = if !widen_bounds && !widen_stats {
                     stats
                 } else {
-                    stats_obj.insert(TIGHT_BOUNDS.to_string(), serde_json::Value::Bool(false));
+                    for (flag, widen) in [(TIGHT_BOUNDS, widen_bounds), (TIGHT_STATS, widen_stats)]
+                    {
+                        if widen {
+                            stats_obj.insert(flag.to_string(), serde_json::Value::Bool(false));
+                        }
+                    }
                     serde_json::to_string(&parsed).map_err(|e| {
                         KernelError::generic(format!(
                             "update_deletion_vectors: failed to re-serialize stats for {path}: {e}"
@@ -692,6 +698,35 @@ mod tests {
                 assert_eq!(visitor.matched_file_indexes, vec![0]);
             }
         }
+    }
+
+    #[rstest]
+    #[case::flags_absent(r#"{"numRecords":10}"#, None)]
+    #[case::bounds_tight(r#"{"numRecords":10,"tightBounds":true}"#, None)]
+    #[case::bounds_already_wide(r#"{"numRecords":10,"tightBounds":false}"#, None)]
+    #[case::stats_tight(
+        r#"{"numRecords":10,"tightBounds":true,"tightStats":true}"#,
+        Some(false)
+    )]
+    #[case::stats_already_wide(
+        r#"{"numRecords":10,"tightBounds":true,"tightStats":false}"#,
+        Some(false)
+    )]
+    fn dv_match_visitor_widens_tightness_flags(
+        #[case] stats: &str,
+        #[case] expected_tight_stats: Option<bool>,
+    ) {
+        let dv_updates = dv_updates_for(TEST_PATH);
+        let mut visitor = DvMatchVisitor::new(&dv_updates);
+        let data = make_scan_metadata_row(TEST_PATH, Some(stats), &[]);
+        visitor.visit_rows_of(&data).unwrap();
+
+        let Scalar::String(new_stats) = &visitor.new_entries[0].stats else {
+            panic!("expected rewritten stats JSON");
+        };
+        let new_stats: serde_json::Value = serde_json::from_str(new_stats).unwrap();
+        assert_eq!(new_stats[TIGHT_BOUNDS].as_bool(), Some(false));
+        assert_eq!(new_stats[TIGHT_STATS].as_bool(), expected_tight_stats);
     }
 
     #[test]
