@@ -181,7 +181,7 @@ impl<'a> StatsSchemaBuilder<'a> {
     ///   minValues: { <columns with original types> },
     ///   maxValues: { <columns with original types> },
     ///   tightBounds: boolean,
-    ///   tightStats: boolean,
+    ///   tightStats: boolean, // adaptiveMetadata tables only
     /// }
     /// ```
     ///
@@ -209,6 +209,7 @@ impl<'a> StatsSchemaBuilder<'a> {
             variant_min_max: self.variant_min_max,
             #[cfg(feature = "geo-type-in-dev")]
             geometry_min_max: self.geometry_min_max,
+            tight_stats: tc.is_adaptive_metadata_enabled(),
         };
         let physical_stats_schema = Arc::new(expected_stats_schema(
             &physical_data_schema,
@@ -252,6 +253,7 @@ fn build_stats_schema_for_columns(
     selected_columns: &[ColumnName],
     variant_min_max: bool,
     #[cfg(feature = "geo-type-in-dev")] geometry_min_max: bool,
+    tight_stats: bool,
 ) -> KernelResult<SchemaRef> {
     let config = StatsConfig {
         data_skipping_stats_columns: Some(selected_columns),
@@ -259,6 +261,7 @@ fn build_stats_schema_for_columns(
         variant_min_max,
         #[cfg(feature = "geo-type-in-dev")]
         geometry_min_max,
+        tight_stats,
     };
     let required_columns = None;
     let requested_columns = None;
@@ -650,6 +653,7 @@ impl TableConfiguration {
             variant_min_max,
             #[cfg(feature = "geo-type-in-dev")]
             geometry_min_max,
+            self.is_adaptive_metadata_enabled(),
         )?;
         // `expected_stats_schema` emits `nullCount` only when a data column is selected.
         if logical.field(NULL_COUNT).is_none() {
@@ -662,6 +666,7 @@ impl TableConfiguration {
             variant_min_max,
             #[cfg(feature = "geo-type-in-dev")]
             geometry_min_max,
+            self.is_adaptive_metadata_enabled(),
         )?;
 
         Ok(Some(StatsOutputSchemas::try_new(logical, physical)?))
@@ -964,10 +969,15 @@ impl TableConfiguration {
             .then(|| self.table_root.clone())
     }
 
+    /// Whether the adaptiveMetadata table feature is enabled.
+    pub(crate) fn is_adaptive_metadata_enabled(&self) -> bool {
+        self.is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+    }
+
     /// The operator that encodes this table's file statistics as JSON.
     pub(crate) fn stats_json_op(&self) -> UnaryExpressionOp {
         // The adaptiveMetadata RFC requires untruncated timestamp bounds in file stats.
-        if self.is_feature_enabled(&TableFeature::AdaptiveMetadataPreview) {
+        if self.is_adaptive_metadata_enabled() {
             UnaryExpressionOp::ToJsonFullPrecision
         } else {
             UnaryExpressionOp::ToJson
