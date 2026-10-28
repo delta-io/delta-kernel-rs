@@ -55,7 +55,7 @@ pub struct FfiRowTrackingMetadataColumns {
 ///
 /// # Safety
 /// The transaction and engine handles are borrowed and must be valid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_write_state(
     txn: Handle<ExclusiveUpdateTableTransaction>,
     engine: Handle<SharedExternEngine>,
@@ -74,7 +74,7 @@ pub unsafe extern "C" fn update_table_txn_write_state(
 ///
 /// # Safety
 /// The state and engine handles are borrowed and must be valid. The callback must be valid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn write_state_encode(
     state: Handle<SharedWriteState>,
     allocate_fn: AllocateBytesFn,
@@ -94,7 +94,7 @@ pub unsafe extern "C" fn write_state_encode(
 ///
 /// # Safety
 /// The encoded slice and engine handle are borrowed and must be valid for this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn write_state_decode(
     encoded: KernelBytesSlice,
     engine: Handle<SharedExternEngine>,
@@ -114,7 +114,7 @@ pub unsafe extern "C" fn write_state_decode(
 ///
 /// # Safety
 /// The state handle is borrowed and must be valid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn write_context_builder(
     state: Handle<SharedWriteState>,
 ) -> Handle<ExclusiveWriteContextBuilder> {
@@ -129,7 +129,7 @@ pub unsafe extern "C" fn write_context_builder(
 ///
 /// # Safety
 /// The builder and partition-value map handles must be valid and are consumed by this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn write_context_builder_with_partition_values(
     builder: Handle<ExclusiveWriteContextBuilder>,
     partition_values: Handle<ExclusivePartitionValueMap>,
@@ -146,7 +146,7 @@ pub unsafe extern "C" fn write_context_builder_with_partition_values(
 ///
 /// # Safety
 /// The builder and partition-value map handles must be valid and are consumed by this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn write_context_builder_with_physical_partition_values(
     builder: Handle<ExclusiveWriteContextBuilder>,
     partition_values: Handle<ExclusivePartitionValueMap>,
@@ -168,7 +168,7 @@ pub unsafe extern "C" fn write_context_builder_with_physical_partition_values(
 /// The builder handle is valid and consumed by this call. The engine handle and every selected
 /// string slice in `columns` must be valid for this call. Each optional value must have a valid
 /// enum tag.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn write_context_builder_with_row_tracking_columns(
     builder: Handle<ExclusiveWriteContextBuilder>,
     columns: &FfiRowTrackingMetadataColumns,
@@ -204,7 +204,7 @@ pub unsafe extern "C" fn write_context_builder_with_row_tracking_columns(
 ///
 /// # Safety
 /// The builder and engine handles must be valid. The builder is consumed by this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn write_context_builder_build(
     builder: Handle<ExclusiveWriteContextBuilder>,
     engine: Handle<SharedExternEngine>,
@@ -221,7 +221,7 @@ pub unsafe extern "C" fn write_context_builder_build(
 ///
 /// # Safety
 /// The handle must be valid and is consumed. Do not use or free it again.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_write_context_builder(builder: Handle<ExclusiveWriteContextBuilder>) {
     unsafe { builder.drop_handle() };
 }
@@ -230,7 +230,7 @@ pub unsafe extern "C" fn free_write_context_builder(builder: Handle<ExclusiveWri
 ///
 /// # Safety
 /// The handle must be valid and is consumed. Do not use or free it again.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_write_state(state: Handle<SharedWriteState>) {
     unsafe { state.drop_handle() };
 }
@@ -242,7 +242,7 @@ pub unsafe extern "C" fn free_write_state(state: Handle<SharedWriteState>) {
 ///
 /// # Safety
 /// `state` is borrowed and must be valid. `allocate_fn` must be valid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_write_state_stats_columns(
     state: Handle<SharedWriteState>,
     allocate_fn: AllocateColumnNamesFn,
@@ -276,7 +276,7 @@ pub unsafe extern "C" fn get_write_state_stats_columns(
 /// # Safety
 ///
 /// `txn` and `engine` must be [valid][Handle#Validity] handles. Both are borrowed for this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_get_unpartitioned_write_context(
     txn: Handle<ExclusiveUpdateTableTransaction>,
     engine: Handle<SharedExternEngine>,
@@ -297,7 +297,7 @@ pub unsafe extern "C" fn update_table_txn_get_unpartitioned_write_context(
 /// # Safety
 ///
 /// `txn` and `engine` must be [valid][Handle#Validity] handles. Both are borrowed for this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_get_unpartitioned_write_context(
     txn: Handle<ExclusiveCreateTableTransaction>,
     engine: Handle<SharedExternEngine>,
@@ -328,7 +328,7 @@ pub unsafe extern "C" fn create_table_txn_get_unpartitioned_write_context(
 ///
 /// All handles must be [valid][Handle#Validity]. This call borrows `txn` and `engine` and
 /// unconditionally consumes `partition_values`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_get_partitioned_write_context(
     txn: Handle<ExclusiveUpdateTableTransaction>,
     partition_values: Handle<ExclusivePartitionValueMap>,
@@ -357,7 +357,7 @@ pub unsafe extern "C" fn update_table_txn_get_partitioned_write_context(
 ///
 /// All handles must be [valid][Handle#Validity]. This call borrows `txn` and `engine` and
 /// unconditionally consumes `partition_values`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_get_partitioned_write_context(
     txn: Handle<ExclusiveCreateTableTransaction>,
     partition_values: Handle<ExclusivePartitionValueMap>,
@@ -386,7 +386,7 @@ fn partitioned_write_context_impl(
     Ok(Arc::new(context).into())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_write_context(write_context: Handle<SharedWriteContext>) {
     write_context.drop_handle();
 }
@@ -399,7 +399,7 @@ pub unsafe extern "C" fn free_write_context(write_context: Handle<SharedWriteCon
 ///
 /// # Safety
 /// Engine is responsible for providing a valid BoundWriteContext pointer
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_write_schema(
     write_context: Handle<SharedWriteContext>,
 ) -> Handle<SharedSchema> {
@@ -421,7 +421,7 @@ pub unsafe extern "C" fn get_write_schema(
 ///
 /// # Safety
 /// Engine is responsible for providing a valid BoundWriteContext pointer
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_physical_write_schema(
     write_context: Handle<SharedWriteContext>,
 ) -> Handle<SharedSchema> {
@@ -445,7 +445,7 @@ pub unsafe extern "C" fn get_physical_write_schema(
 /// Engine is responsible for providing a valid BoundWriteContext pointer
 ///
 /// [`ExpressionEvaluator`]: delta_kernel::ExpressionEvaluator
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_logical_to_physical(
     write_context: Handle<SharedWriteContext>,
 ) -> Handle<SharedExpression> {
@@ -459,7 +459,7 @@ pub unsafe extern "C" fn get_logical_to_physical(
 ///
 /// # Safety
 /// Engine is responsible for providing a valid BoundWriteContext pointer
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_write_path(
     write_context: Handle<SharedWriteContext>,
     allocate_fn: AllocateStringFn,
@@ -483,7 +483,7 @@ pub unsafe extern "C" fn get_write_path(
 ///
 /// # Safety
 /// Engine is responsible for providing a valid BoundWriteContext pointer
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_write_dir(
     write_context: Handle<SharedWriteContext>,
     allocate_fn: AllocateStringFn,
@@ -504,7 +504,7 @@ pub unsafe extern "C" fn get_write_dir(
 /// # Safety
 /// Engine is responsible for providing a valid BoundWriteContext pointer, a valid `engine_context`
 /// pointer passed through to each `visitor` invocation, and a valid `visitor` function pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_partition_values(
     write_context: Handle<SharedWriteContext>,
     engine_context: NullableCvoid,
@@ -540,7 +540,7 @@ pub unsafe extern "C" fn visit_partition_values(
 /// # Safety
 /// Engine is responsible for providing a valid BoundWriteContext pointer, a valid `file_url`
 /// slice, and a valid engine handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn resolve_file_path(
     write_context: Handle<SharedWriteContext>,
     file_url: KernelStringSlice,

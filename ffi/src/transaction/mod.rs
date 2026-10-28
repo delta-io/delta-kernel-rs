@@ -1702,7 +1702,7 @@ mod tests {
         };
         use crate::{snapshot_publish_with_committer, Handle, NullableCvoid, OptionalValue};
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         extern "C" fn test_uc_commit(
             context: NullableCvoid,
             request: CommitRequest,

@@ -33,7 +33,7 @@ pub(crate) struct EngineErrorWithMessage {
     pub(crate) message: String,
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) extern "C" fn allocate_err(
     etype: FFIKernelError,
     message: KernelStringSlice,
@@ -44,7 +44,7 @@ pub(crate) extern "C" fn allocate_err(
     Box::into_raw(boxed) as *mut EngineError
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) extern "C" fn allocate_str(kernel_str: KernelStringSlice) -> NullableCvoid {
     let s = unsafe { String::try_from_slice(&kernel_str) };
     let ptr = Box::into_raw(Box::new(s.unwrap())).cast(); // never null
@@ -52,7 +52,7 @@ pub(crate) extern "C" fn allocate_str(kernel_str: KernelStringSlice) -> Nullable
     Some(ptr)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) extern "C" fn allocate_bytes(bytes: KernelBytesSlice) -> NullableCvoid {
     let bytes = unsafe { bytes.try_as_slice() }.unwrap().to_vec();
     NonNull::new(Box::into_raw(Box::new(bytes)).cast())

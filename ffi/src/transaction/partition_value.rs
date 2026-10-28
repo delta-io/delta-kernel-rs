@@ -33,7 +33,7 @@ pub struct ExclusivePartitionValueMap;
 /// Allocate an empty partition value map. The returned handle must be released either by
 /// [`free_partition_value_map`] or by `update_table_txn_get_partitioned_write_context` (which
 /// consumes the map).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn partition_value_map_new() -> Handle<ExclusivePartitionValueMap> {
     Box::new(PartitionValueMap {
         inner: HashMap::new(),
@@ -47,7 +47,7 @@ pub extern "C" fn partition_value_map_new() -> Handle<ExclusivePartitionValueMap
 ///
 /// Caller must pass a valid handle previously returned by [`partition_value_map_new`] that has
 /// not already been consumed by a write-context call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_partition_value_map(map: Handle<ExclusivePartitionValueMap>) {
     map.drop_handle();
 }
@@ -81,7 +81,7 @@ fn partition_value_map_insert_impl(
 /// # Safety
 ///
 /// Caller must pass valid handles and string slices.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn partition_value_map_insert_string(
     mut map: Handle<ExclusivePartitionValueMap>,
     name: KernelStringSlice,
@@ -100,7 +100,7 @@ pub unsafe extern "C" fn partition_value_map_insert_string(
 /// # Safety
 ///
 /// Caller must pass valid handles and a valid `name` slice.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn partition_value_map_insert_int(
     mut map: Handle<ExclusivePartitionValueMap>,
     name: KernelStringSlice,
@@ -118,7 +118,7 @@ pub unsafe extern "C" fn partition_value_map_insert_int(
 /// # Safety
 ///
 /// Caller must pass valid handles and a valid `name` slice.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn partition_value_map_insert_long(
     mut map: Handle<ExclusivePartitionValueMap>,
     name: KernelStringSlice,
@@ -136,7 +136,7 @@ pub unsafe extern "C" fn partition_value_map_insert_long(
 /// # Safety
 ///
 /// Caller must pass valid handles and a valid `name` slice.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn partition_value_map_insert_short(
     mut map: Handle<ExclusivePartitionValueMap>,
     name: KernelStringSlice,
@@ -154,7 +154,7 @@ pub unsafe extern "C" fn partition_value_map_insert_short(
 /// # Safety
 ///
 /// Caller must pass valid handles and a valid `name` slice.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn partition_value_map_insert_byte(
     mut map: Handle<ExclusivePartitionValueMap>,
     name: KernelStringSlice,
@@ -172,7 +172,7 @@ pub unsafe extern "C" fn partition_value_map_insert_byte(
 /// # Safety
 ///
 /// Caller must pass valid handles and a valid `name` slice.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn partition_value_map_insert_float(
     mut map: Handle<ExclusivePartitionValueMap>,
     name: KernelStringSlice,
@@ -190,7 +190,7 @@ pub unsafe extern "C" fn partition_value_map_insert_float(
 /// # Safety
 ///
 /// Caller must pass valid handles and a valid `name` slice.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn partition_value_map_insert_double(
     mut map: Handle<ExclusivePartitionValueMap>,
     name: KernelStringSlice,
@@ -208,7 +208,7 @@ pub unsafe extern "C" fn partition_value_map_insert_double(
 /// # Safety
 ///
 /// Caller must pass valid handles and a valid `name` slice.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn partition_value_map_insert_bool(
     mut map: Handle<ExclusivePartitionValueMap>,
     name: KernelStringSlice,
@@ -226,7 +226,7 @@ pub unsafe extern "C" fn partition_value_map_insert_bool(
 /// # Safety
 ///
 /// Caller must pass valid handles and a valid `name` slice.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn partition_value_map_insert_date(
     mut map: Handle<ExclusivePartitionValueMap>,
     name: KernelStringSlice,
@@ -245,7 +245,7 @@ pub unsafe extern "C" fn partition_value_map_insert_date(
 /// # Safety
 ///
 /// Caller must pass valid handles and a valid `name` slice.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn partition_value_map_insert_timestamp(
     mut map: Handle<ExclusivePartitionValueMap>,
     name: KernelStringSlice,
@@ -265,7 +265,7 @@ pub unsafe extern "C" fn partition_value_map_insert_timestamp(
 /// # Safety
 ///
 /// Caller must pass valid handles and a valid `name` slice.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn partition_value_map_insert_timestamp_ntz(
     mut map: Handle<ExclusivePartitionValueMap>,
     name: KernelStringSlice,
@@ -285,7 +285,7 @@ pub unsafe extern "C" fn partition_value_map_insert_timestamp_ntz(
 ///
 /// Caller must pass valid handles, a valid `name` slice, and (when `len > 0`) a `value` pointer to
 /// at least `len` readable bytes. An empty value may be passed as `(null, 0)`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn partition_value_map_insert_binary(
     mut map: Handle<ExclusivePartitionValueMap>,
     name: KernelStringSlice,
@@ -313,7 +313,7 @@ pub unsafe extern "C" fn partition_value_map_insert_binary(
 /// # Safety
 ///
 /// Caller must pass valid handles and a valid `name` slice.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn partition_value_map_insert_decimal(
     mut map: Handle<ExclusivePartitionValueMap>,
     name: KernelStringSlice,
@@ -343,7 +343,7 @@ pub unsafe extern "C" fn partition_value_map_insert_decimal(
 /// # Safety
 ///
 /// Caller must pass valid handles and a valid `name` slice.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn partition_value_map_insert_null(
     mut map: Handle<ExclusivePartitionValueMap>,
     name: KernelStringSlice,

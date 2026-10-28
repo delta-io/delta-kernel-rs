@@ -122,7 +122,7 @@ pub type TracingEventFn = extern "C" fn(event: Event);
 ///
 /// # Safety
 /// Caller must pass a valid function pointer for the callback
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn enable_event_tracing(callback: TracingEventFn, max_level: Level) -> bool {
     setup_event_subscriber(callback, max_level).is_ok()
 }
@@ -187,7 +187,7 @@ pub enum LogLineFormat {
 ///
 /// # Safety
 /// Caller must pass a valid function pointer for the callback
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn enable_log_line_tracing(
     callback: TracingLogLineFn,
     max_level: Level,
@@ -223,7 +223,7 @@ pub unsafe extern "C" fn enable_log_line_tracing(
 ///
 /// # Safety
 /// Caller must pass a valid function pointer for the callback
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn enable_formatted_log_line_tracing(
     callback: TracingLogLineFn,
     max_level: Level,
@@ -681,7 +681,7 @@ fn setup_log_line_subscriber(
 ///
 /// # Safety
 /// Caller must pass a valid function pointer for the callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn enable_metrics_reporting(callback: MetricsEventFn) -> bool {
     setup_metrics_reporter(callback).is_ok()
 }
@@ -710,7 +710,7 @@ fn setup_metrics_reporter(callback: MetricsEventFn) -> KernelResult<()> {
 ///
 /// The caller must pass a valid function pointer. The callback must not unwind across the FFI
 /// boundary and must copy the OPEN event's name before returning if it needs to retain it.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn enable_frame_reporting(callback: FrameEventFn) -> bool {
     TRACING_STATE
         .lock()

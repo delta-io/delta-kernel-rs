@@ -67,7 +67,7 @@ impl FileReadResultIterator {
 /// [`free_read_result_iter`]. The visitor function pointer must be non-null.
 ///
 /// [`free_engine_data`]: crate::free_engine_data
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn read_result_next(
     mut data: Handle<ExclusiveFileReadResultIterator>,
     engine_context: NullableCvoid,
@@ -102,7 +102,7 @@ fn read_result_next_impl(
 ///
 /// Caller is responsible for (at most once) passing a valid pointer returned by a call to
 /// [`read_parquet_file`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_read_result_iter(data: Handle<ExclusiveFileReadResultIterator>) {
     data.drop_handle();
 }
@@ -111,7 +111,7 @@ pub unsafe extern "C" fn free_read_result_iter(data: Handle<ExclusiveFileReadRes
 ///
 /// # Safety
 /// Caller is responsible for calling with a valid `ExternEngineHandle` and `FileMeta`
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn read_parquet_file(
     engine: Handle<SharedExternEngine>, // TODO Does this cause a free?
     file: &FileMeta,
@@ -159,7 +159,7 @@ pub struct SharedExpressionEvaluator;
 ///
 /// # Safety
 /// Caller is responsible for calling with a valid `Engine`, `Expression`, and `SharedSchema`s
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn new_expression_evaluator(
     engine: Handle<SharedExternEngine>,
     input_schema: Handle<SharedSchema>,
@@ -194,7 +194,7 @@ fn new_expression_evaluator_impl(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_expression_evaluator(evaluator: Handle<SharedExpressionEvaluator>) {
     debug!("engine released expression evaluator");
     evaluator.drop_handle();
@@ -204,7 +204,7 @@ pub unsafe extern "C" fn free_expression_evaluator(evaluator: Handle<SharedExpre
 ///
 /// # Safety
 /// Caller is responsible for calling with a valid `Engine`, `ExclusiveEngineData`, and `Evaluator`
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn evaluate_expression(
     engine: Handle<SharedExternEngine>,
     batch: &mut Handle<ExclusiveEngineData>,

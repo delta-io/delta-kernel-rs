@@ -81,7 +81,7 @@ pub struct EngineMetadata {
 /// Caller must pass the active map supplied to `EngineMetadata::visitor`, valid key and value data
 /// for the call duration, a valid `kind` discriminant, and a valid error allocator. The state must
 /// not be aliased or retained beyond the callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_metadata_value(
     state: &mut CMetadataMap,
     key: KernelStringSlice,
@@ -197,7 +197,7 @@ fn visit_field_primitive_impl(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_string(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -218,7 +218,7 @@ pub unsafe extern "C" fn visit_field_string(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_long(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -239,7 +239,7 @@ pub unsafe extern "C" fn visit_field_long(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_integer(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -260,7 +260,7 @@ pub unsafe extern "C" fn visit_field_integer(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_short(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -281,7 +281,7 @@ pub unsafe extern "C" fn visit_field_short(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_byte(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -302,7 +302,7 @@ pub unsafe extern "C" fn visit_field_byte(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_float(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -323,7 +323,7 @@ pub unsafe extern "C" fn visit_field_float(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_double(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -344,7 +344,7 @@ pub unsafe extern "C" fn visit_field_double(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_boolean(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -365,7 +365,7 @@ pub unsafe extern "C" fn visit_field_boolean(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_binary(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -386,7 +386,7 @@ pub unsafe extern "C" fn visit_field_binary(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_date(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -407,7 +407,7 @@ pub unsafe extern "C" fn visit_field_date(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_timestamp(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -434,7 +434,7 @@ pub unsafe extern "C" fn visit_field_timestamp(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_timestamp_ntz(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -461,7 +461,7 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_interval_year_month(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -488,7 +488,7 @@ pub unsafe extern "C" fn visit_field_interval_year_month(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_interval_day_time(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -515,7 +515,7 @@ pub unsafe extern "C" fn visit_field_interval_day_time(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_void(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -540,7 +540,7 @@ pub unsafe extern "C" fn visit_field_void(
 /// `allocate_error` function pointer, all valid for the duration of this call. When non-null,
 /// `metadata` must point to a valid descriptor and callback.
 #[cfg(feature = "geo-type-in-dev")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_geometry(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -586,7 +586,7 @@ fn visit_field_geometry_impl(
 /// slices, and `allocate_error` function pointer, all valid for the duration of this call. When
 /// non-null, `metadata` must point to a valid descriptor and callback.
 #[cfg(feature = "geo-type-in-dev")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_geography(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -638,7 +638,7 @@ fn visit_field_geography_impl(
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_decimal(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -692,7 +692,7 @@ fn visit_field_decimal_impl(
 /// Caller is responsible for providing valid `state`, `name` slice, `field_ids` array pointing
 /// to valid field IDs previously returned by this visitor, and `allocate_error` function pointer.
 /// When non-null, `metadata` must point to a valid descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_struct(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -752,7 +752,7 @@ fn visit_field_struct_impl(
 /// Caller is responsible for providing valid `state`, `name` slice, `element_type_id` from
 /// a previous field visitor call, and `allocate_error` function pointer. When non-null, `metadata`
 /// must point to a valid descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_array(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -799,7 +799,7 @@ fn visit_field_array_impl(
 /// Caller is responsible for providing valid `state`, `name` slice, `key_type_id` and
 /// `value_type_id` from previous field visitor calls, and `allocate_error` function pointer. When
 /// non-null, `metadata` must point to a valid descriptor and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_map(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -870,7 +870,7 @@ fn visit_field_map_impl(
 /// may be null when the length is zero. Optional values must have valid discriminants. All inputs
 /// are borrowed for the call. Non-null `metadata` must satisfy [`EngineMetadata`]'s contract, and
 /// `allocate_error` must be a valid error allocator.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_user_defined(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -914,7 +914,7 @@ pub unsafe extern "C" fn visit_field_user_defined(
 /// Caller must ensure:
 /// - All base parameters are valid as per visit_field_string
 /// - `variant_struct_id` is a valid struct type ID from a previous visitor call
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_variant(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
@@ -2775,7 +2775,7 @@ mod tests {
     fn cannot_use_nullable_as_map_keys() {
         // Error allocator for tests that panics when invoked. It is used in tests where we don't
         // expect errors.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         extern "C" fn ensure_map_err(
             _etype: FFIKernelError,
             msg: crate::KernelStringSlice,

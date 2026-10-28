@@ -39,7 +39,7 @@ pub struct ExclusiveDvDescriptor;
 /// Allocate an empty deletion vector descriptor map. The returned handle must be released
 /// either by [`free_dv_descriptor_map`] or by [`update_table_txn_update_deletion_vectors`]
 /// (which consumes the map).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dv_descriptor_map_new() -> Handle<ExclusiveDvDescriptorMap> {
     Box::new(DvDescriptorMap {
         inner: HashMap::new(),
@@ -52,7 +52,7 @@ pub extern "C" fn dv_descriptor_map_new() -> Handle<ExclusiveDvDescriptorMap> {
 /// # Safety
 ///
 /// Caller must pass a valid handle previously returned by [`dv_descriptor_map_new`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_dv_descriptor_map(map: Handle<ExclusiveDvDescriptorMap>) {
     map.drop_handle();
 }
@@ -63,7 +63,7 @@ pub unsafe extern "C" fn free_dv_descriptor_map(map: Handle<ExclusiveDvDescripto
 /// # Safety
 ///
 /// Caller must pass a valid descriptor handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_dv_descriptor(descriptor: Handle<ExclusiveDvDescriptor>) {
     descriptor.drop_handle();
 }
@@ -129,7 +129,7 @@ impl TryFrom<c_int> for KernelDvStorageType {
 /// # Safety
 ///
 /// `path_or_inline_dv` and `engine` must be valid. Both are borrowed for this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dv_descriptor_new(
     storage_type: c_int,
     path_or_inline_dv: KernelStringSlice,
@@ -186,7 +186,7 @@ fn dv_descriptor_new_impl(
 ///
 /// All handles and `data_file_path` must be valid. This call mutably borrows `map`, borrows
 /// `engine` and `data_file_path`, and unconditionally consumes `descriptor`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dv_descriptor_map_insert(
     mut map: Handle<ExclusiveDvDescriptorMap>,
     data_file_path: KernelStringSlice,
@@ -238,7 +238,7 @@ fn dv_descriptor_map_insert_impl(
 /// All handles must be valid. This call mutably borrows `txn`, borrows `engine`, and
 /// unconditionally consumes both `dv_map` and `scan_iter`, including on error. Do not use or free
 /// either consumed handle afterward. The caller must eventually commit or free `txn`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_update_deletion_vectors(
     mut txn: Handle<ExclusiveUpdateTableTransaction>,
     dv_map: Handle<ExclusiveDvDescriptorMap>,

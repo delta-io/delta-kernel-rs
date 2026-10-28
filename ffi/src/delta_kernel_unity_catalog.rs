@@ -141,7 +141,7 @@ pub struct SharedFfiUCCommitClient;
 /// # Safety
 ///
 ///  Caller is responsible for passing a valid pointer for the callback and a valid context pointer
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_uc_commit_client(
     context: NullableCvoid,
     commit_callback: CCommit,
@@ -156,7 +156,7 @@ pub unsafe extern "C" fn get_uc_commit_client(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_uc_commit_client(commit_client: Handle<SharedFfiUCCommitClient>) {
     debug!("released uc commit client");
     commit_client.drop_handle();
@@ -215,7 +215,7 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
 ///  Caller is responsible for passing a valid pointer to a SharedFfiUCCommitClient, obtained via
 ///  calling [`get_uc_commit_client`], valid KernelStringSlices for `table_id`, `catalog`,
 ///  `schema`, and `table_name`, and a valid error function pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_uc_committer(
     commit_client: Handle<SharedFfiUCCommitClient>,
     table_id: KernelStringSlice,
@@ -259,7 +259,7 @@ fn get_uc_committer_impl(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle obtained via `get_uc_committer`
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_uc_committer(commit_client: Handle<MutableCommitter>) {
     debug!("released uc committer");
     commit_client.drop_handle();
@@ -308,7 +308,7 @@ pub(crate) mod tests {
         context.map(|ptr| unsafe { &mut *(ptr.as_ptr() as *mut TestContext) })
     }
 
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     extern "C" fn test_commit_callback(
         context: NullableCvoid,
         request: CommitRequest,

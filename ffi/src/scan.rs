@@ -170,7 +170,7 @@ pub struct EngineExpression {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid scan data handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_scan_metadata(scan_metadata: Handle<SharedScanMetadata>) {
     scan_metadata.drop_handle();
 }
@@ -179,7 +179,7 @@ pub unsafe extern "C" fn free_scan_metadata(scan_metadata: Handle<SharedScanMeta
 ///
 /// # Safety
 /// Engine is responsible for providing valid pointers for each argument
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn selection_vector_from_scan_metadata(
     scan_metadata: Handle<SharedScanMetadata>,
     engine: Handle<SharedExternEngine>,
@@ -198,7 +198,7 @@ fn selection_vector_from_scan_metadata_impl(
 ///
 /// # Safety
 /// Caller is responsible for passing a valid scan handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_scan(scan: Handle<SharedScan>) {
     scan.drop_handle();
 }
@@ -209,7 +209,7 @@ pub unsafe extern "C" fn free_scan(scan: Handle<SharedScan>) {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot pointer, and engine pointer
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
@@ -288,7 +288,7 @@ fn scan_impl(
 /// # Safety
 ///
 /// `snapshot` must be a valid [`SharedSnapshot`] handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_builder(
     snapshot: Handle<SharedSnapshot>,
 ) -> Handle<ExclusiveScanBuilder> {
@@ -308,7 +308,7 @@ pub unsafe extern "C" fn scan_builder(
 /// `builder` and `engine` must be valid handles. The `builder` handle must not be used after this
 /// call. `predicate` must be a valid, non-null [`EnginePredicate`] whose `visitor` and `predicate`
 /// fields are safe to call and read.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_builder_with_predicate(
     builder: Handle<ExclusiveScanBuilder>,
     engine: Handle<SharedExternEngine>,
@@ -333,7 +333,7 @@ pub unsafe extern "C" fn scan_builder_with_predicate(
 /// `builder` and `engine` must be valid handles. The `builder` handle must not be used after this
 /// call. `schema` must be a valid, non-null [`EngineSchema`] whose `visitor` and `schema` fields
 /// are safe to call and read.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_builder_with_schema(
     builder: Handle<ExclusiveScanBuilder>,
     engine: Handle<SharedExternEngine>,
@@ -364,7 +364,7 @@ fn scan_builder_with_schema_impl(
 /// `options` must contain a valid variant. All nested column slices must remain valid for this
 /// call and follow the [`crate::FfiSlice`] contract. Path segments are logical field names,
 /// not dotted strings.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_builder_with_stats(
     builder: Handle<ExclusiveScanBuilder>,
     engine: Handle<SharedExternEngine>,
@@ -386,7 +386,7 @@ pub unsafe extern "C" fn scan_builder_with_stats(
 /// # Safety
 ///
 /// `builder` must be a valid handle that has not been consumed or freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_builder_with_partition_values(
     builder: Handle<ExclusiveScanBuilder>,
     options: FfiPartitionValuesOptions,
@@ -405,7 +405,7 @@ pub unsafe extern "C" fn scan_builder_with_partition_values(
 ///
 /// `builder` and `engine` must be valid handles. The `builder` handle must not be used after
 /// this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_builder_build(
     builder: Handle<ExclusiveScanBuilder>,
     engine: Handle<SharedExternEngine>,
@@ -426,7 +426,7 @@ pub unsafe extern "C" fn scan_builder_build(
 /// # Safety
 ///
 /// `builder` must be a valid handle that has not been previously consumed or freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_scan_builder(builder: Handle<ExclusiveScanBuilder>) {
     builder.drop_handle();
 }
@@ -436,7 +436,7 @@ pub unsafe extern "C" fn free_scan_builder(builder: Handle<ExclusiveScanBuilder>
 /// # Safety
 /// Engine is responsible for providing a valid scan pointer and allocate_fn (for allocating the
 /// string)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_table_root(
     scan: Handle<SharedScan>,
     allocate_fn: AllocateStringFn,
@@ -450,7 +450,7 @@ pub unsafe extern "C" fn scan_table_root(
 ///
 /// # Safety
 /// Engine is responsible for providing a valid `SharedScan` handle
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_logical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
     let scan = unsafe { scan.as_ref() };
     scan.logical_schema().clone().into()
@@ -461,7 +461,7 @@ pub unsafe extern "C" fn scan_logical_schema(scan: Handle<SharedScan>) -> Handle
 ///
 /// # Safety
 /// Engine is responsible for providing a valid `SharedScan` handle
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_physical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
     let scan = unsafe { scan.as_ref() };
     scan.physical_schema().clone().into()
@@ -482,7 +482,7 @@ pub unsafe extern "C" fn scan_physical_schema(scan: Handle<SharedScan>) -> Handl
 /// Caller must pass a valid [`SharedScan`] handle and a valid [`SharedExternEngine`] handle. This
 /// function borrows but does not consume either handle; the caller retains ownership of both.
 #[cfg(feature = "declarative-plans")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_declarative_metadata_plan(
     scan: Handle<SharedScan>,
     engine: Handle<SharedExternEngine>,
@@ -551,7 +551,7 @@ impl Drop for ScanMetadataIterator {
 /// # Safety
 ///
 /// Engine is responsible for passing a valid [`SharedExternEngine`] and [`SharedScan`]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_metadata_iter_init(
     engine: Handle<SharedExternEngine>,
     scan: Handle<SharedScan>,
@@ -585,7 +585,7 @@ fn scan_metadata_iter_init_impl(
 ///
 /// [`free_bool_slice`]: crate::free_bool_slice
 /// [`free_engine_data`]: crate::free_engine_data
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_metadata_next(
     data: Handle<SharedScanMetadataIterator>,
     engine_context: NullableCvoid,
@@ -621,7 +621,7 @@ fn scan_metadata_next_impl(
 /// [`scan_metadata_iter_init`].
 // we should probably be consistent with drop vs. free on engine side (probably the latter is more
 // intuitive to non-rust code)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_scan_metadata_iter(data: Handle<SharedScanMetadataIterator>) {
     data.drop_handle();
 }
@@ -678,7 +678,7 @@ pub struct CStringMap {
     values: HashMap<String, String>,
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 /// allow probing into a CStringMap. If the specified key is in the map, kernel will call
 /// allocate_fn with the value associated with the key and return the value returned from that
 /// function. If the key is not in the map, this will return NULL
@@ -712,7 +712,7 @@ fn get_from_string_map_impl(
 /// # Safety
 ///
 /// The engine is responsible for providing a valid [`CStringMap`] pointer and callback
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_string_map(
     map: &CStringMap,
     engine_context: NullableCvoid,
@@ -798,7 +798,7 @@ impl CMetadataMap {
 ///
 /// The engine is responsible for providing a valid [`CMetadataMap`] pointer, [`KernelStringSlice`],
 /// and (when non-null) a valid `kind_out` pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_from_metadata_map(
     map: &CMetadataMap,
     key: KernelStringSlice,
@@ -833,7 +833,7 @@ fn get_from_metadata_map_impl(
 /// # Safety
 ///
 /// The engine is responsible for providing a valid [`CMetadataMap`] pointer and callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_metadata_map(
     map: &CMetadataMap,
     engine_context: NullableCvoid,
@@ -880,7 +880,7 @@ impl CTransforms {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 /// Allow getting the transform for a particular row. If the requested row is outside the range of
 /// the passed `CTransforms` returns `NULL`, otherwise returns the element at the index of the
 /// specified row. See also [`CTransforms`] above.
@@ -913,7 +913,7 @@ pub unsafe extern "C" fn get_transform_for_row(
 /// `dv_info` must be a valid pointer to a [`DvInfo`], borrowed for the duration of this call.
 /// When obtained from the `info` field of [`CDvInfo`], it is valid only during the scan callback.
 /// `allocate_error` must be a valid error allocator and copy any message it retains.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cardinality_from_dv(
     dv_info: &DvInfo,
     allocate_error: AllocateErrorFn,
@@ -930,7 +930,7 @@ pub unsafe extern "C" fn cardinality_from_dv(
 ///
 /// # Safety
 /// Engine is responsible for providing valid pointers for each argument
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn selection_vector_from_dv(
     dv_info: &DvInfo,
     engine: Handle<SharedExternEngine>,
@@ -956,7 +956,7 @@ fn selection_vector_from_dv_impl(
 ///
 /// # Safety
 /// Engine is responsible for providing valid pointers for each argument
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn row_indexes_from_dv(
     dv_info: &DvInfo,
     engine: Handle<SharedExternEngine>,
@@ -1016,7 +1016,7 @@ struct ContextWrapper {
 ///
 /// # Safety
 /// engine is responsible for passing a valid [`SharedScanMetadata`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_scan_metadata(
     scan_metadata: Handle<SharedScanMetadata>,
     engine: Handle<SharedExternEngine>,
@@ -1080,7 +1080,7 @@ pub struct ScanMetadataArrowResult {
 /// `data` must be a valid [`SharedScanMetadataIterator`] handle.
 /// `engine` must be a valid [`SharedExternEngine`] handle.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_metadata_next_arrow(
     data: Handle<SharedScanMetadataIterator>,
     engine: Handle<SharedExternEngine>,
@@ -1123,7 +1123,7 @@ fn scan_metadata_next_arrow_impl(
 /// `result` must be a valid pointer returned by [`scan_metadata_next_arrow`], or null.
 /// Must be called at most once per result.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_scan_metadata_arrow_result(result: *mut ScanMetadataArrowResult) {
     if result.is_null() {
         return;

@@ -74,7 +74,7 @@ fn make_commit_range_builder(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid path and engine handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_builder_for(
     path: KernelStringSlice,
     start_version: Version,
@@ -94,7 +94,7 @@ pub unsafe extern "C" fn commit_range_builder_for(
 ///
 /// Caller must pass a valid builder handle. The input handle is consumed; the returned handle owns
 /// the builder with the end version applied.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_builder_with_end_version(
     builder: Handle<ExclusiveCommitRangeBuilder>,
     end_version: Version,
@@ -116,7 +116,7 @@ pub unsafe extern "C" fn commit_range_builder_with_end_version(
 /// Caller must pass a valid builder handle. The builder is consumed unconditionally and must not
 /// be used or freed after this call. On error, the builder is dropped. The log-tail array and its
 /// contents must remain valid for the duration of this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_builder_with_log_tail(
     builder: Handle<ExclusiveCommitRangeBuilder>,
     log_tail: LogPathArray,
@@ -138,7 +138,7 @@ pub unsafe extern "C" fn commit_range_builder_with_log_tail(
 ///
 /// Caller must pass a valid builder handle. The input handle is consumed; the returned handle owns
 /// the builder with the maximum catalog version applied.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_builder_with_max_catalog_version(
     builder: Handle<ExclusiveCommitRangeBuilder>,
     max_catalog_version: Version,
@@ -161,7 +161,7 @@ pub unsafe extern "C" fn commit_range_builder_with_max_catalog_version(
 ///
 /// Caller must pass a valid builder handle. The input handle is consumed; the returned handle owns
 /// the builder with the setting applied.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_builder_with_commit_range_validation(
     builder: Handle<ExclusiveCommitRangeBuilder>,
     commit_range_validation: bool,
@@ -183,7 +183,7 @@ pub unsafe extern "C" fn commit_range_builder_with_commit_range_validation(
 ///
 /// Caller must pass a valid builder handle. The input handle is consumed; the returned handle owns
 /// the builder with the setting applied.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_builder_with_fail_on_data_loss(
     builder: Handle<ExclusiveCommitRangeBuilder>,
     fail_on_data_loss: bool,
@@ -203,7 +203,7 @@ pub unsafe extern "C" fn commit_range_builder_with_fail_on_data_loss(
 /// # Safety
 ///
 /// Caller must pass a valid builder pointer and must not use it again after this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_builder_build(
     builder: Handle<ExclusiveCommitRangeBuilder>,
 ) -> ExternResult<Handle<SharedCommitRange>> {
@@ -242,7 +242,7 @@ fn commit_range_builder_build_impl(
 /// # Safety
 ///
 /// Caller must pass a valid builder pointer and must not use it again after this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_commit_range_builder(builder: Handle<ExclusiveCommitRangeBuilder>) {
     builder.drop_handle();
 }
@@ -252,7 +252,7 @@ pub unsafe extern "C" fn free_commit_range_builder(builder: Handle<ExclusiveComm
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_commit_range(commit_range: Handle<SharedCommitRange>) {
     commit_range.drop_handle();
 }
@@ -333,7 +333,7 @@ pub struct SharedCommitAction;
 /// # Safety
 ///
 /// Caller must pass a valid commit action handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_action_version(commit_action: Handle<SharedCommitAction>) -> u64 {
     let commit_action = unsafe { commit_action.as_ref() };
     commit_action.version()
@@ -344,7 +344,7 @@ pub unsafe extern "C" fn commit_action_version(commit_action: Handle<SharedCommi
 /// # Safety
 ///
 /// Caller must pass a valid commit action handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_action_timestamp(commit_action: Handle<SharedCommitAction>) -> i64 {
     let commit_action = unsafe { commit_action.as_ref() };
     commit_action.timestamp()
@@ -363,7 +363,7 @@ pub unsafe extern "C" fn commit_action_timestamp(commit_action: Handle<SharedCom
 ///
 /// [`read_result_next`]: crate::engine_funcs::read_result_next
 /// [`free_read_result_iter`]: crate::engine_funcs::free_read_result_iter
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_action_get_actions(
     commit_action: Handle<SharedCommitAction>,
     engine: Handle<SharedExternEngine>,
@@ -387,7 +387,7 @@ fn commit_action_get_actions_impl(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_commit_action(commit_action: Handle<SharedCommitAction>) {
     commit_action.drop_handle();
 }
@@ -426,7 +426,7 @@ pub struct SharedCommitActionsIterator;
 ///
 /// Caller is responsible for passing valid handles, and an `actions` pointer to `actions_len`
 /// valid [`DeltaAction`] values.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_commits(
     commit_range: Handle<SharedCommitRange>,
     engine: Handle<SharedExternEngine>,
@@ -456,7 +456,7 @@ pub unsafe extern "C" fn commit_range_commits(
 ///
 /// Caller is responsible for passing valid handles, and an `actions` pointer to `actions_len`
 /// valid [`DeltaAction`] values.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_commits_with_snapshot(
     commit_range: Handle<SharedCommitRange>,
     engine: Handle<SharedExternEngine>,
@@ -497,7 +497,7 @@ fn commit_range_commits_impl(
 ///
 /// The iterator must be valid (returned by [`commit_range_commits`]) and not yet freed by
 /// [`free_commit_actions_iter`]. The visitor function pointer must be non-null.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_commits_next(
     data: Handle<SharedCommitActionsIterator>,
     engine_context: NullableCvoid,
@@ -534,7 +534,7 @@ fn commit_range_commits_next_impl(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_commit_actions_iter(iter: Handle<SharedCommitActionsIterator>) {
     iter.drop_handle();
 }
@@ -585,7 +585,7 @@ pub struct SharedCommitFilesIterator;
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_commit_files(
     commit_range: Handle<SharedCommitRange>,
     engine: Handle<SharedExternEngine>,
@@ -619,7 +619,7 @@ fn commit_range_commit_files_impl(
 /// # Safety
 ///
 /// Caller must pass a valid iterator handle and `engine_visitor`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_commit_files_next(
     data: Handle<SharedCommitFilesIterator>,
     engine_context: NullableCvoid,
@@ -657,7 +657,7 @@ fn commit_range_commit_files_next_impl(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_commit_files_iter(iter: Handle<SharedCommitFilesIterator>) {
     iter.drop_handle();
 }

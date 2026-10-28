@@ -292,7 +292,7 @@ pub struct EngineExpressionVisitor {
 /// # Safety
 ///
 /// The caller must pass a valid SharedExpression Handle and expression visitor
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_expression(
     expression: &Handle<SharedExpression>,
     visitor: &mut EngineExpressionVisitor,
@@ -308,7 +308,7 @@ pub unsafe extern "C" fn visit_expression(
 /// # Safety
 ///
 /// The caller must pass a valid Expression pointer and expression visitor
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_expression_ref(
     expression: &Expression,
     visitor: &mut EngineExpressionVisitor,
@@ -325,7 +325,7 @@ pub unsafe extern "C" fn visit_expression_ref(
 /// # Safety
 ///
 /// The caller must pass a valid SharedPredicate Handle and expression visitor
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_predicate(
     predicate: &Handle<SharedPredicate>,
     visitor: &mut EngineExpressionVisitor,
@@ -341,7 +341,7 @@ pub unsafe extern "C" fn visit_predicate(
 /// # Safety
 ///
 /// The caller must pass a valid Predicate pointer and expression visitor
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_predicate_ref(
     predicate: &Predicate,
     visitor: &mut EngineExpressionVisitor,

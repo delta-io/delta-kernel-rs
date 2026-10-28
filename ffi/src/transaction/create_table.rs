@@ -27,7 +27,7 @@ pub struct ExclusiveCreateTableTransaction;
 /// `txn` and `engine` must be [valid][Handle#Validity] handles, and `app_id` must be a valid string
 /// slice. This call borrows `engine` and `app_id` for the call and unconditionally consumes `txn`,
 /// including on error. The caller must commit or free the returned handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_with_transaction_id(
     txn: Handle<ExclusiveCreateTableTransaction>,
     app_id: KernelStringSlice,
@@ -48,7 +48,7 @@ pub unsafe extern "C" fn create_table_txn_with_transaction_id(
 ///
 /// All handles and nested map pointers must be valid. This call borrows `engine` and `metrics`
 /// and unconditionally consumes `txn`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_with_operation_metrics(
     txn: Handle<ExclusiveCreateTableTransaction>,
     metrics: &FfiNullableStringMap,
@@ -69,7 +69,7 @@ pub unsafe extern "C" fn create_table_txn_with_operation_metrics(
 ///
 /// All handles and `schema` must be valid. This call borrows `engine` and `schema` and
 /// unconditionally consumes both `txn` and `commit_info`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_with_commit_info(
     txn: Handle<ExclusiveCreateTableTransaction>,
     commit_info: Handle<ExclusiveEngineData>,
@@ -96,7 +96,7 @@ pub unsafe extern "C" fn create_table_txn_with_commit_info(
 /// # Safety
 ///
 /// `txn` must be a valid handle and is consumed. Do not use or free it again.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_create_table_txn(txn: Handle<ExclusiveCreateTableTransaction>) {
     txn.drop_handle();
 }
@@ -111,7 +111,7 @@ pub unsafe extern "C" fn free_create_table_txn(txn: Handle<ExclusiveCreateTableT
 ///
 /// All handles and strings must be valid. This call borrows `engine`, `domain`, and `configuration`
 /// and unconditionally consumes `txn`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_with_domain_metadata(
     txn: Handle<ExclusiveCreateTableTransaction>,
     domain: KernelStringSlice,
@@ -139,7 +139,7 @@ pub unsafe extern "C" fn create_table_txn_with_domain_metadata(
 /// # Safety
 ///
 /// Both handles must be valid. This call mutably borrows `txn` and consumes `write_metadata`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_add_files(
     mut txn: Handle<ExclusiveCreateTableTransaction>,
     write_metadata: Handle<ExclusiveEngineData>,
@@ -159,7 +159,7 @@ pub unsafe extern "C" fn create_table_txn_add_files(
 ///
 /// Both handles must be valid. This call borrows `engine` and unconditionally consumes `txn`,
 /// including on error. Do not use or free `txn` afterward.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_commit(
     txn: Handle<ExclusiveCreateTableTransaction>,
     engine: Handle<SharedExternEngine>,
@@ -191,7 +191,7 @@ pub struct ExclusiveCreateTableTransactionBuilder;
 ///
 /// All handles and `correlation_id` must be valid. This call borrows `engine` and `correlation_id`
 /// and unconditionally consumes `builder`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_builder_with_correlation_id(
     builder: Handle<ExclusiveCreateTableTransactionBuilder>,
     correlation_id: KernelStringSlice,
@@ -215,7 +215,7 @@ pub unsafe extern "C" fn create_table_txn_builder_with_correlation_id(
 ///
 /// All handles and nested map pointers must be valid. This call borrows `engine` and `parameters`
 /// and unconditionally consumes `builder`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_builder_with_operation_parameters(
     builder: Handle<ExclusiveCreateTableTransactionBuilder>,
     parameters: &FfiNullableStringMap,
@@ -243,7 +243,7 @@ pub unsafe extern "C" fn create_table_txn_builder_with_operation_parameters(
 ///
 /// All handles and nested map pointers must be valid. This call borrows `engine` and `metrics`
 /// and unconditionally consumes `builder`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_builder_with_operation_metrics(
     builder: Handle<ExclusiveCreateTableTransactionBuilder>,
     metrics: &FfiNullableStringMap,
@@ -271,7 +271,7 @@ pub unsafe extern "C" fn create_table_txn_builder_with_operation_metrics(
 ///
 /// All handles and `schema` must be valid. This call borrows `engine` and `schema` and
 /// unconditionally consumes both `builder` and `commit_info`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_builder_with_commit_info(
     builder: Handle<ExclusiveCreateTableTransactionBuilder>,
     commit_info: Handle<ExclusiveEngineData>,
@@ -301,7 +301,7 @@ pub unsafe extern "C" fn create_table_txn_builder_with_commit_info(
 ///
 /// All handles and `app_id` must be valid. This call borrows `engine` and `app_id` and
 /// unconditionally consumes `builder`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_builder_with_transaction_id(
     builder: Handle<ExclusiveCreateTableTransactionBuilder>,
     app_id: KernelStringSlice,
@@ -324,7 +324,7 @@ pub unsafe extern "C" fn create_table_txn_builder_with_transaction_id(
 ///
 /// All handles and strings must be valid. This call borrows `engine`, `domain`, and `configuration`
 /// and unconditionally consumes `builder`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_builder_with_domain_metadata(
     builder: Handle<ExclusiveCreateTableTransactionBuilder>,
     domain: KernelStringSlice,
@@ -385,7 +385,7 @@ pub(super) unsafe fn collect_create_table_columns(
 /// `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid `KernelStringSlice`
 /// values whose backing bytes are readable for the duration of the call. `columns` may be null
 /// when `num_columns == 0`. `builder` is consumed even when this returns an error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_builder_with_clustering_columns(
     builder: Handle<ExclusiveCreateTableTransactionBuilder>,
     columns: *const KernelStringSlice,
@@ -410,7 +410,7 @@ pub unsafe extern "C" fn create_table_txn_builder_with_clustering_columns(
 /// `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid `KernelStringSlice`
 /// values whose backing bytes are readable for the duration of the call. `columns` may be null
 /// when `num_columns == 0`. `builder` is consumed even when this returns an error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_builder_with_partition_columns(
     builder: Handle<ExclusiveCreateTableTransactionBuilder>,
     columns: *const KernelStringSlice,
@@ -448,7 +448,7 @@ pub(super) fn create_table_txn_builder_with_data_layout_impl(
 ///
 /// `path`, `schema`, `engine_info`, and `engine` must be valid. All inputs are borrowed for the
 /// call. The caller retains ownership.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn new_create_table_txn_builder(
     path: KernelStringSlice,
     schema: &EngineSchema,
@@ -488,7 +488,7 @@ fn new_create_table_txn_builder_impl(
 ///
 /// `builder`, `key`, `value`, and `engine` must be valid. This call borrows `engine`, `key`, and
 /// `value` and unconditionally consumes `builder`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_builder_with_table_property(
     builder: Handle<ExclusiveCreateTableTransactionBuilder>,
     key: KernelStringSlice,
@@ -520,7 +520,7 @@ fn create_table_txn_builder_with_table_property_impl(
 ///
 /// Both handles must be valid. This call borrows `engine` and unconditionally consumes `builder`,
 /// including on error. Do not use or free `builder` afterward.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_builder_build(
     builder: Handle<ExclusiveCreateTableTransactionBuilder>,
     engine: Handle<SharedExternEngine>,
@@ -540,7 +540,7 @@ pub unsafe extern "C" fn create_table_txn_builder_build(
 /// All handles must be valid. This call borrows `engine` and unconditionally consumes both
 /// `builder` and `committer`, including on error. Do not use or free either consumed handle
 /// afterward.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_table_txn_builder_build_with_committer(
     builder: Handle<ExclusiveCreateTableTransactionBuilder>,
     engine: Handle<SharedExternEngine>,
@@ -570,7 +570,7 @@ fn create_table_txn_builder_build_impl(
 /// # Safety
 ///
 /// `builder` must be a valid handle and is consumed. Do not use or free it again.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_create_table_txn_builder(
     builder: Handle<ExclusiveCreateTableTransactionBuilder>,
 ) {
