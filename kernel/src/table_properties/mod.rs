@@ -67,6 +67,12 @@ pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION: &str =
 pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP: &str =
     "delta.inCommitTimestampEnablementTimestamp";
 pub(crate) const CHECK_CONSTRAINT_PREFIX: &str = "delta.constraints.";
+// Parquet Modular Encryption, draft RFC delta-io/delta#6195 (`parquetEncryption-dev`).
+pub(crate) const ENCRYPTION_KMS_ID: &str = "delta.encryption.kms_id";
+pub(crate) const ENCRYPTION_KMS_CONFIGURATION: &str = "delta.encryption.kms_configuration";
+pub(crate) const ENCRYPTION_FOOTER_KEY: &str = "delta.encryption.footer_key";
+pub(crate) const ENCRYPTION_PLAINTEXT_FOOTER: &str = "delta.encryption.plaintext_footer";
+pub(crate) const ENCRYPTION_COLUMN_KEYS: &str = "delta.encryption.column_keys";
 
 /// Delta table properties. These are parsed from the 'configuration' map in the most recent
 /// 'Metadata' action of a table.
@@ -242,6 +248,30 @@ pub struct TableProperties {
     /// same as the inCommitTimestamp of the commit when this feature was enabled.
     pub in_commit_timestamp_enablement_timestamp: Option<i64>,
 
+    /// Identifier of the type of Key Management System (KMS) used for [Parquet encryption].
+    /// Experimental: the RFC is a draft and the table feature is `parquetEncryption-dev`.
+    ///
+    /// [Parquet encryption]: https://github.com/delta-io/delta/issues/6195
+    pub encryption_kms_id: Option<String>,
+
+    /// Arbitrary configuration string for the KMS, in a format specific to its type (for
+    /// example JSON).
+    pub encryption_kms_configuration: Option<String>,
+
+    /// Master key ID for footer encryption. Setting it turns Parquet encryption on; with
+    /// [`encryption_plaintext_footer`](Self::encryption_plaintext_footer) it signs the footer
+    /// instead.
+    pub encryption_footer_key: Option<String>,
+
+    /// Whether Parquet footers are written unencrypted (and signed). Defaults to `false`.
+    pub encryption_plaintext_footer: Option<bool>,
+
+    /// Which columns to encrypt with which master key, parsed from
+    /// `<keyId>:<col>,<col>;<keyId>:<col>`. Empty or unset with a footer key means uniform
+    /// encryption of every column with the footer key. Column names use the protocol's
+    /// field-path scheme and are physical names under column mapping.
+    pub encryption_column_keys: Option<Vec<EncryptionColumnKey>>,
+
     /// The table's [CHECK constraints], one per `delta.constraints.<name>` property, sorted by
     /// name and then SQL.
     ///
@@ -296,6 +326,30 @@ impl TableProperties {
     pub fn compression_codec_or_default(&self) -> ParquetCompressionCodec {
         self.parquet_compression_codec
             .unwrap_or(ParquetCompressionCodec::Zstd)
+    }
+}
+
+/// One entry of `delta.encryption.column_keys`: the columns a master key encrypts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncryptionColumnKey {
+    /// The master key ID.
+    pub key_id: String,
+    /// The columns it encrypts; a nested column name encrypts every field under it.
+    pub columns: Vec<ColumnName>,
+}
+
+/// Formats the entry as `<keyId>:<col>,<col>`, the inverse of parsing
+/// `delta.encryption.column_keys`.
+impl std::fmt::Display for EncryptionColumnKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:", self.key_id)?;
+        for (i, column) in self.columns.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{column}")?;
+        }
+        Ok(())
     }
 }
 
@@ -511,6 +565,62 @@ mod tests {
             IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
             "delta.inCommitTimestampEnablementTimestamp"
         );
+        assert_eq!(ENCRYPTION_KMS_ID, "delta.encryption.kms_id");
+        assert_eq!(
+            ENCRYPTION_KMS_CONFIGURATION,
+            "delta.encryption.kms_configuration"
+        );
+        assert_eq!(ENCRYPTION_FOOTER_KEY, "delta.encryption.footer_key");
+        assert_eq!(
+            ENCRYPTION_PLAINTEXT_FOOTER,
+            "delta.encryption.plaintext_footer"
+        );
+        assert_eq!(ENCRYPTION_COLUMN_KEYS, "delta.encryption.column_keys");
+    }
+
+    #[test]
+    fn test_parse_encryption_properties() {
+        // Nested field path, a quoted name containing a dot, and whitespace.
+        let value = "pii:ssn, address.street; finance : `salary.usd`";
+        let actual = TableProperties::from([(ENCRYPTION_COLUMN_KEYS, value)].into_iter());
+        let expected = vec![
+            EncryptionColumnKey {
+                key_id: "pii".to_string(),
+                columns: vec![column_name!("ssn"), column_name!("address.street")],
+            },
+            EncryptionColumnKey {
+                key_id: "finance".to_string(),
+                columns: vec![ColumnName::new(["salary.usd"])],
+            },
+        ];
+        assert_eq!(actual.encryption_column_keys, Some(expected.clone()));
+        // Display is the canonical inverse of parsing.
+        let formatted = expected
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(";");
+        assert_eq!(formatted, "pii:ssn,address.street;finance:`salary.usd`");
+
+        // Empty column keys mean uniform encryption, not a parse failure.
+        let uniform = TableProperties::from([(ENCRYPTION_COLUMN_KEYS, "")].into_iter());
+        assert_eq!(uniform.encryption_column_keys, Some(vec![]));
+
+        // Malformed values fall through to `unknown_properties` like any other property.
+        for bad in ["pii", "pii:", ":ssn", "pii:,ssn", "pii:`unterminated"] {
+            let props = TableProperties::from([(ENCRYPTION_COLUMN_KEYS, bad)].into_iter());
+            assert_eq!(props.encryption_column_keys, None, "{bad}");
+            assert_eq!(
+                props.unknown_properties.get(ENCRYPTION_COLUMN_KEYS),
+                Some(&bad.to_string()),
+                "{bad}"
+            );
+        }
+        let props = TableProperties::from([(ENCRYPTION_PLAINTEXT_FOOTER, "yes")].into_iter());
+        assert_eq!(props.encryption_plaintext_footer, None);
+        assert!(props
+            .unknown_properties
+            .contains_key(ENCRYPTION_PLAINTEXT_FOOTER));
     }
 
     #[test]
@@ -663,6 +773,11 @@ mod tests {
             (IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, "1612345678"),
             (PARQUET_FORMAT_VERSION, "2.12.0"),
             (PARQUET_COMPRESSION_CODEC, "zstd"),
+            (ENCRYPTION_KMS_ID, "vault"),
+            (ENCRYPTION_KMS_CONFIGURATION, "{}"),
+            (ENCRYPTION_FOOTER_KEY, "footer-key"),
+            (ENCRYPTION_PLAINTEXT_FOOTER, "false"),
+            (ENCRYPTION_COLUMN_KEYS, "pii:ssn"),
         ];
         let actual = TableProperties::from(properties.into_iter());
         let expected = TableProperties {
@@ -703,6 +818,14 @@ mod tests {
             parquet_format_version: Some("2.12.0".to_string()),
             parquet_compression_codec: Some(ParquetCompressionCodec::Zstd),
             in_commit_timestamp_enablement_timestamp: Some(1_612_345_678),
+            encryption_kms_id: Some("vault".to_string()),
+            encryption_kms_configuration: Some("{}".to_string()),
+            encryption_footer_key: Some("footer-key".to_string()),
+            encryption_plaintext_footer: Some(false),
+            encryption_column_keys: Some(vec![EncryptionColumnKey {
+                key_id: "pii".to_string(),
+                columns: vec![column_name!("ssn")],
+            }]),
             check_constraints: vec![],
             unknown_properties: HashMap::new(),
         };
