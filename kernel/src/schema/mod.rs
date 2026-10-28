@@ -35,7 +35,7 @@ pub(crate) use column_default::validate_column_defaults_metadata;
 pub use column_default::ColumnDefault;
 pub(crate) mod compare;
 mod memory;
-pub(crate) use memory::validate_defaults_and_measure_schemas;
+pub(crate) use memory::{build_and_measure_schema, measure_schema};
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
 #[cfg(test)]

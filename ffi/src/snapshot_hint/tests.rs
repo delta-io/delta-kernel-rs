@@ -31,7 +31,7 @@ use crate::{
     snapshot_builder_build, snapshot_builder_with_incremental_crc_replay,
     snapshot_builder_with_max_catalog_version, snapshot_builder_with_version,
     snapshot_log_segment_stats, FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats,
-    KernelI64Slice, KernelStringSlice, OptionalValue, SharedExternEngine,
+    KernelI64Slice, KernelStringSlice, OptionalValue, SharedExternEngine, SharedSnapshot,
 };
 
 fn slice(value: &'static str) -> KernelStringSlice {
@@ -365,6 +365,47 @@ fn exported_hint_copy_outlives_snapshot_and_preserves_state(
     assert_eq!(rebuilt_ref.is_built_as_latest(), expected_latest);
     assert_eq!(rebuilt_ref.log_segment(), &expected_segment);
     assert_eq!(rebuilt_ref.crc_at_version(), expected_crc.as_ref());
+    unsafe {
+        free_snapshot(rebuilt);
+        free_engine(engine);
+    }
+}
+
+#[test]
+fn retained_memory_getter_borrows_and_survives_hint_reconstruction() {
+    let engine = test_engine();
+    let builder = unsafe { with_minimal_hint(test_builder(&engine)) };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let read = |handle: &Handle<SharedSnapshot>| {
+        let OptionalValue::Some(bytes) =
+            (unsafe { crate::snapshot_retained_memory_at_creation(handle.shallow_copy()) })
+        else {
+            panic!("completed snapshot must have an estimate");
+        };
+        assert_eq!(
+            bytes as usize,
+            unsafe { handle.as_ref() }
+                .retained_memory_at_creation()
+                .total_bytes()
+                .unwrap()
+        );
+        assert!(bytes > 0);
+        bytes
+    };
+    let expected = read(&snapshot);
+    assert_eq!(read(&snapshot), expected);
+    // The accessor must not keep an extra strong reference.
+    let owner = unsafe { snapshot.clone_as_arc() };
+    assert_eq!(Arc::strong_count(&owner), 2);
+    drop(owner);
+    let builder = ok_or_panic(install_through_visitor(
+        &snapshot,
+        test_builder(&engine),
+        &engine,
+    ));
+    unsafe { free_snapshot(snapshot) };
+    let rebuilt = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    read(&rebuilt);
     unsafe {
         free_snapshot(rebuilt);
         free_engine(engine);

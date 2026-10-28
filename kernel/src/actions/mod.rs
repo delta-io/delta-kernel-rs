@@ -2129,12 +2129,21 @@ impl crate::snapshot::memory::HeapSize for Add {
         &self,
         context: &mut crate::snapshot::memory::SizeContext,
     ) -> crate::snapshot::memory::Memory {
-        self.path.heap_size(context)
+        let memory = self.path.heap_size(context)
             + self.partition_values.heap_size(context)
             + self.stats.heap_size(context)
             + self.tags.heap_size(context)
             + self.deletion_vector.heap_size(context)
-            + self.clustering_provider.heap_size(context)
+            + self.clustering_provider.heap_size(context);
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let memory = memory
+            + self
+                .back_reference
+                .as_ref()
+                .map_or(crate::snapshot::memory::Memory::ZERO, |reference| {
+                    reference.manifest.heap_size(context)
+                });
+        memory
     }
 }
 
@@ -3699,5 +3708,21 @@ mod tests {
             err.to_string().contains("unknown variant"),
             "expected an unknown-variant error, got: {err}"
         );
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl crate::snapshot::memory::HeapSize for CheckpointAction {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.content_root.path.heap_size(context)
+            + self.protocol.heap_size(context)
+            + self.metadata.heap_size(context)
+            + self.transactions.heap_size(context)
+            + self.domain_metadata.heap_size(context)
+            + self.txn_sidecars.heap_size(context)
+            + self.domain_metadata_sidecars.heap_size(context)
     }
 }

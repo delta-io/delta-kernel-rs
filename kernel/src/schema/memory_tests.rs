@@ -41,8 +41,10 @@ fn walk_type(data_type: &DataType) -> Memory {
         }
         DataType::Primitive(primitive) => primitive.heap_size(&mut SizeContext::default()),
         #[cfg(feature = "udt-in-dev")]
-        DataType::UserDefined(_) => {
-            Memory::unavailable(crate::snapshot::memory::Unavailable::UnsupportedType)
+        DataType::UserDefined(udt) => {
+            Memory::precise(size_of::<DataType>())
+                + udt.annotation().heap_size(&mut SizeContext::default())
+                + walk_type(udt.sql_type())
         }
     }
 }
@@ -54,27 +56,30 @@ fn check_representations(logical: &StructType, partitioned: bool, mode: ColumnMa
     } else {
         HashSet::new()
     };
-    let logical_subset = StructType::new_unchecked(
+    let (logical_subset, logical_subset_memory) = build_and_measure_schema(
         logical
             .fields()
             .filter(|field| !partitions.contains(field.name().as_str()))
             .cloned(),
-    );
-    let physical_subset = StructType::new_unchecked(
+    )
+    .unwrap();
+    let (physical_subset, physical_subset_memory) = build_and_measure_schema(
         logical
             .fields()
             .zip(physical.fields())
             .filter(|(logical, _)| !partitions.contains(logical.name().as_str()))
             .map(|(_, physical)| physical.clone()),
-    );
+    )
+    .unwrap();
+    assert_eq!(logical_subset_memory, walk_schema(&logical_subset));
+    assert_eq!(physical_subset_memory, walk_schema(&physical_subset));
     let schemas = [logical, &physical, &logical_subset, &physical_subset];
-    let (has_default, memory) =
-        validate_defaults_and_measure_schemas(schemas, &partitions).unwrap();
-    assert_eq!(
-        has_default,
-        validate_column_defaults_metadata(logical).unwrap()
-    );
-    for (schema, measured) in schemas.into_iter().zip(memory) {
+    for (index, schema) in schemas.into_iter().enumerate() {
+        let (has_default, measured) = measure_schema(schema, index == 0).unwrap();
+        assert_eq!(
+            has_default,
+            index == 0 && validate_column_defaults_metadata(logical).unwrap()
+        );
         assert_eq!(measured, walk_schema(schema));
     }
 }
@@ -187,25 +192,98 @@ fn malformed_nested_default_is_still_rejected() {
         StructType::new_unchecked([column_default::field_with_invalid_default("bad")]),
     )]);
     let before = validate_column_defaults_metadata(&schema).unwrap_err();
-    let after = validate_defaults_and_measure_schemas([&schema; 4], &HashSet::new()).unwrap_err();
+    let after = measure_schema(&schema, true).unwrap_err();
     assert_eq!(before.to_string(), after.to_string());
 }
 
 #[test]
-fn incompatible_companion_shape_marks_only_that_estimate_unavailable() {
+fn each_root_is_measured_without_assuming_the_shape_of_another_root() {
     let logical = StructType::new_unchecked([StructField::nullable("x", DataType::LONG)]);
-    let incompatible = StructType::new_unchecked([StructField::nullable(
+    let physical = StructType::new_unchecked([StructField::nullable(
         "x",
         ArrayType::new(DataType::LONG, true),
     )]);
-    let (_, memory) = validate_defaults_and_measure_schemas(
-        [&logical, &incompatible, &logical, &logical],
-        &HashSet::new(),
+    for schema in [&logical, &physical] {
+        assert_eq!(
+            measure_schema(schema, false).unwrap().1,
+            walk_schema(schema)
+        );
+    }
+}
+
+#[test]
+fn construction_measurement_does_not_validate_companion_defaults() {
+    let (schema, memory) =
+        build_and_measure_schema([column_default::field_with_invalid_default("bad")].into_iter())
+            .unwrap();
+    assert_eq!(memory, walk_schema(&schema));
+    assert!(measure_schema(&schema, true).is_err());
+}
+
+#[test]
+fn discarded_duplicate_field_makes_construction_measurement_unavailable() {
+    let (schema, memory) = build_and_measure_schema(
+        [
+            StructField::nullable("duplicate", DataType::STRING),
+            StructField::nullable("duplicate", DataType::LONG),
+        ]
+        .into_iter(),
     )
     .unwrap();
-    assert_eq!(memory[0], walk_schema(&logical));
+    assert_eq!(schema.fields.len(), 1);
     assert_eq!(
-        memory[1].total_bytes(),
+        memory.total_bytes(),
         Err(crate::snapshot::memory::Unavailable::SchemaShape)
+    );
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+#[test]
+fn geospatial_schema_counts_box_and_crs_storage() {
+    let schema = StructType::new_unchecked([
+        StructField::nullable(
+            "geometry",
+            PrimitiveType::Geometry(Box::new(GeometryType::try_new("EPSG:4326").unwrap())),
+        ),
+        StructField::nullable(
+            "geography",
+            PrimitiveType::Geography(Box::new(
+                GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Spherical).unwrap(),
+            )),
+        ),
+    ]);
+    assert!(measure_schema(&schema, false)
+        .unwrap()
+        .1
+        .total_bytes()
+        .is_ok());
+    assert_eq!(
+        measure_schema(&schema, false).unwrap().1,
+        walk_schema(&schema)
+    );
+}
+
+#[cfg(feature = "udt-in-dev")]
+#[test]
+fn user_defined_schema_counts_annotation_and_physical_tree() {
+    let physical = StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
+    let udt = UserDefinedType::try_new(
+        physical,
+        [
+            ("class".to_owned(), Some("example.Id".to_owned())),
+            ("pyClass".to_owned(), None),
+        ]
+        .into(),
+    )
+    .unwrap();
+    let schema = StructType::new_unchecked([StructField::nullable("id", udt)]);
+    assert!(measure_schema(&schema, false)
+        .unwrap()
+        .1
+        .total_bytes()
+        .is_ok());
+    assert_eq!(
+        measure_schema(&schema, false).unwrap().1,
+        walk_schema(&schema)
     );
 }

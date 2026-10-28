@@ -561,16 +561,19 @@ impl crate::snapshot::memory::HeapSize for LastCheckpointHint {
         &self,
         context: &mut crate::snapshot::memory::SizeContext,
     ) -> crate::snapshot::memory::Memory {
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        if self.amt_checkpoint.is_some() {
-            return crate::snapshot::memory::Memory::unavailable(
-                crate::snapshot::memory::Unavailable::AdaptiveMetadata,
-            );
-        }
-        self.checkpoint_schema.heap_size(context)
+        let memory = self.checkpoint_schema.heap_size(context)
             + self.checksum.heap_size(context)
             + self.tags.heap_size(context)
-            + self.v2_checkpoint.heap_size(context)
+            + self.v2_checkpoint.heap_size(context);
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let memory = memory
+            + self
+                .amt_checkpoint
+                .as_ref()
+                .map_or(crate::snapshot::memory::Memory::ZERO, |amt| {
+                    amt.checkpoint.heap_size(context) + amt.leaves.heap_size(context)
+                });
+        memory
     }
 }
 

@@ -308,11 +308,10 @@ impl Snapshot {
         };
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let retained_memory_at_creation = memory::SnapshotMemoryAtCreation {
-            root: if captured_checkpoint_action.is_some() {
-                memory::Memory::unavailable(memory::Unavailable::AdaptiveMetadata)
-            } else {
-                retained_memory_at_creation.root
-            },
+            // LastManifestCommit contains only inline integers. OnceLocks themselves
+            // are covered by size_of::<Self>(); only the captured action owns heap data.
+            root: retained_memory_at_creation.root
+                + memory::HeapSize::heap_size(&captured_checkpoint_action, &mut context),
             ..retained_memory_at_creation
         };
         Self {
