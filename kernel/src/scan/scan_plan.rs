@@ -1124,15 +1124,10 @@ mod tests {
         #[case] expected: &str,
         #[case] expected_native: &str,
     ) -> KernelResult<()> {
+        let features = [TableFeature::TimestampWithoutTimezone];
         let config = MockTableConfigurationBuilder::new()
-            .with_schema(schema_ref! {
-                nullable "x": (logical_type),
-            })
-            .with_protocol(
-                MockProtocolBuilder::new()
-                    .with_features([TableFeature::TimestampWithoutTimezone])
-                    .build(),
-            )
+            .with_schema(schema_ref! { nullable "x": (logical_type) })
+            .with_protocol(MockProtocolBuilder::new().with_features(features).build())
             .try_build()?;
         let stats_schema = config.stats_schema_builder().build()?;
         let file_schema = schema_ref! {
@@ -1170,10 +1165,8 @@ mod tests {
             .build()?;
         let batches = declarative_metadata(&scan, &engine)?;
         assert_eq!(metadata_row_count(&batches), 1);
-        let expected_native = StructArray::from(parse_json_impl(
-            &StringArray::from(vec![stats(expected_native.into()).to_string()]),
-            stats_schema,
-        )?);
+        let native = StringArray::from(vec![stats(expected_native.into()).to_string()]);
+        let expected_native = StructArray::from(parse_json_impl(&native, stats_schema)?);
         for batch in batches {
             let json = batch.column_by_name(STATS).unwrap().as_string::<i32>();
             assert_eq!(
