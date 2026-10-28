@@ -303,20 +303,19 @@ fn augment_checkpoint_read_schema(
                     "add field in action schema must be a struct",
                 ));
             };
-            let add = StructField::new(
-                add_field.name(),
-                StructType::new_unchecked(add_struct.fields().cloned().chain(add_fields)),
-                add_field.is_nullable(),
-            )
-            .with_metadata(add_field.metadata.clone());
+            let mut add = Some(
+                StructField::new(
+                    add_field.name(),
+                    StructType::new_unchecked(add_struct.fields().cloned().chain(add_fields)),
+                    add_field.is_nullable(),
+                )
+                .with_metadata(add_field.metadata.clone()),
+            );
             action_schema
                 .fields()
-                .map(|f| {
-                    if f.name() == "add" {
-                        add.clone()
-                    } else {
-                        f.clone()
-                    }
+                .map(|f| match add.take_if(|_| f.name() == "add") {
+                    Some(add) => add,
+                    None => f.clone(),
                 })
                 .collect()
         }
@@ -331,21 +330,17 @@ fn augment_checkpoint_read_schema(
 impl LogSegment {
     /// Returns selected replay commit file statistics, failing if the byte sum overflows.
     pub(crate) fn stats(&self) -> KernelResult<LogSegmentStats> {
-        let paths: Vec<&ParsedLogPath> = if self.listed.ascending_compaction_files.is_empty() {
-            self.listed.ascending_commit_files.iter().collect()
-        } else {
-            self.find_commit_cover_paths(None)
-        };
-        paths
-            .iter()
-            .try_fold(LogSegmentStats::default(), |mut stats, path| {
+        self.find_commit_cover_paths(None).iter().try_fold(
+            LogSegmentStats::default(),
+            |mut stats, path| {
                 stats.total_commit_file_bytes = stats
                     .total_commit_file_bytes
                     .checked_add(path.location.size)
                     .ok_or_else(|| KernelError::generic("Log segment commit file size overflow"))?;
                 stats.num_commit_files += 1;
                 Ok(stats)
-            })
+            },
+        )
     }
 
     /// Creates a LogSegment for a newly created table at version 0 from a single commit file.
@@ -1047,7 +1042,8 @@ impl LogSegment {
     fn find_commit_cover_after(&self, after: Option<Version>) -> Vec<FileMeta> {
         self.find_commit_cover_paths(after)
             .into_iter()
-            .map(|path| path.location.clone())
+            .map(|path| &path.location)
+            .cloned()
             .collect()
     }
 
