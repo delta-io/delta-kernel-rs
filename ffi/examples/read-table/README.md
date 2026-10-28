@@ -86,7 +86,7 @@ schema round trip, including annotation lifetimes after the source Rust schemas 
 
 `read_table -m path/to/table` prints all the information from the table's metadata, then exits
 without scanning.
-`-m` can't be combined with `-a`, `-c`, or `-s`. Because no data files are read, the test doesn't
+`-m` can't be combined with `-a`, `-c`, `-p`, or `-s`. Because no data files are read, the test doesn't
 need Arrow GLib. Run these commands from the repository root:
 
 ```sh
@@ -96,6 +96,24 @@ cd ffi/examples/read-table/build
 cmake .. -DPRINT_DATA=OFF
 cmake --build . --target read_table
 ctest -R '^snapshot_visit_metadata$' --output-on-failure
+```
+
+## Snapshot protocol tests
+
+`read_table -p path/to/table` prints the minimum reader/writer versions and optional feature lists,
+then exits without scanning. `-p` can't be combined with `-a`, `-c`, `-m`, or `-s`.
+`snapshot_visit_protocol` invokes one callback with a borrowed `FfiProtocol`. The record and its
+nested arrays and strings are valid only until that callback returns; copy any data you retain.
+The example prints the data during the callback and doesn't need Arrow GLib. Run from the repository
+root:
+
+```sh
+cargo build -p delta_kernel_ffi --features tracing
+mkdir -p ffi/examples/read-table/build
+cd ffi/examples/read-table/build
+cmake .. -DPRINT_DATA=OFF
+cmake --build . --target read_table
+ctest -R '^snapshot_visit_protocol$' --output-on-failure
 ```
 
 [cmake]: https://cmake.org/

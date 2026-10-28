@@ -400,6 +400,27 @@ static void print_snapshot_metadata(NullableCvoid context, const FfiMetadata* me
   print_string_map("configuration", metadata->configuration);
 }
 
+static void print_protocol_features(const char* label, OptionalValueFfiStringArray features) {
+  if (features.tag == SomeFfiStringArray) {
+    printf("%s:\n", label);
+    for (uintptr_t feature_index = 0; feature_index < features.some.len; feature_index++) {
+      const KernelStringSlice* feature = &features.some.ptr[feature_index];
+      printf("  %.*s\n", (int)feature->len, feature->ptr);
+    }
+  } else {
+    printf("%s: None\n", label);
+  }
+}
+
+static void print_snapshot_protocol(NullableCvoid context, const FfiProtocol* protocol) {
+  size_t* visits = context;
+  *visits += 1;
+  printf("min_reader_version: %" PRId32 "\n", protocol->min_reader_version);
+  printf("min_writer_version: %" PRId32 "\n", protocol->min_writer_version);
+  print_protocol_features("reader_features", protocol->reader_features);
+  print_protocol_features("writer_features", protocol->writer_features);
+}
+
 static const char *LEVEL_STRING[] = {
   "ERROR", "WARN", "INFO", "DEBUG", "TRACE"
 };
@@ -453,8 +474,9 @@ int main(int argc, char* argv[])
   bool use_arrow_metadata = false;
   bool print_scan_schema = false;
   bool print_metadata_only = false;
+  bool print_protocol_only = false;
   int c;
-  while ((c = getopt (argc, argv, "ac:ms")) != -1) {
+  while ((c = getopt (argc, argv, "ac:mps")) != -1) {
     switch (c) {
     case 'a':
       // Use the Arrow batch-mode scan metadata path (scan_metadata_next_arrow) instead of
@@ -470,6 +492,9 @@ int main(int argc, char* argv[])
     case 'm':
       // Print the snapshot metadata visited by snapshot_visit_metadata, then exit without scanning.
       print_metadata_only = true;
+      break;
+    case 'p':
+      print_protocol_only = true;
       break;
     case 's':
       // Print the scan's logical schema (scan_logical_schema) as "Scan schema". Useful to check
@@ -495,13 +520,19 @@ int main(int argc, char* argv[])
   }
 
   if (optind != (argc - 1)) {
-    printf("Usage: %s [-a] [-c top_level_column1,top_level_column2] [-s] [-m] table/path\n",
+    printf("Usage: %s [-a] [-c top_level_column1,top_level_column2] [-s] [-m | -p] table/path\n",
            argv[0]);
     return -1;
   }
 
   if (print_metadata_only && (use_arrow_metadata || requested_cols != NULL || print_scan_schema)) {
     fprintf(stderr, "-m cannot be combined with -a, -c, or -s\n");
+    return -1;
+  }
+
+  if (print_protocol_only &&
+      (print_metadata_only || use_arrow_metadata || requested_cols != NULL || print_scan_schema)) {
+    fprintf(stderr, "-p cannot be combined with -a, -c, -m, or -s\n");
     return -1;
   }
 
@@ -513,7 +544,7 @@ int main(int argc, char* argv[])
 #endif
 
   char* table_path = argv[optind];
-  if (!print_metadata_only) {
+  if (!print_metadata_only && !print_protocol_only) {
     printf("Reading table at %s\n", table_path);
   }
 
@@ -593,6 +624,18 @@ int main(int argc, char* argv[])
     free_engine(engine);
     if (!visited) {
       fprintf(stderr, "snapshot_visit_metadata did not invoke the visitor\n");
+      return -1;
+    }
+    return 0;
+  }
+
+  if (print_protocol_only) {
+    size_t visits = 0;
+    snapshot_visit_protocol(snapshot, &visits, print_snapshot_protocol);
+    free_snapshot(snapshot);
+    free_engine(engine);
+    if (visits != 1) {
+      fprintf(stderr, "snapshot_visit_protocol expected one callback, received %zu\n", visits);
       return -1;
     }
     return 0;
