@@ -396,7 +396,6 @@ const ALL_STATS_PARSED_FIELDS: &[&str] = &[
     "add.stats_parsed.maxValues.id",
     "add.stats_parsed.maxValues.value",
     "add.stats_parsed.tightBounds",
-    "add.stats_parsed.tightStats",
 ];
 const ID_STATS_PARSED_FIELDS: &[&str] = &[
     "add.stats_parsed.numRecords",
@@ -404,7 +403,6 @@ const ID_STATS_PARSED_FIELDS: &[&str] = &[
     "add.stats_parsed.minValues.id",
     "add.stats_parsed.maxValues.id",
     "add.stats_parsed.tightBounds",
-    "add.stats_parsed.tightStats",
 ];
 const PARSED_STATS_TABLE_ALL_STATS_FIELDS: &[&str] = &[
     "add.stats_parsed.numRecords",
@@ -424,7 +422,6 @@ const PARSED_STATS_TABLE_ALL_STATS_FIELDS: &[&str] = &[
     "add.stats_parsed.maxValues.salary",
     "add.stats_parsed.maxValues.ts_col",
     "add.stats_parsed.tightBounds",
-    "add.stats_parsed.tightStats",
 ];
 const JSON_STATS_FIELDS: &[&str] = &["add.stats"];
 const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
@@ -589,7 +586,6 @@ fn declarative_metadata_projects_nested_column_mapped_stats() -> KernelResult<()
             format!("stats_parsed.nullCount.{parent}.{child}"),
             "stats_parsed.numRecords".to_string(),
             "stats_parsed.tightBounds".to_string(),
-            "stats_parsed.tightStats".to_string(),
         ]
     );
     Ok(())
@@ -947,7 +943,7 @@ fn expected_stats_row(id: i64, partition: i32) -> String {
     format!(
         "| {{numRecords: 1, nullCount: {{id: 0, value: 0}}, minValues: \
          {{id: {id}, value: value_{id}}}, maxValues: {{id: {id}, value: value_{id}}}, \
-         tightBounds: true, tightStats: }} | {{part: {partition}}}       |"
+         tightBounds: true}} | {{part: {partition}}}       |"
     )
 }
 

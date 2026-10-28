@@ -471,7 +471,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     ///   minValues: { ... },   // Nested struct, only min/max eligible types
     ///   maxValues: { ... },   // Nested struct, only min/max eligible types
     ///   tightBounds: boolean,
-    ///   tightStats: boolean,
+    ///   tightStats: boolean,  // adaptiveMetadata tables only
     /// }
     /// ```
     ///
