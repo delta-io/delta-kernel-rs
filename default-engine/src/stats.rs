@@ -5,7 +5,9 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
+use delta_kernel::actions::{
+    MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS, TIGHT_STATS,
+};
 use delta_kernel::arrow::array::{
     new_null_array, Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array,
     LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
@@ -524,6 +526,27 @@ pub fn collect_stats(
         stats_columns,
         &null_count_only_columns,
     )?)
+}
+
+/// Returns `stats` with a `tightStats` column holding its `tightBounds` value, or `false` when
+/// `tightBounds` is absent. Stats that already carry `tightStats` are returned unchanged.
+pub(crate) fn with_tight_stats(stats: StructArray) -> KernelResult<StructArray> {
+    if stats.column_by_name(TIGHT_STATS).is_some() {
+        return Ok(stats);
+    }
+    let tight_stats = match stats.column_by_name(TIGHT_BOUNDS) {
+        Some(tight_bounds) => tight_bounds.clone(),
+        None => Arc::new(BooleanArray::from(vec![false; stats.len()])),
+    };
+    let (fields, mut columns, nulls) = stats.into_parts();
+    let fields: Vec<_> = fields
+        .iter()
+        .cloned()
+        .chain([Arc::new(Field::new(TIGHT_STATS, DataType::Boolean, true))])
+        .collect();
+    columns.push(tight_stats);
+    StructArray::try_new(fields.into(), columns, nulls)
+        .map_err(|e| KernelError::generic(format!("Failed to add {TIGHT_STATS} to stats: {e}")))
 }
 
 #[cfg(test)]
@@ -2868,5 +2891,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[rstest::rstest]
+    #[case::copies_tight_bounds(Some(true), None, Some(true))]
+    #[case::copies_wide_bounds(Some(false), None, Some(false))]
+    #[case::defaults_to_wide(None, None, Some(false))]
+    #[case::keeps_existing(Some(true), Some(false), Some(false))]
+    fn with_tight_stats_mirrors_tight_bounds(
+        #[case] tight_bounds: Option<bool>,
+        #[case] tight_stats: Option<bool>,
+        #[case] expected: Option<bool>,
+    ) {
+        let mut fields = vec![Field::new(NUM_RECORDS, DataType::Int64, true)];
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1]))];
+        for (name, value) in [(TIGHT_BOUNDS, tight_bounds), (TIGHT_STATS, tight_stats)] {
+            if let Some(value) = value {
+                fields.push(Field::new(name, DataType::Boolean, true));
+                columns.push(Arc::new(BooleanArray::from(vec![value])));
+            }
+        }
+        let stats = StructArray::try_new(fields.into(), columns, None).unwrap();
+
+        let stats = with_tight_stats(stats).unwrap();
+        let tight_stats = stats.column_by_name(TIGHT_STATS).unwrap().as_boolean();
+        assert_eq!(tight_stats.iter().collect::<Vec<_>>(), vec![expected]);
     }
 }

@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
+use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS, TIGHT_STATS};
 use delta_kernel::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use delta_kernel::arrow::array::{
     new_null_array, Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray,
@@ -641,6 +641,36 @@ async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_e
         remove["extendedFileMetadata"].as_bool(),
         Some(true),
         "extendedFileMetadata must be true under adaptiveMetadata, got {remove}"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[rstest]
+#[tokio::test]
+async fn append_writes_tight_stats_only_on_adaptive_metadata_tables(
+    #[values(false, true)] adaptive_metadata: bool,
+) -> KernelResult<()> {
+    let (reader_features, column_mapping_mode) = if adaptive_metadata {
+        (vec!["adaptiveMetadata-preview"], "id")
+    } else {
+        (vec![], "none")
+    };
+    let (_tmp_dir, table_url, _engine, _snapshot) =
+        create_number_table(reader_features, vec![], column_mapping_mode, true).await?;
+
+    let adds = read_actions_from_commit(&table_url, 1, "add")?;
+    assert_eq!(adds.len(), 1, "expected exactly one add action");
+    let stats: serde_json::Value = serde_json::from_str(
+        adds[0]["stats"]
+            .as_str()
+            .expect("add stats should be a string"),
+    )
+    .expect("add stats should be valid JSON");
+    assert_eq!(stats[TIGHT_BOUNDS].as_bool(), Some(true));
+    assert_eq!(
+        stats[TIGHT_STATS].as_bool(),
+        adaptive_metadata.then_some(true)
     );
     Ok(())
 }
