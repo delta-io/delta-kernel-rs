@@ -1560,8 +1560,16 @@ impl Snapshot {
     ///
     /// [`CheckpointSpec`]: crate::checkpoint::CheckpointSpec
     ///
+    /// After writing the checkpoint, compares the CRC computed by log replay with the cached
+    /// in-memory CRC at this snapshot's version, if available. Compares `numFiles` and
+    /// `tableSizeBytes` when both have complete file stats, and `domainMetadata` when both have
+    /// complete domain sets. Mismatches emit a
+    /// [`CrcValidationFailure`](crate::metrics::MetricEvent::CrcValidationFailure) metric and an
+    /// error log without failing the checkpoint write.
+    ///
     /// Note: There is currently no public api for callers to determine whether a table supports V2
     /// checkpoints directly. Tracked in <https://github.com/delta-io/delta-kernel-rs/issues/2450>.
+    // TODO(#3672): Validate the remaining CRC fields.
     #[instrument(parent = &self.span, name = "snap.checkpoint", skip_all, err)]
     pub fn checkpoint(
         self: &SnapshotRef,

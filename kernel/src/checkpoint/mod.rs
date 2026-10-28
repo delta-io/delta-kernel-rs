@@ -105,7 +105,7 @@
 use std::sync::{Arc, LazyLock, Mutex};
 
 use itertools::Itertools;
-use tracing::info;
+use tracing::{error, info};
 use url::Url;
 
 use crate::action_reconciliation::log_replay::{
@@ -119,10 +119,12 @@ use crate::actions::{
     DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
     SIDECAR_FIELD,
 };
+use crate::crc::{Crc, DomainMetadataState};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ExpressionRef, Scalar};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::HasSelectionVector;
+use crate::metrics::events::emit_crc_validation_failure;
 use crate::path::{self, ParsedLogPath};
 use crate::schema::{lazy_schema_ref, SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
@@ -153,10 +155,10 @@ mod tests;
 /// [`CheckpointWriter::finalize`] to produce the `_last_checkpoint` hint file.
 ///
 /// Unlike [`LastCheckpointHint`], which is used on the read path and has many optional
-/// fields, this struct focuses on the write path and all fields are required. Note this
-/// is a kernel requirement; the Delta protocol itself marks some of these fields as
-/// optional in the `_last_checkpoint` hint. See the [Last Checkpoint File Schema] for
-/// more details.
+/// fields, this struct focuses on the write path and requires `num_actions`, `size_in_bytes`,
+/// and `num_of_add_files`. Note this is a kernel requirement; the Delta protocol itself marks some
+/// of these fields as optional in the `_last_checkpoint` hint. See the [Last Checkpoint File
+/// Schema] for more details.
 ///
 /// Construct via [`LastCheckpointHintStats::from_reconciliation_state`].
 ///
@@ -177,6 +179,10 @@ pub struct LastCheckpointHintStats {
     size_in_bytes: i64,
     /// The number of Add-file actions in the checkpoint.
     num_of_add_files: i64,
+    /// CRC computed during checkpoint writing to validate the cached in-memory CRC.
+    /// Tracks `numFiles`, `tableSizeBytes`, and `domainMetadata`.
+    // TODO(#3672): Track the remaining CRC fields.
+    crc: Option<Arc<Mutex<Crc>>>,
 }
 
 impl LastCheckpointHintStats {
@@ -225,6 +231,7 @@ impl LastCheckpointHintStats {
             num_actions,
             size_in_bytes,
             num_of_add_files: state.add_actions_count(),
+            crc: state.crc,
         })
     }
 }
@@ -470,10 +477,16 @@ impl CheckpointWriter {
             .read_actions(engine, self.read_schema.clone())?;
 
         // Process actions through reconciliation
+        let crc = Arc::new(Mutex::new(Crc {
+            version: self.snapshot.version(),
+            domain_metadata_state: DomainMetadataState::Complete(Default::default()),
+            ..Default::default()
+        }));
         let mut processor = ActionReconciliationProcessor::new(
             self.deleted_file_retention_timestamp()?,
             self.get_transaction_expiration_timestamp()?,
             self.snapshot.table_configuration().dv_normalization_root(),
+            Some(Arc::clone(&crc)),
         );
         let checkpoint_data = actions
             .map(move |batch| processor.process_actions_batch(batch?))
@@ -506,12 +519,20 @@ impl CheckpointWriter {
             .is_v2
             .then(|| self.create_checkpoint_metadata_batch(engine, &self.output_schema));
 
-        Ok(ActionReconciliationIterator::new(Box::new(
-            transformed.chain(checkpoint_metadata),
-        )))
+        Ok(ActionReconciliationIterator::new(
+            Box::new(transformed.chain(checkpoint_metadata)),
+            Some(crc),
+        ))
     }
 
     /// Finalizes checkpoint creation by saving metadata about the checkpoint.
+    ///
+    /// Compares the CRC computed during checkpoint writing with the cached in-memory CRC at the
+    /// snapshot's version. Compares `numFiles` and `tableSizeBytes` when both have complete file
+    /// stats, and independently compares `domainMetadata` when both have complete domain sets.
+    /// A mismatch emits a
+    /// [`CrcValidationFailure`](crate::metrics::MetricEvent::CrcValidationFailure) metric and an
+    /// error log without failing finalization.
     ///
     /// # Important
     /// This method **must** be called only after:
@@ -527,11 +548,16 @@ impl CheckpointWriter {
     // Internally, this method:
     // 1. Creates the `_last_checkpoint` data with `create_last_checkpoint_data`
     // 2. Writes the `_last_checkpoint` data to the `_last_checkpoint` file in the delta log
+    // TODO(#3672): Validate the remaining CRC fields.
     pub fn finalize(
         self,
         engine: &dyn Engine,
         last_checkpoint_stats: &LastCheckpointHintStats,
     ) -> KernelResult<()> {
+        if let Some(crc) = &last_checkpoint_stats.crc {
+            self.validate_at_version_crc_if_exist(crc);
+        }
+
         // Skip writing `_last_checkpoint` if the existing hint already points to a newer
         // checkpoint, to avoid regressing the hint.
         let checkpoint_version = self.snapshot.version();
@@ -725,6 +751,56 @@ impl CheckpointWriter {
             actions_count: 1,
             add_actions_count: 0,
         })
+    }
+
+    fn validate_at_version_crc_if_exist(&self, crc_from_replay: &Mutex<Crc>) {
+        let Some(in_memory_crc) = self.snapshot.crc_at_version() else {
+            return;
+        };
+        let expected_crc = match crc_from_replay.lock() {
+            Ok(crc) => crc,
+            Err(error) => {
+                error!(%error, "Cannot validate checkpoint CRC: lock poisoned");
+                return;
+            }
+        };
+        let mut mismatch = false;
+        if let (Some(in_memory_stats), Some(expected_stats)) =
+            (in_memory_crc.file_stats(), expected_crc.file_stats())
+        {
+            if in_memory_stats.num_files() != expected_stats.num_files()
+                || in_memory_stats.table_size_bytes() != expected_stats.table_size_bytes()
+            {
+                mismatch = true;
+                error!(
+                    table_root = %self.snapshot.table_root(),
+                    version = self.snapshot.version(),
+                    expected_num_files = expected_stats.num_files(),
+                    actual_num_files = in_memory_stats.num_files(),
+                    expected_table_size_bytes = expected_stats.table_size_bytes(),
+                    actual_table_size_bytes = in_memory_stats.table_size_bytes(),
+                    "Checkpoint CRC mismatch in numFiles or tableSizeBytes"
+                );
+            }
+        }
+        if let (DomainMetadataState::Complete(actual), DomainMetadataState::Complete(expected)) = (
+            &in_memory_crc.domain_metadata_state,
+            &expected_crc.domain_metadata_state,
+        ) {
+            if actual != expected {
+                mismatch = true;
+                error!(
+                    table_root = %self.snapshot.table_root(),
+                    version = self.snapshot.version(),
+                    expected_num_domains = expected.len(),
+                    actual_num_domains = actual.len(),
+                    "Checkpoint CRC mismatch in domainMetadata"
+                );
+            }
+        }
+        if mismatch {
+            emit_crc_validation_failure();
+        }
     }
 
     /// Helper for computing the checkpoint schema context from the snapshot and engine.

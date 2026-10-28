@@ -365,6 +365,10 @@ pub enum MetricEvent {
     StorageListCompleted(StorageListCompleted),
     StorageReadCompleted(StorageReadCompleted),
     StorageCopyCompleted(StorageCopyCompleted),
+    /// The CRC computed by log replay disagrees with the in-memory CRC at the same version.
+    /// Compares `numFiles`, `tableSizeBytes`, and `domainMetadata` when their state is complete.
+    // TODO(#3672): Validate the remaining CRC fields.
+    CrcValidationFailure,
 }
 
 /// Borrow the caller-supplied correlation id as a [`KernelStringSlice`], or an empty slice when
@@ -550,6 +554,7 @@ impl MetricEvent {
                 duration_ns: ns(*duration),
             }),
             K::CrcReadFailure => Self::CrcReadFailure,
+            K::CrcValidationFailure => Self::CrcValidationFailure,
             K::JsonReadCompleted(kernel::JsonReadCompleted {
                 num_files,
                 bytes_read,
