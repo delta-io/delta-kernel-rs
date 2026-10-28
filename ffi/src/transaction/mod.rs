@@ -3573,12 +3573,14 @@ mod tests {
         );
 
         let col = "id";
-        let columns = [kernel_string_slice!(col)];
+        let path = [kernel_string_slice!(col)];
+        let columns = [FfiColumnName {
+            path: unsafe { FfiStringArray::new_unsafe(&path) },
+        }];
         let builder = ok_or_panic(unsafe {
             create_table_txn_builder_with_clustering_columns(
                 builder,
-                columns.as_ptr(),
-                columns.len(),
+                FfiColumnNameArray::new_unsafe(&columns),
                 engine.shallow_copy(),
             )
         });
@@ -3635,7 +3637,7 @@ mod tests {
             },
         ];
         let builder = ok_or_panic(unsafe {
-            create_table_txn_builder_with_clustering_column_paths(
+            create_table_txn_builder_with_clustering_columns(
                 Box::new(builder).into(),
                 FfiColumnNameArray::new_unsafe(&columns),
                 engine.shallow_copy(),
@@ -3696,7 +3698,7 @@ mod tests {
             unsafe { FfiColumnNameArray::new_unsafe(&columns) }
         };
         let builder = ok_or_panic(unsafe {
-            create_table_txn_builder_with_clustering_column_paths(
+            create_table_txn_builder_with_clustering_columns(
                 builder,
                 columns,
                 engine.shallow_copy(),
@@ -3750,7 +3752,7 @@ mod tests {
             unsafe { FfiColumnNameArray::new_unsafe(&columns) }
         };
         let result = unsafe {
-            create_table_txn_builder_with_clustering_column_paths(
+            create_table_txn_builder_with_clustering_columns(
                 builder,
                 columns,
                 engine.shallow_copy(),
@@ -3866,12 +3868,20 @@ mod tests {
         // Two columns: order must be preserved in the serialized clustering domain metadata.
         let c0 = "id";
         let c1 = "name";
-        let columns = [kernel_string_slice!(c0), kernel_string_slice!(c1)];
+        let path0 = [kernel_string_slice!(c0)];
+        let path1 = [kernel_string_slice!(c1)];
+        let columns = [
+            FfiColumnName {
+                path: unsafe { FfiStringArray::new_unsafe(&path0) },
+            },
+            FfiColumnName {
+                path: unsafe { FfiStringArray::new_unsafe(&path1) },
+            },
+        ];
         let builder = ok_or_panic(unsafe {
             create_table_txn_builder_with_clustering_columns(
                 builder,
-                columns.as_ptr(),
-                columns.len(),
+                FfiColumnNameArray::new_unsafe(&columns),
                 engine.shallow_copy(),
             )
         });
@@ -3904,12 +3914,14 @@ mod tests {
         // Set clustering, then partition: the layouts are mutually exclusive and the last call
         // wins, so the committed table must be partitioned with no clustering domain metadata.
         let c_col = "id";
-        let c_cols = [kernel_string_slice!(c_col)];
+        let c_path = [kernel_string_slice!(c_col)];
+        let c_cols = [FfiColumnName {
+            path: unsafe { FfiStringArray::new_unsafe(&c_path) },
+        }];
         let builder = ok_or_panic(unsafe {
             create_table_txn_builder_with_clustering_columns(
                 builder,
-                c_cols.as_ptr(),
-                c_cols.len(),
+                FfiColumnNameArray::new_unsafe(&c_cols),
                 engine.shallow_copy(),
             )
         });

@@ -372,34 +372,6 @@ pub(super) unsafe fn collect_create_table_columns(
         .collect()
 }
 
-/// Set a clustered data layout on a [`CreateTableTransactionBuilder`] from an array of top-level
-/// clustering column names (in order). Clustering and partitioning are mutually exclusive. The
-/// last data-layout call wins. Column validation (existence, stats-eligible types, duplicates)
-/// happens later at [`create_table_txn_builder_build`].
-///
-/// Only top-level columns are supported through this entry point (each slice is one column name).
-/// Use [`create_table_txn_builder_with_clustering_column_paths`] for nested columns.
-///
-/// # Safety
-///
-/// `builder` and `engine` must be valid. This call borrows `engine` and the column array. When
-/// `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid `KernelStringSlice`
-/// values whose backing bytes are readable for the duration of the call. `columns` may be null
-/// when `num_columns == 0`. `builder` is consumed even when this returns an error.
-#[no_mangle]
-pub unsafe extern "C" fn create_table_txn_builder_with_clustering_columns(
-    builder: Handle<ExclusiveCreateTableTransactionBuilder>,
-    columns: *const KernelStringSlice,
-    num_columns: usize,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
-    let engine = unsafe { engine.as_ref() };
-    let builder = unsafe { *builder.into_inner() };
-    let columns = unsafe { collect_create_table_columns(columns, num_columns) };
-    create_table_txn_builder_with_data_layout_impl(builder, columns.map(DataLayout::clustered))
-        .into_extern_result(&engine)
-}
-
 /// Set ordered logical clustering column paths, replacing any prior data layout.
 ///
 /// Each [`FfiColumnName`](crate::delta_types::FfiColumnName) contains literal field-name segments;
@@ -415,7 +387,7 @@ pub unsafe extern "C" fn create_table_txn_builder_with_clustering_columns(
 /// `engine` is borrowed. `builder` is consumed on success and error; the caller must build or free
 /// the returned builder and must not use or free the input handle afterward.
 #[no_mangle]
-pub unsafe extern "C" fn create_table_txn_builder_with_clustering_column_paths(
+pub unsafe extern "C" fn create_table_txn_builder_with_clustering_columns(
     builder: Handle<ExclusiveCreateTableTransactionBuilder>,
     columns: FfiColumnNameArray,
     engine: Handle<SharedExternEngine>,
