@@ -307,8 +307,14 @@ async fn protocol_upgrade_turns_existing_expressions_into_generated_columns_that
     Ok(())
 }
 
+#[rstest]
+#[case::alter_table(UpdateTableOperation::AlterTable, false)]
+#[case::write_with_schema_evolution(UpdateTableOperation::Write, true)]
 #[tokio::test]
-async fn alter_table_build_fails_on_tables_with_generated_columns() -> KernelResult<()> {
+async fn schema_changes_fail_on_tables_with_generated_columns(
+    #[case] operation: UpdateTableOperation,
+    #[case] data_change: bool,
+) -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = write_table(&table_path, GENERATED_COLUMNS_FEATURE, EVENT_YEAR).await?;
 
@@ -316,13 +322,16 @@ async fn alter_table_build_fails_on_tables_with_generated_columns() -> KernelRes
     let result = begin_transaction_with(
         snapshot,
         engine.as_ref(),
-        UpdateTableOperation::AlterTable,
+        operation,
         "Test/1.0",
-        false,
+        data_change,
         |builder| builder.add_column(StructField::nullable("note", DataType::STRING)),
     );
 
-    let rejected = matches!(result, Err(KernelError::Unsupported(_)));
+    let rejected = matches!(
+        &result,
+        Err(KernelError::Unsupported(msg)) if msg.contains("generated columns")
+    );
     assert!(rejected);
     Ok(())
 }
