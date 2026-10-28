@@ -378,7 +378,9 @@ fn apply_schema_changes(
             "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
         ));
     }
-    if table_config.has_generation_expressions() {
+    if table_config.is_feature_supported(&TableFeature::GeneratedColumns)
+        && table_config.has_generation_expressions()
+    {
         return Err(KernelError::unsupported(
             "Schema changes are not yet supported on tables with generated columns",
         ));

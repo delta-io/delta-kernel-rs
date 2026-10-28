@@ -312,12 +312,17 @@ async fn protocol_upgrade_turns_existing_expressions_into_generated_columns_that
 #[case::alter_table(UpdateTableOperation::AlterTable, false)]
 #[case::write_with_schema_evolution(UpdateTableOperation::Write, true)]
 #[tokio::test]
-async fn schema_changes_fail_on_tables_with_generated_columns(
+async fn schema_changes_fail_only_on_tables_with_generated_columns(
     #[case] operation: UpdateTableOperation,
     #[case] data_change: bool,
-    #[values(GENERATED_COLUMNS_FEATURE, &[])] writer_features: &[&str],
+    #[values(true, false)] lists_feature: bool,
 ) -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
+    let writer_features = if lists_feature {
+        GENERATED_COLUMNS_FEATURE
+    } else {
+        &[]
+    };
     let table_url = write_table(&table_path, writer_features, EVENT_YEAR).await?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -330,8 +335,12 @@ async fn schema_changes_fail_on_tables_with_generated_columns(
         |builder| builder.add_column(StructField::nullable("note", DataType::STRING)),
     );
 
-    let expected = "Schema changes are not yet supported on tables with generated columns";
-    let rejected = matches!(&result, Err(KernelError::Unsupported(msg)) if msg == expected);
-    assert!(rejected);
+    if lists_feature {
+        let expected = "Schema changes are not yet supported on tables with generated columns";
+        let rejected = matches!(&result, Err(KernelError::Unsupported(msg)) if msg == expected);
+        assert!(rejected);
+    } else {
+        let _txn = result?;
+    }
     Ok(())
 }
