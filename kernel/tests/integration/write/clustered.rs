@@ -656,6 +656,40 @@ fn test_add_file_clustering_provider_on_unclustered_table(
 }
 
 #[rstest::rstest]
+#[tokio::test]
+async fn test_add_file_reversed_optional_columns_rejected_at_commit(
+    #[values(false, true)] row_tracking: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let NewFilesSetup {
+        _tmp_dir,
+        engine,
+        mut txn,
+        add_files_metadata,
+        ..
+    } = write_new_files_to_clustered_table(row_tracking, vec![vec![1]]).await?;
+    let schema = schema_ref! {
+        nullable CLUSTERING_PROVIDER_NAME: STRING,
+        nullable TAGS_NAME: { STRING => nullable STRING },
+    };
+    let columns = schema
+        .fields()
+        .map(|field| {
+            ArrayData::try_new(
+                ArrayType::new(field.data_type().clone(), true),
+                [Scalar::Null(field.data_type().clone())],
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let metadata = ArrowEngineData::new(add_files_metadata).append_columns(schema, columns)?;
+    txn.add_files(metadata);
+    assert_result_error_with_message(
+        txn.commit(engine.as_ref()),
+        "Expected schema field 'clusteringProvider' is out of order",
+    );
+    Ok(())
+}
+
+#[rstest::rstest]
 #[case::tags_not_map(TAGS_NAME, DataType::STRING)]
 #[case::provider_not_string(CLUSTERING_PROVIDER_NAME, DataType::LONG)]
 #[case::tags_key_not_string(

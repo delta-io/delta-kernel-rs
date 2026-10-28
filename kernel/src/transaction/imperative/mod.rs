@@ -48,8 +48,8 @@ use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
-    create_row, version_as_i64, DataType, Engine, EngineData, Expression, KernelResult,
-    KernelResultIterator, Predicate, RowVisitor, Version,
+    create_row, version_as_i64, DataType, Engine, EngineData, Expression, ExpressionEvaluator,
+    KernelResult, KernelResultIterator, Predicate, RowVisitor, Version,
 };
 
 mod update_table;
@@ -695,12 +695,19 @@ where
     T: Deref<Target = dyn EngineData> + Send + 'a,
 {
     let evaluation_handler = engine.evaluation_handler();
+    let mut last_evaluator: Option<((bool, bool), Arc<dyn ExpressionEvaluator>)> = None;
     Ok(add_files_metadata.map(move |add_files_batch| {
         let add_files_batch = add_files_batch?;
-        let input_schema = add_files_schema_with(
+        let optional_columns = (
             add_files_batch.has_field(&column_name!(TAGS_NAME)),
             add_files_batch.has_field(&column_name!(CLUSTERING_PROVIDER_NAME)),
         );
+        if let Some((cached_columns, evaluator)) = &last_evaluator {
+            if *cached_columns == optional_columns {
+                return evaluator.evaluate(add_files_batch.deref());
+            }
+        }
+        let input_schema = add_files_schema_with(optional_columns.0, optional_columns.1);
         let input_schema = if row_tracking {
             with_row_tracking_cols(input_schema)?
         } else {
@@ -712,7 +719,9 @@ where
             Arc::new(adds_expr),
             as_log_add_schema(output_schema).into(),
         )?;
-        adds_evaluator.evaluate(add_files_batch.deref())
+        let result = adds_evaluator.evaluate(add_files_batch.deref());
+        last_evaluator = Some((optional_columns, adds_evaluator));
+        result
     }))
 }
 
@@ -805,6 +814,7 @@ fn build_remove_struct_patch(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use ::test_utils::get_column;
@@ -823,7 +833,8 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{MapData, Scalar, StructData};
+    use crate::engine::test_delegating::DelegatingEngine;
+    use crate::expressions::{ExpressionRef, MapData, PredicateRef, Scalar, StructData};
     use crate::scan::log_replay::PATH_NAME;
     use crate::schema::{column_name, schema, MapType};
     use crate::table_configuration::TableConfiguration;
@@ -831,7 +842,7 @@ mod tests {
     use crate::transaction::create_table::create_table;
     use crate::transaction::operation::UpdateTableOperation;
     use crate::unit_test_utils::{copy_test_table, create_valid_add_file_batch, test_schema_flat};
-    use crate::{EvaluationHandler, Snapshot};
+    use crate::{EvaluationHandler, ExpressionEvaluator, PredicateEvaluator, Snapshot};
 
     impl Transaction {
         /// Set clustering columns for testing purposes without needing a table
@@ -885,6 +896,100 @@ mod tests {
                 assert_eq!(Some(field), ADD_SCHEMA.field(name));
             }
         }
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct CountingEvaluationHandler {
+        evaluators_created: AtomicUsize,
+    }
+
+    impl EvaluationHandler for CountingEvaluationHandler {
+        fn new_expression_evaluator(
+            &self,
+            schema: SchemaRef,
+            expression: ExpressionRef,
+            output_type: DataType,
+        ) -> KernelResult<Arc<dyn ExpressionEvaluator>> {
+            self.evaluators_created.fetch_add(1, Ordering::Relaxed);
+            ArrowEvaluationHandler.new_expression_evaluator(schema, expression, output_type)
+        }
+
+        fn new_predicate_evaluator(
+            &self,
+            schema: SchemaRef,
+            predicate: PredicateRef,
+        ) -> KernelResult<Arc<dyn PredicateEvaluator>> {
+            ArrowEvaluationHandler.new_predicate_evaluator(schema, predicate)
+        }
+
+        fn create_many(
+            &self,
+            schema: SchemaRef,
+            rows: Vec<Vec<Scalar>>,
+        ) -> KernelResult<Box<dyn EngineData>> {
+            ArrowEvaluationHandler.create_many(schema, rows)
+        }
+    }
+
+    #[rstest]
+    #[case::base(&[(false, false), (false, false)], 1)]
+    #[case::tags(&[(true, false), (true, false)], 1)]
+    #[case::provider(&[(false, true), (false, true)], 1)]
+    #[case::both(&[(true, true), (true, true)], 1)]
+    #[case::changing_columns(
+        &[(false, false), (false, false), (true, true), (true, true), (false, false), (false, false)],
+        3
+    )]
+    fn test_add_action_evaluators_reused_for_repeated_schema(
+        #[values(false, true)] row_tracking: bool,
+        #[case] optional_columns: &[(bool, bool)],
+        #[case] max_evaluators: usize,
+    ) -> KernelResult<()> {
+        let handler = Arc::new(CountingEvaluationHandler::default());
+        let engine = DelegatingEngine::new(Arc::new(SyncEngine::new()))
+            .with_evaluation_handler(handler.clone());
+        let batches = optional_columns
+            .iter()
+            .map(|&(tags, provider)| {
+                let schema = add_files_schema_with(tags, provider);
+                let schema = if row_tracking {
+                    with_row_tracking_cols(schema)?
+                } else {
+                    schema.clone()
+                };
+                let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
+                let mut columns = create_valid_add_file_batch(false).columns().to_vec();
+                columns.extend(
+                    arrow_schema.fields()[columns.len()..]
+                        .iter()
+                        .map(|field| new_null_array(field.data_type(), 1)),
+                );
+                let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)?;
+                Ok(Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>)
+            })
+            .collect::<KernelResult<Vec<_>>>()?;
+        let actions = build_add_actions(&engine, batches.into_iter().map(Ok), row_tracking, true)?;
+        assert_eq!(handler.evaluators_created.load(Ordering::Relaxed), 0);
+        let actions = actions.collect::<KernelResult<Vec<_>>>()?;
+        assert_eq!(actions.len(), optional_columns.len());
+        for (action, &(tags, provider)) in actions.iter().zip(optional_columns) {
+            assert_eq!(action.has_field(&column_name!("add", TAGS_NAME)), tags);
+            assert_eq!(
+                action.has_field(&column_name!("add", CLUSTERING_PROVIDER_NAME)),
+                provider
+            );
+            assert_eq!(
+                action.has_field(&column_name!("add.baseRowId")),
+                row_tracking
+            );
+        }
+        let created = handler.evaluators_created.load(Ordering::Relaxed);
+        assert!(
+            created <= max_evaluators,
+            "created {created} evaluators for {} batches; expected at most {max_evaluators}",
+            optional_columns.len()
+        );
         Ok(())
     }
 
