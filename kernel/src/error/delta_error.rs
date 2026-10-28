@@ -73,6 +73,7 @@ impl DeltaError {
     ///
     /// `parameters` must contain exactly [`DeltaErrorCondition::parameter_names`], in that order.
     /// Condition-specific factories must maintain this invariant.
+    // TODO(#3421): Remove this dead code attribute when the first delta error factory is introduced
     #[allow(
         dead_code,
         reason = "Reserved for condition-specific factories (see #3421)."
@@ -144,6 +145,7 @@ impl DeltaErrorParameter {
         &self.value
     }
 
+    // TODO(#3421): Remove this dead code attribute when the first delta error factory is introduced
     #[allow(
         dead_code,
         reason = "Reserved for condition-specific factories (see #3421)."
