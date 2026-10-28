@@ -24,8 +24,10 @@ static MANDATORY_ADD_FILE_COLUMNS: LazyLock<ColumnNamesAndTypes> =
 static CLUSTERING_PROVIDER_COLUMNS: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| schema_ref! { (&ADD_FILE_CLUSTERING_PROVIDER_FIELD) }.leaves(None));
 
-/// Rejects populated clustering providers in batches for a table without clustering support.
-pub(crate) fn validate_clustering_providers(batches: &[Box<dyn EngineData>]) -> KernelResult<()> {
+/// Rejects batches with non-null clustering providers.
+pub(crate) fn validate_no_clustering_providers_set(
+    batches: &[Box<dyn EngineData>],
+) -> KernelResult<()> {
     let mut validator = StagedDataValidator::new(
         &CLUSTERING_PROVIDER_COLUMNS,
         vec![Box::new(UnclusteredFile)],

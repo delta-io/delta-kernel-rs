@@ -320,7 +320,7 @@ impl<STATE> Transaction<STATE, Imperative> {
             .effective_table_config
             .is_feature_supported(&TableFeature::ClusteredTable)
         {
-            write_validation::validate_clustering_providers(
+            write_validation::validate_no_clustering_providers_set(
                 &self.staged_data_changes.add_files_metadata,
             )?;
         }
@@ -497,7 +497,7 @@ impl<STATE> Transaction<STATE, Imperative> {
                     .add_files_metadata
                     .iter()
                     .map(|a| Ok(a.deref())),
-                false,
+                false, // no row tracking
                 self.data_change,
             )?;
             Ok((Box::new(add_actions), None))
@@ -548,8 +548,12 @@ impl<STATE> Transaction<STATE, Imperative> {
                     )
                 });
 
-        // Generate add actions including row tracking metadata
-        let add_actions = build_add_actions(engine, extended_add_files, true, self.data_change)?;
+        let add_actions = build_add_actions(
+            engine,
+            extended_add_files,
+            true, // row tracking
+            self.data_change,
+        )?;
 
         // Do a dry run to eagerly compute the new high water mark so we can store it. The row
         // tracking calculation above happens only lazily as our caller drives the iterator.

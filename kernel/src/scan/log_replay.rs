@@ -812,7 +812,6 @@ pub(crate) static FILE_CONSTANT_VALUES_NAME: &str = "fileConstantValues";
 pub(crate) static PATH_NAME: &str = "path";
 pub(crate) static BASE_ROW_ID_NAME: &str = "baseRowId";
 pub(crate) static DEFAULT_ROW_COMMIT_VERSION_NAME: &str = "defaultRowCommitVersion";
-/// Name of the per-file clustering provider column.
 pub const CLUSTERING_PROVIDER_NAME: &str = "clusteringProvider";
 pub(crate) static PARTITION_VALUES_NAME: &str = "partitionValues";
 pub(crate) static SIZE_NAME: &str = "size";
@@ -820,7 +819,6 @@ pub(crate) static SIZE_NAME: &str = "size";
 pub(crate) static MODIFICATION_TIME_NAME: &str = "modificationTime";
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) static DATA_CHANGE_NAME: &str = "dataChange";
-/// Name of the per-file tags column.
 pub const TAGS_NAME: &str = "tags";
 pub(crate) static STATS_NAME: &str = "stats";
 pub(crate) static STATS_PARSED_NAME: &str = "stats_parsed";
