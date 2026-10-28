@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 use crate::executor::TaskExecutor;
 use crate::file_stream::{FileOpenFuture, FileOpener, FileStream};
-use crate::stats::collect_stats;
+use crate::stats::{collect_stats, with_tight_stats};
 use crate::UrlExt;
 
 #[derive(Debug)]
@@ -71,6 +71,14 @@ impl DataFileMetadata {
     /// Returns the absolute URL of the written file.
     pub fn location(&self) -> &url::Url {
         &self.file_meta.location
+    }
+
+    /// Adds a `tightStats` field matching `tightBounds` to the collected statistics.
+    pub(crate) fn with_tight_stats(self) -> KernelResult<Self> {
+        Ok(Self {
+            file_meta: self.file_meta,
+            stats: with_tight_stats(self.stats)?,
+        })
     }
 
     /// Converts this `DataFileMetadata` into an [`EngineData`] record batch matching the schema

@@ -176,6 +176,7 @@ impl<'a> StatsSchemaBuilder<'a> {
     ///   minValues: { <columns with original types> },
     ///   maxValues: { <columns with original types> },
     ///   tightBounds: boolean,
+    ///   tightStats: boolean,
     /// }
     /// ```
     ///

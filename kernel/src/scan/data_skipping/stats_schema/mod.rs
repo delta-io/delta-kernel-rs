@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use column_filter::StatsColumnFilter;
 pub(crate) use column_filter::StatsConfig;
 
-use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
+use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS, TIGHT_STATS};
 use crate::schema::{
     ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, StructField, StructType,
 };
@@ -76,6 +76,10 @@ use crate::KernelResult;
 /// accurately reflect the data in the file. When `false`, the file may have deletion vectors
 /// and the statistics haven't been recomputed to exclude deleted rows.
 ///
+/// The `tightStats` field has the same tight/wide meaning as `tightBounds`, but also covers
+/// timestamp columns, whose bounds are then not truncated to milliseconds. It is written for
+/// adaptiveMetadata tables.
+///
 /// See the Delta protocol for more details on statistics:
 /// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics>
 ///
@@ -87,6 +91,7 @@ use crate::KernelResult;
 ///    minValues: <derived min/max schema>,
 ///    maxValues: <derived min/max schema>,
 ///    tightBounds: boolean,
+///    tightStats: boolean,
 /// }
 /// ```
 ///
@@ -128,6 +133,7 @@ use crate::KernelResult;
 ///     },
 ///   },
 ///   tightBounds: boolean,
+///   tightStats: boolean,
 /// }
 /// ```
 /// Generates the expected schema for file statistics.
@@ -150,7 +156,7 @@ pub(crate) fn expected_stats_schema(
     required_columns: Option<&[ColumnName]>,
     requested_columns: Option<&[ColumnName]>,
 ) -> KernelResult<Schema> {
-    let mut fields = Vec::with_capacity(5);
+    let mut fields = Vec::with_capacity(6);
     fields.push(StructField::nullable(NUM_RECORDS, DataType::LONG));
 
     // generate the base stats schema:
@@ -186,6 +192,7 @@ pub(crate) fn expected_stats_schema(
     // tightBounds indicates whether min/max statistics are accurate (true) or potentially
     // outdated due to deletion vectors (false)
     fields.push(StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN));
+    fields.push(StructField::nullable(TIGHT_STATS, DataType::BOOLEAN));
 
     StructType::try_new(fields)
 }
@@ -470,6 +477,7 @@ mod tests {
             nullable MIN_VALUES: (min_max.clone()),
             nullable MAX_VALUES: (min_max),
             nullable TIGHT_BOUNDS: BOOLEAN,
+            nullable TIGHT_STATS: BOOLEAN,
         }
     }
 
@@ -806,6 +814,7 @@ mod tests {
             nullable NUM_RECORDS: LONG,
             nullable NULL_COUNT: (expected_null_count),
             nullable TIGHT_BOUNDS: BOOLEAN,
+            nullable TIGHT_STATS: BOOLEAN,
         };
 
         assert_eq!(&expected, &stats_schema);
@@ -839,6 +848,7 @@ mod tests {
                 nullable "iv": LONG,
             },
             nullable TIGHT_BOUNDS: BOOLEAN,
+            nullable TIGHT_STATS: BOOLEAN,
         };
         assert_eq!(expected, stats_schema);
     }
@@ -886,6 +896,7 @@ mod tests {
             nullable NUM_RECORDS: LONG,
             nullable NULL_COUNT: (expected_null_count),
             nullable TIGHT_BOUNDS: BOOLEAN,
+            nullable TIGHT_STATS: BOOLEAN,
         };
 
         assert_eq!(&expected, &stats_schema);
@@ -1036,6 +1047,7 @@ mod tests {
                     nullable "nested": { nullable "geography": LONG },
                 },
                 nullable TIGHT_BOUNDS: BOOLEAN,
+                nullable TIGHT_STATS: BOOLEAN,
             }
         );
     }
@@ -1296,10 +1308,11 @@ mod tests {
         )
         .unwrap();
 
-        // No data columns pass both filters, so only numRecords + tightBounds
+        // No data columns pass both filters, so only numRecords + tightBounds + tightStats
         let expected = schema! {
             nullable NUM_RECORDS: LONG,
             nullable TIGHT_BOUNDS: BOOLEAN,
+            nullable TIGHT_STATS: BOOLEAN,
         };
 
         assert_eq!(&expected, &stats_schema);

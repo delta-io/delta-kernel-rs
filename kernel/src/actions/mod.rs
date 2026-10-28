@@ -116,6 +116,10 @@ pub(crate) const MAX_VALUES: &str = "maxValues";
 /// Whether the min/max/nullCount stats are tight or wide. Defaults to `true` when absent.
 #[internal_api]
 pub(crate) const TIGHT_BOUNDS: &str = "tightBounds";
+/// Whether the min/max/nullCount stats are tight or wide, like [`TIGHT_BOUNDS`] but also covering
+/// timestamp bounds, which are then written at full precision. Used by adaptiveMetadata tables.
+#[internal_api]
+pub(crate) const TIGHT_STATS: &str = "tightStats";
 
 /// Struct-encoded per-file statistics column (checkpoints with `writeStatsAsStruct=true`).
 #[internal_api]
