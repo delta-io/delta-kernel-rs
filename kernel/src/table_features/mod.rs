@@ -30,7 +30,7 @@ pub(crate) use timestamp_ntz::{
 use crate::actions::Protocol;
 use crate::expressions::Scalar;
 use crate::schema::derive_macro_utils::ToDataType;
-use crate::schema::{schema_contains_non_null_fields, schema_has_invariants, DataType, Schema};
+use crate::schema::{schema_has_invariants, DataType, Schema};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
@@ -332,16 +332,14 @@ static APPEND_ONLY_INFO: FeatureInfo = FeatureInfo {
 // Although kernel marks invariants as "Supported", invariants must NOT actually be present in the
 // table schema. Kernel will fail to write to any table that actually uses invariants (see check in
 // TableConfiguration::ensure_write_supported). This is to allow legacy tables with the Invariants
-// feature supported but not in use. It is enabled only if the schema has invariant metadata or a
-// non-null field, since it has no table property.
+// feature supported but not in use. It is enabled only if the schema has invariant metadata, since
+// it has no table property.
 static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 2)),
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
-    enablement_check: EnablementCheck::EnabledIfSchema(|s| {
-        schema_has_invariants(s) || schema_contains_non_null_fields(s)
-    }),
+    enablement_check: EnablementCheck::EnabledIfSchema(schema_has_invariants),
 };
 
 // Enabled whenever the writer protocol supports it, even if the table declares no constraint.

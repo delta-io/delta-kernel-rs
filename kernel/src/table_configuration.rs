@@ -3418,8 +3418,17 @@ mod test {
 
     #[test]
     fn test_iceberg_native_v4_with_invariants_enabled() {
+        let mut field = StructField::nullable("value", DataType::INTEGER);
+        field.metadata.insert(
+            crate::schema::ColumnMetadataKey::Invariants
+                .as_ref()
+                .to_string(),
+            crate::schema::MetadataValue::String(
+                r#"{"expression": {"expression": "value > 0"}}"#.to_string(),
+            ),
+        );
         let config = MockTableConfigurationBuilder::new()
-            .with_schema(schema! { not_null "value": INTEGER })
+            .with_schema(schema! { (field) })
             .with_protocol(
                 MockProtocolBuilder::new()
                     .with_features([
@@ -3437,7 +3446,7 @@ mod test {
     #[test]
     fn test_iceberg_native_v4_with_invariants_supported_but_not_enabled() {
         let config = MockTableConfigurationBuilder::new()
-            .with_schema(schema! { nullable "value": INTEGER })
+            .with_schema(schema! { not_null "value": INTEGER })
             .with_protocol(
                 MockProtocolBuilder::new()
                     .with_features([
