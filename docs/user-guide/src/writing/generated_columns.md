@@ -234,8 +234,9 @@ touch a generated column. Use another Delta writer for these operations.
 
 Only top-level columns can be generated columns, and only on a table whose protocol supports the
 `generatedColumns` table feature. When a top-level column carries `delta.generationExpression`
-metadata on a table whose protocol doesn't support the feature, Kernel reads the table but rejects
-writes to it with an `InvalidProtocol` error.
+metadata on a table whose protocol doesn't support the feature, Kernel treats it as a normal column,
+as Delta Spark does. You write it like any other column, and writes to the table don't require
+`ack_generated_columns`.
 
 ## What's next
 

@@ -255,7 +255,7 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_generated_colum
 }
 
 #[tokio::test]
-async fn expressions_without_feature_define_no_generated_columns_and_txn_build_fails(
+async fn expressions_without_feature_define_no_generated_columns_and_writes_need_no_ack(
 ) -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = write_table(&table_path, &[], EVENT_YEAR).await?;
@@ -264,9 +264,10 @@ async fn expressions_without_feature_define_no_generated_columns_and_txn_build_f
     let generated_columns = snapshot.generated_columns()?;
     assert!(generated_columns.is_empty());
 
-    let result = begin_transaction(snapshot, engine.as_ref());
-    let rejected_as_malformed = matches!(result, Err(KernelError::InvalidProtocol(_)));
-    assert!(rejected_as_malformed);
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
+    let _write_state = txn.write_state()?;
+    stage_one_file(&mut txn)?;
+    let _committed = txn.commit(engine.as_ref())?.unwrap_committed();
     Ok(())
 }
 
@@ -314,9 +315,10 @@ async fn protocol_upgrade_turns_existing_expressions_into_generated_columns_that
 async fn schema_changes_fail_on_tables_with_generated_columns(
     #[case] operation: UpdateTableOperation,
     #[case] data_change: bool,
+    #[values(GENERATED_COLUMNS_FEATURE, &[])] writer_features: &[&str],
 ) -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
-    let table_url = write_table(&table_path, GENERATED_COLUMNS_FEATURE, EVENT_YEAR).await?;
+    let table_url = write_table(&table_path, writer_features, EVENT_YEAR).await?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let result = begin_transaction_with(
@@ -328,10 +330,8 @@ async fn schema_changes_fail_on_tables_with_generated_columns(
         |builder| builder.add_column(StructField::nullable("note", DataType::STRING)),
     );
 
-    let rejected = matches!(
-        &result,
-        Err(KernelError::Unsupported(msg)) if msg.contains("generated columns")
-    );
+    let expected = "Schema changes are not yet supported on tables with generated columns";
+    let rejected = matches!(&result, Err(KernelError::Unsupported(msg)) if msg == expected);
     assert!(rejected);
     Ok(())
 }
