@@ -2,6 +2,7 @@
 
 use super::committed::commit_result_to_committed_handle;
 use super::*;
+use crate::delta_types::FfiColumnNameArray;
 
 /// A handle for a create-table transaction (`Transaction<CreateTable>`).
 ///
@@ -377,7 +378,7 @@ pub(super) unsafe fn collect_create_table_columns(
 /// happens later at [`create_table_txn_builder_build`].
 ///
 /// Only top-level columns are supported through this entry point (each slice is one column name).
-/// Nested clustering columns must be set on the Rust builder directly.
+/// Use [`create_table_txn_builder_with_clustering_column_paths`] for nested columns.
 ///
 /// # Safety
 ///
@@ -397,6 +398,36 @@ pub unsafe extern "C" fn create_table_txn_builder_with_clustering_columns(
     let columns = unsafe { collect_create_table_columns(columns, num_columns) };
     create_table_txn_builder_with_data_layout_impl(builder, columns.map(DataLayout::clustered))
         .into_extern_result(&engine)
+}
+
+/// Set ordered logical clustering column paths, replacing any prior data layout.
+///
+/// Each [`FfiColumnName`](crate::delta_types::FfiColumnName) contains literal field-name segments;
+/// dots within a segment are not separators. Column validation (existence, supported types,
+/// duplicates, and empty paths) happens at [`create_table_txn_builder_build`]. Returns an updated
+/// builder, or an error if the borrowed arrays are malformed or strings are not valid UTF-8.
+///
+/// # Safety
+///
+/// `builder` and `engine` must be [valid][Handle#Validity] handles. The column array, nested path
+/// arrays, and string bytes are borrowed for this call and must follow the [`crate::FfiSlice`]
+/// contract: empty arrays may have null pointers; non-empty arrays must be aligned and readable.
+/// `engine` is borrowed. `builder` is consumed on success and error; the caller must build or free
+/// the returned builder and must not use or free the input handle afterward.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_txn_builder_with_clustering_column_paths(
+    builder: Handle<ExclusiveCreateTableTransactionBuilder>,
+    columns: FfiColumnNameArray,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let columns = unsafe { columns.try_to_column_names() };
+    create_table_txn_builder_with_data_layout_impl(
+        builder,
+        columns.map(|columns| DataLayout::Clustered { columns }),
+    )
+    .into_extern_result(&engine)
 }
 
 /// Set a partitioned data layout on a [`CreateTableTransactionBuilder`] from an array of top-level

@@ -122,6 +122,7 @@ mod tests {
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::engine_data::FilteredEngineData;
+    use delta_kernel::expressions::ColumnName;
     use delta_kernel::metrics::MetricEvent;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
@@ -131,6 +132,7 @@ mod tests {
         schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
     };
     use delta_kernel::table_features::TableFeature;
+    use delta_kernel::transaction::create_table::create_table;
     use delta_kernel::{KernelResult, Snapshot};
     use delta_kernel_ffi::delta_types::{
         FfiColumnNameArray, FfiNullableStringMap, FfiNullableStringMapEntry, FfiStringArray,
@@ -3601,6 +3603,170 @@ mod tests {
 
         unsafe { free_engine(engine) };
         Ok(())
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn test_create_table_with_clustering_column_paths(
+        #[case] column_mapping: bool,
+    ) -> KernelResult<()> {
+        let (store, test_engine, table_url) =
+            test_utils::engine_store_setup("clustering_paths", None);
+        let engine = engine_handle_for_store(Arc::clone(&store));
+        let schema = schema_ref! {
+            nullable "parent": { nullable "child": STRING },
+            nullable "literal.name": INTEGER,
+        };
+        let mut builder = create_table(&table_url, schema, "test-engine/1.0", false)
+            .with_data_layout(DataLayout::partitioned(["literal.name"]));
+        if column_mapping {
+            builder = builder.with_table_properties([("delta.columnMapping.mode", "name")]);
+        }
+        let parent_path = [ffi_str("parent"), ffi_str("child")];
+        let literal_path = [ffi_str("literal.name")];
+        let columns = [
+            FfiColumnName {
+                path: unsafe { FfiStringArray::new_unsafe(&parent_path) },
+            },
+            FfiColumnName {
+                path: unsafe { FfiStringArray::new_unsafe(&literal_path) },
+            },
+        ];
+        let builder = ok_or_panic(unsafe {
+            create_table_txn_builder_with_clustering_column_paths(
+                Box::new(builder).into(),
+                FfiColumnNameArray::new_unsafe(&columns),
+                engine.shallow_copy(),
+            )
+        });
+        build_and_commit(builder, &engine);
+        let snapshot = Snapshot::builder_for(table_url).build(&test_engine)?;
+        let infos = snapshot.get_clustering_column_infos(&test_engine)?.unwrap();
+        assert_eq!(
+            infos[0].logical_column,
+            ColumnName::new(["parent", "child"])
+        );
+        assert_eq!(infos[1].logical_column, ColumnName::new(["literal.name"]));
+        assert_eq!(infos.len(), 2);
+        for info in &infos {
+            assert_eq!(info.physical_column != info.logical_column, column_mapping);
+        }
+        assert!(snapshot
+            .table_configuration()
+            .logical_partition_columns()
+            .is_empty());
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::no_columns(vec![])]
+    #[case::empty_path(vec![vec![]])]
+    #[case::empty_segment(vec![vec![""]])]
+    #[case::missing_column(vec![vec!["missing"]])]
+    #[case::duplicate_column(vec![vec!["id"], vec!["id"]])]
+    fn test_create_table_clustering_column_paths_validate_at_build(#[case] paths: Vec<Vec<&str>>) {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("clustering_paths", None);
+        let (_, engine, builder) = create_table_txn_builder(
+            false,
+            &store,
+            &table_url,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        let paths: Vec<Vec<_>> = paths
+            .iter()
+            .map(|path| path.iter().map(|part| ffi_str(part)).collect())
+            .collect();
+        let columns: Vec<_> = paths
+            .iter()
+            .map(|path| FfiColumnName {
+                path: if path.is_empty() {
+                    FfiStringArray::empty()
+                } else {
+                    unsafe { FfiStringArray::new_unsafe(path) }
+                },
+            })
+            .collect();
+        let columns = if columns.is_empty() {
+            FfiColumnNameArray::empty()
+        } else {
+            unsafe { FfiColumnNameArray::new_unsafe(&columns) }
+        };
+        let builder = ok_or_panic(unsafe {
+            create_table_txn_builder_with_clustering_column_paths(
+                builder,
+                columns,
+                engine.shallow_copy(),
+            )
+        });
+        let result = unsafe { create_table_txn_builder_build(builder, engine.shallow_copy()) };
+        assert!(matches!(result, ExternResult::Err(_)));
+        if let ExternResult::Err(error) = result {
+            unsafe { recover_error(error) };
+        }
+        unsafe { free_engine(engine) };
+    }
+
+    #[rstest]
+    #[case::null_array(true, false)]
+    #[case::null_path(false, false)]
+    #[case::invalid_utf8(false, true)]
+    fn test_create_table_clustering_column_paths_reject_malformed_input(
+        #[case] null_array: bool,
+        #[case] invalid_utf8: bool,
+    ) {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("clustering_paths", None);
+        let (_, engine, builder) = create_table_txn_builder(
+            false,
+            &store,
+            &table_url,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        let invalid_bytes = [0xff];
+        let path = [KernelStringSlice {
+            ptr: invalid_bytes.as_ptr().cast(),
+            len: invalid_bytes.len(),
+        }];
+        let columns = [FfiColumnName {
+            path: if invalid_utf8 {
+                unsafe { FfiStringArray::new_unsafe(&path) }
+            } else {
+                FfiStringArray {
+                    ptr: std::ptr::null(),
+                    len: 1,
+                }
+            },
+        }];
+        let columns = if null_array {
+            FfiColumnNameArray {
+                ptr: std::ptr::null(),
+                len: 1,
+            }
+        } else {
+            unsafe { FfiColumnNameArray::new_unsafe(&columns) }
+        };
+        let result = unsafe {
+            create_table_txn_builder_with_clustering_column_paths(
+                builder,
+                columns,
+                engine.shallow_copy(),
+            )
+        };
+        assert_extern_result_error_with_message(
+            result,
+            if invalid_utf8 {
+                FFIKernelError::Utf8Error
+            } else {
+                FFIKernelError::GenericError
+            },
+            None,
+        );
+        // The setter consumes the builder on error; Miri checks its release.
+        unsafe { free_engine(engine) };
     }
 
     #[tokio::test]
