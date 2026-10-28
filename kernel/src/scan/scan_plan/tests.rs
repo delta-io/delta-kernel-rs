@@ -625,6 +625,71 @@ fn declarative_metadata_projects_nested_column_mapped_stats(
 }
 
 #[rstest]
+#[case::commits(LogState::with_latest_version(4), FeatureSet::new())]
+#[case::v1_checkpoint(
+    LogState::with_latest_version(4).with_checkpoint_at([4]),
+    FeatureSet::new()
+)]
+#[case::v1_checkpoint_and_commits(
+    LogState::with_latest_version(4).with_checkpoint_at([2]),
+    FeatureSet::new()
+)]
+#[case::v2_checkpoint(
+    LogState::with_latest_version(4).with_checkpoint_at([4]).with_sidecars_if_enabled(None),
+    FeatureSet::new().v2_checkpoint()
+)]
+#[case::v2_checkpoint_and_commits(
+    LogState::with_latest_version(4).with_checkpoint_at([2]).with_sidecars_if_enabled(None),
+    FeatureSet::new().v2_checkpoint()
+)]
+fn declarative_json_only_disables_metadata_pruning(
+    #[case] log_state: LogState,
+    #[case] features: FeatureSet,
+    #[values(checkpoint_json_stats(), checkpoint_struct_stats())] table_config: TableConfig,
+    #[values(
+        (col!("value").gt(lit(2500i32)), 2),
+        (col!("part_string").eq(lit("part_2000")), 1)
+    )]
+    pruning: (Pred, usize),
+    #[values(
+        PartitionValuesOptions::default(),
+        PartitionValuesOptions::with_struct()
+    )]
+    partitions: PartitionValuesOptions,
+) -> KernelResult<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(log_state)
+        .with_features(features)
+        .with_table_config(table_config)
+        .with_data_layout(DataLayoutConfig::PartitionedAllTypes)
+        .build()
+        .expect("build partitioned table");
+    let engine = SyncEngine::new_with_store(table.store().clone());
+    let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
+    let metadata = |stats, predicate: Option<PredicateRef>| {
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .with_stats(stats)
+            .with_partition_values(partitions.clone())
+            .with_predicate(predicate)
+            .build()?;
+        declarative_metadata(&scan, &engine)
+    };
+    let baseline = metadata(StatsOptions::json_only(), None)?;
+    assert_eq!(metadata_row_count(&baseline), 4);
+    let predicate = Some(Arc::new(pruning.0));
+    let pruned = metadata(StatsOptions::all_struct(), predicate.clone())?;
+    assert_eq!(metadata_row_count(&pruned), pruning.1);
+    let actual = metadata(StatsOptions::json_only(), predicate)?;
+    assert_metadata_eq(
+        &actual,
+        &baseline,
+        "JSON-only disables stats and partition pruning",
+    )
+}
+
+#[rstest]
 #[case::json_commits(
     LogState::with_latest_version(2),
     FeatureSet::new(),

@@ -1207,22 +1207,65 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::keeps_matching_file(StatsOptions::all_struct(), 5, 1)]
+    #[case::prunes_non_matching_file(StatsOptions::all_struct(), 20, 0)]
+    #[case::json_ignores_predicate(StatsOptions::json_only(), 20, 1)]
     fn metadata_planner_falls_back_to_json_for_incompatible_stats(
-        #[values(StatsOptions::json_only(), StatsOptions::all_struct())] stats: StatsOptions,
+        #[case] stats: StatsOptions,
+        #[case] lower_bound: i64,
+        #[case] expected_rows: usize,
     ) -> KernelResult<()> {
-        let scan = mock_snapshot(log_segment(log_root(), &[], None))?
-            .scan_builder()
-            .with_stats(stats)
-            .build()?;
-        let file_schema = schema! {
+        let stats_json =
+            r#"{"numRecords":1,"minValues":{"x":10},"maxValues":{"x":10},"nullCount":{"x":0}}"#;
+        let file_schema = schema_ref! {
             nullable ADD_NAME: {
+                ..(ADD_SCHEMA.fields()),
                 nullable STATS_PARSED: { nullable "minValues": { nullable "x": STRING } },
             },
         };
+        let add = serde_json::json!({ "add": {
+            "path": "a.parquet", "partitionValues": {}, "size": 1,
+            "modificationTime": 1, "dataChange": true, "stats": stats_json,
+            "stats_parsed": { "minValues": { "x": "incompatible" } },
+        }});
+        let json = StringArray::from(vec![add.to_string()]);
+        let batch = parse_json_impl(&json, file_schema.clone())?;
+        let store = Arc::new(InMemory::new());
+        futures::executor::block_on(store.put(
+            &Path::from("_delta_log/00000000000000000000.checkpoint.parquet"),
+            record_batch_to_bytes(&batch).into(),
+        ))?;
+        let segment = log_segment(
+            Url::parse("memory:///_delta_log/")?,
+            &[],
+            Some("memory:///_delta_log/00000000000000000000.checkpoint.parquet"),
+        );
+        let scan = mock_snapshot(segment)?
+            .scan_builder()
+            .with_stats(stats)
+            .with_predicate(Arc::new(col!("x").gt(lit(lower_bound))))
+            .build()?;
         let (read_schema, kind, _) =
             MetadataPlanner::try_new(&scan)?.read_schema(&file_schema, false)?;
         assert!(kind == StatsKind::Json);
         assert_eq!(add_struct(&read_schema), &*ADD_SCHEMA);
+        let batches = declarative_metadata(&scan, &SyncEngine::new_with_store(store))?;
+        assert_eq!(metadata_row_count(&batches), expected_rows);
+        for batch in batches {
+            let paths = batch.column_by_name("path").unwrap().as_string::<i32>();
+            assert_eq!(paths.value(0), "a.parquet");
+            if let Some(schema) = scan.state_info.physical_stats_output_schema() {
+                let json = StringArray::from(vec![stats_json]);
+                let expected = StructArray::from(parse_json_impl(&json, schema.clone())?);
+                assert_eq!(
+                    batch.column_by_name(STATS_PARSED).unwrap().as_struct(),
+                    &expected
+                );
+            } else {
+                let json = batch.column_by_name(STATS).unwrap().as_string::<i32>();
+                assert_eq!(json.value(0), stats_json);
+            }
+        }
         Ok(())
     }
 
