@@ -138,6 +138,15 @@ pub(crate) enum TableFeature {
     MaterializePartitionColumns,
     /// Column Default Values.
     AllowColumnDefaults,
+    /// Collation annotations and statistics for STRING columns.
+    ///
+    /// Kernel string predicates remain binary. See
+    /// [`ScanBuilder::with_predicate`](crate::scan::ScanBuilder::with_predicate).
+    Collations,
+    /// Preview form of [`Self::Collations`], with the same binary-predicate contract.
+    #[strum(serialize = "collations-preview")]
+    #[serde(rename = "collations-preview")]
+    CollationsPreview,
 
     ///////////////////////////
     // ReaderWriter features //
@@ -559,6 +568,14 @@ static ALLOW_COLUMN_DEFAULTS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+static COLLATIONS_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
@@ -805,7 +822,9 @@ impl TableFeature {
             | TableFeature::IcebergNativeV4Preview
             | TableFeature::ClusteredTable
             | TableFeature::MaterializePartitionColumns => FeatureType::WriterOnly,
-            TableFeature::AllowColumnDefaults => FeatureType::WriterOnly,
+            TableFeature::AllowColumnDefaults
+            | TableFeature::Collations
+            | TableFeature::CollationsPreview => FeatureType::WriterOnly,
             TableFeature::Unknown(_) => FeatureType::Unknown,
         }
     }
@@ -843,6 +862,7 @@ impl TableFeature {
             TableFeature::ClusteredTable => &CLUSTERED_TABLE_INFO,
             TableFeature::MaterializePartitionColumns => &MATERIALIZE_PARTITION_COLUMNS_INFO,
             TableFeature::AllowColumnDefaults => &ALLOW_COLUMN_DEFAULTS_INFO,
+            TableFeature::Collations | TableFeature::CollationsPreview => &COLLATIONS_INFO,
 
             // ReaderWriter features
             TableFeature::CatalogManaged => &CATALOG_MANAGED_INFO,
@@ -1234,6 +1254,8 @@ mod tests {
                 TableFeature::FileTypePreview => "fileType-preview",
                 TableFeature::AdaptiveMetadataPreview => "adaptiveMetadata-preview",
                 TableFeature::AllowColumnDefaults => "allowColumnDefaults",
+                TableFeature::Collations => "collations",
+                TableFeature::CollationsPreview => "collations-preview",
                 TableFeature::GeospatialType => "geospatial",
                 TableFeature::Unknown(_) => continue, // tested in test_unknown_features
             };

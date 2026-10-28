@@ -43,9 +43,8 @@ fn generate_checkpoint_parts(
     engine: &dyn Engine,
     file_actions_per_sidecar_hint: usize,
 ) -> KernelResult<CheckpointParts> {
-    let data_iter = writer.checkpoint_data(engine)?;
+    let (data_iter, output_schema) = writer.checkpoint_data_with_schema(engine)?;
     let iter_state = data_iter.state();
-    let output_schema = writer.output_schema.clone();
 
     let splitter = SidecarSplitter::new_mut_shared(
         data_iter,
@@ -557,7 +556,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> KernelResult<()>
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
-    let data_iter = writer.checkpoint_data(&engine)?;
+    let (data_iter, schema) = writer.checkpoint_data_with_schema(&engine)?;
     let mut all_batches = Vec::new();
     for batch_result in data_iter {
         let batch = batch_result?;
@@ -566,7 +565,6 @@ async fn test_generate_sidecars_stats_and_partition_values() -> KernelResult<()>
     }
 
     // Validate the checkpoint data schema
-    let schema = &writer.output_schema;
     let add_field = schema.field(ADD_NAME).expect("schema should have 'add'");
     if let DataType::Struct(ref add_struct) = add_field.data_type {
         assert!(
@@ -651,8 +649,7 @@ async fn test_splitter_no_file_actions() -> KernelResult<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
-    let data_iter = writer.checkpoint_data(&engine)?;
-    let output_schema = writer.output_schema.clone();
+    let (data_iter, output_schema) = writer.checkpoint_data_with_schema(&engine)?;
 
     let splitter = SidecarSplitter::new_mut_shared(
         data_iter,

@@ -1,8 +1,9 @@
-//! Detection and structural validation of field-relative collation annotations.
+//! Detection, validation, and physical-name rewriting of field-relative collation annotations.
 
 use crate::schema::{
     ColumnMetadataKey, DataType, FieldMetadataKeyChecker, MetadataValue, Schema, StructField,
 };
+use crate::table_configuration::TableConfiguration;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
@@ -22,6 +23,53 @@ pub(crate) fn validate_collation_annotations(schema: &Schema) -> KernelResult<()
         return Ok(());
     }
     CollationAnnotationValidator.transform_struct(schema)
+}
+
+/// Validates annotations and requires a declared stable or preview feature on annotated schemas.
+///
+/// Snapshot loading applies the same structural validation as CREATE and ALTER, even for binary
+/// reads of this writer-only feature.
+/// Returns a schema error for malformed annotations or an unsupported error for a missing feature.
+pub(crate) fn validate_collations_feature_support(
+    table_config: &TableConfiguration,
+) -> KernelResult<()> {
+    let schema = table_config.logical_schema_ref();
+    if !schema_has_collations(schema) {
+        return Ok(());
+    }
+    CollationAnnotationValidator.transform_struct(schema)?;
+    require!(
+        table_config.has_collations_feature(),
+        KernelError::unsupported(
+            "Table contains collation metadata but requires the 'collations' or \
+             'collations-preview' table feature"
+        )
+    );
+    Ok(())
+}
+
+/// Replaces matching logical field prefixes with the physical name, preserving path suffixes.
+pub(crate) fn rewrite_collation_field_prefix(
+    annotation: &mut MetadataValue,
+    logical_name: &str,
+    physical_name: &str,
+) {
+    if logical_name == physical_name {
+        return;
+    }
+    let MetadataValue::Other(serde_json::Value::Object(collations)) = annotation else {
+        return;
+    };
+    *collations = std::mem::take(collations)
+        .into_iter()
+        .map(|(path, identifier)| {
+            let physical_path = path
+                .strip_prefix(logical_name)
+                .map(|suffix| format!("{physical_name}{suffix}"))
+                .unwrap_or(path);
+            (physical_path, identifier)
+        })
+        .collect();
 }
 
 struct CollationAnnotationValidator;

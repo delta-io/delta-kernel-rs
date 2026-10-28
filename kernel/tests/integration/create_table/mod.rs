@@ -672,6 +672,7 @@ async fn test_create_table_txn_debug() -> KernelResult<()> {
 #[case("changeDataFeed", TableFeature::ChangeDataFeed, false, false, false)]
 #[case("rowTracking", TableFeature::RowTracking, false, false, true)]
 #[case("domainMetadata", TableFeature::DomainMetadata, false, true, true)]
+#[case("collations", TableFeature::Collations, false, true, true)]
 // WriterOnly features (AlwaysIfSupported)
 #[case(
     "materializePartitionColumns",
@@ -727,6 +728,33 @@ fn test_create_table_with_feature_signal(
         );
     }
 
+    Ok(())
+}
+
+#[rstest]
+fn create_table_rejects_preview_feature_signals(
+    #[values(
+        "collations-preview",
+        "typeWidening-preview",
+        "variantType-preview",
+        "variantShredding-preview",
+        "catalogOwned-preview",
+        "adaptiveMetadata-preview",
+        "icebergNativeV4-preview"
+    )]
+    feature_name: &str,
+) -> KernelResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let key = format!("delta.feature.{feature_name}");
+    let result = create_table(&table_path, simple_schema()?, "Test/1.0", false)
+        .with_table_properties([(key.as_str(), "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+    assert_result_error_with_message(
+        result,
+        &format!(
+            "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
+        ),
+    );
     Ok(())
 }
 

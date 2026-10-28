@@ -485,6 +485,12 @@ impl ScanBuilder {
     /// to the engine by default. Use [`with_stats`](Self::with_stats) if the engine
     /// also wants stats in the scan metadata output.
     ///
+    /// String comparisons use UTF-8 binary semantics, including on columns with `__COLLATIONS`.
+    /// Kernel's pruning ignores `statsWithCollation`. For collation-aware queries, the connector
+    /// must derive a conservative predicate whose TRUE rows include every match of the original
+    /// filter, and apply the original filter after reading. Unsupported comparisons must not
+    /// discard rows through Kernel or underlying-reader pushdown.
+    ///
     /// [`StructType::add_metadata_column`]: crate::schema::StructType::add_metadata_column
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
@@ -1381,13 +1387,20 @@ impl Scan {
         // needed for output or pruning.
         let plan_executor = engine.require_plan_executor()?;
         let needs_leaf_schema = self.state_info.physical_stats_read_schema().is_some()
-            || self.state_info.physical_partition_schema.is_some();
+            || self.state_info.physical_partition_schema.is_some()
+            || self.needs_collation_stats_schema();
         let shape = if needs_leaf_schema {
             CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
         } else {
             CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?
         };
         self.build_metadata_scan_plan(&shape)
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    /// Whether JSON stats synthesis requires the checkpoint's collation stats schema.
+    fn needs_collation_stats_schema(&self) -> bool {
+        self.stats.synthesize_json && self.snapshot.table_configuration().has_collations_feature()
     }
 
     // Factored out to facilitate testing
