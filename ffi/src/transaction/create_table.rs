@@ -347,7 +347,7 @@ pub unsafe extern "C" fn create_table_txn_builder_with_domain_metadata(
         .into_extern_result(&engine)
 }
 
-/// Collect `num_columns` column-name string slices into owned `String`s.
+/// Collect `num_columns` top-level partition column-name slices into owned `String`s.
 ///
 /// Returns an empty `Vec` when `num_columns == 0` without dereferencing `columns`, so a null
 /// pointer is sound in the empty case. Returns `Err` if any slice is not valid UTF-8.
@@ -406,6 +406,9 @@ pub unsafe extern "C" fn create_table_txn_builder_with_clustering_columns(
 /// partition column names (in order). Clustering and partitioning are mutually exclusive. The last
 /// data-layout call wins. Column validation (existence, primitive types, subset of schema) happens
 /// later at [`create_table_txn_builder_build`].
+///
+/// Partition columns must be top-level fields, so each slice is a literal name rather than a
+/// segmented path. Dots within a name are not separators.
 ///
 /// # Safety
 ///

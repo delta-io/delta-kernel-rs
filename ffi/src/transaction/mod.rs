@@ -3619,39 +3619,68 @@ mod tests {
         let engine = engine_handle_for_store(Arc::clone(&store));
         let schema = schema_ref! {
             nullable "parent": { nullable "child": STRING },
-            nullable "literal.name": INTEGER,
+            nullable "parent.child": INTEGER,
+            nullable "grandgrandparent": {
+                nullable "grandparent": { nullable "parent": { nullable "child": STRING } },
+            },
         };
         let mut builder = create_table(&table_url, schema, "test-engine/1.0", false)
-            .with_data_layout(DataLayout::partitioned(["literal.name"]));
+            .with_data_layout(DataLayout::partitioned(["parent.child"]));
         if column_mapping {
             builder = builder.with_table_properties([("delta.columnMapping.mode", "name")]);
         }
-        let parent_path = [ffi_str("parent"), ffi_str("child")];
-        let literal_path = [ffi_str("literal.name")];
-        let columns = [
-            FfiColumnName {
-                path: unsafe { FfiStringArray::new_unsafe(&parent_path) },
-            },
-            FfiColumnName {
-                path: unsafe { FfiStringArray::new_unsafe(&literal_path) },
-            },
-        ];
-        let builder = ok_or_panic(unsafe {
-            create_table_txn_builder_with_clustering_columns(
-                Box::new(builder).into(),
-                FfiColumnNameArray::new_unsafe(&columns),
-                engine.shallow_copy(),
-            )
-        });
+        // Drop every input allocation before build so Miri can detect retained pointers.
+        let builder = {
+            let names = [
+                "parent",
+                "child",
+                "parent.child",
+                "grandgrandparent",
+                "grandparent",
+            ]
+            .map(String::from);
+            let parent_path = Box::new([ffi_str(&names[0]), ffi_str(&names[1])]);
+            let literal_path = Box::new([ffi_str(&names[2])]);
+            let deep_path = Box::new([
+                ffi_str(&names[3]),
+                ffi_str(&names[4]),
+                ffi_str(&names[0]),
+                ffi_str(&names[1]),
+            ]);
+            let columns = Box::new([
+                FfiColumnName {
+                    path: unsafe { FfiStringArray::new_unsafe(parent_path.as_slice()) },
+                },
+                FfiColumnName {
+                    path: unsafe { FfiStringArray::new_unsafe(literal_path.as_slice()) },
+                },
+                FfiColumnName {
+                    path: unsafe { FfiStringArray::new_unsafe(deep_path.as_slice()) },
+                },
+            ]);
+            ok_or_panic(unsafe {
+                create_table_txn_builder_with_clustering_columns(
+                    Box::new(builder).into(),
+                    FfiColumnNameArray::new_unsafe(columns.as_slice()),
+                    engine.shallow_copy(),
+                )
+            })
+        };
         build_and_commit(builder, &engine);
         let snapshot = Snapshot::builder_for(table_url).build(&test_engine)?;
         let infos = snapshot.get_clustering_column_infos(&test_engine)?.unwrap();
+        assert_eq!(infos.len(), 3);
         assert_eq!(
             infos[0].logical_column,
             ColumnName::new(["parent", "child"])
         );
-        assert_eq!(infos[1].logical_column, ColumnName::new(["literal.name"]));
-        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[1].logical_column, ColumnName::new(["parent.child"]));
+        assert_eq!(
+            infos[2].logical_column,
+            ColumnName::new(["grandgrandparent", "grandparent", "parent", "child"])
+        );
+        assert_eq!(infos[0].data_type, DataType::STRING);
+        assert_eq!(infos[1].data_type, DataType::INTEGER);
         for info in &infos {
             assert_eq!(info.physical_column != info.logical_column, column_mapping);
         }
@@ -3664,20 +3693,40 @@ mod tests {
     }
 
     #[rstest]
-    #[case::no_columns(vec![])]
-    #[case::empty_path(vec![vec![]])]
-    #[case::empty_segment(vec![vec![""]])]
-    #[case::missing_column(vec![vec!["missing"]])]
-    #[case::duplicate_column(vec![vec!["id"], vec!["id"]])]
-    fn test_create_table_clustering_column_paths_validate_at_build(#[case] paths: Vec<Vec<&str>>) {
+    #[case::no_columns(vec![], "Clustering requires at least one column")]
+    #[case::empty_path(vec![vec![]], "Column path cannot be empty")]
+    #[case::empty_segment(vec![vec![""]], "field '' not found in schema")]
+    #[case::missing_column(vec![vec!["missing"]], "field 'missing' not found in schema")]
+    #[case::duplicate_column(vec![vec!["id"], vec!["id"]], "Duplicate clustering column")]
+    #[case::dotted_not_split(
+        vec![vec!["parent.child"]],
+        "field 'parent.child' not found in schema"
+    )]
+    #[case::missing_nested_field(
+        vec![vec!["parent", "missing"]],
+        "field 'missing' not found in schema"
+    )]
+    #[case::traverse_primitive(
+        vec![vec!["id", "child"]],
+        "intermediate field 'id' is not a struct type"
+    )]
+    #[case::struct_as_leaf(vec![vec!["parent"]], "has unsupported type")]
+    #[case::duplicate_nested_path(
+        vec![vec!["parent", "child"], vec!["parent", "child"]],
+        "Duplicate clustering column"
+    )]
+    fn test_create_table_clustering_column_paths_validate_at_build(
+        #[case] paths: Vec<Vec<&str>>,
+        #[case] expected_message: &str,
+    ) {
         let (store, _test_engine, table_url) =
             test_utils::engine_store_setup("clustering_paths", None);
-        let (_, engine, builder) = create_table_txn_builder(
-            false,
-            &store,
-            &table_url,
-            vec![StructField::nullable("id", DataType::INTEGER)],
-        );
+        let engine = engine_handle_for_store(Arc::clone(&store));
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "parent": { nullable "child": STRING },
+        };
+        let builder = create_table(&table_url, schema, "test-engine/1.0", false);
         let paths: Vec<Vec<_>> = paths
             .iter()
             .map(|path| path.iter().map(|part| ffi_str(part)).collect())
@@ -3699,16 +3748,13 @@ mod tests {
         };
         let builder = ok_or_panic(unsafe {
             create_table_txn_builder_with_clustering_columns(
-                builder,
+                Box::new(builder).into(),
                 columns,
                 engine.shallow_copy(),
             )
         });
         let result = unsafe { create_table_txn_builder_build(builder, engine.shallow_copy()) };
-        assert!(matches!(result, ExternResult::Err(_)));
-        if let ExternResult::Err(error) = result {
-            unsafe { recover_error(error) };
-        }
+        assert_extern_result_error_contains(result, FFIKernelError::GenericError, expected_message);
         unsafe { free_engine(engine) };
     }
 
