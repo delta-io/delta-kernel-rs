@@ -404,13 +404,11 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// - Discover the generated columns of this transaction via [`Self::generated_columns`] and
     ///   parse each one's [`raw_sql`](GeneratedColumn::raw_sql) itself. The SQL refers to logical
     ///   column names.
+    /// - Compute each generated column from its expression when the write omits the column.
     /// - Make every written row, including its partition values, satisfy `(<value> <=> <generation
-    ///   expression>) IS TRUE` for each generated column. When you reuse files from an earlier
-    ///   commit attempt, for example after a conflict, check their rows against this transaction's
-    ///   generated columns, which can differ from the earlier attempt's. `<=>` is null-safe
-    ///   equality, so a `NULL` value matches a `NULL` expression result.
-    /// - Compute each generated column from its expression when the write omits the column, and
-    ///   reject a row whose supplied value doesn't match.
+    ///   expression>) IS TRUE` for each generated column. `<=>` is null-safe equality, so a `NULL`
+    ///   value matches a `NULL` expression result. This includes files written for an earlier
+    ///   commit attempt, such as one that conflicted, and validated against an older table version.
     ///
     /// The acknowledgement covers whatever this transaction commits. Without it,
     /// [`write_state`](Transaction::write_state) and [`commit`](Self::commit) fail whenever this

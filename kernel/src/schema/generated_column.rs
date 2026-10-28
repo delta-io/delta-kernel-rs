@@ -60,7 +60,7 @@ mod tests {
     };
 
     #[test]
-    fn collects_top_level_generated_columns_in_schema_order() {
+    fn collects_top_level_generated_columns_in_schema_order() -> KernelResult<()> {
         // Only top-level columns can be generated columns, so the expression on `details.nested`
         // defines no generated column.
         let schema = schema! {
@@ -76,7 +76,7 @@ mod tests {
             )),
         };
 
-        let generated_columns = collect_generated_columns(&schema).unwrap();
+        let generated_columns = collect_generated_columns(&schema)?;
 
         let column_pairs: Vec<_> = generated_columns
             .iter()
@@ -87,6 +87,7 @@ mod tests {
             ("event_date", "CAST(event_time AS DATE)"),
         ];
         assert_eq!(column_pairs, expected);
+        Ok(())
     }
 
     #[test]
