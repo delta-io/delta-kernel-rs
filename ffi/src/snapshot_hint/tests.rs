@@ -3,6 +3,7 @@ use std::error::Error as _;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+use delta_kernel::actions::Metadata;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::actions::{Add, LastManifestCommit};
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -269,6 +270,59 @@ unsafe fn with_minimal_hint(
         FfiSnapshotHintFreshness::Unverified,
     );
     unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) }
+}
+
+fn read_snapshot_metadata(snapshot: &Handle<SharedSnapshot>) -> Metadata {
+    extern "C" fn collect(context: NullableCvoid, metadata: *const FfiMetadata) {
+        let result = unsafe {
+            context
+                .unwrap()
+                .cast::<Option<KernelResult<Metadata>>>()
+                .as_mut()
+        };
+        *result = Some(unsafe { (*metadata).try_to_kernel() });
+    }
+    let mut result: Option<KernelResult<Metadata>> = None;
+    unsafe {
+        crate::snapshot_visit_metadata(
+            snapshot.shallow_copy(),
+            Some(NonNull::from(&mut result).cast()),
+            collect,
+        );
+    }
+    result.unwrap().unwrap()
+}
+
+#[test]
+fn metadata_visit_preserves_original_schema_json_and_does_not_consume_snapshot() {
+    let engine = test_engine();
+    let log_path = FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+        1,
+        1,
+    );
+    let mut hint = test_snapshot_hint(
+        std::slice::from_ref(&log_path),
+        0,
+        FfiSnapshotHintFreshness::Unverified,
+    );
+    hint.metadata.schema_string = slice("{ \"fields\" : [], \"type\" : \"struct\" }\n");
+    let expected = unsafe { hint.metadata.try_to_kernel() }.unwrap();
+    let builder = unsafe {
+        ok_or_panic(snapshot_builder_with_snapshot_hint(
+            test_builder(&engine),
+            &hint,
+        ))
+    };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let metadata = read_snapshot_metadata(&snapshot);
+    assert_eq!(metadata, expected);
+    assert_eq!(unsafe { snapshot.as_ref() }.version(), 0);
+    unsafe {
+        free_snapshot(snapshot);
+        free_engine(engine);
+    }
+    assert_eq!(metadata.schema_string(), expected.schema_string());
 }
 
 #[rstest::rstest]
@@ -1076,6 +1130,7 @@ fn typed_export_rejects_adaptive_crc_without_visiting_or_consuming_snapshot(
         unsafe { source.as_ref() }.crc_at_version().map(Arc::as_ref),
         Some(&expected_crc)
     );
+    assert_eq!(read_snapshot_metadata(&source), expected_crc.metadata);
     unsafe {
         crate::free_snapshot_builder(state.builder.take().unwrap());
         free_snapshot(source);

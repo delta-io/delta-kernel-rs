@@ -1,6 +1,6 @@
 //! Pre-commit validation of data staged on a [`Transaction`].
 //!
-//! [`Transaction`]: super::Transaction
+//! [`Transaction`]: crate::transaction::Transaction
 
 // TODO(#2869): Add the remaining write-side validations:
 // - No duplicate (path, DvId) across staged adds, removes, and matched DV files

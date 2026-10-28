@@ -91,7 +91,7 @@ pub(crate) fn list_delta_log_from_storage(
                 .is_none_or(may_begin_listable_log_path),
             Err(_) => true,
         })
-        .map(|meta| ParsedLogPath::try_from(meta?))
+        .map_ok(ParsedLogPath::new)
         // NOTE: this filters out .crc files etc which start with "." - some engines
         // produce `.something.parquet.crc` corresponding to `something.parquet`. Kernel
         // doesn't care about these files. Critically, note these are _different_ than

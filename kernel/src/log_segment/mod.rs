@@ -1731,7 +1731,7 @@ fn validate_compaction_files(compactions: &[ParsedLogPath]) -> KernelResult<()> 
 
 fn validate_log_path_fields(listed_files: &LogSegmentFiles) -> KernelResult<()> {
     for path in listed_files.iter_all_paths() {
-        let reparsed = ParsedLogPath::try_from(path.location.clone())?
+        let reparsed = ParsedLogPath::new(path.location.clone())
             .ok_or_else(|| KernelError::invalid_log_path(path.location.location.as_str()))?;
         require!(
             reparsed == *path,
