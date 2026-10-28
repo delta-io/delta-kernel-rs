@@ -508,6 +508,12 @@ pub enum KernelError {
         actual: &'static str,
     },
 
+    /// An [`Assert`](crate::plans::ir::nodes::Assert) predicate evaluated to FALSE or NULL for an
+    /// input row, during declarative plan execution.
+    #[cfg(feature = "declarative-plans")]
+    #[error("Plan assertion failed: predicate evaluated to FALSE or NULL")]
+    PlanAssertionFailed,
+
     /// The operation was cancelled via a [`CancellationToken`](crate::CancellationToken).
     ///
     /// Surfaced by cancellation-aware operations when a cancellation is detected. See the

@@ -43,6 +43,7 @@ pub enum Operator {
     // === Unary operators (1 input) ===========================================
     Project(Project),
     Filter(Filter),
+    Assert(Assert),
     DynamicScan(DynamicScan),
     Aggregate(Aggregate),
     PrefixSum(PrefixSum),
@@ -53,6 +54,14 @@ pub enum Operator {
     // === N-ary operators (variable inputs) ===================================
     UnionAll(UnionAll),
     WriteJson(WriteJson),
+}
+
+impl Operator {
+    /// Whether this operator produces side effects during execution, requiring execution even
+    /// when its output is unused or empty.
+    pub(crate) const fn has_side_effects(&self) -> bool {
+        matches!(self, Self::Assert(_) | Self::WriteJson(_))
+    }
 }
 
 /// Output schema of [`WriteJson`]: the file's fully qualified `location`,
@@ -443,6 +452,19 @@ pub struct Project {
 /// Output schema is the input schema unchanged.
 #[derive(Debug, Clone)]
 pub struct Filter {
+    pub predicate: PredicateRef,
+}
+
+/// Requires `predicate` to evaluate to TRUE for every input row.
+/// If predicate evaluation yields FALSE or NULL for a row, execution fails with
+/// [`KernelError::PlanAssertionFailed`].
+///
+/// Input rows and schema are forwarded unchanged; empty inputs always satisfy the assertion.
+/// Executors must check every input row even when downstream operators discard the output.
+// TODO(#3742): Improve error design so that we can map assertion failures to user facing errors.
+#[derive(Debug, Clone)]
+pub struct Assert {
+    /// Predicate evaluated against the input schema.
     pub predicate: PredicateRef,
 }
 
