@@ -43,8 +43,6 @@ use crate::schema::{
 use crate::utils::require;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::EngineData;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::KernelResultIteratorStatic;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
 use crate::{
@@ -965,8 +963,7 @@ impl LogSegment {
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         stats_schema: Option<&StructType>,
-        cancellation_token: Option<&CancellationTokenRef>,
-    ) -> KernelResult<ActionsWithCheckpointInfo<KernelResultIteratorStatic<ActionsBatch>>> {
+    ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         let version = Version::try_from(checkpoint.version())
             .ok()
             .filter(|v| *v <= self.end_version)
@@ -1000,7 +997,6 @@ impl LogSegment {
             engine,
             &self.find_commit_cover_after(Some(version)),
             commit_read_schema,
-            cancellation_token,
         )?;
         let stats_fallback =
             needs_json_stats_fallback(&checkpoint_read_schema, stats_schema, false)
@@ -1015,7 +1011,6 @@ impl LogSegment {
             checkpoint,
             &LogRoot::new(table_root.clone())?,
             checkpoint_read_schema.clone(),
-            cancellation_token,
         )?;
         Ok(ActionsWithCheckpointInfo {
             actions: Box::new(commits.chain(checkpoint_actions)),
