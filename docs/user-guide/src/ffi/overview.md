@@ -158,21 +158,11 @@ partition columns without building a scan.
 | `get_app_id_version` | Look up the last committed transaction version for an `app_id` (the read side of [idempotent writes](../writing/idempotent_writes.md)) |
 | `free_schema` | Release a schema handle |
 
-`snapshot_visit_protocol` replaces `snapshot_get_protocol`, `visit_protocol`, and
-`free_protocol`. Those functions and the `SharedProtocol` handle are removed, so
-connectors using them must migrate and rebuild. Read both minimum versions and
-the optional feature lists from `FfiProtocol` in one callback. The lists preserve
-the distinction between absent and present but empty.
-
-The protocol view and its nested arrays and strings are borrowed until the
-callback returns. Copy any data you retain, including data you need after
-releasing the snapshot. Don't free the borrowed data. The accessor doesn't
-consume the snapshot; you still release it with `free_snapshot`.
-
 **Schema and string-map visitors**
 
-Use these callbacks to materialize schemas and inspect scan-metadata partition
-values in your engine's own representation.
+Kernel exposes schemas, protocols, and metadata through visitor callbacks so
+the engine can materialize them into its own types without Kernel allocating
+engine-owned memory.
 
 | Function | Purpose |
 |----------|---------|

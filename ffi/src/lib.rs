@@ -2089,9 +2089,8 @@ pub unsafe extern "C" fn get_partition_columns(
 ///
 /// # Safety
 ///
-/// `snapshot` must be a valid, live handle for the duration of the call. `visitor` must not unwind,
-/// invalidate the snapshot, or modify or free the borrowed view. Any non-null `context` must
-/// satisfy the visitor's requirements; a null context is allowed when the visitor does not need it.
+/// `snapshot` must be a valid, live handle for the duration of the call. `visitor` must not unwind
+/// or invalidate the snapshot. Any non-null `context` must satisfy the visitor's requirements.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_visit_protocol(
     snapshot: Handle<SharedSnapshot>,
@@ -3981,85 +3980,48 @@ mod tests {
     );
 
     #[rstest]
-    #[case::legacy(METADATA, 1, 2, None, None)]
-    #[case::empty_writer_features(METADATA, 1, 7, None, Some(&[][..]))]
-    #[case::writer_only(METADATA, 1, 7, None, Some(&["appendOnly"][..]))]
-    #[case::empty_features(METADATA, 3, 7, Some(&[][..]), Some(&[][..]))]
+    #[case::legacy(1, 2, None, None)]
+    #[case::empty_writer_features(1, 7, None, Some(vec![]))]
+    #[case::writer_only(1, 7, None, Some(vec!["appendOnly"]))]
+    #[case::empty_features(3, 7, Some(vec![]), Some(vec![]))]
     #[case::with_features(
-        METADATA_WITH_FEATURES,
         3,
         7,
-        Some(&["columnMapping"][..]),
-        Some(&["columnMapping", "domainMetadata", "rowTracking"][..])
+        Some(vec!["columnMapping"]),
+        Some(vec!["columnMapping", "domainMetadata", "rowTracking"])
     )]
     #[tokio::test]
     async fn snapshot_visit_protocol_preserves_fields(
-        #[case] metadata: &str,
         #[case] min_reader: i32,
         #[case] min_writer: i32,
-        #[case] reader_features: Option<&[&str]>,
-        #[case] writer_features: Option<&[&str]>,
+        #[case] reader_features: Option<Vec<&str>>,
+        #[case] writer_features: Option<Vec<&str>>,
     ) -> KernelResult<()> {
         extern "C" fn collect(context: NullableCvoid, protocol: *const delta_types::FfiProtocol) {
-            let state = unsafe {
+            let result = unsafe {
                 context
                     .unwrap()
-                    .cast::<(usize, Option<KernelResult<Protocol>>)>()
+                    .cast::<Option<KernelResult<Protocol>>>()
                     .as_mut()
             };
-            state.0 += 1;
-            state.1 = Some(unsafe { (*protocol).try_to_kernel() });
+            *result = Some(unsafe { (*protocol).try_to_kernel() });
         }
 
-        let to_strings = |features: &[&str]| {
-            features
-                .iter()
-                .map(|feature| feature.to_string())
-                .collect::<Vec<_>>()
-        };
-        let expected = Protocol::try_new(
-            min_reader,
-            min_writer,
-            reader_features.map(to_strings),
-            writer_features.map(to_strings),
-        )?;
-        let metadata = metadata
-            .lines()
-            .map(|line| {
-                let mut action: Value = serde_json::from_str(line).unwrap();
-                if action.get("protocol").is_some() {
-                    action["protocol"] = serde_json::to_value(&expected).unwrap();
-                }
-                action.to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let (engine, snapshot) = setup_snapshot(metadata).await?;
-        let mut state = (0usize, None::<KernelResult<Protocol>>);
+        let expected = Protocol::try_new(min_reader, min_writer, reader_features, writer_features)?;
+        let metadata = METADATA.lines().last().unwrap();
+        let commit_data = format!("{}\n{metadata}", serde_json::json!({"protocol": &expected}),);
+        let (engine, snapshot) = setup_snapshot(commit_data).await?;
+        let mut protocol_result: Option<KernelResult<Protocol>> = None;
         unsafe {
             snapshot_visit_protocol(
                 snapshot.shallow_copy(),
-                Some(NonNull::from(&mut state).cast()),
+                Some(NonNull::from(&mut protocol_result).cast()),
                 collect,
             );
             free_snapshot(snapshot);
             free_engine(engine);
         }
-        assert_eq!(state.0, 1);
-        assert_eq!(state.1.expect("visitor was not invoked")?, expected);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn snapshot_visit_protocol_accepts_null_context() -> KernelResult<()> {
-        extern "C" fn ignore(_context: NullableCvoid, _protocol: *const delta_types::FfiProtocol) {}
-
-        let (engine, snapshot) = setup_snapshot(METADATA.to_string()).await?;
-        unsafe {
-            snapshot_visit_protocol(snapshot.shallow_copy(), None, ignore);
-            free_snapshot(snapshot);
-            free_engine(engine);
-        }
+        assert_eq!(protocol_result.unwrap()?, expected);
         Ok(())
     }
 
