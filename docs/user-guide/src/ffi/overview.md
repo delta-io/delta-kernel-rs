@@ -160,7 +160,7 @@ partition columns without building a scan.
 
 **Schema and string-map visitors**
 
-Kernel exposes schemas, protocols, and metadata through visitor callbacks so
+Kernel exposes schemas and string maps through visitor callbacks so
 the engine can materialize them into its own types without Kernel allocating
 engine-owned memory.
 

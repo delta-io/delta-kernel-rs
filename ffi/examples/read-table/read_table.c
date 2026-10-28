@@ -494,6 +494,7 @@ int main(int argc, char* argv[])
       print_metadata_only = true;
       break;
     case 'p':
+      // Print the snapshot protocol visited by snapshot_visit_protocol, then exit without scanning.
       print_protocol_only = true;
       break;
     case 's':
