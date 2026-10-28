@@ -389,7 +389,9 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 /// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values and
 /// table root from the provided [`BoundWriteContext`].
 ///
-/// Paths in the returned Add action metadata are stored relative to the table root.
+/// Paths in the returned Add action metadata are stored relative to the table root. When
+/// [`BoundWriteContext::should_write_tight_stats`] is set, the statistics gain a `tightStats` field
+/// matching `tightBounds`.
 ///
 /// This is the public API for building Add action metadata from file write results. Custom
 /// Arrow-based engines that write parquet files themselves (bypassing
@@ -403,6 +405,11 @@ pub fn build_add_file_metadata(
     write_context: &BoundWriteContext,
 ) -> KernelResult<Box<dyn EngineData>> {
     let add_path = write_context.resolve_file_path(file_metadata.location())?;
+    let file_metadata = if write_context.should_write_tight_stats() {
+        file_metadata.with_tight_stats()?
+    } else {
+        file_metadata
+    };
     file_metadata.as_record_batch(write_context.physical_partition_values(), &add_path)
 }
 
