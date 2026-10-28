@@ -5,6 +5,8 @@ use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
+use crate::utils::current_time_ms;
+
 use tracing::instrument;
 use update_table::{intermediate_dv_schema, new_dv_column_schema};
 
@@ -99,8 +101,11 @@ impl<STATE> Transaction<STATE, Imperative> {
         ),
         err
     )]
-    pub fn commit(self, engine: &dyn Engine) -> KernelResult<CommitResult<STATE>> {
+    pub fn commit(mut self, engine: &dyn Engine) -> KernelResult<CommitResult<STATE>> {
         let commit_start = Instant::now();
+        // The protocol bases the in-commit timestamp on the time of the commit attempt, so
+        // sample the clock here instead of keeping the time the transaction was built.
+        self.set_commit_timestamp(current_time_ms()?);
 
         // === Pre-commit validation ===
         self.validate_operation_compatibility()?;
