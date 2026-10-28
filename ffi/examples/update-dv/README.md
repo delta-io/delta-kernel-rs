@@ -43,42 +43,59 @@ The table must have the `deletionVectors` reader/writer feature and
 `delta.enableDeletionVectors=true`. The example does not write the DV file itself; it only
 installs the descriptor and lets the kernel stage the matching remove/add action pair.
 
-# Kernel-authored DV files
+# Kernel DV serialization
 
-Connectors can use `write_deletion_vectors` instead of serializing DV files themselves.
-It accepts a borrowed `FfiSlice<FfiDeletionVectorUpdate>` with one entry per active file:
-the exact Add-action path and a borrowed slice of physical row indexes. Indexes are
-zero-based across the whole file. Duplicate indexes within an entry are deduplicated;
-duplicate file entries are rejected.
+The FFI exposes the lifecycle of Rust's `StreamingDeletionVectorWriter`:
 
-Start an existing-table transaction with
-`new_update_table_txn_builder(snapshot, operation, engine_info, data_change, engine)`
-from the snapshot used to resolve physical row locations. Supply the operation and
-connector engine information at construction, with `data_change = true` for row
-changes, then build with `update_table_txn_builder_build`.
-Supply that snapshot and a bound write context from the same transaction to
-`write_deletion_vectors`.
-The function reads snapshot file metadata once, validates all requested locations,
-preserves each existing DV, and uploads one Kernel-serialized DV file containing the
-batch's vectors using the Engine's storage handler. The vectors are prepared in memory;
-each descriptor identifies its own offset in the shared file. It does not open the
-business Parquet files, modify a transaction, or commit anything.
+```text
+writer = new_dv_writer(output, allocate_error)
+a = dv_writer_write(&writer, complete_deleted_rows_for_a, allocate_error)
+b = dv_writer_write(&writer, complete_deleted_rows_for_b, allocate_error)
+dv_writer_finalize(writer, allocate_error)
+```
 
-The returned descriptor map is owned by the caller. Pass it to
-`update_table_txn_update_deletion_vectors` together with a metadata iterator from the same
-snapshot. Stage new-file metadata with `update_table_txn_add_files` on that transaction
-and call `update_table_txn_commit` once. If preparation is abandoned, release the map
-with `free_dv_descriptor_map`.
-The snapshot, write context, engine, and all input slices remain caller-owned.
+Create one writer per desired output file. Repeated writes put independent vectors
+in a shared output, each with its own offset. Create separate writers for separate
+outputs. Each write returns `FfiDvWriteResult` with `offset`, `size_in_bytes`, and
+`cardinality`; it does not create a descriptor or choose a path.
 
-An empty batch returns an empty map without uploading files. Missing files, unsupported
-DV features, missing `numRecords`, and out-of-bounds indexes fail explicitly. Input
-validation, including reading and validating all existing DVs, finishes before upload.
-A validation or serialization failure therefore uploads no DV file. An upload failure
-can still leave an uncommitted DV file. Do not treat that file as published or delete
-it while another operation could still use it; apply the connector's safe
-orphan-retention policy.
+Each row-index slice is the **complete** vector, including previous deletions, not
+just newly deleted indexes. Indexes are zero-based physical row ordinals across the
+whole data file. Unsorted indexes and duplicates are accepted and deduplicated.
+An empty slice, including `{NULL, 0}`, serializes an empty vector.
 
-After a commit conflict, load a fresh snapshot and resolve physical row locations again.
-Reusing a descriptor map built against stale file locations can invalidate the wrong
-rows after compaction.
+## Output ownership and errors
+
+`FfiDvWriterOutput` contains a caller-owned context and write/flush callbacks.
+Keep this record at a stable address, exclusively borrowed by the writer, until
+finalization or `free_dv_writer`. The callbacks run synchronously. Write receives
+borrowed bytes and returns the number accepted; partial writes are retried. Flush
+must return success. Callbacks report failures with `EngineExecResult` using the
+existing Rust-owned error-message convention.
+
+The serializer requires no Engine. Each entry point uses the supplied error
+allocator for its FFI result. The host retains ownership of the output and context.
+Callbacks must not unwind or re-enter the same writer. If the handle moves between
+threads, the output must support those sequential calls.
+
+`dv_writer_finalize` consumes the handle on success or error. `free_dv_writer`
+abandons it without flushing. Invalid input is rejected without changing the
+writer; serialization or output failures make it unusable. Abandon failed output
+rather than retrying into a potentially partially written stream. The serializer
+does not upload, publish, or clean up that output.
+
+## Connector responsibilities
+
+Snapshot lookup, file/row validation, existing-DV reads and merging, path generation,
+and upload remain outside serialization. For example, `{1, 3}` from an existing DV
+plus new deletions `{7}` must be supplied as `{1, 3, 7}`.
+
+After finalization, use the write results and the caller-selected output paths to
+build descriptors with `dv_descriptor_new`, then insert them into a descriptor map.
+Use Kernel-generated DV paths where appropriate; do not reimplement path encoding.
+The existing update-table transaction API can stage that map together with new-file
+metadata and commit once. Resolving locations, merging prior DVs, and staging updates
+must use the same snapshot. On conflict, load a fresh snapshot and resolve again.
+
+This separation leaves file grouping, upload, and transaction policy under the
+connector's control while Kernel remains responsible for the binary DV format.

@@ -1,911 +1,631 @@
-//! Prepare connector-requested deletion vectors without implementing their storage format.
+//! FFI lifecycle for Kernel's deletion-vector serializer and caller-owned output.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::io::{self, Write};
 
 use delta_kernel::actions::deletion_vector_writer::{
-    KernelDeletionVector, StreamingDeletionVectorWriter,
+    DeletionVectorWriteResult, KernelDeletionVector, StreamingDeletionVectorWriter,
 };
-use delta_kernel::scan::state::ScanFile;
-use delta_kernel::snapshot::Snapshot;
-use delta_kernel::table_features::{Operation, TableFeature};
-use delta_kernel::transaction::BoundWriteContext;
-use delta_kernel::{Engine, KernelError, KernelResult};
+use delta_kernel::{KernelError, KernelResult};
+use delta_kernel_ffi_macros::handle_descriptor;
 
-use super::deletion_vector::{DvDescriptorMap, ExclusiveDvDescriptorMap};
-use super::write_context::SharedWriteContext;
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::{AllocateErrorFn, EngineExecResult, ExternResult, IntoExternResult};
 use crate::handle::Handle;
-use crate::{FfiSlice, KernelStringSlice, SharedExternEngine, SharedSnapshot, TryFromStringSlice};
+use crate::{FfiSlice, KernelBytesSlice, NullableCvoid};
 
-/// Deleted physical row indexes grouped under one active data-file path.
+/// Writes some or all of `bytes` to the caller's output.
+///
+/// The byte slice is borrowed for this callback only. Set `out` to `Success(n)` with
+/// `0 <= n <= bytes.len`, or `Failure` with a Rust-owned error message. Partial writes are retried.
+/// Kernel initializes `out` to `Uninit`; leaving it unchanged is an error. A null callback is
+/// rejected by `new_dv_writer`.
+pub type DvWriteFn = Option<
+    unsafe extern "C" fn(
+        context: NullableCvoid,
+        bytes: KernelBytesSlice,
+        out: *mut EngineExecResult<usize>,
+    ),
+>;
+
+/// Flushes the caller's output, setting `out` to `Success(true)` or `Failure`.
+///
+/// Kernel initializes `out` to `Uninit`. `Success(false)` or an unchanged result is an error.
+/// A null callback is rejected by `new_dv_writer`.
+pub type DvFlushFn =
+    Option<unsafe extern "C" fn(context: NullableCvoid, out: *mut EngineExecResult<bool>)>;
+
+/// Caller-owned output borrowed by a DV writer until it is finalized or freed.
+///
+/// The record must stay at the same address and must not be accessed, modified, or passed to
+/// another writer during that borrow. Callbacks run synchronously on the thread making the FFI
+/// call. Their context may be null for stateless callbacks. Kernel never frees the record or
+/// context. The callbacks and context must support sequential calls from any thread to which the
+/// writer is moved, and must not unwind or re-enter the same writer.
 #[repr(C)]
-pub struct FfiDeletionVectorUpdate {
-    /// URI-encoded path exactly as recorded in the snapshot's Add action.
-    pub data_file_path: KernelStringSlice,
-    /// Zero-based row ordinals across the entire Parquet file, not within a row group.
-    /// Duplicate indexes are accepted; an empty slice is rejected.
-    pub row_indexes: FfiSlice<u64>,
+pub struct FfiDvWriterOutput {
+    /// Opaque caller-owned callback state, borrowed for the writer's lifetime.
+    pub context: NullableCvoid,
+    /// Required output write callback.
+    pub write: DvWriteFn,
+    /// Required output flush callback.
+    pub flush: DvFlushFn,
 }
 
-/// Write on-disk deletion vectors for a bounded batch of active files.
+// The private adapter is layout-identical to the caller's record. Only new_dv_writer constructs its
+// borrow, after imposing the callback/lifetime contract; the public record exposes no safe I/O API.
+#[repr(transparent)]
+struct BorrowedDvOutput(FfiDvWriterOutput);
+
+// SAFETY: new_dv_writer requires callbacks and context to support sequential calls across threads.
+unsafe impl Send for BorrowedDvOutput {}
+
+/// Owns the serializer state while exclusively borrowing its caller-owned output.
+pub struct DvWriter {
+    writer: StreamingDeletionVectorWriter<'static, BorrowedDvOutput>,
+    failed: bool,
+}
+
+/// Exclusive DV writer handle. Finalize it, or abandon it with `free_dv_writer`.
+#[handle_descriptor(target=DvWriter, mutable=true, sized=true)]
+pub struct ExclusiveDvWriter;
+
+/// The offset, serialized size, and cardinality returned for one complete deletion vector.
 ///
-/// `snapshot` supplies active-file metadata and existing DVs. `write_context` generates DV paths
-/// under that same table root. `updates` supplies one entry per file. `engine` performs the I/O
-/// and allocates errors. The operation reads snapshot metadata once and merges each file's existing
-/// deleted indexes with the requested indexes. It does not read or rewrite business Parquet data.
+/// Combine these fields with the caller-selected output path to construct a DV descriptor.
+#[repr(C)]
+#[derive(Debug, PartialEq, Eq)]
+pub struct FfiDvWriteResult {
+    /// Offset of this DV's size prefix within its output file.
+    pub offset: i32,
+    /// Serialized DV size, excluding the size prefix and checksum.
+    pub size_in_bytes: i32,
+    /// Number of distinct deleted physical row indexes.
+    pub cardinality: i64,
+}
+
+/// Creates a serializer borrowing `output`; does not write or upload anything.
 ///
-/// The write context and the transaction receiving the returned map must come from `snapshot`.
-/// Only table-root equality is checked here; snapshot consistency is the connector's
-/// responsibility.
-///
-/// Returns an owned descriptor map. Pass it to `update_table_txn_update_deletion_vectors` with a
-/// metadata iterator from the same snapshot, or release it with `free_dv_descriptor_map`.
-/// All merged vectors are prepared in memory and serialized into one shared DV file before upload.
-/// No actions are staged or committed. An empty batch returns an empty map without uploading a
-/// file.
+/// Create one writer per desired output file. Write one or more complete vectors with
+/// `dv_writer_write`, then consume the handle with `dv_writer_finalize`. To abandon an output,
+/// consume it with `free_dv_writer` instead. Neither operation frees the caller's output.
+/// `allocate_error` allocates errors for this standalone serializer call; no Engine is required.
 ///
 /// # Errors
-///
-/// Returns an error for unsupported/disabled DVs, mismatched table roots, duplicate or inactive
-/// paths, missing physical row counts, invalid row indexes, malformed input, or storage failures.
-/// Input paths, requested indexes, and all existing DVs are validated before upload. A failed
-/// upload can leave an uncommitted DV file; the connector must retain it until safe orphan cleanup.
-/// No partially prepared map is returned on error.
+/// Returns an error if `output` is null or either callback is missing.
 ///
 /// # Safety
-///
-/// All handles are borrowed and must be valid. The update slice, its UTF-8 strings, and its
-/// row-index slices must be aligned,
-/// initialized, readable, and remain valid for this call. Null slice pointers are valid only for
-/// zero lengths. Kernel does not retain any input memory after returning.
+/// A non-null `output` must be aligned, initialized, and exclusively available. On success, its
+/// address, callbacks, and context must remain valid until the returned handle is finalized or
+/// freed, following `FfiDvWriterOutput`'s lifetime and threading contract. On error no borrow is
+/// retained. The error allocator must be valid for this call.
 #[no_mangle]
-pub unsafe extern "C" fn write_deletion_vectors(
-    snapshot: Handle<SharedSnapshot>,
-    write_context: Handle<SharedWriteContext>,
-    updates: FfiSlice<FfiDeletionVectorUpdate>,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<ExclusiveDvDescriptorMap>> {
-    let engine = unsafe { engine.as_ref() };
-    let result = (|| {
-        let updates = unsafe { updates.try_as_slice() }?;
-        let updates = unsafe { decode_updates(updates) }?;
-        let snapshot = unsafe { snapshot.clone_as_arc() };
-        let context = unsafe { write_context.as_ref() };
-        write_deletion_vectors_impl(snapshot, context, updates, engine.engine().as_ref())
-            .map(|map| Box::new(map).into())
-    })();
-    result.into_extern_result(&engine)
-}
-
-struct RequestedFiles<'a> {
-    indexes: HashMap<&'a str, &'a [u64]>,
-    files: HashMap<String, ScanFile>,
-    duplicate: Option<String>,
-}
-
-unsafe fn decode_updates(
-    updates: &[FfiDeletionVectorUpdate],
-) -> KernelResult<HashMap<&str, &[u64]>> {
-    let mut requests = HashMap::with_capacity(updates.len());
-    for update in updates {
-        if update.data_file_path.len == 0 || update.row_indexes.len == 0 {
+pub unsafe extern "C" fn new_dv_writer(
+    output: *mut FfiDvWriterOutput,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<Handle<ExclusiveDvWriter>> {
+    let result: KernelResult<_> = (|| {
+        // SAFETY: the transparent adapter has the same layout as the caller-owned output record.
+        let output = unsafe { output.cast::<BorrowedDvOutput>().as_mut() }
+            .ok_or_else(|| KernelError::generic("DV writer output must not be null"))?;
+        if output.0.write.is_none() || output.0.flush.is_none() {
             return Err(KernelError::generic(
-                "DV update paths and row-index slices must be nonempty",
+                "DV writer requires write and flush callbacks",
             ));
         }
-        let path: &str = unsafe { TryFromStringSlice::try_from_slice(&update.data_file_path) }?;
-        let indexes = unsafe { update.row_indexes.try_as_slice() }?;
-        if requests.insert(path, indexes).is_some() {
-            return Err(KernelError::generic(format!(
-                "duplicate DV update path: {path}"
-            )));
-        }
-    }
-    Ok(requests)
-}
-
-fn write_deletion_vectors_impl(
-    snapshot: Arc<Snapshot>,
-    context: &BoundWriteContext,
-    indexes: HashMap<&str, &[u64]>,
-    engine: &dyn Engine,
-) -> KernelResult<DvDescriptorMap> {
-    if snapshot.table_root() != context.table_root_dir() {
-        return Err(KernelError::generic(
-            "DV snapshot and write context have different table roots",
-        ));
-    }
-    let configuration = snapshot.table_configuration();
-    configuration.ensure_operation_supported(Operation::Write)?;
-    if !configuration.is_feature_enabled(&TableFeature::DeletionVectors) {
-        return Err(KernelError::generic(
-            "DV writes require deletionVectors features and delta.enableDeletionVectors=true",
-        ));
-    }
-
-    let mut map = DvDescriptorMap {
-        inner: HashMap::with_capacity(indexes.len()),
-    };
-    if indexes.is_empty() {
-        return Ok(map);
-    }
-    let scan = snapshot.clone().scan_builder().build()?;
-    let mut requested = RequestedFiles {
-        indexes,
-        files: HashMap::new(),
-        duplicate: None,
-    };
-    for metadata in scan.scan_metadata(engine)? {
-        requested = metadata?.visit_scan_files(requested, select_file)?;
-    }
-    if let Some(path) = requested.duplicate {
-        return Err(KernelError::generic(format!(
-            "multiple active DV file instances: {path}"
-        )));
-    }
-
-    for (path, indexes) in &requested.indexes {
-        let file = requested.files.get(*path).ok_or_else(|| {
-            KernelError::generic(format!(
-                "DV data file is not active in the snapshot: {path}"
-            ))
-        })?;
-        validate_rows(path, indexes, physical_row_count(file)?)?;
-    }
-
-    let mut prepared = Vec::with_capacity(requested.indexes.len());
-    for (path, indexes) in requested.indexes {
-        let file = requested
-            .files
-            .get(path)
-            .ok_or_else(|| KernelError::internal_error("validated DV file metadata is missing"))?;
-        let mut dv = KernelDeletionVector::new();
-        if let Some(previous) = file
-            .dv_info
-            .get_row_indexes(engine, snapshot.table_root())?
-        {
-            if file.dv_info.cardinality()? != Some(previous.len() as u64) {
-                return Err(KernelError::deletion_vector(format!(
-                    "existing DV cardinality does not match its decoded indexes for {path}",
-                )));
-            }
-            validate_rows(path, &previous, physical_row_count(file)?)?;
-            dv.add_deleted_row_indexes(previous);
-        }
-        dv.add_deleted_row_indexes(indexes);
-        prepared.push((path, dv));
-    }
-
-    let dv_path = context.new_deletion_vector_path(String::new());
-    let mut bytes = Vec::new();
-    let mut writer = StreamingDeletionVectorWriter::new(&mut bytes);
-    for (path, dv) in prepared {
-        let result = writer.write_deletion_vector(dv)?;
-        map.inner
-            .insert(path.to_owned(), result.to_descriptor(&dv_path));
-    }
-    writer.finalize()?;
-    engine
-        .storage_handler()
-        .put(&dv_path.absolute_path()?, bytes.into(), false)?;
-    Ok(map)
-}
-
-fn select_file(requested: &mut RequestedFiles<'_>, file: ScanFile) {
-    if requested.indexes.contains_key(file.path.as_str()) {
-        let path = file.path.clone();
-        if requested.files.insert(path.clone(), file).is_some() {
-            requested.duplicate = Some(path);
-        }
-    }
-}
-
-fn physical_row_count(file: &ScanFile) -> KernelResult<u64> {
-    file.stats
-        .as_ref()
-        .map(|stats| stats.num_records)
-        .ok_or_else(|| {
-            KernelError::generic(format!(
-                "DV data file has no numRecords statistic: {}",
-                file.path
-            ))
+        // SAFETY: the FFI caller keeps this exclusive borrow alive until finalize/free consumes it.
+        let writer = StreamingDeletionVectorWriter::new(output);
+        Ok(Box::new(DvWriter {
+            writer,
+            failed: false,
         })
+        .into())
+    })();
+    result.into_extern_result(&allocate_error)
 }
 
-fn validate_rows(path: &str, rows: &[u64], num_records: u64) -> KernelResult<()> {
-    if let Some(index) = rows.iter().find(|index| **index >= num_records) {
-        return Err(KernelError::generic(format!(
-            "DV row index {index} is outside physical row count {num_records} for {path}",
-        )));
-    }
-    Ok(())
+/// Serializes one complete vector, returning its offset, size, and cardinality.
+///
+/// `deleted_rows` contains all deleted physical row indexes for that vector, including previous
+/// deletions. The serializer neither reads nor merges an existing vector. Input order is
+/// unrestricted; duplicate indexes are deduplicated and an empty slice represents an empty DV.
+/// Each call appends an independent vector to this writer's output.
+///
+/// # Errors
+/// Returns an error for a null writer pointer, malformed input, serialization/output failure, or
+/// a writer already failed by such an error. Malformed input does not change the writer. After a
+/// serialization/output failure, abandon the output and free the handle; it cannot be resumed.
+///
+/// # Safety
+/// A non-null `writer` must point to a valid, exclusively borrowed handle. For nonzero length,
+/// `deleted_rows` must address that many aligned, initialized u64 values, readable for this call.
+/// A zero-length slice may have a null pointer. The output's lifetime/threading contract continues
+/// to apply. Callbacks and the error allocator must be valid; no input rows are retained.
+#[no_mangle]
+pub unsafe extern "C" fn dv_writer_write(
+    writer: *mut Handle<ExclusiveDvWriter>,
+    deleted_rows: FfiSlice<u64>,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<FfiDvWriteResult> {
+    let result: KernelResult<_> = (|| {
+        let handle = unsafe { writer.as_mut() }
+            .ok_or_else(|| KernelError::generic("DV writer pointer must not be null"))?;
+        let writer = unsafe { handle.as_mut() };
+        if writer.failed {
+            return Err(KernelError::invalid_transaction_state(
+                "DV writer has failed",
+            ));
+        }
+        let rows = unsafe { deleted_rows.try_as_slice() }?;
+        let mut dv = KernelDeletionVector::new();
+        dv.add_deleted_row_indexes(rows);
+        let result = writer.writer.write_deletion_vector(dv);
+        writer.failed = result.is_err();
+        result.map(FfiDvWriteResult::from)
+    })();
+    result.into_extern_result(&allocate_error)
 }
 
-#[cfg(all(test, feature = "default-engine-base"))]
-mod tests {
-    use std::ptr;
-
-    use delta_kernel::arrow::array::Int32Array;
-    use delta_kernel::arrow::record_batch::RecordBatch;
-    use delta_kernel::committer::FileSystemCommitter;
-    use delta_kernel::object_store::path::Path;
-    use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
-    use delta_kernel::parquet::file::properties::WriterProperties;
-    use delta_kernel::schema::schema_ref;
-    use delta_kernel::transaction::create_table::create_table;
-    use delta_kernel::transaction::UpdateTableOperation;
-    use delta_kernel_default_engine::DefaultEngineBuilder;
-    use rstest::rstest;
-    use test_utils::{
-        create_add_files_metadata, engine_store_setup, into_record_batch, record_batch_to_bytes,
-        record_batch_to_bytes_with_props,
+/// Finalizes and consumes the writer, flushing its output.
+///
+/// The handle is consumed on both success and error. The caller may release its output record
+/// and context after this call returns. No upload or transaction commit is performed.
+///
+/// # Errors
+/// Returns an error if a prior serialization/output operation failed or flushing fails.
+///
+/// # Safety
+/// `writer` must be a valid owned handle, and its output must still satisfy its lifetime/threading
+/// contract. Do not use or free the handle again. The error allocator must be valid for this call.
+#[no_mangle]
+pub unsafe extern "C" fn dv_writer_finalize(
+    writer: Handle<ExclusiveDvWriter>,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<bool> {
+    let writer = unsafe { writer.into_inner() };
+    let result = if writer.failed {
+        Err(KernelError::invalid_transaction_state(
+            "DV writer has failed",
+        ))
+    } else {
+        writer.writer.finalize()
     };
+    result.map(|()| true).into_extern_result(&allocate_error)
+}
+
+/// Abandons and consumes a writer without flushing or freeing its caller-owned output.
+///
+/// Any bytes already written are incomplete/unpublished output; cleanup is the caller's
+/// responsibility. After this call the caller may release the output record and context.
+///
+/// # Safety
+/// `writer` must be a valid owned handle and the borrowed output must still be valid. Do not use
+/// or free the handle again.
+#[no_mangle]
+pub unsafe extern "C" fn free_dv_writer(writer: Handle<ExclusiveDvWriter>) {
+    writer.drop_handle();
+}
+
+impl From<DeletionVectorWriteResult> for FfiDvWriteResult {
+    fn from(result: DeletionVectorWriteResult) -> Self {
+        Self {
+            offset: result.offset,
+            size_in_bytes: result.size_in_bytes,
+            cardinality: result.cardinality,
+        }
+    }
+}
+
+impl Write for BorrowedDvOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let callback = self
+            .0
+            .write
+            .ok_or_else(|| io::Error::other("missing DV write callback"))?;
+        let mut result = EngineExecResult::Uninit;
+        unsafe {
+            callback(
+                self.0.context,
+                KernelBytesSlice::new_unsafe(bytes),
+                &mut result,
+            );
+        }
+        match result {
+            EngineExecResult::Success(count) if count <= bytes.len() => Ok(count),
+            EngineExecResult::Success(_) => Err(io::Error::other("DV write count exceeds input")),
+            EngineExecResult::Failure(error) => Err(io::Error::other(KernelError::from(error))),
+            EngineExecResult::Uninit => {
+                Err(io::Error::other("DV write callback left result unset"))
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let callback = self
+            .0
+            .flush
+            .ok_or_else(|| io::Error::other("missing DV flush callback"))?;
+        let mut result = EngineExecResult::Uninit;
+        unsafe { callback(self.0.context, &mut result) };
+        match result {
+            EngineExecResult::Success(true) => Ok(()),
+            EngineExecResult::Success(false) => {
+                Err(io::Error::other("DV flush callback returned false"))
+            }
+            EngineExecResult::Failure(error) => Err(io::Error::other(KernelError::from(error))),
+            EngineExecResult::Uninit => {
+                Err(io::Error::other("DV flush callback left result unset"))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ptr::{self, NonNull};
+
+    #[cfg(feature = "default-engine-base")]
+    use delta_kernel::actions::deletion_vector::{
+        DeletionVectorDescriptor, DeletionVectorStorageType,
+    };
+    #[cfg(feature = "default-engine-base")]
+    use delta_kernel::object_store::{path::Path, ObjectStoreExt};
+    #[cfg(feature = "default-engine-base")]
+    use delta_kernel::Engine;
+    use rstest::rstest;
 
     use super::*;
-    use crate::ffi_test_utils::{engine_handle_for_store, ok_or_panic, recover_error};
-    use crate::scan::{free_scan, scan, scan_metadata_iter_init};
-    use crate::transaction::write_context::free_write_context;
-    use crate::transaction::{
-        committed_transaction_version, free_committed_transaction, free_update_table_txn,
-        new_update_table_txn_builder, update_table_txn_builder_build, update_table_txn_commit,
-        update_table_txn_update_deletion_vectors, KernelUpdateTableOperation,
-    };
-    use crate::{free_engine, free_snapshot, kernel_string_slice};
+    use crate::error::{EngineExecError, FFIKernelError};
+    use crate::ffi_test_utils::{allocate_err, ok_or_panic, recover_error};
 
-    type TestResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-    struct Fixture {
-        store: Arc<DynObjectStore>,
-        kernel_engine: Arc<dyn Engine>,
-        engine: Handle<SharedExternEngine>,
-        snapshot: Handle<SharedSnapshot>,
-        context: Handle<SharedWriteContext>,
-        table_url: url::Url,
+    #[derive(Default)]
+    struct Output {
+        bytes: Vec<u8>,
+        flushes: usize,
+        max_chunk: Option<usize>,
+        mode: Option<FailureMode>,
     }
 
-    impl Fixture {
-        async fn new(enabled: bool) -> TestResult<Self> {
-            Self::for_table(enabled, "write_dv_updates").await
-        }
-
-        async fn for_table(enabled: bool, name: &str) -> TestResult<Self> {
-            let (store, _, table_url) = engine_store_setup(name, None);
-            let kernel_engine: Arc<dyn Engine> =
-                Arc::new(DefaultEngineBuilder::new(store.clone()).build());
-            let schema = schema_ref! { nullable "id": INTEGER };
-            create_table(&table_url, schema, "ffi-dv-writer-test", true)
-                .with_table_properties([(
-                    "delta.enableDeletionVectors",
-                    if enabled { "true" } else { "false" },
-                )])
-                .build(kernel_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-                .commit(kernel_engine.as_ref())?
-                .unwrap_committed();
-            let snapshot = Snapshot::builder_for(&table_url).build(kernel_engine.as_ref())?;
-            let mut transaction = snapshot
-                .update_table(UpdateTableOperation::Write, "ffi-dv-writer-test", true)
-                .build(kernel_engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-            let mut metadata = Vec::new();
-            for (path, ids) in [
-                ("first.parquet", vec![10, 20, 30, 40]),
-                ("second.parquet", vec![50, 60]),
-            ] {
-                let batch = RecordBatch::try_from_iter([(
-                    "id",
-                    Arc::new(Int32Array::from(ids)) as delta_kernel::arrow::array::ArrayRef,
-                )])?;
-                let bytes = record_batch_to_bytes_with_props(
-                    &batch,
-                    WriterProperties::builder()
-                        .set_max_row_group_row_count(Some(2))
-                        .build(),
-                );
-                let size = bytes.len() as i64;
-                store
-                    .put(
-                        &Path::from_url_path(table_url.join(path)?.path())?,
-                        bytes.into(),
-                    )
-                    .await?;
-                metadata.push((path, size, 1_000_000, Some(batch.num_rows() as i64)));
-            }
-            transaction.add_files(create_add_files_metadata(
-                transaction.add_files_schema(),
-                metadata,
-            )?);
-            let snapshot = transaction
-                .commit(kernel_engine.as_ref())?
-                .unwrap_post_commit_snapshot();
-            let context = snapshot
-                .clone()
-                .update_table(UpdateTableOperation::Merge, "ffi-dv-writer-test", true)
-                .build(kernel_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-                .write_state()?
-                .write_context_builder()
-                .build()?;
-            Ok(Self {
-                store: store.clone(),
-                kernel_engine,
-                engine: engine_handle_for_store(store),
-                snapshot: snapshot.into(),
-                context: Arc::new(context).into(),
-                table_url,
-            })
-        }
-
-        fn prepare(
-            &self,
-            entries: &[FfiDeletionVectorUpdate],
-        ) -> ExternResult<Handle<ExclusiveDvDescriptorMap>> {
-            unsafe {
-                write_deletion_vectors(
-                    self.snapshot.shallow_copy(),
-                    self.context.shallow_copy(),
-                    FfiSlice::new_unsafe(entries),
-                    self.engine.shallow_copy(),
-                )
-            }
-        }
-
-        fn dv_count(&self) -> usize {
-            self.kernel_engine
-                .storage_handler()
-                .list_from(&self.table_url)
-                .unwrap()
-                .collect::<KernelResult<Vec<_>>>()
-                .unwrap()
-                .iter()
-                .filter(|file| file.location.as_str().contains("deletion_vector_"))
-                .count()
-        }
-
-        async fn original_bytes(&self) -> Vec<bytes::Bytes> {
-            let mut files = Vec::new();
-            for path in ["first.parquet", "second.parquet"] {
-                files.push(
-                    self.store
-                        .get(
-                            &Path::from_url_path(self.table_url.join(path).unwrap().path())
-                                .unwrap(),
-                        )
-                        .await
-                        .unwrap()
-                        .bytes()
-                        .await
-                        .unwrap(),
-                );
-            }
-            files
-        }
-
-        fn refresh(&mut self) -> TestResult<()> {
-            let snapshot =
-                Snapshot::builder_for(&self.table_url).build(self.kernel_engine.as_ref())?;
-            let context = snapshot
-                .clone()
-                .update_table(UpdateTableOperation::Merge, "ffi-dv-writer-test", true)
-                .build(
-                    self.kernel_engine.as_ref(),
-                    Box::new(FileSystemCommitter::new()),
-                )?
-                .write_state()?
-                .write_context_builder()
-                .build()?;
-            unsafe {
-                free_write_context(self.context.shallow_copy());
-                free_snapshot(self.snapshot.shallow_copy());
-            }
-            self.snapshot = snapshot.into();
-            self.context = Arc::new(context).into();
-            Ok(())
-        }
-
-        async fn commit(
-            &self,
-            map: Handle<ExclusiveDvDescriptorMap>,
-            new_rows: Option<(&str, Vec<i32>)>,
-        ) -> TestResult<()> {
-            let snapshot_version = unsafe { self.snapshot.as_ref() }.version();
-            let engine_info = "ffi-dv-writer-test";
-            let builder = ok_or_panic(unsafe {
-                new_update_table_txn_builder(
-                    self.snapshot.shallow_copy(),
-                    KernelUpdateTableOperation::Merge,
-                    kernel_string_slice!(engine_info),
-                    true,
-                    self.engine.shallow_copy(),
-                )
-            });
-            let mut transaction_handle = ok_or_panic(unsafe {
-                update_table_txn_builder_build(builder, self.engine.shallow_copy())
-            });
-            if let Some((path, ids)) = new_rows {
-                let batch = RecordBatch::try_from_iter([(
-                    "id",
-                    Arc::new(Int32Array::from(ids)) as delta_kernel::arrow::array::ArrayRef,
-                )])?;
-                let bytes = record_batch_to_bytes(&batch);
-                let size = bytes.len() as i64;
-                self.store
-                    .put(
-                        &Path::from_url_path(self.table_url.join(path)?.path())?,
-                        bytes.into(),
-                    )
-                    .await?;
-                let metadata = create_add_files_metadata(
-                    unsafe { transaction_handle.as_ref() }.add_files_schema(),
-                    vec![(path, size, 1_000_000, Some(batch.num_rows() as i64))],
-                )?;
-                unsafe { transaction_handle.as_mut() }.add_files(metadata);
-            }
-            let scan = ok_or_panic(unsafe {
-                scan(
-                    self.snapshot.shallow_copy(),
-                    self.engine.shallow_copy(),
-                    None,
-                    None,
-                )
-            });
-            let metadata = ok_or_panic(unsafe {
-                scan_metadata_iter_init(self.engine.shallow_copy(), scan.shallow_copy())
-            });
-            let result = unsafe {
-                update_table_txn_update_deletion_vectors(
-                    transaction_handle.shallow_copy(),
-                    map,
-                    metadata,
-                    self.engine.shallow_copy(),
-                )
-            };
-            unsafe { free_scan(scan) };
-            ok_or_panic(result);
-            let committed = match unsafe {
-                update_table_txn_commit(transaction_handle, self.engine.shallow_copy())
-            } {
-                ExternResult::Ok(committed) => committed,
-                ExternResult::Err(error) => {
-                    return Err(unsafe { recover_error(error) }.message.into());
-                }
-            };
-            assert_eq!(
-                unsafe { committed_transaction_version(&committed) },
-                snapshot_version + 1
-            );
-            unsafe { free_committed_transaction(committed) };
-            Ok(())
-        }
-
-        fn visible_ids(&self) -> TestResult<Vec<i32>> {
-            let snapshot =
-                Snapshot::builder_for(&self.table_url).build(self.kernel_engine.as_ref())?;
-            let mut ids = Vec::new();
-            for batch in snapshot
-                .scan_builder()
-                .build()?
-                .execute(self.kernel_engine.clone())?
-            {
-                let batch = into_record_batch(batch?);
-                let column = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .unwrap();
-                ids.extend(column.values().iter().copied());
-            }
-            ids.sort_unstable();
-            Ok(ids)
-        }
+    #[derive(Clone, Copy)]
+    enum FailureMode {
+        Write,
+        WriteAfterPrefix,
+        ZeroWrite,
+        InvalidWriteCount,
+        UnsetWriteResult,
+        Flush,
+        FalseFlush,
+        UnsetFlushResult,
     }
 
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            unsafe {
-                free_write_context(self.context.shallow_copy());
-                free_snapshot(self.snapshot.shallow_copy());
-                free_engine(self.engine.shallow_copy());
+    impl Output {
+        fn callbacks(&mut self) -> FfiDvWriterOutput {
+            FfiDvWriterOutput {
+                context: Some(NonNull::from(self).cast()),
+                write: Some(write_output),
+                flush: Some(flush_output),
             }
         }
     }
 
-    unsafe fn entry(path: &str, rows: &[u64]) -> FfiDeletionVectorUpdate {
-        FfiDeletionVectorUpdate {
-            data_file_path: kernel_string_slice!(path),
-            row_indexes: FfiSlice::new_unsafe(rows),
+    fn output_error(message: &str) -> EngineExecError {
+        EngineExecError {
+            etype: FFIKernelError::IOErrorError,
+            message: Box::new(message.to_owned()).into(),
         }
     }
 
-    #[tokio::test]
-    async fn writes_multiple_files_and_preserves_existing_dvs_without_rewriting_parquet(
-    ) -> TestResult<()> {
-        let mut fixture = Fixture::new(true).await?;
-        let before = fixture.original_bytes().await;
-        let entries = unsafe {
-            [
-                entry("first.parquet", &[1, 2, 2]),
-                entry("second.parquet", &[0]),
-            ]
+    unsafe extern "C" fn write_output(
+        context: NullableCvoid,
+        bytes: KernelBytesSlice,
+        out: *mut EngineExecResult<usize>,
+    ) {
+        let output = unsafe { &mut *context.unwrap().as_ptr().cast::<Output>() };
+        let bytes = unsafe { bytes.try_as_slice() }.unwrap();
+        let result = match output.mode {
+            Some(FailureMode::Write) => {
+                EngineExecResult::Failure(output_error("test write failure"))
+            }
+            Some(FailureMode::WriteAfterPrefix) if !output.bytes.is_empty() => {
+                EngineExecResult::Failure(output_error("test write failure"))
+            }
+            Some(FailureMode::ZeroWrite) => EngineExecResult::Success(0),
+            Some(FailureMode::InvalidWriteCount) => EngineExecResult::Success(bytes.len() + 1),
+            Some(FailureMode::UnsetWriteResult) => return,
+            _ => {
+                let count = output.max_chunk.unwrap_or(bytes.len()).min(bytes.len());
+                output.bytes.extend_from_slice(&bytes[..count]);
+                EngineExecResult::Success(count)
+            }
         };
-        let map = ok_or_panic(fixture.prepare(&entries));
-        assert_eq!(unsafe { map.as_ref() }.inner.len(), 2);
-        let first = &unsafe { map.as_ref() }.inner["first.parquet"];
-        let second = &unsafe { map.as_ref() }.inner["second.parquet"];
-        assert_eq!(first.path_or_inline_dv, second.path_or_inline_dv);
-        assert_ne!(first.offset, second.offset);
-        assert_eq!(fixture.dv_count(), 1);
-        assert_eq!(fixture.visible_ids()?, vec![10, 20, 30, 40, 50, 60]);
-        fixture
-            .commit(map, Some(("new.parquet", vec![20, 30, 70])))
-            .await?;
-        assert_eq!(fixture.visible_ids()?, vec![10, 20, 30, 40, 60, 70]);
-        fixture.refresh()?;
-
-        let entries = unsafe { [entry("first.parquet", &[0, 1])] };
-        let map = ok_or_panic(fixture.prepare(&entries));
-        assert_eq!(
-            unsafe { map.as_ref() }.inner["first.parquet"].cardinality,
-            3
-        );
-        fixture.commit(map, None).await?;
-        assert_eq!(fixture.visible_ids()?, vec![20, 30, 40, 60, 70]);
-        assert_eq!(fixture.original_bytes().await, before);
-        Ok(())
+        unsafe { out.write(result) };
     }
 
-    #[rstest]
-    #[case::missing_file("missing.parquet", &[0], "not active")]
-    #[case::past_end("second.parquet", &[2], "physical row count")]
-    #[case::max_index("second.parquet", &[u64::MAX], "physical row count")]
-    #[case::empty_path("", &[0], "nonempty")]
-    #[case::empty_indexes("second.parquet", &[], "nonempty")]
-    #[tokio::test]
-    async fn invalid_batch_does_not_upload_any_dv(
-        #[case] path: &str,
-        #[case] rows: &[u64],
-        #[case] expected: &str,
-    ) -> TestResult<()> {
-        let fixture = Fixture::new(true).await?;
-        let entries = unsafe { [entry("first.parquet", &[1]), entry(path, rows)] };
-        match fixture.prepare(&entries) {
+    unsafe extern "C" fn flush_output(context: NullableCvoid, out: *mut EngineExecResult<bool>) {
+        let output = unsafe { &mut *context.unwrap().as_ptr().cast::<Output>() };
+        output.flushes += 1;
+        let result = match output.mode {
+            Some(FailureMode::Flush) => {
+                EngineExecResult::Failure(output_error("test flush failure"))
+            }
+            Some(FailureMode::FalseFlush) => EngineExecResult::Success(false),
+            Some(FailureMode::UnsetFlushResult) => return,
+            _ => EngineExecResult::Success(true),
+        };
+        unsafe { out.write(result) };
+    }
+
+    fn rows(indexes: &[u64]) -> FfiSlice<u64> {
+        unsafe { FfiSlice::new_unsafe(indexes) }
+    }
+
+    fn expect_error<T>(result: ExternResult<T>, expected: &str) {
+        match result {
             ExternResult::Err(error) => {
                 let error = unsafe { recover_error(error) };
                 assert!(error.message.contains(expected), "{}", error.message);
             }
-            ExternResult::Ok(map) => {
-                unsafe { super::super::free_dv_descriptor_map(map) };
-                panic!("invalid batch succeeded");
-            }
+            ExternResult::Ok(_) => panic!("expected error containing {expected}"),
         }
-        assert_eq!(fixture.dv_count(), 0);
-        Ok(())
     }
 
-    #[tokio::test]
-    async fn duplicate_file_paths_are_rejected_before_io() -> TestResult<()> {
-        let fixture = Fixture::new(true).await?;
-        let entries = unsafe { [entry("first.parquet", &[1]), entry("first.parquet", &[2])] };
-        let error = match fixture.prepare(&entries) {
-            ExternResult::Err(error) => unsafe { recover_error(error) },
-            ExternResult::Ok(map) => {
-                unsafe { super::super::free_dv_descriptor_map(map) };
-                panic!("duplicate paths succeeded");
-            }
-        };
-        assert!(error.message.contains("duplicate"));
-        assert_eq!(fixture.dv_count(), 0);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn a_context_for_another_table_is_rejected_before_upload() -> TestResult<()> {
-        let fixture = Fixture::new(true).await?;
-        let other = Fixture::for_table(true, "other_table").await?;
-        let entries = unsafe { [entry("first.parquet", &[1])] };
-        let result = unsafe {
-            write_deletion_vectors(
-                fixture.snapshot.shallow_copy(),
-                other.context.shallow_copy(),
-                FfiSlice::new_unsafe(&entries),
-                fixture.engine.shallow_copy(),
-            )
-        };
-        match result {
-            ExternResult::Err(error) => {
-                assert!(unsafe { recover_error(error) }
-                    .message
-                    .contains("different table roots"));
-            }
-            ExternResult::Ok(map) => {
-                unsafe { super::super::free_dv_descriptor_map(map) };
-                panic!("mismatched table roots succeeded");
-            }
-        }
-        assert_eq!(fixture.dv_count(), 0);
-        assert_eq!(other.dv_count(), 0);
-        Ok(())
-    }
-
-    #[rstest]
-    #[case::invalid_utf8(true)]
-    #[case::null_row_slice(false)]
-    #[tokio::test]
-    async fn malformed_nested_slices_fail_without_uploads(
-        #[case] invalid_utf8: bool,
-    ) -> TestResult<()> {
-        let fixture = Fixture::new(true).await?;
-        let bytes = [0xffu8];
-        let mut update = unsafe { entry("first.parquet", &[1]) };
-        let expected = if invalid_utf8 {
-            update.data_file_path = KernelStringSlice {
-                ptr: bytes.as_ptr().cast(),
-                len: bytes.len(),
-            };
-            "utf"
-        } else {
-            update.row_indexes = FfiSlice {
-                ptr: ptr::null(),
-                len: 1,
-            };
-            "null"
-        };
-        match fixture.prepare(&[update]) {
-            ExternResult::Err(error) => {
-                let error = unsafe { recover_error(error) };
-                assert!(
-                    error.message.to_lowercase().contains(expected),
-                    "{}",
-                    error.message
-                );
-            }
-            ExternResult::Ok(map) => {
-                unsafe { super::super::free_dv_descriptor_map(map) };
-                panic!("malformed input succeeded");
-            }
-        }
-        assert_eq!(fixture.dv_count(), 0);
-        // Errors borrow the input handles; the same fixture remains usable.
-        let entries = unsafe { [entry("first.parquet", &[1])] };
-        let map = ok_or_panic(fixture.prepare(&entries));
-        unsafe { super::super::free_dv_descriptor_map(map) };
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn null_empty_file_path_is_rejected_without_uploading_or_consuming_handles(
-    ) -> TestResult<()> {
-        let fixture = Fixture::new(true).await?;
-        let mut update = unsafe { entry("first.parquet", &[1]) };
-        update.data_file_path = KernelStringSlice {
-            ptr: ptr::null(),
-            len: 0,
-        };
-        match fixture.prepare(&[update]) {
-            ExternResult::Err(error) => {
-                assert!(unsafe { recover_error(error) }.message.contains("nonempty"));
-            }
-            ExternResult::Ok(map) => {
-                unsafe { super::super::free_dv_descriptor_map(map) };
-                panic!("null empty file path succeeded");
-            }
-        }
-        assert_eq!(fixture.dv_count(), 0);
-        let entries = unsafe { [entry("first.parquet", &[1])] };
-        let map = ok_or_panic(fixture.prepare(&entries));
-        unsafe { super::super::free_dv_descriptor_map(map) };
-        Ok(())
-    }
-
-    #[rstest]
-    #[case::unreadable(false)]
-    #[case::wrong_cardinality(true)]
-    #[tokio::test]
-    async fn an_invalid_existing_dv_is_not_replaced_by_only_new_indexes(
-        #[case] wrong_cardinality: bool,
-    ) -> TestResult<()> {
-        let mut fixture = Fixture::new(true).await?;
-        let entries = unsafe { [entry("first.parquet", &[1])] };
-        let mut map = ok_or_panic(fixture.prepare(&entries));
-        if wrong_cardinality {
-            unsafe { map.as_mut() }
-                .inner
-                .get_mut("first.parquet")
-                .unwrap()
-                .cardinality += 1;
-        }
-        let descriptor = unsafe { map.as_ref() }.inner["first.parquet"].clone();
-        fixture.commit(map, None).await?;
-        fixture.refresh()?;
-        if !wrong_cardinality {
-            let path = descriptor.absolute_path(&fixture.table_url)?.unwrap();
-            fixture.kernel_engine.storage_handler().delete(&path)?;
-        }
-        let count = fixture.dv_count();
-
-        let entries = unsafe { [entry("first.parquet", &[2])] };
-        match fixture.prepare(&entries) {
-            ExternResult::Err(error) => {
-                let error = unsafe { recover_error(error) };
-                if wrong_cardinality {
-                    assert!(error.message.contains("cardinality"), "{}", error.message);
-                }
-            }
-            ExternResult::Ok(map) => {
-                unsafe { super::super::free_dv_descriptor_map(map) };
-                panic!("invalid previous DV was ignored");
-            }
-        }
-        assert_eq!(fixture.dv_count(), count);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn invalid_last_existing_dv_does_not_upload_prepared_vectors() -> TestResult<()> {
-        let mut fixture = Fixture::new(true).await?;
-        let first_rows: &[u64] = &[2];
-        let second_rows: &[u64] = &[1];
-        let indexes = HashMap::from([
-            ("first.parquet", first_rows),
-            ("second.parquet", second_rows),
-        ]);
-        // Select the last entry in this map's iteration order so a valid DV is prepared first.
-        let invalid_path = *indexes.keys().last().unwrap();
-        let entries = unsafe { [entry("first.parquet", &[1]), entry("second.parquet", &[0])] };
-        let mut map = ok_or_panic(fixture.prepare(&entries));
-        unsafe { map.as_mut() }
-            .inner
-            .get_mut(invalid_path)
-            .unwrap()
-            .cardinality += 1;
-        fixture.commit(map, None).await?;
-        fixture.refresh()?;
-        let count = fixture.dv_count();
-
-        let snapshot = unsafe { fixture.snapshot.clone_as_arc() };
-        let context = unsafe { fixture.context.as_ref() };
-        let error = match write_deletion_vectors_impl(
-            snapshot,
-            context,
-            indexes,
-            fixture.kernel_engine.as_ref(),
-        ) {
-            Ok(_) => panic!("invalid final DV was ignored"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("cardinality"), "{error}");
-        assert_eq!(fixture.dv_count(), count);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn stale_preparation_conflicts_and_fresh_preparation_preserves_both_deletes(
-    ) -> TestResult<()> {
-        let mut fixture = Fixture::new(true).await?;
-        let entries = unsafe { [entry("first.parquet", &[1])] };
-        let stale = ok_or_panic(fixture.prepare(&entries));
-        let entries = unsafe { [entry("first.parquet", &[2])] };
-        let concurrent = ok_or_panic(fixture.prepare(&entries));
-        fixture.commit(concurrent, None).await?;
-
-        let error = fixture.commit(stale, None).await.unwrap_err();
-        assert!(error.to_string().contains("conflict"), "{error}");
-        assert_eq!(fixture.visible_ids()?, vec![10, 20, 40, 50, 60]);
-        fixture.refresh()?;
-        let entries = unsafe { [entry("first.parquet", &[1])] };
-        let fresh = ok_or_panic(fixture.prepare(&entries));
-        fixture.commit(fresh, None).await?;
-        assert_eq!(fixture.visible_ids()?, vec![10, 40, 50, 60]);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn filesystem_transaction_retains_its_snapshot_after_input_handles_are_released(
-    ) -> TestResult<()> {
-        let fixture = Fixture::new(true).await?;
-        let engine = engine_handle_for_store(fixture.store.clone());
-        let snapshot: Handle<SharedSnapshot> = unsafe { fixture.snapshot.clone_as_arc() }.into();
-        let table_root = fixture.table_url.clone();
-        let engine_info = "ffi-dv-writer-test";
-        let builder = ok_or_panic(unsafe {
-            new_update_table_txn_builder(
-                snapshot.shallow_copy(),
-                KernelUpdateTableOperation::Merge,
-                kernel_string_slice!(engine_info),
-                true,
-                engine.shallow_copy(),
-            )
-        });
-        let transaction =
-            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
-        unsafe { free_snapshot(snapshot) };
-        drop(fixture);
-
-        let state = unsafe { transaction.as_ref() }.write_state()?;
-        let context = state.write_context_builder().build()?;
-        assert_eq!(context.table_root_dir(), &table_root);
-        assert_eq!(context.logical_data_schema().num_fields(), 1);
-        unsafe {
-            free_update_table_txn(transaction);
-            free_engine(engine);
-        }
-        Ok(())
+    fn serialize(vectors: &[&[u64]]) -> (Output, Vec<FfiDvWriteResult>) {
+        let mut output = Output::default();
+        let mut callbacks = output.callbacks();
+        let mut writer = ok_or_panic(unsafe { new_dv_writer(&mut callbacks, allocate_err) });
+        let results = vectors
+            .iter()
+            .map(|indexes| {
+                ok_or_panic(unsafe { dv_writer_write(&mut writer, rows(indexes), allocate_err) })
+            })
+            .collect();
+        assert!(ok_or_panic(unsafe {
+            dv_writer_finalize(writer, allocate_err)
+        }));
+        (output, results)
     }
 
     #[test]
-    fn missing_physical_row_counts_and_duplicate_active_paths_are_rejected() {
-        let file = ScanFile {
-            path: "first.parquet".to_string(),
-            size: 1,
-            modification_time: 0,
-            stats: None,
-            dv_info: Default::default(),
-            transform: None,
-            partition_values: HashMap::new(),
-        };
-        assert!(physical_row_count(&file)
-            .unwrap_err()
-            .to_string()
-            .contains("numRecords"));
-        let indexes: &[u64] = &[0];
-        let mut requested = RequestedFiles {
-            indexes: HashMap::from([("first.parquet", indexes)]),
-            files: HashMap::new(),
-            duplicate: None,
-        };
-        select_file(&mut requested, file.clone());
-        select_file(&mut requested, file);
-        assert_eq!(requested.duplicate.as_deref(), Some("first.parquet"));
+    fn several_complete_vectors_share_one_output_and_match_the_rust_writer() {
+        let vectors: &[&[u64]] = &[&[5, 1, 5, 0], &[2, u32::MAX as u64 + 1, u64::MAX], &[]];
+        let (output, results) = serialize(vectors);
+        let mut expected = Vec::new();
+        let mut writer = StreamingDeletionVectorWriter::new(&mut expected);
+        let expected_results: Vec<_> = vectors
+            .iter()
+            .map(|indexes| {
+                let mut dv = KernelDeletionVector::new();
+                dv.add_deleted_row_indexes(*indexes);
+                FfiDvWriteResult::from(writer.write_deletion_vector(dv).unwrap())
+            })
+            .collect();
+        writer.finalize().unwrap();
+        assert_eq!(output.bytes, expected);
+        assert_eq!(results, expected_results);
+        assert_eq!(results[0].offset, 1);
+        assert_eq!(results[0].cardinality, 3);
+        assert!(results[1].offset > results[0].offset);
+        assert_eq!(results[2].cardinality, 0);
+        assert_eq!(output.flushes, 1);
     }
 
-    #[tokio::test]
-    async fn disabled_deletion_vectors_are_rejected() -> TestResult<()> {
-        let fixture = Fixture::new(false).await?;
-        let entries = unsafe { [entry("first.parquet", &[1])] };
-        match fixture.prepare(&entries) {
-            ExternResult::Err(error) => {
-                assert!(unsafe { recover_error(error) }
-                    .message
-                    .contains("deletionVectors"));
-            }
-            ExternResult::Ok(map) => {
-                unsafe { super::super::free_dv_descriptor_map(map) };
-                panic!("disabled DV write succeeded");
-            }
-        }
-        assert_eq!(fixture.dv_count(), 0);
-        Ok(())
+    #[test]
+    fn callers_can_choose_separate_outputs_and_offsets_restart() {
+        let (first, a) = serialize(&[&[1, 3, 7]]);
+        let (second, b) = serialize(&[&[2]]);
+        assert_eq!(a[0].offset, 1);
+        assert_eq!(b[0].offset, 1);
+        assert_eq!(a[0].cardinality, 3);
+        assert_eq!(b[0].cardinality, 1);
+        assert_ne!(first.bytes, second.bytes);
+    }
+
+    #[test]
+    fn empty_writer_finalizes_without_creating_a_vector() {
+        let (output, results) = serialize(&[]);
+        assert!(output.bytes.is_empty());
+        assert!(results.is_empty());
+        assert_eq!(output.flushes, 1);
+    }
+
+    #[test]
+    fn null_empty_rows_are_a_complete_empty_vector() {
+        let mut output = Output::default();
+        let mut callbacks = output.callbacks();
+        let mut writer = ok_or_panic(unsafe { new_dv_writer(&mut callbacks, allocate_err) });
+        let result =
+            ok_or_panic(unsafe { dv_writer_write(&mut writer, FfiSlice::empty(), allocate_err) });
+        assert_eq!(result.cardinality, 0);
+        assert!(ok_or_panic(unsafe {
+            dv_writer_finalize(writer, allocate_err)
+        }));
+        assert!(!output.bytes.is_empty());
+    }
+
+    #[test]
+    fn invalid_row_slice_does_not_change_or_poison_the_writer() {
+        let mut output = Output::default();
+        let mut callbacks = output.callbacks();
+        let mut writer = ok_or_panic(unsafe { new_dv_writer(&mut callbacks, allocate_err) });
+        expect_error(
+            unsafe {
+                dv_writer_write(
+                    &mut writer,
+                    FfiSlice {
+                        ptr: ptr::null(),
+                        len: 1,
+                    },
+                    allocate_err,
+                )
+            },
+            "null",
+        );
+        assert!(output.bytes.is_empty());
+        let result = ok_or_panic(unsafe { dv_writer_write(&mut writer, rows(&[4]), allocate_err) });
+        assert_eq!(result.offset, 1);
+        assert_eq!(result.cardinality, 1);
+        ok_or_panic(unsafe { dv_writer_finalize(writer, allocate_err) });
+    }
+
+    #[test]
+    fn null_output_and_writer_pointers_return_errors() {
+        expect_error(
+            unsafe { new_dv_writer(ptr::null_mut(), allocate_err) },
+            "null",
+        );
+        expect_error(
+            unsafe { dv_writer_write(ptr::null_mut(), FfiSlice::empty(), allocate_err) },
+            "null",
+        );
     }
 
     #[rstest]
-    #[case::empty(false)]
-    #[case::nonempty(true)]
-    #[tokio::test]
-    async fn null_update_pointer_is_valid_only_for_empty_batches(
-        #[case] nonempty: bool,
-    ) -> TestResult<()> {
-        let fixture = Fixture::new(true).await?;
-        let result = unsafe {
-            write_deletion_vectors(
-                fixture.snapshot.shallow_copy(),
-                fixture.context.shallow_copy(),
-                FfiSlice {
-                    ptr: ptr::null(),
-                    len: usize::from(nonempty),
-                },
-                fixture.engine.shallow_copy(),
-            )
+    #[case::write(true)]
+    #[case::flush(false)]
+    fn missing_output_callbacks_are_rejected(#[case] missing_write: bool) {
+        let mut output = Output::default();
+        let mut callbacks = output.callbacks();
+        if missing_write {
+            callbacks.write = None;
+        } else {
+            callbacks.flush = None;
+        }
+        expect_error(
+            unsafe { new_dv_writer(&mut callbacks, allocate_err) },
+            "callbacks",
+        );
+        assert!(output.bytes.is_empty());
+        assert_eq!(output.flushes, 0);
+    }
+
+    #[test]
+    fn short_writes_are_completed_by_the_rust_serializer() {
+        let mut output = Output {
+            max_chunk: Some(2),
+            ..Default::default()
         };
-        match result {
-            ExternResult::Ok(map) => {
-                assert!(!nonempty);
-                assert!(unsafe { map.as_ref() }.inner.is_empty());
-                unsafe { super::super::free_dv_descriptor_map(map) };
-            }
-            ExternResult::Err(error) => {
-                assert!(nonempty);
-                assert!(unsafe { recover_error(error) }.message.contains("null"));
+        let mut callbacks = output.callbacks();
+        let mut writer = ok_or_panic(unsafe { new_dv_writer(&mut callbacks, allocate_err) });
+        ok_or_panic(unsafe { dv_writer_write(&mut writer, rows(&[0, 7]), allocate_err) });
+        ok_or_panic(unsafe { dv_writer_finalize(writer, allocate_err) });
+        assert_eq!(output.bytes, serialize(&[&[0, 7]]).0.bytes);
+    }
+
+    #[rstest]
+    #[case::write(FailureMode::Write, "test write failure")]
+    #[case::partial_output(FailureMode::WriteAfterPrefix, "test write failure")]
+    #[case::zero(FailureMode::ZeroWrite, "Failed to write")]
+    #[case::invalid_count(FailureMode::InvalidWriteCount, "exceeds input")]
+    #[case::unset(FailureMode::UnsetWriteResult, "left result unset")]
+    fn failed_writes_cannot_be_resumed(#[case] mode: FailureMode, #[case] message: &str) {
+        let mut output = Output {
+            mode: Some(mode),
+            ..Default::default()
+        };
+        let mut callbacks = output.callbacks();
+        let mut writer = ok_or_panic(unsafe { new_dv_writer(&mut callbacks, allocate_err) });
+        expect_error(
+            unsafe { dv_writer_write(&mut writer, rows(&[1]), allocate_err) },
+            message,
+        );
+        if matches!(mode, FailureMode::WriteAfterPrefix) {
+            assert!(!output.bytes.is_empty());
+        }
+        output.mode = None;
+        expect_error(
+            unsafe { dv_writer_write(&mut writer, rows(&[1]), allocate_err) },
+            "has failed",
+        );
+        expect_error(
+            unsafe { dv_writer_finalize(writer, allocate_err) },
+            "has failed",
+        );
+        assert_eq!(output.flushes, 0);
+    }
+
+    #[rstest]
+    #[case::flush(FailureMode::Flush, "test flush failure")]
+    #[case::false_result(FailureMode::FalseFlush, "returned false")]
+    #[case::unset(FailureMode::UnsetFlushResult, "left result unset")]
+    fn finalization_propagates_flush_errors(#[case] mode: FailureMode, #[case] message: &str) {
+        let mut output = Output {
+            mode: Some(mode),
+            ..Default::default()
+        };
+        let mut callbacks = output.callbacks();
+        let mut writer = ok_or_panic(unsafe { new_dv_writer(&mut callbacks, allocate_err) });
+        ok_or_panic(unsafe { dv_writer_write(&mut writer, rows(&[1]), allocate_err) });
+        expect_error(unsafe { dv_writer_finalize(writer, allocate_err) }, message);
+        assert_eq!(output.flushes, 1);
+    }
+
+    #[test]
+    fn free_abandons_output_without_flushing() {
+        let mut output = Output::default();
+        let mut callbacks = output.callbacks();
+        let mut writer = ok_or_panic(unsafe { new_dv_writer(&mut callbacks, allocate_err) });
+        ok_or_panic(unsafe { dv_writer_write(&mut writer, rows(&[1]), allocate_err) });
+        unsafe { free_dv_writer(writer) };
+        assert!(!output.bytes.is_empty());
+        assert_eq!(output.flushes, 0);
+    }
+
+    #[test]
+    fn writer_can_move_threads_while_its_output_remains_exclusive() {
+        let mut output = Output::default();
+        let mut callbacks = output.callbacks();
+        let writer = ok_or_panic(unsafe { new_dv_writer(&mut callbacks, allocate_err) });
+        let result = std::thread::spawn(move || {
+            let mut writer = writer;
+            let result =
+                ok_or_panic(unsafe { dv_writer_write(&mut writer, rows(&[1, 3]), allocate_err) });
+            ok_or_panic(unsafe { dv_writer_finalize(writer, allocate_err) });
+            result
+        })
+        .join()
+        .unwrap();
+        assert_eq!(result.cardinality, 2);
+        assert_eq!(output.flushes, 1);
+        assert_eq!(output.bytes, serialize(&[&[1, 3]]).0.bytes);
+    }
+
+    #[cfg(feature = "default-engine-base")]
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn kernel_reader_decodes_independent_vectors_from_shared_and_separate_outputs() {
+        let vectors: &[&[u64]] = &[&[1, 3, 7], &[2, 8], &[]];
+        let (store, engine, root) = test_utils::engine_store_setup("ffi_dv_serializer", None);
+        for shared in [true, false] {
+            let groups: Vec<&[&[u64]]> = if shared {
+                vec![vectors]
+            } else {
+                vectors.chunks(1).collect()
+            };
+            for (file, group) in groups.iter().enumerate() {
+                let (output, results) = serialize(group);
+                let path = root.join(&format!("output-{shared}-{file}.bin")).unwrap();
+                store
+                    .put(
+                        &Path::from_url_path(path.path()).unwrap(),
+                        output.bytes.into(),
+                    )
+                    .await
+                    .unwrap();
+                for (result, expected) in results.into_iter().zip(*group) {
+                    let descriptor = DeletionVectorDescriptor::try_new(
+                        DeletionVectorStorageType::PersistedAbsolute,
+                        path.as_str(),
+                        Some(result.offset),
+                        result.size_in_bytes,
+                        result.cardinality,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        descriptor
+                            .row_indexes(engine.storage_handler(), &root)
+                            .unwrap(),
+                        *expected
+                    );
+                }
             }
         }
-        assert_eq!(fixture.dv_count(), 0);
-        Ok(())
     }
 }

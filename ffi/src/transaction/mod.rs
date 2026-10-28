@@ -21,7 +21,10 @@ pub use deletion_vector::{
     free_dv_descriptor_map, update_table_txn_update_deletion_vectors, ExclusiveDvDescriptor,
     ExclusiveDvDescriptorMap, KernelDvStorageType,
 };
-pub use deletion_vector_writer::{write_deletion_vectors, FfiDeletionVectorUpdate};
+pub use deletion_vector_writer::{
+    dv_writer_finalize, dv_writer_write, free_dv_writer, new_dv_writer, DvFlushFn, DvWriteFn,
+    ExclusiveDvWriter, FfiDvWriteResult, FfiDvWriterOutput,
+};
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::transaction::create_table::{
