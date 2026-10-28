@@ -1,6 +1,6 @@
 pub(crate) use crate::actions::visitors::SetTransactionMap;
 use crate::actions::visitors::SetTransactionVisitor;
-use crate::actions::{SetTransaction, LOG_TXN_SCHEMA};
+use crate::actions::{LOG_TXN_SCHEMA, SetTransaction};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::{Engine, KernelResult, KernelResultIterator, RowVisitor as _, Version};
@@ -99,10 +99,10 @@ mod tests {
     use itertools::Itertools;
 
     use super::*;
+    use crate::Snapshot;
     use crate::arrow::array::StringArray;
     use crate::engine::sync::SyncEngine;
     use crate::unit_test_utils::parse_json_batch;
-    use crate::Snapshot;
 
     fn get_latest_transactions(
         path: &str,

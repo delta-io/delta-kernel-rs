@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
 use delta_kernel::arrow::array::{
-    new_null_array, Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array,
-    LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
+    Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array, LargeStringArray,
+    PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray, new_null_array,
 };
 use delta_kernel::arrow::compute::concat;
 use delta_kernel::arrow::compute::kernels::aggregate::{
@@ -16,9 +16,9 @@ use delta_kernel::arrow::compute::kernels::aggregate::{
 };
 use delta_kernel::arrow::datatypes::{
     ArrowPrimitiveType, DataType, Date32Type, Date64Type, Decimal128Type, Field, Float32Type,
-    Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, SchemaRef as ArrowSchemaRef, TimeUnit,
+    Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, SchemaRef as ArrowSchemaRef, TimeUnit,
     TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use delta_kernel::column_trie::ColumnTrie;
 use delta_kernel::engine::arrow_utils::fix_nested_null_masks;
@@ -775,7 +775,7 @@ fn reduce_stats(stats: &StructArray) -> KernelResult<StructArray> {
             other => {
                 return Err(KernelError::internal_error(format!(
                     "cannot reduce unknown stats section: {other}"
-                )))
+                )));
             }
         });
     }
@@ -2021,11 +2021,13 @@ mod tests {
         let leaf = |section| string_leaf(child_struct(&merged, section), "s");
         assert_eq!(leaf(MIN_VALUES), Some("apple"));
         assert_eq!(leaf(MAX_VALUES), Some("date"));
-        assert!(merged
-            .column_by_name(TIGHT_BOUNDS)
-            .unwrap()
-            .as_boolean()
-            .value(0));
+        assert!(
+            merged
+                .column_by_name(TIGHT_BOUNDS)
+                .unwrap()
+                .as_boolean()
+                .value(0)
+        );
     }
 
     #[test]
@@ -2486,11 +2488,13 @@ mod tests {
         assert_eq!(bound(MIN_VALUES), expected_bounds.map(|(min, _)| min));
         assert_eq!(bound(MAX_VALUES), expected_bounds.map(|(_, max)| max));
         assert_eq!(flat_stat::<Int64Type>(&stats, NULL_COUNT, "n"), 0);
-        assert!(stats
-            .column_by_name(TIGHT_BOUNDS)
-            .unwrap()
-            .as_boolean()
-            .value(0));
+        assert!(
+            stats
+                .column_by_name(TIGHT_BOUNDS)
+                .unwrap()
+                .as_boolean()
+                .value(0)
+        );
     }
 
     // Every Arrow string type takes its own arm in `compute_leaf_agg`.

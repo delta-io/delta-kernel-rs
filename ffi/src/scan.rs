@@ -1,7 +1,7 @@
 //! Scan related ffi code
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
@@ -20,14 +20,14 @@ use crate::delta_types::FfiColumnNameArray;
 #[cfg(feature = "default-engine-base")]
 use crate::engine_data::ArrowFFIData;
 use crate::error::AllocateErrorFn;
-use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::expressions::SharedExpression;
-use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
+use crate::expressions::kernel_visitor::{KernelExpressionVisitorState, unwrap_kernel_predicate};
+use crate::schema_visitor::{KernelSchemaVisitorState, extract_kernel_schema};
 use crate::{
-    kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
-    ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice,
-    NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema, SharedSnapshot,
-    TryFromStringSlice,
+    AllocateStringFn, ExternEngine, ExternResult, IntoExternResult, KernelBoolSlice,
+    KernelRowIndexArray, KernelStringSlice, NullableCvoid, OptionalValue, SharedExternEngine,
+    SharedSchema, SharedSnapshot, TryFromStringSlice, kernel_string_slice,
+    unwrap_and_parse_path_as_url,
 };
 
 #[handle_descriptor(target=Scan, mutable=false, sized=true)]
@@ -1149,29 +1149,29 @@ mod scan_builder_tests {
 
     use std::ffi::c_void;
 
-    use test_utils::{actions_to_string, TestAction};
+    use test_utils::{TestAction, actions_to_string};
     #[cfg(feature = "geo-type-in-dev")]
     use url::Url;
 
     use super::{
-        free_scan, free_scan_builder, scan_builder, scan_builder_build,
-        scan_builder_with_predicate, scan_builder_with_schema, scan_builder_with_stats,
-        scan_logical_schema, EnginePredicate, EngineSchema, FfiStatsOptions,
+        EnginePredicate, EngineSchema, FfiStatsOptions, free_scan, free_scan_builder, scan_builder,
+        scan_builder_build, scan_builder_with_predicate, scan_builder_with_schema,
+        scan_builder_with_stats, scan_logical_schema,
     };
     use crate::delta_types::{FfiColumnName, FfiColumnNameArray};
     use crate::error::FFIKernelError;
     use crate::expressions::kernel_visitor::{
-        visit_expression_column, visit_expression_literal_int, visit_predicate_lt,
-        KernelExpressionVisitorState,
+        KernelExpressionVisitorState, visit_expression_column, visit_expression_literal_int,
+        visit_predicate_lt,
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::ffi_test_utils::build_snapshot;
     use crate::ffi_test_utils::{allocate_err, ok_or_panic, recover_error, setup_snapshot};
     use crate::schema_visitor::{
-        visit_field_integer, visit_field_struct, KernelSchemaVisitorState,
+        KernelSchemaVisitorState, visit_field_integer, visit_field_struct,
     };
     use crate::{
-        free_engine, free_schema, free_snapshot, kernel_string_slice, ExternResult, FfiSlice,
+        ExternResult, FfiSlice, free_engine, free_schema, free_snapshot, kernel_string_slice,
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::{
@@ -1766,14 +1766,14 @@ mod scan_metadata_arrow_tests {
         Array, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
     };
     use rstest::rstest;
-    use test_utils::{actions_to_string, TestAction};
+    use test_utils::{TestAction, actions_to_string};
 
     use super::{
-        free_scan, free_scan_metadata_arrow_result, free_scan_metadata_iter, get_transform_for_row,
-        scan_builder, scan_builder_build, scan_builder_with_partition_values,
-        scan_builder_with_stats, scan_metadata_iter_init, scan_metadata_next_arrow_impl,
         CTransforms, FfiPartitionValuesOptions, FfiStatsOptions, ScanMetadataArrowResult,
-        SharedScan, SharedScanMetadataIterator,
+        SharedScan, SharedScanMetadataIterator, free_scan, free_scan_metadata_arrow_result,
+        free_scan_metadata_iter, get_transform_for_row, scan_builder, scan_builder_build,
+        scan_builder_with_partition_values, scan_builder_with_stats, scan_metadata_iter_init,
+        scan_metadata_next_arrow_impl,
     };
     use crate::engine_data::ArrowFFIData;
     use crate::ffi_test_utils::{ok_or_panic, setup_snapshot};
@@ -1880,9 +1880,11 @@ mod scan_metadata_arrow_tests {
         assert!(batch_schema.field_with_name("deletionVector").is_ok());
         assert!(batch_schema.field_with_name("fileConstantValues").is_ok());
         assert!(batch_schema.field_with_name("stats_parsed").is_err());
-        assert!(batch_schema
-            .field_with_name("partitionValues_parsed")
-            .is_err());
+        assert!(
+            batch_schema
+                .field_with_name("partitionValues_parsed")
+                .is_err()
+        );
 
         // Selection vector length matches batch rows; exactly 1 row selected (the add file)
         assert_eq!(sv.len(), batch.num_rows());
@@ -2285,23 +2287,23 @@ mod tests {
 
         use delta_kernel::plans::proto::operation as proto_op;
         use prost::Message as _;
-        use test_utils::{actions_to_string, TestAction};
+        use test_utils::{TestAction, actions_to_string};
 
         use super::super::{
-            free_scan, scan_builder, scan_builder_build, scan_builder_with_predicate,
-            scan_declarative_metadata_plan, EnginePredicate,
+            EnginePredicate, free_scan, scan_builder, scan_builder_build,
+            scan_builder_with_predicate, scan_declarative_metadata_plan,
         };
         use crate::error::EngineExecResult;
         use crate::expressions::kernel_visitor::{
-            visit_expression_literal_bool, KernelExpressionVisitorState,
+            KernelExpressionVisitorState, visit_expression_literal_bool,
         };
         use crate::ffi_test_utils::{allocate_err, ok_or_panic, setup_snapshot};
         use crate::handle::Handle;
         use crate::plans::result::CPlanResult;
         use crate::plans::{get_plan_based_engine, get_plan_executor};
         use crate::{
-            free_engine, free_snapshot, KernelBytesSlice, NullableCvoid, OptionalValue,
-            SharedExternEngine,
+            KernelBytesSlice, NullableCvoid, OptionalValue, SharedExternEngine, free_engine,
+            free_snapshot,
         };
 
         extern "C" fn visit_false(

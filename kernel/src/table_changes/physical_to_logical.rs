@@ -5,9 +5,9 @@ use super::{CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_
 use crate::expressions::Scalar;
 use crate::scan::state_info::StateInfo;
 use crate::scan::transform_spec::{
-    get_transform_expr, parse_partition_values, FileRowTrackingMetadata,
+    FileRowTrackingMetadata, get_transform_expr, parse_partition_values,
 };
-use crate::schema::{schema_ref, SchemaRef, StructType};
+use crate::schema::{SchemaRef, StructType, schema_ref};
 use crate::{ExpressionRef, KernelError, KernelResult};
 
 /// Gets CDF metadata columns from the logical schema and scan file.
@@ -136,11 +136,11 @@ mod tests {
 
     use super::*;
     use crate::expressions::Expression;
+    use crate::scan::PhysicalPredicate;
     use crate::scan::state::DvInfo;
     use crate::scan::state_info::StateInfo;
     use crate::scan::transform_spec::FieldTransformSpec;
-    use crate::scan::PhysicalPredicate;
-    use crate::schema::{schema, schema_ref, DataType};
+    use crate::schema::{DataType, schema, schema_ref};
     use crate::table_features::ColumnMappingMode;
 
     fn create_test_logical_schema() -> SchemaRef {

@@ -287,7 +287,7 @@ fn collect_required_leaf_paths(
 mod tests {
     use super::*;
     use crate::expressions::column_name;
-    use crate::schema::{schema, StructType};
+    use crate::schema::{StructType, schema};
     use crate::table_properties::TableProperties;
 
     fn make_props_with_num_cols(n: u64) -> TableProperties {

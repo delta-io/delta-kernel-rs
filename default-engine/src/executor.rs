@@ -11,8 +11,8 @@
 //! runtime. Behind the `tokio` feature flag, we provide a both a single-threaded
 //! and multi-threaded executor based on Tokio.
 use delta_kernel::KernelResult;
-use futures::future::BoxFuture;
 use futures::Future;
+use futures::future::BoxFuture;
 
 /// An executor that can be used to run async tasks. This is used by IO functions
 /// within the `DefaultEngine`.

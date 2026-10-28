@@ -12,25 +12,26 @@ use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{col, lit, ColumnName, Predicate, Scalar};
-use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::expressions::{ColumnName, Predicate, Scalar, col, lit};
 use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::parquet::arrow::ArrowWriter;
-use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::PartitionValuesOptions;
-use delta_kernel::schema::{schema_ref, DataType, StructField};
-use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
+use delta_kernel::scan::state::ScanFile;
+use delta_kernel::schema::{DataType, StructField, schema_ref};
+use delta_kernel::table_features::{ColumnMappingMode, get_any_level_column_physical_name};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Engine, Snapshot, SnapshotRef};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{
-    partitioned, unpartitioned, version_latest, FeatureSet, LogState, TableConfig, TestTableBuilder,
+    FeatureSet, LogState, TableConfig, TestTableBuilder, partitioned, unpartitioned, version_latest,
 };
 use test_utils::{
-    add_commit, assert_result_error_with_message, create_default_engine_mt_executor, get_column,
-    install_thread_local_metrics_reporter, test_context, test_table_setup_mt, CountingReporter,
+    CountingReporter, add_commit, assert_result_error_with_message,
+    create_default_engine_mt_executor, get_column, install_thread_local_metrics_reporter,
+    test_context, test_table_setup_mt,
 };
 use url::Url;
 

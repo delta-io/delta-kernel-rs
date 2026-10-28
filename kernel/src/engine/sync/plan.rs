@@ -28,13 +28,13 @@ use crate::arrow::row::{OwnedRow, RowConverter, SortField};
 use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
-use crate::engine::arrow_expression::{extract_column, ArrowEvaluationHandler};
+use crate::engine::arrow_expression::{ArrowEvaluationHandler, extract_column};
 use crate::engine::arrow_utils::{coerce_columns_to_schema, to_json_bytes};
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
 use crate::plans::ir::nodes::{
-    DynamicScan, FileType, Operator, Project, RelationId, RelationRef, ScanFile, ScanJson,
-    ScanParquet, SemiJoin, Values, WriteJson, FILE_META_SCHEMA,
+    DynamicScan, FILE_META_SCHEMA, FileType, Operator, Project, RelationId, RelationRef, ScanFile,
+    ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, ScopedPlanExecutor};
@@ -711,10 +711,10 @@ mod tests {
     use crate::arrow::array::StructArray;
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
     use crate::engine::sync::get_bytes;
-    use crate::expressions::{col, column_name, lit, Predicate, StructData};
+    use crate::expressions::{Predicate, StructData, col, column_name, lit};
     use crate::object_store::memory::InMemory;
     use crate::plans::PlanBuilder;
-    use crate::schema::{schema, schema_ref, ToSchema as _};
+    use crate::schema::{ToSchema as _, schema, schema_ref};
 
     fn write_plan(
         inputs: impl IntoIterator<Item = PlanBuilder>,
@@ -911,9 +911,11 @@ mod tests {
         let error = scoped
             .create_ref("arrow-batch", wrong_schema, batch.clone())
             .expect_err("a mismatched schema must be rejected");
-        assert!(error
-            .to_string()
-            .contains("record batch schema does not match"));
+        assert!(
+            error
+                .to_string()
+                .contains("record batch schema does not match")
+        );
 
         let relation_ref = scoped.create_ref("arrow-batch", schema, batch.clone())?;
         assert!(relation_ref.id().starts_with("arrow-batch-"));
@@ -930,9 +932,11 @@ mod tests {
             .execute_op(Operation::QueryPlan(query))
             .err()
             .expect("the unscoped executor must reject a scope's relation");
-        assert!(error
-            .to_string()
-            .contains("requires an executor that can store relations"));
+        assert!(
+            error
+                .to_string()
+                .contains("requires an executor that can store relations")
+        );
         Ok(())
     }
 
@@ -946,9 +950,11 @@ mod tests {
         let error = scoped
             .execute_and_retain("wrong-schema", plan)
             .expect_err("a mismatched plan schema must be rejected");
-        assert!(error
-            .to_string()
-            .contains("record batch schema does not match"));
+        assert!(
+            error
+                .to_string()
+                .contains("record batch schema does not match")
+        );
         assert!(scoped.relation_store.lock().unwrap().is_empty());
         Ok(())
     }
@@ -1020,9 +1026,11 @@ mod tests {
             .execute_op(Operation::QueryPlan(unscoped))
             .err()
             .expect("the unscoped executor must reject a scope's relation");
-        assert!(error
-            .to_string()
-            .contains("requires an executor that can store relations"));
+        assert!(
+            error
+                .to_string()
+                .contains("requires an executor that can store relations")
+        );
 
         let weak_column = {
             let retained_relations = first_scope.relation_store.lock().unwrap();

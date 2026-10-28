@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    new_null_array, ArrayRef, BinaryArray, Int32Array, StructArray, TimestampMicrosecondArray,
+    ArrayRef, BinaryArray, Int32Array, StructArray, TimestampMicrosecondArray, new_null_array,
 };
 use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
@@ -11,11 +11,11 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField};
-use delta_kernel::transaction::create_table::create_table as kernel_create_table;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::schema::{DataType, SchemaRef, StructField, schema_ref};
 use delta_kernel::transaction::UpdateTableOperation;
+use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::{KernelError, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
@@ -101,13 +101,15 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     // Check that the add action exists
     assert!(parsed_commits[1].get("add").is_some());
     // Ensure the supplied data-change intent is used.
-    assert!(parsed_commits[1]
-        .get("add")
-        .unwrap()
-        .get("dataChange")
-        .unwrap()
-        .as_bool()
-        .unwrap());
+    assert!(
+        parsed_commits[1]
+            .get("add")
+            .unwrap()
+            .get("dataChange")
+            .unwrap()
+            .as_bool()
+            .unwrap()
+    );
 
     let stats: serde_json::Value =
         serde_json::from_str(parsed_commits[1]["add"]["stats"].as_str().unwrap())?;
@@ -121,8 +123,8 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn test_append_timestamp_stats_are_millisecond_truncated(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_append_timestamp_stats_are_millisecond_truncated()
+-> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = schema_ref! { nullable "ts": TIMESTAMP };
@@ -853,8 +855,8 @@ async fn metadata_only_commit_with_void_in_array_succeeds() -> Result<(), Box<dy
 // Schema: {id: int, s: struct<a: int, b: void>}
 // Physical: {id: int, s: struct<a: int>}
 #[tokio::test]
-async fn write_context_excludes_nested_void_from_physical_schema(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn write_context_excludes_nested_void_from_physical_schema()
+-> Result<(), Box<dyn std::error::Error>> {
     let schema = schema_ref! {
         nullable "id": INTEGER,
         nullable "s": {

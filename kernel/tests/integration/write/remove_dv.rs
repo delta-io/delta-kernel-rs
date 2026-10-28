@@ -9,8 +9,8 @@ use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionV
 use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
 use delta_kernel::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use delta_kernel::arrow::array::{
-    new_null_array, Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray,
-    StructArray,
+    Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+    new_null_array,
 };
 use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{
@@ -22,14 +22,14 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::{
-    col, lit, null_lit, ExpressionStructPatchBuilder, MapData, Scalar,
+    ExpressionStructPatchBuilder, MapData, Scalar, col, lit, null_lit,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::log_replay::FileActionKey;
-use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::scan::{scan_row_schema, PartitionValuesOptions, StatsOptions};
-use delta_kernel::schema::{schema_ref, DataType, MapType};
+use delta_kernel::object_store::path::Path;
+use delta_kernel::scan::{PartitionValuesOptions, StatsOptions, scan_row_schema};
+use delta_kernel::schema::{DataType, MapType, schema_ref};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel::{
@@ -600,8 +600,8 @@ async fn test_remove_files_adds_expected_entries() -> KernelResult<()> {
 /// `test_remove_files_adds_expected_entries` covers the timestamped, conditionally-extended shape.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[tokio::test]
-async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_extended_metadata(
-) -> KernelResult<()> {
+async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_extended_metadata()
+-> KernelResult<()> {
     // v1: create a `number: INTEGER` adaptiveMetadata table and append a data file.
     let (_tmp_dir, table_url, engine, snapshot) =
         create_number_table(vec!["adaptiveMetadata-preview"], vec![], "id", true).await?;
@@ -2200,8 +2200,8 @@ fn setup_table_with_dv_small() -> KernelResult<DvSmallTableSetup> {
 /// remove under the id that [`DeletionVectorDescriptor::unique_id_for`] derives for the add's DV.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[tokio::test]
-async fn adaptive_metadata_remove_cancels_add_across_dv_storage_types(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn adaptive_metadata_remove_cancels_add_across_dv_storage_types()
+-> Result<(), Box<dyn std::error::Error>> {
     // v1: create an adaptiveMetadata table with one data file.
     let (_tmp_dir, table_url, engine, snapshot) =
         create_number_table(vec!["adaptiveMetadata-preview"], vec![], "id", true).await?;

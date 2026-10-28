@@ -39,9 +39,9 @@ pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
 
 #[cfg(feature = "declarative-plans")]
-use crate::plans::{RelationRef, ScopedPlanExecutor};
-#[cfg(feature = "declarative-plans")]
 use crate::KernelError;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::{RelationRef, ScopedPlanExecutor};
 use crate::{Engine, FilteredEngineData, KernelResult, KernelResultIterator};
 
 /// A Committer is the system by which transactions are committed to a table. Transactions are

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{new_null_array, ArrayRef, RecordBatch, StructArray};
+use datafusion::arrow::array::{ArrayRef, RecordBatch, StructArray, new_null_array};
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use datafusion::common::utils::take_function_args;
 use datafusion::common::{
@@ -11,8 +11,8 @@ use datafusion::common::{
 use datafusion::functions::core::expr_fn::{coalesce, get_field, named_struct, nullif};
 use datafusion::functions_nested::expr_fn::make_array;
 use datafusion::logical_expr::{
-    binary_expr, cast, lit, Case, ColumnarValue, Expr as DFExpr, Operator, ScalarFunctionArgs,
-    ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    Case, ColumnarValue, Expr as DFExpr, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+    Signature, Volatility, binary_expr, cast, lit,
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -152,7 +152,7 @@ fn variadic_to_df_expr(
             Some(other) => {
                 return Err(KernelError::unsupported(format!(
                     "converting an Array expression requires an array output type, got {other:?}"
-                )))
+                )));
             }
             None => None,
         },
@@ -640,10 +640,10 @@ mod tests {
     use datafusion::physical_expr::create_physical_expr;
     use datafusion::physical_expr::execution_props::ExecutionProps;
     use delta_kernel::expressions::{
-        col, lit, null_lit, ColumnName as KernelColumnName, Expression as KernelExpr,
-        ExpressionStructPatch, ExpressionStructPatchBuilder, MapToStructOptions,
+        ColumnName as KernelColumnName, Expression as KernelExpr, ExpressionStructPatch,
+        ExpressionStructPatchBuilder, MapToStructOptions, col, lit, null_lit,
     };
-    use delta_kernel::schema::{schema, schema_ref, ArrayType, DataType, MapType, StructType};
+    use delta_kernel::schema::{ArrayType, DataType, MapType, StructType, schema, schema_ref};
     use rstest::rstest;
 
     use super::*;
@@ -1145,8 +1145,9 @@ mod tests {
         #[case] expected_value: &str,
     ) {
         let target = schema! { nullable "f": (field_type) };
-        let expected =
-            format!("CASE WHEN pv IS NOT NULL THEN named_struct(Utf8(\"f\"), {expected_value}) ELSE NULL END");
+        let expected = format!(
+            "CASE WHEN pv IS NOT NULL THEN named_struct(Utf8(\"f\"), {expected_value}) ELSE NULL END"
+        );
         assert_eq!(lower_map_to_struct(target), expected);
     }
 

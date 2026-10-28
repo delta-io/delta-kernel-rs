@@ -10,29 +10,29 @@ use update_table::{intermediate_dv_schema, new_dv_column_schema};
 
 use super::stats_verifier::StatsColumnVerifier;
 use super::{
-    augmented_write_metadata_schema, stats_verifier, with_row_tracking_cols, CommitResult,
-    EngineDataResultIterator, Imperative, NonfileCommitActions, PostCommitInputs, Transaction,
-    UpdateTable,
-};
-use crate::actions::{
-    as_log_add_schema, CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction,
-    LOG_DOMAIN_METADATA_SCHEMA, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA,
-    LOG_TXN_SCHEMA,
+    CommitResult, EngineDataResultIterator, Imperative, NonfileCommitActions, PostCommitInputs,
+    Transaction, UpdateTable, augmented_write_metadata_schema, stats_verifier,
+    with_row_tracking_cols,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{BackReference, CheckpointAction};
+use crate::actions::{
+    CommitInfo, DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA, LOG_METADATA_SCHEMA,
+    LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA, LOG_TXN_SCHEMA, Metadata, Protocol, SetTransaction,
+    as_log_add_schema,
+};
 use crate::committer::{CommitMetadata, CommitResponse};
 use crate::crc::FileStatsDelta;
 use crate::engine_data::FilteredEngineData;
 use crate::error::KernelError;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
-    col, column_name, lit, null_lit, ArrayData, ColumnName, ExpressionStructPatch,
-    ExpressionStructPatchBuilder,
+    ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, col, column_name,
+    lit, null_lit,
 };
 use crate::log_replay::HasSelectionVector;
-use crate::metrics::events::TRANSACTION_COMMIT_SPAN;
 use crate::metrics::CommitFailureReason;
+use crate::metrics::events::TRANSACTION_COMMIT_SPAN;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::{
@@ -42,13 +42,13 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::ToSchema;
-use crate::schema::{schema_ref, ArrayType, SchemaRef, StructField, StructType};
+use crate::schema::{ArrayType, SchemaRef, StructField, StructType, schema_ref};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
-    create_row, version_as_i64, DataType, Engine, EngineData, Expression, KernelResult,
-    KernelResultIterator, Predicate, RowVisitor, Version,
+    DataType, Engine, EngineData, Expression, KernelResult, KernelResultIterator, Predicate,
+    RowVisitor, Version, create_row, version_as_i64,
 };
 
 mod update_table;
@@ -801,7 +801,7 @@ mod tests {
     use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
     use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
     use crate::arrow::array::{
-        new_null_array, ArrayRef, BooleanArray, Int64Array, StringArray, StructArray,
+        ArrayRef, BooleanArray, Int64Array, StringArray, StructArray, new_null_array,
     };
     use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
@@ -812,12 +812,12 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{MapData, Scalar, StructData};
     use crate::scan::log_replay::PATH_NAME;
-    use crate::schema::{column_name, schema, MapType};
+    use crate::schema::{MapType, column_name, schema};
     use crate::table_configuration::TableConfiguration;
     use crate::table_properties::APPEND_ONLY;
+    use crate::transaction::BASE_ADD_FILES_SCHEMA;
     use crate::transaction::create_table::create_table;
     use crate::transaction::operation::UpdateTableOperation;
-    use crate::transaction::BASE_ADD_FILES_SCHEMA;
     use crate::unit_test_utils::{copy_test_table, create_valid_add_file_batch, test_schema_flat};
     use crate::{EvaluationHandler, Snapshot};
 

@@ -13,16 +13,16 @@ use url::Url;
 use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
-    deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
+    DeletionVectorDescriptor, deletion_treemap_to_bools, split_vector,
 };
-use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
+use crate::actions::{ADD_FIELD, ADD_NAME, Add, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
 use crate::engine::CancellableEngine;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{
-    column_name, ColumnName, ExpressionRef, MapToStructOptions, Predicate, PredicateRef,
+    ColumnName, ExpressionRef, MapToStructOptions, Predicate, PredicateRef, column_name,
 };
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
@@ -36,19 +36,19 @@ use crate::parallel::sequential_phase::SequentialPhase;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{
-    ScanLogReplayProcessor, BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME,
-    DEFAULT_ROW_COMMIT_VERSION_NAME,
+    BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
+    ScanLogReplayProcessor,
 };
 use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    lazy_schema_ref, schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef,
-    StructField, StructType, ToSchema as _,
+    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
+    ToSchema as _, lazy_schema_ref, schema_ref,
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, Operation};
-use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
-use crate::utils::{require, FoldWithOption as _, IteratorExt};
+use crate::transforms::{ExpressionTransform, SchemaTransform, transform_output_type};
+use crate::utils::{FoldWithOption as _, IteratorExt, require};
 use crate::{
     Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, SnapshotRef,
     Version,

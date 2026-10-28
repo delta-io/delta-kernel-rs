@@ -13,13 +13,13 @@
 //! update_table_txn_get_unpartitioned_write_context(txn, engine)
 //! ```
 
-use delta_kernel::transaction::Transaction;
 use delta_kernel::KernelResult;
+use delta_kernel::transaction::Transaction;
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::transaction::ExclusiveUpdateTableTransaction;
-use crate::{kernel_string_slice, KernelStringSlice, NullableCvoid, SharedExternEngine};
+use crate::{KernelStringSlice, NullableCvoid, SharedExternEngine, kernel_string_slice};
 
 /// Acknowledges that the connector materializes this table's column defaults before writing data
 /// files.
@@ -105,7 +105,7 @@ mod tests {
     use crate::ffi_test_utils::{build_update_table_txn, ok_or_panic};
     use crate::tests::get_default_engine;
     use crate::transaction::free_update_table_txn;
-    use crate::{free_engine, TryFromStringSlice};
+    use crate::{TryFromStringSlice, free_engine};
 
     const FIXTURE: &str = "../kernel/tests/data/table-with-column-defaults/";
 

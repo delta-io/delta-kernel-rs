@@ -13,11 +13,11 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{KernelError, KernelResult, Snapshot, Version};
 use rstest::rstest;
 use serde_json::json;
-use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::{
-    add_commit, assert_result_error_with_message, engine_store_setup, insert_data_with,
-    test_table_setup_mt, TestCatalogCommitter,
+    TestCatalogCommitter, add_commit, assert_result_error_with_message, engine_store_setup,
+    insert_data_with, test_table_setup_mt,
 };
 
 /// The newest version of the table built by [`setup_multi_version_table`].

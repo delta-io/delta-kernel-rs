@@ -7,8 +7,8 @@ use delta_kernel_derive::internal_api;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{
-    CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction, MAX_VALUES, MIN_VALUES,
-    NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
+    CommitInfo, DomainMetadata, MAX_VALUES, MIN_VALUES, Metadata, NULL_COUNT, NUM_RECORDS,
+    Protocol, SetTransaction, TIGHT_BOUNDS,
 };
 use crate::committer::{CommitMetadata, CommitProtocolMetadata, CommitType, Committer};
 use crate::crc::{CrcDelta, FileStatsDelta};
@@ -20,14 +20,14 @@ use crate::path::{LogRoot, ParsedLogPath};
 use crate::scan::log_replay::STATS_NAME;
 use crate::schema::void_utils::validate_schema_for_write;
 use crate::schema::{
-    lazy_schema_ref, ColumnDefault, SchemaRef, SchemaStructPatchBuilder, StructField,
+    ColumnDefault, SchemaRef, SchemaStructPatchBuilder, StructField, lazy_schema_ref,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 #[cfg(feature = "check-constraints-in-dev")]
 use crate::table_properties::CheckConstraint;
-use crate::utils::{require, PhantomType};
+use crate::utils::{PhantomType, require};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::version_as_i64;
 use crate::{DataType, Engine, EngineData, FileMeta, KernelResult, KernelResultIterator, Version};
@@ -47,8 +47,8 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
-pub use builder::update_table::UpdateTableTransactionBuilder;
 use builder::TransactionBuilderState;
+pub use builder::update_table::UpdateTableTransactionBuilder;
 pub use builder::{TransactionBuilder, TransactionType};
 use commit_info::collect_operation_metadata;
 mod bound_write_context;
@@ -1498,8 +1498,8 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::CommitInfo;
+    use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::arrow::array::{
         ArrayRef, Float64Array, Int32Array, Int64Array, NullArray, StringArray,
     };
@@ -1517,25 +1517,25 @@ mod tests {
         ArrayData, ExpressionStructPatchBuilder, MapData, Scalar, StructData,
     };
     use crate::metrics::{CommitFailureReason, MetricEvent, TableType, TransactionCommitFailure};
+    use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStoreExt as _;
     use crate::scan::state_info::tests::RowTrackingState;
-    use crate::schema::{column_name, schema, schema_ref, ArrayType, MapType, StructType};
+    use crate::schema::{ArrayType, MapType, StructType, column_name, schema, schema_ref};
     use crate::table_features::{ColumnMappingMode, TableFeature};
     use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_ROW_TRACKING};
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
     use crate::transaction::exec_mode::StagedDataChanges;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::unit_test_utils::{
-        adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
-    };
-    use crate::unit_test_utils::{
+        CapturingReporter, MockProtocolBuilder, MockTableConfigurationBuilder,
         assert_result_error_with_message, copy_test_table, create_valid_add_file_batch,
         install_thread_local_metrics_reporter, load_test_table, string_array_to_engine_data,
         test_schema_flat, test_schema_nested, test_schema_with_array, test_schema_with_map,
-        CapturingReporter, MockProtocolBuilder, MockTableConfigurationBuilder,
+    };
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::unit_test_utils::{
+        adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
     };
     use crate::{EvaluationHandler, Expression, KernelResultIterator, Snapshot};
 
@@ -1953,9 +1953,11 @@ mod tests {
         // Independently built transactions must retain their own write schemas.
         let initial_write_state = txn.write_state()?;
         let initial_write_context = initial_write_state.write_context_builder().build()?;
-        assert!(!initial_write_context
-            .logical_data_schema()
-            .contains("fresh_column"));
+        assert!(
+            !initial_write_context
+                .logical_data_schema()
+                .contains("fresh_column")
+        );
 
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
@@ -1964,15 +1966,21 @@ mod tests {
 
         let updated_write_state = txn.write_state()?;
         let updated_write_context = updated_write_state.write_context_builder().build()?;
-        assert!(updated_write_context
-            .logical_data_schema()
-            .contains("fresh_column"));
-        assert!(updated_write_context
-            .physical_data_schema()
-            .contains("fresh_column"));
-        assert!(!initial_write_context
-            .logical_data_schema()
-            .contains("fresh_column"));
+        assert!(
+            updated_write_context
+                .logical_data_schema()
+                .contains("fresh_column")
+        );
+        assert!(
+            updated_write_context
+                .physical_data_schema()
+                .contains("fresh_column")
+        );
+        assert!(
+            !initial_write_context
+                .logical_data_schema()
+                .contains("fresh_column")
+        );
 
         Ok(())
     }
@@ -2434,7 +2442,7 @@ mod tests {
         assert_eq!(get_column!(rb, names[1], Int32Array).value(0), 7); // p2 (prepended)
         assert_eq!(get_column!(rb, names[2], Int32Array).value(0), 10); // d1
         assert_eq!(get_column!(rb, names[3], StringArray).value(0), "cc"); // p3 (after d1, void
-                                                                           // skipped)
+        // skipped)
         assert_eq!(get_column!(rb, names[4], Int32Array).value(0), 9); // p4 (after d1)
         assert_eq!(get_column!(rb, names[5], Int32Array).value(0), 20); // d2
         Ok(())
@@ -2577,7 +2585,8 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("matched") && err_msg.contains("does not match"),
-            "Expected error about mismatched count (expected 1 descriptor, 0 matched files), got: {err_msg}");
+            "Expected error about mismatched count (expected 1 descriptor, 0 matched files), got: {err_msg}"
+        );
         Ok(())
     }
 

@@ -24,7 +24,7 @@ use delta_kernel::{
     KernelError, KernelResult, KernelResultIterator, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
-use futures::{ready, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, ready};
 use url::Url;
 
 use crate::executor::TaskExecutor;
@@ -283,7 +283,7 @@ mod tests {
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::ops::Range;
     use std::path::PathBuf;
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::task::Waker;
 
     use delta_kernel::actions::get_commit_schema;

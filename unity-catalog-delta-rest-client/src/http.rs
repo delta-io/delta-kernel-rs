@@ -1,6 +1,6 @@
 use std::future::Future;
 
-use reqwest::{header, Client, Response, StatusCode};
+use reqwest::{Client, Response, StatusCode, header};
 use tracing::warn;
 
 use crate::config::ClientConfig;
@@ -55,7 +55,7 @@ where
                 return Err(Error::HttpStatusError {
                     status: response.status().as_u16(),
                     message: "Server error".to_string(),
-                })
+                });
             }
             Err(e) if retry < config.max_retries => {
                 warn!(

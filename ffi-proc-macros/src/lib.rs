@@ -4,8 +4,8 @@ use quote::{quote, quote_spanned};
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
 use syn::{
-    parse_macro_input, Error, Fields, FieldsNamed, FieldsUnnamed, Ident, ItemStruct, LitBool,
-    Result, Token, Type,
+    Error, Fields, FieldsNamed, FieldsUnnamed, Ident, ItemStruct, LitBool, Result, Token, Type,
+    parse_macro_input,
 };
 
 struct HandleDescriptorParams {
@@ -31,7 +31,7 @@ impl Parse for HandleDescriptorParams {
                 return Err(Error::new(
                     target.span(),
                     "expected a type or a trait object",
-                ))
+                ));
             }
         };
 

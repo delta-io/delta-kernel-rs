@@ -393,14 +393,18 @@ mod tests {
         // in_commit_timestamp
         assert_eq!(commit_metadata.in_commit_timestamp(), 1234);
         assert_eq!(commit_metadata.max_published_version(), Some(42));
-        assert!(commit_metadata
-            .protocol_metadata()
-            .read_protocol()
-            .is_some());
-        assert!(commit_metadata
-            .protocol_metadata()
-            .read_metadata()
-            .is_some());
+        assert!(
+            commit_metadata
+                .protocol_metadata()
+                .read_protocol()
+                .is_some()
+        );
+        assert!(
+            commit_metadata
+                .protocol_metadata()
+                .read_metadata()
+                .is_some()
+        );
         assert!(commit_metadata.protocol_metadata().new_protocol().is_none());
         assert!(commit_metadata.protocol_metadata().new_metadata().is_none());
         assert!(commit_metadata.domain_metadata_changes().is_empty());

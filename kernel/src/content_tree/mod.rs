@@ -20,7 +20,7 @@ use delta_kernel_derive::ToSchema;
 use url::Url;
 
 use crate::engine_data::{EngineData, GetData, TypedGetData as _};
-use crate::expressions::{null_lit, Expression, Scalar, StructData};
+use crate::expressions::{Expression, Scalar, StructData, null_lit};
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::{ColumnNamesAndTypes, DataType, StructType, ToSchema as _};
 use crate::{KernelError, KernelResult, Version};

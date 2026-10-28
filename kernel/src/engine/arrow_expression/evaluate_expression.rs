@@ -10,12 +10,12 @@ use tracing::warn;
 use super::timestamp_timezone::TimestampTimezone;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
-    self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
-    AsArray, BooleanArray, Datum, ListArray, MapArray, MutableArrayData, NullBufferBuilder,
-    RecordBatch, StringArray, StructArray,
+    self as arrow_array, Array, ArrayBuilder, ArrayData, ArrayRef, AsArray, BooleanArray, Datum,
+    ListArray, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch, StringArray,
+    StructArray, make_array, new_null_array,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
-use crate::arrow::compute::kernels::cast_utils::{string_to_datetime, Parser};
+use crate::arrow::compute::kernels::cast_utils::{Parser, string_to_datetime};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
@@ -27,15 +27,15 @@ use crate::arrow::datatypes::{
     Schema as ArrowSchema, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
-use crate::arrow::json::writer::{make_encoder, EncoderOptions};
 use crate::arrow::json::StructMode;
+use crate::arrow::json::writer::{EncoderOptions, make_encoder};
 use crate::delta_kernel_derive::internal_api;
-use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow, LIST_ARRAY_ROOT};
+use crate::engine::arrow_conversion::{LIST_ARRAY_ROOT, TryFromKernel, TryIntoArrow};
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
 use crate::engine::arrow_utils::{list_type_with_element, parse_json_impl, prim_array_cmp};
-use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
+use crate::engine::ensure_data_types::{ValidationMode, ensure_data_types};
 use crate::error::{KernelError, KernelResult};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
@@ -1133,12 +1133,12 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use crate::expressions::{
-        col, column_expr_ref, lit, null_lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
-        Expression as Expr, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
-        MapToStructOptions, Predicate as Pred, StructData,
+        ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
+        ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, MapToStructOptions,
+        Predicate as Pred, StructData, col, column_expr_ref, lit, null_lit,
     };
     use crate::schema::{
-        schema, schema_ref, ArrayType, DataType, MapType, StructField, StructType,
+        ArrayType, DataType, MapType, StructField, StructType, schema, schema_ref,
     };
     use crate::unit_test_utils::assert_result_error_with_message;
 
@@ -1430,10 +1430,12 @@ mod tests {
         let expr = Expr::struct_patch(patch).unwrap();
         let result =
             evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema.clone())));
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reference invalid input field names"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("reference invalid input field names")
+        );
 
         // Test unused insertion keys
         let insertion_patch =
@@ -1443,10 +1445,12 @@ mod tests {
         let result2 =
             evaluate_expression(&expr2, &batch, Some(&DataType::from(output_schema.clone())));
         assert!(result2.is_err());
-        assert!(result2
-            .unwrap_err()
-            .to_string()
-            .contains("reference invalid input field names"));
+        assert!(
+            result2
+                .unwrap_err()
+                .to_string()
+                .contains("reference invalid input field names")
+        );
 
         // Test column count mismatch -- too many output schema fields
         let drop_patch = ExpressionStructPatchBuilder::new().drop("a");
@@ -1461,10 +1465,12 @@ mod tests {
         let result3 =
             evaluate_expression(&expr3, &batch, Some(&DataType::from(wrong_output_schema)));
         assert!(result3.is_err());
-        assert!(result3
-            .unwrap_err()
-            .to_string()
-            .contains("Too many fields in output schema"));
+        assert!(
+            result3
+                .unwrap_err()
+                .to_string()
+                .contains("Too many fields in output schema")
+        );
 
         // Test column count mismatch -- too few output schema fields
         let drop_patch = ExpressionStructPatchBuilder::new().drop("a");
@@ -1475,20 +1481,24 @@ mod tests {
         let result3 =
             evaluate_expression(&expr3, &batch, Some(&DataType::from(wrong_output_schema)));
         assert!(result3.is_err());
-        assert!(result3
-            .unwrap_err()
-            .to_string()
-            .contains("Too few fields in output schema"));
+        assert!(
+            result3
+                .unwrap_err()
+                .to_string()
+                .contains("Too few fields in output schema")
+        );
 
         // Test missing output schema
         let patch = ExpressionStructPatchBuilder::new();
         let expr4 = Expr::struct_patch(patch).unwrap();
         let result4 = evaluate_expression(&expr4, &batch, None);
         assert!(result4.is_err());
-        assert!(result4
-            .unwrap_err()
-            .to_string()
-            .contains("Data type is required"));
+        assert!(
+            result4
+                .unwrap_err()
+                .to_string()
+                .contains("Data type is required")
+        );
     }
 
     #[test]
@@ -1556,10 +1566,12 @@ mod tests {
         };
         let expr = Expr::struct_patch(patch).unwrap();
         let result = evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema)));
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reference invalid input field names"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("reference invalid input field names")
+        );
     }
 
     #[test]

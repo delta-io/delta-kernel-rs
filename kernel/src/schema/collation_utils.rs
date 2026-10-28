@@ -3,7 +3,7 @@
 use crate::schema::{
     ColumnMetadataKey, DataType, FieldMetadataKeyChecker, MetadataValue, Schema, StructField,
 };
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
@@ -102,7 +102,7 @@ mod tests {
 
     use super::*;
     use crate::schema::validation::validate_schema;
-    use crate::schema::{schema, ArrayType, MapType, StructType};
+    use crate::schema::{ArrayType, MapType, StructType, schema};
     use crate::table_features::ColumnMappingMode;
 
     fn annotated(
@@ -154,10 +154,12 @@ mod tests {
     fn malformed_annotations_are_rejected(#[case] annotation: serde_json::Value) {
         let schema =
             StructType::try_new([annotated("field", DataType::STRING, annotation)]).unwrap();
-        assert!(validate_collation_annotations(&schema)
-            .unwrap_err()
-            .to_string()
-            .contains("__COLLATIONS"));
+        assert!(
+            validate_collation_annotations(&schema)
+                .unwrap_err()
+                .to_string()
+                .contains("__COLLATIONS")
+        );
     }
 
     #[rstest]

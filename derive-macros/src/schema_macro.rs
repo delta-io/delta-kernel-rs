@@ -34,15 +34,15 @@
 //! `Expr`/`LitStr`/`Ident` sub-parsers). The entry point can be a simple closure because
 //! `FnOnce(ParseStream) -> syn::Result<T>` satisfies `syn::parse::Parser`.
 
-use std::collections::hash_map::Entry as MapEntry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry as MapEntry;
 
 use proc_macro2::{Span, TokenStream};
-use quote::{quote, quote_spanned, ToTokens};
+use quote::{ToTokens, quote, quote_spanned};
 use syn::parse::{ParseStream, Parser};
 use syn::spanned::Spanned;
 use syn::token::{Brace, Bracket, Paren};
-use syn::{braced, bracketed, parenthesized, Expr, Ident, LitStr, Token};
+use syn::{Expr, Ident, LitStr, Token, braced, bracketed, parenthesized};
 
 mod kw {
     syn::custom_keyword!(nullable);

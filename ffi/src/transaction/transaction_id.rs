@@ -81,8 +81,9 @@ mod tests {
         assert_extern_result_error_contains, engine_handle_for_store, ok_or_panic,
     };
     use crate::transaction::{
-        free_committed_transaction, new_update_table_txn_builder, update_table_txn_builder_build,
-        update_table_txn_commit, update_table_txn_with_transaction_id, KernelUpdateTableOperation,
+        KernelUpdateTableOperation, free_committed_transaction, new_update_table_txn_builder,
+        update_table_txn_builder_build, update_table_txn_commit,
+        update_table_txn_with_transaction_id,
     };
     use crate::{free_engine, free_snapshot, kernel_string_slice};
 

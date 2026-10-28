@@ -12,7 +12,7 @@ use super::{put_bytes, read_files_arrow};
 use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
-    fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan, RowIndexBuilder,
+    RowIndexBuilder, fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan,
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::reader_options;
@@ -148,9 +148,9 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::EngineData;
     use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
-    use crate::EngineData;
 
     fn test_data_iter() -> Box<dyn KernelResultIterator<Box<dyn EngineData>>> {
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(

@@ -1,9 +1,9 @@
 #[cfg(doc)]
 use super::Transaction;
+use crate::EngineData;
 use crate::engine_data::FilteredEngineData;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::RelationRef;
-use crate::EngineData;
 
 /// Execution mode for a [`Transaction`].
 ///

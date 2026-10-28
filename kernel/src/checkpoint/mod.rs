@@ -115,7 +115,7 @@ use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
 };
 use crate::actions::{
-    CheckpointMetadata, ADD_FIELD, CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME,
+    ADD_FIELD, CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME, CheckpointMetadata,
     DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
     SIDECAR_FIELD,
 };
@@ -124,14 +124,14 @@ use crate::expressions::{ExpressionRef, Scalar};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::HasSelectionVector;
 use crate::path::{self, ParsedLogPath};
-use crate::schema::{lazy_schema_ref, SchemaRef, StructField};
+use crate::schema::{SchemaRef, StructField, lazy_schema_ref};
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    version_as_i64, Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator,
-    Version,
+    Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, Version,
+    version_as_i64,
 };
 
 #[cfg(feature = "declarative-plans")]
@@ -143,9 +143,9 @@ mod sidecar;
 #[allow(unused_imports)]
 pub(crate) use checkpoint_shape::{CheckpointShape, CheckpointType};
 use checkpoint_transform::{
-    build_checkpoint_read_schema, build_checkpoint_transform, StatsTransformConfig,
+    StatsTransformConfig, build_checkpoint_read_schema, build_checkpoint_transform,
 };
-use sidecar::{create_sidecar_action_batch, SidecarSplitter, SingleSidecarDataIterator};
+use sidecar::{SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch};
 #[cfg(test)]
 mod tests;
 

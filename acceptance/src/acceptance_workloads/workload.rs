@@ -220,7 +220,7 @@ pub fn execute_and_validate_workload(
 mod tests {
     use delta_kernel::arrow::array::{Int32Array, RecordBatch};
     use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-    use delta_kernel::expressions::{col, lit, Predicate};
+    use delta_kernel::expressions::{Predicate, col, lit};
 
     use super::*;
 

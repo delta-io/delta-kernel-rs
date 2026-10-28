@@ -95,6 +95,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::EngineData;
     use crate::arrow::array::{Int64Array, StringArray};
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -103,7 +104,6 @@ mod tests {
         add_files_with_partition_values, assert_result_error_with_message, nullable_add_file,
         nullable_add_files, replace_column, set_field_as_null,
     };
-    use crate::EngineData;
 
     fn add_file_validator(physical_partition_columns: &[&str]) -> StagedDataValidator {
         StagedDataValidator::for_add_files(physical_partition_columns.iter().map(|s| s.to_string()))

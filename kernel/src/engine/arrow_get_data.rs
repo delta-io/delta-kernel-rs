@@ -3,13 +3,13 @@ use std::ops::Range;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{
     Date32Type, Decimal128Type, Float32Type, Float64Type, GenericBinaryType, GenericStringType,
-    Int16Type, Int32Type, Int64Type, Int8Type, TimestampMicrosecondType,
+    Int8Type, Int16Type, Int32Type, Int64Type, TimestampMicrosecondType,
 };
 use crate::arrow::array::{
     Array, BinaryViewArray, BooleanArray, GenericByteArray, GenericListArray, GenericListViewArray,
     MapArray, OffsetSizeTrait, PrimitiveArray, RunArray, StringViewArray, StructArray,
 };
-use crate::engine::arrow_data::{as_string_accessor, ArrowEngineData};
+use crate::engine::arrow_data::{ArrowEngineData, as_string_accessor};
 use crate::engine_data::{
     EngineData, GetData, ListItem, MapItem, RowVisitor, StructList, StructListAccessor,
 };
@@ -365,11 +365,11 @@ mod tests {
 
     use super::*;
     use crate::arrow::array::{
-        BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+        BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
         LargeBinaryArray, LargeStringArray, ListArray, ListBuilder, PrimitiveArray, StringBuilder,
     };
     use crate::engine::test_utils::{
-        struct_list_fixture, struct_list_fixture_opt, CollectNVisitor,
+        CollectNVisitor, struct_list_fixture, struct_list_fixture_opt,
     };
     use crate::engine_data::GetData;
     use crate::unit_test_utils::assert_result_error_with_message;

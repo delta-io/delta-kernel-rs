@@ -749,9 +749,10 @@ mod tests {
         // Should return an error
         assert!(result.is_err());
         if let Err(e) = result {
-            assert!(e
-                .to_string()
-                .contains("Selection vector is larger than data length"));
+            assert!(
+                e.to_string()
+                    .contains("Selection vector is larger than data length")
+            );
             assert!(e.to_string().contains("3 > 2"));
         }
     }

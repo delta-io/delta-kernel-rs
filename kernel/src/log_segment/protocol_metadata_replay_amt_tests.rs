@@ -6,16 +6,16 @@ use std::sync::Arc;
 use rstest::rstest;
 use test_utils::{add_commit, assert_result_error_with_message, delta_path_for_version};
 
-use super::tests::add_checkpoint_to_store;
 use super::LogSegment;
+use super::tests::add_checkpoint_to_store;
 use crate::actions::LastManifestCommit;
 use crate::committer::FileSystemCommitter;
 use crate::crc::{Crc, FileStats, FileStatsState};
 use crate::engine::sync::SyncEngine;
 #[cfg(feature = "declarative-plans")]
 use crate::engine::test_delegating::DelegatingEngine;
-use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
+use crate::object_store::memory::InMemory;
 use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;

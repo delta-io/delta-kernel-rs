@@ -7,8 +7,8 @@ use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    parse_macro_input, Attribute, Data, DataStruct, DeriveInput, Error, Expr, ExprLit, Field,
-    Fields, Item, ItemMacro, Lit, Meta, PathArguments, Token, Type, Visibility,
+    Attribute, Data, DataStruct, DeriveInput, Error, Expr, ExprLit, Field, Fields, Item, ItemMacro,
+    Lit, Meta, PathArguments, Token, Type, Visibility, parse_macro_input,
 };
 
 mod expr_macro;

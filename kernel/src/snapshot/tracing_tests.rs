@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use test_utils::{actions_to_string, add_commit, delta_path_for_version, TestAction, METADATA};
+use test_utils::{METADATA, TestAction, actions_to_string, add_commit, delta_path_for_version};
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Level, Subscriber};
@@ -9,6 +9,7 @@ use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
 use tracing_subscriber::registry::LookupSpan;
 
 use super::SnapshotBuilder;
+use crate::FileMeta;
 use crate::engine::sync::SyncEngine;
 use crate::log_path::LogPath;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
@@ -16,7 +17,6 @@ use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::utils::try_parse_uri;
-use crate::FileMeta;
 
 const FRESH_CONSTRUCTOR_SPAN: &str = "try_new_from_log_segment";
 const INCREMENTAL_CONSTRUCTOR_SPAN: &str = "try_new_from";
@@ -199,8 +199,8 @@ fn commit_log_path(table_root: &str, version: u64) -> LogPath {
 }
 
 #[tokio::test]
-async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arguments(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arguments()
+-> Result<(), Box<dyn std::error::Error>> {
     let (engine, store, table_root) = setup_test();
     create_table(&store, &table_root).await?;
 
@@ -258,24 +258,28 @@ async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arg
     }
 
     let initial_values = captured.initial_values();
-    assert!(initial_values
-        .iter()
-        .filter(|(span_name, _)| is_constructor_span(span_name))
-        .all(|(_, fields)| {
-            fields.values().all(|value| value.len() < 256)
-                && fields
-                    .get("path")
-                    .is_some_and(|path| path.contains(&table_root))
-        }));
+    assert!(
+        initial_values
+            .iter()
+            .filter(|(span_name, _)| is_constructor_span(span_name))
+            .all(|(_, fields)| {
+                fields.values().all(|value| value.len() < 256)
+                    && fields
+                        .get("path")
+                        .is_some_and(|path| path.contains(&table_root))
+            })
+    );
     let fresh_values = trace_fields(&initial_values, FRESH_CONSTRUCTOR_SPAN);
     assert_eq!(fresh_values["version"], "0");
 
     let recorded_values = captured.recorded_values();
-    assert!(recorded_values
-        .iter()
-        .filter(|(span_name, _)| is_constructor_span(span_name))
-        .flat_map(|(_, fields)| fields.values())
-        .all(|value| value.len() < 32));
+    assert!(
+        recorded_values
+            .iter()
+            .filter(|(span_name, _)| is_constructor_span(span_name))
+            .flat_map(|(_, fields)| fields.values())
+            .all(|value| value.len() < 32)
+    );
     assert_eq!(
         recorded_values
             .iter()
@@ -293,11 +297,13 @@ async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arg
     assert!(Arc::ptr_eq(&updated, &unchanged));
     assert!(captured.error_events().is_empty());
 
-    assert!(SnapshotBuilder::new_from(updated.clone())
-        .at_version(0)
-        .with_correlation_id("incremental-test")
-        .build(engine.as_ref())
-        .is_err());
+    assert!(
+        SnapshotBuilder::new_from(updated.clone())
+            .at_version(0)
+            .with_correlation_id("incremental-test")
+            .build(engine.as_ref())
+            .is_err()
+    );
 
     let error_events = captured.error_events();
     assert_eq!(error_events.len(), 1);
@@ -320,10 +326,12 @@ async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arg
         actions_to_string(vec![TestAction::Add("part-00000-test.parquet".into())]),
     )
     .await?;
-    assert!(SnapshotBuilder::new_for(invalid_root)
-        .with_correlation_id("fresh-test")
-        .build(invalid_engine.as_ref())
-        .is_err());
+    assert!(
+        SnapshotBuilder::new_for(invalid_root)
+            .with_correlation_id("fresh-test")
+            .build(invalid_engine.as_ref())
+            .is_err()
+    );
 
     let error_events = captured.error_events();
     assert_eq!(error_events.len(), 2);
@@ -342,8 +350,8 @@ async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arg
 }
 
 #[tokio::test]
-async fn snapshot_unsupported_reader_feature_emits_constructor_error(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn snapshot_unsupported_reader_feature_emits_constructor_error()
+-> Result<(), Box<dyn std::error::Error>> {
     let (engine, store, table_root) = setup_test();
     let unsupported_table = METADATA.replace(
         r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
@@ -352,10 +360,12 @@ async fn snapshot_unsupported_reader_feature_emits_constructor_error(
     add_commit(&table_root, store.as_ref(), 0, unsupported_table).await?;
 
     let (captured, _guard) = install_capture();
-    assert!(SnapshotBuilder::new_for(table_root)
-        .with_correlation_id("unsupported-feature-test")
-        .build(engine.as_ref())
-        .is_err());
+    assert!(
+        SnapshotBuilder::new_for(table_root)
+            .with_correlation_id("unsupported-feature-test")
+            .build(engine.as_ref())
+            .is_err()
+    );
 
     let error_events = captured.error_events();
     assert_eq!(error_events.len(), 1);
@@ -369,8 +379,8 @@ async fn snapshot_unsupported_reader_feature_emits_constructor_error(
 }
 
 #[tokio::test]
-async fn incremental_failure_captures_assembled_log_segment(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn incremental_failure_captures_assembled_log_segment()
+-> Result<(), Box<dyn std::error::Error>> {
     let (engine, store, table_root) = setup_test();
     add_commit(&table_root, store.as_ref(), 0, METADATA.to_owned()).await?;
     let snapshot = SnapshotBuilder::new_for(&table_root)
@@ -384,13 +394,15 @@ async fn incremental_failure_captures_assembled_log_segment(
     add_commit(&table_root, store.as_ref(), 1, unsupported_table).await?;
 
     let (captured, _guard) = install_capture();
-    assert!(SnapshotBuilder::new_from(snapshot)
-        .with_log_tail(vec![
-            commit_log_path(&table_root, 0),
-            commit_log_path(&table_root, 1),
-        ])
-        .build(engine.as_ref())
-        .is_err());
+    assert!(
+        SnapshotBuilder::new_from(snapshot)
+            .with_log_tail(vec![
+                commit_log_path(&table_root, 0),
+                commit_log_path(&table_root, 1),
+            ])
+            .build(engine.as_ref())
+            .is_err()
+    );
 
     let error_events = captured.error_events();
     assert_eq!(error_events.len(), 1);
@@ -405,8 +417,8 @@ async fn incremental_failure_captures_assembled_log_segment(
 }
 
 #[tokio::test]
-async fn snapshot_rebuild_failure_emits_inner_and_outer_constructor_errors(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn snapshot_rebuild_failure_emits_inner_and_outer_constructor_errors()
+-> Result<(), Box<dyn std::error::Error>> {
     let (engine, store, table_root) = setup_test();
     create_table(&store, &table_root).await?;
     let snapshot = SnapshotBuilder::new_for(table_root)
@@ -421,9 +433,11 @@ async fn snapshot_rebuild_failure_emits_inner_and_outer_constructor_errors(
         .await?;
 
     let (captured, _guard) = install_capture();
-    assert!(SnapshotBuilder::new_from(snapshot)
-        .build(engine.as_ref())
-        .is_err());
+    assert!(
+        SnapshotBuilder::new_from(snapshot)
+            .build(engine.as_ref())
+            .is_err()
+    );
 
     let error_events = captured.error_events();
     assert_eq!(error_events.len(), 2);

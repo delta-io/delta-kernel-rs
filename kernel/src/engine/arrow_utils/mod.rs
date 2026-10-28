@@ -17,31 +17,31 @@ use self::apply_schema::apply_schema_to_struct;
 use self::file_values::validate_file_values;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
-    make_array, new_null_array, Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray,
-    GenericListViewArray, MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
-    RecordBatchOptions, StringArray, StructArray,
+    Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray, GenericListViewArray,
+    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RecordBatchOptions, StringArray,
+    StructArray, make_array, new_null_array,
 };
 use crate::arrow::buffer::NullBuffer;
-use crate::arrow::compute::{cast_with_options, CastOptions};
+use crate::arrow::compute::{CastOptions, cast_with_options};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
     Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
-use crate::arrow::json::writer::{make_encoder, LineDelimited, NullableEncoder};
+use crate::arrow::json::writer::{LineDelimited, NullableEncoder, make_encoder};
 use crate::arrow::json::{Encoder, EncoderFactory, EncoderOptions, ReaderBuilder, WriterBuilder};
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::ensure_data_types::DataTypeCompat;
 use crate::engine_data::FilteredEngineData;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
-use crate::parquet::arrow::{ProjectionMask, PARQUET_FIELD_ID_META_KEY};
+use crate::parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::schema::types::SchemaDescriptor;
 use crate::schema::{
-    schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
-    PrimitiveType, Schema, SchemaRef, StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
+    PrimitiveType, Schema, SchemaRef, StructField, StructType, schema,
 };
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
 use crate::{EngineData, KernelError, KernelResult, KernelResultIterator};
 
@@ -715,7 +715,7 @@ fn get_indices(
                         DataTypeCompat::Nested => {
                             return Err(KernelError::internal_error(
                                 "Comparing nested types in get_indices",
-                            ))
+                            ));
                         }
                     }
                     found_fields.insert(requested_field.name());
@@ -1716,8 +1716,8 @@ mod tests {
     use crate::parquet::file::metadata::ColumnChunkMetaData;
     use crate::parquet::schema::types::{SchemaDescriptor, Type};
     use crate::schema::{
-        schema, schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec,
-        MetadataValue, StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
+        StructField, StructType, schema, schema_ref,
     };
     use crate::table_features::ColumnMappingMode;
     use crate::unit_test_utils::assert_result_error_with_message;
@@ -2418,15 +2418,17 @@ mod tests {
             .into();
 
             // The key and value may have field ids not present in the delta schema
-            let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new_map(
-                parquet_name(0, mode),
-                "entries",
-                ArrowField::new("i", ArrowDataType::Int32, false),
-                ArrowField::new("s", ArrowDataType::Utf8, false),
-                false,
-                false,
-            )
-            .with_metadata(arrow_fid(1))]));
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new_map(
+                    parquet_name(0, mode),
+                    "entries",
+                    ArrowField::new("i", ArrowDataType::Int32, false),
+                    ArrowField::new("s", ArrowDataType::Utf8, false),
+                    false,
+                    false,
+                )
+                .with_metadata(arrow_fid(1)),
+            ]));
             let (mask_indices, reorder_indices) =
                 get_requested_indices(&requested_schema, &parquet_schema).unwrap();
             let expect_mask = vec![0, 1];

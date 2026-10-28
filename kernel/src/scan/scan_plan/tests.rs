@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use ::test_utils::table_builder::{
-    checkpoint_json_stats, checkpoint_struct_stats, no_checkpoint_stats, DataLayoutConfig,
-    FeatureSet, LogState, TableConfig, TestTableBuilder,
+    DataLayoutConfig, FeatureSet, LogState, TableConfig, TestTableBuilder, checkpoint_json_stats,
+    checkpoint_struct_stats, no_checkpoint_stats,
 };
 use rstest::rstest;
 
@@ -15,9 +15,9 @@ use crate::arrow::util::pretty::pretty_format_batches;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
-use crate::expressions::{col, column_name, lit, Predicate as Pred};
-use crate::plans::ir::nodes::Operator;
+use crate::expressions::{Predicate as Pred, col, column_name, lit};
 use crate::plans::Operation as PlanOperation;
+use crate::plans::ir::nodes::Operator;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
 use crate::unit_test_utils::load_test_table;
 use crate::{Engine, KernelResult, PredicateRef, Snapshot};
@@ -266,10 +266,11 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
         .declarative_metadata_scan_plan(engine.as_ref())?
         .expect("metadata plan");
 
-    assert!(plan
-        .nodes
-        .iter()
-        .all(|node| !matches!(&node.op, Operator::DynamicScan(_))));
+    assert!(
+        plan.nodes
+            .iter()
+            .all(|node| !matches!(&node.op, Operator::DynamicScan(_)))
+    );
     assert!(plan.nodes.iter().any(|node| {
         let Operator::ScanParquet(scan) = &node.op else {
             return false;

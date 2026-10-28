@@ -10,7 +10,7 @@ use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
 };
-use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
+use crate::engine::arrow_data::{ArrowEngineData, extract_record_batch};
 use crate::engine::arrow_utils::apply_schema::{apply_schema, apply_schema_to};
 use crate::error::{KernelError, KernelResult};
 use crate::expressions::{ArrayData, Expression, ExpressionRef, PredicateRef, Scalar};

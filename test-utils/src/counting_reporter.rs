@@ -327,11 +327,15 @@ impl CountingReporter {
         let crc_files_found = self.latest_crc_files_found.get();
 
         println!("  [io] {label}");
-        println!("    storage : {list_calls} list ({list_files} files seen)  {storage_reads} raw read ({storage_files} files, {storage_kib} KiB)  {copy_calls} copy");
+        println!(
+            "    storage : {list_calls} list ({list_files} files seen)  {storage_reads} raw read ({storage_files} files, {storage_kib} KiB)  {copy_calls} copy"
+        );
         println!("    json    : {json_calls} call(s)  {json_files} files  {json_kib} KiB");
         println!("    parquet : {parquet_calls} call(s)  {parquet_files} files  {parquet_kib} KiB");
         println!("    crc     : {crc_calls} call(s)  {crc_kib} KiB");
-        println!("    log     : {log_loads} segment load(s) -- {commits} commits  {checkpoints} checkpoints  {compactions} compactions  {crc_files_found} latest_crc_files");
+        println!(
+            "    log     : {log_loads} segment load(s) -- {commits} commits  {checkpoints} checkpoints  {compactions} compactions  {crc_files_found} latest_crc_files"
+        );
     }
 }
 

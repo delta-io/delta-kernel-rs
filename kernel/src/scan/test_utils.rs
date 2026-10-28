@@ -1,21 +1,21 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use super::state::ScanCallback;
 use super::PhysicalPredicate;
+use super::state::ScanCallback;
+use crate::JsonHandler;
 use crate::arrow::array::StringArray;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
+use crate::engine::sync::json::SyncJsonHandler;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::CheckpointReadInfo;
-use crate::scan::log_replay::{scan_action_iter, ScanPartitionValuesOptions, ScanStatsOptions};
+use crate::scan::log_replay::{ScanPartitionValuesOptions, ScanStatsOptions, scan_action_iter};
 use crate::scan::state_info::StateInfo;
 use crate::scan::transform_spec::TransformSpec;
-use crate::schema::{schema_ref, SchemaRef};
+use crate::schema::{SchemaRef, schema_ref};
 use crate::table_features::ColumnMappingMode;
 use crate::unit_test_utils::string_array_to_engine_data;
-use crate::JsonHandler;
 
 // Preserve schema-projected null columns because batch equality checks include them.
 fn parse_batch<S: AsRef<str>>(

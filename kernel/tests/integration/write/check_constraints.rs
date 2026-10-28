@@ -3,7 +3,7 @@
 
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::schema::{schema_ref, DataType, StructField};
+use delta_kernel::schema::{DataType, StructField, schema_ref};
 use delta_kernel::table_properties::CheckConstraint;
 use delta_kernel::transaction::{Transaction, UpdateTableOperation};
 use delta_kernel::{Engine, KernelError, KernelResult, Snapshot, SnapshotRef};

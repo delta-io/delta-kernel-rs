@@ -4,7 +4,7 @@
 use datafusion::functions_nested::expr_fn::array_has;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::utils::{conjunction, disjunction};
-use datafusion::logical_expr::{binary_expr, lit, Expr as DFExpr, Operator};
+use datafusion::logical_expr::{Expr as DFExpr, Operator, binary_expr, lit};
 use delta_kernel::expressions::{
     ArrayData as KernelArrayData, BinaryPredicate as KernelBinaryPredicate,
     BinaryPredicateOp as KernelBinaryPredicateOp, ColumnName as KernelColumnName,
@@ -69,7 +69,7 @@ fn binary_to_df_predicate_expr(
 ) -> KernelResult<DFExpr> {
     let op = match binary.op {
         KernelBinaryPredicateOp::In => {
-            return in_to_df_predicate_expr(&binary.left, &binary.right, input_schema)
+            return in_to_df_predicate_expr(&binary.left, &binary.right, input_schema);
         }
         KernelBinaryPredicateOp::Equal => Operator::Eq,
         KernelBinaryPredicateOp::LessThan => Operator::Lt,
@@ -119,15 +119,16 @@ fn in_to_df_predicate_expr(
         ));
     };
     let value = to_df_expr(value, input_schema, None)?;
-    let membership =
-        match list {
-            KernelExpression::Literal(KernelScalar::Array(array)) => in_list_expr(value, array)?,
-            KernelExpression::Column(name) => array_has_expr(value, list, name, input_schema)?,
-            _ => return Err(KernelError::unsupported(
+    let membership = match list {
+        KernelExpression::Literal(KernelScalar::Array(array)) => in_list_expr(value, array)?,
+        KernelExpression::Column(name) => array_has_expr(value, list, name, input_schema)?,
+        _ => {
+            return Err(KernelError::unsupported(
                 "converting an IN predicate requires a literal array or an array-typed column on \
                  the right-hand side",
-            )),
-        };
+            ));
+        }
+    };
     Ok(membership.is_true())
 }
 
@@ -187,7 +188,7 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::arrow::array::{
-        new_null_array, Array, AsArray, Int64Array, ListArray, RecordBatch,
+        Array, AsArray, Int64Array, ListArray, RecordBatch, new_null_array,
     };
     use datafusion::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
@@ -195,10 +196,10 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::expressions::{
-        col, lit, null_lit, ArrayData as KernelArrayData, Expression as KernelExpr,
-        Predicate as KernelPred,
+        ArrayData as KernelArrayData, Expression as KernelExpr, Predicate as KernelPred, col, lit,
+        null_lit,
     };
-    use delta_kernel::schema::{schema, ArrayType, DataType};
+    use delta_kernel::schema::{ArrayType, DataType, schema};
     use rstest::rstest;
 
     use super::*;

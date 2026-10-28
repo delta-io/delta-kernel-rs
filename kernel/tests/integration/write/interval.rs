@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use delta_kernel::schema::{schema_ref, DataType};
+use delta_kernel::schema::{DataType, schema_ref};
 use test_utils::load_and_begin_transaction_with;
 
 mod supported {
@@ -247,7 +247,10 @@ mod supported {
         );
         for category in ["nullCount", "minValues", "maxValues"] {
             assert!(
-                stats.get(category).and_then(|value| value.get("iv")).is_none(),
+                stats
+                    .get(category)
+                    .and_then(|value| value.get("iv"))
+                    .is_none(),
                 "interval column excluded by {property_name} must not have {category}; got: {stats}",
             );
         }

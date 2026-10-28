@@ -47,7 +47,7 @@ use url::Url;
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::compare::SchemaComparison as _;
-use crate::schema::{try_schema, DataType, Schema, StructField, StructType};
+use crate::schema::{DataType, Schema, StructField, StructType, try_schema};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{Operation, TableFeature};
@@ -553,27 +553,27 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use itertools::{assert_equal, Itertools};
+    use itertools::{Itertools, assert_equal};
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::{Add, Metadata, Protocol, Remove};
     use crate::engine::sync::SyncEngine;
-    use crate::schema::{schema_ref, DataType, StructField, StructType};
-    use crate::table_changes::test_utils::{
-        row_tracking_properties, row_tracking_protocol, row_tracking_setup_actions,
-        test_deletion_vector, TEST_MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
-        TEST_MATERIALIZED_ROW_ID_COLUMN_NAME,
-    };
+    use crate::schema::{DataType, StructField, StructType, schema_ref};
     use crate::table_changes::CDF_FIELDS;
+    use crate::table_changes::test_utils::{
+        TEST_MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, TEST_MATERIALIZED_ROW_ID_COLUMN_NAME,
+        row_tracking_properties, row_tracking_protocol, row_tracking_setup_actions,
+        test_deletion_vector,
+    };
     use crate::table_features::TableFeature;
     use crate::table_properties::{
         COLUMN_MAPPING_MODE, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
         MATERIALIZED_ROW_ID_COLUMN_NAME,
     };
     use crate::unit_test_utils::{
-        assert_result_error_with_message, test_schema_flat_with_column_mapping, Action,
-        LocalMockTable,
+        Action, LocalMockTable, assert_result_error_with_message,
+        test_schema_flat_with_column_mapping,
     };
     use crate::{Engine, KernelError};
 

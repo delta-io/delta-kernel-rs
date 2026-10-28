@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use super::{Imperative, Transaction};
-use crate::actions::{CommitInfo, COMMIT_INFO_NAME, LOG_COMMIT_INFO_SCHEMA};
+use crate::actions::{COMMIT_INFO_NAME, CommitInfo, LOG_COMMIT_INFO_SCHEMA};
 use crate::engine_data::{GetData, MapItem, RowVisitor, TypedGetData as _};
-use crate::expressions::{lit, null_lit, MapData, Scalar};
-use crate::schema::{column_name, schema_ref, ColumnName, MapType, ToSchema};
+use crate::expressions::{MapData, Scalar, lit, null_lit};
+use crate::schema::{ColumnName, MapType, ToSchema, column_name, schema_ref};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::require;
 use crate::{
-    create_row, DataType, Engine, EngineData, Expression, ExpressionRef, KernelError, KernelResult,
+    DataType, Engine, EngineData, Expression, ExpressionRef, KernelError, KernelResult, create_row,
 };
 
 pub(super) fn collect_operation_metadata<I, K, V>(entries: I) -> HashMap<String, Option<String>>
@@ -70,8 +70,11 @@ fn commit_info_literal_exprs(
     ]);
     let expected_expr_len = CommitInfo::to_schema().fields().len();
     if literal_exprs.len() != expected_expr_len {
-        return Err(KernelError::Generic(format!("expect the commit_info_literal_exprs return {expected_expr_len} expressions, but only get {} expressions. \
-            If CommitInfo field was added/removed, please update Expression::Literal in this function and update the with_commit_info doc comment", literal_exprs.len())));
+        return Err(KernelError::Generic(format!(
+            "expect the commit_info_literal_exprs return {expected_expr_len} expressions, but only get {} expressions. \
+            If CommitInfo field was added/removed, please update Expression::Literal in this function and update the with_commit_info doc comment",
+            literal_exprs.len()
+        )));
     }
     Ok(literal_exprs)
 }
@@ -221,7 +224,7 @@ mod tests {
     use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::TryIntoKernel;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::schema::{schema_ref, Schema, SchemaRef, ToSchema};
+    use crate::schema::{Schema, SchemaRef, ToSchema, schema_ref};
     use crate::transaction::Transaction;
     use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
     use crate::utils::FoldWithOption as _;

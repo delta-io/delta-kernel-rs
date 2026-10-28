@@ -15,9 +15,9 @@ use std::sync::Arc;
 use delta_kernel::actions::Protocol;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::history_manager::{
-    first_version_after as kernel_first_version_after,
+    CommitAt, HistoryCommitType, first_version_after as kernel_first_version_after,
     get_earliest_commit as kernel_get_earliest_commit,
-    latest_version_as_of as kernel_latest_version_as_of, CommitAt, HistoryCommitType,
+    latest_version_as_of as kernel_latest_version_as_of,
 };
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::object_store::ObjectStore;
@@ -57,8 +57,8 @@ pub mod commit_range;
 pub mod delta_types;
 mod domain_metadata;
 pub use domain_metadata::{
-    get_domain_metadata, snapshot_row_tracking_high_water_mark,
-    ROW_TRACKING_INITIAL_HIGH_WATER_MARK,
+    ROW_TRACKING_INITIAL_HIGH_WATER_MARK, get_domain_metadata,
+    snapshot_row_tracking_high_water_mark,
 };
 pub mod engine_data;
 pub mod engine_funcs;
@@ -2274,16 +2274,17 @@ mod tests {
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
     use delta_kernel::schema::schema_ref;
-    use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use delta_kernel_default_engine::DefaultEngineBuilder;
+    use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use rstest::rstest;
     use serde_json::Value;
     use test_utils::table_builder::{LogState, TestTableBuilder};
     use test_utils::{
-        actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,
+        METADATA, METADATA_WITH_FEATURES, METADATA_WITH_TABLE_PROPERTIES,
+        TEST_ICT_ENABLEMENT_TIMESTAMP, TestAction, actions_to_string,
+        actions_to_string_catalog_managed, actions_to_string_partitioned,
         actions_to_string_with_metadata, add_commit, add_staged_commit,
-        assert_result_error_with_message, create_table, TestAction, METADATA,
-        METADATA_WITH_FEATURES, METADATA_WITH_TABLE_PROPERTIES, TEST_ICT_ENABLEMENT_TIMESTAMP,
+        assert_result_error_with_message, create_table,
     };
     use url::Url;
 
@@ -3305,8 +3306,8 @@ mod tests {
 
     // Checkpoint on V1 table with V2 spec => `FFIKernelError::CheckpointWriteError`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_snapshot_v2_on_non_v2_table_returns_checkpoint_write_error(
-    ) -> KernelResult<()> {
+    async fn test_checkpoint_snapshot_v2_on_non_v2_table_returns_checkpoint_write_error()
+    -> KernelResult<()> {
         let (_storage, engine, snapshot) = setup_checkpoint_test(false, 1).await?;
 
         let spec = FfiCheckpointSpec::V2NoSidecar;
@@ -3316,7 +3317,9 @@ mod tests {
         assert_extern_result_error_with_message(
             extern_result,
             FFIKernelError::CheckpointWriteError,
-            Some("Error writing checkpoint: CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported"),
+            Some(
+                "Error writing checkpoint: CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported",
+            ),
         );
 
         unsafe { free_snapshot(snapshot) }
@@ -3777,8 +3780,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_from_existing_snapshot_advances_to_latest_and_pinned_version(
-    ) -> KernelResult<()> {
+    async fn test_builder_from_existing_snapshot_advances_to_latest_and_pinned_version()
+    -> KernelResult<()> {
         let path = "memory:///";
         let (storage, engine, snapshot_at_v0) = make_engine_and_v0_snapshot(path).await?;
         assert_eq!(unsafe { version(snapshot_at_v0.shallow_copy()) }, 0);
@@ -3866,7 +3869,9 @@ mod tests {
         assert_extern_result_error_with_message(
             result,
             FFIKernelError::GenericError,
-            Some("Generic delta kernel error: Requested snapshot version 1 is older than snapshot hint version 2"),
+            Some(
+                "Generic delta kernel error: Requested snapshot version 1 is older than snapshot hint version 2",
+            ),
         );
 
         unsafe { free_snapshot(snapshot_at_v2) }

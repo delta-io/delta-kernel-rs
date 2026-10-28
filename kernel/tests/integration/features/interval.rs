@@ -1,7 +1,7 @@
 //! Reader-side behavior for ANSI interval columns.
 
-use delta_kernel::schema::{schema_ref, DataType};
 use delta_kernel::Snapshot;
+use delta_kernel::schema::{DataType, schema_ref};
 use test_utils::{create_table, engine_store_setup};
 
 #[rstest::rstest]

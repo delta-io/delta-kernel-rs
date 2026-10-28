@@ -3,20 +3,20 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::Snapshot;
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES};
 use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::expressions::{column_name, ColumnName};
-use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::expressions::{ColumnName, column_name};
 use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::StructType;
-use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
+use delta_kernel::table_features::{ColumnMappingMode, get_any_level_column_physical_name};
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
-use delta_kernel::Snapshot;
 use itertools::Itertools;
 use tempfile::TempDir;
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::{
     create_default_engine_mt_executor, nested_batches, nested_schema, read_actions_from_commit,
     test_table_setup, write_batch_to_table,

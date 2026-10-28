@@ -32,8 +32,8 @@ use delta_kernel::table_features::TableFeature;
 use delta_kernel::{KernelError, KernelResult, Version};
 
 use crate::{
-    kernel_string_slice, optional_pointer, FfiFileStats, FfiSlice, KernelI64Slice,
-    KernelStringSlice, OptionalValue,
+    FfiFileStats, FfiSlice, KernelI64Slice, KernelStringSlice, OptionalValue, kernel_string_slice,
+    optional_pointer,
 };
 
 /// Borrowed array of UTF-8 strings.

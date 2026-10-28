@@ -25,18 +25,18 @@ use delta_kernel::object_store::{DynObjectStore, ObjectStore, ObjectStoreExt};
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::path::ParsedLogPath;
-use delta_kernel::schema::{schema_ref, SchemaRef, StructType};
+use delta_kernel::schema::{SchemaRef, StructType, schema_ref};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::{
     BoundWriteContext, CommitResult, Transaction, UpdateTableOperation,
 };
 use delta_kernel::{Engine, KernelResult, Snapshot, Version};
 use serde_json::json;
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::{
-    create_add_files_metadata, create_table, engine_store_setup, into_record_batch,
-    modify_add_file_partition_keys, AddFilePartitionKeyModify,
+    AddFilePartitionKeyModify, create_add_files_metadata, create_table, engine_store_setup,
+    into_record_batch, modify_add_file_partition_keys,
 };
 use url::Url;
 use uuid::Uuid;
@@ -200,9 +200,11 @@ pub async fn get_and_check_all_parquet_sizes(store: Arc<DynObjectStore>, path: &
         .collect::<Vec<_>>();
     assert_eq!(parquet_files.len(), 2);
     let size = parquet_files.first().unwrap().as_ref().unwrap().size;
-    assert!(parquet_files
-        .iter()
-        .all(|f| f.as_ref().unwrap().size == size));
+    assert!(
+        parquet_files
+            .iter()
+            .all(|f| f.as_ref().unwrap().size == size)
+    );
     size
 }
 

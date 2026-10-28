@@ -8,13 +8,17 @@ use itertools::Itertools;
 use tracing::{debug, info, warn};
 use url::Url;
 
-use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{
-    action_presence_leaf, schema_contains_file_actions, Sidecar, LOG_ADD_SCHEMA,
-    SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
-};
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{CheckpointAction, LastManifestCommit, LOG_CHECKPOINT_SCHEMA};
+use crate::EngineData;
+#[cfg(feature = "declarative-plans")]
+use crate::Scalar;
+use crate::actions::visitors::SidecarVisitor;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::{CheckpointAction, LOG_CHECKPOINT_SCHEMA, LastManifestCommit};
+use crate::actions::{
+    LOG_ADD_SCHEMA, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME, Sidecar, action_presence_leaf,
+    schema_contains_file_actions,
+};
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
@@ -22,7 +26,7 @@ use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{
-    emit_log_segment_load, emit_log_segment_load_failure, SnapshotLoadMetricContext,
+    SnapshotLoadMetricContext, emit_log_segment_load, emit_log_segment_load_failure,
 };
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
@@ -30,14 +34,10 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::plans::ir::nodes::{FileType, ScanFile};
 use crate::schema::compare::SchemaComparison;
 use crate::schema::{
-    lazy_schema_ref, CheckpointFieldKind, DataType, SchemaRef, StructField, StructType,
-    ToSchema as _,
+    CheckpointFieldKind, DataType, SchemaRef, StructField, StructType, ToSchema as _,
+    lazy_schema_ref,
 };
 use crate::utils::require;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::EngineData;
-#[cfg(feature = "declarative-plans")]
-use crate::Scalar;
 use crate::{
     Engine, FileMeta, KernelError, KernelResult, KernelResultIterator, Predicate, PredicateRef,
     RowVisitor, StorageHandler, Version,
@@ -454,11 +454,13 @@ impl LogSegment {
                 .unwrap_or_else(|| "none".into()),
             self.listed.checkpoint_parts.len(),
             self.listed.ascending_compaction_files.len(),
-            self.listed.latest_crc_file
+            self.listed
+                .latest_crc_file
                 .as_ref()
                 .map(|f| f.version.to_string())
                 .unwrap_or_else(|| "none".into()),
-            self.listed.max_published_version
+            self.listed
+                .max_published_version
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "none".into()),
         )
@@ -1544,7 +1546,9 @@ impl LogSegment {
         stats_schema: &StructType,
     ) -> bool {
         let Some(stats_parsed) = Self::get_field_from_add(checkpoint_schema, "stats_parsed") else {
-            debug!("stats_parsed not compatible: checkpoint schema does not contain add.stats_parsed field");
+            debug!(
+                "stats_parsed not compatible: checkpoint schema does not contain add.stats_parsed field"
+            );
             return false;
         };
 
@@ -1660,7 +1664,9 @@ impl LogSegment {
         let Some(partition_parsed) =
             Self::get_field_from_add(checkpoint_schema, "partitionValues_parsed")
         else {
-            debug!("partitionValues_parsed not compatible: checkpoint schema does not contain add.partitionValues_parsed field");
+            debug!(
+                "partitionValues_parsed not compatible: checkpoint schema does not contain add.partitionValues_parsed field"
+            );
             return false;
         };
 

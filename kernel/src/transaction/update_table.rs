@@ -2,17 +2,17 @@
 
 use delta_kernel_derive::internal_api;
 
+use super::{ExecutionMode, Transaction, UpdateTable};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use super::{
-    manifest_commit_state::ManifestCommitState, root_manifest_file::RootManifestFile, ManifestWrite,
+    ManifestWrite, manifest_commit_state::ManifestCommitState, root_manifest_file::RootManifestFile,
 };
-use super::{ExecutionMode, Transaction, UpdateTable};
+use crate::KernelResult;
 use crate::error::KernelError;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_features::TableFeature;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::utils::require;
-use crate::KernelResult;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::{Engine, FileMeta};
 
@@ -142,7 +142,7 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
             Some(ManifestWrite::RootFile(_)) => {
                 return Err(KernelError::invalid_transaction_state(
                     "explicit root manifest and manifest commit are mutually exclusive",
-                ))
+                ));
             }
             // Repeated calls reuse the state from the first call.
             Some(ManifestWrite::Commit(_)) => {}

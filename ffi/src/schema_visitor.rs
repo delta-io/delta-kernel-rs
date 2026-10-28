@@ -961,7 +961,7 @@ fn create_variant_data_type(
 #[cfg(test)]
 mod tests {
     use std::ffi::c_void;
-    use std::ptr::{null, NonNull};
+    use std::ptr::{NonNull, null};
 
     use delta_kernel::schema::{DataType, MetadataValue, PrimitiveType};
     use rstest::rstest;

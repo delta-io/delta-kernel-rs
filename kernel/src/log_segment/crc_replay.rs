@@ -19,24 +19,24 @@ use super::LogSegment;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::visit_last_manifest_commit_at;
 use crate::actions::visitors::{
-    visit_metadata_at, visit_protocol_at, METADATA_LEAVES, PROTOCOL_LEAVES,
+    METADATA_LEAVES, PROTOCOL_LEAVES, visit_metadata_at, visit_protocol_at,
 };
 use crate::actions::{
-    DomainMetadata, SetTransaction, ADD_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_FIELD,
-    METADATA_FIELD, PROTOCOL_FIELD, REMOVE_NAME, SET_TRANSACTION_FIELD,
+    ADD_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_FIELD, DomainMetadata, METADATA_FIELD,
+    PROTOCOL_FIELD, REMOVE_NAME, SET_TRANSACTION_FIELD, SetTransaction,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{LastManifestCommit, LAST_MANIFEST_COMMIT_FIELD};
+use crate::actions::{LAST_MANIFEST_COMMIT_FIELD, LastManifestCommit};
 use crate::crc::{
-    is_incremental_safe_operation, read_crc_file_or_none, size_to_u64, Crc, CrcDelta,
-    FileSizeHistogram, FileStatsDelta,
+    Crc, CrcDelta, FileSizeHistogram, FileStatsDelta, is_incremental_safe_operation,
+    read_crc_file_or_none, size_to_u64,
 };
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
 use crate::schema::{
-    column_name, lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
-    SchemaRef, StructField, StructType,
+    ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef, StructField,
+    StructType, column_name, lazy_schema_ref,
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
@@ -965,8 +965,8 @@ mod tests {
     // reachable by driving the accumulator directly.
 
     #[test]
-    fn per_commit_invariant_holds_when_file_action_and_commit_info_split_across_batches_of_one_file(
-    ) {
+    fn per_commit_invariant_holds_when_file_action_and_commit_info_split_across_batches_of_one_file()
+     {
         let mut acc = CrcReplayAccumulator::new(None);
         acc.process_batch_start("v1.json");
         acc.on_add(0).unwrap();
@@ -1090,12 +1090,14 @@ mod tests {
         assert_eq!(crc.version, 2);
         assert_eq!(crc.protocol.min_writer_version(), 7);
         assert!(crc.protocol.has_table_feature(&TableFeature::RowTracking));
-        assert!(crc
-            .protocol
-            .has_table_feature(&TableFeature::InCommitTimestamp));
-        assert!(crc
-            .protocol
-            .has_table_feature(&TableFeature::DomainMetadata));
+        assert!(
+            crc.protocol
+                .has_table_feature(&TableFeature::InCommitTimestamp)
+        );
+        assert!(
+            crc.protocol
+                .has_table_feature(&TableFeature::DomainMetadata)
+        );
         assert_eq!(crc.metadata.id(), "id-2");
         assert_eq!(crc.in_commit_timestamp_opt, Some(9999));
 

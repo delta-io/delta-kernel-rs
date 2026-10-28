@@ -18,7 +18,7 @@ use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::scan::log_replay::ScanLogReplayProcessor;
-use crate::scan::{ScanMetadata, COMMIT_READ_SCHEMA};
+use crate::scan::{COMMIT_READ_SCHEMA, ScanMetadata};
 use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIterator};

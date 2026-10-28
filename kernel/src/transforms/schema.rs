@@ -4,8 +4,8 @@ use std::borrow::{Cow, ToOwned};
 use crate::schema::UserDefinedType;
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
 use crate::transforms::{
-    map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, transform_output_type,
-    Carrier,
+    Carrier, map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else,
+    transform_output_type,
 };
 
 /// Generic framework for describing recursive bottom-up schema transforms.
@@ -287,7 +287,7 @@ impl<'a> SchemaTransform<'a> for SchemaDepthChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{schema, DataType};
+    use crate::schema::{DataType, schema};
 
     #[test]
     fn test_depth_checker() {

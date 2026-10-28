@@ -1,7 +1,7 @@
 use ::test_utils::add_commit;
 
 use super::*;
-use crate::actions::{get_commit_schema, TIGHT_BOUNDS};
+use crate::actions::{TIGHT_BOUNDS, get_commit_schema};
 use crate::arrow::array::{ArrayRef, AsArray, BinaryArray};
 use crate::engine::arrow_expression::evaluate_expression::evaluate_expression;
 use crate::engine::arrow_expression::opaque::{ArrowOpaqueExpression, ArrowOpaqueExpressionOp};

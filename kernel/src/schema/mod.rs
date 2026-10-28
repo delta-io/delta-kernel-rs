@@ -18,14 +18,14 @@ use strum::{Display as StrumDisplay, EnumString};
 use tracing::warn;
 
 // re-export because many call sites that use schemas do not necessarily use expressions
-pub(crate) use crate::expressions::{column_name, ColumnName};
+pub(crate) use crate::expressions::{ColumnName, column_name};
 use crate::reserved_field_ids::FILE_NAME;
 use crate::table_features::{
-    validate_and_extract_column_mapping_annotations, validate_column_mapping_id, ColumnMappingMode,
-    StaleAnnotationPolicy,
+    ColumnMappingMode, StaleAnnotationPolicy, validate_and_extract_column_mapping_annotations,
+    validate_column_mapping_id,
 };
-use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::utils::{require, CollectInto};
+use crate::transforms::{SchemaTransform, transform_output_type};
+use crate::utils::{CollectInto, require};
 use crate::{KernelError, KernelResult};
 
 pub(crate) mod column_default;
@@ -544,7 +544,7 @@ impl StructField {
                     "Field '{}' has a non-string `{}` annotation: {other}",
                     self.name,
                     ColumnMetadataKey::CurrentDefault.as_ref(),
-                )))
+                )));
             }
         };
         ColumnDefault::new(raw_sql, &self.data_type).map(Some)
@@ -772,7 +772,10 @@ impl StructField {
                 let Some(MetadataValue::Number(fid)) = field_id else {
                     // `validate_and_extract_column_mapping_annotations` should have verified that
                     // this has a field Id
-                    warn!("StructField with name {} is missing field id in the Id column mapping mode", self.name());
+                    warn!(
+                        "StructField with name {} is missing field id in the Id column mapping mode",
+                        self.name()
+                    );
                     debug_assert!(false);
                     return base_metadata;
                 };
@@ -793,7 +796,10 @@ impl StructField {
                 // Parquet files carry field IDs in Name mode as well (matching
                 // the Delta protocol requirement and Delta Spark behaviour).
                 let Some(MetadataValue::Number(fid)) = field_id else {
-                    warn!("StructField with name {} is missing field id in the Name column mapping mode", self.name());
+                    warn!(
+                        "StructField with name {} is missing field id in the Name column mapping mode",
+                        self.name()
+                    );
                     debug_assert!(false);
                     return base_metadata;
                 };
@@ -2457,7 +2463,7 @@ impl DataType {
                 (segment, data_type) => {
                     return Err(KernelError::schema(format!(
                         "path segment {segment:?} does not match {data_type}"
-                    )))
+                    )));
                 }
             };
         }
@@ -3340,12 +3346,16 @@ mod tests {
         let physical_field = field.make_physical(ColumnMappingMode::None).unwrap();
 
         assert_eq!(physical_field.name, "e");
-        assert!(physical_field
-            .get_config_value(&ColumnMetadataKey::ColumnMappingId)
-            .is_none());
-        assert!(physical_field
-            .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
-            .is_none());
+        assert!(
+            physical_field
+                .get_config_value(&ColumnMetadataKey::ColumnMappingId)
+                .is_none()
+        );
+        assert!(
+            physical_field
+                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+                .is_none()
+        );
 
         let DataType::Array(atype) = physical_field.data_type else {
             panic!("Expected an Array");
@@ -3368,12 +3378,16 @@ mod tests {
         let physical = field.make_physical(ColumnMappingMode::None).unwrap();
 
         assert_eq!(physical.name, "e");
-        assert!(!physical
-            .metadata
-            .contains_key(ColumnMetadataKey::ColumnMappingId.as_ref()));
-        assert!(!physical
-            .metadata
-            .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()));
+        assert!(
+            !physical
+                .metadata
+                .contains_key(ColumnMetadataKey::ColumnMappingId.as_ref())
+        );
+        assert!(
+            !physical
+                .metadata
+                .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+        );
         // Non-column-mapping metadata is untouched.
         assert!(physical.metadata.contains_key("delta.identity.start"));
 
@@ -3386,12 +3400,16 @@ mod tests {
         };
         let leaf = stype.fields().next().unwrap();
         assert_eq!(leaf.name, "d");
-        assert!(!leaf
-            .metadata
-            .contains_key(ColumnMetadataKey::ColumnMappingId.as_ref()));
-        assert!(!leaf
-            .metadata
-            .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()));
+        assert!(
+            !leaf
+                .metadata
+                .contains_key(ColumnMetadataKey::ColumnMappingId.as_ref())
+        );
+        assert!(
+            !leaf
+                .metadata
+                .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+        );
     }
 
     #[test]

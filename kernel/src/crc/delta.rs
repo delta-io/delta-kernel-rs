@@ -12,10 +12,10 @@ use super::file_stats::FileStatsDelta;
 use super::{
     Crc, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
 };
+use crate::Version;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::LastManifestCommit;
 use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
-use crate::Version;
 
 /// CRC-relevant changes aggregated over commits `(X, Y]`.
 #[derive(Debug, Clone, Default)]
@@ -240,8 +240,8 @@ mod tests {
     use super::*;
     use crate::actions::{Add, DomainMetadata, Metadata, Protocol};
     use crate::crc::{
-        is_incremental_safe_operation, DeletedRecordCountsHistogram, FileSizeHistogram,
-        SetTransactionState,
+        DeletedRecordCountsHistogram, FileSizeHistogram, SetTransactionState,
+        is_incremental_safe_operation,
     };
 
     fn base_crc() -> Crc {

@@ -14,7 +14,7 @@ use url::Url;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::error::add_scalar_path_context;
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
-use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema};
+use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema, lazy_schema_ref};
 use crate::utils::CollectInto;
 use crate::{FileMeta, KernelError, KernelResult};
 
@@ -1199,7 +1199,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::column_name;
-    use crate::schema::{schema_ref, DataType, MetadataValue, StructField};
+    use crate::schema::{DataType, MetadataValue, StructField, schema_ref};
     use crate::unit_test_utils::assert_result_error_with_message;
 
     /// Builds a flat `LONG` schema from `(name, nullable)` pairs.

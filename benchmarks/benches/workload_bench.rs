@@ -1,13 +1,13 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use delta_kernel::metrics::WithMetricsReporterLayer;
 use delta_kernel_benchmarks::registry::BenchRegistry;
 use delta_kernel_benchmarks::runners::{
-    benchmark_name, configured_benchmark_name, create_read_runner, SnapshotConstructionRunner,
-    WorkloadRunner,
+    SnapshotConstructionRunner, WorkloadRunner, benchmark_name, configured_benchmark_name,
+    create_read_runner,
 };
 use delta_kernel_benchmarks::utils::load_all_workloads;
 use delta_kernel_workloads::models::{ReadOperation, Spec};

@@ -8,13 +8,13 @@ use tracing::{info, instrument};
 use crate::cancellation::CancellationTokenRef;
 use crate::engine::CancellableEngine;
 use crate::log_path::LogPath;
-use crate::log_segment::{validate_catalog_managed_log_tail, LogSegment};
+use crate::log_segment::{LogSegment, validate_catalog_managed_log_tail};
 use crate::log_segment_files::CheckpointHandling;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::metrics::{MetricId, SnapshotLoadMetricContext, SnapshotLoadType};
 use crate::path::DELTA_LOG_DIR_WITH_SLASH;
 use crate::snapshot::{SnapshotHint, SnapshotRef};
-use crate::utils::{require, try_parse_uri, PhantomType};
+use crate::utils::{PhantomType, require, try_parse_uri};
 use crate::{Engine, KernelError, KernelResult, Snapshot, Version};
 
 /// Marker for builders that load a snapshot from a table root.
@@ -531,7 +531,7 @@ pub(super) mod tests {
 
     use itertools::Itertools;
     use serde_json::json;
-    use test_utils::{actions_to_string, add_commit, TestAction};
+    use test_utils::{TestAction, actions_to_string, add_commit};
 
     use super::*;
     use crate::engine::sync::SyncEngine;
@@ -539,7 +539,7 @@ pub(super) mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
     use crate::utils::FoldWithOption as _;
 
     pub(in crate::snapshot) fn setup_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
@@ -646,8 +646,8 @@ pub(super) mod tests {
         Ok(())
     }
 
-    pub(in crate::snapshot) fn measuring_reporter(
-    ) -> (Arc<CapturingReporter>, tracing::subscriber::DefaultGuard) {
+    pub(in crate::snapshot) fn measuring_reporter()
+    -> (Arc<CapturingReporter>, tracing::subscriber::DefaultGuard) {
         let reporter = Arc::new(CapturingReporter::default());
         let guard = install_thread_local_metrics_reporter(reporter.clone());
         (reporter, guard)
@@ -704,9 +704,11 @@ pub(super) mod tests {
         let (engine, _store, table_root) = setup_test();
         let (reporter, _guard) = measuring_reporter();
 
-        assert!(SnapshotBuilder::new_for(table_root)
-            .build(engine.as_ref())
-            .is_err());
+        assert!(
+            SnapshotBuilder::new_for(table_root)
+                .build(engine.as_ref())
+                .is_err()
+        );
 
         let events = reporter.events();
         let failure = events
@@ -721,8 +723,8 @@ pub(super) mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn protocol_metadata_load_failure_emits_metric_when_actions_absent(
-    ) -> KernelResult<(), Box<dyn std::error::Error>> {
+    async fn protocol_metadata_load_failure_emits_metric_when_actions_absent()
+    -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         // A commit with no protocol/metadata: the segment lists fine, then the read fails.
         add_commit(
@@ -734,9 +736,11 @@ pub(super) mod tests {
         .await?;
         let (reporter, _guard) = measuring_reporter();
 
-        assert!(SnapshotBuilder::new_for(table_root)
-            .build(engine.as_ref())
-            .is_err());
+        assert!(
+            SnapshotBuilder::new_for(table_root)
+                .build(engine.as_ref())
+                .is_err()
+        );
 
         let events = reporter.events();
         assert!(
@@ -755,8 +759,8 @@ pub(super) mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn snapshot_update_from_existing_emits_metric(
-    ) -> KernelResult<(), Box<dyn std::error::Error>> {
+    async fn snapshot_update_from_existing_emits_metric()
+    -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         create_table(&store, &table_root).await?;
 
@@ -785,8 +789,8 @@ pub(super) mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn snapshot_update_to_earlier_version_emits_failed_metric(
-    ) -> KernelResult<(), Box<dyn std::error::Error>> {
+    async fn snapshot_update_to_earlier_version_emits_failed_metric()
+    -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         create_table(&store, &table_root).await?;
 
@@ -821,8 +825,8 @@ pub(super) mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn snapshot_completed_duration_exceeds_log_segment_load_duration(
-    ) -> KernelResult<(), Box<dyn std::error::Error>> {
+    async fn snapshot_completed_duration_exceeds_log_segment_load_duration()
+    -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         create_table(&store, &table_root).await?;
 
@@ -906,14 +910,14 @@ pub(super) mod tests {
 
     pub(in crate::snapshot) mod catalog_managed_tests {
         use test_utils::{
-            actions_to_string, actions_to_string_catalog_managed, add_commit, add_staged_commit,
-            TestAction,
+            TestAction, actions_to_string, actions_to_string_catalog_managed, add_commit,
+            add_staged_commit,
         };
 
         use super::*;
+        use crate::FileMeta;
         use crate::log_path::LogPath;
         use crate::utils::try_parse_uri;
-        use crate::FileMeta;
 
         pub(in crate::snapshot) fn create_log_path(table_root: &str, commit_path: Path) -> LogPath {
             let table_url = try_parse_uri(table_root).expect("Failed to parse table root");
@@ -928,8 +932,8 @@ pub(super) mod tests {
 
         /// Creates an in-memory engine, store, and table root with an initial catalog-managed
         /// commit at version 0 (protocol + metadata).
-        pub(in crate::snapshot) async fn setup_catalog_managed_test(
-        ) -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
+        pub(in crate::snapshot) async fn setup_catalog_managed_test()
+        -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
             let (engine, store, table_root) = setup_test();
             let actions = vec![TestAction::Metadata];
             add_commit(
@@ -944,8 +948,8 @@ pub(super) mod tests {
         }
 
         #[test_log::test(tokio::test)]
-        async fn test_staged_commits_without_max_catalog_version_errors(
-        ) -> KernelResult<(), Box<dyn std::error::Error>> {
+        async fn test_staged_commits_without_max_catalog_version_errors()
+        -> KernelResult<(), Box<dyn std::error::Error>> {
             let (engine, store, table_root) = setup_catalog_managed_test().await;
             let path1 =
                 add_staged_commit(&table_root, store.as_ref(), 1, String::from("{}")).await?;
@@ -976,8 +980,8 @@ pub(super) mod tests {
         }
 
         #[test_log::test(tokio::test)]
-        async fn test_log_tail_last_version_mismatch_errors(
-        ) -> KernelResult<(), Box<dyn std::error::Error>> {
+        async fn test_log_tail_last_version_mismatch_errors()
+        -> KernelResult<(), Box<dyn std::error::Error>> {
             let (engine, store, table_root) = setup_catalog_managed_test().await;
             let actions = vec![TestAction::Add("file_1.parquet".to_string())];
             add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
@@ -1013,8 +1017,8 @@ pub(super) mod tests {
         }
 
         #[test_log::test(tokio::test)]
-        async fn test_non_catalog_managed_table_with_max_catalog_version_errors(
-        ) -> KernelResult<(), Box<dyn std::error::Error>> {
+        async fn test_non_catalog_managed_table_with_max_catalog_version_errors()
+        -> KernelResult<(), Box<dyn std::error::Error>> {
             let (engine, store, table_root) = setup_test();
 
             let actions = vec![TestAction::Metadata];
@@ -1030,8 +1034,8 @@ pub(super) mod tests {
         }
 
         #[test_log::test(tokio::test)]
-        async fn test_log_tail_last_version_less_than_time_travel_version_errors(
-        ) -> KernelResult<(), Box<dyn std::error::Error>> {
+        async fn test_log_tail_last_version_less_than_time_travel_version_errors()
+        -> KernelResult<(), Box<dyn std::error::Error>> {
             let (engine, store, table_root) = setup_catalog_managed_test().await;
             let actions = vec![TestAction::Add("file_1.parquet".to_string())];
             add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
@@ -1054,8 +1058,8 @@ pub(super) mod tests {
         }
 
         #[test_log::test(tokio::test)]
-        async fn test_max_catalog_version_as_effective_version(
-        ) -> KernelResult<(), Box<dyn std::error::Error>> {
+        async fn test_max_catalog_version_as_effective_version()
+        -> KernelResult<(), Box<dyn std::error::Error>> {
             let (engine, store, table_root) = setup_catalog_managed_test().await;
             let actions = vec![TestAction::Add("file_1.parquet".to_string())];
             add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
@@ -1072,8 +1076,8 @@ pub(super) mod tests {
         }
 
         #[test_log::test(tokio::test)]
-        async fn test_time_travel_with_max_catalog_version(
-        ) -> KernelResult<(), Box<dyn std::error::Error>> {
+        async fn test_time_travel_with_max_catalog_version()
+        -> KernelResult<(), Box<dyn std::error::Error>> {
             let (engine, store, table_root) = setup_catalog_managed_test().await;
             let actions = vec![TestAction::Add("file_1.parquet".to_string())];
             add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
@@ -1089,8 +1093,8 @@ pub(super) mod tests {
         }
 
         #[test_log::test(tokio::test)]
-        async fn test_builder_from_catalog_managed_without_mcv_errors(
-        ) -> KernelResult<(), Box<dyn std::error::Error>> {
+        async fn test_builder_from_catalog_managed_without_mcv_errors()
+        -> KernelResult<(), Box<dyn std::error::Error>> {
             let (engine, store, table_root) = setup_catalog_managed_test().await;
             let actions = vec![TestAction::Add("file_1.parquet".to_string())];
             add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;

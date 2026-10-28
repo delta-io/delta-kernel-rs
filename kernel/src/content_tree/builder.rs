@@ -9,13 +9,13 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::NUM_RECORDS;
 use crate::content_tree::{
-    struct_expr_from_schema, ContentTreeNodeEntry, DataContentType, DataFileFormat, TrackingInfo,
-    TrackingStatus, CONTENT_TYPE, FILE_FORMAT, FILE_SEQUENCE_NUMBER, FILE_SIZE_IN_BYTES,
-    FIRST_ROW_ID, LOCATION, PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER, TRACKING,
-    TRACKING_SNAPSHOT_ID, TRACKING_STATUS,
+    CONTENT_TYPE, ContentTreeNodeEntry, DataContentType, DataFileFormat, FILE_FORMAT,
+    FILE_SEQUENCE_NUMBER, FILE_SIZE_IN_BYTES, FIRST_ROW_ID, LOCATION, PARTITION_SPEC_ID,
+    RECORD_COUNT, SEQUENCE_NUMBER, TRACKING, TRACKING_SNAPSHOT_ID, TRACKING_STATUS, TrackingInfo,
+    TrackingStatus, struct_expr_from_schema,
 };
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{lit, ColumnName, Expression};
+use crate::expressions::{ColumnName, Expression, lit};
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, PATH_NAME, SIZE_NAME, STATS_NAME,
 };
@@ -46,7 +46,7 @@ fn write_metadata_input_schema() -> KernelResult<SchemaRef> {
         _ => {
             return Err(KernelError::generic(
                 "add-file write-metadata schema is missing the `stats` struct",
-            ))
+            ));
         }
     };
     let narrowed = SchemaStructPatchBuilder::new()
@@ -236,11 +236,11 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::Engine;
     use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{Scalar, StructData};
-    use crate::Engine;
 
     /// A row of write-metadata input, where any field may be null (to exercise null rejection).
     #[derive(Clone, Copy)]

@@ -103,8 +103,8 @@ mod tests {
     use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
-    use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
+    use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine_data::FilteredEngineData;
     use crate::{Engine as _, EngineData, KernelError};
 
@@ -128,11 +128,13 @@ mod tests {
     fn uses_arrow_evaluation_handler_without_fallback() {
         let engine = plan_engine(None);
 
-        assert!(engine
-            .evaluation_handler()
-            .as_ref()
-            .any_ref()
-            .is::<ArrowEvaluationHandler>());
+        assert!(
+            engine
+                .evaluation_handler()
+                .as_ref()
+                .any_ref()
+                .is::<ArrowEvaluationHandler>()
+        );
     }
 
     #[test]

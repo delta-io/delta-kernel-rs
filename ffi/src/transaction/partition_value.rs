@@ -9,8 +9,8 @@
 
 use std::collections::HashMap;
 
-use delta_kernel::expressions::Scalar;
 use delta_kernel::KernelResult;
+use delta_kernel::expressions::Scalar;
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::error::{ExternResult, IntoExternResult};

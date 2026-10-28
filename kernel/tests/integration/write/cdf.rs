@@ -13,9 +13,9 @@ use delta_kernel::schema::{DataType, SchemaRef, StructField};
 use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel::{Snapshot, Version};
 use rstest::rstest;
-use tempfile::{tempdir, TempDir};
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use tempfile::{TempDir, tempdir};
 use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::{
     assert_result_error_with_message, begin_transaction, begin_transaction_with,
     create_add_files_metadata, create_table, create_table_and_load_snapshot, engine_store_setup,
@@ -387,9 +387,11 @@ async fn test_file_rewrite_validates_explicit_data_change(
         for (kind, expected_count) in [("add", if use_dv { 2 } else { 1 }), ("remove", 1)] {
             let actions = read_actions_from_commit(before.table_root(), 2, kind)?;
             assert_eq!(actions.len(), expected_count);
-            assert!(actions
-                .iter()
-                .all(|action| action["dataChange"] == data_change));
+            assert!(
+                actions
+                    .iter()
+                    .all(|action| action["dataChange"] == data_change)
+            );
         }
     }
 

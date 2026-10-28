@@ -2,19 +2,19 @@
 //! engine's native expressions into kernel's [`Expression`] and [`Predicate`] types.
 use std::sync::Arc;
 
+use delta_kernel::KernelResult;
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
 use delta_kernel::expressions::{
-    lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
-    JunctionPredicateOp, Predicate, Scalar, UnaryPredicateOp,
+    BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp, Predicate,
+    Scalar, UnaryPredicateOp, lit, null_lit,
 };
 use delta_kernel::schema::{DataType, PrimitiveType};
-use delta_kernel::KernelResult;
 
 #[cfg(feature = "default-engine-base")]
-use crate::expressions::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
-#[cfg(feature = "default-engine-base")]
 use crate::expressions::FfiOpaquePredicateOp;
+#[cfg(feature = "default-engine-base")]
+use crate::expressions::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
 use crate::expressions::{FfiMapToStructOptions, SharedExpression, SharedPredicate};
 use crate::handle::Handle;
 use crate::scan::{EngineExpression, EnginePredicate};
@@ -877,8 +877,8 @@ fn visit_predicate_opaque_with_eval_impl(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use delta_kernel::expressions::{col, lit, MapToStructOptions, Scalar};
-    use delta_kernel::schema::{schema, ArrayType, DataType, MapType};
+    use delta_kernel::expressions::{MapToStructOptions, Scalar, col, lit};
+    use delta_kernel::schema::{ArrayType, DataType, MapType, schema};
     use rstest::rstest;
 
     use super::*;
@@ -1423,16 +1423,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn opaque_predicate_prunes_files_end_to_end() {
         use std::ffi::c_void;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use delta_kernel::arrow::array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
+        use delta_kernel::Snapshot;
+        use delta_kernel::arrow::array::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
         use delta_kernel::arrow::array::{
             Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, StructArray,
         };
         use delta_kernel::object_store::memory::InMemory;
         use delta_kernel::scan::state::ScanFile;
-        use delta_kernel::Snapshot;
         use delta_kernel_default_engine::DefaultEngineBuilder;
         use test_utils::add_commit;
 
@@ -1582,11 +1582,11 @@ mod tests {
         use std::ffi::c_void;
         use std::sync::Arc;
 
-        use delta_kernel::arrow::array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
+        use delta_kernel::Snapshot;
+        use delta_kernel::arrow::array::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
         use delta_kernel::arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, StructArray};
         use delta_kernel::object_store::memory::InMemory;
         use delta_kernel::scan::state::ScanFile;
-        use delta_kernel::Snapshot;
         use delta_kernel_default_engine::DefaultEngineBuilder;
         use test_utils::add_commit;
 

@@ -2,14 +2,14 @@ use std::collections::VecDeque;
 use std::mem;
 use std::ops::Range;
 use std::pin::Pin;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use delta_kernel::{FileMeta, KernelResult};
+use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, Stream, StreamExt};
-use futures::FutureExt;
 
 /// A fallible future that resolves to a stream of [`RecordBatch`]
 /// cbindgen:ignore

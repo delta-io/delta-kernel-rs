@@ -7,8 +7,8 @@ use tracing::debug;
 
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{
-    Date32Type, Decimal128Type, Float32Type, Float64Type, GenericStringType, Int16Type, Int32Type,
-    Int64Type, Int8Type, TimestampMicrosecondType,
+    Date32Type, Decimal128Type, Float32Type, Float64Type, GenericStringType, Int8Type, Int16Type,
+    Int32Type, Int64Type, TimestampMicrosecondType,
 };
 use crate::arrow::array::{
     Array, ArrayRef, GenericByteArray, OffsetSizeTrait, RecordBatch, RunArray, StringViewArray,
@@ -544,8 +544,8 @@ mod tests {
 
     use rstest::rstest;
 
-    use super::{extract_record_batch, ArrowEngineData};
-    use crate::actions::{get_commit_schema, Metadata, Protocol, LOG_PROTOCOL_SCHEMA};
+    use super::{ArrowEngineData, extract_record_batch};
+    use crate::actions::{LOG_PROTOCOL_SCHEMA, Metadata, Protocol, get_commit_schema};
     use crate::arrow::array::types::{Int32Type, Int64Type};
     use crate::arrow::array::{
         Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Int32Array, Int64Array,
@@ -557,10 +557,10 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::engine::sync::SyncEngine;
-    use crate::engine::test_utils::{struct_list_fixture_as, CollectNVisitor, ListFlavor};
+    use crate::engine::test_utils::{CollectNVisitor, ListFlavor, struct_list_fixture_as};
     use crate::engine_data::{GetData, ListItem, MapItem, RowVisitor, TypedGetData};
-    use crate::expressions::{column_name, ArrayData};
-    use crate::schema::{schema, schema_ref, ArrayType, ColumnName, ColumnNamesAndTypes, DataType};
+    use crate::expressions::{ArrayData, column_name};
+    use crate::schema::{ArrayType, ColumnName, ColumnNamesAndTypes, DataType, schema, schema_ref};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{Engine as _, EngineData as _, KernelResult};

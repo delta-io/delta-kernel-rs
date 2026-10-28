@@ -9,7 +9,7 @@ use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::utils::require;
-use crate::{version_as_i64, Engine, KernelResult, Version};
+use crate::{Engine, KernelResult, Version, version_as_i64};
 
 /// State for an in-progress manifest (content-tree) commit.
 #[internal_api]

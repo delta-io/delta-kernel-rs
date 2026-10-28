@@ -1,6 +1,6 @@
 //! Schema fixtures for column mappings.
 use delta_kernel::schema::{
-    schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType, schema,
 };
 
 pub fn same_leaf_phy_name_under_different_parents() -> StructType {

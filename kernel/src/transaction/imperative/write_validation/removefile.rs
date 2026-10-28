@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 use super::utils::validate_required_field_exist;
 use super::{StagedDataValidator, Validation};
 use crate::engine_data::{GetData, TypedGetData as _};
-use crate::schema::{lazy_schema_ref, ColumnNamesAndTypes, SchemaRef};
+use crate::schema::{ColumnNamesAndTypes, SchemaRef, lazy_schema_ref};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 

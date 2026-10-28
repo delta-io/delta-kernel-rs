@@ -18,14 +18,14 @@ use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
-    ensure_standalone_checkpoint_supported, CheckpointSpec, CheckpointWriter, V2CheckpointConfig,
-    DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
+    CheckpointSpec, CheckpointWriter, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT, V2CheckpointConfig,
+    ensure_standalone_checkpoint_supported,
 };
-use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
+use crate::clustering::{CLUSTERING_DOMAIN_NAME, ClusteringColumnInfo, parse_clustering_columns};
 use crate::committer::{Committer, PublishMetadata};
 use crate::crc::{
-    try_write_crc_file, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats,
-    SetTransactionState,
+    Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats, SetTransactionState,
+    try_write_crc_file,
 };
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
@@ -34,14 +34,14 @@ use crate::log_segment::LastManifestCommitResolution;
 use crate::log_segment::{DomainMetadataMap, LogSegment, PmResolution};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::{
-    emit_protocol_metadata_load, emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
+    SnapshotLoadMetricContext, emit_protocol_metadata_load, emit_protocol_metadata_load_failure,
 };
 use crate::path::ParsedLogPath;
-use crate::row_tracking::{parse_row_tracking_high_water_mark, ROW_TRACKING_DOMAIN_NAME};
+use crate::row_tracking::{ROW_TRACKING_DOMAIN_NAME, parse_row_tracking_high_water_mark};
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
-use crate::table_features::{physical_to_logical_column_name_and_type, Operation, TableFeature};
+use crate::table_features::{Operation, TableFeature, physical_to_logical_column_name_and_type};
 #[cfg(feature = "check-constraints-in-dev")]
 use crate::table_properties::CheckConstraint;
 use crate::table_properties::TableProperties;
@@ -1760,7 +1760,7 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
     use test_utils::table_builder::{
-        checkpoint_json_stats, unpartitioned, FeatureSet, LogState, TestTableBuilder, VersionTarget,
+        FeatureSet, LogState, TestTableBuilder, VersionTarget, checkpoint_json_stats, unpartitioned,
     };
     use test_utils::{add_commit, delta_path_for_version};
 
@@ -1774,12 +1774,12 @@ mod tests {
     use crate::last_checkpoint_hint::LastCheckpointHint;
     use crate::log_segment::LogSegment;
     use crate::log_segment_files::LogSegmentFiles;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStoreExt as _;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::ParsedLogPath;
-    use crate::schema::{schema_ref, DataType, StructField, StructType};
+    use crate::schema::{DataType, StructField, StructType, schema_ref};
     use crate::table_features::{
         TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
     };
@@ -1878,12 +1878,14 @@ mod tests {
     ) -> KernelResult<Snapshot> {
         // Create a log segment with only checkpoint and no commit file (simulating scenario
         // where a checkpoint exists but the commit file has been cleaned up)
-        let checkpoint_parts = vec![ParsedLogPath::new(crate::FileMeta {
-            location: url.join("_delta_log/00000000000000000000.checkpoint.parquet")?,
-            last_modified: 0,
-            size: 100,
-        })
-        .unwrap()];
+        let checkpoint_parts = vec![
+            ParsedLogPath::new(crate::FileMeta {
+                location: url.join("_delta_log/00000000000000000000.checkpoint.parquet")?,
+                last_modified: 0,
+                size: 100,
+            })
+            .unwrap(),
+        ];
 
         let listed_files = LogSegmentFiles {
             checkpoint_parts,
@@ -2333,8 +2335,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_timestamp_with_ict_enablement_timeline(
-    ) -> KernelResult<(), Box<dyn std::error::Error>> {
+    async fn test_timestamp_with_ict_enablement_timeline()
+    -> KernelResult<(), Box<dyn std::error::Error>> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory://test/";
         let engine = SyncEngine::new_with_store(store.clone());
@@ -2443,7 +2445,7 @@ mod tests {
             ),
         ];
         commit(table_root, store.as_ref(), 0, commit_data.to_vec()).await; // ICT enabled from
-                                                                           // version 0
+        // version 0
 
         // Create commit without ICT despite being enabled (corrupt case)
         let commit_missing_ict = [create_commit_info(1234567890, None)];
@@ -2510,7 +2512,9 @@ mod tests {
             create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
             create_metadata(
                 Some("5fba94ed-9794-4965-ba6e-6ee3c0d22af9"),
-                Some("{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"),
+                Some(
+                    "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
+                ),
                 Some(1587968585495),
                 Some(("0".to_string(), "1587968586154".to_string())),
                 false,
@@ -2524,7 +2528,9 @@ mod tests {
             create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
             create_metadata(
                 Some("5fba94ed-9794-4965-ba6e-6ee3c0d22af9"),
-                Some("{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"),
+                Some(
+                    "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
+                ),
                 Some(1587968585495),
                 Some(("0".to_string(), "1587968586154".to_string())),
                 false,

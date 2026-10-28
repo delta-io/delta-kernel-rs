@@ -86,11 +86,11 @@ use crate::actions::{
     ADD_FIELD, DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD,
     SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
-use crate::schema::{lazy_schema_ref, SchemaRef};
+use crate::schema::{SchemaRef, lazy_schema_ref};
 
 mod writer;
 
-pub use writer::{should_compact, LogCompactionWriter};
+pub use writer::{LogCompactionWriter, should_compact};
 
 #[cfg(test)]
 mod tests;

@@ -3,9 +3,9 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use delta_kernel::object_store::ObjectStore;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path as ObjectPath;
-use delta_kernel::object_store::ObjectStore;
 use delta_kernel::{Engine, KernelError, Snapshot, Version};
 use futures::stream::TryStreamExt;
 use serde::{Deserialize, Serialize};

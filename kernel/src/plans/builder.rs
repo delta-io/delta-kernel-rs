@@ -43,8 +43,8 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 
 use super::ir::nodes::{
-    Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, Operator, Project, RelationRef,
-    ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson, FILE_META_SCHEMA,
+    Aggregate, AggregateBuilder, DynamicScan, FILE_META_SCHEMA, FileType, Filter, Operator,
+    Project, RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
@@ -579,7 +579,7 @@ impl PlanBuilder {
             // An absent build side matches nothing, so an anti-join forwards an unfiltered
             // probe side while a semi-join is uninhabited.
             PlanBuilderRoot::Absent(_) if inverted => {
-                return Ok(PlanBuilder(PlanBuilderRoot::Present(probe)))
+                return Ok(PlanBuilder(PlanBuilderRoot::Present(probe)));
             }
             PlanBuilderRoot::Absent(_) => return Ok(Self::absent(Arc::clone(&probe.schema))),
         };
@@ -744,13 +744,13 @@ mod tests {
     use test_utils::assert_result_error_with_message;
 
     use super::*;
+    use crate::FileMeta;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
-    use crate::expressions::{col, column_name, lit, Expression};
+    use crate::expressions::{Expression, col, column_name, lit};
     use crate::plans::ir::nodes::FileType;
     use crate::schema::{
-        schema, schema_ref, DataType, MetadataColumnSpec, StructField, StructType,
+        DataType, MetadataColumnSpec, StructField, StructType, schema, schema_ref,
     };
-    use crate::FileMeta;
 
     /// A single-file scan (present), no file-constant columns -- the trivial scan fixture.
     fn scan(schema: SchemaRef) -> PlanBuilder {

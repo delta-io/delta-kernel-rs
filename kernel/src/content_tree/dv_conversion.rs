@@ -5,7 +5,7 @@ use crate::amt_path_util::validate_table_relative;
 use crate::content_tree::DeletionVectorInfo;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Scalar};
-use crate::schema::{column_name, lazy_schema_ref, ArrayType, ColumnName, DataType, SchemaRef};
+use crate::schema::{ArrayType, ColumnName, DataType, SchemaRef, column_name, lazy_schema_ref};
 use crate::{EngineData, KernelError, KernelResult};
 
 /// Extracts deletion vector content from a DeletionVectorDescriptor.
@@ -237,11 +237,11 @@ mod tests {
     use test_utils::assert_result_error_with_message;
 
     use super::*;
+    use crate::Engine;
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::engine::sync::SyncEngine;
     use crate::expressions::StructData;
-    use crate::schema::{schema_ref, ColumnNamesAndTypes, StructField, StructType, ToSchema};
-    use crate::Engine;
+    use crate::schema::{ColumnNamesAndTypes, StructField, StructType, ToSchema, schema_ref};
 
     /// Decoded DV columns read back from an augmented batch, one entry per row.
     #[derive(Default)]

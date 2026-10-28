@@ -23,16 +23,16 @@ use delta_kernel::metrics::{
 };
 use delta_kernel::{KernelError, KernelResult};
 use tracing::field::{Field as TracingField, Visit};
-use tracing::{error, Event as TracingEvent, Subscriber};
+use tracing::{Event as TracingEvent, Subscriber, error};
 use tracing_core::Dispatch;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::{Context, Identity, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::{reload, Layer, Registry};
+use tracing_subscriber::{Layer, Registry, reload};
 
-use crate::ffi_metrics::{with_ffi_event, MetricEvent};
-use crate::{kernel_string_slice, KernelStringSlice};
+use crate::ffi_metrics::{MetricEvent, with_ffi_event};
+use crate::{KernelStringSlice, kernel_string_slice};
 
 /// A type-erased logging layer that lives in the reloadable logging slot of the global subscriber.
 /// cbindgen:ignore
@@ -1068,7 +1068,7 @@ mod tests {
 
     #[test]
     #[ignore] // We cannot run this test if test_enable_log_line_tracing was run before - see
-              // comment there, however this test works if run individually.
+    // comment there, however this test works if run individually.
     fn test_enable_event_tracing() {
         setup_events();
         unsafe {

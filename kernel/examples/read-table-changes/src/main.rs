@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use clap::Parser;
 use common::{LocationArgs, ParseWithExamples};
+use delta_kernel::KernelResult;
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::KernelResult;
 use itertools::Itertools;
 
 #[derive(Parser)]

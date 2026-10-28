@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::{
     CancellationToken as _, CancellationTokenRef, Engine, FileMeta, FileSlice, JsonHandler,
@@ -13,8 +13,8 @@ use delta_kernel::{
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
-    actions_to_string, add_commit, generate_simple_batch, load_test_data, record_batch_to_bytes,
-    TestAction, TestCancellationToken, TokenCapturingEngine,
+    TestAction, TestCancellationToken, TokenCapturingEngine, actions_to_string, add_commit,
+    generate_simple_batch, load_test_data, record_batch_to_bytes,
 };
 
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";

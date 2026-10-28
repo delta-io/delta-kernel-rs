@@ -13,14 +13,14 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::ffi::from_ffi;
 use delta_kernel::arrow::array::{
-    make_array, Array, ArrayRef, BooleanArray, RecordBatch, StructArray,
+    Array, ArrayRef, BooleanArray, RecordBatch, StructArray, make_array,
 };
 use delta_kernel::arrow::datatypes::{Field, Fields, Schema};
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
 use delta_kernel::engine::arrow_expression::opaque::{
     ArrowOpaquePredicate as _, ArrowOpaquePredicateOp,
 };
-use delta_kernel::expressions::{null_lit, Expression, ExpressionRef, ScalarExpressionEvaluator};
+use delta_kernel::expressions::{Expression, ExpressionRef, ScalarExpressionEvaluator, null_lit};
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator, KernelPredicateEvaluator,
@@ -290,7 +290,7 @@ fn call_eval_pred(
         EngineExecResult::Uninit => {
             return Err(KernelError::Generic(format!(
                 "engine opaque-eval callback for `{op_name}` returned without writing a result"
-            )))
+            )));
         }
     };
 
@@ -393,20 +393,20 @@ mod tests {
 
     use std::ffi::c_void;
     use std::ptr;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-    use delta_kernel::arrow::array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
+    use delta_kernel::arrow::array::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
     use delta_kernel::arrow::array::{
         ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray, StructArray,
     };
     use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
-    use delta_kernel::expressions::{col, lit, Expression, Predicate};
+    use delta_kernel::expressions::{Expression, Predicate, col, lit};
 
     use super::*;
-    use crate::expressions::opaque_eval::EngineEvalRowsFn;
     use crate::KernelStringSlice;
+    use crate::expressions::opaque_eval::EngineEvalRowsFn;
 
     // === Engine-side test stubs ===================================================
     //
@@ -847,15 +847,15 @@ mod tests {
         use std::cmp::Ordering;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+        use delta_kernel::Predicate;
         use delta_kernel::arrow::array::Int64Array;
         use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
         use delta_kernel::expressions::{
-            col, column_name, joined_column_expr, lit, BinaryExpressionOp, BinaryPredicateOp,
-            ColumnName, Expression, JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
+            BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp,
+            OpaquePredicateOpRef, Scalar, col, column_name, joined_column_expr, lit,
         };
         use delta_kernel::kernel_predicates::DataSkippingPredicateEvaluator;
         use delta_kernel::schema::DataType;
-        use delta_kernel::Predicate;
 
         use super::*;
 

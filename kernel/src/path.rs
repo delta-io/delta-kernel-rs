@@ -13,11 +13,11 @@ use crate::actions::visitors::InCommitTimestampVisitor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::LastManifestCommitVisitor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{LastManifestCommit, COMMIT_INFO_NAME, LAST_MANIFEST_COMMIT_FIELD};
+use crate::actions::{COMMIT_INFO_NAME, LAST_MANIFEST_COMMIT_FIELD, LastManifestCommit};
 use crate::engine_data::RowVisitor;
+use crate::schema::SchemaRef;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::lazy_schema_ref;
-use crate::schema::SchemaRef;
 use crate::utils::require;
 use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult, Version};
 

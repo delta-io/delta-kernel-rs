@@ -17,20 +17,20 @@ use std::{iter, slice};
 use bytes::Bytes;
 use url::Url;
 
-use crate::actions::{CheckpointAction, ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA};
+use crate::actions::{ADD_NAME, ADD_SCHEMA, CheckpointAction, LOG_ADD_SCHEMA};
 use crate::amt_path_util::amt_manifest_filemeta;
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::{
-    struct_expr_from_schema, ColumnFile, ContentTreeNodeEntry, DataContentType, DataFileFormat,
-    TrackingInfo, TrackingStatus, AMT_FORMAT_VERSION, COLUMN_FILES, CONTENT_TYPE, DV_INFO,
-    FILE_FORMAT, FILE_SIZE_IN_BYTES, FIRST_ROW_ID, FORMAT_VERSION, LOCATION, MANIFEST_DV,
-    MANIFEST_INFO, MODIFIED_SNAPSHOT_ID, PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER,
-    TRACKING, TRACKING_COLUMNS, TRACKING_STATUS,
+    AMT_FORMAT_VERSION, COLUMN_FILES, CONTENT_TYPE, ColumnFile, ContentTreeNodeEntry, DV_INFO,
+    DataContentType, DataFileFormat, FILE_FORMAT, FILE_SIZE_IN_BYTES, FIRST_ROW_ID, FORMAT_VERSION,
+    LOCATION, MANIFEST_DV, MANIFEST_INFO, MODIFIED_SNAPSHOT_ID, PARTITION_SPEC_ID, RECORD_COUNT,
+    SEQUENCE_NUMBER, TRACKING, TRACKING_COLUMNS, TRACKING_STATUS, TrackingInfo, TrackingStatus,
+    struct_expr_from_schema,
 };
 use crate::engine_data::{
     EngineData, FilteredEngineData, GetData, RowVisitor, StructList, TypedGetData as _,
 };
-use crate::expressions::{lit, ArrayData, ColumnName, Expression, MapData, Scalar};
+use crate::expressions::{ArrayData, ColumnName, Expression, MapData, Scalar, lit};
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DATA_CHANGE_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, MODIFICATION_TIME_NAME,
     PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
@@ -1014,7 +1014,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::schema::StructType;
     use crate::unit_test_utils::adaptive_metadata_fixtures::checkpoint_action_with_root;
-    use crate::unit_test_utils::{assert_result_error_with_message, TestCancellationToken};
+    use crate::unit_test_utils::{TestCancellationToken, assert_result_error_with_message};
     use crate::{FileSize, ParquetFooter, ParquetHandler, PredicateRef};
 
     /// The [`ReadContext`] the tests read against; [`expected_add_row`] reads its values back.

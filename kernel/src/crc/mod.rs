@@ -26,12 +26,12 @@ mod state;
 mod writer;
 
 #[allow(unused)]
-pub(crate) use delta::{merge_domain_metadata, CrcDelta};
+pub(crate) use delta::{CrcDelta, merge_domain_metadata};
 use delta_kernel_derive::internal_api;
 pub use file_size_histogram::FileSizeHistogram;
 pub use file_stats::FileStats;
 #[allow(unused)]
-pub(crate) use file_stats::{is_incremental_safe_operation, size_to_u64, FileStatsDelta};
+pub(crate) use file_stats::{FileStatsDelta, is_incremental_safe_operation, size_to_u64};
 pub(crate) use reader::read_crc_file_or_none;
 #[cfg(test)]
 pub(crate) use reader::try_read_crc_file;
@@ -732,8 +732,8 @@ mod tests {
     use rstest::rstest;
 
     use super::{
-        Crc, CrcRaw, DeletedRecordCountsHistogram, DomainMetadataState, FileStats, FileStatsState,
-        SetTransactionState, ENABLE_IN_COMMIT_TIMESTAMPS,
+        Crc, CrcRaw, DeletedRecordCountsHistogram, DomainMetadataState,
+        ENABLE_IN_COMMIT_TIMESTAMPS, FileStats, FileStatsState, SetTransactionState,
     };
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::actions::LastManifestCommit;

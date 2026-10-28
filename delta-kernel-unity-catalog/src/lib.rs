@@ -129,10 +129,12 @@ mod tests {
             .with_max_catalog_version(max_catalog_version)
             .build(&engine);
 
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Log tail versions 1 and 3 are not contiguous"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Log tail versions 1 and 3 are not contiguous")
+        );
     }
 
     /// Builds a `LoadTableResponse` with no commits at the given location and ratified version.

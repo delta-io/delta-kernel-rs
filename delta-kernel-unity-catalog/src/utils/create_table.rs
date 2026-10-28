@@ -195,11 +195,11 @@ mod tests {
 
     use delta_kernel::expressions::column_name;
     use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel::schema::{schema_ref, SchemaRef};
+    use delta_kernel::schema::{SchemaRef, schema_ref};
     use delta_kernel::snapshot::Snapshot;
+    use delta_kernel::transaction::UpdateTableOperation;
     use delta_kernel::transaction::create_table::create_table;
     use delta_kernel::transaction::data_layout::DataLayout;
-    use delta_kernel::transaction::UpdateTableOperation;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use test_utils::TestCatalogCommitter;
@@ -266,16 +266,18 @@ mod tests {
 
         assert_eq!(req.protocol.min_reader_version, 3);
         assert_eq!(req.protocol.min_writer_version, 7);
-        assert!(req
-            .protocol
-            .reader_features
-            .iter()
-            .any(|f| f == "catalogManaged"));
-        assert!(req
-            .protocol
-            .writer_features
-            .iter()
-            .any(|f| f == "inCommitTimestamp"));
+        assert!(
+            req.protocol
+                .reader_features
+                .iter()
+                .any(|f| f == "catalogManaged")
+        );
+        assert!(
+            req.protocol
+                .writer_features
+                .iter()
+                .any(|f| f == "inCommitTimestamp")
+        );
 
         assert_eq!(
             req.properties["io.unitycatalog.tableId"],

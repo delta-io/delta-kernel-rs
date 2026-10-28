@@ -7,36 +7,36 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(feature = "internal-api")]
+use delta_kernel::LogPath;
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
 #[cfg(feature = "internal-api")]
 use delta_kernel::crc::Crc;
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::metrics::SnapshotLoadType;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::snapshot::IncrementalReplay;
 #[cfg(feature = "internal-api")]
 use delta_kernel::snapshot::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::UpdateTableOperation;
-#[cfg(feature = "internal-api")]
-use delta_kernel::LogPath;
 use delta_kernel::{KernelResult, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 #[cfg(feature = "internal-api")]
 use test_utils::table_builder::{FeatureSet, LastCheckpointHintState};
 use test_utils::{
-    insert_data, test_table_setup, test_table_setup_mt, CountingReporter, SnapshotCompletionStatus,
+    CountingReporter, SnapshotCompletionStatus, insert_data, test_table_setup, test_table_setup_mt,
 };
 use url::Url;
 
 use super::{
-    insert_rows, measuring_engine, setup_table_with_v1_checkpoint, simple_schema, LogState,
-    TestTableBuilder,
+    LogState, TestTableBuilder, insert_rows, measuring_engine, setup_table_with_v1_checkpoint,
+    simple_schema,
 };
 
 fn assert_full_snapshot_completed(reporter: &CountingReporter) {
@@ -727,9 +727,10 @@ async fn get_domain_metadata_load_emits_loaded_metric(#[case] with_crc: bool) ->
     // Miss on a nonexistent domain. A Complete CRC answers the miss from cache; without a CRC it
     // falls back to log replay.
     reporter.reset();
-    assert!(snap
-        .get_domain_metadata("does.not.exist", &engine)?
-        .is_none());
+    assert!(
+        snap.get_domain_metadata("does.not.exist", &engine)?
+            .is_none()
+    );
     assert_eq!(reporter.domain_metadata_loads.get(), 1);
     assert_eq!(reporter.domain_metadata_cache_hits.get(), with_crc as u64);
     assert_eq!(reporter.domain_metadata_domains_returned.get(), 0);

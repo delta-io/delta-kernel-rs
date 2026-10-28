@@ -2,13 +2,13 @@
 //!
 //! run with `cargo test -p mem-test dhat_large_table_log -- --ignored --nocapture`
 
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::Snapshot;
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel_default_engine::DefaultEngineBuilder;
 use serde_json::json;
 use tempfile::tempdir;

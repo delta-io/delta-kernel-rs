@@ -11,8 +11,8 @@ use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use url::Url;
 
-use crate::executor::TaskExecutor;
 use crate::UrlExt;
+use crate::executor::TaskExecutor;
 
 #[derive(Debug)]
 pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
@@ -298,16 +298,16 @@ mod tests {
     use std::ops::Range;
     use std::time::Duration;
 
+    use delta_kernel::Engine as _;
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel::Engine as _;
     use delta_kernel_default_engine_test_utils::current_time_duration;
     use itertools::Itertools;
     use test_utils::delta_path_for_version;
 
     use super::*;
-    use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::DefaultEngineBuilder;
+    use crate::executor::tokio::TokioBackgroundExecutor;
 
     fn setup_test() -> (
         tempfile::TempDir,

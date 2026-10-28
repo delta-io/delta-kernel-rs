@@ -233,7 +233,7 @@ mod tests {
     use crate::ffi_test_utils::ok_or_panic;
     use crate::handle::Handle;
     use crate::tests::get_default_engine;
-    use crate::{free_engine, SharedSchema};
+    use crate::{SharedSchema, free_engine};
 
     #[test]
     fn test_new_expression_evaluator() {

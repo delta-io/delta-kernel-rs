@@ -16,17 +16,17 @@ use crate::actions::{
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
-    col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, ExpressionRef,
-    MapToStructOptions, Predicate,
+    ColumnName, Expression as Expr, ExpressionRef, MapToStructOptions, Predicate, col, column_name,
+    joined_column_expr, lit,
 };
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME};
 use crate::schema::{
-    lazy_schema_ref, schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder, StructField,
+    DataType, SchemaRef, SchemaStructPatchBuilder, StructField, lazy_schema_ref, schema, schema_ref,
 };
-use crate::struct_patch::{project_struct_preserving_nulls, ProjectionStructPatchBuilder};
-use crate::transforms::{transform_output_type, ExpressionTransform};
+use crate::struct_patch::{ProjectionStructPatchBuilder, project_struct_preserving_nulls};
+use crate::transforms::{ExpressionTransform, transform_output_type};
 use crate::utils::FoldWithOption as _;
 use crate::{KernelError, KernelResult, PlanBuilder};
 
@@ -566,16 +566,16 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
     use crate::log_segment_files::LogSegmentFiles;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStoreExt as _;
-    use crate::plans::ir::nodes::Operator;
     use crate::plans::Operation as PlanOperation;
+    use crate::plans::ir::nodes::Operator;
     use crate::scan::{PartitionValuesOptions, StatsOptions};
     use crate::schema::StructType;
     use crate::snapshot::Snapshot;
     use crate::unit_test_utils::{
-        create_log_path, MockProtocolBuilder, MockTableConfigurationBuilder,
+        MockProtocolBuilder, MockTableConfigurationBuilder, create_log_path,
     };
     use crate::{Engine as _, KernelResult};
 
@@ -908,9 +908,10 @@ mod tests {
             scan.state_info.physical_predicate,
             PhysicalPredicate::StaticSkipAll
         );
-        assert!(scan
-            .build_metadata_scan_plan(&shape(CheckpointType::Leaf, None))?
-            .is_none());
+        assert!(
+            scan.build_metadata_scan_plan(&shape(CheckpointType::Leaf, None))?
+                .is_none()
+        );
         Ok(())
     }
 

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use delta_kernel::{Engine, KernelResult, Snapshot};
 
-use super::{measuring_engine, LogState, TestTableBuilder};
+use super::{LogState, TestTableBuilder, measuring_engine};
 
 // ============================================================================
 // scan.execute() contributes parquet data-file reads

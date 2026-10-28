@@ -18,8 +18,8 @@ use std::time::Duration;
 use delta_kernel::object_store::{Error as ObjectStoreError, ObjectStore};
 use delta_kernel::{KernelError, KernelResult};
 use delta_kernel_default_engine::rest_store::{
-    build_rest_client, headers_from_pairs, AuthHeaderProvider, HeaderMap, RefreshingHeaderProvider,
-    RestClientOptions, RestEndpointConfig, RestObjectStore, StaticHeaderProvider,
+    AuthHeaderProvider, HeaderMap, RefreshingHeaderProvider, RestClientOptions, RestEndpointConfig,
+    RestObjectStore, StaticHeaderProvider, build_rest_client, headers_from_pairs,
 };
 use derive_more::Constructor;
 use url::Url;

@@ -17,7 +17,7 @@ use crate::expressions::{
     SharedPredicate,
 };
 use crate::handle::Handle;
-use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
+use crate::{KernelStringSlice, SharedSchema, kernel_string_slice};
 
 type VisitLiteralFn<T> = extern "C" fn(data: *mut c_void, sibling_list_id: usize, value: T);
 type VisitUnaryFn = extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
@@ -784,12 +784,12 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::expressions::{lit, Expression, MapToStructOptions, Scalar};
+    use delta_kernel::expressions::{Expression, MapToStructOptions, Scalar, lit};
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::FfiMapToStructOptions;
     use crate::TryFromStringSlice;
+    use crate::expressions::FfiMapToStructOptions;
 
     #[derive(Debug, PartialEq, Eq)]
     enum LiteralEvent {

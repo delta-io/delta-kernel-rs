@@ -2,22 +2,22 @@
 
 use std::sync::Arc;
 
+use delta_kernel::Snapshot;
 use delta_kernel::arrow::array::{ArrayRef, MapBuilder, RecordBatch, StringArray, StringBuilder};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::object_store::path::Path;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::UpdateTableOperation;
-use delta_kernel::Snapshot;
 use itertools::Itertools;
 use rstest::rstest;
-use serde_json::{json, Deserializer};
+use serde_json::{Deserializer, json};
 use test_utils::{load_and_begin_transaction_with, set_json_value, setup_test_tables};
 
 use crate::common::write_utils::{
-    get_simple_int_schema, validate_timestamp, validate_txn_id, ZERO_UUID,
+    ZERO_UUID, get_simple_int_schema, validate_timestamp, validate_txn_id,
 };
 
 #[rstest]
@@ -67,9 +67,11 @@ async fn test_commit_info_defaults_to_empty_parameters_and_omitted_metrics(
             parsed_commit["commitInfo"]["operationParameters"],
             json!({})
         );
-        assert!(parsed_commit["commitInfo"]
-            .get("operationMetrics")
-            .is_none());
+        assert!(
+            parsed_commit["commitInfo"]
+                .get("operationMetrics")
+                .is_none()
+        );
 
         let expected_commit = json!({
             "commitInfo": {
@@ -88,8 +90,8 @@ async fn test_commit_info_defaults_to_empty_parameters_and_omitted_metrics(
 }
 
 #[tokio::test]
-async fn transaction_builder_writes_operation_parameters_and_metrics(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn transaction_builder_writes_operation_parameters_and_metrics()
+-> Result<(), Box<dyn std::error::Error>> {
     let schema = get_simple_int_schema();
 
     for (table_url, engine, store, table_name) in

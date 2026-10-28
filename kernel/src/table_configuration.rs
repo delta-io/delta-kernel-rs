@@ -16,27 +16,27 @@ use delta_kernel_derive::internal_api;
 use tracing::warn;
 use url::Url;
 
-use crate::actions::{Metadata, Protocol, NULL_COUNT};
+use crate::actions::{Metadata, NULL_COUNT, Protocol};
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
-    expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
+    StatsConfig, StripFieldMetadataTransform, expected_stats_schema, stats_column_names,
 };
 pub(crate) use crate::schema::file_utils::validate_file_type_feature_support;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
-    schema_has_invariants, validate_column_defaults_metadata, SchemaRef, StructField, StructType,
+    SchemaRef, StructField, StructType, schema_has_invariants, validate_column_defaults_metadata,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::table_features::validate_geospatial_feature_support;
 use crate::table_features::{
+    ColumnMappingMode, EnablementCheck, FeatureRequirement, FeatureType,
+    IcebergCompatValidationContext, KernelSupport, LEGACY_WRITER_FEATURES,
+    MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION, Operation, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature, V2_VALIDATOR, V3_VALIDATOR,
     check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
     get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
-    validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
-    FeatureType, IcebergCompatValidationContext, KernelSupport, Operation, TableFeature,
-    LEGACY_WRITER_FEATURES, MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, V2_VALIDATOR,
-    V3_VALIDATOR,
+    validate_timestamp_ntz_feature_support,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
@@ -998,7 +998,7 @@ impl TableConfiguration {
             KernelSupport::NotSupported => {
                 return Err(KernelError::unsupported(format!(
                     "Feature '{feature}' is not supported"
-                )))
+                )));
             }
             KernelSupport::Custom(check) => {
                 check(&self.protocol, &self.table_properties, operation)?;
@@ -1286,27 +1286,27 @@ mod test {
     use rstest::rstest;
 
     use super::{InCommitTimestampEnablement, StatsOutputSchemas, TableConfiguration};
-    use crate::actions::{Metadata, Protocol, MIN_VALUES};
+    use crate::KernelError;
+    use crate::actions::{MIN_VALUES, Metadata, Protocol};
     use crate::schema::{
-        column_name, schema, schema_ref, ColumnName, DataType, SchemaRef, StructField,
+        ColumnName, DataType, SchemaRef, StructField, column_name, schema, schema_ref,
     };
     use crate::table_features::{
-        ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
-        TABLE_FEATURES_MIN_WRITER_VERSION,
+        ColumnMappingMode, FeatureType, Operation, TABLE_FEATURES_MIN_READER_VERSION,
+        TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
     };
     use crate::table_properties::{
-        TableProperties, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1,
-        ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
-        ENABLE_ROW_TRACKING,
+        ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
+        ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
+        TableProperties,
     };
     use crate::unit_test_utils::{
-        assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
-        test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
+        MockProtocolBuilder, MockTableConfigurationBuilder, assert_result_error_with_message,
+        test_schema_flat, test_schema_flat_with_column_mapping, test_schema_nested,
+        test_schema_nested_with_column_mapping, test_schema_with_array,
         test_schema_with_array_and_column_mapping, test_schema_with_map,
-        test_schema_with_map_and_column_mapping, MockProtocolBuilder,
-        MockTableConfigurationBuilder,
+        test_schema_with_map_and_column_mapping,
     };
-    use crate::KernelError;
 
     #[test]
     fn stats_output_schemas_allow_aligned_physical_names() {
@@ -1577,9 +1577,13 @@ mod test {
             ))
             .build();
         let expected = if rv < 1 {
-            format!("Invalid protocol action in the delta log: min_reader_version must be >= 1, got {rv}")
+            format!(
+                "Invalid protocol action in the delta log: min_reader_version must be >= 1, got {rv}"
+            )
         } else {
-            format!("Invalid protocol action in the delta log: min_writer_version must be >= 1, got {wv}")
+            format!(
+                "Invalid protocol action in the delta log: min_writer_version must be >= 1, got {wv}"
+            )
         };
         assert_result_error_with_message(table_config.ensure_operation_supported(op), &expected);
     }
@@ -1892,7 +1896,10 @@ mod test {
         };
 
         let result = ntz_config(&[]);
-        assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features");
+        assert_result_error_with_message(
+            result,
+            "Unsupported: Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features",
+        );
 
         let result = ntz_config(&[TableFeature::TimestampWithoutTimezone]);
         assert!(
@@ -1941,7 +1948,10 @@ mod test {
         };
 
         let result = variant_config(&[]);
-        assert_result_error_with_message(result, "Unsupported: Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features");
+        assert_result_error_with_message(
+            result,
+            "Unsupported: Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features",
+        );
 
         let result = variant_config(&[TableFeature::VariantType]);
         assert!(
@@ -2174,13 +2184,15 @@ mod test {
 
         // A non-legacy ReaderWriter feature in the same writer-only position has no legacy reader
         // version to fall back on, so the protocol is rejected outright rather than tolerated.
-        assert!(Protocol::try_new(
-            TABLE_FEATURES_MIN_READER_VERSION,
-            TABLE_FEATURES_MIN_WRITER_VERSION,
-            Some(TableFeature::EMPTY_LIST),
-            Some(vec![TableFeature::DeletionVectors]),
-        )
-        .is_err());
+        assert!(
+            Protocol::try_new(
+                TABLE_FEATURES_MIN_READER_VERSION,
+                TABLE_FEATURES_MIN_WRITER_VERSION,
+                Some(TableFeature::EMPTY_LIST),
+                Some(vec![TableFeature::DeletionVectors]),
+            )
+            .is_err()
+        );
 
         // The conformant shape (ColumnMapping in both lists) is still reported supported: the
         // legacy-version fallback does not perturb the normal reader_features membership path.
@@ -2280,9 +2292,11 @@ mod test {
     #[test]
     fn test_ensure_operation_supported_reads() {
         let config = MockTableConfigurationBuilder::new().build();
-        assert!(config
-            .ensure_operation_supported(Operation::SnapshotLoad)
-            .is_ok());
+        assert!(
+            config
+                .ensure_operation_supported(Operation::SnapshotLoad)
+                .is_ok()
+        );
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
 
         let config = MockTableConfigurationBuilder::new()
@@ -2320,9 +2334,11 @@ mod test {
                 .build();
             assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
             assert!(config.ensure_operation_supported(Operation::Cdf).is_ok());
-            assert!(config
-                .ensure_operation_supported(Operation::SnapshotLoad)
-                .is_ok());
+            assert!(
+                config
+                    .ensure_operation_supported(Operation::SnapshotLoad)
+                    .is_ok()
+            );
         }
     }
 

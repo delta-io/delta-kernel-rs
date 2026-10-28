@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::BoundWriteContext;
-use crate::expressions::{lit, ColumnName, ExpressionStructPatchBuilder, Scalar};
+use crate::expressions::{ColumnName, ExpressionStructPatchBuilder, Scalar, lit};
 use crate::partition::serialization::serialize_partition_value;
 use crate::partition::validation::{validate_partition_values, validate_physical_partition_values};
 use crate::schema::void_utils::add_void_stripping;
@@ -451,13 +451,13 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::Engine;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{schema_ref, MetadataValue};
+    use crate::schema::{MetadataValue, schema_ref};
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
-    use crate::Engine;
 
     fn partitioned_write_state(
         column_mapping_mode: ColumnMappingMode,
@@ -637,9 +637,11 @@ mod tests {
                 .strip_suffix('/')
                 .unwrap();
             assert_eq!(prefix.len(), random_prefix_length);
-            assert!(prefix
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric()));
+            assert!(
+                prefix
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+            );
         } else {
             assert_eq!(write_dir, "/table/year=2024/");
         }
@@ -669,32 +671,42 @@ mod tests {
         };
 
         assert!(error_for(HashMap::new()).contains("missing partition column"));
-        assert!(error_for(HashMap::from([(
-            "unknown".to_string(),
-            Scalar::Integer(2024),
-        )]))
-        .contains("unknown partition column 'unknown'"));
-        assert!(error_for(HashMap::from([(
-            physical_name.to_uppercase(),
-            Scalar::Integer(2024),
-        )]))
-        .contains("unknown partition column"));
-        assert!(error_for(HashMap::from([(
-            physical_name.clone(),
-            Scalar::String("2024".into()),
-        )]))
-        .contains("value of type"));
-        assert!(error_for(HashMap::from([(
-            physical_name.clone(),
-            Scalar::Null(DataType::INTEGER),
-        )]))
-        .contains("is not nullable"));
+        assert!(
+            error_for(HashMap::from([(
+                "unknown".to_string(),
+                Scalar::Integer(2024),
+            )]))
+            .contains("unknown partition column 'unknown'")
+        );
+        assert!(
+            error_for(HashMap::from([(
+                physical_name.to_uppercase(),
+                Scalar::Integer(2024),
+            )]))
+            .contains("unknown partition column")
+        );
+        assert!(
+            error_for(HashMap::from([(
+                physical_name.clone(),
+                Scalar::String("2024".into()),
+            )]))
+            .contains("value of type")
+        );
+        assert!(
+            error_for(HashMap::from([(
+                physical_name.clone(),
+                Scalar::Null(DataType::INTEGER),
+            )]))
+            .contains("is not nullable")
+        );
         if column_mapping_mode != ColumnMappingMode::None {
             assert_ne!(physical_name, "year");
-            assert!(error_for(HashMap::from([
-                ("year".to_string(), Scalar::Integer(2024),)
-            ]))
-            .contains("unknown partition column 'year'"));
+            assert!(
+                error_for(HashMap::from([
+                    ("year".to_string(), Scalar::Integer(2024),)
+                ]))
+                .contains("unknown partition column 'year'")
+            );
         }
     }
 
@@ -939,9 +951,11 @@ mod tests {
         encoded["version"] = 2.into();
 
         let error = WriteState::decode(&serde_json::to_vec(&encoded).unwrap()).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("unsupported write state format version 2; expected 1"));
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported write state format version 2; expected 1")
+        );
     }
 
     #[test]

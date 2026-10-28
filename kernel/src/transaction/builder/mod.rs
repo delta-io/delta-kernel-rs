@@ -13,12 +13,12 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 pub(super) use self::state::TransactionBuilderState;
+use crate::EngineData;
 use crate::actions::DomainMetadata;
 use crate::schema::SchemaRef;
 use crate::transaction::{
-    collect_operation_metadata, CreateTable, ExecutionMode, Imperative, UpdateTable,
+    CreateTable, ExecutionMode, Imperative, UpdateTable, collect_operation_metadata,
 };
-use crate::EngineData;
 
 /// A transaction type supported by [`TransactionBuilder`].
 ///
@@ -182,7 +182,7 @@ mod tests {
 
     use rstest::rstest;
 
-    use super::{private, TransactionBuilder, TransactionBuilderState, TransactionType};
+    use super::{TransactionBuilder, TransactionBuilderState, TransactionType, private};
     use crate::arrow::array::StringArray;
     use crate::schema::schema_ref;
     #[cfg(feature = "declarative-plans")]

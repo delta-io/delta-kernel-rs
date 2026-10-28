@@ -83,7 +83,9 @@ pub(crate) enum SchemaDiffError {
         "Field at path '{path}' is missing physical name (required when column mapping is enabled)"
     )]
     MissingPhysicalName { path: ColumnName },
-    #[error("Field with ID {field_id} at path '{path}' has inconsistent physical names: '{before}' -> '{after}'. Physical names must not change for the same field ID.")]
+    #[error(
+        "Field with ID {field_id} at path '{path}' has inconsistent physical names: '{before}' -> '{after}'. Physical names must not change for the same field ID."
+    )]
     PhysicalNameChanged {
         field_id: i64,
         path: ColumnName,
@@ -737,7 +739,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::column_name;
-    use crate::schema::{schema, ArrayType, DataType, MapType, StructField};
+    use crate::schema::{ArrayType, DataType, MapType, StructField, schema};
 
     fn create_field_with_id(
         name: &str,
@@ -956,12 +958,16 @@ mod tests {
         // Should have 3 changes
         assert_eq!(update.change_types.len(), 3);
         assert!(update.change_types.contains(&FieldChangeType::Renamed));
-        assert!(update
-            .change_types
-            .contains(&FieldChangeType::NullabilityLoosened));
-        assert!(update
-            .change_types
-            .contains(&FieldChangeType::MetadataChanged));
+        assert!(
+            update
+                .change_types
+                .contains(&FieldChangeType::NullabilityLoosened)
+        );
+        assert!(
+            update
+                .change_types
+                .contains(&FieldChangeType::MetadataChanged)
+        );
 
         // Breaking because metadata changed (metadata changes can be unsafe, e.g., row tracking)
         assert!(diff.has_breaking_changes());
@@ -992,12 +998,16 @@ mod tests {
 
         assert_eq!(update.change_types.len(), 3);
         assert!(update.change_types.contains(&FieldChangeType::Renamed));
-        assert!(update
-            .change_types
-            .contains(&FieldChangeType::NullabilityTightened));
-        assert!(update
-            .change_types
-            .contains(&FieldChangeType::MetadataChanged));
+        assert!(
+            update
+                .change_types
+                .contains(&FieldChangeType::NullabilityTightened)
+        );
+        assert!(
+            update
+                .change_types
+                .contains(&FieldChangeType::MetadataChanged)
+        );
 
         // Breaking because nullability was tightened
         assert!(diff.has_breaking_changes());

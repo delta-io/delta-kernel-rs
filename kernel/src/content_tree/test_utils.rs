@@ -6,8 +6,8 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::content_tree::{
-    ContentTreeNodeEntry, DataContentType, DataFileFormat, ManifestInfo, TrackingInfo,
-    TrackingStatus, AMT_FORMAT_VERSION,
+    AMT_FORMAT_VERSION, ContentTreeNodeEntry, DataContentType, DataFileFormat, ManifestInfo,
+    TrackingInfo, TrackingStatus,
 };
 use crate::expressions::{Scalar, StructData};
 use crate::schema::ToSchema as _;

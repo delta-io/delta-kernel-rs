@@ -10,7 +10,7 @@ use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::{Engine, KernelResult, Snapshot};
 use rstest::rstest;
 use test_utils::{
-    insert_data_with, install_thread_local_metrics_reporter, test_table_setup_mt, CapturingReporter,
+    CapturingReporter, insert_data_with, install_thread_local_metrics_reporter, test_table_setup_mt,
 };
 
 use super::table_type::{assert_table_types, create_simple_table, make_committer};

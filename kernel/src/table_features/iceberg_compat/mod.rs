@@ -12,7 +12,7 @@ use crate::schema::PrimitiveType::{Byte, Decimal, Double, Float, Integer, Long, 
 use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{KernelError, KernelResult};
 
 pub(crate) enum IcebergCompatVersion {
@@ -320,7 +320,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{schema, ArrayType, MetadataValue, PrimitiveType, StructType};
+    use crate::schema::{ArrayType, MetadataValue, PrimitiveType, StructType, schema};
 
     // === LegacyNestedIdsVisitor: parquet.field.nested.ids detection ===
 

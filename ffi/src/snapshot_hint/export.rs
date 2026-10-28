@@ -3,15 +3,15 @@
 //! Shared backing storage and its lifetime rules live beside the FFI types in
 //! [`crate::delta_types`].
 
-use delta_kernel::snapshot::{SnapshotHint, SnapshotHintFreshness};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::KernelError;
 use delta_kernel::KernelResult;
+use delta_kernel::snapshot::{SnapshotHint, SnapshotHintFreshness};
 
 use super::{FfiSnapshotHint, FfiSnapshotHintFreshness, SnapshotHintVisitor};
 use crate::delta_types::{CheckpointBacking, CrcBacking, MetadataBacking, ProtocolBacking};
 use crate::log_path::FfiLogPath;
-use crate::{kernel_string_slice, optional_pointer, FfiSlice, NullableCvoid};
+use crate::{FfiSlice, NullableCvoid, kernel_string_slice, optional_pointer};
 
 pub(super) fn visit(
     hint: &SnapshotHint,

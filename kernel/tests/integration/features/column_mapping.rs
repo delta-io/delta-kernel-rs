@@ -3,15 +3,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::Snapshot;
 use delta_kernel::arrow::array::{Int32Array, RecordBatch, StringArray};
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use delta_kernel::object_store::path::Path as ObjectStorePath;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
-use delta_kernel::schema::{schema, DataType};
+use delta_kernel::schema::{DataType, schema};
 use delta_kernel::table_features::TableFeature;
-use delta_kernel::Snapshot;
 use rstest::rstest;
 use serde_json::json;
 use test_utils::column_mapping_fixtures::cm_field;

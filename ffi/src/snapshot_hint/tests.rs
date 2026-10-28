@@ -16,7 +16,7 @@ use delta_kernel::{
     Engine, EvaluationHandler, FileMeta, JsonHandler, ParquetHandler, StorageHandler,
 };
 use test_utils::table_builder::{LogState, TestTableBuilder};
-use test_utils::{compacted_log_path_for_versions, create_log_path, TestCatalogCommitter};
+use test_utils::{TestCatalogCommitter, compacted_log_path_for_versions, create_log_path};
 
 use super::*;
 use crate::delta_types::*;
@@ -27,11 +27,11 @@ use crate::ffi_test_utils::{
 };
 use crate::log_path::FfiLogPath;
 use crate::{
-    engine_to_handle, free_engine, free_snapshot, get_snapshot_builder, get_snapshot_builder_from,
-    snapshot_builder_build, snapshot_builder_with_incremental_crc_replay,
-    snapshot_builder_with_max_catalog_version, snapshot_builder_with_version,
-    snapshot_log_segment_stats, FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats,
-    KernelI64Slice, KernelStringSlice, OptionalValue, SharedExternEngine,
+    FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats, KernelI64Slice, KernelStringSlice,
+    OptionalValue, SharedExternEngine, engine_to_handle, free_engine, free_snapshot,
+    get_snapshot_builder, get_snapshot_builder_from, snapshot_builder_build,
+    snapshot_builder_with_incremental_crc_replay, snapshot_builder_with_max_catalog_version,
+    snapshot_builder_with_version, snapshot_log_segment_stats,
 };
 
 fn slice(value: &'static str) -> KernelStringSlice {
@@ -521,10 +521,12 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
         ))
     });
     assert_eq!(state.visits, 1);
-    assert!(state
-        .files
-        .windows(2)
-        .all(|pair| pair[0].location.as_str() < pair[1].location.as_str()));
+    assert!(
+        state
+            .files
+            .windows(2)
+            .all(|pair| pair[0].location.as_str() < pair[1].location.as_str())
+    );
     assert_eq!(
         state.files,
         expected_files.into_values().collect::<Vec<_>>()
@@ -1206,11 +1208,13 @@ fn invalid_crc_preserves_source() {
     let KernelError::SnapshotHint(source) = error else {
         panic!("expected SnapshotHint")
     };
-    assert!(source
-        .source()
-        .expect("connector error must preserve its source")
-        .to_string()
-        .contains("invalid CRC state"));
+    assert!(
+        source
+            .source()
+            .expect("connector error must preserve its source")
+            .to_string()
+            .contains("invalid CRC state")
+    );
 }
 
 #[derive(Clone, Copy)]

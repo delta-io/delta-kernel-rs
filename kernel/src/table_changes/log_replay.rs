@@ -8,21 +8,21 @@ use std::sync::{Arc, LazyLock};
 use itertools::Itertools;
 use tracing::info;
 
-use crate::actions::visitors::{visit_deletion_vector_at, InCommitTimestampVisitor};
+use crate::actions::visitors::{InCommitTimestampVisitor, visit_deletion_vector_at};
 use crate::actions::{
-    Metadata, Protocol, ADD_FIELD, CDC_FIELD, COMMIT_INFO_NAME, METADATA_FIELD, PROTOCOL_FIELD,
+    ADD_FIELD, CDC_FIELD, COMMIT_INFO_NAME, METADATA_FIELD, Metadata, PROTOCOL_FIELD, Protocol,
     REMOVE_FIELD,
 };
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{column_name, ColumnName, MapToStructOptions};
+use crate::expressions::{ColumnName, MapToStructOptions, column_name};
 use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
-use crate::schema::{schema_ref, ColumnNamesAndTypes, DataType, SchemaRef};
-use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
+use crate::schema::{ColumnNamesAndTypes, DataType, SchemaRef, schema_ref};
 use crate::table_changes::CdfMode;
+use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{format_features, Operation, TableFeature};
+use crate::table_features::{Operation, TableFeature, format_features};
 use crate::utils::require;
 use crate::{
     Engine, EngineData, KernelError, KernelResult, KernelResultIterator, PredicateRef, RowVisitor,

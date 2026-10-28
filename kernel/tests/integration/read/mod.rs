@@ -20,25 +20,25 @@ use delta_kernel::arrow::datatypes::{
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::expressions::{
-    col, column_pred, lit, null_lit, Expression as Expr, ExpressionRef, Predicate as Pred,
-    PredicateRef, Scalar,
+    Expression as Expr, ExpressionRef, Predicate as Pred, PredicateRef, Scalar, col, column_pred,
+    lit, null_lit,
 };
 use delta_kernel::log_segment::LogSegment;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::path::ParsedLogPath;
-use delta_kernel::scan::state::{transform_to_logical, ScanFile};
+use delta_kernel::scan::state::{ScanFile, transform_to_logical};
 use delta_kernel::scan::{Scan, StatsOptions};
-use delta_kernel::schema::{schema_ref, DataType, MetadataColumnSpec, Schema, StructField};
+use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, schema_ref};
 use delta_kernel::{Engine, FileMeta, Snapshot};
 use itertools::Itertools;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
-    actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
-    load_test_data, read_scan, record_batch_to_bytes, record_batch_to_bytes_with_props, IntoArray,
-    TestAction, METADATA,
+    IntoArray, METADATA, TestAction, actions_to_string, add_commit, generate_batch,
+    generate_simple_batch, into_record_batch, load_test_data, read_scan, record_batch_to_bytes,
+    record_batch_to_bytes_with_props,
 };
 use url::Url;
 
@@ -1620,7 +1620,7 @@ fn type_widening_basic() -> Result<(), Box<dyn std::error::Error>> {
         "| 1                   | 2                   | 3.4000000953674316 | 5.0            | 6.0            | 7.0            | 2024-09-09T00:00:00        |",
         "| 9223372036854775807 | 9223372036854775807 | 1.234567890123     | 1.234567890123 | 1.234567890123 | 1.234567890123 | 2024-09-09T12:34:56.123456 |",
         "+---------------------+---------------------+--------------------+----------------+----------------+----------------+----------------------------+",
-   ];
+    ];
     let select_cols: Option<&[&str]> = Some(&[
         "byte_long",
         "int_long",
@@ -2443,8 +2443,8 @@ fn partition_values_parsed_skipping() -> Result<(), Box<dyn std::error::Error>> 
 //   file 2: truncated max=4s > adjusted predicate (3_999_401) -> kept (truncation safe)
 //   file 3: max=8s >> adjusted predicate -> kept
 #[tokio::test]
-async fn timestamp_max_stat_truncation_does_not_over_prune(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn timestamp_max_stat_truncation_does_not_over_prune()
+-> Result<(), Box<dyn std::error::Error>> {
     let ts_metadata = "{\
         \"id\":\"test-ts-table\",\
         \"format\":{\"provider\":\"parquet\",\"options\":{}},\
@@ -2681,8 +2681,8 @@ fn timestamp_truncation_real_table_gt() -> Result<(), Box<dyn std::error::Error>
 
 // Verify that an explicit projection including a void column returns it as null.
 #[tokio::test]
-async fn explicit_projection_with_void_column_returns_nulls(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn explicit_projection_with_void_column_returns_nulls()
+-> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_batch(vec![("id", vec![1, 2, 3].into_arrow_array())])?;
 
     let storage = Arc::new(InMemory::new());

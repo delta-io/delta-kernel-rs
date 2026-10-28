@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rstest::rstest;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use test_utils::delta_path_for_version;
 use url::Url;
 
@@ -16,12 +16,12 @@ use super::LogSegment;
 use crate::actions::CheckpointAction;
 use crate::actions::{DomainMetadata, Format, Metadata, Protocol, SetTransaction};
 use crate::crc::{
-    try_read_crc_file, Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState,
+    Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState, try_read_crc_file,
 };
-use crate::engine::sync::SyncEngine;
 use crate::engine::CancellableEngine;
-use crate::object_store::memory::InMemory;
+use crate::engine::sync::SyncEngine;
 use crate::object_store::ObjectStoreExt as _;
+use crate::object_store::memory::InMemory;
 use crate::path::ParsedLogPath;
 use crate::snapshot::{IncrementalReplay, SnapshotBuilder, SnapshotRef};
 #[cfg(feature = "adaptive-metadata-in-dev")]

@@ -15,10 +15,10 @@ use std::collections::HashSet;
 use tracing::warn;
 use url::Url;
 
+use crate::KernelResult;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::log_replay::FileActionKey;
-use crate::KernelResult;
 
 /// Information we want to return to the add-dedup about file related actions
 pub(crate) struct FileActionInfo {

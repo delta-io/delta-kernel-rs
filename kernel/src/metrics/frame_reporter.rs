@@ -5,9 +5,9 @@ use std::sync::Arc;
 use tracing::span::Id;
 use tracing::subscriber::Interest;
 use tracing::{Metadata, Subscriber};
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::Layer;
 
 /// Tracing field whose presence opts a span into call-frame lifecycle reporting.
 pub const ENABLE_CALL_FRAME_FIELD: &str = "enable_call_frame";
@@ -81,20 +81,20 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::Mutex;
 
     use tracing::field::Empty;
     use tracing::subscriber::with_default;
-    use tracing::{info_span, trace_span, Span};
-    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing::{Span, info_span, trace_span};
     use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::*;
+    use crate::Snapshot;
     use crate::engine::sync::SyncEngine;
     use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
     use crate::unit_test_utils::{copy_test_table, load_test_table};
-    use crate::Snapshot;
 
     #[derive(Clone, Debug, PartialEq)]
     enum FrameEvent {
@@ -169,14 +169,18 @@ mod tests {
             let _inner_guard = inner.enter();
         });
 
-        let [FrameEvent::Enter {
-            id: outer_id,
-            name: "outer",
-        }, FrameEvent::Enter {
-            id: inner_id,
-            name: "inner",
-        }, FrameEvent::Exit { id: inner_exit_id }, FrameEvent::Exit { id: outer_exit_id }] =
-            events.as_slice()
+        let [
+            FrameEvent::Enter {
+                id: outer_id,
+                name: "outer",
+            },
+            FrameEvent::Enter {
+                id: inner_id,
+                name: "inner",
+            },
+            FrameEvent::Exit { id: inner_exit_id },
+            FrameEvent::Exit { id: outer_exit_id },
+        ] = events.as_slice()
         else {
             panic!("unexpected events: {events:?}");
         };
@@ -204,16 +208,17 @@ mod tests {
             let unmarked_metadata = unmarked.metadata().unwrap();
             let marked_metadata = marked.metadata().unwrap();
 
-            assert!(<FrameReporterLayer as Layer<Registry>>::register_callsite(
-                &layer,
-                unmarked_metadata
-            )
-            .is_never());
-            assert!(<FrameReporterLayer as Layer<Registry>>::register_callsite(
-                &layer,
-                marked_metadata
-            )
-            .is_always());
+            assert!(
+                <FrameReporterLayer as Layer<Registry>>::register_callsite(
+                    &layer,
+                    unmarked_metadata
+                )
+                .is_never()
+            );
+            assert!(
+                <FrameReporterLayer as Layer<Registry>>::register_callsite(&layer, marked_metadata)
+                    .is_always()
+            );
         });
     }
 

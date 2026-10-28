@@ -5,21 +5,21 @@ use std::sync::Arc;
 use itertools::Itertools;
 
 use super::super::arrow_conversion::{
-    kernel_flat_parquet_id_to_arrow_metadata, lookup_nested_field_id, parquet_field_id_metadata,
-    LIST_ARRAY_ROOT, MAP_KEY_DEFAULT, MAP_VALUE_DEFAULT,
+    LIST_ARRAY_ROOT, MAP_KEY_DEFAULT, MAP_VALUE_DEFAULT, kernel_flat_parquet_id_to_arrow_metadata,
+    lookup_nested_field_id, parquet_field_id_metadata,
 };
 use super::make_arrow_error;
+use crate::KernelResult;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
 };
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
-use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
+use crate::engine::ensure_data_types::{ValidationMode, ensure_data_types};
 use crate::error::KernelError;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::schema::{ArrayType, ColumnMetadataKey, DataType, MapType, Schema, StructField};
-use crate::KernelResult;
 
 // Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch` where
 // the names of fields, nullable, and metadata in the struct have been transformed to match those
@@ -403,7 +403,7 @@ mod apply_schema_validation_tests {
     use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::{
-        schema, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        ColumnMetadataKey, DataType, MetadataValue, StructField, StructType, schema,
     };
     use crate::unit_test_utils::{
         array_in_map_arrow_data_without_field_ids, array_in_map_kernel_schema,

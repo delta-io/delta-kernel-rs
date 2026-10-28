@@ -115,7 +115,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::array::{new_null_array, ArrayRef, Int64Array, StructArray};
+    use crate::arrow::array::{ArrayRef, Int64Array, StructArray, new_null_array};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_conversion::TryIntoArrow;

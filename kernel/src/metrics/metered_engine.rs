@@ -95,7 +95,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::engine::test_delegating::DelegatingEngine;
     use crate::metrics::MetricEvent;
-    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
     use crate::{FileMeta, FileSlice, KernelResult, KernelResultIterator};
 
     /// Minimal storage handler used in tests: returns N preconfigured FileMeta items.
@@ -185,10 +185,12 @@ mod tests {
     fn json_and_parquet_handlers_are_metered() {
         let engine = MeteredDeltaEngine::new(Arc::new(stub_engine()));
         assert!(engine.json_handler().any_ref().is::<MeteredJsonHandler>());
-        assert!(engine
-            .parquet_handler()
-            .any_ref()
-            .is::<MeteredParquetHandler>());
+        assert!(
+            engine
+                .parquet_handler()
+                .any_ref()
+                .is::<MeteredParquetHandler>()
+        );
     }
 
     #[test]

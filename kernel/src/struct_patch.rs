@@ -59,7 +59,7 @@
 //! both halves can pair its dense field list with the expressions this walk produces rather than
 //! deriving the field names again.
 
-use std::collections::{hash_map, HashMap};
+use std::collections::{HashMap, hash_map};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -955,9 +955,9 @@ mod tests {
     use rstest::rstest;
 
     use crate::expressions::{
-        lit, Expression as Expr, ExpressionRef, ExpressionStructPatch, ExpressionStructPatchBuilder,
+        Expression as Expr, ExpressionRef, ExpressionStructPatch, ExpressionStructPatchBuilder, lit,
     };
-    use crate::schema::{schema, DataType, SchemaStructPatchBuilder, StructField, StructType};
+    use crate::schema::{DataType, SchemaStructPatchBuilder, StructField, StructType, schema};
     use crate::struct_patch::ProjectionStructPatchBuilder;
     use crate::unit_test_utils::assert_result_error_with_message;
 

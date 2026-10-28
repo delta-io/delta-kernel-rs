@@ -16,9 +16,9 @@
 
 use std::ffi::c_void;
 
+use crate::KernelStringSlice;
 use crate::engine_data::ArrowFFIData;
 use crate::error::EngineExecResult;
-use crate::KernelStringSlice;
 
 /// Engine callback for **row-time** evaluation of an opaque predicate.
 ///
@@ -147,8 +147,8 @@ impl Drop for FfiOpaqueEvalCallbacks {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 

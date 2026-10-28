@@ -197,7 +197,7 @@ fn take_quoted_string(chars: &mut CharStream<'_>, sql: &str) -> KernelResult<Str
             None => {
                 return Err(KernelError::generic(format!(
                     "unterminated string literal in {sql}"
-                )))
+                )));
             }
         }
     }
@@ -276,7 +276,7 @@ fn quote_follows(chars: &CharStream<'_>) -> bool {
 mod tests {
     use rstest::rstest;
 
-    use super::{tokenize, Keyword, Token};
+    use super::{Keyword, Token, tokenize};
 
     fn ident(s: &str) -> Token {
         Token::Ident(s.to_string())

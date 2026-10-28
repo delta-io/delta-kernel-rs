@@ -7,29 +7,29 @@ use rstest::rstest;
 use test_utils::LoggingTest;
 
 use super::{
-    table_changes_action_iter, table_changes_action_iter_with_mode, TableChangesScanMetadata,
+    TableChangesScanMetadata, table_changes_action_iter, table_changes_action_iter_with_mode,
 };
 use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{col, lit, BinaryPredicateOp};
+use crate::expressions::{BinaryPredicateOp, col, lit};
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
-use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
-use crate::schema::{schema, schema_ref, DataType, SchemaRef, StructField};
+use crate::scan::state::DvInfo;
+use crate::schema::{DataType, SchemaRef, StructField, schema, schema_ref};
+use crate::table_changes::CdfMode;
 use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_changes::test_utils::{
     row_tracking_metadata, row_tracking_table_config, test_deletion_vector,
 };
-use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::table_properties::{
     ENABLE_CHANGE_DATA_FEED, ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED,
 };
 use crate::unit_test_utils::{
-    assert_result_error_with_message, Action, LocalMockTable, MockProtocolBuilder,
-    MockTableConfigurationBuilder,
+    Action, LocalMockTable, MockProtocolBuilder, MockTableConfigurationBuilder,
+    assert_result_error_with_message,
 };
 use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Predicate, Version};
 

@@ -196,8 +196,8 @@ use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 
 pub use counting_reporter::{
-    ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
     CapturingReporter, CountingReporter, RelaxedCounter, SnapshotCompletionStatus,
+    ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
 };
 use delta_kernel::actions::{
     LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
@@ -227,29 +227,29 @@ use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{
-    schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType,
+    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType, schema_ref,
 };
 use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel::transaction::{
     CommitResult, Transaction, UpdateTableOperation, UpdateTableTransactionBuilder,
 };
 use delta_kernel::{
-    try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
+    CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
     FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData, JsonHandler, KernelError,
     KernelResult, KernelResultIterator, LogPath, ParquetFooter, ParquetHandler, PredicateRef,
-    Snapshot,
+    Snapshot, try_parse_uri,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
 pub use delta_kernel_default_engine;
+use delta_kernel_default_engine::executor::TaskExecutor;
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
-use delta_kernel_default_engine::executor::TaskExecutor;
 use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use itertools::Itertools;
-use serde_json::{json, to_vec, Deserializer};
+use serde_json::{Deserializer, json, to_vec};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use url::Url;
@@ -2148,10 +2148,10 @@ pub fn get_materialized_row_tracking_column_names(
         row_id_column_name: config["delta.rowTracking.materializedRowIdColumnName"]
             .as_str()
             .map(str::to_owned),
-        row_commit_version_column_name: config
-            ["delta.rowTracking.materializedRowCommitVersionColumnName"]
-            .as_str()
-            .map(str::to_owned),
+        row_commit_version_column_name:
+            config["delta.rowTracking.materializedRowCommitVersionColumnName"]
+                .as_str()
+                .map(str::to_owned),
     })
 }
 

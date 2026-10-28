@@ -10,7 +10,7 @@ use delta_kernel::{Expression, KernelResult, Predicate};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::handle::Handle;
-use crate::{kernel_string_slice, KernelStringSlice, OptionalValue};
+use crate::{KernelStringSlice, OptionalValue, kernel_string_slice};
 
 pub mod engine_visitor;
 pub mod kernel_visitor;

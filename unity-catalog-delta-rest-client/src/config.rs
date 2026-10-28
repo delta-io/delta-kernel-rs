@@ -205,10 +205,12 @@ mod tests {
         let config =
             ClientConfig::new("some-workspace.something.com", "token", client_user_agent())
                 .unwrap();
-        assert!(config
-            .workspace_url
-            .as_str()
-            .contains("api/2.1/unity-catalog"));
+        assert!(
+            config
+                .workspace_url
+                .as_str()
+                .contains("api/2.1/unity-catalog")
+        );
         assert_eq!(config.token, "token");
     }
 

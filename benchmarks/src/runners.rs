@@ -15,8 +15,8 @@ use delta_kernel::expressions::PredicateRef;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, StatsOptions};
 use delta_kernel::{Engine, Snapshot};
-use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
+use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_unity_catalog::snapshot_builder_from_load_table;
 use delta_kernel_workloads::models::{
     ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo, TimeTravel,

@@ -13,8 +13,8 @@ use strum::AsRefStr;
 use crate::error::add_scalar_path_context;
 use crate::schema::derive_macro_utils::{GetStructField, ToDataType};
 use crate::schema::{
-    parse_interval_type, ArrayType, DataType, DecimalType, IntervalField, IntervalFieldRange,
-    MapType, PrimitiveType, StructField, StructType,
+    ArrayType, DataType, DecimalType, IntervalField, IntervalFieldRange, MapType, PrimitiveType,
+    StructField, StructType, parse_interval_type,
 };
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
@@ -1200,11 +1200,11 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::{col, lit, BinaryPredicateOp};
-    use crate::schema::{schema, ToSchema};
+    use crate::Predicate as Pred;
+    use crate::expressions::{BinaryPredicateOp, col, lit};
+    use crate::schema::{ToSchema, schema};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::Predicate as Pred;
 
     #[rstest]
     #[case::truncates(Scalar::Integer(7), Scalar::Integer(2), Some(Scalar::Integer(3)))]
@@ -1397,7 +1397,11 @@ mod tests {
         expect_fail_parse("++1.0", 1, 1);
         expect_fail_parse("1.0E1+", 1, 1);
         // overflow i8 for `scale`
-        expect_fail_parse("0.999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999", 1, 0);
+        expect_fail_parse(
+            "0.999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
+            1,
+            0,
+        );
         // scale will be too small to fit in i8
         expect_fail_parse("0.E170141183460469231731687303715884105727", 1, 0);
     }
@@ -1442,10 +1446,13 @@ mod tests {
     #[test]
     fn test_invalid_map() {
         // incorrect schema
-        assert_result_error_with_message(MapData::try_new(
-            MapType::new(DataType::STRING, DataType::INTEGER, false),
-            [(Scalar::Integer(1), Scalar::String("s".to_string())),],
-        ), "Schema error: Map scalar type mismatch: expected key type string, got key type integer");
+        assert_result_error_with_message(
+            MapData::try_new(
+                MapType::new(DataType::STRING, DataType::INTEGER, false),
+                [(Scalar::Integer(1), Scalar::String("s".to_string()))],
+            ),
+            "Schema error: Map scalar type mismatch: expected key type string, got key type integer",
+        );
 
         // key must be non-null
         assert_result_error_with_message(

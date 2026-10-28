@@ -114,7 +114,9 @@ async fn try_main() -> KernelResult<()> {
             CommitResult::Committed(committed) => break committed,
             CommitResult::Conflicted(conflicted) => {
                 let conflicting_version = conflicted.conflict_version();
-                println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
+                println!(
+                    "✗ Failed to write data, transaction conflicted with version: {conflicting_version}"
+                );
                 return Err(KernelError::generic("Commit failed"));
             }
             CommitResult::Retryable(RetryableTransaction { transaction, error }) => {

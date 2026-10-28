@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::LazyLock;
 
-use delta_kernel_derive::{internal_api, IntoStructData, ToSchema, TryFromStructData};
+use delta_kernel_derive::{IntoStructData, ToSchema, TryFromStructData, internal_api};
 use derive_more::Constructor;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -20,20 +20,20 @@ use crate::amt_path_util::amt_manifest_filemeta;
 use crate::expressions::Scalar;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::{ArrayData, StructData};
-use crate::schema::{
-    is_unsupported_delta_type_error, lazy_schema_ref, schema_ref, SchemaRef, StructField,
-    StructType, ToSchema as _,
-};
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::schema::{schema, ArrayType, DataType};
+use crate::schema::{ArrayType, DataType, schema};
+use crate::schema::{
+    SchemaRef, StructField, StructType, ToSchema as _, is_unsupported_delta_type_error,
+    lazy_schema_ref, schema_ref,
+};
 use crate::table_features::{
-    FeatureType, TableFeature, LEGACY_READER_FEATURES, MIN_VALID_RW_VERSION,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    FeatureType, LEGACY_READER_FEATURES, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::{require, to_file_size};
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::{create_row, Engine, Version};
+use crate::{Engine, Version, create_row};
 use crate::{EngineData, FileMeta, KernelError, KernelResult, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1845,7 +1845,7 @@ impl CheckpointAction {
                     other => {
                         return Err(KernelError::generic(format!(
                             "checkpoint sidecar has unsupported type `{other}`"
-                        )))
+                        )));
                     }
                 },
             }
@@ -2099,6 +2099,8 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::FileSize;
     use crate::arrow::array::{
         Array, Int32Array, ListBuilder, RecordBatch, StringBuilder, StructArray,
     };
@@ -2111,12 +2113,10 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::{Scalar, StructData};
-    use crate::schema::{schema, schema_ref, DataType, MapType, StructField};
+    use crate::schema::{DataType, MapType, StructField, schema, schema_ref};
     use crate::unit_test_utils::assert_result_error_with_message;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::FileSize;
     use crate::{
-        create_row, Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+        Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler, create_row,
     };
 
     #[rstest]
@@ -2606,9 +2606,13 @@ mod tests {
     #[case(1, -1)]
     fn reject_protocol_version_below_minimum(#[case] rv: i32, #[case] wv: i32) {
         let expected = if rv < 1 {
-            format!("Invalid protocol action in the delta log: min_reader_version must be >= 1, got {rv}")
+            format!(
+                "Invalid protocol action in the delta log: min_reader_version must be >= 1, got {rv}"
+            )
         } else {
-            format!("Invalid protocol action in the delta log: min_writer_version must be >= 1, got {wv}")
+            format!(
+                "Invalid protocol action in the delta log: min_writer_version must be >= 1, got {wv}"
+            )
         };
         assert_result_error_with_message(
             Protocol::try_new(rv, wv, TableFeature::NO_LIST, TableFeature::NO_LIST),
@@ -2646,10 +2650,7 @@ mod tests {
             ),
             (
                 vec![TableFeature::VariantType],
-                vec![
-                    TableFeature::VariantType,
-                    TableFeature::DeletionVectors,
-                ],
+                vec![TableFeature::VariantType, TableFeature::DeletionVectors],
                 "Writer features must be Writer-only or also listed in reader features",
             ),
             // WriterOnly feature present in reader features

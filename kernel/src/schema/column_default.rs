@@ -19,9 +19,9 @@
 //! - On an IcebergCompatV3 table, kernel warns when its parser cannot verify that a default is a
 //!   literal.
 
-use crate::expressions::{parse_sql, Expression, Scalar};
+use crate::expressions::{Expression, Scalar, parse_sql};
 use crate::schema::{DataType, StructField, StructType};
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{KernelError, KernelResult};
 
 /// A column-level default parsed from the `CURRENT_DEFAULT` metadata key of a
@@ -244,7 +244,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::col;
-    use crate::schema::{schema, ArrayType, MapType, StructField};
+    use crate::schema::{ArrayType, MapType, StructField, schema};
 
     fn struct_ty() -> DataType {
         DataType::from(schema! { nullable "a": INTEGER })

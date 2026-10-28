@@ -3,22 +3,22 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{new_null_array, Array, Int32Array, StringArray};
+use delta_kernel::arrow::array::{Array, Int32Array, StringArray, new_null_array};
 use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{column_name, ColumnName, Scalar};
+use delta_kernel::expressions::{ColumnName, Scalar, column_name};
 use delta_kernel::schema::{
-    schema, schema_ref, try_schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue,
-    SchemaRef, StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, SchemaRef, StructField,
+    StructType, schema, schema_ref, try_schema,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::{KernelError, KernelResult};
 use rstest::rstest;
 use serde_json::json;
@@ -149,9 +149,10 @@ async fn schema_evolution_while_writing_round_trips_new_column(
                 .unwrap();
             for row in 0..batch.num_rows() {
                 let country = (!countries.is_null(row)).then(|| countries.value(row).to_string());
-                assert!(rows
-                    .insert(ids.value(row), (names.value(row).to_string(), country))
-                    .is_none());
+                assert!(
+                    rows.insert(ids.value(row), (names.value(row).to_string(), country))
+                        .is_none()
+                );
             }
         }
         assert_eq!(
@@ -260,11 +261,13 @@ async fn alter_table_commit_rejects_staged_files(
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(fresh.version(), before.version());
     assert_eq!(fresh.schema(), before.schema());
-    assert!(!temp_dir
-        .path()
-        .join("_delta_log")
-        .join(format!("{:020}.json", before.version() + 1))
-        .exists());
+    assert!(
+        !temp_dir
+            .path()
+            .join("_delta_log")
+            .join(format!("{:020}.json", before.version() + 1))
+            .exists()
+    );
     test_read(&ArrowEngineData::new(old_batch), fresh.table_root(), engine)?;
     Ok(())
 }
@@ -575,12 +578,14 @@ async fn add_columns_lifecycle(
         }
         assert!(max_column_id(&reloaded).expect("CM table must have maxColumnId") > orig);
     } else {
-        assert!(reloaded
-            .table_configuration()
-            .metadata()
-            .configuration()
-            .get("delta.columnMapping.maxColumnId")
-            .is_none());
+        assert!(
+            reloaded
+                .table_configuration()
+                .metadata()
+                .configuration()
+                .get("delta.columnMapping.maxColumnId")
+                .is_none()
+        );
     }
 
     // Scan back -- old rows should have NULL for every new column.

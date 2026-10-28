@@ -1,16 +1,16 @@
 //! Integration tests for transaction-identifier write paths.
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::object_store::path::Path;
 use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::{KernelError, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
-use serde_json::{json, Deserializer};
+use serde_json::{Deserializer, json};
 use test_utils::{assert_result_error_with_message, set_json_value, setup_test_tables};
 
-use crate::common::write_utils::{get_simple_int_schema, validate_txn_id, ZERO_UUID};
+use crate::common::write_utils::{ZERO_UUID, get_simple_int_schema, validate_txn_id};
 
 #[rstest]
 #[case::builder(false)]

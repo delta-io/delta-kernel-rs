@@ -1,9 +1,9 @@
 use derive_more::Constructor;
 
 use super::*;
-use crate::expressions::{col, lit, Expression as Expr, Predicate as Pred};
-use crate::kernel_predicates::KernelPredicateEvaluator as _;
 use crate::DataType;
+use crate::expressions::{Expression as Expr, Predicate as Pred, col, lit};
+use crate::kernel_predicates::KernelPredicateEvaluator as _;
 
 const TRUE: Option<bool> = Some(true);
 const FALSE: Option<bool> = Some(false);

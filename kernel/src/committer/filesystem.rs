@@ -2,9 +2,9 @@
 
 use tracing::{info, instrument};
 
+use super::Committer;
 use super::commit_types::{CommitMetadata, CommitResponse};
 use super::publish_types::PublishMetadata;
-use super::Committer;
 #[cfg(feature = "declarative-plans")]
 use crate::committer::write_commit_json_declarative;
 #[cfg(feature = "declarative-plans")]
@@ -124,20 +124,20 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::actions::{Metadata, Protocol, LOG_METADATA_SCHEMA};
+    use crate::actions::{LOG_METADATA_SCHEMA, Metadata, Protocol};
     use crate::committer::{CommitProtocolMetadata, CommitType};
     #[cfg(feature = "declarative-plans")]
     use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::sync::SyncEngine;
     #[cfg(feature = "declarative-plans")]
     use crate::engine::sync::plan::SyncPlanExecutor;
-    use crate::engine::sync::SyncEngine;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStoreExt as _;
     use crate::path::LogRoot;
     use crate::schema::schema_ref;
     use crate::transaction::UpdateTableOperation;
-    use crate::{create_row, EngineData};
+    use crate::{EngineData, create_row};
 
     #[derive(Clone, Copy)]
     enum CommitStyle {
@@ -275,10 +275,12 @@ mod tests {
                 }
                 assert!(file_meta.size > 0);
                 assert_eq!(file_meta.size, stored.len() as u64);
-                assert!(file_meta
-                    .location
-                    .as_str()
-                    .ends_with("00000000000000000001.json"));
+                assert!(
+                    file_meta
+                        .location
+                        .as_str()
+                        .ends_with("00000000000000000001.json")
+                );
             }
             CommitResponse::Conflict { .. } => panic!("Expected Committed, got Conflict"),
         }

@@ -9,16 +9,16 @@ use crate::engine::arrow_data::ArrowEngineData;
 use crate::schema::{DataType, StructField};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{find_max_column_id_in_schema, TableFeature};
+use crate::table_features::{TableFeature, find_max_column_id_in_schema};
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     minimal_checkpoint_action, setup_table, write_commit,
 };
 use crate::unit_test_utils::{
-    assert_result_error_with_message, create_valid_add_file_batch, MockProtocolBuilder,
-    MockTableConfigurationBuilder,
+    MockProtocolBuilder, MockTableConfigurationBuilder, assert_result_error_with_message,
+    create_valid_add_file_batch,
 };
-use crate::{create_row, FileMeta, KernelError, KernelResult};
+use crate::{FileMeta, KernelError, KernelResult, create_row};
 
 fn adaptive_table_config() -> TableConfiguration {
     MockTableConfigurationBuilder::new()

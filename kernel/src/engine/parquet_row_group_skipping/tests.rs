@@ -15,15 +15,15 @@ use crate::arrow::datatypes::{
 };
 use crate::engine::reader_options;
 use crate::expressions::{
-    col, column_name, column_pred, lit, Expression, OpaquePredicateOp, ScalarExpressionEvaluator,
+    Expression, OpaquePredicateOp, ScalarExpressionEvaluator, col, column_name, column_pred, lit,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator as _, DirectDataSkippingPredicateEvaluator,
     DirectPredicateEvaluator, IndirectDataSkippingPredicateEvaluator,
     KernelPredicateEvaluator as _,
 };
-use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::ArrowWriter;
+use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::basic::Type as PhysicalType;
 use crate::parquet::data_type::{ByteArray, FixedLenByteArray};
 use crate::parquet::file::properties::WriterProperties;

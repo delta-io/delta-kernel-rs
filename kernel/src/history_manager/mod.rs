@@ -25,7 +25,7 @@ use std::num::NonZero;
 
 use error::{LogHistoryError, NearestTimestamp};
 use itertools::Itertools;
-use search::{binary_search_by_key_with_bounds, Bound, SearchError};
+use search::{Bound, SearchError, binary_search_by_key_with_bounds};
 use tracing::{info, trace, warn};
 use url::Url;
 
@@ -126,7 +126,7 @@ fn get_timestamp_search_bounds(
 
     let (ict_enablement_version, ict_timestamp) = match ict_enablement {
         InCommitTimestampEnablement::NotEnabled => {
-            return Ok(TimestampSearchBounds::FileModificationSearch)
+            return Ok(TimestampSearchBounds::FileModificationSearch);
         }
         InCommitTimestampEnablement::Enabled {
             enablement: Some((v, t)),
@@ -238,9 +238,7 @@ fn linear_search_file_mod_timestamps(
         if monotonic_ts != raw_ts {
             trace!(
                 version = commit.version,
-                raw_ts,
-                monotonic_ts,
-                "Adjusted non-monotonic timestamp"
+                raw_ts, monotonic_ts, "Adjusted non-monotonic timestamp"
             );
         }
 
@@ -252,7 +250,7 @@ fn linear_search_file_mod_timestamps(
             Bound::GreatestLower => break,
             // LeastUpper: return version upon first match
             Bound::LeastUpper if monotonic_ts >= timestamp => {
-                return Ok(CommitAt::new(commit.version, monotonic_ts))
+                return Ok(CommitAt::new(commit.version, monotonic_ts));
             }
             Bound::LeastUpper => {}
         }
@@ -394,7 +392,7 @@ pub(crate) fn timestamp_to_version(
         (Ordering::Equal, _) => return Ok(CommitAt::new(snapshot.version(), snap_ts)),
         // Timestamp after snapshot: for GreatestLower, snapshot is the answer
         (Ordering::Greater, Bound::GreatestLower) => {
-            return Ok(CommitAt::new(snapshot.version(), snap_ts))
+            return Ok(CommitAt::new(snapshot.version(), snap_ts));
         }
         // Timestamp after snapshot: for LeastUpper, no version exists
         (Ordering::Greater, Bound::LeastUpper) => {
@@ -898,10 +896,10 @@ pub fn get_earliest_commit(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::fs::{remove_file, OpenOptions};
+    use std::fs::{OpenOptions, remove_file};
     use std::ops::RangeInclusive;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::{Duration, SystemTime};
 
     use bytes::Bytes;
@@ -911,11 +909,11 @@ mod tests {
 
     use super::*;
     use crate::actions::{CommitInfo, Metadata, Protocol};
+    use crate::engine::CancellableEngine;
     use crate::engine::sync::SyncEngine;
     use crate::engine::test_delegating::DelegatingEngine;
-    use crate::engine::CancellableEngine;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{schema_ref, SchemaRef};
+    use crate::schema::{SchemaRef, schema_ref};
     use crate::snapshot::{Snapshot, SnapshotBuilder};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{Action, LocalMockTable, TestCancellationToken};
@@ -1960,7 +1958,9 @@ mod tests {
             (Ok(p), Ok(r)) => assert_eq!(p, r, "diverged at ts={timestamp} bound={bound:?}"),
             (Err(_), Err(_)) => {}
             (p, r) => {
-                panic!("Published and Recreatable diverged at ts={timestamp} bound={bound:?}: {p:?} vs {r:?}")
+                panic!(
+                    "Published and Recreatable diverged at ts={timestamp} bound={bound:?}: {p:?} vs {r:?}"
+                )
             }
         }
     }

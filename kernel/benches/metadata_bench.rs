@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::try_parse_uri;
 use tempfile::TempDir;

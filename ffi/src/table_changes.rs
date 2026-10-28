@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use delta_kernel::arrow::array::{Array, ArrayData, StructArray};
 use delta_kernel::arrow::ffi::to_ffi;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
-use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::table_changes::TableChanges;
+use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::{EngineData, KernelError, KernelResult, KernelResultIterator, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
@@ -14,12 +14,12 @@ use url::Url;
 
 use super::handle::Handle;
 use crate::engine_data::ArrowFFIData;
-use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
+use crate::expressions::kernel_visitor::{KernelExpressionVisitorState, unwrap_kernel_predicate};
 use crate::scan::EnginePredicate;
 use crate::{
-    kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
-    ExternResult, IntoExternResult, KernelStringSlice, NullableCvoid, SharedExternEngine,
-    SharedSchema,
+    AllocateStringFn, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
+    NullableCvoid, SharedExternEngine, SharedSchema, kernel_string_slice,
+    unwrap_and_parse_path_as_url,
 };
 
 #[handle_descriptor(target=TableChanges, mutable=true, sized=true)]
@@ -346,14 +346,14 @@ mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
-    use delta_kernel::schema::{schema_ref, StructType};
+    use delta_kernel::schema::{StructType, schema_ref};
     use delta_kernel::{Engine, KernelResult};
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use delta_kernel_ffi::engine_data::get_engine_data;
     use itertools::Itertools;
     use test_utils::{
-        actions_to_string_with_metadata, add_commit, generate_batch, record_batch_to_bytes,
-        IntoArray as _, TestAction,
+        IntoArray as _, TestAction, actions_to_string_with_metadata, add_commit, generate_batch,
+        record_batch_to_bytes,
     };
 
     use super::*;

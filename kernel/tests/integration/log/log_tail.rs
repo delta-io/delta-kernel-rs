@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use delta_kernel::commit_range::CommitRange;
-use delta_kernel::history_manager::{first_version_after, latest_version_as_of, HistoryCommitType};
+use delta_kernel::history_manager::{HistoryCommitType, first_version_after, latest_version_as_of};
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::{KernelError, Snapshot};
 use rstest::rstest;
@@ -10,9 +10,9 @@ use test_utils::delta_kernel_default_engine::executor::tokio::{
 };
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
-    actions_to_string, actions_to_string_catalog_managed, add_commit, add_staged_commit,
-    create_log_path, delta_path_for_version, install_thread_local_metrics_reporter,
-    CountingReporter, TestAction,
+    CountingReporter, TestAction, actions_to_string, actions_to_string_catalog_managed, add_commit,
+    add_staged_commit, create_log_path, delta_path_for_version,
+    install_thread_local_metrics_reporter,
 };
 use url::Url;
 

@@ -58,13 +58,13 @@ mod tests {
 
     use super::*;
     use crate::actions::{Format, Metadata, Protocol};
-    use crate::engine::sync::SyncEngine;
     use crate::engine::CancellableEngine;
+    use crate::engine::sync::SyncEngine;
     use crate::metrics::MetricEvent;
     use crate::path::ParsedLogPath;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{
-        install_thread_local_metrics_reporter, CapturingReporter, TestCancellationToken,
+        CapturingReporter, TestCancellationToken, install_thread_local_metrics_reporter,
     };
 
     fn test_table_root(dir: &str) -> url::Url {
@@ -168,12 +168,16 @@ mod tests {
         let dms = crc.domain_metadata_state.expect_complete();
         assert_eq!(dms.len(), 3);
 
-        assert!(dms["delta.clustering"]
-            .configuration()
-            .contains("clusteringColumns"));
-        assert!(dms["delta.rowTracking"]
-            .configuration()
-            .contains("rowIdHighWaterMark"));
+        assert!(
+            dms["delta.clustering"]
+                .configuration()
+                .contains("clusteringColumns")
+        );
+        assert!(
+            dms["delta.rowTracking"]
+                .configuration()
+                .contains("rowIdHighWaterMark")
+        );
         assert!(dms["myApp.metadata"].configuration().contains("key"));
 
         // Verify set transactions

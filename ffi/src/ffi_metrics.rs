@@ -11,7 +11,7 @@
 
 use delta_kernel::metrics as kernel;
 
-use crate::{kernel_string_slice, KernelStringSlice};
+use crate::{KernelStringSlice, kernel_string_slice};
 
 /// The 16 raw bytes of an operation's UUID, used to correlate events from the same operation.
 #[repr(C)]

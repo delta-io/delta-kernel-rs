@@ -4,7 +4,7 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::engine_data::TypedGetData as _;
-use crate::expressions::{column_name, ColumnName};
+use crate::expressions::{ColumnName, column_name};
 use crate::plans::{Operation, PlanBuilder, RelationRef, ScopedPlanExecutor};
 use crate::schema::DataType;
 use crate::{

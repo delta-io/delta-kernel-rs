@@ -3,18 +3,18 @@
 use tracing::warn;
 
 use super::{
-    check_no_legacy_nested_ids, check_only_supported_types, IcebergCompatCheck,
-    IcebergCompatValidator, IcebergCompatVersion,
+    IcebergCompatCheck, IcebergCompatValidator, IcebergCompatVersion, check_no_legacy_nested_ids,
+    check_only_supported_types,
 };
+use crate::KernelResult;
 use crate::schema::PrimitiveType::{
     Binary, Boolean, Byte, Date, Decimal, Double, Float, Integer, Long, Short,
     String as StringType, Timestamp, TimestampNtz,
 };
-use crate::schema::{try_collect_column_defaults, DataType};
+use crate::schema::{DataType, try_collect_column_defaults};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::transforms::SchemaTransform;
-use crate::KernelResult;
 
 /// V3 invariants paired with the version constant. Fed to
 /// [`super::validate_iceberg_compat_if_needed`].
@@ -119,7 +119,7 @@ pub(crate) fn iceberg_compat_v3_column_defaults_validation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{schema, ArrayType, MapType};
+    use crate::schema::{ArrayType, MapType, schema};
 
     #[test]
     fn is_v3_supported_type_accepted_datatypes() {
@@ -180,7 +180,7 @@ mod column_default_tests {
 
     use super::iceberg_compat_v3_column_defaults_validation;
     use crate::schema::ColumnMetadataKey::CurrentDefault;
-    use crate::schema::{schema, ArrayType, DataType, MetadataValue, StructField, StructType};
+    use crate::schema::{ArrayType, DataType, MetadataValue, StructField, StructType, schema};
     use crate::table_configuration::TableConfiguration;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{MockProtocolBuilder, MockTableConfigurationBuilder};
@@ -292,7 +292,7 @@ mod type_change_tests {
 
     use super::iceberg_compat_v3_type_changes_validation;
     use crate::schema::{
-        schema, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        ColumnMetadataKey, DataType, MetadataValue, StructField, StructType, schema,
     };
     use crate::table_configuration::TableConfiguration;
     use crate::table_features::{ColumnMappingMode, TableFeature};

@@ -9,8 +9,8 @@
 //! - [`DomainMetadataState`] tracks domain-metadata completeness (Complete / Partial).
 //! - [`SetTransactionState`] tracks set-transaction completeness (Complete / Partial).
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use delta_kernel_derive::internal_api;
 

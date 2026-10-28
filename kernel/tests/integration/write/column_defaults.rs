@@ -14,23 +14,24 @@ use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _}
 use delta_kernel::expressions::{ColumnName, Scalar};
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::schema::{
-    schema, schema_ref, ArrayType, ColumnMetadataKey, DataType, MetadataValue, SchemaRef,
-    StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+    schema, schema_ref,
 };
 use delta_kernel::table_features::{
-    get_any_level_column_physical_name, ColumnMappingMode, TableFeature,
+    ColumnMappingMode, TableFeature, get_any_level_column_physical_name,
 };
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::{Engine, KernelResult, Snapshot};
 use rstest::rstest;
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::{
-    copy_directory, create_default_engine, create_table, engine_store_setup, get_column,
-    insert_data, read_actions_from_commit, read_scan, resolve_field, schema_with_column_defaults,
-    test_read, test_table_setup, test_table_setup_mt, write_batch_to_table, LoggingTest,
+    LoggingTest, copy_directory, create_default_engine, create_table, engine_store_setup,
+    get_column, insert_data, read_actions_from_commit, read_scan, resolve_field,
+    schema_with_column_defaults, test_read, test_table_setup, test_table_setup_mt,
+    write_batch_to_table,
 };
 use url::Url;
 
@@ -245,9 +246,11 @@ async fn test_blind_append_to_column_defaults_table_is_supported() -> KernelResu
         Arc::new(Int64Array::from(vec![1, 2, 3])),
         Arc::new(StringArray::from(vec!["a", "b", "c"])),
     ];
-    assert!(insert_data(snapshot, &engine, columns.clone())
-        .await?
-        .is_committed());
+    assert!(
+        insert_data(snapshot, &engine, columns.clone())
+            .await?
+            .is_committed()
+    );
 
     // Round-trip read.
     let data = RecordBatch::try_new(Arc::new(schema.as_ref().try_into_arrow()?), columns)?;
@@ -1034,9 +1037,11 @@ async fn test_column_default_with_iceberg_compat_v3_e2e() -> KernelResult<()> {
         Arc::new(Int64Array::from(vec![1, 2, 3])),
         Arc::new(Int32Array::from(vec![42, 42, 42])),
     ];
-    assert!(insert_data(snapshot, &engine, columns.clone())
-        .await?
-        .is_committed());
+    assert!(
+        insert_data(snapshot, &engine, columns.clone())
+            .await?
+            .is_committed()
+    );
 
     let data = RecordBatch::try_new(Arc::new(schema.as_ref().try_into_arrow()?), columns)?;
     test_read(&ArrowEngineData::new(data), &table_url, engine)?;

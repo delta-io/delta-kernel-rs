@@ -6,7 +6,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 #[cfg(test)]
-use delta_kernel::{object_store::memory::InMemory, Engine, KernelResult};
+use delta_kernel::{Engine, KernelResult, object_store::memory::InMemory};
 #[cfg(test)]
 use delta_kernel_default_engine::DefaultEngineBuilder;
 #[cfg(test)]
@@ -15,13 +15,12 @@ use test_utils::add_commit;
 use crate::error::{AllocateError, AllocateErrorFn, EngineError, ExternResult, FFIKernelError};
 #[cfg(test)]
 use crate::{
-    engine_to_handle, free_snapshot, get_snapshot_builder, kernel_string_slice,
-    snapshot_builder_build,
+    ExternEngine, SharedExternEngine, SharedSnapshot, engine_to_handle, free_snapshot,
+    get_snapshot_builder, kernel_string_slice, snapshot_builder_build,
     transaction::{
-        new_update_table_txn_builder, update_table_txn_builder_build,
-        ExclusiveUpdateTableTransaction, KernelUpdateTableOperation,
+        ExclusiveUpdateTableTransaction, KernelUpdateTableOperation, new_update_table_txn_builder,
+        update_table_txn_builder_build,
     },
-    ExternEngine, SharedExternEngine, SharedSnapshot,
 };
 use crate::{KernelBytesSlice, KernelStringSlice, NullableCvoid, TryFromStringSlice};
 

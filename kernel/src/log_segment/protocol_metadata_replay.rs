@@ -12,14 +12,14 @@ use super::LogSegment;
 #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
 use crate::actions::CHECKPOINT_ACTION_NAME;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{CheckpointAction, LastManifestCommit, CHECKPOINT_ACTION_FIELD};
-use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
+use crate::actions::{CHECKPOINT_ACTION_FIELD, CheckpointAction, LastManifestCommit};
+use crate::actions::{METADATA_FIELD, Metadata, PROTOCOL_FIELD, Protocol};
 #[cfg(feature = "declarative-plans")]
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::Crc;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 #[cfg(feature = "declarative-plans")]
-use crate::expressions::{col, Predicate};
+use crate::expressions::{Predicate, col};
 use crate::log_replay::ActionsBatch;
 use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
@@ -32,8 +32,8 @@ use crate::plans::ir::plan::Plan;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::{
-    column_name, schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
-    StructField, StructType,
+    ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, StructField, StructType,
+    column_name, schema_ref,
 };
 use crate::{Engine, EngineData, KernelError, KernelResult, KernelResultIterator, Version};
 
@@ -557,16 +557,16 @@ mod tests {
     use itertools::Itertools;
     use test_log::test;
 
+    use crate::Snapshot;
     use crate::engine::sync::SyncEngine;
     #[cfg(feature = "declarative-plans")]
     use crate::engine::test_delegating::DelegatingEngine;
     #[cfg(feature = "declarative-plans")]
-    use crate::expressions::{col, Predicate};
+    use crate::expressions::{Predicate, col};
     #[cfg(feature = "declarative-plans")]
     use crate::plans::ir::nodes::Operator;
     #[cfg(feature = "declarative-plans")]
     use crate::plans::{Operation, PlanExecutor, PlanResult};
-    use crate::Snapshot;
     #[cfg(feature = "declarative-plans")]
     use crate::{KernelError, KernelResult};
 

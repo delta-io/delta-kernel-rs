@@ -326,7 +326,7 @@ fn parse_column_name(chars: &mut Chars<'_>) -> KernelResult<(ColumnName, FieldEn
             Some(other) => {
                 return Err(KernelError::generic(format!(
                     "Invalid character {other:?} after field {field_name:?}",
-                )))
+                )));
             }
         };
         path.push(field_name);

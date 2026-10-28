@@ -22,7 +22,7 @@ use crate::{EngineData, KernelResult};
 /// A single row-level validation.
 pub(crate) trait Validation {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>])
-        -> KernelResult<()>;
+    -> KernelResult<()>;
 }
 
 /// Runs validations over batches that share one staged-data schema.

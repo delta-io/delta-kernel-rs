@@ -15,8 +15,8 @@ use std::sync::Arc;
 use url::Url;
 
 use super::CHECKPOINT_ACTIONS_SCHEMA_V2;
-use crate::actions::visitors::SidecarVisitor;
 use crate::actions::SIDECAR_NAME;
+use crate::actions::visitors::SidecarVisitor;
 use crate::engine_data::RowVisitor;
 use crate::expressions::col;
 use crate::log_segment::LogSegment;
@@ -95,7 +95,7 @@ impl CheckpointShape {
                 return Ok(CheckpointShape {
                     checkpoint_type: CheckpointType::None,
                     leaf_checkpoint_schema: None,
-                })
+                });
             }
         };
 
@@ -315,12 +315,13 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::KernelResult;
     use crate::actions::{
-        CheckpointMetadata, Sidecar, ADD_NAME, MAX_VALUES, MIN_VALUES, NUM_RECORDS,
-        SIDECAR_FILE_SCHEMA_TAG, STATS_PARSED,
+        ADD_NAME, CheckpointMetadata, MAX_VALUES, MIN_VALUES, NUM_RECORDS, SIDECAR_FILE_SCHEMA_TAG,
+        STATS_PARSED, Sidecar,
     };
-    use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
+    use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
     use crate::log_segment_files::LogSegmentFiles;
     use crate::plans::ir::nodes::Operator;
@@ -329,7 +330,6 @@ mod tests {
     use crate::unit_test_utils::{
         copy_test_table, create_log_path, create_log_path_with_size, load_test_table,
     };
-    use crate::KernelResult;
 
     /// Counts I/O operations and verifies that sidecar discovery queries filter out null paths.
     struct CountingExecutor {
@@ -498,9 +498,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(shape
-            .compatible_stats_parsed_schema(&incompatible)
-            .is_none());
+        assert!(
+            shape
+                .compatible_stats_parsed_schema(&incompatible)
+                .is_none()
+        );
     }
 
     #[rstest]

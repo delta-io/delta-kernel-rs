@@ -1,12 +1,12 @@
-use delta_kernel::snapshot::Snapshot;
 use delta_kernel::KernelResult;
+use delta_kernel::snapshot::Snapshot;
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::expressions::kernel_visitor::NullTypeTag;
 use crate::handle::Handle;
 use crate::{
-    kernel_string_slice, AllocateStringFn, ExternEngine, KernelStringSlice, NullableCvoid,
-    OptionalValue, SharedExternEngine, SharedSnapshot, TryFromStringSlice,
+    AllocateStringFn, ExternEngine, KernelStringSlice, NullableCvoid, OptionalValue,
+    SharedExternEngine, SharedSnapshot, TryFromStringSlice, kernel_string_slice,
 };
 
 /// The row-tracking high-water mark before any fresh row IDs have been assigned.
@@ -205,8 +205,8 @@ mod tests {
     use std::ptr::NonNull;
     use std::sync::Arc;
 
-    use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::KernelResult;
+    use delta_kernel::object_store::memory::InMemory;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use serde_json::json;
@@ -324,7 +324,13 @@ mod tests {
 
         let domain3 = "delta.domain3";
         let res = get_domain_metadata_helper(domain3);
-        assert_extern_result_error_with_message(res, FFIKernelError::GenericError, Some("Generic delta kernel error: User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
+        assert_extern_result_error_with_message(
+            res,
+            FFIKernelError::GenericError,
+            Some(
+                "Generic delta kernel error: User DomainMetadata are not allowed to use system-controlled 'delta.*' domain",
+            ),
+        );
 
         // Secondly, we visit the entire domain metadata
 
