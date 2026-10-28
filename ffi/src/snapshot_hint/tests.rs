@@ -30,9 +30,9 @@ use crate::{
     engine_to_handle, free_engine, free_snapshot, get_snapshot_builder, get_snapshot_builder_from,
     snapshot_builder_build, snapshot_builder_with_incremental_crc_replay,
     snapshot_builder_with_max_catalog_version, snapshot_builder_with_version,
-    snapshot_checkpoint_file_groups, snapshot_log_segment_stats, FfiCheckpointFileGroup,
-    FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats, FfiSlice, KernelI64Slice,
-    KernelStringSlice, OptionalValue, SharedExternEngine,
+    snapshot_checkpoint_file_groups, snapshot_checkpoint_size_in_bytes, snapshot_log_segment_stats,
+    FfiCheckpointFileGroup, FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats, FfiSlice,
+    KernelI64Slice, KernelStringSlice, OptionalValue, SharedExternEngine,
 };
 
 fn slice(value: &'static str) -> KernelStringSlice {
@@ -260,6 +260,13 @@ fn checkpoint_file_groups_copy_borrowed_schemas(#[case] checkpoint_present: bool
                 collect,
             ));
         }
+        let bytes = unsafe {
+            ok_or_panic(snapshot_checkpoint_size_in_bytes(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+            ))
+        };
+        assert_eq!(bytes, u64::from(checkpoint_present));
         if checkpoint_present {
             assert_eq!(output.len(), 1);
             assert_eq!(output[0].0, 1);

@@ -2,9 +2,9 @@
 //! has schema etc.)
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 use delta_kernel_derive::internal_api;
 use tracing::{debug, error, info, instrument, warn};
@@ -31,7 +31,7 @@ use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::log_segment::LastManifestCommitResolution;
-use crate::log_segment::{DomainMetadataMap, LogSegment, PmResolution};
+use crate::log_segment::{CheckpointFileInfo, DomainMetadataMap, LogSegment, PmResolution};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::{
     emit_protocol_metadata_load, emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
@@ -98,6 +98,9 @@ pub enum CheckpointWriteResult {
 pub struct Snapshot {
     span: tracing::Span,
     log_segment: LogSegment,
+    // Log files are immutable. Cache successful inspection only; a failed read can be retried.
+    // Serialize discovery so concurrent consumers do not repeat footer or sidecar reads.
+    checkpoint_file_info: Mutex<Option<Arc<CheckpointFileInfo>>>,
     table_configuration: TableConfiguration,
     /// The newest CRC resolved at construction, kept so later queries and CRC writes reuse it
     /// instead of re-reading from disk. Queried via [`Snapshot::crc_at_version`] (authoritative,
@@ -283,6 +286,7 @@ impl Snapshot {
         Self {
             span,
             log_segment,
+            checkpoint_file_info: Mutex::new(None),
             table_configuration,
             crc,
             built_as_latest,
@@ -576,7 +580,53 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Vec<CheckpointFileGroup>> {
-        self.log_segment.checkpoint_file_groups(engine)
+        let info = self.checkpoint_file_info(engine)?;
+        if self.log_segment.listed.checkpoint_parts.is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(vec![CheckpointFileGroup {
+            num_files: if info.sidecars.is_empty() {
+                self.log_segment.listed.checkpoint_parts.len() as u64
+            } else {
+                info.sidecars.len() as u64
+            },
+            parquet_schema: info.parquet_schema.clone(),
+        }])
+    }
+
+    /// Returns the selected checkpoint's physical size, including every top-level part and
+    /// referenced sidecar. Returns zero without a checkpoint. Successful inspection is cached
+    /// and shared with [`Self::checkpoint_file_groups`] and declarative scan planning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if checkpoint metadata cannot be read or the sum exceeds [`u64::MAX`].
+    pub fn checkpoint_size_in_bytes(&self, engine: &dyn Engine) -> KernelResult<u64> {
+        Ok(self.checkpoint_file_info(engine)?.size_in_bytes)
+    }
+
+    fn checkpoint_file_info(&self, engine: &dyn Engine) -> KernelResult<Arc<CheckpointFileInfo>> {
+        let mut cached = self
+            .checkpoint_file_info
+            .lock()
+            .map_err(|_| KernelError::generic("Checkpoint inspection lock poisoned"))?;
+        if let Some(info) = cached.as_ref() {
+            return Ok(info.clone());
+        }
+        let info = Arc::new(self.log_segment.checkpoint_file_info(engine)?);
+        *cached = Some(info.clone());
+        Ok(info)
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn cached_checkpoint_file_info(
+        &self,
+    ) -> KernelResult<Option<Arc<CheckpointFileInfo>>> {
+        Ok(self
+            .checkpoint_file_info
+            .lock()
+            .map_err(|_| KernelError::generic("Checkpoint inspection lock poisoned"))?
+            .clone())
     }
 
     /// Captures retained snapshot state as an owned hint without engine I/O.

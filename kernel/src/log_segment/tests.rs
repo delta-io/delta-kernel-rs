@@ -1860,12 +1860,12 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None,
         None,
     )?;
+    let info = log_segment.checkpoint_file_info(&engine)?;
+    assert!(info.sidecars.is_empty());
+    assert!(info.parquet_schema.is_none());
     assert_eq!(
-        log_segment.checkpoint_file_groups(&engine)?,
-        vec![CheckpointFileGroup {
-            num_files: 1,
-            parquet_schema: None,
-        }]
+        info.size_in_bytes,
+        log_segment.listed.checkpoint_parts[0].location.size
     );
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,

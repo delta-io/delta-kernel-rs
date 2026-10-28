@@ -1758,6 +1758,30 @@ pub unsafe extern "C" fn snapshot_log_segment_stats(
         .into_extern_result(&engine_ref)
 }
 
+/// Returns the selected checkpoint's bytes, including top-level files and sidecars.
+///
+/// Successful inspection is cached in the snapshot. Returns zero without a checkpoint.
+/// Both handles are borrowed; the scalar result requires no release.
+///
+/// # Errors
+///
+/// Returns an error if checkpoint inspection fails or the sum exceeds `u64::MAX`.
+///
+/// # Safety
+///
+/// Caller must pass valid snapshot and engine handles and retain ownership of both.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_checkpoint_size_in_bytes(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<u64> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .checkpoint_size_in_bytes(engine_ref.engine().as_ref())
+        .into_extern_result(&engine_ref)
+}
+
 /// Borrowed description of checkpoint files sharing a physical schema.
 #[repr(C)]
 pub struct FfiCheckpointFileGroup {

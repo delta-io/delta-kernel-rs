@@ -1391,7 +1391,11 @@ impl Scan {
         // Resolve the checkpoint shape once. The planner owns the decision to retain the file-
         // action schema; checkpoint discovery owns how that schema is obtained.
         let plan_executor = engine.require_plan_executor()?;
-        let shape = if planner.requires_checkpoint_add_schema() {
+        let shape = if let Some(info) = self.snapshot.cached_checkpoint_file_info()? {
+            // Inspection already resolved all physical inputs. Reuse it instead of rereading
+            // the checkpoint or sidecar footer through the plan executor.
+            CheckpointShape::from_file_info(self.snapshot.log_segment(), &info)
+        } else if planner.requires_checkpoint_add_schema() {
             CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
         } else {
             CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?

@@ -32,7 +32,7 @@ use crate::schema::{
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::utils::FoldWithOption as _;
-use crate::{KernelError, KernelResult, PlanBuilder};
+use crate::{KernelError, KernelResult, PlanBuilder, Scalar};
 
 // === Internal column names ===
 
@@ -441,7 +441,29 @@ impl Scan {
                 PlanBuilder::scan_json(parts, &[VERSION], schema)
             }
             (CheckpointType::Manifest, Some((file_type, parts))) => {
-                match log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
+                let cached = self.snapshot.cached_checkpoint_file_info()?;
+                let sidecars = match cached {
+                    Some(info) => {
+                        let version = crate::version_as_i64(
+                            log_segment.checkpoint_version.ok_or_else(|| {
+                                KernelError::generic("Manifest checkpoint has no version")
+                            })?,
+                        )?;
+                        Some(
+                            info.sidecars
+                                .iter()
+                                .map(|meta| ScanFile {
+                                    meta: meta.clone(),
+                                    file_constants: vec![Scalar::Long(version)],
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    }
+                    None => {
+                        log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()?
+                    }
+                };
+                match sidecars {
                     Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
                     // Without a complete hint, load the sidecars referenced by the
                     // manifest.

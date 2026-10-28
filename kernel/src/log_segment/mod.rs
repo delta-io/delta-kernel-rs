@@ -87,6 +87,14 @@ pub struct CheckpointFileGroup {
     pub parquet_schema: Option<SchemaRef>,
 }
 
+/// Resolved physical checkpoint inputs, shared by inspection and scan planning.
+#[derive(Debug)]
+pub(crate) struct CheckpointFileInfo {
+    pub(crate) parquet_schema: Option<SchemaRef>,
+    pub(crate) sidecars: Vec<FileMeta>,
+    pub(crate) size_in_bytes: u64,
+}
+
 /// Information about checkpoint reading for data skipping optimization.
 ///
 /// Returned alongside the actions iterator from checkpoint reading functions.
@@ -1186,23 +1194,27 @@ impl LogSegment {
             .map(Some)
     }
 
-    pub(crate) fn checkpoint_file_groups(
+    pub(crate) fn checkpoint_file_info(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<Vec<CheckpointFileGroup>> {
-        if self.listed.checkpoint_parts.is_empty() {
-            return Ok(vec![]);
-        }
+    ) -> KernelResult<CheckpointFileInfo> {
         let (parquet_schema, sidecars) = self.get_file_actions_schema_and_sidecars(engine)?;
-        let num_files = if sidecars.is_empty() {
-            self.listed.checkpoint_parts.len()
-        } else {
-            sidecars.len()
-        };
-        Ok(vec![CheckpointFileGroup {
-            num_files: num_files as u64,
+        let size_in_bytes = self
+            .listed
+            .checkpoint_parts
+            .iter()
+            .map(|part| &part.location)
+            .chain(sidecars.iter())
+            .try_fold(0u64, |total, file| {
+                total
+                    .checked_add(file.size)
+                    .ok_or_else(|| KernelError::generic("Checkpoint file size exceeds u64::MAX"))
+            })?;
+        Ok(CheckpointFileInfo {
             parquet_schema,
-        }])
+            sidecars,
+            size_in_bytes,
+        })
     }
 
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.

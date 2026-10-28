@@ -19,7 +19,7 @@ use crate::actions::visitors::SidecarVisitor;
 use crate::actions::SIDECAR_NAME;
 use crate::engine_data::RowVisitor;
 use crate::expressions::col;
-use crate::log_segment::LogSegment;
+use crate::log_segment::{CheckpointFileInfo, LogSegment};
 use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::{SchemaRef, StructType};
@@ -47,6 +47,19 @@ pub(crate) struct CheckpointShape {
 }
 
 impl CheckpointShape {
+    pub(crate) fn from_file_info(segment: &LogSegment, info: &CheckpointFileInfo) -> Self {
+        Self {
+            checkpoint_type: if segment.listed.checkpoint_parts.is_empty() {
+                CheckpointType::None
+            } else if info.sidecars.is_empty() {
+                CheckpointType::Leaf
+            } else {
+                CheckpointType::Manifest
+            },
+            leaf_checkpoint_schema: info.parquet_schema.clone(),
+        }
+    }
+
     /// Resolves `snapshot`'s checkpoint topology without retaining the checkpoint leaf schema.
     ///
     /// Returns an error if checkpoint metadata is invalid or required checkpoint data cannot be
@@ -366,6 +379,59 @@ mod tests {
             }
             self.inner.execute_op(op)
         }
+    }
+
+    #[rstest]
+    #[case("app-txn-no-checkpoint")]
+    #[case("with_checkpoint_no_last_checkpoint")]
+    #[case("v1-multi-part-struct-stats-only")]
+    #[case("v2-checkpoints-json-with-sidecars")]
+    #[case("v2-checkpoints-parquet-with-sidecars")]
+    #[case("v2-checkpoints-json-without-sidecars")]
+    fn checkpoint_inspection_counts_all_bytes_and_is_reused(#[case] table: &str) {
+        let (table_root, _tempdir) = copy_test_table(table).unwrap();
+        let engine = Arc::new(SyncEngine::new());
+        let snapshot = Snapshot::builder_for(table_root)
+            .build(engine.as_ref())
+            .unwrap();
+        let groups = snapshot.checkpoint_file_groups(engine.as_ref()).unwrap();
+        let info = snapshot.cached_checkpoint_file_info().unwrap().unwrap();
+        let paths: Vec<_> = snapshot
+            .log_segment()
+            .listed
+            .checkpoint_parts
+            .iter()
+            .map(|p| &p.location)
+            .chain(info.sidecars.iter())
+            .map(|file| file.location.to_file_path().unwrap())
+            .collect();
+        let expected: u64 = paths
+            .iter()
+            .map(|path| std::fs::metadata(path).unwrap().len())
+            .sum();
+        assert_eq!(
+            snapshot.checkpoint_size_in_bytes(engine.as_ref()).unwrap(),
+            expected
+        );
+        for path in paths {
+            std::fs::remove_file(path).unwrap();
+        }
+        assert_eq!(
+            snapshot.checkpoint_file_groups(engine.as_ref()).unwrap(),
+            groups
+        );
+        assert_eq!(
+            snapshot.checkpoint_size_in_bytes(engine.as_ref()).unwrap(),
+            expected
+        );
+        // Planning must reuse both the schema and the sidecar list, with no further IO.
+        snapshot
+            .clone()
+            .scan_builder()
+            .build()
+            .unwrap()
+            .declarative_metadata_scan_plan(engine.as_ref())
+            .unwrap();
     }
 
     /// Resolves checkpoint shape and, when requested, parsed-stats availability across fixtures.
