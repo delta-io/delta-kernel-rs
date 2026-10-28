@@ -142,49 +142,6 @@ impl<T: TransactionType> TransactionBuilder<T> {
         self.common_state.engine_commit_info = Some((commit_info, commit_info_schema));
         self
     }
-
-    /// Adds a per-file `tags` column to the transaction's [`add_files_schema`] and returns the
-    /// updated builder.
-    ///
-    /// The column is a nullable `tags: map<string, string>` with nullable values. It follows the
-    /// base add-files columns, and precedes `clusteringProvider` when
-    /// [`with_add_file_clustering_provider`](Self::with_add_file_clustering_provider) is also set.
-    /// Each row's value becomes the `tags` field of that file's Add action.
-    ///
-    /// `DefaultEngine::write_parquet` does not produce this column, so the caller appends it to
-    /// each batch passed to [`add_files`], e.g. with [`EngineData::append_columns`]. Commit fails
-    /// for a batch without it.
-    ///
-    /// [`add_files_schema`]: crate::transaction::Transaction::add_files_schema
-    /// [`add_files`]: crate::transaction::Transaction::add_files
-    pub fn with_add_file_tags(mut self) -> Self {
-        self.common_state.add_file_tags = true;
-        self
-    }
-
-    /// Adds a per-file `clusteringProvider` column to the transaction's [`add_files_schema`] and
-    /// returns the updated builder.
-    ///
-    /// The column is a nullable `clusteringProvider: string`. It is the last add-files column,
-    /// after `tags` when [`with_add_file_tags`](Self::with_add_file_tags) is also set. Each row's
-    /// value becomes the `clusteringProvider` field of that file's Add action. The Delta protocol
-    /// requires: "When a clustering implementation clusters files, writers must set the name of
-    /// the clustering implementation in the `clusteringProvider` field when adding `add` actions
-    /// for clustered files." A null value marks the file as unclustered.
-    ///
-    /// `DefaultEngine::write_parquet` does not produce this column, so the caller appends it to
-    /// each batch passed to [`add_files`], e.g. with [`EngineData::append_columns`]. Commit fails
-    /// for a batch without it.
-    ///
-    /// Build rejects this option if the table's protocol does not support the `clustering` writer
-    /// feature.
-    ///
-    /// [`add_files_schema`]: crate::transaction::Transaction::add_files_schema
-    /// [`add_files`]: crate::transaction::Transaction::add_files
-    pub fn with_add_file_clustering_provider(mut self) -> Self {
-        self.common_state.add_file_clustering_provider = true;
-        self
-    }
 }
 
 impl TransactionType for CreateTable {
@@ -239,8 +196,6 @@ mod tests {
                 string_array_to_engine_data(StringArray::from(vec!["tag"])),
                 schema_ref! { nullable "a": STRING },
             )
-            .with_add_file_tags()
-            .with_add_file_clustering_provider()
     }
 
     #[test]
@@ -267,8 +222,6 @@ mod tests {
             "app.domain"
         );
         assert!(!builder.common_state.data_change);
-        assert!(builder.common_state.add_file_tags);
-        assert!(builder.common_state.add_file_clustering_provider);
         let (commit_info, schema) = builder.common_state.engine_commit_info.as_ref().unwrap();
         assert_eq!(commit_info.len(), 1);
         assert_eq!(

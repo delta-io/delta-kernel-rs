@@ -206,8 +206,6 @@ impl TransactionBuilder<UpdateTable> {
     /// - Unsupported table writes, schema evolution, or CDF validation failures.
     /// - Conflicting application ids or domain metadata, or reserved or unsupported domains.
     /// - Connector commit information that does not contain exactly one row.
-    /// - [`with_add_file_clustering_provider`](Self::with_add_file_clustering_provider) on a table
-    ///   that does not support the `clustering` writer feature.
     ///
     /// Schema changes are rejected when `icebergCompatV2`, `icebergCompatV3`, or
     /// `allowColumnDefaults` is enabled. This applies to standalone ALTER TABLE transactions and
@@ -337,7 +335,6 @@ fn try_new_update_table<MODE: ExecutionMode>(
         Some(changes) => apply_schema_changes(effective_table_config, changes)?,
         None => effective_table_config,
     };
-    common_state.validate_for_table(&effective_table_config)?;
 
     Ok(Transaction {
         read_snapshot_opt: Some(read_snapshot),

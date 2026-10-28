@@ -12,11 +12,13 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{column_name, ArrayData, ColumnName, MapData, Scalar};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::DynObjectStore;
-use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, ArrayType, DataType, MapType, StructField, StructType};
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::{Transaction, UpdateTableOperation};
+use delta_kernel::transaction::{
+    Transaction, UpdateTableOperation, CLUSTERING_PROVIDER_NAME, TAGS_NAME,
+};
 use delta_kernel::{EngineData as _, Snapshot};
 use itertools::Itertools;
 use serde_json::{json, Value};
@@ -26,8 +28,8 @@ use test_utils::delta_kernel_default_engine::executor::tokio::{
 };
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    assert_result_error_with_message, create_default_engine_mt_executor, into_record_batch,
-    nested_batches, nested_schema, read_actions_from_commit, test_table_setup,
+    assert_result_error_with_message, create_add_files_metadata, create_default_engine_mt_executor,
+    into_record_batch, nested_batches, nested_schema, read_actions_from_commit, test_table_setup,
     write_batch_to_table,
 };
 use url::Url;
@@ -360,13 +362,10 @@ struct NewFilesSetup {
     add_files_metadata: RecordBatch,
 }
 
-/// Creates a table clustered on `id`, then writes one data file per entry of `file_ids` in a write
-/// transaction built with the given add-file options. Returns the transaction with the files'
-/// add-file metadata concatenated into one batch, not yet added to the transaction.
+/// Creates a table clustered on `id` and writes one data file per entry of `file_ids`.
+/// Returns the transaction and its file metadata without staging the files.
 async fn write_new_files_to_clustered_table(
     row_tracking: bool,
-    tags: bool,
-    clustering_provider: bool,
     file_ids: Vec<Vec<i32>>,
 ) -> Result<NewFilesSetup, Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = test_table_setup()?;
@@ -386,14 +385,9 @@ async fn write_new_files_to_clustered_table(
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 
-    let mut builder = snapshot.update_table(UpdateTableOperation::Write, "Test/1.0", true);
-    if tags {
-        builder = builder.with_add_file_tags();
-    }
-    if clustering_provider {
-        builder = builder.with_add_file_clustering_provider();
-    }
-    let txn = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let txn = snapshot
+        .update_table(UpdateTableOperation::Write, "Test/1.0", true)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let write_state = txn.write_state()?;
     let write_context = write_state.write_context_builder().build()?;
     let mut file_metadata = Vec::new();
@@ -414,11 +408,10 @@ async fn write_new_files_to_clustered_table(
 
 #[rstest::rstest]
 #[tokio::test]
-async fn test_add_file_tags_and_clustering_provider_match_opted_in_schema(
+async fn test_add_file_tags_and_clustering_provider_written_to_add_actions(
     #[values(false, true)] row_tracking: bool,
     #[values(false, true)] tags: bool,
     #[values(false, true)] clustering_provider: bool,
-    #[values(false, true)] extra_columns: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let NewFilesSetup {
         _tmp_dir,
@@ -426,19 +419,14 @@ async fn test_add_file_tags_and_clustering_provider_match_opted_in_schema(
         engine,
         mut txn,
         add_files_metadata,
-    } = write_new_files_to_clustered_table(
-        row_tracking,
-        tags,
-        clustering_provider,
-        vec![vec![1, 2], vec![3], vec![4]],
-    )
-    .await?;
+    } = write_new_files_to_clustered_table(row_tracking, vec![vec![1, 2], vec![3], vec![4]])
+        .await?;
 
     let mut fields = Vec::new();
     let mut columns = Vec::new();
-    if tags || extra_columns {
+    if tags {
         let tags_type = MapType::new(DataType::STRING, DataType::STRING, true);
-        fields.push(StructField::nullable("tags", tags_type.clone()));
+        fields.push(StructField::nullable(TAGS_NAME, tags_type.clone()));
         columns.push(ArrayData::try_new(
             ArrayType::new(tags_type.clone(), true),
             [
@@ -454,9 +442,9 @@ async fn test_add_file_tags_and_clustering_provider_match_opted_in_schema(
             ],
         )?);
     }
-    if clustering_provider || extra_columns {
+    if clustering_provider {
         fields.push(StructField::nullable(
-            "clusteringProvider",
+            CLUSTERING_PROVIDER_NAME,
             DataType::STRING,
         ));
         columns.push(ArrayData::try_new(
@@ -474,12 +462,10 @@ async fn test_add_file_tags_and_clustering_provider_match_opted_in_schema(
     } else {
         add_files_metadata.append_columns(Arc::new(StructType::try_new(fields)?), columns)?
     });
-    let result = txn.commit(engine.as_ref());
-    if extra_columns && (!tags || !clustering_provider) {
-        assert_result_error_with_message(result, "Too few fields in output schema");
-        return Ok(());
-    }
-    let version = result?.unwrap_committed().commit_version();
+    let version = txn
+        .commit(engine.as_ref())?
+        .unwrap_committed()
+        .commit_version();
 
     let adds = read_actions_from_commit(&table_url, version, "add")?;
     let read_back = |name: &str| adds.iter().map(|add| add.get(name).cloned()).collect_vec();
@@ -515,15 +501,176 @@ async fn test_add_file_tags_and_clustering_provider_match_opted_in_schema(
 }
 
 #[rstest::rstest]
-#[case::tags(true, false, "tags")]
-#[case::clustering_provider(false, true, "clusteringProvider")]
-#[case::both(true, true, "tags")]
 #[tokio::test]
-async fn test_add_files_without_opted_in_column_fails_at_commit(
+async fn test_add_files_with_mixed_optional_columns(
     #[values(false, true)] row_tracking: bool,
-    #[case] tags: bool,
-    #[case] clustering_provider: bool,
-    #[case] missing_column: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let NewFilesSetup {
+        _tmp_dir,
+        table_url,
+        engine,
+        mut txn,
+        add_files_metadata,
+    } = write_new_files_to_clustered_table(row_tracking, vec![vec![1], vec![2], vec![3], vec![4]])
+        .await?;
+
+    let shapes = [(false, false), (true, false), (false, true), (true, true)];
+    for (row, (tags, provider)) in shapes.into_iter().enumerate() {
+        let metadata = ArrowEngineData::new(add_files_metadata.slice(row, 1));
+        let mut fields = Vec::new();
+        let mut columns = Vec::new();
+        if tags {
+            let tags_type = MapType::new(DataType::STRING, DataType::STRING, true);
+            fields.push(StructField::nullable(TAGS_NAME, tags_type.clone()));
+            columns.push(ArrayData::try_new(
+                ArrayType::new(tags_type.clone(), true),
+                [Scalar::Map(MapData::try_new(
+                    tags_type,
+                    [("key", "value")],
+                )?)],
+            )?);
+        }
+        if provider {
+            fields.push(StructField::nullable(
+                CLUSTERING_PROVIDER_NAME,
+                DataType::STRING,
+            ));
+            columns.push(ArrayData::try_new(
+                ArrayType::new(DataType::STRING, true),
+                [Scalar::from("liquid")],
+            )?);
+        }
+        txn.add_files(if fields.is_empty() {
+            Box::new(metadata)
+        } else {
+            metadata.append_columns(Arc::new(StructType::try_new(fields)?), columns)?
+        });
+    }
+    let version = txn
+        .commit(engine.as_ref())?
+        .unwrap_committed()
+        .commit_version();
+    let adds = read_actions_from_commit(&table_url, version, "add")?;
+    assert_eq!(adds.len(), shapes.len());
+    for (row, (add, (tags, provider))) in adds.iter().zip(shapes).enumerate() {
+        assert_eq!(
+            add.get("tags"),
+            tags.then(|| json!({"key": "value"})).as_ref()
+        );
+        assert_eq!(
+            add.get("clusteringProvider"),
+            provider.then(|| json!("liquid")).as_ref()
+        );
+        assert_eq!(
+            add.get("baseRowId"),
+            row_tracking.then(|| json!(row)).as_ref()
+        );
+        assert_eq!(
+            add.get("defaultRowCommitVersion"),
+            row_tracking.then(|| json!(version)).as_ref()
+        );
+        assert_eq!(add["dataChange"], true);
+    }
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::absent(None)]
+#[case::null(Some([None, None]))]
+#[case::populated(Some([None, Some("liquid")]))]
+#[case::empty_string(Some([None, Some("")]))]
+fn test_add_file_clustering_provider_on_unclustered_table(
+    #[values(false, true)] create_transaction: bool,
+    #[values(false, true)] row_tracking: bool,
+    #[case] providers: Option<[Option<&str>; 2]>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let properties = if row_tracking {
+        vec![("delta.enableRowTracking", "true")]
+    } else {
+        vec![]
+    };
+    let mut create = create_table_txn(table_url.as_str(), get_simple_schema(), "Test/1.0", true)
+        .with_table_properties(properties)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let mut metadata = create_add_files_metadata(
+        create.add_files_schema(),
+        vec![
+            ("one.parquet", 10, 0, Some(1)),
+            ("two.parquet", 10, 0, Some(1)),
+        ],
+    )?;
+    let tags_type = MapType::new(DataType::STRING, DataType::STRING, true);
+    metadata = metadata.append_columns(
+        schema_ref! { nullable TAGS_NAME: { STRING => nullable STRING } },
+        vec![ArrayData::try_new(
+            ArrayType::new(tags_type.clone(), true),
+            vec![Scalar::Map(MapData::try_new(tags_type, [("key", "value")])?); 2],
+        )?],
+    )?;
+    if let Some(values) = providers {
+        metadata = metadata.append_columns(
+            schema_ref! { nullable CLUSTERING_PROVIDER_NAME: STRING },
+            vec![ArrayData::try_new(
+                ArrayType::new(DataType::STRING, true),
+                values.map(|value| {
+                    value
+                        .map(Scalar::from)
+                        .unwrap_or(Scalar::Null(DataType::STRING))
+                }),
+            )?],
+        )?;
+    }
+
+    let result = if create_transaction {
+        create.add_files(metadata);
+        create
+            .commit(engine.as_ref())
+            .map(|result| result.unwrap_committed().commit_version())
+    } else {
+        let snapshot = create
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        let mut txn = snapshot
+            .update_table(UpdateTableOperation::Write, "Test/1.0", true)
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        txn.add_files(metadata);
+        txn.commit(engine.as_ref())
+            .map(|result| result.unwrap_committed().commit_version())
+    };
+    if providers.is_some_and(|values| values.iter().any(Option::is_some)) {
+        assert_result_error_with_message(
+            result,
+            "clusteringProvider requires the 'clustering' writer feature",
+        );
+    } else {
+        let adds = read_actions_from_commit(&table_url, result?, "add")?;
+        assert_eq!(adds.len(), 2);
+        for add in adds {
+            assert_eq!(add["tags"], json!({"key": "value"}));
+            assert!(add.get("clusteringProvider").is_none());
+        }
+    }
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::tags_not_map(TAGS_NAME, DataType::STRING)]
+#[case::provider_not_string(CLUSTERING_PROVIDER_NAME, DataType::LONG)]
+#[case::tags_key_not_string(
+    TAGS_NAME,
+    DataType::from(MapType::new(DataType::LONG, DataType::STRING, true))
+)]
+#[case::tags_value_not_string(
+    TAGS_NAME,
+    DataType::from(MapType::new(DataType::STRING, DataType::LONG, true))
+)]
+#[tokio::test]
+async fn test_add_file_optional_column_wrong_type_rejected(
+    #[values(false, true)] row_tracking: bool,
+    #[case] name: &str,
+    #[case] data_type: DataType,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let NewFilesSetup {
         _tmp_dir,
@@ -531,51 +678,21 @@ async fn test_add_files_without_opted_in_column_fails_at_commit(
         mut txn,
         add_files_metadata,
         ..
-    } = write_new_files_to_clustered_table(row_tracking, tags, clustering_provider, vec![vec![1]])
-        .await?;
-
-    txn.add_files(Box::new(ArrowEngineData::new(add_files_metadata)));
-    assert_result_error_with_message(
-        txn.commit(engine.as_ref()),
-        &format!("Expected schema field '{missing_column}' is missing"),
+    } = write_new_files_to_clustered_table(row_tracking, vec![vec![1]]).await?;
+    let metadata = ArrowEngineData::new(add_files_metadata).append_columns(
+        Arc::new(StructType::try_new([StructField::nullable(
+            name,
+            data_type.clone(),
+        )])?),
+        vec![ArrayData::try_new(
+            ArrayType::new(data_type.clone(), true),
+            [Scalar::Null(data_type)],
+        )?],
+    )?;
+    txn.add_files(metadata);
+    assert!(
+        txn.commit(engine.as_ref()).is_err(),
+        "accepted wrong type for {name}"
     );
-    Ok(())
-}
-
-#[test]
-fn test_add_file_clustering_provider_rejected_on_unclustered_table(
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = test_table_setup()?;
-    let table_url = Url::from_directory_path(&table_path).unwrap();
-    let expected_error = "with_add_file_clustering_provider requires a table that supports the \
-                          'clustering' writer feature";
-
-    let create = || create_table_txn(table_url.as_str(), get_simple_schema(), "Test/1.0", true);
-    assert_result_error_with_message(
-        create()
-            .with_add_file_clustering_provider()
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
-        expected_error,
-    );
-    let snapshot = create()
-        .with_add_file_tags()
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
-        .unwrap_post_commit_snapshot();
-
-    let update = || {
-        snapshot
-            .clone()
-            .update_table(UpdateTableOperation::Write, "Test/1.0", true)
-    };
-    assert_result_error_with_message(
-        update()
-            .with_add_file_clustering_provider()
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
-        expected_error,
-    );
-    update()
-        .with_add_file_tags()
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     Ok(())
 }

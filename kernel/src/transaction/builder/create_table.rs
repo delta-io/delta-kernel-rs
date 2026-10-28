@@ -951,8 +951,6 @@ impl TransactionBuilder<CreateTable> {
     /// - Unsupported delta properties or feature flags are specified
     /// - Connector commit information does not contain exactly one row
     /// - An application transaction identifier occurs more than once
-    /// - [`with_add_file_clustering_provider`](Self::with_add_file_clustering_provider) is set when
-    ///   the new table's protocol does not support the `clustering` writer feature
     #[internal_api]
     pub(crate) fn build(
         self,
@@ -1086,7 +1084,6 @@ fn try_new_create_table<MODE: ExecutionMode>(
     clustering_columns: Option<Vec<ColumnName>>,
     common_state: TransactionBuilderState,
 ) -> KernelResult<Transaction<CreateTable, MODE>> {
-    common_state.validate_for_table(&effective_table_config)?;
     validate_iceberg_compat_if_needed(
         &effective_table_config,
         &V2_VALIDATOR,

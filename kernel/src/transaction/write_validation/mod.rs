@@ -10,6 +10,7 @@ mod dv;
 mod removefile;
 mod utils;
 
+pub(super) use addfile::validate_clustering_providers;
 use derive_more::Constructor;
 
 use crate::engine_data::{

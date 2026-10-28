@@ -5,8 +5,6 @@ use std::sync::Arc;
 
 use crate::actions::DomainMetadata;
 use crate::schema::SchemaRef;
-use crate::table_configuration::TableConfiguration;
-use crate::table_features::TableFeature;
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::utils::require;
 use crate::{EngineData, KernelError, KernelResult};
@@ -22,8 +20,6 @@ pub(in crate::transaction) struct TransactionBuilderState {
     pub(in crate::transaction) transaction_ids: Vec<(String, i64)>,
     pub(in crate::transaction) domain_metadata_additions: Vec<DomainMetadata>,
     pub(in crate::transaction) data_change: bool,
-    pub(in crate::transaction) add_file_tags: bool,
-    pub(in crate::transaction) add_file_clustering_provider: bool,
 }
 
 impl std::fmt::Debug for TransactionBuilderState {
@@ -37,11 +33,6 @@ impl std::fmt::Debug for TransactionBuilderState {
             .field("transaction_ids", &self.transaction_ids)
             .field("domain_metadata_additions", &self.domain_metadata_additions)
             .field("data_change", &self.data_change)
-            .field("add_file_tags", &self.add_file_tags)
-            .field(
-                "add_file_clustering_provider",
-                &self.add_file_clustering_provider,
-            )
             .finish()
     }
 }
@@ -87,19 +78,6 @@ impl TransactionBuilderState {
             },
         )?;
 
-        Ok(())
-    }
-
-    /// Validates the options that depend on the protocol of the table being written.
-    pub(super) fn validate_for_table(&self, table_config: &TableConfiguration) -> KernelResult<()> {
-        require!(
-            !self.add_file_clustering_provider
-                || table_config.is_feature_supported(&TableFeature::ClusteredTable),
-            KernelError::invalid_transaction_state(
-                "with_add_file_clustering_provider requires a table that supports the 'clustering' \
-                 writer feature"
-            )
-        );
         Ok(())
     }
 }
