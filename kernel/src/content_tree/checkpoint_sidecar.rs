@@ -4,20 +4,17 @@ use std::iter;
 
 use super::action_projector::ActionProjector;
 use crate::actions::Sidecar;
-use crate::cancellation::CancellationTokenRef;
 use crate::log_replay::ActionsBatch;
 use crate::path::LogRoot;
 use crate::schema::SchemaRef;
-use crate::{Engine, KernelResult, KernelResultIteratorStatic};
+use crate::{Engine, KernelResult, KernelResultIterator};
 
 /// Reads the `action` rows of `sidecars` as checkpoint batches (`is_log_batch = false`) matching
 /// `read_schema`.
 ///
 /// Each sidecar is a Parquet file that, like a V2 checkpoint sidecar, holds one action per row in
 /// a top-level `action` column described by `source_schema`, and whose path is relative to the
-/// `_delta_log/_sidecars/` directory under `log_root` (see [`Sidecar::to_filemeta`]). The reads
-/// stop with [`KernelError::Cancelled`](crate::KernelError::Cancelled) once `cancellation_token`
-/// is cancelled.
+/// `_delta_log/_sidecars/` directory under `log_root` (see [`Sidecar::to_filemeta`]).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn read_sidecar_actions(
     engine: &dyn Engine,
@@ -26,8 +23,7 @@ pub(super) fn read_sidecar_actions(
     action: &str,
     source_schema: SchemaRef,
     read_schema: SchemaRef,
-    cancellation_token: Option<&CancellationTokenRef>,
-) -> KernelResult<KernelResultIteratorStatic<ActionsBatch>> {
+) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
     if sidecars.is_empty() {
         return Ok(Box::new(iter::empty()));
     }
@@ -38,12 +34,7 @@ pub(super) fn read_sidecar_actions(
     let projector = ActionProjector::try_new(engine, action, source_schema.clone(), read_schema)?;
     let batches = engine
         .parquet_handler()
-        .read_parquet_files_with_cancellation(
-            &files,
-            source_schema,
-            None,
-            cancellation_token.cloned(),
-        )?;
+        .read_parquet_files(&files, source_schema, None)?;
     Ok(Box::new(batches.map(move |batch| {
         Ok(ActionsBatch::new(
             projector.project(batch?.as_ref())?,
@@ -65,8 +56,10 @@ mod tests {
         LOG_TXN_SCHEMA, SET_TRANSACTION_NAME,
     };
     use crate::arrow::array::{AsArray as _, RecordBatch};
+    use crate::cancellation::CancellationTokenRef;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
+    use crate::engine::CancellableEngine;
     use crate::expressions::Scalar;
     use crate::object_store::memory::InMemory;
     use crate::schema::StructType;
@@ -138,7 +131,6 @@ mod tests {
             action,
             source_schema,
             read_schema,
-            None,
         )
         .unwrap()
         .map(|batch| {
@@ -168,7 +160,6 @@ mod tests {
             SET_TRANSACTION_NAME,
             LOG_TXN_SCHEMA.clone(),
             LOG_TXN_SCHEMA.clone(),
-            None,
         )
         .unwrap();
         assert_eq!(batches.count(), 0);
@@ -186,13 +177,12 @@ mod tests {
         );
         let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
         let result = read_sidecar_actions(
-            &engine,
+            &CancellableEngine::new(&engine, token),
             &log_root(),
             &[sidecar],
             SET_TRANSACTION_NAME,
             LOG_TXN_SCHEMA.clone(),
             LOG_TXN_SCHEMA.clone(),
-            Some(&token),
         );
         assert!(matches!(result, Err(KernelError::Cancelled)));
     }
@@ -208,7 +198,6 @@ mod tests {
             SET_TRANSACTION_NAME,
             LOG_TXN_SCHEMA.clone(),
             LOG_TXN_SCHEMA.clone(),
-            None,
         )
         .and_then(|batches| batches.collect::<KernelResult<Vec<_>>>());
         assert_result_error_with_message(result, "_delta_log/_sidecars/missing.parquet");
