@@ -686,10 +686,10 @@ impl MockProtocolBuilder {
 /// metadata.
 pub(crate) fn field_with_generation_expression(
     name: &str,
-    ty: impl Into<KernelDataType>,
+    data_type: impl Into<KernelDataType>,
     metadata_value: impl Into<MetadataValue>,
 ) -> StructField {
-    StructField::nullable(name, ty).add_metadata([(
+    StructField::nullable(name, data_type).add_metadata([(
         ColumnMetadataKey::GenerationExpression.as_ref(),
         metadata_value.into(),
     )])

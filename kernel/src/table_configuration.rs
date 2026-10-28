@@ -1127,18 +1127,6 @@ impl TableConfiguration {
             )
         );
 
-        // A generation expression only takes effect on a table that supports the `generatedColumns`
-        // writer feature. Kernel refuses to write a table that has one without that support, while
-        // Delta Spark writes such a table and ignores the expression.
-        require!(
-            self.is_feature_supported(&TableFeature::GeneratedColumns)
-                || !self.has_generation_expressions(),
-            KernelError::invalid_protocol(
-                "Table contains generation expressions but does not support the \
-                 'generatedColumns' writer feature",
-            )
-        );
-
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
         // TODO: Better story for schema validation for Invariants and other features
         if self.is_feature_supported(&TableFeature::Invariants)
@@ -1535,10 +1523,12 @@ mod test {
 
     #[rstest]
     // Tables whose top-level columns declare generation expressions.
+    // Without `generatedColumns` support, kernel writes the table as a normal table, as Delta Spark
+    // does.
     #[case::without_feature(
         generated_event_year_schema(),
         MockProtocolBuilder::new().build(),
-        WriteSupport::InvalidProtocol
+        WriteSupport::Supported
     )]
     // The protocol allows the expression, so kernel's write support for `generatedColumns`
     // decides.
@@ -1552,7 +1542,7 @@ mod test {
     #[case::legacy_writer_below_min_version(
         generated_event_year_schema(),
         MockProtocolBuilder::new().with_versions(1, 2).build(),
-        WriteSupport::InvalidProtocol
+        WriteSupport::Supported
     )]
     // Writer version 4 implies `generatedColumns` among other features, so kernel's write support
     // for those features decides.
@@ -1580,12 +1570,12 @@ mod test {
     #[case::empty_expression_without_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "")) },
         MockProtocolBuilder::new().with_versions(1, 2).build(),
-        WriteSupport::InvalidProtocol
+        WriteSupport::Supported
     )]
     #[case::non_string_expression_without_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, 7_i64)) },
         MockProtocolBuilder::new().with_versions(1, 2).build(),
-        WriteSupport::InvalidProtocol
+        WriteSupport::Supported
     )]
     // No top-level generation expressions.
     #[case::no_generation_expression(
