@@ -873,7 +873,7 @@ fn declarative_metadata_partition_values_prune_without_struct_stats(
     // The reference scan requests default JSON stats; this scan disables stats to isolate
     // partition pruning. Compare the shared metadata fields.
     assert_metadata_eq(
-        &without_columns(&actual, &[STATS])?,
+        &actual,
         &without_columns(&expected, &[STATS])?,
         "partition pruning",
     )

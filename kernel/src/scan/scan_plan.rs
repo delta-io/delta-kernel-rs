@@ -158,10 +158,9 @@ impl<'a> MetadataPlanner<'a> {
         // A schema patch to apply to `ADD_SCHEMA`
         let patch = SchemaStructPatchBuilder::new();
 
-        let prefer_json_stats = self.scan.stats.synthesize_json && file_add_schema.contains(STATS);
-
         // Decide what kind of stats to read from the file by transforming `ADD_SCHEMA` based on the
         // `file_schema` and table-derived stats schema.
+        let prefer_json_stats = self.scan.stats.synthesize_json && file_add_schema.contains(STATS);
         let (patch, stats_kind) = match (self.stats_schema.as_ref(), get_type_of(STATS_PARSED)) {
             // Parsed statistics are requested and present in the file
             (Some(required_stats), Some(DataType::Struct(file_parsed_stats)))
@@ -266,7 +265,7 @@ impl<'a> MetadataPlanner<'a> {
     fn project_output(&self, plan: PlanBuilder, stats: StatsKind) -> KernelResult<PlanBuilder> {
         let output_stats_schema = self.scan.state_info.physical_stats_output_schema();
 
-        plan.project_patch(|patch| {
+        plan.project_patch(|mut patch| {
             let mut patch = match stats {
                 StatsKind::None => patch,
                 StatsKind::Json => patch.fold_with(output_stats_schema, |patch, schema| {
@@ -275,15 +274,13 @@ impl<'a> MetadataPlanner<'a> {
                     patch.insert_after_at([ADD_NAME], STATS, field, expr)
                 }),
                 StatsKind::Struct | StatsKind::Both => {
-                    let patch = if stats == StatsKind::Struct && self.scan.stats.synthesize_json {
+                    if stats == StatsKind::Struct && self.scan.stats.synthesize_json {
                         let field = StructField::nullable(STATS, DataType::STRING);
                         let expr =
                             Expr::unary(UnaryExpressionOp::ToJson, col!(ADD_NAME, STATS_PARSED));
                         // Match ADD_SCHEMA's field order without moving native structured stats.
-                        patch.insert_after_at([ADD_NAME], "dataChange", field, expr)
-                    } else {
-                        patch
-                    };
+                        patch = patch.insert_after_at([ADD_NAME], "dataChange", field, expr)
+                    }
                     // TODO(#3535): Remove support for outputting both structured and JSON stats.
                     match (self.stats_schema.as_ref(), output_stats_schema) {
                         (_, None) => patch.drop_at([ADD_NAME], STATS_PARSED),
@@ -664,6 +661,7 @@ mod tests {
     use crate::object_store::ObjectStoreExt as _;
     use crate::plans::ir::nodes::Operator;
     use crate::plans::Operation as PlanOperation;
+    use crate::scan::data_skipping::stats_schema::expected_stats_schema;
     use crate::scan::{PartitionValuesOptions, StatsOptions};
     use crate::schema::StructType;
     use crate::snapshot::Snapshot;
@@ -1135,52 +1133,18 @@ mod tests {
                     .with_features([TableFeature::TimestampWithoutTimezone])
                     .build(),
             )
-            .with_table_root("memory:///")
             .try_build()?;
-        let bounds = schema! {
-            nullable "x": (native_type),
-        };
+        let stats_schema = config.stats_schema_builder().build()?;
         let file_schema = schema_ref! {
             nullable ADD_NAME: {
                 ..(ADD_SCHEMA.fields().filter(|field| field.name() != STATS)),
-                nullable STATS_PARSED: {
-                    nullable "numRecords": LONG,
-                    nullable "minValues": (bounds.clone()),
-                    nullable "maxValues": (bounds),
-                    nullable "nullCount": {
-                        nullable "x": LONG,
-                    },
-                },
+                nullable STATS_PARSED: (expected_stats_schema(
+                    &schema! { nullable "x": (native_type) },
+                    &Default::default(), None, None,
+                )?),
             },
         };
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
-        let batch = parse_json_impl(
-            &StringArray::from(vec![concat!(
-                r#"{"add":{"path":"a.parquet","partitionValues":{},"size":1,"modificationTime":1,"#,
-                r#""dataChange":true,"stats_parsed":{"numRecords":1,"#,
-                r#""minValues":{"x":1},"#,
-                r#""maxValues":{"x":1},"#,
-                r#""nullCount":{"x":0}}}}"#,
-            )]),
-            file_schema,
-        )?;
-        futures::executor::block_on(store.put(
-            &Path::from("_delta_log/00000000000000000000.checkpoint.parquet"),
-            record_batch_to_bytes(&batch).into(),
-        ))?;
-        let segment = log_segment(
-            Url::parse("memory:///_delta_log/")?,
-            &[],
-            Some("memory:///_delta_log/00000000000000000000.checkpoint.parquet"),
-        );
-        let scan = Arc::new(Snapshot::new(segment, config)?)
-            .scan_builder()
-            .with_stats(StatsOptions::all())
-            .build()?;
-        let batches = declarative_metadata(&scan, &engine)?;
-        assert_eq!(metadata_row_count(&batches), 1);
-        let expected_stats = |value| {
+        let stats = |value: serde_json::Value| {
             serde_json::json!({
                 "numRecords": 1,
                 "minValues": {"x": value},
@@ -1188,19 +1152,33 @@ mod tests {
                 "nullCount": {"x": 0},
             })
         };
-        let native = StringArray::from(vec![expected_stats(expected_native).to_string()]);
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let add = serde_json::json!({ "add": {
+            "path": "a.parquet", "partitionValues": {}, "size": 1,
+            "modificationTime": 1, "dataChange": true, "stats_parsed": stats(1.into()),
+        }});
+        let batch = parse_json_impl(&StringArray::from(vec![add.to_string()]), file_schema)?;
+        futures::executor::block_on(store.put(
+            &Path::from("_delta_log/00000000000000000000.checkpoint.parquet"),
+            record_batch_to_bytes(&batch).into(),
+        ))?;
+        let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
+        let scan = Arc::new(Snapshot::new(segment, config)?)
+            .scan_builder()
+            .with_stats(StatsOptions::all())
+            .build()?;
+        let batches = declarative_metadata(&scan, &engine)?;
+        assert_eq!(metadata_row_count(&batches), 1);
         let expected_native = StructArray::from(parse_json_impl(
-            &native,
-            scan.state_info
-                .physical_stats_output_schema()
-                .unwrap()
-                .clone(),
+            &StringArray::from(vec![stats(expected_native.into()).to_string()]),
+            stats_schema,
         )?);
         for batch in batches {
             let json = batch.column_by_name(STATS).unwrap().as_string::<i32>();
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(json.value(0))?,
-                expected_stats(expected)
+                stats(expected.into())
             );
             assert_eq!(
                 batch.column_by_name(STATS_PARSED).unwrap().as_struct(),
@@ -1251,8 +1229,7 @@ mod tests {
         let (read_schema, kind, _) =
             MetadataPlanner::try_new(&scan)?.read_schema(&file_schema, false)?;
         assert!(kind == StatsKind::Json);
-        assert!(add_struct(&read_schema).contains(STATS));
-        assert!(!add_struct(&read_schema).contains(STATS_PARSED));
+        assert_eq!(add_struct(&read_schema), &*ADD_SCHEMA);
         Ok(())
     }
 
