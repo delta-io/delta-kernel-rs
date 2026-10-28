@@ -34,7 +34,8 @@ impl SetTransactionScanner {
         log_segment: &LogSegment,
         engine: &dyn Engine,
     ) -> KernelResult<SetTransactionMap> {
-        scan_application_transactions(replay_for_app_ids(log_segment, engine)?, None)
+        let actions = replay_for_app_ids(log_segment, engine)?;
+        scan_application_transactions(actions, None)
     }
 
     /// Fetch the latest `txn` action for `application_id`, rooted in an authoritative (`Complete`)
