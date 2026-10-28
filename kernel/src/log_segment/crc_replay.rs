@@ -181,14 +181,7 @@ impl LogSegment {
         let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
         // Read only the checkpoint parquet plus any V2 sidecars via `create_checkpoint_stream`.
         let batches = self
-            .create_checkpoint_stream(
-                engine,
-                CHECKPOINT_CRC_SCHEMA.clone(),
-                None,
-                None,
-                None,
-                None,
-            )?
+            .create_checkpoint_stream(engine, CHECKPOINT_CRC_SCHEMA.clone(), None, None, None)?
             .actions;
         for batch in batches {
             let batch = batch?;
@@ -1076,7 +1069,6 @@ mod tests {
             vec![],
             None,
             Some(2),
-            None,
         )
         .unwrap();
 
@@ -1154,7 +1146,6 @@ mod tests {
             vec![],
             None,
             Some(0),
-            None,
         )
         .unwrap();
         for base in [0, 5] {
@@ -1185,7 +1176,6 @@ mod tests {
             vec![],
             None,
             Some(1),
-            None,
         )
         .unwrap();
         assert!(matches!(

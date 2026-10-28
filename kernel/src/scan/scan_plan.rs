@@ -16,6 +16,7 @@ use crate::actions::{
     get_all_actions_schema, ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME,
     SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
 };
+use crate::checkpoint::collation_stats::source_collation_stats;
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
     col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, Predicate,
@@ -172,8 +173,17 @@ impl<'a> MetadataPlanner<'a> {
                         CheckpointFieldKind::Stats,
                     ) =>
             {
-                let stats_parsed_field =
-                    StructField::nullable(STATS_PARSED, required_stats.clone());
+                let stats_schema = required_stats.clone().try_fold_with(
+                    source_collation_stats(file_schema)
+                        .filter(|_| self.scan.needs_collation_stats_schema()),
+                    |stats, field| {
+                        SchemaStructPatchBuilder::new()
+                            .append(field.clone())
+                            .build(&stats)
+                            .map(Arc::new)
+                    },
+                )?;
+                let stats_parsed_field = StructField::nullable(STATS_PARSED, stats_schema);
                 let patch = patch.drop(STATS).insert_after(STATS, stats_parsed_field);
                 (patch, StatsKind::Struct)
             }
@@ -266,6 +276,11 @@ impl<'a> MetadataPlanner<'a> {
         let output_stats_schema = self.scan.state_info.physical_stats_output_schema();
 
         plan.project_patch(|mut patch| {
+            let read_stats = patch
+                .input_schema()
+                .field_at(&column_name!(ADD_NAME, STATS_PARSED))
+                .ok()
+                .map(StructField::data_type);
             let mut patch = match stats {
                 StatsKind::None => patch,
                 StatsKind::Json => patch.fold_with(output_stats_schema, |patch, schema| {
@@ -282,9 +297,11 @@ impl<'a> MetadataPlanner<'a> {
                         patch = patch.insert_after_at([ADD_NAME], "dataChange", field, expr)
                     }
                     // TODO(#3535): Remove support for outputting both structured and JSON stats.
-                    match (self.stats_schema.as_ref(), output_stats_schema) {
+                    match (read_stats, output_stats_schema) {
                         (_, None) => patch.drop_at([ADD_NAME], STATS_PARSED),
-                        (Some(read), Some(output)) if read != output => {
+                        (Some(DataType::Struct(read)), Some(output))
+                            if read.as_ref() != output.as_ref() =>
+                        {
                             let mut parent = vec![ADD_NAME.into(), STATS_PARSED.into()];
                             Self::project_filter_only_stats(patch, read, output, &mut parent)
                         }

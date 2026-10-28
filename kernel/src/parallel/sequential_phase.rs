@@ -107,7 +107,7 @@ impl SequentialPhase {
         checkpoint_read_schema: SchemaRef,
     ) -> KernelResult<Self> {
         let commit_phase: Option<Box<dyn KernelResultIterator<ActionsBatch>>> = Some(Box::new(
-            log_segment.read_commit_actions(engine.as_ref(), COMMIT_READ_SCHEMA.clone(), None)?,
+            log_segment.read_commit_actions(engine.as_ref(), COMMIT_READ_SCHEMA.clone())?,
         ));
 
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
