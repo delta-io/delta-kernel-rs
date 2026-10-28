@@ -1427,7 +1427,6 @@ impl Scan {
                     COMMIT_READ_SCHEMA.clone(),
                     checkpoint_schema,
                     physical_stats_read_schema,
-                    self.cancellation_token.as_ref(),
                 );
         }
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
