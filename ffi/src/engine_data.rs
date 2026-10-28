@@ -44,7 +44,7 @@ pub unsafe extern "C" fn engine_data_length(data: &mut Handle<ExclusiveEngineDat
 // for examples of how that works.
 #[no_mangle]
 pub unsafe extern "C" fn get_raw_engine_data(mut data: Handle<ExclusiveEngineData>) -> *mut c_void {
-    let ptr = get_raw_engine_data_impl(&mut data) as *mut dyn EngineData;
+    let ptr = unsafe { get_raw_engine_data_impl(&mut data) } as *mut dyn EngineData;
     ptr as _
 }
 
@@ -109,7 +109,8 @@ pub unsafe extern "C" fn get_raw_arrow_data(
 ) -> ExternResult<*mut ArrowFFIData> {
     // TODO(frj): This consumes the handle. Is that what we really want?
     let data = unsafe { data.into_inner() };
-    get_raw_arrow_data_impl(data).into_extern_result(&engine.as_ref())
+    let result = get_raw_arrow_data_impl(data);
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -161,7 +162,8 @@ pub unsafe extern "C" fn get_engine_data(
     schema: &FFI_ArrowSchema,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<Handle<ExclusiveEngineData>> {
-    get_engine_data_impl(array, schema).into_extern_result(&allocate_error)
+    let result = unsafe { get_engine_data_impl(array, schema) };
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 #[cfg(feature = "default-engine-base")]

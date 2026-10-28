@@ -274,16 +274,14 @@ fn call_eval_pred(
     // -- transferring ownership of the written Arrow C Data Interface structs -- or Failure(err).
     let mut result = EngineExecResult::Uninit;
 
+    let name = kernel_string_slice!(op_name);
+    let eval = match mode {
+        EvalMode::RowMode => cb.eval_pred_rows,
+        EvalMode::StatsMode => cb.eval_pred_stats,
+    };
     // SAFETY: callback was supplied by the engine. `args_ffi` is moved into the call (engine owns
     // it now), and `result` is a writable slot valid for the duration of the call.
-    unsafe {
-        let name = kernel_string_slice!(op_name);
-        let eval = match mode {
-            EvalMode::RowMode => cb.eval_pred_rows,
-            EvalMode::StatsMode => cb.eval_pred_stats,
-        };
-        eval(cb.engine_state, name, args_ffi, inverted, &mut result);
-    }
+    unsafe { eval(cb.engine_state, name, args_ffi, inverted, &mut result) };
     let result_ffi = match result {
         EngineExecResult::Success(result_ffi) => result_ffi,
         EngineExecResult::Failure(err) => return Err(err.into()),

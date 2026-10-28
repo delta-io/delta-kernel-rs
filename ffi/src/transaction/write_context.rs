@@ -62,9 +62,8 @@ pub unsafe extern "C" fn update_table_txn_write_state(
 ) -> ExternResult<Handle<SharedWriteState>> {
     let txn = unsafe { txn.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    txn.write_state()
-        .map(Into::into)
-        .into_extern_result(&engine)
+    let result = txn.write_state().map(Into::into);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Encodes write state for transport to workers running the same kernel version.
@@ -82,10 +81,10 @@ pub unsafe extern "C" fn write_state_encode(
 ) -> ExternResult<NullableCvoid> {
     let state = unsafe { state.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    state
+    let result = state
         .encode()
-        .map(|state| allocate_fn(kernel_bytes_slice!(state)))
-        .into_extern_result(&engine)
+        .map(|state| allocate_fn(kernel_bytes_slice!(state)));
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Decodes the payload from [`write_state_encode`] into an owned write-state handle.
@@ -101,10 +100,8 @@ pub unsafe extern "C" fn write_state_decode(
 ) -> ExternResult<Handle<SharedWriteState>> {
     let engine = unsafe { engine.as_ref() };
     let encoded = unsafe { encoded.try_as_slice() };
-    encoded
-        .and_then(WriteState::decode)
-        .map(Into::into)
-        .into_extern_result(&engine)
+    let result = encoded.and_then(WriteState::decode).map(Into::into);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Creates a builder for one bound write context.
@@ -183,15 +180,15 @@ pub unsafe extern "C" fn write_context_builder_with_row_tracking_columns(
         Option::<&KernelStringSlice>::from(&columns.row_commit_version_col_name)
             .map(|name| unsafe { TryFromStringSlice::try_from_slice(name) })
             .transpose();
-    row_id_col_name
+    let result = row_id_col_name
         .and_then(|row_id_col_name| {
             Ok(RowTrackingMetadataColumns {
                 row_id_col_name,
                 row_commit_version_col_name: row_commit_version_col_name?,
             })
         })
-        .map(|columns| Box::new(builder.with_row_tracking_columns(columns)).into())
-        .into_extern_result(&engine)
+        .map(|columns| Box::new(builder.with_row_tracking_columns(columns)).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Builds and consumes a write-context builder.
@@ -211,10 +208,8 @@ pub unsafe extern "C" fn write_context_builder_build(
 ) -> ExternResult<Handle<SharedWriteContext>> {
     let builder = unsafe { builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    builder
-        .build()
-        .map(|context| Arc::new(context).into())
-        .into_extern_result(&engine)
+    let result = builder.build().map(|context| Arc::new(context).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Drops a write-context builder without building it.
@@ -223,7 +218,7 @@ pub unsafe extern "C" fn write_context_builder_build(
 /// The handle must be valid and is consumed. Do not use or free it again.
 #[no_mangle]
 pub unsafe extern "C" fn free_write_context_builder(builder: Handle<ExclusiveWriteContextBuilder>) {
-    unsafe { builder.drop_handle() };
+    unsafe { builder.drop_handle() }
 }
 
 /// Releases an owned write-state handle. Bound contexts keep their own state references.
@@ -232,7 +227,7 @@ pub unsafe extern "C" fn free_write_context_builder(builder: Handle<ExclusiveWri
 /// The handle must be valid and is consumed. Do not use or free it again.
 #[no_mangle]
 pub unsafe extern "C" fn free_write_state(state: Handle<SharedWriteState>) {
-    unsafe { state.drop_handle() };
+    unsafe { state.drop_handle() }
 }
 
 /// Passes the physical statistics column paths to `allocate_fn` as one borrowed typed array.
@@ -283,10 +278,11 @@ pub unsafe extern "C" fn update_table_txn_get_unpartitioned_write_context(
 ) -> ExternResult<Handle<SharedWriteContext>> {
     let txn = unsafe { txn.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    txn.write_state()
+    let result = txn
+        .write_state()
         .and_then(|state| state.write_context_builder().build())
-        .map(|context| Arc::new(context).into())
-        .into_extern_result(&engine)
+        .map(|context| Arc::new(context).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Gets the write context from a create-table transaction for an unpartitioned table.
@@ -304,10 +300,11 @@ pub unsafe extern "C" fn create_table_txn_get_unpartitioned_write_context(
 ) -> ExternResult<Handle<SharedWriteContext>> {
     let txn = unsafe { txn.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    txn.write_state()
+    let result = txn
+        .write_state()
         .and_then(|state| state.write_context_builder().build())
-        .map(|context| Arc::new(context).into())
-        .into_extern_result(&engine)
+        .map(|context| Arc::new(context).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Gets the write context from a transaction for a partitioned table, for the partition described
@@ -337,7 +334,7 @@ pub unsafe extern "C" fn update_table_txn_get_partitioned_write_context(
     let txn = unsafe { txn.as_ref() };
     let partition_values = unsafe { partition_values.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    partitioned_write_context_impl(
+    let result = partitioned_write_context_impl(
         |pv| {
             txn.write_state()?
                 .write_context_builder()
@@ -345,8 +342,8 @@ pub unsafe extern "C" fn update_table_txn_get_partitioned_write_context(
                 .build()
         },
         *partition_values,
-    )
-    .into_extern_result(&engine)
+    );
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Gets the write context from a create-table transaction for a partitioned table. See
@@ -366,7 +363,7 @@ pub unsafe extern "C" fn create_table_txn_get_partitioned_write_context(
     let txn = unsafe { txn.as_ref() };
     let partition_values = unsafe { partition_values.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    partitioned_write_context_impl(
+    let result = partitioned_write_context_impl(
         |pv| {
             txn.write_state()?
                 .write_context_builder()
@@ -374,8 +371,8 @@ pub unsafe extern "C" fn create_table_txn_get_partitioned_write_context(
                 .build()
         },
         *partition_values,
-    )
-    .into_extern_result(&engine)
+    );
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn partitioned_write_context_impl(
@@ -388,7 +385,7 @@ fn partitioned_write_context_impl(
 
 #[no_mangle]
 pub unsafe extern "C" fn free_write_context(write_context: Handle<SharedWriteContext>) {
-    write_context.drop_handle();
+    unsafe { write_context.drop_handle() }
 }
 
 /// Returns the logical (user-facing) write schema from a [`BoundWriteContext`] handle. For
@@ -550,9 +547,9 @@ pub unsafe extern "C" fn resolve_file_path(
     let write_context = unsafe { write_context.as_ref() };
     let engine = unsafe { engine.as_ref() };
     let file_url: KernelResult<&str> = unsafe { TryFromStringSlice::try_from_slice(&file_url) };
-    resolve_file_path_impl(write_context, file_url)
-        .map(|path| allocate_fn(kernel_string_slice!(path)))
-        .into_extern_result(&engine)
+    let result = resolve_file_path_impl(write_context, file_url)
+        .map(|path| allocate_fn(kernel_string_slice!(path)));
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn resolve_file_path_impl(

@@ -237,7 +237,8 @@ pub unsafe extern "C" fn visit_expression_column(
     parts_len: usize,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    visit_expression_column_impl(state, parts, parts_len).into_extern_result(&allocate_error)
+    let result = unsafe { visit_expression_column_impl(state, parts, parts_len) };
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 /// # Safety
 /// `parts` must point to `parts_len` valid [`KernelStringSlice`], each valid for the
@@ -293,7 +294,8 @@ pub unsafe extern "C" fn visit_expression_literal_string(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let value = unsafe { String::try_from_slice(&value) };
-    visit_expression_literal_string_impl(state, value).into_extern_result(&allocate_error)
+    let result = visit_expression_literal_string_impl(state, value);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 fn visit_expression_literal_string_impl(
     state: &mut KernelExpressionVisitorState,
@@ -415,7 +417,7 @@ pub unsafe extern "C" fn visit_expression_literal_binary(
     value: *const u8,
     len: usize,
 ) -> usize {
-    let bytes = std::slice::from_raw_parts(value, len);
+    let bytes = unsafe { std::slice::from_raw_parts(value, len) };
     wrap_expression(state, lit(bytes))
 }
 
@@ -432,10 +434,8 @@ pub extern "C" fn visit_expression_literal_decimal(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
-    unsafe {
-        visit_expression_literal_decimal_impl(state, value_hi, value_lo, precision, scale)
-            .into_extern_result(&allocate_error)
-    }
+    let result = visit_expression_literal_decimal_impl(state, value_hi, value_lo, precision, scale);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 fn visit_expression_literal_decimal_impl(
@@ -627,10 +627,8 @@ pub extern "C" fn visit_expression_literal_null(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
-    unsafe {
-        visit_expression_literal_null_impl(state, type_tag, precision, scale)
-            .into_extern_result(&allocate_error)
-    }
+    let result = visit_expression_literal_null_impl(state, type_tag, precision, scale);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 fn visit_expression_literal_null_impl(
@@ -723,7 +721,8 @@ pub unsafe extern "C" fn visit_engine_expression(
     engine_expression: &mut EngineExpression,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<Handle<SharedExpression>> {
-    visit_engine_expression_impl(engine_expression).into_extern_result(&allocate_error)
+    let result = visit_engine_expression_impl(engine_expression);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 fn visit_engine_expression_impl(
@@ -753,7 +752,8 @@ pub unsafe extern "C" fn visit_engine_predicate(
     engine_predicate: &mut EnginePredicate,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<Handle<SharedPredicate>> {
-    visit_engine_predicate_impl(engine_predicate).into_extern_result(&allocate_error)
+    let result = visit_engine_predicate_impl(engine_predicate);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 fn visit_engine_predicate_impl(
@@ -808,7 +808,8 @@ pub unsafe extern "C" fn visit_predicate_opaque(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name = unsafe { String::try_from_slice(&name) };
-    visit_predicate_opaque_impl(state, name, children).into_extern_result(&allocate_error)
+    let result = visit_predicate_opaque_impl(state, name, children);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 fn visit_predicate_opaque_impl(
@@ -854,8 +855,8 @@ pub unsafe extern "C" fn visit_predicate_opaque_with_eval(
     let name = unsafe { String::try_from_slice(&name) };
     // Wrap immediately so free_state fires exactly once on every exit path.
     let callbacks = Arc::new(FfiOpaqueEvalCallbacks::new(callbacks));
-    visit_predicate_opaque_with_eval_impl(state, name, children, callbacks)
-        .into_extern_result(&allocate_error)
+    let result = visit_predicate_opaque_with_eval_impl(state, name, children, callbacks);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -1313,15 +1314,14 @@ mod tests {
         let (a, b) = make_two_literal_ids(&mut state);
         let (_keep, mut it) = make_iter(vec![a, b]);
         let name = "MY_OP";
-        let result = unsafe {
+        let id = ok_or_panic(unsafe {
             visit_predicate_opaque(
                 &mut state,
                 kernel_string_slice!(name),
                 &mut it,
                 allocate_err,
             )
-        };
-        let id = ok_or_panic(result);
+        });
         assert_ne!(id, 0);
         let pred = unwrap_kernel_predicate(&mut state, id).unwrap();
         assert_eq!(pred, Predicate::NULL);
@@ -1367,7 +1367,7 @@ mod tests {
         let (a, b) = make_two_literal_ids(&mut state);
         let (_keep, mut it) = make_iter(vec![a, b]);
         let name = "MY_EVAL_OP";
-        let result = unsafe {
+        let id = ok_or_panic(unsafe {
             visit_predicate_opaque_with_eval(
                 &mut state,
                 kernel_string_slice!(name),
@@ -1375,8 +1375,7 @@ mod tests {
                 callbacks(),
                 allocate_err,
             )
-        };
-        let id = ok_or_panic(result);
+        });
         assert_ne!(id, 0);
         assert_eq!(
             FREED.load(Ordering::SeqCst),

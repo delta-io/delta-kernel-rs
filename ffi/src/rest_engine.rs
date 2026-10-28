@@ -218,7 +218,7 @@ pub(crate) fn rest_builder_state_from_ffi(
 unsafe fn take_auth_pairs_from_c(
     headers: *mut CAuthHeaders,
 ) -> KernelResult<Vec<(String, String)>> {
-    let count = (*headers).count as usize;
+    let count = unsafe { (*headers).count } as usize;
     if count > AUTH_MAX_NUM_HEADERS {
         return Err(KernelError::generic(format!(
             "auth header count {count} exceeds max {AUTH_MAX_NUM_HEADERS}"
@@ -227,10 +227,13 @@ unsafe fn take_auth_pairs_from_c(
 
     let mut pairs = Vec::with_capacity(count);
     for i in 0..count {
-        let slot = ptr::read(ptr::addr_of_mut!((*headers).headers[i]));
         // SAFETY: each handle is moved out of `CAuthHeaders` exactly once.
-        let name = *slot.name.into_inner();
-        let value = *slot.value.into_inner();
+        let (name, value) = unsafe {
+            let slot = ptr::read(ptr::addr_of_mut!((*headers).headers[i]));
+            let name = *slot.name.into_inner();
+            let value = *slot.value.into_inner();
+            (name, value)
+        };
         pairs.push((name, value));
     }
     Ok(pairs)

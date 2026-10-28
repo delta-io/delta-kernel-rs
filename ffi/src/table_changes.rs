@@ -43,7 +43,8 @@ pub unsafe extern "C" fn table_changes_from_version(
 ) -> ExternResult<Handle<ExclusiveTableChanges>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    table_changes_impl(url, engine, start_version, None).into_extern_result(&engine)
+    let result = table_changes_impl(url, engine, start_version, None);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Get the table changes from the specified table between two versions
@@ -65,7 +66,8 @@ pub unsafe extern "C" fn table_changes_between_versions(
 ) -> ExternResult<Handle<ExclusiveTableChanges>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    table_changes_impl(url, engine, start_version, end_version.into()).into_extern_result(&engine)
+    let result = table_changes_impl(url, engine, start_version, end_version.into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn table_changes_impl(
@@ -89,7 +91,7 @@ fn table_changes_impl(
 /// Caller is responsible for passing a valid table changes handle.
 #[no_mangle]
 pub unsafe extern "C" fn free_table_changes(table_changes: Handle<ExclusiveTableChanges>) {
-    table_changes.drop_handle();
+    unsafe { table_changes.drop_handle() }
 }
 
 /// Get schema from the specified TableChanges.
@@ -163,7 +165,8 @@ pub unsafe extern "C" fn table_changes_scan(
     predicate: Option<&mut EnginePredicate>,
 ) -> ExternResult<Handle<SharedTableChangesScan>> {
     let table_changes = unsafe { table_changes.into_inner() };
-    table_changes_scan_impl(*table_changes, predicate).into_extern_result(&engine.as_ref())
+    let result = table_changes_scan_impl(*table_changes, predicate);
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 fn table_changes_scan_impl(
@@ -189,7 +192,7 @@ fn table_changes_scan_impl(
 pub unsafe extern "C" fn free_table_changes_scan(
     table_changes_scan: Handle<SharedTableChangesScan>,
 ) {
-    table_changes_scan.drop_handle();
+    unsafe { table_changes_scan.drop_handle() }
 }
 
 /// Get the table root of a table changes scan.
@@ -263,8 +266,8 @@ pub unsafe extern "C" fn table_changes_scan_execute(
 ) -> ExternResult<Handle<SharedScanTableChangesIterator>> {
     let table_changes_scan = unsafe { table_changes_scan.as_ref() };
     let engine = unsafe { engine.clone_as_arc() };
-    table_changes_scan_execute_impl(table_changes_scan, engine.clone())
-        .into_extern_result(&engine.as_ref())
+    let result = table_changes_scan_execute_impl(table_changes_scan, engine.clone());
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 fn table_changes_scan_execute_impl(
@@ -288,7 +291,7 @@ fn table_changes_scan_execute_impl(
 pub unsafe extern "C" fn free_scan_table_changes_iter(
     data: Handle<SharedScanTableChangesIterator>,
 ) {
-    data.drop_handle();
+    unsafe { data.drop_handle() }
 }
 
 /// Get next batch of data from the table changes iterator.
@@ -306,7 +309,8 @@ pub unsafe extern "C" fn scan_table_changes_next(
     data: Handle<SharedScanTableChangesIterator>,
 ) -> ExternResult<*mut ArrowFFIData> {
     let data = unsafe { data.as_ref() };
-    scan_table_changes_next_impl(data).into_extern_result(&data.engine.as_ref())
+    let result = scan_table_changes_next_impl(data);
+    unsafe { result.into_extern_result(&data.engine.as_ref()) }
 }
 
 fn scan_table_changes_next_impl(

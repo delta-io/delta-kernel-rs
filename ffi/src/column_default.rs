@@ -76,7 +76,8 @@ pub unsafe extern "C" fn update_table_txn_visit_top_level_column_defaults(
 ) -> ExternResult<usize> {
     let engine = unsafe { engine.as_ref() };
     let txn = unsafe { txn.as_ref() };
-    visit_top_level_column_defaults_impl(txn, engine_context, visitor).into_extern_result(&engine)
+    let result = visit_top_level_column_defaults_impl(txn, engine_context, visitor);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn visit_top_level_column_defaults_impl(

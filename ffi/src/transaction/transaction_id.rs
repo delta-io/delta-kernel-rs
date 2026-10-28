@@ -30,9 +30,9 @@ pub unsafe extern "C" fn update_table_txn_builder_with_transaction_id(
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
     let app_id_res: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&app_id) };
-    app_id_res
-        .map(|app_id| Box::new(builder.with_transaction_id(app_id, version)).into())
-        .into_extern_result(&engine)
+    let result =
+        app_id_res.map(|app_id| Box::new(builder.with_transaction_id(app_id, version)).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Retrieves the version associated with an app_id from a snapshot.
@@ -53,9 +53,8 @@ pub unsafe extern "C" fn get_app_id_version(
     let engine = unsafe { engine.as_ref() };
     let app_id_res = unsafe { String::try_from_slice(&app_id) };
 
-    get_app_id_version_impl(snapshot, app_id_res, engine)
-        .map(OptionalValue::from)
-        .into_extern_result(&engine)
+    let result = get_app_id_version_impl(snapshot, app_id_res, engine).map(OptionalValue::from);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn get_app_id_version_impl(

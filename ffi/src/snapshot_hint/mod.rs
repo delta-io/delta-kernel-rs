@@ -44,11 +44,11 @@ pub unsafe extern "C" fn snapshot_to_snapshot_hint(
 ) -> ExternResult<bool> {
     let snapshot = unsafe { snapshot.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    snapshot
+    let result = snapshot
         .to_snapshot_hint()
         .and_then(|hint| export::visit(&hint, context, visitor))
-        .map(|()| true)
-        .into_extern_result(&engine)
+        .map(|()| true);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Receives one complete borrowed hint. All nested storage expires when the callback returns.
@@ -196,9 +196,9 @@ pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint(
 ) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
     let mut builder = unsafe { builder.into_inner() };
     let engine = builder.engine.clone();
-    unsafe { snapshot_builder_with_snapshot_hint_impl(&mut builder, value) }
-        .map(|_| builder.into())
-        .into_extern_result(&engine.as_ref())
+    let result = unsafe { snapshot_builder_with_snapshot_hint_impl(&mut builder, value) }
+        .map(|_| builder.into());
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 #[cfg(test)]

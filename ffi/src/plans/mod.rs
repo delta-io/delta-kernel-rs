@@ -39,7 +39,7 @@ pub unsafe extern "C" fn get_plan_executor(
 /// it again afterwards.
 #[no_mangle]
 pub unsafe extern "C" fn free_plan_executor(executor: Handle<SharedPlanExecutor>) {
-    executor.drop_handle();
+    unsafe { executor.drop_handle() }
 }
 
 /// Construct a [`PlanBasedEngine`] backed by `plan_executor`, optionally delegating operations not

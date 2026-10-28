@@ -83,8 +83,8 @@ pub unsafe extern "C" fn commit_range_builder_for(
     let engine_ref = unsafe { engine.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    url.map(|url| make_commit_range_builder(url, start_version, engine_arc))
-        .into_extern_result(&engine_ref)
+    let result = url.map(|url| make_commit_range_builder(url, start_version, engine_arc));
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Pin the end version of the range. When omitted, the range extends to the latest committed
@@ -129,7 +129,7 @@ pub unsafe extern "C" fn commit_range_builder_with_log_tail(
         builder.max_catalog_version = Some(max_catalog_version);
         builder.into()
     });
-    result.into_extern_result(&engine.as_ref())
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 /// Set the maximum catalog-ratified version on the builder.
@@ -209,7 +209,8 @@ pub unsafe extern "C" fn commit_range_builder_build(
 ) -> ExternResult<Handle<SharedCommitRange>> {
     let builder_box = unsafe { builder.into_inner() };
     let engine = builder_box.engine.clone();
-    commit_range_builder_build_impl(*builder_box).into_extern_result(&engine.as_ref())
+    let result = commit_range_builder_build_impl(*builder_box);
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 fn commit_range_builder_build_impl(
@@ -244,7 +245,7 @@ fn commit_range_builder_build_impl(
 /// Caller must pass a valid builder pointer and must not use it again after this call.
 #[no_mangle]
 pub unsafe extern "C" fn free_commit_range_builder(builder: Handle<ExclusiveCommitRangeBuilder>) {
-    builder.drop_handle();
+    unsafe { builder.drop_handle() }
 }
 
 /// Free a [`CommitRange`].
@@ -254,7 +255,7 @@ pub unsafe extern "C" fn free_commit_range_builder(builder: Handle<ExclusiveComm
 /// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn free_commit_range(commit_range: Handle<SharedCommitRange>) {
-    commit_range.drop_handle();
+    unsafe { commit_range.drop_handle() }
 }
 
 /// FFI-safe mirror of the kernel's [`KernelDeltaAction`]: the Delta log action kinds a caller can
@@ -371,7 +372,8 @@ pub unsafe extern "C" fn commit_action_get_actions(
     let engine_ref = unsafe { engine.as_ref() };
     let commit_action = unsafe { commit_action.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
-    commit_action_get_actions_impl(commit_action, engine_arc).into_extern_result(&engine_ref)
+    let result = commit_action_get_actions_impl(commit_action, engine_arc);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 fn commit_action_get_actions_impl(
@@ -389,7 +391,7 @@ fn commit_action_get_actions_impl(
 /// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn free_commit_action(commit_action: Handle<SharedCommitAction>) {
-    commit_action.drop_handle();
+    unsafe { commit_action.drop_handle() }
 }
 
 type CommitActionIter = Box<dyn KernelResultIterator<CommitAction>>;
@@ -437,8 +439,8 @@ pub unsafe extern "C" fn commit_range_commits(
     let commit_range = unsafe { commit_range.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
     let actions = unsafe { parse_actions(actions, actions_len) };
-    commit_range_commits_impl(commit_range, engine_arc, None, actions)
-        .into_extern_result(&engine_ref)
+    let result = commit_range_commits_impl(commit_range, engine_arc, None, actions);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Like [`commit_range_commits`], but seeds the iterator's protocol/metadata from `start_snapshot`.
@@ -469,8 +471,8 @@ pub unsafe extern "C" fn commit_range_commits_with_snapshot(
     let engine_arc = unsafe { engine.clone_as_arc() };
     let start_snapshot = unsafe { start_snapshot.clone_as_arc() };
     let actions = unsafe { parse_actions(actions, actions_len) };
-    commit_range_commits_impl(commit_range, engine_arc, Some(start_snapshot), actions)
-        .into_extern_result(&engine_ref)
+    let result = commit_range_commits_impl(commit_range, engine_arc, Some(start_snapshot), actions);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 fn commit_range_commits_impl(
@@ -507,8 +509,8 @@ pub unsafe extern "C" fn commit_range_commits_next(
     ),
 ) -> ExternResult<bool> {
     let data = unsafe { data.as_ref() };
-    commit_range_commits_next_impl(data, engine_context, engine_visitor)
-        .into_extern_result(&data.engine.as_ref())
+    let result = commit_range_commits_next_impl(data, engine_context, engine_visitor);
+    unsafe { result.into_extern_result(&data.engine.as_ref()) }
 }
 
 fn commit_range_commits_next_impl(
@@ -536,7 +538,7 @@ fn commit_range_commits_next_impl(
 /// Caller is responsible for passing a valid pointer.
 #[no_mangle]
 pub unsafe extern "C" fn free_commit_actions_iter(iter: Handle<SharedCommitActionsIterator>) {
-    iter.drop_handle();
+    unsafe { iter.drop_handle() }
 }
 
 /// A commit file passed to the [`commit_range_commit_files_next`] visitor.
@@ -593,7 +595,8 @@ pub unsafe extern "C" fn commit_range_commit_files(
     let engine_ref = unsafe { engine.as_ref() };
     let commit_range = unsafe { commit_range.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
-    commit_range_commit_files_impl(commit_range, engine_arc).into_extern_result(&engine_ref)
+    let result = commit_range_commit_files_impl(commit_range, engine_arc);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 fn commit_range_commit_files_impl(
@@ -626,8 +629,8 @@ pub unsafe extern "C" fn commit_range_commit_files_next(
     engine_visitor: extern "C" fn(engine_context: NullableCvoid, commit_file: *const FfiCommitFile),
 ) -> ExternResult<bool> {
     let data = unsafe { data.as_ref() };
-    commit_range_commit_files_next_impl(data, engine_context, engine_visitor)
-        .into_extern_result(&data.engine.as_ref())
+    let result = commit_range_commit_files_next_impl(data, engine_context, engine_visitor);
+    unsafe { result.into_extern_result(&data.engine.as_ref()) }
 }
 
 fn commit_range_commit_files_next_impl(
@@ -659,7 +662,7 @@ fn commit_range_commit_files_next_impl(
 /// Caller is responsible for passing a valid pointer.
 #[no_mangle]
 pub unsafe extern "C" fn free_commit_files_iter(iter: Handle<SharedCommitFilesIterator>) {
-    iter.drop_handle();
+    unsafe { iter.drop_handle() }
 }
 
 #[cfg(test)]
