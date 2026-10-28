@@ -174,6 +174,13 @@ impl BoundWriteContext {
         self.write_state.stats_columns()
     }
 
+    /// Returns whether the statistics of newly written files should include `tightStats`, set to
+    /// the same value as `tightBounds`. True only for adaptiveMetadata tables whose statistics
+    /// include no timestamp columns.
+    pub fn should_write_tight_stats(&self) -> bool {
+        self.write_state.write_tight_stats
+    }
+
     /// Returns the serialized partition values for this write context. Keys are physical
     /// column names; values are protocol-serialized strings (`None` = null).
     ///
@@ -305,6 +312,7 @@ mod tests {
             materialized_row_commit_version_column_name: None,
             row_tracking_enabled: false,
             iceberg_compat_v3_enabled: false,
+            write_tight_stats: false,
             column_mapping_mode: cm_mode,
             stats_columns: vec![],
             logical_partition_columns: partition_columns,
