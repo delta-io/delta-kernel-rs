@@ -5,16 +5,15 @@ use std::iter;
 use super::action_projector::ActionProjector;
 use super::reader::{read_add_actions_from_amt, ReadContext};
 use crate::actions::{CheckpointAction, ADD_NAME, LOG_ADD_SCHEMA, REMOVE_NAME};
-use crate::cancellation::CancellationTokenRef;
 use crate::log_replay::ActionsBatch;
 use crate::path::LogRoot;
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult, KernelResultIteratorStatic};
+use crate::{Engine, KernelError, KernelResult, KernelResultIterator};
 
 /// Reads the actions `read_schema` asks for from `checkpoint`, as checkpoint batches
 /// (`is_log_batch = false`) matching `read_schema`. `log_root` resolves the action's file
-/// references, and `cancellation_token` stops their reads.
+/// references.
 ///
 /// `add` rows come from the action's content tree. A checkpoint holds reconciled state, so `remove`
 /// rows are never produced.
@@ -23,8 +22,7 @@ pub(crate) fn read_checkpoint_action(
     checkpoint: &CheckpointAction,
     log_root: &LogRoot,
     read_schema: SchemaRef,
-    cancellation_token: Option<&CancellationTokenRef>,
-) -> KernelResult<KernelResultIteratorStatic<ActionsBatch>> {
+) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
     let mut reads_adds = false;
     for field in read_schema.fields() {
         match field.name().as_str() {
@@ -56,19 +54,15 @@ pub(crate) fn read_checkpoint_action(
     );
 
     let ctx = ReadContext {
+        table_root: log_root.table_root().clone(),
         // TODO(#2866): inherit each file's commit timestamp instead of a non-zero constant.
         modification_time: 1,
         data_change: false,
     };
     let projector =
         ActionProjector::try_new(engine, ADD_NAME, LOG_ADD_SCHEMA.clone(), read_schema)?;
-    let adds = read_add_actions_from_amt(
-        engine,
-        checkpoint,
-        log_root.table_root(),
-        &ctx,
-        cancellation_token,
-    )?;
+    // The engine's handlers carry any cancellation token bound to this read.
+    let adds = read_add_actions_from_amt(engine, checkpoint, &ctx, None)?;
     Ok(Box::new(adds.map(move |batch| {
         // `ActionsBatch` does not take a `FilteredEngineData` yet, so drop the deselected rows
         // here; otherwise replay would read them as live adds.
@@ -98,6 +92,7 @@ mod tests {
     use crate::content_tree::{ContentTreeNodeEntry, TrackingStatus};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
+    use crate::engine::CancellableEngine;
     use crate::log_segment::tests::add_checkpoint_to_store;
     use crate::log_segment::LogSegment;
     use crate::object_store::memory::InMemory;
@@ -114,7 +109,7 @@ mod tests {
         assert_result_error_with_message, create_log_path_with_size,
         test_schema_flat_with_column_mapping, Action, TestCancellationToken,
     };
-    use crate::Version;
+    use crate::{CancellationTokenRef, Version};
 
     const TABLE_ROOT: &str = "memory:///";
     const ROOT_PATH: &str = "metadata/root.parquet";
@@ -168,7 +163,6 @@ mod tests {
             vec![],
             None,
             None,
-            None,
         )
         .unwrap()
     }
@@ -205,7 +199,6 @@ mod tests {
                 &table_root(),
                 commit_schema,
                 checkpoint_schema,
-                None,
                 None,
             )?
             .actions
@@ -329,7 +322,6 @@ mod tests {
             &checkpoint,
             &log_root(),
             CHECKPOINT_READ_SCHEMA.clone(),
-            None,
         )
         .unwrap()
         .map(|batch| batch.unwrap().actions.try_into_record_batch().unwrap())
@@ -440,7 +432,7 @@ mod tests {
         };
 
         let batches: Vec<_> =
-            read_checkpoint_action(&engine, &checkpoint, &log_root(), read_schema.clone(), None)
+            read_checkpoint_action(&engine, &checkpoint, &log_root(), read_schema.clone())
                 .unwrap()
                 .map(|batch| batch.unwrap().actions.try_into_record_batch().unwrap())
                 .collect();
@@ -469,11 +461,10 @@ mod tests {
         let checkpoint = checkpoint_with_tree(&engine, &tree_with_deleted_entry(), 1);
         let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
         let result = read_checkpoint_action(
-            &engine,
+            &CancellableEngine::new(&engine, token),
             &checkpoint,
             &log_root(),
             CHECKPOINT_READ_SCHEMA.clone(),
-            Some(&token),
         );
         assert!(matches!(result, Err(KernelError::Cancelled)));
     }
@@ -497,7 +488,6 @@ mod tests {
                 &checkpoint,
                 &log_root(),
                 CHECKPOINT_READ_SCHEMA.clone(),
-                None,
             ),
             "partitioned adaptiveMetadata checkpoint action is not yet supported; partition \
              columns: [\"id\"]",
@@ -518,7 +508,7 @@ mod tests {
             .unwrap(),
         );
         assert_result_error_with_message(
-            read_checkpoint_action(&engine, &checkpoint, &log_root(), schema, None),
+            read_checkpoint_action(&engine, &checkpoint, &log_root(), schema),
             &format!("reading `{SET_TRANSACTION_NAME}` actions"),
         );
     }
