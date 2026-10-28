@@ -406,7 +406,6 @@ impl<Mode> SnapshotBuilder<Mode> {
                     log_tail,
                     effective_version,
                     metric_context.clone(),
-                    None,
                 )?;
                 Snapshot::try_new_from_log_segment(
                     table_url,

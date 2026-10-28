@@ -122,6 +122,10 @@ method, preserving configured intent. Declarative transactions stage relation ha
 `add_files_ref`, `remove_files_ref`, and `update_deletion_vectors_ref`;
 `commit_declarative(executor)` returns an unsupported error while plan-based commits are unimplemented.
 Staged relations must remain available in that executor until commit completes.
+`transaction::imperative` contains EngineData staging, staged-data validation, action encoding,
+and committer response handling. The feature-gated `transaction::declarative` contains relation
+staging and the unsupported declarative commit entry point. Transaction configuration,
+mode-independent validation, CRC construction, and post-commit snapshot logic remain shared.
 
 Kernel captures table-wide configuration in a transportable `WriteState`. Each writer binds
 partition values and any logical materialized row-tracking columns to create a `BoundWriteContext`

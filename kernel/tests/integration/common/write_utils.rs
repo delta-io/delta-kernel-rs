@@ -70,7 +70,7 @@ pub fn load_existing_single_file_checkpoint_path(
     for entry in std::fs::read_dir(&log_dir).expect("failed to read _delta_log") {
         let entry = entry.unwrap();
         let url = Url::from_file_path(entry.path()).expect("entry path to url");
-        let Some(parsed) = ParsedLogPath::try_from(url).expect("parse log path") else {
+        let Some(parsed) = ParsedLogPath::new(url) else {
             continue;
         };
         if parsed.is_checkpoint() && parsed.version == version {

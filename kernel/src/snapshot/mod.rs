@@ -1643,7 +1643,7 @@ impl Snapshot {
 
         writer.finalize(engine, &info.last_checkpoint_stats)?;
 
-        let checkpoint_log_path = ParsedLogPath::try_from(info.file_meta)?.ok_or_else(|| {
+        let checkpoint_log_path = ParsedLogPath::new(info.file_meta).ok_or_else(|| {
             KernelError::internal_error("Checkpoint path could not be parsed as a log path")
         })?;
         let new_log_segment = self
@@ -1878,11 +1878,11 @@ mod tests {
     ) -> KernelResult<Snapshot> {
         // Create a log segment with only checkpoint and no commit file (simulating scenario
         // where a checkpoint exists but the commit file has been cleaned up)
-        let checkpoint_parts = vec![ParsedLogPath::try_from(crate::FileMeta {
+        let checkpoint_parts = vec![ParsedLogPath::new(crate::FileMeta {
             location: url.join("_delta_log/00000000000000000000.checkpoint.parquet")?,
             last_modified: 0,
             size: 100,
-        })?
+        })
         .unwrap()];
 
         let listed_files = LogSegmentFiles {
@@ -1950,7 +1950,7 @@ mod tests {
 
         let engine = SyncEngine::new();
         let storage = engine.storage_handler();
-        let cp = LastCheckpointHint::try_read(storage.as_ref(), &url, None).unwrap();
+        let cp = LastCheckpointHint::try_read(storage.as_ref(), &url).unwrap();
         assert!(cp.is_none());
     }
 
@@ -2004,8 +2004,8 @@ mod tests {
         let engine = SyncEngine::new_with_store(store);
         let storage = engine.storage_handler();
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = LastCheckpointHint::try_read(storage.as_ref(), &url, None)
-            .expect("read last checkpoint");
+        let invalid =
+            LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
@@ -2039,8 +2039,8 @@ mod tests {
         // valid, invalid and valid with tags.
         for (path_prefix, _, expected_result) in test_cases {
             let url = Url::parse(&format!("memory:///{path_prefix}/")).expect("valid url");
-            let result = LastCheckpointHint::try_read(storage.as_ref(), &url, None)
-                .expect("read last checkpoint");
+            let result =
+                LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
             assert_eq!(result, expected_result);
         }
     }
@@ -2057,24 +2057,22 @@ mod tests {
 
         assert_eq!(snapshot.log_segment.listed.checkpoint_parts.len(), 1);
         assert_eq!(
-            ParsedLogPath::try_from(
+            ParsedLogPath::new(
                 snapshot.log_segment.listed.checkpoint_parts[0]
                     .location
                     .clone()
             )
-            .unwrap()
             .unwrap()
             .version,
             2,
         );
         assert_eq!(snapshot.log_segment.listed.ascending_commit_files.len(), 1);
         assert_eq!(
-            ParsedLogPath::try_from(
+            ParsedLogPath::new(
                 snapshot.log_segment.listed.ascending_commit_files[0]
                     .location
                     .clone()
             )
-            .unwrap()
             .unwrap()
             .version,
             3,
@@ -3002,12 +3000,11 @@ mod tests {
                     let filename =
                         format!("00000000000000000099.checkpoint.{i:010}.0000000100.parquet");
                     let location = log_root.join(&filename).unwrap();
-                    let part = ParsedLogPath::try_from(crate::FileMeta {
+                    let part = ParsedLogPath::new(crate::FileMeta {
                         location,
                         last_modified: 0,
                         size: 100,
                     })
-                    .unwrap()
                     .unwrap();
                     listed.checkpoint_parts.push(part);
                 }
@@ -3028,12 +3025,11 @@ mod tests {
                     let end = start + 5;
                     let filename = format!("{start:020}.{end:020}.compacted.json");
                     let location = log_root.join(&filename).unwrap();
-                    let comp = ParsedLogPath::try_from(crate::FileMeta {
+                    let comp = ParsedLogPath::new(crate::FileMeta {
                         location,
                         last_modified: 0,
                         size: 100,
                     })
-                    .unwrap()
                     .unwrap();
                     listed.ascending_compaction_files.push(comp);
                 }
