@@ -158,7 +158,7 @@ partition columns without building a scan.
 | `get_app_id_version` | Look up the last committed transaction version for an `app_id` (the read side of [idempotent writes](../writing/idempotent_writes.md)) |
 | `free_protocol` / `free_schema` | Release the corresponding handles |
 
-**Schema and metadata visitors**
+**Schema and protocol visitors**
 
 Kernel exposes schemas, protocols, and metadata through visitor callbacks so
 the engine can materialize them into its own types without Kernel allocating
@@ -168,7 +168,7 @@ engine-owned memory.
 |----------|---------|
 | `visit_schema` | Walk a `SharedSchema` by invoking per-field callbacks on an `EngineSchemaVisitor` |
 | `visit_protocol` | Invoke a `visit_versions` callback, then a `visit_feature` callback per reader/writer feature |
-| `visit_string_map` / `get_from_string_map` | Iterate or look up entries in an opaque `CStringMap` (used by both metadata and scan-metadata surfaces) |
+| `visit_string_map` / `get_from_string_map` | Iterate or look up entries in an opaque `CStringMap` (used by scan-metadata partition values) |
 
 See [Visitor callbacks](#visitor-callbacks) below for the pattern.
 
