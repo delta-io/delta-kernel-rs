@@ -14,7 +14,7 @@ use crate::actions::{
     REMOVE_FIELD,
 };
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{column_name, ColumnName};
+use crate::expressions::{column_name, ColumnName, MapToStructOptions};
 use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
@@ -24,7 +24,9 @@ use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{format_features, Operation, TableFeature};
 use crate::utils::require;
-use crate::{Engine, EngineData, KernelError, KernelResult, PredicateRef, RowVisitor};
+use crate::{
+    Engine, EngineData, KernelError, KernelResult, KernelResultIterator, PredicateRef, RowVisitor,
+};
 
 #[cfg(test)]
 mod tests;
@@ -52,10 +54,10 @@ pub(crate) struct TableChangesScanMetadata {
 pub(crate) fn table_changes_action_iter(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
-    commit_files: impl IntoIterator<Item = ParsedLogPath>,
+    commit_files: impl IntoIterator<Item = ParsedLogPath, IntoIter: Send>,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
-) -> KernelResult<impl Iterator<Item = KernelResult<TableChangesScanMetadata>>> {
+) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
     // The data-reading (`execute`) path always uses change-data-file semantics.
     table_changes_action_iter_with_mode(
         engine,
@@ -75,11 +77,11 @@ pub(crate) fn table_changes_action_iter(
 pub(crate) fn table_changes_action_iter_with_mode(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
-    commit_files: impl IntoIterator<Item = ParsedLogPath>,
+    commit_files: impl IntoIterator<Item = ParsedLogPath, IntoIter: Send>,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
     mode: CdfMode,
-) -> KernelResult<impl Iterator<Item = KernelResult<TableChangesScanMetadata>>> {
+) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
     // Skip against the raw `{ add, remove, ... }` action batch: table_changes must resolve
     // deletion vector pairs before filtering, so unlike the scan path it operates on raw
     // batches with stats parsed from `add.stats` JSON.
@@ -90,6 +92,7 @@ pub(crate) fn table_changes_action_iter_with_mode(
                 predicate,
                 start_table_configuration,
                 FileActionSelectionVisitor::schema(),
+                MapToStructOptions::default(),
             )
         })
         .map(Arc::new);
@@ -332,7 +335,7 @@ impl LogReplayScanner {
         self,
         engine: Arc<dyn Engine>,
         filter: Option<Arc<DataSkippingFilter>>,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<TableChangesScanMetadata>>> {
+    ) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
         let Self {
             has_cdc_action,
             remove_dvs,

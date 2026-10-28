@@ -40,18 +40,20 @@ pub(crate) fn validate_clustering_providers(batches: &[Box<dyn EngineData>]) -> 
 
 impl StagedDataValidator {
     /// Creates a validator that validates every staged add-file row.
-    pub(crate) fn staged_add_file(
+    pub(crate) fn for_add_files(
         physical_partition_columns: impl IntoIterator<Item = String>,
     ) -> Self {
         StagedDataValidator::new(
             &MANDATORY_ADD_FILE_COLUMNS,
-            vec![Box::new(AddFileRequiredFields {
+            vec![Box::new(MandatoryAddFileValidation {
                 physical_partition_columns: physical_partition_columns.into_iter().collect(),
             })],
         )
     }
 }
 
+/// Mandatory validations for every staged AddFile row.
+///
 /// Validates required-field existence and that each row's `partitionValues` keys match the table's
 /// physical partition columns.
 ///
@@ -59,13 +61,14 @@ impl StagedDataValidator {
 /// Optional fields: `stats`, `tags`, `deletionVector`, `baseRowId`,
 /// `defaultRowCommitVersion`, and `clusteringProvider`.
 ///
-/// NOTE: Currently, Kernel doesn't require connectors to set dataChange for staged addFile.
+/// Kernel guarantees `dataChange` exists by lazily appending it to AddFile actions, so we don't
+/// validate its presence here.
 /// TODO(2869): Add intent-based validation for dataChange.
-pub(crate) struct AddFileRequiredFields {
+struct MandatoryAddFileValidation {
     physical_partition_columns: HashSet<String>,
 }
 
-impl Validation for AddFileRequiredFields {
+impl Validation for MandatoryAddFileValidation {
     fn validate_row<'a>(
         &mut self,
         row: usize,
@@ -141,9 +144,7 @@ mod tests {
     use crate::EngineData;
 
     fn add_file_validator(physical_partition_columns: &[&str]) -> StagedDataValidator {
-        StagedDataValidator::staged_add_file(
-            physical_partition_columns.iter().map(|s| s.to_string()),
-        )
+        StagedDataValidator::for_add_files(physical_partition_columns.iter().map(|s| s.to_string()))
     }
 
     fn as_engine_data(batch: RecordBatch) -> [Box<dyn EngineData>; 1] {
@@ -190,7 +191,7 @@ mod tests {
             })
             .collect();
         assert_result_error_with_message(
-            add_file_validator(&[] /* physical_partition_columns */).validate(&adds),
+            add_file_validator(&[] /* physical_partition_columns */).validate_batches(&adds),
             &format!("missing required field '{field}'"),
         );
     }
@@ -244,7 +245,8 @@ mod tests {
             Arc::new(Int64Array::from(vec![modification_time])),
         );
         let adds = [Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>];
-        let result = add_file_validator(&[] /* physical_partition_columns */).validate(&adds);
+        let result =
+            add_file_validator(&[] /* physical_partition_columns */).validate_batches(&adds);
 
         if let Some(expected_error) = expected_error {
             assert_result_error_with_message(result, expected_error);
@@ -257,7 +259,7 @@ mod tests {
     fn partition_values_exact_match_ok() {
         let batch = add_files_with_partition_values(&[&[("p1", Some("a")), ("p2", Some("b"))]]);
         add_file_validator(&["p1", "p2"] /* physical_partition_columns */)
-            .validate(&as_engine_data(batch))
+            .validate_batches(&as_engine_data(batch))
             .unwrap();
     }
 
@@ -265,7 +267,7 @@ mod tests {
     fn partition_value_null_still_counts_as_present() {
         let batch = add_files_with_partition_values(&[&[("p1", Some("a")), ("p2", None)]]);
         add_file_validator(&["p1", "p2"] /* physical_partition_columns */)
-            .validate(&as_engine_data(batch))
+            .validate_batches(&as_engine_data(batch))
             .unwrap();
     }
 
@@ -322,7 +324,7 @@ mod tests {
             })
             .collect();
         let error = add_file_validator(physical_partition_columns)
-            .validate(&adds)
+            .validate_batches(&adds)
             .expect_err("invalid partition values should be rejected");
         let KernelError::InvalidPartitionValues(message) = error else {
             panic!("expected InvalidPartitionValues, got {error:?}");
@@ -338,7 +340,7 @@ mod tests {
         let batch = add_files_with_partition_values(&[&[("stray", Some("x"))]]);
         assert_result_error_with_message(
             add_file_validator(&[] /* physical_partition_columns */)
-                .validate(&as_engine_data(batch)),
+                .validate_batches(&as_engine_data(batch)),
             "partitionValues keys",
         );
     }

@@ -21,6 +21,7 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
+pub(crate) use crate::schema::file_utils::validate_file_type_feature_support;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
@@ -428,6 +429,7 @@ impl TableConfiguration {
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
+        validate_file_type_feature_support(&table_config)?;
         // Reject corrupt column-default metadata (a non-string `CURRENT_DEFAULT`, or a non-`NULL`
         // default on a Variant column) and retain whether the validated schema declares any column
         // defaults.
@@ -1255,6 +1257,7 @@ impl TableConfiguration {
         match feature.info().enablement_check {
             EnablementCheck::AlwaysIfSupported => true,
             EnablementCheck::EnabledIf(check_fn) => check_fn(&self.table_properties),
+            EnablementCheck::EnabledIfSchema(check_fn) => check_fn(&self.logical_schema),
         }
     }
 
@@ -1365,7 +1368,11 @@ mod test {
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::CheckConstraints])
             .build(),
-        WriteSupport::Unsupported
+        if cfg!(feature = "check-constraints-in-dev") {
+            WriteSupport::Supported
+        } else {
+            WriteSupport::Unsupported
+        }
     )]
     #[case::legacy_writer_below_min_version(
         &[("delta.constraints.positive", "amount > 0")],
@@ -1375,7 +1382,11 @@ mod test {
     #[case::legacy_writer_at_min_version(
         &[("delta.constraints.positive", "amount > 0")],
         MockProtocolBuilder::new().with_versions(1, 3).build(),
-        WriteSupport::Unsupported
+        if cfg!(feature = "check-constraints-in-dev") {
+            WriteSupport::Supported
+        } else {
+            WriteSupport::Unsupported
+        }
     )]
     // Unusual names, accepted only because other Delta writers can store and enforce them.
     #[case::bare_prefix(
@@ -1390,6 +1401,20 @@ mod test {
         ],
         MockProtocolBuilder::new().with_versions(1, 2).build(),
         WriteSupport::InvalidProtocol
+    )]
+    #[case::names_differing_only_in_case_with_feature(
+        &[
+            ("delta.constraints.positive", "amount > 0"),
+            ("delta.constraints.POSITIVE", "amount > 1"),
+        ],
+        MockProtocolBuilder::new()
+            .with_writer_features([TableFeature::CheckConstraints])
+            .build(),
+        if cfg!(feature = "check-constraints-in-dev") {
+            WriteSupport::Supported
+        } else {
+            WriteSupport::Unsupported
+        }
     )]
     // No CHECK constraint keys.
     #[case::no_properties(
@@ -1506,6 +1531,33 @@ mod test {
             .build();
         assert!(table_config.is_feature_supported(&TableFeature::DeletionVectors));
         assert!(table_config.is_feature_enabled(&TableFeature::DeletionVectors));
+    }
+
+    #[rstest]
+    #[case::no_constraint(&[])]
+    #[case::named_constraint(&[("delta.constraints.positive", "amount > 0")])]
+    #[case::non_lowercase_prefix(&[("DELTA.CONSTRAINTS.positive", "amount > 0")])]
+    #[case::bare_prefix_empty_name(&[("delta.constraints.", "1 > 0")])]
+    #[case::whitespace_only_name(&[("delta.constraints.   ", "1 > 0")])]
+    fn check_constraints_enabled_exactly_when_supported(
+        #[case] properties: &[(&str, &str)],
+        #[values(true, false)] feature_listed: bool,
+    ) {
+        let writer_features = if feature_listed {
+            vec![TableFeature::CheckConstraints]
+        } else {
+            vec![]
+        };
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_properties(properties)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_writer_features(writer_features)
+                    .build(),
+            )
+            .build();
+        let is_enabled = table_config.is_feature_enabled(&TableFeature::CheckConstraints);
+        assert_eq!(is_enabled, feature_listed);
     }
 
     #[rstest]
@@ -3350,14 +3402,6 @@ mod test {
         vec![TableFeature::IcebergNativeV4Preview],
         Some("requires 'adaptiveMetadata-preview' to be enabled")
     )]
-    #[case::invariants_enabled(
-        vec![
-            TableFeature::AdaptiveMetadataPreview,
-            TableFeature::IcebergNativeV4Preview,
-            TableFeature::Invariants,
-        ],
-        Some("requires 'invariants' to not be enabled")
-    )]
     fn test_iceberg_native_v4_feature_requirements(
         #[case] features: Vec<TableFeature>,
         #[case] expected_error_substring: Option<&str>,
@@ -3370,6 +3414,51 @@ mod test {
             Some(msg) => assert_result_error_with_message(result, msg),
             None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
         }
+    }
+
+    #[test]
+    fn test_iceberg_native_v4_with_invariants_enabled() {
+        let mut field = StructField::nullable("value", DataType::INTEGER);
+        field.metadata.insert(
+            crate::schema::ColumnMetadataKey::Invariants
+                .as_ref()
+                .to_string(),
+            crate::schema::MetadataValue::String(
+                r#"{"expression": {"expression": "value > 0"}}"#.to_string(),
+            ),
+        );
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(schema! { (field) })
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::AdaptiveMetadataPreview,
+                        TableFeature::IcebergNativeV4Preview,
+                        TableFeature::Invariants,
+                    ])
+                    .build(),
+            )
+            .build();
+        let result = config.validate_feature_requirements(&TableFeature::IcebergNativeV4Preview);
+        assert_result_error_with_message(result, "requires 'invariants' to not be enabled");
+    }
+
+    #[test]
+    fn test_iceberg_native_v4_with_invariants_supported_but_not_enabled() {
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(schema! { not_null "value": INTEGER })
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::AdaptiveMetadataPreview,
+                        TableFeature::IcebergNativeV4Preview,
+                        TableFeature::Invariants,
+                    ])
+                    .build(),
+            )
+            .build();
+        let result = config.validate_feature_requirements(&TableFeature::IcebergNativeV4Preview);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
     // IcebergCompatV1/V2/V3 are pairwise mutually exclusive.

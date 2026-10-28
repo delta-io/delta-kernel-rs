@@ -274,7 +274,7 @@ impl ParquetHandler for GeometryStatsHandler {
     fn write_parquet_file(
         &self,
         location: Url,
-        data: KernelResultIteratorStatic<Box<dyn EngineData>>,
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
     ) -> KernelResult<FileSize> {
         self.parquet.write_parquet_file(location, data)
     }

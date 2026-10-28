@@ -186,7 +186,9 @@ Kernel for reading. The exact API calls depend on your catalog.
 //    (version, uuid, ...) tuples, format the filename as {version:020}.{uuid}.json
 //    first. See "Building a log tail" in reading.md.
 //    let log_tail: Vec<LogPath> = commits.into_iter()
-//        .map(|c| LogPath::staged_commit(table_root.clone(), &c.filename, c.timestamp, c.size))
+//        .map(|c| LogPath::from_commit_filename(
+//            table_root.clone(), c.version, &c.filename, c.timestamp, c.size,
+//        ))
 //        .collect::<Result<_, _>>()?;
 
 // 4. Build Engine with vended credentials

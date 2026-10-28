@@ -14,7 +14,7 @@ use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
-use delta_kernel::{EngineData, KernelResult, Snapshot};
+use delta_kernel::{EngineData, KernelResult, KernelResultIterator, Snapshot};
 use itertools::Itertools;
 use tempfile::tempdir;
 use test_utils::{
@@ -51,7 +51,7 @@ async fn write_parquet_file(
 }
 
 fn count_total_scan_rows(
-    scan_result_iter: impl Iterator<Item = KernelResult<Box<dyn EngineData>>>,
+    scan_result_iter: impl KernelResultIterator<Box<dyn EngineData>>,
 ) -> KernelResult<usize> {
     scan_result_iter
         .map(|result| Ok(result?.len()))

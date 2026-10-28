@@ -151,14 +151,14 @@ partition columns without building a scan.
 | `snapshot_timestamp` | Return the snapshot's commit timestamp (milliseconds since epoch) |
 | `snapshot_table_root` | Return the table root URL as an engine-allocated string |
 | `logical_schema` | Return the table's logical schema as a `Handle<SharedSchema>` |
-| `snapshot_get_metadata` | Clone the table metadata into a `Handle<SharedMetadata>` |
+| `snapshot_visit_metadata` | Invoke one callback with the complete metadata action as a borrowed `FfiMetadata`. Copy any values you keep before the callback returns |
 | `snapshot_get_protocol` | Clone the protocol into a `Handle<SharedProtocol>` |
 | `get_partition_column_count` / `get_partition_columns` | Count partition columns and iterate their names as a `StringSliceIterator` |
 | `string_slice_next` / `free_string_slice_data` | Iterate and release a `StringSliceIterator` (e.g. returned by `get_partition_columns`) |
 | `get_app_id_version` | Look up the last committed transaction version for an `app_id` (the read side of [idempotent writes](../writing/idempotent_writes.md)) |
-| `free_metadata` / `free_protocol` / `free_schema` | Release the corresponding handles |
+| `free_protocol` / `free_schema` | Release the corresponding handles |
 
-**Schema and metadata visitors**
+**Schema and protocol visitors**
 
 Kernel exposes schemas, protocols, and metadata through visitor callbacks so
 the engine can materialize them into its own types without Kernel allocating
@@ -168,10 +168,7 @@ engine-owned memory.
 |----------|---------|
 | `visit_schema` | Walk a `SharedSchema` by invoking per-field callbacks on an `EngineSchemaVisitor` |
 | `visit_protocol` | Invoke a `visit_versions` callback, then a `visit_feature` callback per reader/writer feature |
-| `visit_metadata` | Invoke a single callback with `(id, name, description, format_provider, has_created_time, created_time_ms)` |
-| `visit_metadata_format_options` | Iterate arbitrary format option key/value pairs from a `SharedMetadata` handle |
-| `visit_metadata_configuration` | Iterate the `configuration` key/value map (takes a snapshot handle, not a metadata handle) |
-| `visit_string_map` / `get_from_string_map` | Iterate or look up entries in an opaque `CStringMap` (used by both metadata and scan-metadata surfaces) |
+| `visit_string_map` / `get_from_string_map` | Iterate or look up entries in an opaque `CStringMap` (used by scan-metadata partition values) |
 
 See [Visitor callbacks](#visitor-callbacks) below for the pattern.
 
@@ -322,6 +319,20 @@ changed on a builder or transaction. Use `true` for logical data changes and `fa
 metadata-only changes or rewrites that preserve logical data. Build validation rejects
 `ALTER TABLE` with `true` and blind append with `false`; commit validation checks staged files.
 
+**Commit ranges**
+
+Read a range of raw commits. Mirrors the Rust `CommitRange` API.
+
+| Function | Purpose |
+|----------|---------|
+| `commit_range_builder_for` | Create a commit range builder from a table path and start version |
+| `commit_range_builder_with_end_version` / `commit_range_builder_with_log_tail` / `commit_range_builder_with_max_catalog_version` | Bound the range and supply the catalog log tail for catalog-managed tables |
+| `commit_range_builder_with_commit_range_validation` / `commit_range_builder_with_fail_on_data_loss` | Relax build-time validation and choose whether the commit-files iterator fails on missing versions |
+| `commit_range_builder_build` | Consume the builder and produce a `SharedCommitRange` |
+| `commit_range_commits` / `commit_range_commits_with_snapshot` / `commit_range_commits_next` | Iterate commits as `SharedCommitAction` handles; requires a range built with commit range validation |
+| `commit_range_commit_files` / `commit_range_commit_files_next` | Return an iterator of commit files |
+| `free_commit_range_builder` / `free_commit_range` / `free_commit_action` / `free_commit_actions_iter` / `free_commit_files_iter` | Release commit-range handles |
+
 **Change data feed (table changes)**
 
 Incremental log reads for change data feed. Mirrors the Rust
@@ -418,8 +429,8 @@ calls return `false`.
 
 Several FFI entry points take a visitor struct (for example,
 `EngineSchemaVisitor` for `visit_schema`, `EngineExpressionVisitor` for
-`visit_expression`) or individual callbacks (as in `visit_metadata`). The
-pattern is the same in every case:
+`visit_expression`) or individual callbacks (as in `snapshot_visit_metadata`).
+The pattern is the same in every case:
 
 1. You allocate a context (a `NullableCvoid` you own) that the callbacks can
    write into. Kernel does not interpret this value.
@@ -427,7 +438,7 @@ pattern is the same in every case:
    passing the context plus node-specific arguments (names, types, literal
    values, child handles). For tree-structured inputs (schemas, expressions,
    predicates), callbacks fire in depth-first order; for flat inputs (e.g.
-   `visit_metadata`), the callback fires once.
+   `snapshot_visit_metadata`), the callback fires once.
 3. When `visit_*` returns, the context holds your engine-side representation.
 
 Callbacks run synchronously on the same thread that called `visit_*`. Strings

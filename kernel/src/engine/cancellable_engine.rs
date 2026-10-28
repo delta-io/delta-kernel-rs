@@ -1,9 +1,9 @@
-//! Applies snapshot-build cancellation to reads through the connector's engine handlers.
+//! Binds an operation's cancellation token to reads through the connector's engine handlers.
 //!
-//! `SnapshotBuilder::build` uses `CancellableEngine` for builds with a token and no snapshot
-//! hint. The wrappers supply that token when loading code calls an ordinary read method,
-//! or a cancellation-aware one with no token of its own, so discovery and replay share
-//! cancellation without threading a token through each helper.
+//! Snapshot building and scan metadata operations use `CancellableEngine` when configured with a
+//! token. The wrappers supply that token when loading code calls an ordinary read method, or a
+//! cancellation-aware one with no token of its own, so discovery and replay share cancellation
+//! without threading a token through each helper.
 
 use std::sync::Arc;
 
@@ -17,23 +17,22 @@ use crate::plans::PlanExecutor;
 use crate::{
     CancellationTokenRef, Engine, EngineData, EvaluationHandler, FileDataReadResultIterator,
     FileMeta, FileSize, FileSlice, FilteredEngineData, JsonHandler, KernelResult,
-    KernelResultIterator, KernelResultIteratorStatic, ParquetFooter, ParquetHandler, PredicateRef,
-    SchemaRef, StorageHandler,
+    KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
 };
 
 /// An engine adapter that supplies a default cancellation token to storage, JSON, and
 /// Parquet reads.
 ///
-/// Snapshot builds with cancellation supply one token to [`Self::new`]. The wrapped
-/// handlers use it as the default for reads, so loading helpers inherit cancellation
-/// through the engine.
+/// Operations with cancellation supply one token to [`Self::new`]. The wrapped handlers use it as
+/// the default for reads, so loading helpers inherit cancellation through the engine.
 ///
 /// At the handler API boundary, `*_with_cancellation` methods accept an optional per-call
 /// token. `None` uses the stored default; `Some(token)` overrides it for that read and is
 /// forwarded unchanged.
 ///
-/// Write methods delegate unchanged for now. Parsing, evaluation, and declarative execution
-/// retain their underlying behavior.
+/// Write methods forward to the underlying handlers without applying this adapter's
+/// cancellation token. Parsing, evaluation, and declarative execution retain their underlying
+/// behavior.
 ///
 /// Snapshots retain neither the adapter nor its token. Read iterators own their cancellation state
 /// and can outlive the adapter. Cached metadata can be returned without consulting the default
@@ -154,13 +153,13 @@ impl StorageHandler for ReadHandler<dyn StorageHandler> {
     cancellable_read_pair! {
         /// Lists files using a per-call token or the default token.
         fn list_from, list_from_with_cancellation(path: &Url)
-            -> KernelResult<KernelResultIteratorStatic<FileMeta>>;
+            -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
     }
 
     cancellable_read_pair! {
         /// Reads byte ranges using a per-call token or the default token.
         fn read_files, read_files_with_cancellation(files: Vec<FileSlice>)
-            -> KernelResult<KernelResultIteratorStatic<Bytes>>;
+            -> KernelResult<Box<dyn KernelResultIterator<Bytes>>>;
     }
 
     /// Returns file metadata after checking the default token for cancellation.
@@ -198,7 +197,9 @@ impl JsonHandler for ReadHandler<dyn JsonHandler> {
 
         /// Writes JSON batches without applying read cancellation.
         fn write_json_file(
-            path: &Url, data: KernelResultIterator<'_, FilteredEngineData>, overwrite: bool,
+            path: &Url,
+            data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
+            overwrite: bool,
         ) -> KernelResult<FileSize>;
     }
 }
@@ -220,7 +221,10 @@ impl ParquetHandler for ReadHandler<dyn ParquetHandler> {
     forward_methods! {
         /// Writes Parquet batches without applying read cancellation.
         fn write_parquet_file(
-            location: Url, data: KernelResultIteratorStatic<Box<dyn EngineData>>,
+            location: Url, data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
         ) -> KernelResult<FileSize>;
     }
 }
+
+#[cfg(test)]
+mod tests;

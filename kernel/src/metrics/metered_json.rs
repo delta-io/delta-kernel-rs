@@ -94,7 +94,7 @@ impl JsonHandler for MeteredJsonHandler {
     fn write_json_file(
         &self,
         path: &url::Url,
-        data: KernelResultIterator<'_, FilteredEngineData>,
+        data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         overwrite: bool,
     ) -> KernelResult<FileSize> {
         self.inner.write_json_file(path, data, overwrite)
@@ -162,7 +162,7 @@ mod tests {
         fn write_json_file(
             &self,
             _path: &Url,
-            _data: KernelResultIterator<'_, FilteredEngineData>,
+            _data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
             _overwrite: bool,
         ) -> KernelResult<FileSize> {
             self.write_size.ok_or_else(|| {

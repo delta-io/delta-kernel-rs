@@ -35,7 +35,7 @@ use crate::schema::{
     column_name, schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
     StructField, StructType,
 };
-use crate::{Engine, EngineData, KernelError, KernelResult, Version};
+use crate::{Engine, EngineData, KernelError, KernelResult, KernelResultIterator, Version};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -221,7 +221,7 @@ impl LogSegment {
     fn read_pm_batches_via_plan(
         &self,
         executor: &dyn PlanExecutor,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<VersionedBatch>> + Send> {
+    ) -> KernelResult<impl KernelResultIterator<VersionedBatch>> {
         let plan = self.build_pm_plan()?;
 
         let batches = executor
@@ -245,7 +245,7 @@ impl LogSegment {
     fn read_pm_batches(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<VersionedBatch>> + Send> {
+    ) -> KernelResult<impl KernelResultIterator<VersionedBatch>> {
         let (commit_schema, checkpoint_schema) = pm_replay_schemas();
         // Commit schema only: `_file` in the checkpoint schema would break its skipping predicate.
         let file_column =
@@ -259,7 +259,6 @@ impl LogSegment {
                 engine,
                 commit_schema,
                 checkpoint_schema,
-                None,
                 None,
                 None,
                 None,
@@ -353,7 +352,7 @@ struct VersionedBatch {
 
 /// The newest Protocol and Metadata across `batches`.
 fn resolve_pm_batches(
-    batches: impl Iterator<Item = KernelResult<VersionedBatch>>,
+    batches: impl KernelResultIterator<VersionedBatch>,
 ) -> KernelResult<PmCandidate> {
     let mut metadata: Option<(i64, Metadata)> = None;
     let mut protocol: Option<(i64, Protocol)> = None;
@@ -419,7 +418,7 @@ fn batch_version(data: &dyn EngineData) -> KernelResult<Version> {
         .ok_or_else(|| KernelError::internal_error("commit batch missing _file column"))?;
     let url = Url::parse(&file)
         .map_err(|e| KernelError::internal_error(format!("batch has invalid _file {file}: {e}")))?;
-    ParsedLogPath::try_from(url)?
+    ParsedLogPath::new(url)
         .map(|path| path.version)
         .ok_or_else(|| KernelError::internal_error(format!("batch from non-log file {file}")))
 }

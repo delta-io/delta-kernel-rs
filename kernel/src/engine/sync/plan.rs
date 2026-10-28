@@ -41,7 +41,7 @@ use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, ScopedPlanE
 use crate::schema::{ArrayType, DataType, SchemaRef, StructType};
 use crate::{
     EvaluationHandler as _, FileMeta, FilteredEngineData, KernelError, KernelResult,
-    KernelResultIteratorStatic, StorageHandler as _,
+    KernelResultIterator, StorageHandler as _,
 };
 
 /// A synchronous, test-only [`PlanExecutor`].
@@ -336,7 +336,7 @@ impl SyncPlanExecutor {
             let metas = [file.meta.clone()];
             let read_schema = read_schema.clone();
             // The two constructors have distinct `impl Iterator` types, so box to unify the arms.
-            let data: KernelResultIteratorStatic<ArrowEngineData> = match file_type {
+            let data: Box<dyn KernelResultIterator<ArrowEngineData>> = match file_type {
                 FileType::Json => Box::new(read_files_arrow(
                     store,
                     &metas,

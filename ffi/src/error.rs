@@ -81,6 +81,7 @@ pub enum FFIKernelError {
     InvalidGeoParamsError = 52,
     MaxCatalogVersionError = 53,
     TableAlreadyExistsAtPath = 54,
+    CommitRangeError = 55,
 }
 
 impl From<KernelError> for FFIKernelError {
@@ -94,6 +95,7 @@ impl From<KernelError> for FFIKernelError {
             KernelError::Extract(..) => FFIKernelError::ExtractError,
             KernelError::Generic(_) => FFIKernelError::GenericError,
             KernelError::GenericError { .. } => FFIKernelError::GenericError,
+            KernelError::CommitRange(_) => FFIKernelError::CommitRangeError,
             KernelError::MaxCatalogVersion(_) => FFIKernelError::MaxCatalogVersionError,
             KernelError::LogTailVersionsNotContiguous { .. } => FFIKernelError::InvalidLogSegment,
             KernelError::IOError(_) => FFIKernelError::IOErrorError,
@@ -320,6 +322,7 @@ impl From<EngineExecError> for KernelError {
             FFIKernelError::CheckpointWriteError => KernelError::CheckpointWrite(message),
             FFIKernelError::EngineDataTypeError => KernelError::EngineDataType(message),
             FFIKernelError::GenericError => KernelError::Generic(message),
+            FFIKernelError::CommitRangeError => KernelError::CommitRange(message),
             FFIKernelError::MaxCatalogVersionError => KernelError::MaxCatalogVersion(message),
             FFIKernelError::InternalError => KernelError::InternalError(message),
             FFIKernelError::FileNotFoundError => KernelError::FileNotFound(message),
@@ -420,6 +423,27 @@ mod error_code_tests {
             FFIKernelError::RowTrackingChangeFeedUnsupported
         );
         assert_eq!(FFIKernelError::RowTrackingChangeFeedUnsupported as i32, 44);
+    }
+
+    #[test]
+    fn commit_range_error_has_stable_ffi_mapping() {
+        let error = KernelError::CommitRange("invalid builder mode".to_string());
+        assert_eq!(
+            error.to_string(),
+            "Commit range error: invalid builder mode"
+        );
+        assert_eq!(
+            FFIKernelError::from(error),
+            FFIKernelError::CommitRangeError
+        );
+        assert_eq!(FFIKernelError::CommitRangeError as i32, 55);
+
+        let error: KernelError =
+            exec_error(FFIKernelError::CommitRangeError, "invalid builder mode").into();
+        assert!(matches!(
+            error,
+            KernelError::CommitRange(message) if message == "invalid builder mode"
+        ));
     }
 
     #[test]
