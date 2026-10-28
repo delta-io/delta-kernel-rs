@@ -2183,6 +2183,22 @@ impl crate::snapshot::memory::HeapSize for CheckpointMetadata {
     }
 }
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl crate::snapshot::memory::HeapSize for CheckpointAction {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.content_root.path.heap_size(context)
+            + self.protocol.heap_size(context)
+            + self.metadata.heap_size(context)
+            + self.transactions.heap_size(context)
+            + self.domain_metadata.heap_size(context)
+            + self.txn_sidecars.heap_size(context)
+            + self.domain_metadata_sidecars.heap_size(context)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -3708,21 +3724,5 @@ mod tests {
             err.to_string().contains("unknown variant"),
             "expected an unknown-variant error, got: {err}"
         );
-    }
-}
-
-#[cfg(feature = "adaptive-metadata-in-dev")]
-impl crate::snapshot::memory::HeapSize for CheckpointAction {
-    fn heap_size(
-        &self,
-        context: &mut crate::snapshot::memory::SizeContext,
-    ) -> crate::snapshot::memory::Memory {
-        self.content_root.path.heap_size(context)
-            + self.protocol.heap_size(context)
-            + self.metadata.heap_size(context)
-            + self.transactions.heap_size(context)
-            + self.domain_metadata.heap_size(context)
-            + self.txn_sidecars.heap_size(context)
-            + self.domain_metadata_sidecars.heap_size(context)
     }
 }
