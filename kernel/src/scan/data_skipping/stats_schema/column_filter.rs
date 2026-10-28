@@ -27,6 +27,9 @@ pub(crate) struct StatsConfig<'a> {
     /// Geometry counts as one leaf and has a `nullCount` independently of this option.
     #[cfg(feature = "geo-type-in-dev")]
     pub(crate) geometry_min_max: bool,
+    /// Whether the schema includes the `tightStats` flag, which only adaptiveMetadata tables
+    /// define.
+    pub(crate) tight_stats: bool,
 }
 
 /// Handles column filtering logic for statistics based on table properties.
