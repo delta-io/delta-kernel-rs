@@ -648,12 +648,11 @@ mod tests {
         let log_root = table_root.join("_delta_log/").unwrap();
         let paths: Vec<_> = (0..2)
             .map(|version| {
-                ParsedLogPath::try_from(FileMeta {
+                ParsedLogPath::new(FileMeta {
                     location: log_root.join(&format!("{version:020}.json")).unwrap(),
                     last_modified: 0,
                     size: 1,
                 })
-                .unwrap()
                 .unwrap()
             })
             .collect();
@@ -810,12 +809,11 @@ mod tests {
         // later-populated state as though it existed at construction.
         let root = Url::parse("memory:///adaptive-accounting/").unwrap();
         let log_root = root.join("_delta_log/").unwrap();
-        let path = ParsedLogPath::try_from(FileMeta {
+        let path = ParsedLogPath::new(FileMeta {
             location: log_root.join("00000000000000000000.json").unwrap(),
             last_modified: 0,
             size: 1,
         })
-        .unwrap()
         .unwrap();
         let log = LogSegment::try_new(
             LogSegmentFiles {
