@@ -3,14 +3,13 @@
 `cargo xtask generate-delta-error-conditions` generates
 `kernel/src/error/delta_error_condition/generated.rs` from these checked-in inputs:
 
-- `delta-error-classes.json`: a verbatim snapshot of Delta's
-  `spark/src/main/resources/error/delta-error-classes.json`.
+- `delta-error-classes.json`: a verbatim snapshot of [Delta's error catalog][upstream-catalog].
 - `source.json`: the delta-io/delta repository, full commit SHA, source path, and catalog SHA-256.
 - `selected-conditions.json`: the allowlist of exact leaf condition names to expose in Kernel.
   Subclasses use `PARENT.SUB`; selecting a parent does not select its children.
 
-Add conditions alongside the factories and call sites that need them. Preserve upstream names,
-SQLSTATEs, message templates, and parameter names. Duplicate selections, unknown names, and
+Add a condition to `selected-conditions.json` when Kernel code needs to use it. Preserve upstream
+names, SQLSTATEs, message templates, and parameter names. Duplicate selections, unknown names, and
 selected names that map to the same Rust variant are rejected.
 
 To download the latest upstream catalog, run `cargo xtask update-delta-error-catalog` (requires
@@ -29,3 +28,6 @@ Do not edit the snapshot's individual entries or the generated Rust by hand.
 
 Removing or renaming a selected condition removes a `DeltaErrorCondition` variant, which is a
 breaking Kernel API change. Unselected upstream conditions do not become public Rust variants.
+
+[upstream-catalog]:
+  https://github.com/delta-io/delta/blob/master/spark/src/main/resources/error/delta-error-classes.json
