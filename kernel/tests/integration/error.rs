@@ -17,7 +17,7 @@ use rstest::rstest;
 })]
 fn test_error_preserves_kernel_display_and_source(#[case] kernel: KernelError) {
     let expected_display = kernel.to_string();
-    let error = Error::Kernel(kernel);
+    let error: Error = kernel.into();
     assert_eq!(error.to_string(), expected_display);
 
     let Error::Kernel(kernel) = &error else {
@@ -35,9 +35,9 @@ fn test_error_preserves_kernel_display_and_source(#[case] kernel: KernelError) {
 }
 
 #[test]
-fn test_kernel_result_explicitly_maps_into_error() {
+fn test_kernel_result_converts_into_error() {
     let propagate = |result: KernelResult<()>| -> Result<()> {
-        result.map_err(Error::Kernel)?;
+        result?;
         Ok(())
     };
 

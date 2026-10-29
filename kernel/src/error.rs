@@ -30,7 +30,7 @@ pub enum Error {
 
     /// A failure represented by a kernel implementation error.
     #[error(transparent)]
-    Kernel(KernelError),
+    Kernel(#[from] KernelError),
 }
 
 /// Details of a failed conversion from a scalar into a Rust value.
@@ -104,9 +104,6 @@ pub(crate) fn add_scalar_path_context(
 }
 
 /// A result whose error is the top-level [`Error`].
-// Note: `delta_kernel::Result` is currently unused as part of the error migration tracked in:
-// https://github.com/delta-io/delta-kernel-rs/issues/3421.
-// First usages will come when the first `KernelError` is migrated to a `DeltaError`.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A result whose error defaults to [`KernelError`].
