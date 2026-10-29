@@ -387,6 +387,7 @@ pub(crate) fn timestamp_to_version(
     // Short-circuit: compare against snapshot's timestamp to avoid log segment rebuild.
     // This optimization mirrors Delta Spark and Java Kernel behavior.
     let snap_ts = snapshot
+        .reader()
         .get_timestamp(engine)
         .map_err(|e| LogHistoryError::internal("failed to get snapshot timestamp", e))?;
     match (timestamp.cmp(&snap_ts), bound) {

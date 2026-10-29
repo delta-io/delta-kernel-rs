@@ -183,11 +183,29 @@ fn engine_reported_crc_cancellation_is_not_optional() {
     assert_eq!(reads.events.lock().unwrap().last(), Some(&Read::Crc));
 }
 
-/// Keeps the reader token on tail-only metadata replay rooted in a stale complete CRC.
-#[test]
-fn reader_stale_crc_replay_is_cancellable() {
+#[rstest]
+#[case::tail_only("tail.metadata", Some(r#"{"tail":true}"#))]
+#[case::absent("missing", None)]
+#[case::stale_crc("myApp.metadata", Some(r#"{"key":"value"}"#))]
+fn reader_stale_crc_replay_is_cancellable(
+    #[case] domain: &str,
+    #[case] expected: Option<&str>,
+    #[values(false, true)] cancelled: bool,
+) {
     let (url, _temp) = stale_crc_table();
-    let reads = RecordingReads::new(Some(Read::Json));
+    std::fs::write(
+        url.to_file_path()
+            .unwrap()
+            .join("_delta_log/00000000000000000001.json"),
+        concat!(
+            r#"{"commitInfo":{"operation":"WRITE"}}"#,
+            "\n",
+            r#"{"domainMetadata":{"domain":"tail.metadata","configuration":"{\"tail\":true}","#,
+            r#""removed":false}}"#,
+        ),
+    )
+    .unwrap();
+    let reads = RecordingReads::new(cancelled.then_some(Read::Json));
     let snapshot = Snapshot::builder_for(&url)
         .with_incremental_crc_replay(IncrementalReplay::Disabled)
         .build(reads.inner.as_ref())
@@ -196,10 +214,12 @@ fn reader_stale_crc_replay_is_cancellable() {
     let reader = snapshot
         .reader()
         .with_cancellation_token(reads.token.clone() as CancellationTokenRef);
-    assert!(matches!(
-        reader.get_domain_metadata("missing", &reads.engine()),
-        Err(KernelError::Cancelled)
-    ));
+    let result = reader.get_domain_metadata(domain, &reads.engine());
+    if cancelled {
+        assert!(matches!(result, Err(KernelError::Cancelled)));
+    } else {
+        assert_eq!(result.unwrap().as_deref(), expected);
+    }
     assert_eq!(*reads.events.lock().unwrap(), [Read::Json]);
 }
 

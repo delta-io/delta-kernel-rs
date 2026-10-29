@@ -1,4 +1,4 @@
-//! Operation-scoped access to snapshot metadata that may require storage reads.
+//! Access to snapshot metadata that may require storage reads.
 
 use std::collections::HashSet;
 
@@ -12,12 +12,12 @@ use crate::expressions::ColumnName;
 use crate::log_segment::DomainMetadataMap;
 use crate::{CancellationTokenRef, Engine, KernelResult};
 
-/// Reads snapshot metadata with an optional operation-scoped cancellation token.
+/// Reads snapshot metadata with an optional cancellation token.
 ///
 /// Use [`Snapshot::reader`] for domain metadata, clustering columns, application transactions,
-/// row-tracking metadata, and commit timestamps. These getters can read storage when the snapshot
-/// does not already contain the required metadata. In-memory getters such as [`Snapshot::schema`]
-/// and [`Snapshot::version`] remain on the snapshot.
+/// row-tracking metadata, and commit timestamps. These getters may read storage when the required
+/// metadata is not cached in the snapshot. In-memory getters such as [`Snapshot::schema`] and
+/// [`Snapshot::version`] remain on the snapshot.
 ///
 /// Getters run synchronously and may block on I/O. By default, they use the supplied engine's
 /// normal cancellation and timeout behavior. [`Self::with_cancellation_token`] adds cooperative
@@ -26,7 +26,7 @@ use crate::{CancellationTokenRef, Engine, KernelResult};
 /// on the engine. Creating or configuring a reader does not issue I/O.
 ///
 /// The reader borrows its snapshot and retains no engine. The snapshot retains neither the reader
-/// nor its token, so independent operations can use different readers on the same snapshot.
+/// nor its token, so callers can use different readers on the same snapshot.
 ///
 /// ```no_run
 /// # use delta_kernel::{CancellationTokenRef, Engine, KernelResult, Snapshot};
@@ -43,30 +43,6 @@ use crate::{CancellationTokenRef, Engine, KernelResult};
 /// let timestamp = reader.get_timestamp(engine)?;
 /// # Ok(())
 /// # }
-/// ```
-///
-/// Metadata reads require a reader, including when no cancellation token is needed:
-///
-/// ```compile_fail,E0624
-/// # use delta_kernel::{Engine, Snapshot};
-/// # fn read(snapshot: &Snapshot, engine: &dyn Engine) {
-/// snapshot.get_domain_metadata("my-domain", engine);
-/// # }
-/// ```
-///
-/// The same restriction applies to getters exposed by `internal-api`:
-///
-/// ```compile_fail,E0624
-/// # use delta_kernel::{Engine, Snapshot};
-/// # fn read(snapshot: &Snapshot, engine: &dyn Engine) {
-/// snapshot.get_physical_clustering_columns(engine);
-/// # }
-/// ```
-///
-/// The engine adapter is internal to Kernel:
-///
-/// ```compile_fail,E0603
-/// use delta_kernel::engine::CancellableEngine;
 /// ```
 pub struct SnapshotReader<'a> {
     /// Immutable table state shared independently of this read scope.
@@ -85,6 +61,9 @@ impl<'a> SnapshotReader<'a> {
     /// Reads return [`crate::KernelError::Cancelled`] when the engine observes cancellation.
     /// The original token is forwarded unchanged, and getters remain synchronous. This does not
     /// affect snapshot construction, scans, or other readers created from the same snapshot.
+    ///
+    /// This token is passed as the per-call token to cancellation-aware handlers; the engine
+    /// decides how it combines with its own cancellation.
     pub fn with_cancellation_token(
         mut self,
         token: impl Into<Option<CancellationTokenRef>>,
@@ -93,10 +72,17 @@ impl<'a> SnapshotReader<'a> {
         self
     }
 
-    /// Returns the latest non-expired transaction version for `application_id`, or `None`.
+    /// Returns the latest non-expired transaction version for `application_id`.
     ///
-    /// Uses `engine` to replay the log when CRC state cannot answer the query. Returns read,
-    /// retention-property, or cancellation errors. Reports transaction-load success or failure.
+    /// Returns `None` if no transaction exists for the application or its latest transaction has
+    /// expired under `delta.setTransactionRetentionDuration`.
+    ///
+    /// Uses an at-version CRC when it can answer the query. Otherwise, uses `engine` to scan only
+    /// commits after a stale CRC with complete transaction state, skipping the checkpoint, or to
+    /// replay the full log when no such CRC is available.
+    ///
+    /// Reports `SetTransactionLoadSuccess` or `SetTransactionLoadFailure`. Returns read,
+    /// retention-property, or cancellation errors.
     pub fn get_app_id_version(
         &self,
         application_id: &str,
@@ -142,10 +128,11 @@ impl<'a> SnapshotReader<'a> {
         self.read(engine, Snapshot::get_timestamp)
     }
 
-    /// Returns clustering descriptors in domain order, or `None` if clustering is absent.
+    /// Returns clustering descriptors in domain order.
     ///
-    /// Each descriptor contains the physical name, logical name, and type. Uses `engine` to load
-    /// domain metadata when needed. Returns malformed-metadata, column-resolution, read, or
+    /// Returns `None` when the clustering feature is absent or `delta.clustering` has no active
+    /// entry. Each descriptor contains the physical name, logical name, and type. Uses `engine` to
+    /// load domain metadata when needed. Returns malformed-metadata, column-resolution, read, or
     /// cancellation errors. An empty vector means the clustering domain names no columns.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
@@ -156,11 +143,12 @@ impl<'a> SnapshotReader<'a> {
         self.read(engine, Snapshot::get_clustering_column_infos)
     }
 
-    /// Returns physical clustering column names, or `None` if clustering is absent.
+    /// Returns physical clustering column names in domain order.
     ///
-    /// Uses `engine` to load domain metadata when needed and preserves domain order and column
-    /// mapping. Returns malformed-metadata, read, or cancellation errors. An empty vector means
-    /// the clustering domain names no columns.
+    /// Returns `None` when the clustering feature is absent or `delta.clustering` has no active
+    /// entry. Uses `engine` to load domain metadata when needed and preserves column mapping.
+    /// Returns malformed-metadata, read, or cancellation errors. An empty vector means the
+    /// clustering domain names no columns.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn get_physical_clustering_columns(
@@ -172,8 +160,14 @@ impl<'a> SnapshotReader<'a> {
 
     /// Returns current metadata for `domains`, or all domains when the filter is `None`.
     ///
-    /// Includes system-controlled domains. Uses `engine` to replay the log when CRC state cannot
-    /// answer the query. Returns read or cancellation errors and reports domain-load metrics.
+    /// Includes system-controlled domains and excludes removed entries. Uses an at-version CRC
+    /// with complete domain state, or a partial CRC containing every domain in an explicit filter.
+    /// Otherwise, uses `engine` to scan commits after a stale CRC with complete domain state and
+    /// reconcile them against its map, skipping the checkpoint, or replays the full log when no
+    /// such CRC is available.
+    ///
+    /// Reports `DomainMetadataLoadSuccess` or `DomainMetadataLoadFailure`. Returns read or
+    /// cancellation errors.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn get_domain_metadatas_internal(

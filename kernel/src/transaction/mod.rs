@@ -1109,6 +1109,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         // - One millisecond later than the previous commit's inCommitTimestamp
         Ok(self
             .read_snapshot()?
+            .reader()
             .get_in_commit_timestamp(engine)?
             .map(|prev_ict| self.commit_timestamp.max(prev_ict + 1)))
     }
@@ -3446,7 +3447,7 @@ mod tests {
         let engine = SyncEngine::new();
         let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
 
-        let prev_ict = snapshot.get_in_commit_timestamp(&engine)?;
+        let prev_ict = snapshot.reader().get_in_commit_timestamp(&engine)?;
         assert_eq!(prev_ict, Some(future_ict));
 
         let (committer, captured_ts) = CapturingCommitter::new();
