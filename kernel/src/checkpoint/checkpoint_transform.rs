@@ -13,13 +13,13 @@
 //! This module provides transforms to populate these fields using COALESCE expressions,
 //! ensuring that values are preserved regardless of the source format (commits vs checkpoints).
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use crate::actions::{ADD_NAME, STATS_PARSED as STATS_PARSED_FIELD};
 use crate::expressions::{col, Expression, ExpressionRef, MapToStructOptions, UnaryExpressionOp};
 use crate::schema::{DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType};
 use crate::struct_patch::ProjectionStructPatchBuilder;
-use crate::table_properties::TableProperties;
+use crate::table_configuration::TableConfiguration;
 use crate::utils::FoldWithOption as _;
 use crate::{KernelError, KernelResult};
 
@@ -27,18 +27,22 @@ pub(crate) const STATS_FIELD: &str = "stats";
 pub(crate) const PARTITION_VALUES_FIELD: &str = "partitionValues";
 pub(crate) const PARTITION_VALUES_PARSED_FIELD: &str = "partitionValues_parsed";
 
-/// Configuration for stats transformation based on table properties.
+/// Configuration for stats transformation based on the table configuration.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StatsTransformConfig {
     pub write_stats_as_json: bool,
     pub write_stats_as_struct: bool,
+    /// Operator that encodes `stats_parsed` as JSON `stats`.
+    pub stats_json_op: UnaryExpressionOp,
 }
 
 impl StatsTransformConfig {
-    pub(super) fn from_table_properties(properties: &TableProperties) -> Self {
+    pub(super) fn from_table_configuration(table_configuration: &TableConfiguration) -> Self {
+        let properties = table_configuration.table_properties();
         Self {
             write_stats_as_json: properties.should_write_stats_as_json(),
             write_stats_as_struct: properties.should_write_stats_as_struct(),
+            stats_json_op: table_configuration.stats_json_op(),
         }
     }
 }
@@ -46,7 +50,8 @@ impl StatsTransformConfig {
 /// Builds a transform for the Add action to populate and/or drop stats and partition fields.
 ///
 /// The transform handles statistics based on table properties:
-/// - When `writeStatsAsJson=true`: `stats = COALESCE(stats, ToJson(stats_parsed))`
+/// - When `writeStatsAsJson=true`: `stats = COALESCE(stats, ToJson(stats_parsed))`, using the
+///   config's `stats_json_op`
 /// - When `writeStatsAsJson=false`: drop `stats` field
 /// - When `writeStatsAsStruct=true`: `stats_parsed = COALESCE(stats_parsed, ParseJson(stats))`
 /// - When `writeStatsAsStruct=false`: drop `stats_parsed` field
@@ -91,8 +96,11 @@ pub(crate) fn build_checkpoint_transform(
     if config.write_stats_as_json {
         // Populate stats from stats_parsed if needed (for old checkpoints that only had
         // stats_parsed)
-        patch_builder =
-            patch_builder.replace_expr_at([ADD_NAME], STATS_FIELD, STATS_JSON_EXPR.clone());
+        patch_builder = patch_builder.replace_expr_at(
+            [ADD_NAME],
+            STATS_FIELD,
+            stats_json_expr(config.stats_json_op),
+        );
     } else {
         // Drop stats field when not writing as JSON
         patch_builder = patch_builder.drop_at([ADD_NAME], STATS_FIELD);
@@ -223,19 +231,16 @@ fn build_partition_values_parsed_expr() -> ExpressionRef {
     ]))
 }
 
-/// Static expression: `stats = COALESCE(stats, ToJson(stats_parsed))`
+/// `stats = COALESCE(stats, op(stats_parsed))`, where `op` encodes JSON.
 ///
 /// This expression prefers existing JSON stats, falling back to converting stats_parsed.
 /// Column paths are relative to the full batch, not the nested Add struct.
-static STATS_JSON_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
+fn stats_json_expr(op: UnaryExpressionOp) -> ExpressionRef {
     Arc::new(Expression::coalesce([
         col!(ADD_NAME, STATS_FIELD),
-        Expression::unary(
-            UnaryExpressionOp::ToJson,
-            col!(ADD_NAME, STATS_PARSED_FIELD),
-        ),
+        Expression::unary(op, col!(ADD_NAME, STATS_PARSED_FIELD)),
     ]))
-});
+}
 
 /// Transforms the Add action schema within a checkpoint schema.
 ///
@@ -281,25 +286,37 @@ mod tests {
     use crate::actions::NUM_RECORDS;
     use crate::expressions::ExpressionStructPatch;
     use crate::schema::{schema, schema_ref, MapType};
+    use crate::unit_test_utils::MockTableConfigurationBuilder;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::unit_test_utils::{
+        adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
+    };
 
-    #[test]
-    fn test_config_defaults() {
-        // Default: writeStatsAsJson=true, writeStatsAsStruct=false (per protocol)
-        let props = TableProperties::default();
-        let config = StatsTransformConfig::from_table_properties(&props);
-        assert!(config.write_stats_as_json);
-        assert!(!config.write_stats_as_struct);
+    #[rstest]
+    #[case::defaults(&[], true, false)]
+    #[case::struct_enabled(&[("delta.checkpoint.writeStatsAsStruct", "true")], true, true)]
+    #[case::json_disabled(&[("delta.checkpoint.writeStatsAsJson", "false")], false, false)]
+    fn test_config_from_table_properties(
+        #[case] properties: &[(&str, &str)],
+        #[case] write_stats_as_json: bool,
+        #[case] write_stats_as_struct: bool,
+    ) {
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_properties(properties)
+            .build();
+        let config = StatsTransformConfig::from_table_configuration(&table_config);
+        assert_eq!(config.write_stats_as_json, write_stats_as_json);
+        assert_eq!(config.write_stats_as_struct, write_stats_as_struct);
+        assert_eq!(config.stats_json_op, UnaryExpressionOp::ToJson);
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_config_with_struct_enabled() {
-        let props = TableProperties {
-            checkpoint_write_stats_as_struct: Some(true),
-            ..Default::default()
-        };
-        let config = StatsTransformConfig::from_table_properties(&props);
-        assert!(config.write_stats_as_json);
-        assert!(config.write_stats_as_struct);
+    fn test_config_encodes_adaptive_metadata_stats_at_full_precision() {
+        let table_config =
+            adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
+        let config = StatsTransformConfig::from_table_configuration(&table_config);
+        assert_eq!(config.stats_json_op, UnaryExpressionOp::ToJsonFullPrecision);
     }
 
     /// Helper to extract the outer and inner patches from a stats transform expression.
@@ -395,6 +412,7 @@ mod tests {
         let config = StatsTransformConfig {
             write_stats_as_json: true,
             write_stats_as_struct: false,
+            stats_json_op: UnaryExpressionOp::ToJson,
         };
         let stats_schema = schema_ref! {};
         let (_, transform_expr) = build_checkpoint_transform(&config, &stats_schema, None);
@@ -419,6 +437,7 @@ mod tests {
         let config = StatsTransformConfig {
             write_stats_as_json: true,
             write_stats_as_struct: true,
+            stats_json_op: UnaryExpressionOp::ToJson,
         };
         let stats_schema = schema_ref! {};
         let pv_schema = schema_ref! {
@@ -487,6 +506,7 @@ mod tests {
         let config = StatsTransformConfig {
             write_stats_as_json,
             write_stats_as_struct,
+            stats_json_op: UnaryExpressionOp::ToJson,
         };
         let stats_schema = schema_ref! {
             nullable NUM_RECORDS: LONG,

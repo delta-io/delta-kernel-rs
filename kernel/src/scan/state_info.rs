@@ -8,7 +8,7 @@ use tracing::{debug, enabled, warn, Level};
 use url::Url;
 
 use crate::actions::NULL_COUNT;
-use crate::expressions::ColumnName;
+use crate::expressions::{ColumnName, UnaryExpressionOp};
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, StructStats};
@@ -367,6 +367,17 @@ fn union_extra_into_filter(filter: &mut Vec<ColumnName>, extra: &[ColumnName]) {
 }
 
 impl StateInfo {
+    /// The operator that encodes this table's `stats_parsed` as JSON. See
+    /// [`TableConfiguration::stats_json_op`].
+    pub(crate) fn stats_json_op(&self) -> UnaryExpressionOp {
+        // `dv_normalization_root` is set exactly when adaptiveMetadata is enabled.
+        if self.dv_normalization_root.is_some() {
+            UnaryExpressionOp::ToJsonFullPrecision
+        } else {
+            UnaryExpressionOp::ToJson
+        }
+    }
+
     /// Create StateInfo with a custom field classifier for different scan types.
     /// Get the state needed to process a scan.
     ///

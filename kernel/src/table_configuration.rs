@@ -17,7 +17,7 @@ use tracing::warn;
 use url::Url;
 
 use crate::actions::{Metadata, Protocol, NULL_COUNT};
-use crate::expressions::ColumnName;
+use crate::expressions::{ColumnName, UnaryExpressionOp};
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
@@ -926,6 +926,16 @@ impl TableConfiguration {
     /// Whether the adaptiveMetadata table feature is enabled.
     pub(crate) fn is_adaptive_metadata_enabled(&self) -> bool {
         self.is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+    }
+
+    /// The operator that encodes this table's file statistics as JSON. adaptiveMetadata stats
+    /// carry `tightStats`, which requires untruncated timestamp bounds.
+    pub(crate) fn stats_json_op(&self) -> UnaryExpressionOp {
+        if self.is_adaptive_metadata_enabled() {
+            UnaryExpressionOp::ToJsonFullPrecision
+        } else {
+            UnaryExpressionOp::ToJson
+        }
     }
 
     /// The [`Version`] which this [`TableConfiguration`] belongs to.

@@ -733,7 +733,7 @@ impl CheckpointWriter {
         engine: &dyn Engine,
     ) -> KernelResult<CheckpointSchemaContext> {
         let tc = snapshot.table_configuration();
-        let config = StatsTransformConfig::from_table_properties(snapshot.table_properties());
+        let config = StatsTransformConfig::from_table_configuration(tc);
 
         // Select schema based on V2 checkpoint support
         let is_v2 = tc.is_feature_supported(&TableFeature::V2Checkpoint);

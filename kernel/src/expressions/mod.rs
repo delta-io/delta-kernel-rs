@@ -144,6 +144,12 @@ pub enum UnaryExpressionOp {
     ///
     /// [Per-file Statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics
     ToJson,
+    /// Like [`ToJson`](Self::ToJson), but timestamps keep their full microsecond precision: they
+    /// encode with exactly six fractional digits, so `{ ts: 2026-07-02T15:55:55.298677Z }` becomes
+    /// `{"ts":"2026-07-02T15:55:55.298677Z"}`. Kernel writes adaptiveMetadata `add.stats` with
+    /// this operator, because those stats carry `tightStats`, which requires untruncated
+    /// timestamp bounds. This is the exact inverse of [`ParseJsonExpression`].
+    ToJsonFullPrecision,
 }
 
 /// A binary arithmetic operator over two numeric operands.
@@ -364,8 +370,8 @@ pub struct VariadicExpression {
 }
 
 /// An expression that parses a JSON string column into a struct column of `output_schema`, the
-/// inverse of [`UnaryExpressionOp::ToJson`] except for the sub-millisecond timestamp precision
-/// that operator discards.
+/// inverse of [`UnaryExpressionOp::ToJsonFullPrecision`], and of [`UnaryExpressionOp::ToJson`]
+/// except for the sub-millisecond timestamp precision that operator discards.
 ///
 /// Unparseable input must degrade to NULL rather than fail the query, because kernel parses
 /// `add.stats` with this operator and data skipping reads null stats as "include the file". The
@@ -984,7 +990,7 @@ impl Expression {
     /// Creates a new ParseJson expression that parses a JSON string column into a struct.
     /// This is the inverse of [`UnaryExpressionOp::ToJson`] - it converts a JSON-encoded string
     /// into a struct. Sub-millisecond timestamp precision does not survive the round trip, since
-    /// `ToJson` truncates it.
+    /// `ToJson` truncates it; use [`UnaryExpressionOp::ToJsonFullPrecision`] to keep it.
     pub fn parse_json(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
     }
@@ -1184,6 +1190,7 @@ impl Display for UnaryExpressionOp {
         use UnaryExpressionOp::*;
         match self {
             ToJson => write!(f, "TO_JSON"),
+            ToJsonFullPrecision => write!(f, "TO_JSON_FULL_PRECISION"),
         }
     }
 }
@@ -1620,9 +1627,12 @@ mod tests {
 
         // ==================== Expression Operations Tests ====================
 
-        #[test]
-        fn test_unary_expression_roundtrip() {
-            let expr = Expression::unary(UnaryExpressionOp::ToJson, col!("data"));
+        #[rstest::rstest]
+        fn test_unary_expression_roundtrip(
+            #[values(UnaryExpressionOp::ToJson, UnaryExpressionOp::ToJsonFullPrecision)]
+            op: UnaryExpressionOp,
+        ) {
+            let expr = Expression::unary(op, col!("data"));
             assert_roundtrip(&expr);
         }
 

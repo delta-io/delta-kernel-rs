@@ -264,6 +264,7 @@ impl ScanLogReplayProcessor {
             synthesize_json,
         } = stats_options;
         let timestamp_timezone_name = partition_values_options.timestamp_timezone.as_deref();
+        let json_synthesis_op = synthesize_json.then(|| state_info.stats_json_op());
 
         // Create metrics first so we can pass them to DataSkippingFilter
         let metrics = Arc::new(ScanMetrics::default());
@@ -339,7 +340,7 @@ impl ScanLogReplayProcessor {
                     stats_schema_for_transform.clone(),
                     false, /* has_stats_parsed */
                     skip_stats,
-                    synthesize_json,
+                    json_synthesis_op,
                     partition_schema_for_transform.clone(),
                     false, /* has_partition_values_parsed */
                     timestamp_timezone_name,
@@ -353,7 +354,7 @@ impl ScanLogReplayProcessor {
                     stats_schema_for_transform,
                     has_stats_parsed,
                     skip_stats,
-                    synthesize_json,
+                    json_synthesis_op,
                     partition_schema_for_transform,
                     has_partition_values_parsed,
                     timestamp_timezone_name,
@@ -917,14 +918,15 @@ fn build_stats_output_projection(
 /// - `physical_stats_read_schema`: Schema for parsing stats from JSON for data skipping and
 ///   structured output, or None if structured stats are not needed.
 /// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column. When true and
-///   `synthesize_json` is true, stats output uses `COALESCE(add.stats, ToJson(add.stats_parsed))`
+///   `synthesize_json` is `Some(op)`, stats output uses `COALESCE(add.stats, op(add.stats_parsed))`
 ///   so that `ScanFile.stats` is populated even when the checkpoint lacks JSON stats
 ///   (writeStatsAsJson=false).
 /// - `skip_stats`: When true, replaces the stats column with a null literal, avoiding reads of the
 ///   JSON stats column in checkpoint parquet files.
-/// - `synthesize_json`: When false, disables the `ToJson(add.stats_parsed)` fallback regardless of
-///   `has_stats_parsed`. Compatible parsed-stats checkpoints produce null JSON stats and can omit
-///   the JSON stats column; JSON-only checkpoints and commits retain `add.stats` as fallback input.
+/// - `synthesize_json`: The JSON-encoding operator for the `stats_parsed` fallback. `None` disables
+///   the fallback regardless of `has_stats_parsed`. Compatible parsed-stats checkpoints produce
+///   null JSON stats and can omit the JSON stats column; JSON-only checkpoints and commits retain
+///   `add.stats` as fallback input.
 /// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
 ///   value parsing is not needed.
 /// - `has_partition_values_parsed`: Whether the source carries a native `partitionValues_parsed`
@@ -939,19 +941,19 @@ fn get_add_transform_expr(
     physical_stats_read_schema: Option<SchemaRef>,
     has_stats_parsed: bool,
     skip_stats: bool,
-    synthesize_json: bool,
+    synthesize_json: Option<UnaryExpressionOp>,
     partition_schema: Option<SchemaRef>,
     has_partition_values_parsed: bool,
     timestamp_timezone: Option<&str>,
 ) -> ExpressionRef {
     let stats_expr = if skip_stats {
         Arc::new(null_lit(DataType::STRING))
-    } else if has_stats_parsed && synthesize_json {
+    } else if let Some(json_op) = synthesize_json.filter(|_| has_stats_parsed) {
         // Checkpoint may lack JSON stats when writeStatsAsJson=false. Fall back to
         // serializing stats_parsed so ScanFile.stats is populated either way.
         Arc::new(Expression::coalesce([
             col!("add.stats"),
-            Expression::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed")),
+            Expression::unary(json_op, col!("add.stats_parsed")),
         ]))
     } else if has_stats_parsed {
         // The compatible checkpoint projection can omit add.stats when JSON output is disabled.
@@ -2497,9 +2499,9 @@ mod tests {
         // Synthesis enabled: COALESCE branch present -> exactly one ToJson.
         let with_synthesis = get_add_transform_expr(
             Some(stats_schema.clone()),
-            true,  // has_stats_parsed
-            false, // skip_stats
-            true,  // synthesize_json
+            true,                            // has_stats_parsed
+            false,                           // skip_stats
+            Some(UnaryExpressionOp::ToJson), // synthesize_json
             partition_schema.clone(),
             false, // has_partition_values_parsed
             None,  // timestamp_timezone
@@ -2515,7 +2517,7 @@ mod tests {
             Some(stats_schema),
             true,  // has_stats_parsed
             false, // skip_stats
-            false, // synthesize_json
+            None,  // synthesize_json
             partition_schema,
             false, // has_partition_values_parsed
             None,  // timestamp_timezone

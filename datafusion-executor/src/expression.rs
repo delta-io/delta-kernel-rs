@@ -73,9 +73,12 @@ pub fn to_df_expr(
         KernelExpression::ParseJson(parse) => parse_json_to_df_expr(parse, input_schema),
 
         KernelExpression::Unary(u) => match u.op {
-            UnaryExpressionOp::ToJson => Err(KernelError::unsupported(
-                "converting the ToJson expression is not yet supported",
-            )),
+            UnaryExpressionOp::ToJson | UnaryExpressionOp::ToJsonFullPrecision => {
+                Err(KernelError::unsupported(format!(
+                    "converting the {:?} expression is not yet supported",
+                    u.op
+                )))
+            }
         },
 
         // TODO(#3007): implement once kernel's Cast semantics are clarified.

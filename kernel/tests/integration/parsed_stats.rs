@@ -281,9 +281,13 @@ mod adaptive_metadata {
     use std::sync::Arc;
 
     use delta_kernel::actions::TIGHT_STATS;
+    use delta_kernel::arrow::array::TimestampMicrosecondArray;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::schema::schema_ref;
-    use test_utils::{add_commit, create_table_with_column_mapping_mode};
+    use test_utils::{
+        add_commit, create_table_with_column_mapping_mode, engine_store_setup, insert_data,
+        read_actions_from_commit,
+    };
     use url::Url;
 
     use super::*;
@@ -375,5 +379,53 @@ mod adaptive_metadata {
             rows.into_iter().map(|(_, tight)| tight).collect::<Vec<_>>()
         });
         assert_eq!(actual, expected);
+    }
+
+    /// adaptiveMetadata `add.stats` keep every microsecond digit of timestamp bounds, while other
+    /// tables truncate them down to milliseconds.
+    #[rstest]
+    #[case::adaptive_metadata(vec!["adaptiveMetadata-preview"], "id", "2026-07-02T15:55:55.298677Z")]
+    #[case::without_adaptive_metadata(vec![], "none", "2026-07-02T15:55:55.298Z")]
+    #[tokio::test]
+    async fn committed_timestamp_stats_precision_follows_adaptive_metadata(
+        #[case] features: Vec<&str>,
+        #[case] column_mapping_mode: &str,
+        #[case] expected_bound: &str,
+    ) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir_url = Url::from_directory_path(temp_dir.path()).unwrap();
+        let (store, engine, table_location) = engine_store_setup("ts_table", Some(&temp_dir_url));
+        let engine = Arc::new(engine);
+        let table_url = create_table_with_column_mapping_mode(
+            store,
+            table_location,
+            schema_ref! { nullable "ts": TIMESTAMP },
+            &[],
+            true,
+            features.clone(),
+            features,
+            column_mapping_mode,
+        )
+        .await
+        .unwrap();
+        let snapshot = Snapshot::builder_for(table_url.clone())
+            .build(engine.as_ref())
+            .unwrap();
+        let ts = TimestampMicrosecondArray::from(vec![1_783_007_755_298_677]).with_timezone("UTC");
+        insert_data(snapshot, &engine, vec![Arc::new(ts)])
+            .await
+            .unwrap()
+            .unwrap_committed();
+
+        let adds = read_actions_from_commit(&table_url, 1, "add").unwrap();
+        let [add] = adds.as_slice() else {
+            panic!("expected one add, got {adds:?}");
+        };
+        let stats: serde_json::Value =
+            serde_json::from_str(add["stats"].as_str().unwrap()).unwrap();
+        for bound in [MIN_VALUES, MAX_VALUES] {
+            let values: Vec<_> = stats[bound].as_object().unwrap().values().collect();
+            assert_eq!(values, [expected_bound], "{bound} in {stats}");
+        }
     }
 }

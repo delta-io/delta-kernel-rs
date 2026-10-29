@@ -176,6 +176,12 @@ pub struct EngineExpressionVisitor {
     /// See [`UnaryExpressionOp::ToJson`] for the encoding the implementation must produce; in
     /// particular, timestamps carry exactly three fractional digits, truncated.
     pub visit_to_json: VisitUnaryFn,
+    /// Visits the `ToJsonFullPrecision` unary operator belonging to the list identified by
+    /// `sibling_list_id`. The sub-expression will be in a _one_ item list identified by
+    /// `child_list_id`. See [`UnaryExpressionOp::ToJsonFullPrecision`] for the encoding the
+    /// implementation must produce; it differs from `ToJson` only in keeping all six microsecond
+    /// digits of timestamps.
+    pub visit_to_json_full_precision: VisitUnaryFn,
     /// Visits the `ParseJson` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expression (JSON string) will be in a _one_ item list identified by
     /// `child_list_id`. The `output_schema` handle specifies the schema to parse the JSON
@@ -658,6 +664,7 @@ fn visit_expression_impl(
             visit_expression_impl(visitor, expr, child_list_id);
             let visit_fn = match op {
                 UnaryExpressionOp::ToJson => visitor.visit_to_json,
+                UnaryExpressionOp::ToJsonFullPrecision => visitor.visit_to_json_full_precision,
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
@@ -959,6 +966,7 @@ mod tests {
             visit_not: ignore_child_list,
             visit_is_null: ignore_child_list,
             visit_to_json: ignore_child_list,
+            visit_to_json_full_precision: ignore_child_list,
             visit_parse_json: ignore_parse_json,
             visit_map_to_struct,
             visit_lt: ignore_child_list,
