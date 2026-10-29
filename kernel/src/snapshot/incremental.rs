@@ -326,7 +326,11 @@ impl Snapshot {
                 // incremental replay context, preserving the original error sources.
                 combined_log_segment
                     .segment_after_version(existing_snapshot_version)
-                    .read_protocol_metadata_opt(engine, newer_base)
+                    .read_protocol_metadata_newer_than(
+                        engine,
+                        newer_base,
+                        existing_snapshot_version,
+                    )
                     .inspect_err(|_| {
                         emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
                     })?
