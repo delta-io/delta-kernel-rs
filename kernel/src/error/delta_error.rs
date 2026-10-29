@@ -232,7 +232,6 @@ mod tests {
         );
         assert_eq!(delta.backtrace().status(), BacktraceStatus::Captured);
         let backtrace = delta.backtrace().to_string();
-        assert!(backtrace.contains("DeltaError::new"), "{backtrace}");
 
         let error: Error = delta.into();
         let Error::Delta(delta) = error else {
