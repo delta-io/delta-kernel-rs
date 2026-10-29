@@ -1522,9 +1522,8 @@ mod test {
     }
 
     #[rstest]
-    // Tables whose top-level columns declare generation expressions without `generatedColumns`
-    // support. The expressions define no generated columns, so kernel writes the table as a normal
-    // table, as Delta Spark does.
+    // Tables with top-level generation expressions, but without `generatedColumns` in the protocol.
+    // Kernel ignores the expressions and writes the table as a normal table, like Delta Spark.
     #[case::without_feature(
         generated_event_year_schema(),
         MockProtocolBuilder::new().build(),
@@ -1581,8 +1580,8 @@ mod test {
         MockProtocolBuilder::new().with_versions(1, 2).build(),
         WriteSupport::Supported
     )]
-    // Only top-level columns can be generated columns, so an expression on a nested field defines
-    // no generated column. Delta Spark writes such a table as a normal table.
+    // Only top-level columns can be generated columns, so kernel ignores an expression on a nested
+    // field, like Delta Spark.
     #[case::nested_generation_expression(
         schema_ref! {
             nullable "details": (schema! {
