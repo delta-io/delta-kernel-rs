@@ -3,7 +3,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-#[cfg(feature = "adaptive-metadata-in-dev")]
+#[cfg(feature = "declarative-plans")]
+use std::sync::Mutex;
+#[cfg(any(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
 use std::sync::OnceLock;
 
 use delta_kernel_derive::internal_api;
@@ -17,6 +19,8 @@ use crate::actions::visitors::SetTransactionMap;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
+#[cfg(feature = "declarative-plans")]
+use crate::checkpoint::CheckpointShape;
 use crate::checkpoint::{
     ensure_standalone_checkpoint_supported, CheckpointSpec, CheckpointWriter, V2CheckpointConfig,
     DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
@@ -123,6 +127,12 @@ pub struct Snapshot {
     /// (see [`LastManifestCommitResolution`]). Safe to cache like [`Self::checkpoint_action`].
     #[cfg(feature = "adaptive-metadata-in-dev")]
     last_manifest_commit: OnceLock<Option<LastManifestCommit>>,
+    // Immutable checkpoint inputs are shared by inspection and scan planning.
+    #[cfg(feature = "declarative-plans")]
+    checkpoint_shape: OnceLock<CheckpointShape>,
+    // Serialize fallible initialization without locking subsequent reads. Failed I/O can retry.
+    #[cfg(feature = "declarative-plans")]
+    checkpoint_shape_init: Mutex<()>,
 }
 
 impl PartialEq for Snapshot {
@@ -294,6 +304,10 @@ impl Snapshot {
             },
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit,
+            #[cfg(feature = "declarative-plans")]
+            checkpoint_shape: OnceLock::new(),
+            #[cfg(feature = "declarative-plans")]
+            checkpoint_shape_init: Mutex::new(()),
         }
     }
 
@@ -561,6 +575,114 @@ impl Snapshot {
     /// Returns an error if the total commit file size exceeds [`u64::MAX`].
     pub fn log_segment_stats(&self) -> KernelResult<LogSegmentStats> {
         self.log_segment.stats()
+    }
+
+    /// Returns the selected checkpoint's physical size, including every top-level part and
+    /// referenced sidecar. Returns zero without a checkpoint. Successful inspection is cached
+    /// and shared with [`Self::checkpoint_shape`] and declarative scan planning.
+    /// Resolves metadata through `engine`'s [`PlanExecutor`](crate::plans::PlanExecutor).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `engine` has no plan executor, checkpoint metadata cannot be read,
+    /// or the sum exceeds [`u64::MAX`].
+    #[cfg(feature = "declarative-plans")]
+    pub fn checkpoint_size_in_bytes(&self, engine: &dyn Engine) -> KernelResult<u64> {
+        let shape = self.checkpoint_shape(engine, false)?;
+        self.log_segment
+            .listed
+            .checkpoint_parts
+            .iter()
+            .map(|part| &part.location)
+            .chain(shape.sidecars.iter())
+            .try_fold(0u64, |total, file| {
+                total
+                    .checked_add(file.size)
+                    .ok_or_else(|| KernelError::generic("Checkpoint file size exceeds u64::MAX"))
+            })
+    }
+
+    /// Returns the number of checkpoint files carrying file actions, or zero without a checkpoint.
+    /// Counts sidecars instead of the top-level checkpoint when sidecars are present.
+    /// Resolves metadata through `engine`, sharing [`Self::checkpoint_shape`]'s cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if checkpoint shape resolution fails.
+    #[cfg(feature = "declarative-plans")]
+    pub fn checkpoint_num_files(&self, engine: &dyn Engine) -> KernelResult<u64> {
+        let shape = self.checkpoint_shape(engine, false)?;
+        Ok(if shape.sidecars.is_empty() {
+            self.log_segment.listed.checkpoint_parts.len()
+        } else {
+            shape.sidecars.len()
+        } as u64)
+    }
+
+    /// Returns the checkpoint's physical Parquet schema, borrowed for the snapshot's lifetime.
+    /// Returns `None` without a checkpoint or for an inline JSON checkpoint. All checkpoint parts
+    /// or sidecars share this schema. Resolves metadata through `engine`, sharing
+    /// [`Self::checkpoint_shape`]'s cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if checkpoint shape or schema resolution fails.
+    #[cfg(feature = "declarative-plans")]
+    pub fn checkpoint_parquet_schema(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<&SchemaRef>> {
+        let shape = self.checkpoint_shape(engine, true)?;
+        let is_json_leaf = shape.sidecars.is_empty()
+            && self
+                .log_segment
+                .listed
+                .checkpoint_parts
+                .first()
+                .is_some_and(|part| part.is_json());
+        Ok(if is_json_leaf {
+            None
+        } else {
+            shape.leaf_checkpoint_schema()
+        })
+    }
+
+    /// Returns this snapshot's cached checkpoint shape, borrowed for the snapshot's lifetime.
+    /// Uses `engine`'s [`PlanExecutor`](crate::plans::PlanExecutor) to resolve checkpoint inputs;
+    /// `needs_leaf_schema` additionally loads the physical schema.
+    /// Successful inspection is shared with declarative scan planning. Failed reads can retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `engine` has no plan executor or checkpoint metadata cannot be read or
+    /// decoded.
+    #[cfg(feature = "declarative-plans")]
+    pub fn checkpoint_shape(
+        &self,
+        engine: &dyn Engine,
+        needs_leaf_schema: bool,
+    ) -> KernelResult<&CheckpointShape> {
+        if let Some(shape) = self.checkpoint_shape.get() {
+            if !needs_leaf_schema || shape.leaf_schema_resolved() {
+                return Ok(shape);
+            }
+        }
+        let exec = engine.require_plan_executor()?;
+        let _guard = self
+            .checkpoint_shape_init
+            .lock()
+            .map_err(|_| KernelError::generic("Checkpoint inspection lock poisoned"))?;
+        let shape = match self.checkpoint_shape.get() {
+            Some(shape) => shape,
+            None => {
+                let shape = CheckpointShape::try_new(exec.as_ref(), self)?;
+                self.checkpoint_shape.get_or_init(|| shape)
+            }
+        };
+        if needs_leaf_schema {
+            shape.resolve_leaf_schema(exec.as_ref(), self)?;
+        }
+        Ok(shape)
     }
 
     /// Captures retained snapshot state as an owned hint without engine I/O.
@@ -1785,8 +1907,42 @@ mod tests {
     };
     use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
     use crate::transaction::create_table::create_table;
+    #[cfg(feature = "declarative-plans")]
+    use crate::unit_test_utils::load_test_table;
     use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::utils::FoldWithOption as _;
+
+    #[cfg(feature = "declarative-plans")]
+    #[rstest]
+    #[case("table-without-dv-small", 0, false)]
+    #[case("v1-single-part-struct-stats-only", 1, true)]
+    #[case("v1-multi-part-struct-stats-only", 3, true)]
+    #[case("v1-multi-part-partitioned-struct-stats-only", 3, true)]
+    #[case("v2-json-sidecars-struct-stats-only", 1, true)]
+    #[case("v2-parquet-sidecars-struct-stats-only", 1, true)]
+    #[case("v2-classic-parquet-struct-stats-only", 1, true)]
+    #[case("v2-checkpoints-json-without-sidecars", 1, false)]
+    fn checkpoint_shape_describes_file_actions(
+        #[case] table: &str,
+        #[case] expected_files: u64,
+        #[case] expect_parquet_schema: bool,
+    ) -> KernelResult<()> {
+        let (engine, snapshot, _temp) = load_test_table(table)?;
+        assert_eq!(
+            snapshot.checkpoint_num_files(engine.as_ref())?,
+            expected_files
+        );
+        let schema = snapshot.checkpoint_parquet_schema(engine.as_ref())?;
+        assert_eq!(schema.is_some(), expect_parquet_schema);
+        if let Some(schema) = schema {
+            let DataType::Struct(add) = schema.field("add").unwrap().data_type() else {
+                panic!("checkpoint add field must be a struct");
+            };
+            assert!(add.field("stats_parsed").is_some());
+            assert!(add.field("path").is_some());
+        }
+        Ok(())
+    }
 
     /// Helper function to create a commitInfo action with optional ICT
     fn create_commit_info(timestamp: i64, ict: Option<i64>) -> serde_json::Value {
