@@ -381,16 +381,22 @@ mod adaptive_metadata {
         assert_eq!(actual, expected);
     }
 
-    /// adaptiveMetadata `add.stats` keep every microsecond digit of timestamp bounds, while other
-    /// tables truncate them down to milliseconds.
+    /// adaptiveMetadata `add.stats` carry `tightStats` and keep every microsecond digit of
+    /// timestamp bounds, while other tables truncate them down to milliseconds.
     #[rstest]
-    #[case::adaptive_metadata(vec!["adaptiveMetadata-preview"], "id", "2026-07-02T15:55:55.298677Z")]
-    #[case::without_adaptive_metadata(vec![], "none", "2026-07-02T15:55:55.298Z")]
+    #[case::adaptive_metadata(
+        vec!["adaptiveMetadata-preview"],
+        "id",
+        "2026-07-02T15:55:55.298677Z",
+        Some(true)
+    )]
+    #[case::without_adaptive_metadata(vec![], "none", "2026-07-02T15:55:55.298Z", None)]
     #[tokio::test]
     async fn committed_timestamp_stats_precision_follows_adaptive_metadata(
         #[case] features: Vec<&str>,
         #[case] column_mapping_mode: &str,
         #[case] expected_bound: &str,
+        #[case] expected_tight_stats: Option<bool>,
     ) {
         let temp_dir = tempfile::tempdir().unwrap();
         let temp_dir_url = Url::from_directory_path(temp_dir.path()).unwrap();
@@ -427,5 +433,10 @@ mod adaptive_metadata {
             let values: Vec<_> = stats[bound].as_object().unwrap().values().collect();
             assert_eq!(values, [expected_bound], "{bound} in {stats}");
         }
+        assert_eq!(
+            stats[TIGHT_STATS].as_bool(),
+            expected_tight_stats,
+            "{stats}"
+        );
     }
 }
