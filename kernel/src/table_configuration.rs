@@ -1144,7 +1144,7 @@ impl TableConfiguration {
             )
         );
 
-        // Run discovery to check that every generated column's expression is a string, because
+        // Run discovery to assert that every generated column's expression is a string, because
         // connectors receive it as SQL text. A non-string expression fails discovery with a schema
         // error and blocks the write.
         #[cfg(feature = "generated-columns-in-dev")]

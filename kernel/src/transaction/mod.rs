@@ -1005,8 +1005,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         Ok(())
     }
 
-    /// Fails `write_state` and commits when this transaction has effective generated columns and
-    /// the connector hasn't acknowledged enforcing them.
+    /// Fails `write_state` and `commit` when this transaction has effective generated columns that
+    /// the connector hasn't acknowledged.
     #[cfg(feature = "generated-columns-in-dev")]
     fn ensure_generated_columns_acknowledged(&self) -> KernelResult<()> {
         require!(
