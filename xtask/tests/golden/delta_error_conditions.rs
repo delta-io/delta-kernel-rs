@@ -16,9 +16,6 @@ pub enum DeltaErrorCondition {
     FamilyInherits,
     /// `TOP_LEVEL` (SQLSTATE `22000`).
     TopLevel,
-    /// A synthetic condition for unit tests with an empty allowlist.
-    #[cfg(test)]
-    TestOnly,
 }
 
 impl DeltaErrorCondition {
@@ -36,8 +33,6 @@ impl DeltaErrorCondition {
                 parameter_names: &["a", "b"],
                 message_template: "Value <a> and <b>.",
             },
-            #[cfg(test)]
-            Self::TestOnly => super::TEST_CONDITION_METADATA,
         }
     }
 }

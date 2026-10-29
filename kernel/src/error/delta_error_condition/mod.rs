@@ -16,15 +16,6 @@ struct ConditionMetadata {
     message_template: &'static str,
 }
 
-// Keep DeltaError construction testable without adding a public catalog condition.
-#[cfg(test)]
-const TEST_CONDITION_METADATA: ConditionMetadata = ConditionMetadata {
-    name: "TEST_ONLY",
-    sql_state: None,
-    parameter_names: &["first", "second"],
-    message_template: "First <first>, second <second>, first <first>.",
-};
-
 impl DeltaErrorCondition {
     /// Returns the catalog name of this condition, such as `DELTA_VERSIONS_NOT_CONTIGUOUS` or
     /// `PARENT.SUB` for a subclass.

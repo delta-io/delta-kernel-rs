@@ -223,10 +223,12 @@ mod tests {
         }
 
         let delta = DeltaError::new(
-            DeltaErrorCondition::TestOnly,
+            DeltaErrorCondition::DeltaVersionsNotContiguous,
             vec![
-                DeltaErrorParameter::new("first", "one"),
-                DeltaErrorParameter::new("second", "two"),
+                DeltaErrorParameter::new("versionList", "0, 2"),
+                DeltaErrorParameter::new("startVersion", 0),
+                DeltaErrorParameter::new("endVersion", 2),
+                DeltaErrorParameter::new("versionToLoad", 2),
             ],
             None,
         );

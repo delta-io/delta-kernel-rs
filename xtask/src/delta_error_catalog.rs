@@ -373,12 +373,6 @@ fn render(source: &Source, conditions: &[Condition]) -> Result<String, std::fmt:
         writeln!(out, "    /// `{}`{sql_state}.", c.name)?;
         writeln!(out, "    {},", c.variant)?;
     }
-    writeln!(
-        out,
-        "    /// A synthetic condition for unit tests with an empty allowlist."
-    )?;
-    writeln!(out, "    #[cfg(test)]")?;
-    writeln!(out, "    TestOnly,")?;
     writeln!(out, "}}")?;
     writeln!(out)?;
     writeln!(out, "impl DeltaErrorCondition {{")?;
@@ -412,11 +406,6 @@ fn render(source: &Source, conditions: &[Condition]) -> Result<String, std::fmt:
         writeln!(out, "                message_template: {:?},", c.template)?;
         writeln!(out, "            }},")?;
     }
-    writeln!(out, "            #[cfg(test)]")?;
-    writeln!(
-        out,
-        "            Self::TestOnly => super::TEST_CONDITION_METADATA,"
-    )?;
     writeln!(out, "        }}")?;
     writeln!(out, "    }}")?;
     writeln!(out, "}}")?;

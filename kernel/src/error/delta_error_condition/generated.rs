@@ -14,9 +14,6 @@ use super::ConditionMetadata;
 pub enum DeltaErrorCondition {
     /// `DELTA_VERSIONS_NOT_CONTIGUOUS` (SQLSTATE `KD00C`).
     DeltaVersionsNotContiguous,
-    /// A synthetic condition for unit tests with an empty allowlist.
-    #[cfg(test)]
-    TestOnly,
 }
 
 impl DeltaErrorCondition {
@@ -28,8 +25,6 @@ impl DeltaErrorCondition {
                 parameter_names: &["versionList", "startVersion", "endVersion", "versionToLoad"],
                 message_template: "Versions (<versionList>) are not contiguous. \nA gap in the delta log between versions <startVersion> and <endVersion> was detected while trying to load version <versionToLoad>.",
             },
-            #[cfg(test)]
-            Self::TestOnly => super::TEST_CONDITION_METADATA,
         }
     }
 }
