@@ -180,6 +180,7 @@ impl CommitRangeBuilder {
             commit_files,
             start_version,
             end_version,
+            max_catalog_version,
             commit_ordering,
             supports_commit_actions: commit_range_validation,
             supports_commit_files: commit_ordering == CommitOrdering::AscendingOrder,
@@ -571,6 +572,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(range.end_version(), 1);
+        assert_eq!(range.max_catalog_version(), Some(1));
         assert_eq!(range.commit_files.len(), 2);
         assert_eq!(range.commit_files[1].version, 1);
         assert_eq!(
@@ -717,6 +719,20 @@ mod tests {
         assert_eq!(range.end_version(), 0);
         assert_eq!(range.commit_files.len(), 1);
         assert_eq!(range.commit_files[0].version, 0);
+    }
+
+    #[test]
+    fn test_max_catalog_version_setter_order_is_preserved() {
+        let table_root = dv_small_table_root();
+        let max_from_log_tail = CommitRange::builder_for(table_root.as_str(), 0)
+            .with_max_catalog_version(0)
+            .with_log_tail(Vec::new(), 1);
+        assert_eq!(max_from_log_tail.max_catalog_version, Some(1));
+
+        let max_from_setter = CommitRange::builder_for(table_root.as_str(), 0)
+            .with_log_tail(Vec::new(), 1)
+            .with_max_catalog_version(0);
+        assert_eq!(max_from_setter.max_catalog_version, Some(0));
     }
 
     #[test]

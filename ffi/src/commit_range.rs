@@ -12,7 +12,8 @@ use crate::handle::Handle;
 use crate::log_path::{FfiLogPath, LogPathArray};
 use crate::{
     kernel_string_slice, unwrap_and_parse_path_as_url, ExternEngine, ExternResult,
-    IntoExternResult, KernelStringSlice, NullableCvoid, SharedExternEngine, SharedSnapshot,
+    IntoExternResult, KernelStringSlice, NullableCvoid, OptionalValue, SharedExternEngine,
+    SharedSnapshot,
 };
 
 /// An opaque, shared handle owning a [`CommitRange`] produced by
@@ -255,6 +256,24 @@ pub unsafe extern "C" fn free_commit_range_builder(builder: Handle<ExclusiveComm
 #[no_mangle]
 pub unsafe extern "C" fn free_commit_range(commit_range: Handle<SharedCommitRange>) {
     commit_range.drop_handle();
+}
+
+/// Return the maximum catalog version explicitly configured for a commit range, if any.
+///
+/// `OptionalValue::None` means no maximum was configured, even when the range end was inferred.
+/// The value is independent of the range end and is returned as a copy that remains valid after
+/// the range handle is released. This accessor performs no I/O.
+///
+/// # Safety
+///
+/// Caller must pass a valid live commit range handle. The function borrows the handle for the
+/// duration of the call and does not consume it.
+#[no_mangle]
+pub unsafe extern "C" fn commit_range_max_catalog_version(
+    commit_range: Handle<SharedCommitRange>,
+) -> OptionalValue<Version> {
+    let commit_range = unsafe { commit_range.as_ref() };
+    commit_range.max_catalog_version().into()
 }
 
 /// FFI-safe mirror of the kernel's [`KernelDeltaAction`]: the Delta log action kinds a caller can
@@ -798,6 +817,50 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
+    #[case::none_inferred_end(None, None, None)]
+    #[case::none_explicit_end(None, Some(2), None)]
+    #[case::zero(Some(0), None, Some(0))]
+    #[case::nonzero_above_explicit_end(Some(5), Some(2), Some(5))]
+    #[case::maximum_version(Some(Version::MAX), Some(2), Some(Version::MAX))]
+    #[tokio::test]
+    async fn test_commit_range_max_catalog_version_returns_configured_value(
+        #[case] builder_max: Option<Version>,
+        #[case] builder_end: Option<Version>,
+        #[case] expected_max_catalog_version: Option<Version>,
+    ) -> KernelResult<()> {
+        let (engine, table_root) = setup_engine_with_commits(3).await;
+        let builder = unsafe {
+            ok_or_panic(commit_range_builder_for(
+                kernel_string_slice!(table_root),
+                0,
+                engine.shallow_copy(),
+            ))
+        };
+        let builder = if let Some(end_version) = builder_end {
+            unsafe { commit_range_builder_with_end_version(builder, end_version) }
+        } else {
+            builder
+        };
+        let builder = if let Some(max_catalog_version) = builder_max {
+            unsafe { commit_range_builder_with_max_catalog_version(builder, max_catalog_version) }
+        } else {
+            builder
+        };
+        let range = unsafe { ok_or_panic(commit_range_builder_build(builder)) };
+
+        let first = unsafe { commit_range_max_catalog_version(range.shallow_copy()) };
+        let second = unsafe { commit_range_max_catalog_version(range.shallow_copy()) };
+        assert_eq!(first, expected_max_catalog_version.into());
+        assert_eq!(second, expected_max_catalog_version.into());
+        let copied_version: Option<Version> = first.into();
+
+        unsafe { free_commit_range(range) }
+        assert_eq!(copied_version, expected_max_catalog_version);
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_commit_range_builder_accepts_catalog_log_tail() -> KernelResult<()> {
         let (engine, table_root) = setup_engine_with_commits(1).await;
@@ -821,6 +884,10 @@ mod tests {
             unsafe { ok_or_panic(commit_range_builder_with_log_tail(builder, log_tail, 1)) };
         let range = unsafe { ok_or_panic(commit_range_builder_build(builder)) };
         assert_eq!(unsafe { range.as_ref() }.end_version(), 1);
+        assert_eq!(
+            unsafe { commit_range_max_catalog_version(range.shallow_copy()) },
+            OptionalValue::Some(1)
+        );
 
         unsafe { free_commit_range(range) }
         unsafe { free_engine(engine) }

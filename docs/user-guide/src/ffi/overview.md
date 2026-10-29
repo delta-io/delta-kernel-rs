@@ -329,6 +329,7 @@ Read a range of raw commits. Mirrors the Rust `CommitRange` API.
 | `commit_range_builder_with_end_version` / `commit_range_builder_with_log_tail` / `commit_range_builder_with_max_catalog_version` | Bound the range and supply the catalog log tail for catalog-managed tables |
 | `commit_range_builder_with_commit_range_validation` / `commit_range_builder_with_fail_on_data_loss` | Relax build-time validation and choose whether the commit-files iterator fails on missing versions |
 | `commit_range_builder_build` | Consume the builder and produce a `SharedCommitRange` |
+| `commit_range_max_catalog_version` | Read the optional maximum catalog version retained by a `SharedCommitRange` |
 | `commit_range_commits` / `commit_range_commits_with_snapshot` / `commit_range_commits_next` | Iterate commits as `SharedCommitAction` handles; requires a range built with commit range validation |
 | `commit_range_commit_files` / `commit_range_commit_files_next` | Return an iterator of commit files |
 | `free_commit_range_builder` / `free_commit_range` / `free_commit_action` / `free_commit_actions_iter` / `free_commit_files_iter` | Release commit-range handles |

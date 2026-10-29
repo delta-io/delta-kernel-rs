@@ -88,6 +88,7 @@ pub struct CommitRange {
     commit_files: Vec<ParsedLogPath>,
     start_version: Version,
     end_version: Version,
+    max_catalog_version: Option<Version>,
     commit_ordering: CommitOrdering,
     supports_commit_actions: bool,
     supports_commit_files: bool,
@@ -117,6 +118,11 @@ impl CommitRange {
     /// Last version (inclusive) in the range.
     pub fn end_version(&self) -> Version {
         self.end_version
+    }
+
+    /// Maximum catalog version plumbed through the commit range, if any.
+    pub fn max_catalog_version(&self) -> Option<Version> {
+        self.max_catalog_version
     }
 
     /// The table root URL this range was built from.
@@ -424,7 +430,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use test_utils::{add_commit, assert_result_error_with_message};
+    use test_utils::{
+        actions_to_string_catalog_managed, add_commit, assert_result_error_with_message, TestAction,
+    };
 
     use super::*;
     use crate::actions::visitors::{AddVisitor, RemoveVisitor};
@@ -455,6 +463,80 @@ mod tests {
             .build(engine.as_ref())
             .unwrap();
         (range, engine, anchor_snapshot)
+    }
+
+    #[rstest::rstest]
+    #[case::inferred_end(None, 1)]
+    #[case::explicit_end(Some(1), 1)]
+    fn test_max_catalog_version_is_none_when_not_configured(
+        #[case] end_version: Option<Version>,
+        #[case] expected_end_version: Version,
+    ) {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let table_root = url::Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+        let mut builder = CommitRange::builder_for(table_root.as_str(), 0);
+        if let Some(end_version) = end_version {
+            builder = builder.with_end_version(end_version);
+        }
+        let range = builder.build(&engine).unwrap();
+
+        assert_eq!(range.end_version(), expected_end_version);
+        assert_eq!(range.max_catalog_version(), None);
+    }
+
+    #[rstest::rstest]
+    #[case::zero(0, None, 0)]
+    #[case::above_explicit_end(5, Some(1), 1)]
+    #[case::maximum_version(Version::MAX, Some(1), 1)]
+    fn test_max_catalog_version_is_independent_of_range_end(
+        #[case] max_catalog_version: Version,
+        #[case] end_version: Option<Version>,
+        #[case] expected_end_version: Version,
+    ) {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let table_root = url::Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+        let mut builder = CommitRange::builder_for(table_root.as_str(), 0);
+        if let Some(end_version) = end_version {
+            builder = builder.with_end_version(end_version);
+        }
+        let range = builder
+            .with_max_catalog_version(max_catalog_version)
+            .build(&engine)
+            .unwrap();
+
+        assert_eq!(range.end_version(), expected_end_version);
+        assert_eq!(range.max_catalog_version(), Some(max_catalog_version));
+    }
+
+    #[tokio::test]
+    async fn test_builder_from_uses_only_explicit_range_catalog_version() -> KernelResult<()> {
+        let table_root = "memory:///catalog_managed_range/";
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            actions_to_string_catalog_managed(vec![TestAction::Metadata]),
+        )
+        .await
+        .unwrap();
+        let engine = SyncEngine::new_with_store(storage);
+        let snapshot = Snapshot::builder_for(table_root)
+            .with_max_catalog_version(0)
+            .build(&engine)?;
+
+        let without_range_max = CommitRange::builder_from(snapshot.clone(), 0).build(&engine)?;
+        assert_eq!(without_range_max.max_catalog_version(), None);
+
+        let with_range_max = CommitRange::builder_from(snapshot, 0)
+            .with_max_catalog_version(0)
+            .build(&engine)?;
+        assert_eq!(with_range_max.max_catalog_version(), Some(0));
+        Ok(())
     }
 
     #[test]
