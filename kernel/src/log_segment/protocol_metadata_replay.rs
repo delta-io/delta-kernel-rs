@@ -159,6 +159,10 @@ impl LogSegment {
                 return Ok(newest);
             }
             let Some(older) = PmPlanSegment::older_commits(self, &newest)? else {
+                // Nothing older to read: the segment has no older commits, or the newest commit's
+                // own checkpoint action has the P&M as of the commit before it. A P or M that is
+                // still missing is reported upstream, by the snapshot build that consumes this
+                // resolution.
                 return Ok(newest);
             };
             let resolved = newest.merge(self.replay_for_pm_via_plan(executor, older)?);
@@ -216,13 +220,13 @@ impl LogSegment {
             col!(PROTOCOL_NAME, "minReaderVersion").is_not_null(),
             col!(METADATA_NAME, "id").is_not_null(),
         );
-        let relevant_action = extra_actions.iter().fold(pm_action, |relevant, action| {
-            Predicate::or(relevant, action.keep.clone())
+        let relevant_action = extra_actions.iter().fold(pm_action, |filter, action| {
+            Predicate::or(filter, action.keep.clone())
         });
 
-        let relevant = PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
+        let relevant_actions = PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
             .filter(relevant_action)?;
-        Self::newest_pm_plan(relevant, &extra_actions)
+        Self::newest_pm_plan(relevant_actions, &extra_actions)
     }
 
     /// Aggregates `input` to its newest Protocol, Metadata, and each of `extra_actions`, with the
@@ -371,10 +375,10 @@ enum PmPlanSegment {
     /// Only the newest commit.
     NewestCommit,
     /// The commits after `oldest_exclusive` (all when `None`), except the newest. Also keeps
-    /// the checkpoint action in `commit_containing_manifest`.
+    /// the checkpoint action in the manifest commit at `manifest_commit`.
     OlderCommits {
         oldest_exclusive: Option<Version>,
-        commit_containing_manifest: Option<Version>,
+        manifest_commit: Option<Version>,
     },
 }
 
@@ -393,13 +397,13 @@ impl PmPlanSegment {
                 .map(|commit| (commit.version, pointer.content_root_version)),
             _ => None,
         };
-        let (oldest_exclusive, commit_containing_manifest) = match pointed_commit {
+        let (oldest_exclusive, manifest_commit) = match pointed_commit {
             // The pointed checkpoint action has the P&M as of its content root, so earlier commits
             // hold nothing newer. The range includes the content root because the commit
             // containing that action can be at that version.
-            Some((commit_containing_manifest, content_root)) => (
+            Some((manifest_commit, content_root)) => (
                 as_version(content_root)?.checked_sub(1),
-                Some(commit_containing_manifest),
+                Some(manifest_commit),
             ),
             // Without a listed commit containing the pointed action, the newest commit's own
             // action (if any) bounds the range; otherwise every older commit is read.
@@ -410,7 +414,7 @@ impl PmPlanSegment {
         };
         let older = Self::OlderCommits {
             oldest_exclusive,
-            commit_containing_manifest,
+            manifest_commit,
         };
         // An empty range can't include a commit containing the pointed action either.
         Ok((!older.commit_paths(log_segment).is_empty()).then_some(older))
@@ -422,7 +426,8 @@ impl PmPlanSegment {
             Self::WholeSegment => {
                 let mut paths = log_segment.find_commit_cover_paths(None);
                 // Log compactions drop commitInfo, so read the newest commit itself when one
-                // covers it.
+                // covers it. Only its commitInfo is needed; the compaction is still generally
+                // cheaper to read than the commits it replaces.
                 if let Some(newest_commit) = log_segment.newest_commit() {
                     if !paths.contains(&newest_commit) {
                         paths.push(newest_commit);
@@ -433,12 +438,12 @@ impl PmPlanSegment {
             Self::NewestCommit => Vec::from_iter(log_segment.newest_commit()),
             Self::OlderCommits {
                 oldest_exclusive,
-                commit_containing_manifest,
+                manifest_commit,
             } => match log_segment.end_version.checked_sub(1) {
                 Some(newest_inclusive) => log_segment.find_commit_cover_paths_in_range(
                     oldest_exclusive,
                     newest_inclusive,
-                    commit_containing_manifest.as_slice(),
+                    manifest_commit.as_slice(),
                 ),
                 // A segment ending at version 0 has no commits older than its newest.
                 None => Vec::new(),
@@ -457,7 +462,7 @@ impl PmPlanSegment {
             self,
             Self::NewestCommit
                 | Self::OlderCommits {
-                    commit_containing_manifest: Some(_),
+                    manifest_commit: Some(_),
                     ..
                 }
         )
@@ -482,9 +487,8 @@ impl PmPlanSegment {
             Self::NewestCommit => Some(end_version),
             // The action the newest commit's pointer names.
             Self::OlderCommits {
-                commit_containing_manifest,
-                ..
-            } => commit_containing_manifest,
+                manifest_commit, ..
+            } => manifest_commit,
         };
         let checkpoint_action = checkpoint_action_version
             .map(|version| -> KernelResult<_> {
@@ -1083,7 +1087,7 @@ mod tests {
         let snapshot = app_txn_checkpoint_snapshot();
         let plan_segment = PmPlanSegment::OlderCommits {
             oldest_exclusive: None,
-            commit_containing_manifest: Some(1),
+            manifest_commit: Some(1),
         };
         let filter = pm_plan_filter(snapshot.log_segment(), plan_segment);
         let expected = Predicate::or(
