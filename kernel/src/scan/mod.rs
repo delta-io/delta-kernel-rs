@@ -19,6 +19,7 @@ use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
+use crate::engine::CancellableEngine;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{
     column_name, ColumnName, ExpressionRef, MapToStructOptions, Predicate, PredicateRef,
@@ -112,6 +113,10 @@ pub use crate::parallel::parallel_scan_metadata::{
 /// Configures structured-stats output and JSON synthesis in scan metadata.
 /// Existing JSON passes through for commits and checkpoints without compatible structured stats
 /// unless stats are disabled.
+///
+/// Declarative metadata plans disable stats and partition pruning when JSON output is requested,
+/// including both-output requests. The data-row predicate and imperative metadata path are
+/// unchanged.
 ///
 /// Most consumers should pick one of the named constructors:
 /// - [`Self::json_only`] (default) -- JSON stats only.
@@ -1072,6 +1077,13 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
+        self.with_cancellable_engine(engine, |engine| self.scan_metadata_with_engine(engine))
+    }
+
+    fn scan_metadata_with_engine(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
         let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
         self.scan_metadata_inner(engine, actions_with_checkpoint_info)
     }
@@ -1128,6 +1140,23 @@ impl Scan {
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn scan_metadata_from(
+        &self,
+        engine: &dyn Engine,
+        existing_version: Version,
+        existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
+        existing_predicate: Option<PredicateRef>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<ScanMetadata>>> {
+        self.with_cancellable_engine(engine, |engine| {
+            self.scan_metadata_from_with_engine(
+                engine,
+                existing_version,
+                existing_data,
+                existing_predicate,
+            )
+        })
+    }
+
+    fn scan_metadata_from_with_engine(
         &self,
         engine: &dyn Engine,
         existing_version: Version,
@@ -1205,7 +1234,7 @@ impl Scan {
         // TODO: we may be able to apply heuristics or other logic to try and fetch missing deltas
         // from the log.
         if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
-            return Ok(Box::new(self.scan_metadata(engine)?));
+            return Ok(Box::new(self.scan_metadata_with_engine(engine)?));
         }
 
         // create a new log segment containing only the commits added after the version hint.
@@ -1234,7 +1263,6 @@ impl Scan {
             meta_predicate,
             physical_stats_read_schema,
             None,
-            self.cancellation_token.as_ref(),
         )?;
         // Only the cached suffix needs a kernel-side check. The engine owns cancellation for the
         // newly read action prefix.
@@ -1252,6 +1280,21 @@ impl Scan {
             engine,
             actions_with_checkpoint_info,
         )?))
+    }
+
+    fn with_cancellable_engine<T>(
+        &self,
+        engine: &dyn Engine,
+        operation: impl FnOnce(&dyn Engine) -> T,
+    ) -> T {
+        let scoped_engine = self
+            .cancellation_token
+            .clone()
+            .map(|token| CancellableEngine::new(engine, token));
+        let engine = scoped_engine
+            .as_ref()
+            .map_or(engine, |engine| engine as &dyn Engine);
+        operation(engine)
     }
 
     fn scan_metadata_inner(
@@ -1313,9 +1356,9 @@ impl Scan {
     /// # Errors
     ///
     /// Returns an error if [`PartitionValuesOptions::with_timestamp_timezone`] was set on a table
-    /// with `TIMESTAMP` partition columns,
-    /// if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
-    /// or if log discovery, checkpoint inspection, or plan construction fails.
+    /// with `TIMESTAMP` partition columns, if planning requires a
+    /// [`PlanExecutor`](crate::plans::PlanExecutor) that the engine does not provide, or if log
+    /// discovery, checkpoint inspection, or plan construction fails.
     #[tracing::instrument(
         name = "scan.declarative_metadata_scan_plan",
         skip_all,
@@ -1338,17 +1381,28 @@ impl Scan {
                  use scan_metadata instead"
             )
         );
-        // Resolve the checkpoint shape once. Retain the leaf schema only when parsed metadata is
-        // needed for output or pruning.
+
+        // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
+        if self.state_info.physical_predicate == PhysicalPredicate::StaticSkipAll {
+            return Ok(None);
+        }
+
+        let planner = scan_plan::MetadataPlanner::try_new(self)?;
+        // Resolve the checkpoint shape once. The planner owns the decision to retain the file-
+        // action schema; checkpoint discovery owns how that schema is obtained.
         let plan_executor = engine.require_plan_executor()?;
-        let needs_leaf_schema = self.state_info.physical_stats_read_schema().is_some()
-            || self.state_info.physical_partition_schema.is_some();
-        let shape = if needs_leaf_schema {
+        let shape = if planner.requires_checkpoint_add_schema() {
             CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
         } else {
             CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?
         };
-        self.build_metadata_scan_plan(&shape)
+        self.build_metadata_scan_plan(&shape, &planner)
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    /// Whether JSON stats synthesis requires the checkpoint's collation stats schema.
+    fn needs_collation_stats_schema(&self) -> bool {
+        self.stats.synthesize_json && self.snapshot.table_configuration().has_collations_feature()
     }
 
     // Factored out to facilitate testing
@@ -1372,7 +1426,6 @@ impl Scan {
                     .physical_partition_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
-                self.cancellation_token.as_ref(),
             )
     }
 

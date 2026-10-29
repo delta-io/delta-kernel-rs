@@ -120,7 +120,7 @@ use crate::actions::{
     SIDECAR_FIELD,
 };
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{ExpressionRef, Scalar};
+use crate::expressions::Scalar;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::HasSelectionVector;
 use crate::path::{self, ParsedLogPath};
@@ -137,6 +137,7 @@ use crate::{
 #[cfg(feature = "declarative-plans")]
 mod checkpoint_shape;
 mod checkpoint_transform;
+pub(crate) mod collation_stats;
 mod sidecar;
 
 #[cfg(feature = "declarative-plans")]
@@ -238,6 +239,7 @@ pub(crate) struct WrittenCheckpointInfo {
 }
 
 /// Schemas and configs needed for building the checkpoint read/output schemas.
+#[derive(Debug, Clone)]
 struct CheckpointSchemaContext {
     stats_config: StatsTransformConfig,
     /// The checkpoint schema before table-specific fields like
@@ -360,10 +362,8 @@ pub struct CheckpointWriter {
     /// field here to avoid multiple type conversions.
     version: i64,
 
-    is_v2: bool,
+    schema_context: CheckpointSchemaContext,
     read_schema: SchemaRef,
-    output_schema: SchemaRef,
-    transform_expr: ExpressionRef,
 }
 
 impl RetentionCalculator for CheckpointWriter {
@@ -391,20 +391,11 @@ impl CheckpointWriter {
             &schema_context.stats_schema,
             schema_context.partition_schema.as_deref(),
         )?;
-        let (output_schema, transform_expr) = build_checkpoint_transform(
-            &schema_context.stats_config,
-            &read_schema,
-            &schema_context.stats_schema,
-            schema_context.partition_schema.as_ref(),
-        )?;
-
         Ok(Self {
             version: version_as_i64(snapshot.version())?,
             snapshot,
-            is_v2: schema_context.is_v2,
+            schema_context,
             read_schema,
-            output_schema,
-            transform_expr,
         })
     }
 
@@ -463,6 +454,15 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<ActionReconciliationIterator> {
+        self.checkpoint_data_with_schema(engine)
+            .map(|(data, _)| data)
+    }
+
+    /// Prepares checkpoint data and its output schema using the same replay for collation sampling.
+    fn checkpoint_data_with_schema(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<(ActionReconciliationIterator, SchemaRef)> {
         // Read actions from log segment
         let actions = self
             .snapshot
@@ -475,19 +475,39 @@ impl CheckpointWriter {
             self.get_transaction_expiration_timestamp()?,
             self.snapshot.table_configuration().dv_normalization_root(),
         );
-        let checkpoint_data = actions
+        let mut checkpoint_data = actions
             .map(move |batch| processor.process_actions_batch(batch?))
             .filter_ok(HasSelectionVector::has_selected_rows);
+
+        let context = &self.schema_context;
+        let (stats_schema, buffered) = if context.stats_config.write_stats_as_struct
+            && self.snapshot.table_configuration().has_collations_feature()
+        {
+            collation_stats::checkpoint_stats_schema(
+                &self.snapshot,
+                context.stats_schema.clone(),
+                &mut checkpoint_data,
+            )?
+        } else {
+            (context.stats_schema.clone(), Vec::new())
+        };
+        let (output_schema, transform_expr) = build_checkpoint_transform(
+            &context.stats_config,
+            &self.read_schema,
+            &stats_schema,
+            context.partition_schema.as_ref(),
+        )?;
 
         // Create the expression evaluator for the checkpoint transform.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             self.read_schema.clone(),
-            self.transform_expr.clone(),
-            self.output_schema.clone().into(),
+            transform_expr,
+            output_schema.clone().into(),
         )?;
 
         // Apply stats transform to each reconciled batch
+        let checkpoint_data = buffered.into_iter().map(Ok).chain(checkpoint_data);
         let transformed = checkpoint_data.map(move |batch_result| {
             let batch = batch_result?;
             let (data, sv) = batch.filtered_data.into_parts();
@@ -503,12 +523,14 @@ impl CheckpointWriter {
         // action stream. The metadata batch is created with the output schema directly,
         // bypassing the stats transform (it has no add actions to transform).
         let checkpoint_metadata = self
+            .schema_context
             .is_v2
-            .then(|| self.create_checkpoint_metadata_batch(engine, &self.output_schema));
+            .then(|| self.create_checkpoint_metadata_batch(engine, &output_schema));
 
-        Ok(ActionReconciliationIterator::new(Box::new(
-            transformed.chain(checkpoint_metadata),
-        )))
+        Ok((
+            ActionReconciliationIterator::new(Box::new(transformed.chain(checkpoint_metadata))),
+            output_schema,
+        ))
     }
 
     /// Finalizes checkpoint creation by saving metadata about the checkpoint.
@@ -572,13 +594,13 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         file_actions_per_sidecar_hint: usize,
     ) -> KernelResult<WrittenCheckpointInfo> {
-        let data_iter = self.checkpoint_data(engine)?;
+        let (data_iter, output_schema) = self.checkpoint_data_with_schema(engine)?;
         let iter_state = data_iter.state();
 
         let splitter = SidecarSplitter::new_mut_shared(
             data_iter,
             engine.evaluation_handler().as_ref(),
-            self.output_schema.clone(),
+            output_schema.clone(),
         )?;
 
         // Write sidecar files
@@ -619,8 +641,7 @@ impl CheckpointWriter {
         // the `sidecar` column, e.g. `sidecar: { path: "<sidecar_filename>.parquet", sizeInBytes:
         // <size>, modificationTime: <time>, tags: null }`, with all other action columns
         // left null.
-        let sidecar_batch =
-            create_sidecar_action_batch(engine, &self.output_schema, &sidecar_metas)?;
+        let sidecar_batch = create_sidecar_action_batch(engine, &output_schema, &sidecar_metas)?;
 
         // Write main checkpoint file: non-file actions + sidecar references
         let checkpoint_path = self.checkpoint_path()?;
@@ -752,7 +773,6 @@ impl CheckpointWriter {
             .stats_schema_builder()
             .with_required_physical_columns(physical_clustering_columns.as_deref())
             .build()?;
-
         // Build partition schema for partitionValues_parsed (None for non-partitioned tables)
         let partition_schema = tc.build_partition_values_parsed_schema();
         Ok(CheckpointSchemaContext {

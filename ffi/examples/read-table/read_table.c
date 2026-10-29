@@ -332,6 +332,74 @@ void print_snapshot_file_stats(SharedSnapshot* snapshot)
   }
 }
 
+static void print_optional_string(const char* label, OptionalValueKernelStringSlice value) {
+  if (value.tag == SomeKernelStringSlice) {
+    printf("%s: %.*s\n", label, (int)value.some.len, value.some.ptr);
+  } else {
+    printf("%s: None\n", label);
+  }
+}
+
+static int compare_map_keys(const void* a, const void* b) {
+  const KernelStringSlice* left = &(*(const FfiStringMapEntry* const*)a)->key;
+  const KernelStringSlice* right = &(*(const FfiStringMapEntry* const*)b)->key;
+  uintptr_t len = left->len < right->len ? left->len : right->len;
+  int cmp = len == 0 ? 0 : memcmp(left->ptr, right->ptr, len);
+  if (cmp != 0) {
+    return cmp;
+  }
+  return (left->len > right->len) - (left->len < right->len);
+}
+
+static void print_string_map(const char* label, FfiStringMap map) {
+  printf("%s:\n", label);
+  if (map.len == 0) {
+    return;
+  }
+  const FfiStringMapEntry** sorted = malloc(sizeof(*sorted) * map.len);
+  if (sorted == NULL) {
+    fprintf(stderr, "Failed to allocate %s sort buffer\n", label);
+    exit(-1);
+  }
+  for (uintptr_t i = 0; i < map.len; i++) {
+    sorted[i] = &map.ptr[i];
+  }
+  // Map order isn't guaranteed, so sort by key to keep the golden test output deterministic.
+  qsort(sorted, map.len, sizeof(*sorted), compare_map_keys);
+  for (uintptr_t i = 0; i < map.len; i++) {
+    const FfiStringMapEntry* entry = sorted[i];
+    printf("  %.*s: %.*s\n",
+           (int)entry->key.len,
+           entry->key.ptr,
+           (int)entry->value.len,
+           entry->value.ptr);
+  }
+  free(sorted);
+}
+
+static void print_snapshot_metadata(NullableCvoid context, const FfiMetadata* metadata) {
+  bool* visited = context;
+  *visited = true;
+  printf("id: %.*s\n", (int)metadata->id.len, metadata->id.ptr);
+  print_optional_string("name", metadata->name);
+  print_optional_string("description", metadata->description);
+  printf(
+    "format_provider: %.*s\n", (int)metadata->format_provider.len, metadata->format_provider.ptr);
+  print_string_map("format_options", metadata->format_options);
+  printf("schema_string: %.*s\n", (int)metadata->schema_string.len, metadata->schema_string.ptr);
+  printf("partition_columns:\n");
+  for (uintptr_t i = 0; i < metadata->partition_columns.len; i++) {
+    const KernelStringSlice* column = &metadata->partition_columns.ptr[i];
+    printf("  %.*s\n", (int)column->len, column->ptr);
+  }
+  if (metadata->created_time.tag == Somei64) {
+    printf("created_time: %" PRId64 "\n", metadata->created_time.some);
+  } else {
+    printf("created_time: None\n");
+  }
+  print_string_map("configuration", metadata->configuration);
+}
+
 static const char *LEVEL_STRING[] = {
   "ERROR", "WARN", "INFO", "DEBUG", "TRACE"
 };
@@ -384,8 +452,9 @@ int main(int argc, char* argv[])
   char* requested_cols = NULL;
   bool use_arrow_metadata = false;
   bool print_scan_schema = false;
+  bool print_metadata_only = false;
   int c;
-  while ((c = getopt (argc, argv, "ac:s")) != -1) {
+  while ((c = getopt (argc, argv, "ac:ms")) != -1) {
     switch (c) {
     case 'a':
       // Use the Arrow batch-mode scan metadata path (scan_metadata_next_arrow) instead of
@@ -397,6 +466,10 @@ int main(int argc, char* argv[])
       break;
     case 'c':
       requested_cols = optarg;
+      break;
+    case 'm':
+      // Print the snapshot metadata visited by snapshot_visit_metadata, then exit without scanning.
+      print_metadata_only = true;
       break;
     case 's':
       // Print the scan's logical schema (scan_logical_schema) as "Scan schema". Useful to check
@@ -422,7 +495,13 @@ int main(int argc, char* argv[])
   }
 
   if (optind != (argc - 1)) {
-    printf("Usage: %s [-a] [-c top_level_column1,top_level_column2] [-s] table/path\n", argv[0]);
+    printf("Usage: %s [-a] [-c top_level_column1,top_level_column2] [-s] [-m] table/path\n",
+           argv[0]);
+    return -1;
+  }
+
+  if (print_metadata_only && (use_arrow_metadata || requested_cols != NULL || print_scan_schema)) {
+    fprintf(stderr, "-m cannot be combined with -a, -c, or -s\n");
     return -1;
   }
 
@@ -434,7 +513,9 @@ int main(int argc, char* argv[])
 #endif
 
   char* table_path = argv[optind];
-  printf("Reading table at %s\n", table_path);
+  if (!print_metadata_only) {
+    printf("Reading table at %s\n", table_path);
+  }
 
 #ifdef VERBOSE
   enable_event_tracing(tracing_callback, TRACE);
@@ -504,6 +585,18 @@ int main(int argc, char* argv[])
 
   uint64_t v = version(snapshot);
   printf("version: %" PRIu64 "\n\n", v);
+
+  if (print_metadata_only) {
+    bool visited = false;
+    snapshot_visit_metadata(snapshot, &visited, print_snapshot_metadata);
+    free_snapshot(snapshot);
+    free_engine(engine);
+    if (!visited) {
+      fprintf(stderr, "snapshot_visit_metadata did not invoke the visitor\n");
+      return -1;
+    }
+    return 0;
+  }
 
   CSchema *cschema = get_cschema(snapshot, engine);
   print_cschema("Schema", cschema);

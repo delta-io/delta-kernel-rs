@@ -6,6 +6,8 @@ use url::Url;
 
 use super::*;
 use crate::engine::sync::SyncEngine;
+use crate::engine::test_delegating::DelegatingEngine;
+use crate::engine::CancellableEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
 use crate::object_store::ObjectStoreExt as _;
@@ -215,15 +217,7 @@ fn list_and_destructure(
     Option<ParsedLogPath>,
     Option<Version>,
 ) {
-    let r = LogSegmentFiles::list(
-        storage,
-        log_root,
-        log_tail,
-        start_version,
-        end_version,
-        None,
-    )
-    .unwrap();
+    let r = LogSegmentFiles::list(storage, log_root, log_tail, start_version, end_version).unwrap();
     (
         r.ascending_commit_files,
         r.ascending_compaction_files,
@@ -692,14 +686,9 @@ async fn backward_scan_single_checkpoint_cases(
     let (storage, log_root) = create_storage(log_files).await;
     let counter = CountingStorageHandler::new(storage);
 
-    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
-        &counter,
-        &log_root,
-        vec![],
-        1005,
-        None,
-    )
-    .unwrap();
+    let result =
+        LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005)
+            .unwrap();
 
     assert_eq!(counter.call_count(), expected_listings);
 
@@ -826,7 +815,6 @@ async fn backward_scan_multipart_checkpoint_cases(
         &log_root,
         vec![],
         end_version,
-        None,
     )
     .unwrap();
 
@@ -877,7 +865,6 @@ async fn backward_scan_with_log_tail_derives_lower_bound_from_checkpoint() {
         &log_root,
         log_tail,
         10,
-        None,
     )
     .unwrap();
 
@@ -928,7 +915,6 @@ async fn backward_scan_with_log_tail_starting_before_checkpoint() {
         &log_root,
         log_tail,
         8,
-        None,
     )
     .unwrap();
 
@@ -971,7 +957,6 @@ async fn backward_scan_log_tail_defines_latest_version() {
         &log_root,
         log_tail,
         5,
-        None,
     )
     .unwrap();
 
@@ -1029,7 +1014,7 @@ async fn test_zero_byte_commit_kept_in_listing() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result =
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2), None).unwrap();
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
     assert_eq!(result.ascending_commit_files.len(), 3);
     assert_eq!(result.ascending_commit_files[0].version, 0);
     assert_eq!(result.ascending_commit_files[1].version, 1);
@@ -1058,16 +1043,10 @@ async fn test_zero_byte_compaction_skipped_commits_used(#[case] use_backward_sca
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(
-            storage.as_ref(),
-            &log_root,
-            vec![],
-            4,
-            None,
-        )
-        .unwrap()
+        LogSegmentFiles::list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 4)
+            .unwrap()
     } else {
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(4), None).unwrap()
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(4)).unwrap()
     };
 
     assert!(
@@ -1104,16 +1083,10 @@ async fn test_zero_byte_checkpoint_skipped_older_used(#[case] use_backward_scan:
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(
-            storage.as_ref(),
-            &log_root,
-            vec![],
-            10,
-            None,
-        )
-        .unwrap()
+        LogSegmentFiles::list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 10)
+            .unwrap()
     } else {
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(10), None).unwrap()
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(10)).unwrap()
     };
 
     // Should fall back to checkpoint at v5 (the empty v10 checkpoint is skipped)
@@ -1139,7 +1112,7 @@ async fn test_zero_byte_crc_kept() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result =
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2), None).unwrap();
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
 
     // The 0-byte CRC at v2 is kept (latest_crc_file tracks the highest version)
     let crc = result.latest_crc_file.unwrap();
@@ -1162,14 +1135,9 @@ async fn test_zero_byte_checkpoint_backward_scan_crosses_windows() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
     let counter = CountingStorageHandler::new(storage);
 
-    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
-        &counter,
-        &log_root,
-        vec![],
-        1005,
-        None,
-    )
-    .unwrap();
+    let result =
+        LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005)
+            .unwrap();
 
     // Needed 2 windows because the 0-byte checkpoint at v1005 was skipped
     assert_eq!(counter.call_count(), 2);
@@ -1192,7 +1160,7 @@ async fn test_list_commits_zero_byte_commit_kept() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result =
-        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(2), None)
+        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(2))
             .unwrap();
     assert_eq!(result.ascending_commit_files.len(), 3);
     assert_eq!(result.ascending_commit_files[2].version, 2);
@@ -1264,8 +1232,7 @@ async fn list_commits_merges_log_tail(
         .collect();
 
     let result =
-        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, log_tail, start, end, None)
-            .unwrap();
+        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, log_tail, start, end).unwrap();
 
     let commits = &result.ascending_commit_files;
     assert_eq!(commits.len(), expected.len());
@@ -1292,7 +1259,7 @@ async fn test_list_commits_keeps_commits_across_checkpoint() {
     let (storage, log_root) = create_storage(files).await;
 
     let result =
-        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(5), None)
+        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, vec![], Some(0), Some(5))
             .unwrap();
     let versions: Vec<_> = result
         .ascending_commit_files
@@ -1324,7 +1291,6 @@ async fn test_list_ignoring_checkpoints_keeps_commits_and_crc() {
         Some(0),
         Some(5),
         CheckpointHandling::Ignore,
-        None,
     )
     .unwrap();
 
@@ -1663,7 +1629,6 @@ async fn last_checkpoint_hint_applies_iff_it_names_the_selected_checkpoint(
         &log_root,
         vec![],
         None,
-        None,
     )
     .unwrap();
 
@@ -1866,10 +1831,16 @@ fn finite_listing_handler(count: usize) -> (Url, Arc<AtomicU32>, FiniteListingHa
 #[test]
 fn precancelled_token_stops_listing_before_any_storage_call() {
     let (log_root, pulled, storage) = finite_listing_handler(100);
+    let engine =
+        DelegatingEngine::new(Arc::new(SyncEngine::new())).with_storage_handler(Arc::new(storage));
+    let engine = CancellableEngine::new(&engine, Arc::new(TestCancellationToken::cancelled()));
 
-    let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
-
-    let result = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, Some(&token));
+    let result = list_delta_log_from_storage(
+        engine.storage_handler().as_ref(),
+        &log_root,
+        0,
+        Version::MAX,
+    );
     assert!(matches!(result, Err(KernelError::Cancelled)));
     assert_eq!(pulled.load(Ordering::Relaxed), 0);
 }
@@ -1881,10 +1852,12 @@ fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
     let (log_root, pulled, storage) = finite_listing_handler(100);
 
     let token = Arc::new(TestCancellationToken::default());
-    let token_ref: CancellationTokenRef = token.clone();
+    let engine =
+        DelegatingEngine::new(Arc::new(SyncEngine::new())).with_storage_handler(Arc::new(storage));
+    let engine = CancellableEngine::new(&engine, token.clone());
+    let storage = engine.storage_handler();
     let mut iter =
-        list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, Some(&token_ref))
-            .unwrap();
+        list_delta_log_from_storage(storage.as_ref(), &log_root, 0, Version::MAX).unwrap();
 
     assert!(matches!(iter.next(), Some(Ok(p)) if p.version == 0));
     assert!(matches!(iter.next(), Some(Ok(p)) if p.version == 1));
@@ -1901,7 +1874,7 @@ fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
 fn listing_without_token_is_unchanged() {
     let (log_root, _pulled, storage) = finite_listing_handler(5);
 
-    let listed: Vec<_> = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX, None)
+    let listed: Vec<_> = list_delta_log_from_storage(&storage, &log_root, 0, Version::MAX)
         .unwrap()
         .map(KernelResult::unwrap)
         .collect();
