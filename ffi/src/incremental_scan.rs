@@ -472,12 +472,9 @@ mod tests {
         }
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let builder = unsafe {
-            ok_or_panic(get_snapshot_builder(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
+        let table_root = kernel_string_slice!(table_root);
+        let builder =
+            unsafe { ok_or_panic(get_snapshot_builder(table_root, engine.shallow_copy())) };
         let builder = unsafe { snapshot_builder_with_version(builder, target_version) };
         let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
         (engine, snapshot)

@@ -88,9 +88,8 @@ impl FfiStatsOptions {
                 StatsOptions::struct_columns(unsafe { columns.try_to_column_names() }?)
             }
             Self::AllStructWithExtraIndexed(columns) => {
-                StatsOptions::all_struct_with_extra_indexed(unsafe {
-                    columns.try_to_column_names()
-                }?)
+                let column_names = unsafe { columns.try_to_column_names() };
+                StatsOptions::all_struct_with_extra_indexed(column_names?)
             }
         })
     }

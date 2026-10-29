@@ -183,14 +183,13 @@ impl FfiAuthHeaderProvider {
         let out = headers.as_mut_ptr();
         // SAFETY: `out` is valid for writes here. The callback initializes `headers[0..count]`;
         // only those slots are read below.
-        unsafe {
-            (*out).count = 0;
-            (*out).ttl_ms = 0;
-            (self.callback)(self.context, out, self.allocate_error);
-            let ttl = ((*out).ttl_ms != 0).then(|| Duration::from_millis((*out).ttl_ms));
-            let pairs = take_auth_pairs_from_c(out)?;
-            Ok((headers_from_pairs(pairs)?, ttl))
-        }
+        unsafe { (*out).count = 0 };
+        unsafe { (*out).ttl_ms = 0 };
+        (self.callback)(self.context, out, self.allocate_error);
+        let ttl_ms = unsafe { (*out).ttl_ms };
+        let ttl = (ttl_ms != 0).then(|| Duration::from_millis(ttl_ms));
+        let pairs = unsafe { take_auth_pairs_from_c(out)? };
+        Ok((headers_from_pairs(pairs)?, ttl))
     }
 }
 
@@ -227,13 +226,10 @@ unsafe fn take_auth_pairs_from_c(
 
     let mut pairs = Vec::with_capacity(count);
     for i in 0..count {
+        let slot = unsafe { ptr::read(ptr::addr_of_mut!((*headers).headers[i])) };
         // SAFETY: each handle is moved out of `CAuthHeaders` exactly once.
-        let (name, value) = unsafe {
-            let slot = ptr::read(ptr::addr_of_mut!((*headers).headers[i]));
-            let name = *slot.name.into_inner();
-            let value = *slot.value.into_inner();
-            (name, value)
-        };
+        let name = unsafe { *slot.name.into_inner() };
+        let value = unsafe { *slot.value.into_inner() };
         pairs.push((name, value));
     }
     Ok(pairs)

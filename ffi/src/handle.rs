@@ -183,9 +183,14 @@ mod private {
 
         /// In testing code we want to simulate what c code can do where a pointer can be used
         /// without consuming it. This creates a "new" handle just by copying the underlying pointer
-        /// without increasing the arc refcount. This is dangerous! Do not use outside testing code!
+        /// without increasing the arc refcount.
+        ///
+        /// # Safety
+        ///
+        /// This is dangerous! Do not use outside testing code! Caller must ensure a valid handle
+        /// outlives this new fake one, or it will dangle.
         #[cfg(test)]
-        pub fn shallow_copy(&self) -> Self {
+        pub unsafe fn shallow_copy(&self) -> Self {
             Handle { ptr: self.ptr }
         }
     }

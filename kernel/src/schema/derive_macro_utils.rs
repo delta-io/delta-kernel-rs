@@ -281,3 +281,133 @@ impl StructDataFields {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // The derive macro reads each field's type, not its value, so the fields look unused.
+    #![allow(dead_code)]
+
+    use std::collections::{HashMap, HashSet};
+
+    use bytes::Bytes;
+    use delta_kernel_derive::ToSchema;
+
+    use crate::schema::{schema, ToSchema};
+
+    #[derive(ToSchema)]
+    struct AllPrimitivesNotNull {
+        string_field: String,
+        binary_field: Bytes,
+        long_field: i64,
+        integer_field: i32,
+        short_field: i16,
+        byte_field: i8,
+        float_field: f32,
+        double_field: f64,
+        boolean_field: bool,
+    }
+
+    #[test]
+    fn to_schema_all_primitives_not_null() {
+        let expected = schema! {
+            not_null "stringField": STRING,
+            not_null "binaryField": BINARY,
+            not_null "longField": LONG,
+            not_null "integerField": INTEGER,
+            not_null "shortField": SHORT,
+            not_null "byteField": BYTE,
+            not_null "floatField": FLOAT,
+            not_null "doubleField": DOUBLE,
+            not_null "booleanField": BOOLEAN,
+        };
+        assert_eq!(AllPrimitivesNotNull::to_schema(), expected);
+    }
+
+    #[derive(ToSchema)]
+    struct AllPrimitivesNullable {
+        string_field: Option<String>,
+        binary_field: Option<Bytes>,
+        long_field: Option<i64>,
+        integer_field: Option<i32>,
+        short_field: Option<i16>,
+        byte_field: Option<i8>,
+        float_field: Option<f32>,
+        double_field: Option<f64>,
+        boolean_field: Option<bool>,
+    }
+
+    #[test]
+    fn to_schema_all_primitives_nullable() {
+        let expected = schema! {
+            nullable "stringField": STRING,
+            nullable "binaryField": BINARY,
+            nullable "longField": LONG,
+            nullable "integerField": INTEGER,
+            nullable "shortField": SHORT,
+            nullable "byteField": BYTE,
+            nullable "floatField": FLOAT,
+            nullable "doubleField": DOUBLE,
+            nullable "booleanField": BOOLEAN,
+        };
+        assert_eq!(AllPrimitivesNullable::to_schema(), expected);
+    }
+
+    #[derive(ToSchema)]
+    struct Containers {
+        list_field: Vec<String>,
+        int_list: Vec<i64>,
+        nullable_element_list: Vec<Option<String>>,
+        optional_list: Option<Vec<String>>,
+        string_set: HashSet<String>,
+        map_field: HashMap<String, String>,
+        nullable_value_map: HashMap<String, Option<String>>,
+        #[allow_null_container_values]
+        null_value_map: HashMap<String, String>,
+        #[allow_null_container_values]
+        optional_null_value_map: Option<HashMap<String, String>>,
+    }
+
+    #[test]
+    fn to_schema_containers() {
+        let expected = schema! {
+            not_null "listField": [not_null STRING],
+            not_null "intList": [not_null LONG],
+            not_null "nullableElementList": [nullable STRING],
+            nullable "optionalList": [not_null STRING],
+            not_null "stringSet": [not_null STRING],
+            not_null "mapField": {STRING => not_null STRING},
+            not_null "nullableValueMap": {STRING => nullable STRING},
+            not_null "nullValueMap": {STRING => nullable STRING},
+            nullable "optionalNullValueMap": {STRING => nullable STRING},
+        };
+        assert_eq!(Containers::to_schema(), expected);
+    }
+
+    #[derive(ToSchema)]
+    struct Inner {
+        inner_field: String,
+    }
+
+    #[derive(ToSchema)]
+    struct Outer {
+        inner: Inner,
+        maybe_inner: Option<Inner>,
+        inner_list: Vec<Inner>,
+    }
+
+    #[test]
+    fn to_schema_nested_structs() {
+        let expected = schema! {
+            not_null "inner": {
+                not_null "innerField": STRING,
+            },
+            nullable "maybeInner": {
+                not_null "innerField": STRING,
+            },
+            not_null "innerList": [not_null {
+                not_null "innerField": STRING,
+            }],
+        };
+        assert_eq!(Outer::to_schema(), expected);
+    }
+}

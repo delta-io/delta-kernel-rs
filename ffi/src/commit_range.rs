@@ -727,13 +727,9 @@ mod tests {
         end_version: u64,
         engine: Handle<SharedExternEngine>,
     ) -> Handle<SharedCommitRange> {
-        let builder = unsafe {
-            ok_or_panic(commit_range_builder_for(
-                kernel_string_slice!(table_root),
-                start_version,
-                engine,
-            ))
-        };
+        let table_root = kernel_string_slice!(table_root);
+        let builder =
+            unsafe { ok_or_panic(commit_range_builder_for(table_root, start_version, engine)) };
         let builder = unsafe { commit_range_builder_with_end_version(builder, end_version) };
         unsafe { ok_or_panic(commit_range_builder_build(builder)) }
     }
@@ -1194,7 +1190,7 @@ mod tests {
         };
 
         let mut ctx = GetActionsCtx {
-            engine: engine.shallow_copy(),
+            engine: unsafe { engine.shallow_copy() },
             total_rows: 0,
         };
         let ctx_ptr = Some(unsafe { NonNull::new_unchecked(&mut ctx) }.cast());
