@@ -86,19 +86,14 @@ pub(crate) static ADD_DV_HELPER_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// entry's `deletionVector` column plus the [`ADD_DV_HELPER_SCHEMA`] columns: the inverse of
 /// [`extract_deletion_vector_content`].
 ///
-/// Only the per-row storage type and an absolute location's percent-encoding have no expression,
-/// so only they come from the helpers; every other field passes through. A relative location is
-/// kept verbatim as a `PersistedUnencodedRelative` (`'r'`) descriptor, which stores the same raw
-/// table-relative path. Log replay normalizes DV identities, so either form still matches the `u`,
-/// `r`, or `p` descriptor the writer started from.
-///
-/// The descriptor is null wherever the storage type helper is: row visitors read leaves without
-/// applying a parent struct's null mask, so keying it off a helper the caller nulls for every entry
-/// it drops keeps each leaf null exactly where the descriptor is. The casts null out a value that
-/// overflows an i32, so the caller must validate the entries it keeps with
-/// [`AddDeletionVectorColumns::try_push`].
+/// The descriptor is null for every entry [`AddDeletionVectorColumns`] pushed as null, and is
+/// otherwise built from the entry validated by [`AddDeletionVectorColumns::try_push`]. A relative
+/// location becomes a `PersistedUnencodedRelative` (`'r'`) descriptor; an absolute one becomes
+/// `PersistedAbsolute` (`'p'`).
 pub(crate) fn add_deletion_vector_expression() -> Expression {
     let dv_field = |field: &str| Expression::column([DV_INFO, field]);
+    // Only the storage type and an absolute location's percent-encoding need per-row work, so only
+    // they come from helper columns; every other field passes through.
     Expression::struct_with_nullability_from(
         [
             Expression::column([DV_STORAGE_TYPE_HELPER]),
@@ -106,6 +101,8 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
                 Expression::column([DV_ABSOLUTE_PATH_HELPER]),
                 dv_field(LOCATION),
             ]),
+            // TODO(#3750): use a cast that fails on overflow. Until then these would null out an
+            // out-of-range value, which `try_push` rejects up front.
             Expression::cast(dv_field(DV_INFO_OFFSET), DataType::INTEGER),
             // Undo the +8 framing of `extract_deletion_vector_content`.
             Expression::cast(
@@ -114,6 +111,9 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
             ),
             dv_field(DV_INFO_CARDINALITY),
         ],
+        // Keyed off the storage type helper, not `deletionVector`: row visitors read leaves
+        // without the parent's null mask, so the descriptor must be null exactly where its
+        // `storageType` leaf is, including for entries the caller drops.
         Expression::from_pred(Expression::column([DV_STORAGE_TYPE_HELPER]).is_not_null()),
     )
 }
@@ -214,6 +214,9 @@ impl AddDeletionVectorColumns {
                 DeletionVectorStorageType::PersistedAbsolute,
                 Scalar::String(url.into()),
             ),
+            // Kept verbatim: `'r'` stores the same raw table-relative path. Log replay normalizes
+            // DV identities, so it still matches the `'u'`, `'r'`, or `'p'` descriptor the writer
+            // started from.
             None => {
                 validate_table_relative(location)?;
                 reject_dot_segments(location)?;
