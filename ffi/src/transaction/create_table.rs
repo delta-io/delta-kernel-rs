@@ -2,6 +2,7 @@
 
 use super::committed::commit_result_to_committed_handle;
 use super::*;
+use crate::delta_types::FfiColumnNameArray;
 
 /// A handle for a create-table transaction (`Transaction<CreateTable>`).
 ///
@@ -346,7 +347,7 @@ pub unsafe extern "C" fn create_table_txn_builder_with_domain_metadata(
         .into_extern_result(&engine)
 }
 
-/// Collect `num_columns` column-name string slices into owned `String`s.
+/// Collect `num_columns` top-level partition column-name slices into owned `String`s.
 ///
 /// Returns an empty `Vec` when `num_columns == 0` without dereferencing `columns`, so a null
 /// pointer is sound in the empty case. Returns `Err` if any slice is not valid UTF-8.
@@ -371,38 +372,43 @@ pub(super) unsafe fn collect_create_table_columns(
         .collect()
 }
 
-/// Set a clustered data layout on a [`CreateTableTransactionBuilder`] from an array of top-level
-/// clustering column names (in order). Clustering and partitioning are mutually exclusive. The
-/// last data-layout call wins. Column validation (existence, stats-eligible types, duplicates)
-/// happens later at [`create_table_txn_builder_build`].
+/// Set ordered logical clustering column paths, replacing any prior data layout.
 ///
-/// Only top-level columns are supported through this entry point (each slice is one column name).
-/// Nested clustering columns must be set on the Rust builder directly.
+/// Each [`FfiColumnName`](crate::delta_types::FfiColumnName) contains literal field-name segments;
+/// dots within a segment are not separators. Column validation (existence, supported types,
+/// duplicates, and empty paths) happens at [`create_table_txn_builder_build`]. Returns an updated
+/// builder, or an error if the borrowed arrays are malformed or strings are not valid UTF-8.
 ///
 /// # Safety
 ///
-/// `builder` and `engine` must be valid. This call borrows `engine` and the column array. When
-/// `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid `KernelStringSlice`
-/// values whose backing bytes are readable for the duration of the call. `columns` may be null
-/// when `num_columns == 0`. `builder` is consumed even when this returns an error.
+/// `builder` and `engine` must be [valid][Handle#Validity] handles. The column array, nested path
+/// arrays, and string bytes are borrowed for this call and must follow the [`crate::FfiSlice`]
+/// contract: empty arrays may have null pointers; non-empty arrays must be aligned and readable.
+/// `engine` is borrowed. `builder` is consumed on success and error; the caller must build or free
+/// the returned builder and must not use or free the input handle afterward.
 #[no_mangle]
 pub unsafe extern "C" fn create_table_txn_builder_with_clustering_columns(
     builder: Handle<ExclusiveCreateTableTransactionBuilder>,
-    columns: *const KernelStringSlice,
-    num_columns: usize,
+    columns: FfiColumnNameArray,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCreateTableTransactionBuilder>> {
-    let engine = unsafe { engine.as_ref() };
     let builder = unsafe { *builder.into_inner() };
-    let columns = unsafe { collect_create_table_columns(columns, num_columns) };
-    create_table_txn_builder_with_data_layout_impl(builder, columns.map(DataLayout::clustered))
-        .into_extern_result(&engine)
+    let engine = unsafe { engine.as_ref() };
+    let columns = unsafe { columns.try_to_column_names() };
+    create_table_txn_builder_with_data_layout_impl(
+        builder,
+        columns.map(|columns| DataLayout::Clustered { columns }),
+    )
+    .into_extern_result(&engine)
 }
 
 /// Set a partitioned data layout on a [`CreateTableTransactionBuilder`] from an array of top-level
 /// partition column names (in order). Clustering and partitioning are mutually exclusive. The last
 /// data-layout call wins. Column validation (existence, primitive types, subset of schema) happens
 /// later at [`create_table_txn_builder_build`].
+///
+/// Partition columns must be top-level fields, so each slice is a literal name rather than a
+/// segmented path. Dots within a name are not separators.
 ///
 /// # Safety
 ///

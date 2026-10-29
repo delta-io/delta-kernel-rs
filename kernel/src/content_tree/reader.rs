@@ -446,6 +446,29 @@ impl LeafReadContext {
         self.next_position += entries.len();
         Ok(filtered)
     }
+
+    /// Checks, once all of the leaf's batches are converted, that the manifest deletion vector
+    /// removes no position at or past the leaf's entry count.
+    ///
+    /// # Errors
+    /// Returns an `InvalidCheckpoint` error naming `location` if the deletion vector has such a
+    /// position, since it then does not describe this leaf.
+    fn finish(&self, location: &str) -> KernelResult<()> {
+        let Some(dv) = &self.manifest_dv else {
+            return Ok(());
+        };
+        // Mumbling positions fit in 21 bits, so none can be at or past a larger entry count.
+        let Ok(end) = u32::try_from(self.next_position) else {
+            return Ok(());
+        };
+        match dv.iter_from(end).next() {
+            Some(pos) => Err(KernelError::invalid_checkpoint(format!(
+                "AMT leaf manifest '{location}' has {end} entries, but its manifestInfo.dv \
+                 removes position {pos}"
+            ))),
+            None => Ok(()),
+        }
+    }
 }
 
 // === Helpers ===
@@ -548,7 +571,9 @@ impl LeafToAddActions {
         {
             // The engine returns each leaf's batches together and in request order, so a leaf
             // ahead of this batch's file has no batches left.
-            self.pending.pop_front();
+            if let Some((location, context)) = self.pending.pop_front() {
+                context.finish(&location)?;
+            }
         }
         let Some((_, context)) = self.pending.front_mut() else {
             return Err(KernelError::internal_error(format!(
@@ -566,7 +591,16 @@ impl Iterator for LeafToAddActions {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let result = match self.batches.as_mut()?.next()? {
+            let Some(next) = self.batches.as_mut()?.next() else {
+                // Every remaining leaf is finished. Dropping the batches fuses the iterator.
+                self.batches = None;
+                let result = self
+                    .pending
+                    .drain(..)
+                    .try_for_each(|(location, context)| context.finish(&location));
+                return result.err().map(Err);
+            };
+            let result = match next {
                 // An empty batch carries no `_file` to group by, and no actions.
                 Ok(batch) if batch.is_empty() => continue,
                 Ok(batch) => self.convert_to_add_actions(batch.as_ref()),
@@ -1841,6 +1875,55 @@ mod tests {
         leaf.manifest_info.as_mut().unwrap().dv = Some(dv);
         let checkpoint = write_root(&engine, &[leaf]);
         assert_result_error_with_message(read_tree(&engine, &checkpoint), message);
+    }
+
+    #[rstest]
+    #[case::first_leaf(&[0, 2], &[], "'memory:///table/metadata/first.parquet' has 2 entries")]
+    #[case::last_leaf(&[], &[1], "'memory:///table/metadata/last.parquet' has 1 entries")]
+    fn read_add_actions_from_amt_rejects_manifest_dv_position_past_leaf_end(
+        #[values(ReadShape::AsIs, ReadShape::Split)] shape: ReadShape,
+        #[case] first_dv: &[u32],
+        #[case] last_dv: &[u32],
+        #[case] message: &str,
+    ) {
+        let engine = shaped_engine(shape);
+        let first = write_leaf(
+            &engine,
+            "metadata/first.parquet",
+            &[
+                leaf_entry("a.parquet", 100, 10, None, None, None),
+                leaf_entry("b.parquet", 200, 20, None, None, None),
+            ],
+            5,
+            1000,
+        );
+        let last = write_leaf(
+            &engine,
+            "metadata/last.parquet",
+            &[leaf_entry("c.parquet", 300, 30, None, None, None)],
+            6,
+            2000,
+        );
+        let checkpoint = write_root(
+            &engine,
+            &[
+                with_manifest_dv(first, first_dv),
+                with_manifest_dv(last, last_dv),
+            ],
+        );
+        assert_result_error_with_message(read_tree(&engine, &checkpoint), message);
+    }
+
+    #[test]
+    fn read_add_actions_from_amt_rejects_manifest_dv_on_empty_leaf() {
+        let engine = memory_engine();
+        let leaf = write_leaf(&engine, "metadata/leaf.parquet", &[], 5, 100);
+        let checkpoint = write_root(&engine, &[with_manifest_dv(leaf, &[0])]);
+        assert_result_error_with_message(
+            read_tree(&engine, &checkpoint),
+            "'memory:///table/metadata/leaf.parquet' has 0 entries, but its manifestInfo.dv \
+             removes position 0",
+        );
     }
 
     #[test]
