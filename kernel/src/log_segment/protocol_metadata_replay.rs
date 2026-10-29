@@ -20,7 +20,6 @@ use crate::crc::Crc;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 #[cfg(feature = "declarative-plans")]
 use crate::expressions::{col, Predicate};
-use crate::log_replay::ActionsBatch;
 use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
 #[cfg(feature = "declarative-plans")]
@@ -35,7 +34,9 @@ use crate::schema::{
     column_name, schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
     StructField, StructType,
 };
-use crate::{Engine, EngineData, KernelError, KernelResult, KernelResultIterator, Version};
+use crate::{
+    version_as_i64, Engine, EngineData, KernelError, KernelResult, KernelResultIterator, Version,
+};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -78,61 +79,34 @@ impl LogSegment {
                 crc.version
             );
             let pruned = self.segment_after_version(crc.version);
-            let candidate = pruned.replay_for_pm(engine)?;
             // Ignore pruned P&M at or below the CRC version: a lagging AMT checkpoint action can
-            // carry it, and the CRC's P&M is at least as new.
-            let metadata_opt = candidate
-                .metadata
-                .filter(|(v, _)| *v > crc.version as i64)
-                .map(|(_, m)| m);
-            let protocol_opt = candidate
-                .protocol
-                .filter(|(v, _)| *v > crc.version as i64)
-                .map(|(_, p)| p);
-            // The pruned replay only reads commits after the CRC version, but a hit there is still
-            // the latest action: any action at or below the CRC is older.
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            let captured_checkpoint_action = candidate.checkpoint.map(|(_, c)| Arc::new(c));
-
-            if metadata_opt.is_some() && protocol_opt.is_some() {
+            // carry it, and the CRC's P&M is at least as new. A captured checkpoint action is still
+            // the latest: any action at or below the CRC is older.
+            let mut resolution = pruned
+                .replay_for_pm(engine)?
+                .newer_than(version_as_i64(crc.version)?)
+                .into_resolution(ProtocolMetadataSource::CrcSeededPmOnlyReplay);
+            if resolution.metadata.is_some() && resolution.protocol.is_some() {
                 info!("Found P&M from pruned log replay");
-                return Ok(PmResolution {
-                    metadata: metadata_opt,
-                    protocol: protocol_opt,
-                    source: ProtocolMetadataSource::CrcSeededPmOnlyReplay,
-                    #[cfg(feature = "adaptive-metadata-in-dev")]
-                    captured_checkpoint_action,
-                    #[cfg(feature = "adaptive-metadata-in-dev")]
-                    last_manifest_commit: LastManifestCommitResolution::Unresolved,
-                });
+                return Ok(resolution);
             }
 
-            // Case 2(b): P&M incomplete or older than the CRC, use the CRC.
-            // Use `or_else` so any newer P or M found in the pruned replay takes priority
-            // over the (older) CRC values.
+            // Case 2(b): P&M incomplete or older than the CRC, use the CRC. Any newer P or M found
+            // in the pruned replay takes priority over the (older) CRC values.
             info!("P&M fallback to CRC (no P&M changes after CRC version)");
-            return Ok(PmResolution {
-                metadata: metadata_opt.or_else(|| Some(crc.metadata.clone())),
-                protocol: protocol_opt.or_else(|| Some(crc.protocol.clone())),
-                source: ProtocolMetadataSource::CrcSeededPmOnlyReplay,
-                #[cfg(feature = "adaptive-metadata-in-dev")]
-                captured_checkpoint_action,
-                #[cfg(feature = "adaptive-metadata-in-dev")]
-                last_manifest_commit: LastManifestCommitResolution::Unresolved,
-            });
+            resolution
+                .metadata
+                .get_or_insert_with(|| crc.metadata.clone());
+            resolution
+                .protocol
+                .get_or_insert_with(|| crc.protocol.clone());
+            return Ok(resolution);
         }
 
         // Case 3: Full P&M log replay.
-        let candidate = self.replay_for_pm(engine)?;
-        Ok(PmResolution {
-            metadata: candidate.metadata.map(|(_, m)| m),
-            protocol: candidate.protocol.map(|(_, p)| p),
-            source: ProtocolMetadataSource::FullReplay,
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            captured_checkpoint_action: candidate.checkpoint.map(|(_, c)| Arc::new(c)),
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            last_manifest_commit: LastManifestCommitResolution::Unresolved,
-        })
+        Ok(self
+            .replay_for_pm(engine)?
+            .into_resolution(ProtocolMetadataSource::FullReplay))
     }
 
     /// Replays the log segment for the latest Protocol and Metadata, each with its version.
@@ -227,15 +201,18 @@ impl LogSegment {
         let batches = executor
             .execute_op(Operation::QueryPlan(plan))?
             .into_data()?
-            .map(|batch| {
-                // Mark as a log batch so the checkpoint action is read from it.
-                let batch = ActionsBatch::new(batch?, true);
+            .map(|actions| {
+                let actions = actions?;
                 let (protocol_version, metadata_version) =
-                    pm_versions_from_plan_output(batch.actions.as_ref())?;
+                    pm_versions_from_plan_output(actions.as_ref())?;
                 Ok(VersionedBatch {
                     protocol_version,
                     metadata_version,
-                    batch,
+                    // The plan reads every file with one schema, which includes the checkpoint
+                    // action.
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    projects_checkpoint_action: true,
+                    actions,
                 })
             });
         Ok(batches)
@@ -277,7 +254,10 @@ impl LogSegment {
             Ok(VersionedBatch {
                 protocol_version: Some(version),
                 metadata_version: Some(version),
-                batch,
+                // Only the commit schema projects the checkpoint action.
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                projects_checkpoint_action: batch.is_log_batch,
+                actions: batch.actions,
             })
         }))
     }
@@ -334,6 +314,7 @@ impl PmResolution {
 
 /// Protocol and Metadata, each tagged with the version it was found at. Holds both a single
 /// batch's parse and the newest resolved across batches.
+#[derive(Default)]
 struct PmCandidate {
     protocol: Option<(i64, Protocol)>,
     metadata: Option<(i64, Metadata)>,
@@ -343,49 +324,67 @@ struct PmCandidate {
     checkpoint: Option<(i64, CheckpointAction)>,
 }
 
+impl PmCandidate {
+    /// Drops the Protocol and Metadata found at or below `version`.
+    fn newer_than(mut self, version: i64) -> Self {
+        self.protocol = self.protocol.filter(|(v, _)| *v > version);
+        self.metadata = self.metadata.filter(|(v, _)| *v > version);
+        self
+    }
+
+    /// The resolution this replay result gives the snapshot, resolved through `source`.
+    fn into_resolution(self, source: ProtocolMetadataSource) -> PmResolution {
+        PmResolution {
+            metadata: self.metadata.map(|(_, m)| m),
+            protocol: self.protocol.map(|(_, p)| p),
+            source,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            captured_checkpoint_action: self.checkpoint.map(|(_, c)| Arc::new(c)),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit: LastManifestCommitResolution::Unresolved,
+        }
+    }
+
+    /// Folds `other`, parsed from a batch replay reached later, into this result. Each field keeps
+    /// its higher-versioned value, so the order batches merge in only matters on a version tie,
+    /// where `other` wins.
+    fn merge(self, other: PmCandidate) -> Self {
+        PmCandidate {
+            protocol: newer(self.protocol, other.protocol),
+            metadata: newer(self.metadata, other.metadata),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint: newer(self.checkpoint, other.checkpoint),
+        }
+    }
+}
+
 /// A P&M-projected batch with the versions to rank its Protocol and Metadata at.
 struct VersionedBatch {
     protocol_version: Option<i64>,
     metadata_version: Option<i64>,
-    batch: ActionsBatch,
+    /// Whether `actions` has the AMT checkpoint action column.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    projects_checkpoint_action: bool,
+    actions: Box<dyn EngineData>,
 }
 
 /// The newest Protocol and Metadata across `batches`.
 fn resolve_pm_batches(
     batches: impl KernelResultIterator<VersionedBatch>,
 ) -> KernelResult<PmCandidate> {
-    let mut metadata: Option<(i64, Metadata)> = None;
-    let mut protocol: Option<(i64, Protocol)> = None;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    let mut checkpoint: Option<(i64, CheckpointAction)> = None;
+    let mut resolved = PmCandidate::default();
     for batch in batches {
-        let VersionedBatch {
-            protocol_version,
-            metadata_version,
-            batch,
-        } = batch?;
-        let batch_version = protocol_version.max(metadata_version);
-        let candidate = pm_candidate(&batch, protocol_version, metadata_version)?;
-        metadata = newer(metadata, candidate.metadata);
-        protocol = newer(protocol, candidate.protocol);
-        // Keep the highest-versioned checkpoint action, ranked by version like P&M (not by
-        // iteration order). Best-effort: if the loop breaks below before reaching one, it stays
-        // `None`.
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        {
-            checkpoint = newer(checkpoint, candidate.checkpoint);
-        }
+        let batch = batch?;
+        let batch_version = batch.protocol_version.max(batch.metadata_version);
+        resolved = resolved.merge(pm_candidate(&batch)?);
         // A checkpoint action's P&M can be older than its commit, so check version not presence.
-        if is_final(&protocol, batch_version) && is_final(&metadata, batch_version) {
+        if is_final(&resolved.protocol, batch_version)
+            && is_final(&resolved.metadata, batch_version)
+        {
             break;
         }
     }
-    Ok(PmCandidate {
-        protocol,
-        metadata,
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        checkpoint,
-    })
+    Ok(resolved)
 }
 
 /// Parses the log version from a batch's `_file` metadata column.
@@ -431,6 +430,17 @@ fn is_final<T>(winner: &Option<(i64, T)>, batch_version: Option<i64>) -> bool {
     }
 }
 
+/// The Protocol and Metadata nested in a checkpoint action, each tagged with the action's
+/// `checkpointMetadata.version`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn checkpoint_pm(checkpoint: &CheckpointAction) -> ((i64, Protocol), (i64, Metadata)) {
+    let version = checkpoint.version();
+    (
+        (version, checkpoint.protocol().clone()),
+        (version, checkpoint.metadata().clone()),
+    )
+}
+
 /// The higher-versioned of `a` and `b`; on a tie, `b` wins.
 fn newer<T>(a: Option<(i64, T)>, b: Option<(i64, T)>) -> Option<(i64, T)> {
     match (a, b) {
@@ -463,39 +473,28 @@ fn pm_replay_schemas() -> (Arc<StructType>, Arc<StructType>) {
     (commit_schema, checkpoint_schema)
 }
 
-/// The Protocol and Metadata in `batch`, tagged with the given versions, plus any AMT checkpoint
+/// The Protocol and Metadata in `batch`, tagged with its versions, plus any AMT checkpoint
 /// action's nested P&M at its own version.
-fn pm_candidate(
-    batch: &ActionsBatch,
-    protocol_version: Option<i64>,
-    metadata_version: Option<i64>,
-) -> KernelResult<PmCandidate> {
+fn pm_candidate(batch: &VersionedBatch) -> KernelResult<PmCandidate> {
     let actions = batch.actions.as_ref();
-    let protocol = protocol_version.zip(Protocol::try_new_from_data(actions)?);
-    let metadata = metadata_version.zip(Metadata::try_new_from_data(actions)?);
+    let protocol = batch
+        .protocol_version
+        .zip(Protocol::try_new_from_data(actions)?);
+    let metadata = batch
+        .metadata_version
+        .zip(Metadata::try_new_from_data(actions)?);
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     {
-        // A checkpoint action's nested P&M is at its own `checkpointMetadata.version`. Only parse
-        // it from batches projected with the checkpoint-action column. The non-plan read
-        // (`read_pm_batches`) reads commits with `commit_schema` (which includes
-        // `CHECKPOINT_ACTION_FIELD`) and checkpoint parts with `checkpoint_schema` (which omits
-        // it), so here `is_log_batch` is exactly "this batch carries the column" and the action is
-        // captured solely from commits. The plan path instead projects every union input with one
-        // schema that includes the column and marks all batches as log batches, so it can also
-        // capture the action from checkpoint parts. Both land on the same answer because a non-plan
-        // miss is resolved through `lastManifestCommit` in `latest_checkpoint_action`.
-        let checkpoint = if batch.is_log_batch {
+        // Parsing an action needs its column in the batch's schema. A checkpoint action's nested
+        // P&M rank at its `checkpointMetadata.version`.
+        let checkpoint = if batch.projects_checkpoint_action {
             CheckpointAction::try_new_from_data(actions)?
         } else {
             None
         };
-        let checkpoint_protocol = checkpoint
-            .as_ref()
-            .map(|c| (c.version(), c.protocol().clone()));
-        let checkpoint_metadata = checkpoint
-            .as_ref()
-            .map(|c| (c.version(), c.metadata().clone()));
+        let (checkpoint_protocol, checkpoint_metadata) =
+            checkpoint.as_ref().map(checkpoint_pm).unzip();
         Ok(PmCandidate {
             protocol: newer(protocol, checkpoint_protocol),
             metadata: newer(metadata, checkpoint_metadata),
