@@ -431,6 +431,21 @@ pub unsafe extern "C" fn free_scan_builder(builder: Handle<ExclusiveScanBuilder>
     builder.drop_handle();
 }
 
+/// Return an owned reference to the snapshot used to build `scan`.
+///
+/// Borrows `scan` without consuming it. The returned snapshot handle may outlive the scan and must
+/// be released with [`free_snapshot`](crate::free_snapshot). This does not rebuild the snapshot or
+/// perform engine I/O.
+///
+/// # Safety
+///
+/// `scan` must be a valid, live [`SharedScan`] handle for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn scan_snapshot(scan: Handle<SharedScan>) -> Handle<SharedSnapshot> {
+    let scan = unsafe { scan.as_ref() };
+    Arc::clone(scan.snapshot()).into()
+}
+
 /// Get the table root of a scan.
 ///
 /// # Safety
@@ -1149,6 +1164,7 @@ mod scan_builder_tests {
 
     use std::ffi::c_void;
 
+    use rstest::rstest;
     use test_utils::{actions_to_string, TestAction};
     #[cfg(feature = "geo-type-in-dev")]
     use url::Url;
@@ -1156,7 +1172,7 @@ mod scan_builder_tests {
     use super::{
         free_scan, free_scan_builder, scan_builder, scan_builder_build,
         scan_builder_with_predicate, scan_builder_with_schema, scan_builder_with_stats,
-        scan_logical_schema, EnginePredicate, EngineSchema, FfiStatsOptions,
+        scan_logical_schema, scan_snapshot, EnginePredicate, EngineSchema, FfiStatsOptions,
     };
     use crate::delta_types::{FfiColumnName, FfiColumnNameArray};
     use crate::error::FFIKernelError;
@@ -1178,6 +1194,41 @@ mod scan_builder_tests {
         schema_visitor::{visit_field_geography, visit_field_geometry},
         tests::get_default_engine,
     };
+
+    #[rstest]
+    #[tokio::test]
+    async fn scan_snapshot_handles_have_independent_lifetimes(
+        #[values(false, true)] release_scan_first: bool,
+    ) {
+        let (engine, source) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
+        let builder = unsafe { scan_builder(source.shallow_copy()) };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        let first = unsafe { scan_snapshot(scan.shallow_copy()) };
+        let second = unsafe { scan_snapshot(scan.shallow_copy()) };
+        assert!(std::ptr::eq(unsafe { source.as_ref() }, unsafe {
+            first.as_ref()
+        }));
+        assert!(std::ptr::eq(unsafe { first.as_ref() }, unsafe {
+            second.as_ref()
+        }));
+        unsafe { free_snapshot(source) };
+        unsafe { free_snapshot(first) };
+
+        if release_scan_first {
+            unsafe { free_scan(scan) };
+            assert_eq!(unsafe { second.as_ref() }.version(), 0);
+            unsafe { free_snapshot(second) };
+        } else {
+            unsafe { free_snapshot(second) };
+            let schema = unsafe { scan_logical_schema(scan.shallow_copy()) };
+            assert_eq!(unsafe { schema.as_ref() }.fields().count(), 2);
+            unsafe { free_schema(schema) };
+            unsafe { free_scan(scan) };
+        }
+        unsafe { free_engine(engine) };
+    }
 
     /// Schema visitor that produces `{id: integer (nullable)}` -- a single-column projection of
     /// the standard test table schema.
