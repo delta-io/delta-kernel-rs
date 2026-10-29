@@ -135,7 +135,7 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         ));
     };
     let freshness = value.freshness.into();
-    let log_paths = unsafe { value.log_paths.log_paths() }
+    let log_paths = unsafe { value.log_paths.log_paths_with_root(table_root) }
         .map_err(|source| invalid_with_source("supplied log paths are invalid", source))?;
     let protocol = unsafe { value.protocol.try_to_kernel() }
         .map_err(|source| invalid_with_source("supplied protocol is invalid", source))?;
