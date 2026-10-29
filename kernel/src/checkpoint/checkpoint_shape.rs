@@ -383,7 +383,7 @@ mod tests {
     use crate::unit_test_utils::{
         copy_test_table, create_log_path, create_log_path_with_size, load_test_table,
     };
-    use crate::KernelResult;
+    use crate::{Engine, KernelResult, SnapshotRef};
 
     /// Counts I/O operations and verifies that sidecar discovery queries filter out null paths.
     struct CountingExecutor {
@@ -427,6 +427,20 @@ mod tests {
         }
     }
 
+    fn build_metadata_plan(
+        snapshot: &SnapshotRef,
+        engine: &dyn Engine,
+        stats: StatsOptions,
+    ) -> KernelResult<()> {
+        snapshot
+            .clone()
+            .scan_builder()
+            .with_stats(stats)
+            .build()?
+            .declarative_metadata_scan_plan(engine)?;
+        Ok(())
+    }
+
     #[rstest]
     #[case("app-txn-no-checkpoint")]
     #[case("with_checkpoint_no_last_checkpoint")]
@@ -437,28 +451,16 @@ mod tests {
     fn checkpoint_inspection_counts_all_bytes_and_is_reused(
         #[case] table: &str,
         #[values(false, true)] scan_first: bool,
-    ) {
-        let (table_root, _tempdir) = copy_test_table(table).unwrap();
-        let engine = Arc::new(SyncEngine::new());
-        let snapshot = Snapshot::builder_for(table_root)
-            .build(engine.as_ref())
-            .unwrap();
-        let plan = || {
-            snapshot
-                .clone()
-                .scan_builder()
-                .with_stats(StatsOptions::all_struct())
-                .build()
-                .unwrap()
-                .declarative_metadata_scan_plan(engine.as_ref())
-                .unwrap()
-        };
+    ) -> KernelResult<()> {
+        let (table_root, _tempdir) = copy_test_table(table)?;
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
         if scan_first {
-            plan();
+            build_metadata_plan(&snapshot, &engine, StatsOptions::all_struct())?;
         }
-        let shape = snapshot.checkpoint_shape(engine.as_ref(), true).unwrap();
-        let num_files = snapshot.checkpoint_num_files(engine.as_ref()).unwrap();
-        let schema = snapshot.checkpoint_parquet_schema(engine.as_ref()).unwrap();
+        let shape = snapshot.checkpoint_shape(&engine, true)?;
+        let num_files = snapshot.checkpoint_num_files(&engine)?;
+        let schema = snapshot.checkpoint_parquet_schema(&engine)?;
         let paths: Vec<_> = snapshot
             .log_segment()
             .listed
@@ -472,101 +474,71 @@ mod tests {
             .iter()
             .map(|path| std::fs::metadata(path).unwrap().len())
             .sum();
-        assert_eq!(
-            snapshot.checkpoint_size_in_bytes(engine.as_ref()).unwrap(),
-            expected
-        );
+        assert_eq!(snapshot.checkpoint_size_in_bytes(&engine)?, expected);
         for path in paths {
-            std::fs::remove_file(path).unwrap();
+            std::fs::remove_file(path)?;
         }
         assert!(std::ptr::eq(
-            snapshot.checkpoint_shape(engine.as_ref(), true).unwrap(),
+            snapshot.checkpoint_shape(&engine, true)?,
             shape
         ));
-        assert_eq!(
-            snapshot.checkpoint_size_in_bytes(engine.as_ref()).unwrap(),
-            expected
-        );
-        assert_eq!(
-            snapshot.checkpoint_num_files(engine.as_ref()).unwrap(),
-            num_files
-        );
-        assert_eq!(
-            snapshot.checkpoint_parquet_schema(engine.as_ref()).unwrap(),
-            schema
-        );
-        plan();
+        assert_eq!(snapshot.checkpoint_size_in_bytes(&engine)?, expected);
+        assert_eq!(snapshot.checkpoint_num_files(&engine)?, num_files);
+        assert_eq!(snapshot.checkpoint_parquet_schema(&engine)?, schema);
+        build_metadata_plan(&snapshot, &engine, StatsOptions::all_struct())
     }
 
     #[test]
-    fn snapshot_adds_leaf_schema_after_a_scan_without_stats() {
-        let (engine, snapshot, _tempdir) =
-            load_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
+    fn snapshot_adds_leaf_schema_after_a_scan_without_stats() -> KernelResult<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-parquet-with-sidecars")?;
         let exec = Arc::new(CountingExecutor::new());
         let engine = DelegatingEngine::new(engine).with_plan_executor(exec.clone());
-        let plan = |stats| {
-            snapshot
-                .clone()
-                .scan_builder()
-                .with_stats(stats)
-                .build()
-                .unwrap()
-                .declarative_metadata_scan_plan(&engine)
-                .unwrap()
-        };
-        plan(StatsOptions::none());
+        build_metadata_plan(&snapshot, &engine, StatsOptions::none())?;
         assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 0);
         assert!(!snapshot
-            .checkpoint_shape(&engine, false)
-            .unwrap()
+            .checkpoint_shape(&engine, false)?
             .leaf_schema_resolved());
-        let bytes = snapshot.checkpoint_size_in_bytes(&engine).unwrap();
+        let bytes = snapshot.checkpoint_size_in_bytes(&engine)?;
         assert!(bytes > 0);
         assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 0);
-        plan(StatsOptions::all_struct());
-        assert!(snapshot
-            .checkpoint_parquet_schema(&engine)
-            .unwrap()
-            .is_some());
-        plan(StatsOptions::all_struct());
-        assert_eq!(snapshot.checkpoint_size_in_bytes(&engine).unwrap(), bytes);
+        build_metadata_plan(&snapshot, &engine, StatsOptions::all_struct())?;
+        assert!(snapshot.checkpoint_parquet_schema(&engine)?.is_some());
+        build_metadata_plan(&snapshot, &engine, StatsOptions::all_struct())?;
+        assert_eq!(snapshot.checkpoint_size_in_bytes(&engine)?, bytes);
         assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 1);
         assert_eq!(exec.query_scans.load(Ordering::Relaxed), 0);
+        Ok(())
     }
 
     #[rstest]
     #[case("with_checkpoint_no_last_checkpoint")]
     #[case("v2-checkpoints-parquet-with-sidecars")]
-    fn snapshot_retries_failed_checkpoint_inspection(#[case] table: &str) {
-        let (engine, snapshot, _tempdir) = load_test_table(table).unwrap();
+    fn snapshot_retries_failed_checkpoint_inspection(#[case] table: &str) -> KernelResult<()> {
+        let (engine, snapshot, _tempdir) = load_test_table(table)?;
         let exec = Arc::new(CountingExecutor::new());
         let engine = DelegatingEngine::new(engine).with_plan_executor(exec.clone());
         exec.fail_next_footer.store(true, Ordering::Relaxed);
         assert!(snapshot.checkpoint_shape(&engine, true).is_err());
-        let shape = snapshot.checkpoint_shape(&engine, true).unwrap();
-        assert!(snapshot
-            .checkpoint_parquet_schema(&engine)
-            .unwrap()
-            .is_some());
+        let shape = snapshot.checkpoint_shape(&engine, true)?;
+        assert!(snapshot.checkpoint_parquet_schema(&engine)?.is_some());
         assert!(std::ptr::eq(
-            snapshot.checkpoint_shape(&engine, true).unwrap(),
+            snapshot.checkpoint_shape(&engine, true)?,
             shape
         ));
         assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 2);
+        Ok(())
     }
 
     #[test]
-    fn concurrent_inspection_and_scans_share_checkpoint_io_without_a_hint() {
-        let (root, _tempdir) = copy_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
-        let hint = Url::parse(root.as_ref())
-            .unwrap()
-            .join("_delta_log/_last_checkpoint")
-            .unwrap();
-        std::fs::remove_file(hint.to_file_path().unwrap()).unwrap();
+    fn concurrent_inspection_and_scans_share_checkpoint_io_without_a_hint() -> KernelResult<()> {
+        let (root, _tempdir) = copy_test_table("v2-checkpoints-parquet-with-sidecars")?;
+        std::fs::remove_file(
+            root.join("_delta_log/_last_checkpoint")?
+                .to_file_path()
+                .unwrap(),
+        )?;
         let base_engine = Arc::new(SyncEngine::new());
-        let snapshot = Snapshot::builder_for(root)
-            .build(base_engine.as_ref())
-            .unwrap();
+        let snapshot = Snapshot::builder_for(root).build(base_engine.as_ref())?;
         let exec = Arc::new(CountingExecutor::new());
         let engine = DelegatingEngine::new(base_engine).with_plan_executor(exec.clone());
         let barrier = Barrier::new(8);
@@ -584,22 +556,15 @@ mod tests {
                         1 => {
                             snapshot.checkpoint_size_in_bytes(engine).unwrap();
                         }
-                        _ => {
-                            snapshot
-                                .clone()
-                                .scan_builder()
-                                .with_stats(StatsOptions::all_struct())
-                                .build()
-                                .unwrap()
-                                .declarative_metadata_scan_plan(engine)
-                                .unwrap();
-                        }
+                        _ => build_metadata_plan(snapshot, engine, StatsOptions::all_struct())
+                            .unwrap(),
                     }
                 });
             }
         });
         assert_eq!(exec.query_scans.load(Ordering::Relaxed), 1);
         assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 2);
+        Ok(())
     }
 
     /// Resolves checkpoint shape and, when requested, parsed-stats availability across fixtures.
