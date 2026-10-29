@@ -1546,7 +1546,7 @@ mod test {
     }
 
     /// The write support of a table that lists the `generatedColumns` writer feature.
-    const GENERATED_COLUMNS_LISTED_WRITE_SUPPORT: WriteSupport =
+    const WITH_GENERATED_COLUMNS_FEATURE_WRITE_SUPPORT: WriteSupport =
         if cfg!(feature = "generated-columns-in-dev") {
             WriteSupport::Supported
         } else {
@@ -1566,7 +1566,7 @@ mod test {
 
     /// The write support of a table that lists the `generatedColumns` writer feature and whose
     /// generation expression is a non-string value.
-    const NON_STRING_EXPRESSION_LISTED_WRITE_SUPPORT: WriteSupport =
+    const NON_STRING_EXPRESSION_WITH_GENERATED_COLUMNS_FEATURE_WRITE_SUPPORT: WriteSupport =
         if cfg!(feature = "generated-columns-in-dev") {
             WriteSupport::InvalidSchema
         } else {
@@ -1586,55 +1586,56 @@ mod test {
         MockProtocolBuilder::new().with_versions(1, 2).build(),
         WriteSupport::Supported
     )]
-    // Kernel rejects writes to tables that support `generatedColumns`. The feature is listed in the
-    // protocol, or implied by writer version 4.
+    // Kernel writes tables that support `generatedColumns` only with `generated-columns-in-dev`.
+    // The feature is listed in the protocol, or implied by writer version 4.
     #[case::with_feature(
         generated_event_year_schema(),
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        GENERATED_COLUMNS_LISTED_WRITE_SUPPORT
+        WITH_GENERATED_COLUMNS_FEATURE_WRITE_SUPPORT
     )]
     #[case::legacy_writer_at_min_version(
         generated_event_year_schema(),
         MockProtocolBuilder::new().with_versions(1, 4).build(),
         LEGACY_WRITER_V4_WRITE_SUPPORT
     )]
-    // Write support depends only on the protocol, so empty and non-string expression values get the
-    // same results as a regular expression.
+    // Connectors validate the SQL, so an empty expression gets the same results as a regular one.
     #[case::empty_expression_with_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "")) },
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        GENERATED_COLUMNS_LISTED_WRITE_SUPPORT
-    )]
-    // Connectors receive generation expressions as SQL text, so with `generated-columns-in-dev`
-    // kernel rejects a non-string expression.
-    #[case::non_string_expression_with_feature(
-        schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, 7_i64)) },
-        MockProtocolBuilder::new()
-            .with_writer_features([TableFeature::GeneratedColumns])
-            .build(),
-        NON_STRING_EXPRESSION_LISTED_WRITE_SUPPORT
+        WITH_GENERATED_COLUMNS_FEATURE_WRITE_SUPPORT
     )]
     #[case::empty_expression_without_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "")) },
         MockProtocolBuilder::new().with_versions(1, 2).build(),
         WriteSupport::Supported
     )]
+    // Connectors receive generation expressions as SQL text, so with `generated-columns-in-dev`
+    // kernel rejects a non-string expression on a table that supports `generatedColumns`. On a
+    // table without that support, kernel ignores the expression.
+    #[case::non_string_expression_with_feature(
+        schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, 7_i64)) },
+        MockProtocolBuilder::new()
+            .with_writer_features([TableFeature::GeneratedColumns])
+            .build(),
+        NON_STRING_EXPRESSION_WITH_GENERATED_COLUMNS_FEATURE_WRITE_SUPPORT
+    )]
     #[case::non_string_expression_without_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, 7_i64)) },
         MockProtocolBuilder::new().with_versions(1, 2).build(),
         WriteSupport::Supported
     )]
-    // No top-level generation expressions.
+    // No top-level generation expressions. A table that supports `generatedColumns` is still
+    // written only with `generated-columns-in-dev`.
     #[case::no_generation_expression_with_feature(
         schema_ref! { nullable "event_time": TIMESTAMP },
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        GENERATED_COLUMNS_LISTED_WRITE_SUPPORT
+        WITH_GENERATED_COLUMNS_FEATURE_WRITE_SUPPORT
     )]
     #[case::no_generation_expression(
         schema_ref! { nullable "event_time": TIMESTAMP },

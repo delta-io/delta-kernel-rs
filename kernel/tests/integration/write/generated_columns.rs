@@ -21,7 +21,7 @@ use crate::common::write_utils::get_scan_files;
 
 const GENERATED_COLUMNS_FEATURE: &[&str] = &["generatedColumns"];
 const EVENT_YEAR: &[(&str, &str)] = &[("event_year", "YEAR(event_time)")];
-const TESTING_GENERATED_COLUMNS: &[(&str, &str)] = &[
+const EXAMPLE_GENERATED_COLUMNS: &[(&str, &str)] = &[
     // Expressions a user would expect.
     ("event_year", "YEAR(event_time)"),
     ("double_id", "id * 2"),
@@ -124,7 +124,7 @@ async fn snapshot_and_transaction_return_stored_generated_columns_in_schema_orde
     let table_url = write_table(
         &table_path,
         GENERATED_COLUMNS_FEATURE,
-        TESTING_GENERATED_COLUMNS,
+        EXAMPLE_GENERATED_COLUMNS,
     )
     .await?;
 
@@ -136,12 +136,12 @@ async fn snapshot_and_transaction_return_stored_generated_columns_in_schema_orde
     }
     let snapshot_columns = snapshot.generated_columns()?;
     let from_snapshot = generated_column_pairs(&snapshot_columns);
-    assert_eq!(from_snapshot, TESTING_GENERATED_COLUMNS);
+    assert_eq!(from_snapshot, EXAMPLE_GENERATED_COLUMNS);
 
     let mut txn = begin_transaction(snapshot, engine.as_ref())?;
     let txn_columns = txn.generated_columns()?;
     let from_txn = generated_column_pairs(&txn_columns);
-    assert_eq!(from_txn, TESTING_GENERATED_COLUMNS);
+    assert_eq!(from_txn, EXAMPLE_GENERATED_COLUMNS);
 
     stage_one_file(&mut txn)?;
     assert_gate_error(txn.commit(engine.as_ref()));
@@ -150,7 +150,7 @@ async fn snapshot_and_transaction_return_stored_generated_columns_in_schema_orde
 
 #[rstest]
 #[tokio::test]
-async fn mapped_and_partitioned_tables_return_logical_names_and_require_ack_for_write_state(
+async fn column_mapped_and_partitioned_tables_return_logical_names_and_require_ack_for_write_state(
     #[values(true, false)] column_mapping: bool,
     #[values(true, false)] partitioned: bool,
 ) -> KernelResult<()> {
