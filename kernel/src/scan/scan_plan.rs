@@ -693,9 +693,6 @@ mod tests {
             .map(|stats| parquet_read_schema(Some(stats), None).unwrap());
         CheckpointShape {
             sidecars: manifest_sidecars(&checkpoint_type),
-            size_in_bytes: 0,
-            num_files: 0,
-            is_json_leaf: false,
             checkpoint_type,
             leaf_checkpoint_schema: leaf_checkpoint_schema.into(),
         }
@@ -836,9 +833,6 @@ mod tests {
             checkpoint_type: CheckpointType::Leaf,
             leaf_checkpoint_schema: Some(schema_ref! {}).into(),
             sidecars: vec![],
-            size_in_bytes: 0,
-            num_files: 0,
-            is_json_leaf: false,
         },
         FileType::Parquet,
         vec!["scan_parquet", "filter", "project", "semi_join", "project"]
@@ -887,9 +881,6 @@ mod tests {
             .build()?;
         let shape = CheckpointShape {
             sidecars: manifest_sidecars(&checkpoint_type),
-            size_in_bytes: 0,
-            num_files: 0,
-            is_json_leaf: false,
             checkpoint_type,
             leaf_checkpoint_schema: Some(parquet_read_schema(
                 parsed_stats.as_ref(),
@@ -966,9 +957,6 @@ mod tests {
             checkpoint_type: CheckpointType::Leaf,
             leaf_checkpoint_schema: Some(schema_ref! {}).into(),
             sidecars: vec![],
-            size_in_bytes: 0,
-            num_files: 0,
-            is_json_leaf: false,
         },
         FileType::Parquet,
         vec!["scan_parquet", "filter", "project", "project"]

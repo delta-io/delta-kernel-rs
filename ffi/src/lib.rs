@@ -1821,17 +1821,17 @@ pub unsafe extern "C" fn snapshot_checkpoint_file_groups(
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
     let result = (|| -> KernelResult<bool> {
-        let shape = snapshot.checkpoint_shape(engine_ref.engine().as_ref(), true)?;
-        let schema = shape
-            .parquet_schema()
+        let schema = snapshot
+            .checkpoint_parquet_schema(engine_ref.engine().as_ref())?
             .map(serde_json::to_string)
             .transpose()?
             .unwrap_or_default();
+        let num_files = snapshot.checkpoint_num_files(engine_ref.engine().as_ref())?;
         let view = FfiCheckpointFileGroup {
-            num_files: shape.num_files,
+            num_files,
             parquet_schema_json: kernel_string_slice!(schema),
         };
-        let views = if shape.num_files == 0 {
+        let views = if num_files == 0 {
             &[]
         } else {
             std::slice::from_ref(&view)

@@ -588,19 +588,74 @@ impl Snapshot {
     /// or the sum exceeds [`u64::MAX`].
     #[cfg(feature = "declarative-plans")]
     pub fn checkpoint_size_in_bytes(&self, engine: &dyn Engine) -> KernelResult<u64> {
-        Ok(self.checkpoint_shape(engine, false)?.size_in_bytes)
+        let shape = self.checkpoint_shape(engine, false)?;
+        self.log_segment
+            .listed
+            .checkpoint_parts
+            .iter()
+            .map(|part| &part.location)
+            .chain(shape.sidecars.iter())
+            .try_fold(0u64, |total, file| {
+                total
+                    .checked_add(file.size)
+                    .ok_or_else(|| KernelError::generic("Checkpoint file size exceeds u64::MAX"))
+            })
+    }
+
+    /// Returns the number of checkpoint files carrying file actions, or zero without a checkpoint.
+    /// Counts sidecars instead of the top-level checkpoint when sidecars are present.
+    /// Resolves metadata through `engine`, sharing [`Self::checkpoint_shape`]'s cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if checkpoint shape resolution fails.
+    #[cfg(feature = "declarative-plans")]
+    pub fn checkpoint_num_files(&self, engine: &dyn Engine) -> KernelResult<u64> {
+        let shape = self.checkpoint_shape(engine, false)?;
+        Ok(if shape.sidecars.is_empty() {
+            self.log_segment.listed.checkpoint_parts.len()
+        } else {
+            shape.sidecars.len()
+        } as u64)
+    }
+
+    /// Returns the checkpoint's physical Parquet schema, borrowed for the snapshot's lifetime.
+    /// Returns `None` without a checkpoint or for an inline JSON checkpoint. All checkpoint parts
+    /// or sidecars share this schema. Resolves metadata through `engine`, sharing
+    /// [`Self::checkpoint_shape`]'s cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if checkpoint shape or schema resolution fails.
+    #[cfg(feature = "declarative-plans")]
+    pub fn checkpoint_parquet_schema(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<&SchemaRef>> {
+        let shape = self.checkpoint_shape(engine, true)?;
+        let is_json_leaf = shape.sidecars.is_empty()
+            && self
+                .log_segment
+                .listed
+                .checkpoint_parts
+                .first()
+                .is_some_and(|part| part.is_json());
+        Ok(if is_json_leaf {
+            None
+        } else {
+            shape.leaf_checkpoint_schema()
+        })
     }
 
     /// Returns this snapshot's cached checkpoint shape, borrowed for the snapshot's lifetime.
     /// Uses `engine`'s [`PlanExecutor`](crate::plans::PlanExecutor) to resolve checkpoint inputs;
-    /// `needs_leaf_schema` additionally loads the physical schema. File count and bytes are zero
-    /// when no checkpoint was selected.
+    /// `needs_leaf_schema` additionally loads the physical schema.
     /// Successful inspection is shared with declarative scan planning. Failed reads can retry.
     ///
     /// # Errors
     ///
-    /// Returns an error if `engine` has no plan executor, checkpoint metadata cannot be read or
-    /// decoded, or its size overflows.
+    /// Returns an error if `engine` has no plan executor or checkpoint metadata cannot be read or
+    /// decoded.
     #[cfg(feature = "declarative-plans")]
     pub fn checkpoint_shape(
         &self,
@@ -620,7 +675,7 @@ impl Snapshot {
         let shape = match self.checkpoint_shape.get() {
             Some(shape) => shape,
             None => {
-                let shape = CheckpointShape::resolve(exec.as_ref(), self)?;
+                let shape = CheckpointShape::try_new(exec.as_ref(), self)?;
                 self.checkpoint_shape.get_or_init(|| shape)
             }
         };
@@ -1873,10 +1928,13 @@ mod tests {
         #[case] expect_parquet_schema: bool,
     ) -> KernelResult<()> {
         let (engine, snapshot, _temp) = load_test_table(table)?;
-        let shape = snapshot.checkpoint_shape(engine.as_ref(), true)?;
-        assert_eq!(shape.num_files, expected_files);
-        assert_eq!(shape.parquet_schema().is_some(), expect_parquet_schema);
-        if let Some(schema) = shape.parquet_schema() {
+        assert_eq!(
+            snapshot.checkpoint_num_files(engine.as_ref())?,
+            expected_files
+        );
+        let schema = snapshot.checkpoint_parquet_schema(engine.as_ref())?;
+        assert_eq!(schema.is_some(), expect_parquet_schema);
+        if let Some(schema) = schema {
             let DataType::Struct(add) = schema.field("add").unwrap().data_type() else {
                 panic!("checkpoint add field must be a struct");
             };

@@ -44,48 +44,9 @@ pub struct CheckpointShape {
     /// Schema of the checkpoint leaves, when requested. An empty cell means uninspected.
     pub(crate) leaf_checkpoint_schema: OnceLock<Option<SchemaRef>>,
     pub(crate) sidecars: Vec<FileMeta>,
-    pub(crate) is_json_leaf: bool,
-    /// Number of files carrying file actions, excluding the manifest when sidecars are present.
-    /// Zero when the snapshot has no checkpoint.
-    pub num_files: u64,
-    /// Total bytes of all checkpoint parts and referenced sidecars.
-    pub size_in_bytes: u64,
 }
 
 impl CheckpointShape {
-    /// Physical Parquet schema when requested during snapshot inspection.
-    /// Returns `None` before schema resolution, without a checkpoint, or for an inline JSON
-    /// checkpoint. All checkpoint parts or sidecars share this schema.
-    pub fn parquet_schema(&self) -> Option<&SchemaRef> {
-        if self.is_json_leaf {
-            None
-        } else {
-            self.leaf_checkpoint_schema()
-        }
-    }
-
-    pub(crate) fn resolve(exec: &dyn PlanExecutor, snapshot: &Snapshot) -> KernelResult<Self> {
-        let mut shape = Self::try_new(exec, snapshot)?;
-        let parts = &snapshot.log_segment().listed.checkpoint_parts;
-        shape.num_files = if shape.sidecars.is_empty() {
-            parts.len()
-        } else {
-            shape.sidecars.len()
-        } as u64;
-        shape.is_json_leaf =
-            shape.sidecars.is_empty() && parts.first().is_some_and(|part| part.is_json());
-        shape.size_in_bytes = parts
-            .iter()
-            .map(|part| &part.location)
-            .chain(shape.sidecars.iter())
-            .try_fold(0u64, |total, file| {
-                total.checked_add(file.size).ok_or_else(|| {
-                    crate::KernelError::generic("Checkpoint file size exceeds u64::MAX")
-                })
-            })?;
-        Ok(shape)
-    }
-
     pub(crate) fn leaf_checkpoint_schema(&self) -> Option<&SchemaRef> {
         self.leaf_checkpoint_schema.get().and_then(Option::as_ref)
     }
@@ -180,9 +141,6 @@ impl CheckpointShape {
                     checkpoint_type: CheckpointType::None,
                     leaf_checkpoint_schema: None.into(),
                     sidecars: vec![],
-                    size_in_bytes: 0,
-                    num_files: 0,
-                    is_json_leaf: false,
                 })
             }
         };
@@ -315,9 +273,6 @@ impl CheckpointShape {
                 .map(|schema| Some(schema).into())
                 .unwrap_or_default(),
             sidecars,
-            size_in_bytes: 0,
-            num_files: 0,
-            is_json_leaf: false,
         })
     }
 
@@ -328,9 +283,6 @@ impl CheckpointShape {
                 .map(|schema| Some(schema).into())
                 .unwrap_or_default(),
             sidecars: vec![],
-            size_in_bytes: 0,
-            num_files: 0,
-            is_json_leaf: false,
         }
     }
 
@@ -505,6 +457,8 @@ mod tests {
             plan();
         }
         let shape = snapshot.checkpoint_shape(engine.as_ref(), true).unwrap();
+        let num_files = snapshot.checkpoint_num_files(engine.as_ref()).unwrap();
+        let schema = snapshot.checkpoint_parquet_schema(engine.as_ref()).unwrap();
         let paths: Vec<_> = snapshot
             .log_segment()
             .listed
@@ -532,6 +486,14 @@ mod tests {
         assert_eq!(
             snapshot.checkpoint_size_in_bytes(engine.as_ref()).unwrap(),
             expected
+        );
+        assert_eq!(
+            snapshot.checkpoint_num_files(engine.as_ref()).unwrap(),
+            num_files
+        );
+        assert_eq!(
+            snapshot.checkpoint_parquet_schema(engine.as_ref()).unwrap(),
+            schema
         );
         plan();
     }
@@ -562,8 +524,10 @@ mod tests {
         assert!(bytes > 0);
         assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 0);
         plan(StatsOptions::all_struct());
-        let shape = snapshot.checkpoint_shape(&engine, true).unwrap();
-        assert!(shape.parquet_schema().is_some());
+        assert!(snapshot
+            .checkpoint_parquet_schema(&engine)
+            .unwrap()
+            .is_some());
         plan(StatsOptions::all_struct());
         assert_eq!(snapshot.checkpoint_size_in_bytes(&engine).unwrap(), bytes);
         assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 1);
@@ -580,7 +544,10 @@ mod tests {
         exec.fail_next_footer.store(true, Ordering::Relaxed);
         assert!(snapshot.checkpoint_shape(&engine, true).is_err());
         let shape = snapshot.checkpoint_shape(&engine, true).unwrap();
-        assert!(shape.parquet_schema().is_some());
+        assert!(snapshot
+            .checkpoint_parquet_schema(&engine)
+            .unwrap()
+            .is_some());
         assert!(std::ptr::eq(
             snapshot.checkpoint_shape(&engine, true).unwrap(),
             shape
