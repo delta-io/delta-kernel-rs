@@ -1498,6 +1498,33 @@ impl LastManifestCommit {
         );
         Ok(())
     }
+
+    /// Returns `action`, read from the manifest commit this names, after checking that it exists
+    /// and has this pointer's content root version.
+    pub(crate) fn require_checkpoint_action(
+        &self,
+        action: Option<CheckpointAction>,
+    ) -> KernelResult<CheckpointAction> {
+        let action =
+            action.ok_or_else(|| self.inconsistency("that commit carries no checkpoint action"))?;
+        require!(
+            action.content_root_version() == self.content_root_version,
+            self.inconsistency(format!(
+                "that commit's checkpoint action has content root version {}",
+                action.content_root_version()
+            ))
+        );
+        Ok(action)
+    }
+
+    /// The error for a pointer that the log contradicts, as explained by `detail`.
+    pub(crate) fn inconsistency(&self, detail: impl fmt::Display) -> KernelError {
+        KernelError::invalid_log_segment(format!(
+            "lastManifestCommit names manifest commit version {} as the source of content root \
+             version {}, but {detail}",
+            self.version, self.content_root_version
+        ))
+    }
 }
 
 /// The checkpoint action embeds metadata tree state in a Delta log entry.
