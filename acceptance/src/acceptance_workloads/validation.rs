@@ -329,6 +329,20 @@ fn expected_error_matches(expected: &ExpectedError, actual: &Error) -> bool {
     }
 }
 
+fn expected_delta_error_matches(
+    expected: &ExpectedError,
+    actual: &delta_kernel::DeltaError,
+) -> bool {
+    expected.error_code == actual.name()
+        || matches!(
+            (expected.error_code.as_str(), actual.name()),
+            (
+                "DELTA_TABLE_NOT_FOUND" | "DELTA_MISSING_TRANSACTION_LOG",
+                "DELTA_PATH_DOES_NOT_EXIST"
+            )
+        )
+}
+
 fn validate_expected_error(actual: &Error, expected: &ExpectedError) -> KernelResult<(), String> {
     if expected_error_matches(expected, actual) {
         debug!(
@@ -495,7 +509,9 @@ pub fn validate_snapshot(
 mod tests {
     use delta_kernel::arrow::array::{ArrayRef, Int32Array, TimestampNanosecondArray};
     use delta_kernel::arrow::datatypes::{Field, Schema, TimeUnit};
+    use delta_kernel::{DeltaError, DeltaErrorCondition};
     use delta_kernel_workloads::models::{ExpectedError, SnapshotExpected};
+    use rstest::rstest;
 
     use super::*;
 
@@ -521,6 +537,25 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    #[rstest]
+    #[case::table_not_found("DELTA_TABLE_NOT_FOUND", true)]
+    #[case::missing_transaction_log("DELTA_MISSING_TRANSACTION_LOG", true)]
+    #[case::exact_condition("DELTA_PATH_DOES_NOT_EXIST", true)]
+    #[case::truncated_transaction_log("DELTA_TRUNCATED_TRANSACTION_LOG", false)]
+    #[case::unrelated_log_error("DELTA_LOG_FILE_NOT_FOUND", false)]
+    fn path_migration_delta_error_matches(#[case] code: &str, #[case] matches: bool) {
+        let actual = DeltaError::for_test(
+            DeltaErrorCondition::DeltaPathDoesNotExist,
+            &["file:///missing/"],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            expected_delta_error_matches(&expected_error(code), &actual),
+            matches
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use delta_kernel_derive::internal_api;
 use url::Url;
 
-use crate::{FileSize, KernelError, KernelResult};
+use crate::{DeltaError, FileSize, KernelError, KernelResult};
 
 /// Phantom type parameter `T`: The containing type mentions but does not own any instance of `T`.
 ///
@@ -67,8 +67,11 @@ impl<I: IntoIterator, T: FromIterator<I::Item>> CollectInto<T> for I {
     }
 }
 
-/// Try to parse string uri into a URL for a table path. This will do it's best to handle things
-/// like `/local/paths`, and even `../relative/paths`.
+/// Parses `uri` into a table URL, accepting absolute and relative local filesystem paths.
+///
+/// Local paths must exist and name a directory. An absent local path returns
+/// [`DeltaPathDoesNotExist`](crate::DeltaErrorCondition::DeltaPathDoesNotExist); other location
+/// failures preserve their Kernel classification.
 #[allow(unused)]
 #[internal_api]
 pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> KernelResult<Url> {
@@ -76,11 +79,17 @@ pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> KernelResult<Url> {
     let uri_type = resolve_uri_type(uri)?;
     let url = match uri_type {
         UriType::LocalPath(path) => {
-            if !path.exists() {
-                // When we support writes, create a directory if we can
-                return Err(KernelError::InvalidTableLocation(format!(
-                    "Path does not exist: {path:?}"
-                )));
+            let exists = path.try_exists().map_err(|error| {
+                KernelError::InvalidTableLocation(format!(
+                    "Invalid table location: {uri} Error: {error:?}"
+                ))
+            })?;
+            if !exists {
+                return Err(DeltaError::path_does_not_exist(
+                    uri,
+                    KernelError::InvalidTableLocation(format!("Path does not exist: {path:?}")),
+                )
+                .into());
             }
             if !path.is_dir() {
                 return Err(KernelError::InvalidTableLocation(format!(
@@ -256,6 +265,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
     use super::*;
 
     #[test]
@@ -308,6 +320,19 @@ mod tests {
             url.to_string(),
             "s3://foo/__unitystorage/catalogs/cid/tables/tid/"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_path_io_failure_retains_kernel_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("loop");
+        symlink(&path, &path).unwrap();
+        let error = try_parse_uri(path.to_str().unwrap()).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::Kernel(KernelError::InvalidTableLocation(_))
+        ));
     }
 
     mod on_complete_tests {

@@ -13,6 +13,7 @@ dependencies = [
  "flate2",
  "futures",
  "itertools 0.14.0",
+ "rstest",
  "serde",
  "serde_json",
  "sha2",

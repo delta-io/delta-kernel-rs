@@ -397,4 +397,46 @@ mod tests {
         assert_eq!(output.calls, 1);
         assert_eq!(output.fields[0], ("code".into(), "Utf8Error".into()));
     }
+    #[cfg(feature = "default-engine-base")]
+    #[test]
+    fn absent_snapshot_dispatches_condition_and_parameters_through_registered_engine() {
+        let mut output = Box::new(Capture {
+            fail: true,
+            ..Default::default()
+        });
+        let context = std::ptr::from_mut(output.as_mut()).cast();
+        let engine = delta_kernel_default_engine::DefaultEngineBuilder::new(std::sync::Arc::new(
+            delta_kernel::object_store::memory::InMemory::new(),
+        ))
+        .build();
+        let handle = crate::engine_to_handle(
+            std::sync::Arc::new(engine),
+            ErrorAllocators {
+                context,
+                allocate_kernel_error: kernel,
+                allocate_delta_error: delta,
+            },
+        );
+        let table_path = "memory:///";
+        let builder = unsafe {
+            crate::get_snapshot_builder(
+                crate::kernel_string_slice!(table_path),
+                handle.shallow_copy(),
+            )
+        };
+        let crate::ExternResult::Ok(builder) = builder else {
+            panic!("valid table URL must produce a builder")
+        };
+        assert_eq!(output.calls, 0);
+        let result = unsafe { crate::snapshot_builder_build(builder) };
+        assert!(matches!(result, crate::ExternResult::Err(pointer) if pointer.is_null()));
+        assert_eq!(output.calls, 1);
+        assert_eq!(
+            output.fields[0],
+            ("condition".into(), "DELTA_PATH_DOES_NOT_EXIST".into())
+        );
+        assert_eq!(output.fields[1], ("sql_state".into(), "42K03".into()));
+        assert_eq!(output.fields[2], ("path".into(), "memory:///".into()));
+        unsafe { crate::free_engine(handle) };
+    }
 }

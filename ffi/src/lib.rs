@@ -3821,10 +3821,9 @@ mod tests {
             let invalid_path = "not a valid url!";
             get_snapshot_builder(kernel_string_slice!(invalid_path), engine.shallow_copy())
         };
-        assert_extern_result_error_with_message(
+        crate::ffi_test_utils::assert_extern_result_delta_error(
             result,
-            FFIKernelError::InvalidTableLocationError,
-            None,
+            "DELTA_PATH_DOES_NOT_EXIST",
         );
 
         unsafe { free_engine(engine) }

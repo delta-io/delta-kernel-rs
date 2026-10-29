@@ -12,6 +12,8 @@ use super::ConditionMetadata;
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DeltaErrorCondition {
+    /// `DELTA_PATH_DOES_NOT_EXIST` (SQLSTATE `42K03`).
+    DeltaPathDoesNotExist,
     /// `DELTA_VERSIONS_NOT_CONTIGUOUS` (SQLSTATE `KD00C`).
     DeltaVersionsNotContiguous,
     /// `DELTA_VERSION_INVALID` (SQLSTATE `42815`).
@@ -21,6 +23,12 @@ pub enum DeltaErrorCondition {
 impl DeltaErrorCondition {
     pub(super) const fn metadata(self) -> ConditionMetadata {
         match self {
+            Self::DeltaPathDoesNotExist => ConditionMetadata {
+                name: "DELTA_PATH_DOES_NOT_EXIST",
+                sql_state: Some("42K03"),
+                parameter_names: &["path"],
+                message_template: "<path> doesn't exist, or is not a Delta table.",
+            },
             Self::DeltaVersionsNotContiguous => ConditionMetadata {
                 name: "DELTA_VERSIONS_NOT_CONTIGUOUS",
                 sql_state: Some("KD00C"),

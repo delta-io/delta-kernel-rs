@@ -527,6 +527,7 @@ impl<Mode> SnapshotBuilder<Mode> {
 
 #[cfg(test)]
 pub(super) mod tests {
+    use std::error::Error as _;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -700,16 +701,43 @@ pub(super) mod tests {
         Ok(())
     }
 
+    #[test]
+    fn nonexistent_local_table_reports_requested_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("absent");
+        let (engine, _, _) = setup_test();
+        let error = Snapshot::builder_for(path.to_str().unwrap())
+            .build(engine.as_ref())
+            .unwrap_err();
+        let crate::Error::Delta(delta) = error else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(delta.name(), "DELTA_PATH_DOES_NOT_EXIST");
+        assert_eq!(delta.parameters()[0].value(), path.to_str().unwrap());
+        assert!(matches!(
+            delta.source().unwrap().downcast_ref::<KernelError>(),
+            Some(KernelError::InvalidTableLocation(_))
+        ));
+    }
+
     #[test_log::test(tokio::test)]
     async fn log_segment_load_failure_emits_metric_on_empty_log() -> KernelResult<()> {
         let (engine, _store, table_root) = setup_test();
         let (reporter, _guard) = measuring_reporter();
 
-        assert!(
-            SnapshotBuilder::new_for(table_root)
-                .build(engine.as_ref())
-                .is_err()
-        );
+        let error = SnapshotBuilder::new_for(&table_root)
+            .build(engine.as_ref())
+            .unwrap_err();
+        let crate::Error::Delta(delta) = error else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(delta.name(), "DELTA_PATH_DOES_NOT_EXIST");
+        assert_eq!(delta.sql_state(), Some("42K03"));
+        assert_eq!(delta.parameters()[0].value(), table_root);
+        assert!(matches!(
+            delta.source().unwrap().downcast_ref::<KernelError>(),
+            Some(KernelError::EmptyLog)
+        ));
 
         let events = reporter.events();
         let failure = events
@@ -737,11 +765,13 @@ pub(super) mod tests {
         .await?;
         let (reporter, _guard) = measuring_reporter();
 
-        assert!(
-            SnapshotBuilder::new_for(table_root)
-                .build(engine.as_ref())
-                .is_err()
-        );
+        let error = SnapshotBuilder::new_for(table_root)
+            .build(engine.as_ref())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::Kernel(KernelError::MissingMetadataAndProtocol)
+        ));
 
         let events = reporter.events();
         assert!(

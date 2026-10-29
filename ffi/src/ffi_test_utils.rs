@@ -30,6 +30,7 @@ use crate::{KernelBytesSlice, KernelStringSlice, NullableCvoid, TryFromStringSli
 pub(crate) struct EngineErrorWithMessage {
     pub(crate) etype: FFIKernelError,
     pub(crate) message: String,
+    pub(crate) condition: Option<String>,
 }
 
 pub(crate) const TEST_ERROR_ALLOCATORS: ErrorAllocators = ErrorAllocators {
@@ -45,6 +46,7 @@ unsafe extern "C" fn allocate_kernel_err(
     let info = unsafe { &*info };
     let error = EngineErrorWithMessage {
         etype: info.code,
+        condition: None,
         message: unsafe { info.message.try_to_string().unwrap() },
     };
     Box::into_raw(Box::new(error)).cast()
@@ -57,6 +59,7 @@ unsafe extern "C" fn allocate_delta_err(
     let info = unsafe { &*info };
     let error = EngineErrorWithMessage {
         etype: FFIKernelError::UnknownError,
+        condition: Some(unsafe { info.condition.try_to_string().unwrap() }),
         message: unsafe { info.message.try_to_string().unwrap() },
     };
     Box::into_raw(Box::new(error)).cast()
@@ -247,6 +250,15 @@ pub(crate) fn assert_timestamp_is_recent(timestamp: i64) {
         (now_ms - one_day_ms..=now_ms).contains(&timestamp),
         "commit timestamp {timestamp} not within one day of now {now_ms}"
     );
+}
+
+/// Requires a structured Delta classification and frees the test connector allocation.
+pub(crate) fn assert_extern_result_delta_error<T>(result: ExternResult<T>, condition: &str) {
+    let ExternResult::Err(error) = result else {
+        panic!("expected a Delta error")
+    };
+    let error = unsafe { recover_error(error) };
+    assert_eq!(error.condition.as_deref(), Some(condition));
 }
 
 #[cfg(test)]

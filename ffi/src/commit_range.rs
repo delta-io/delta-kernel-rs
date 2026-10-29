@@ -914,10 +914,9 @@ mod tests {
         let result = unsafe {
             commit_range_builder_for(kernel_string_slice!(invalid_path), 0, engine.shallow_copy())
         };
-        assert_extern_result_error_with_message(
+        crate::ffi_test_utils::assert_extern_result_delta_error(
             result,
-            FFIKernelError::InvalidTableLocationError,
-            None,
+            "DELTA_PATH_DOES_NOT_EXIST",
         );
 
         unsafe { free_engine(engine) }
