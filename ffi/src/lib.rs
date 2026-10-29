@@ -479,7 +479,8 @@ pub unsafe extern "C" fn allocate_kernel_string(
     kernel_str: KernelStringSlice,
     error_fn: AllocateErrorFn,
 ) -> ExternResult<Handle<ExclusiveRustString>> {
-    allocate_kernel_string_impl(kernel_str).into_extern_result(&error_fn)
+    let result = allocate_kernel_string_impl(kernel_str);
+    unsafe { result.into_extern_result(&error_fn) }
 }
 
 fn allocate_kernel_string_impl(
@@ -629,7 +630,7 @@ mod private {
             if self.len == 0 {
                 Default::default()
             } else {
-                Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len)
+                unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len) }
             }
         }
     }
@@ -672,7 +673,7 @@ mod private {
         /// The slice must have been originally created `From<Vec<u64>>`, and must not have
         /// already been consumed by a previous call to this method.
         pub unsafe fn into_vec(self) -> Vec<u64> {
-            Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len)
+            unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len) }
         }
 
         /// Creates an empty slice.
@@ -709,7 +710,7 @@ pub unsafe extern "C" fn free_bool_slice(slice: KernelBoolSlice) {
 /// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
-    let _ = slice.into_vec();
+    let _ = unsafe { slice.into_vec() };
 }
 
 /// Free a [`KernelOwnedBytes`] buffer obtained from kernel.
@@ -741,7 +742,7 @@ pub struct ExclusiveEngineData;
 /// Caller is responsible for passing a valid handle as engine_data
 #[no_mangle]
 pub unsafe extern "C" fn free_engine_data(engine_data: Handle<ExclusiveEngineData>) {
-    engine_data.drop_handle();
+    unsafe { engine_data.drop_handle() }
 }
 
 // A wrapper for Engine which defines additional FFI-specific methods.
@@ -880,7 +881,8 @@ pub unsafe extern "C" fn get_engine_builder(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    get_engine_builder_impl(url, allocate_error).into_extern_result(&allocate_error)
+    let result = get_engine_builder_impl(url, allocate_error);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -908,7 +910,7 @@ fn get_engine_builder_impl(
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn free_engine_builder(builder: Handle<ExclusiveEngineBuilder>) {
-    unsafe { builder.drop_handle() };
+    unsafe { builder.drop_handle() }
 }
 
 /// Set an option on the builder and return the updated builder handle on success.
@@ -931,9 +933,8 @@ pub unsafe extern "C" fn builder_with_option(
 ) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
     let mut builder = unsafe { builder.into_inner() };
     let allocate_fn = builder.allocate_fn;
-    builder_with_option_impl(&mut builder, key, value)
-        .map(|_| builder.into())
-        .into_extern_result(&allocate_fn)
+    let result = builder_with_option_impl(&mut builder, key, value).map(|_| builder.into());
+    unsafe { result.into_extern_result(&allocate_fn) }
 }
 #[cfg(feature = "default-engine-base")]
 fn builder_with_option_impl(
@@ -1034,9 +1035,10 @@ pub unsafe extern "C" fn builder_with_rest_object_store(
 ) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
     let mut builder = unsafe { builder.into_inner() };
     let allocate_fn = builder.allocate_fn;
-    builder_with_rest_object_store_impl(&mut builder, endpoint_config, callback, context)
-        .map(|_| builder.into())
-        .into_extern_result(&allocate_fn)
+    let result =
+        builder_with_rest_object_store_impl(&mut builder, endpoint_config, callback, context)
+            .map(|_| builder.into());
+    unsafe { result.into_extern_result(&allocate_fn) }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -1073,15 +1075,15 @@ pub unsafe extern "C" fn builder_build(
     builder: Handle<ExclusiveEngineBuilder>,
 ) -> ExternResult<Handle<SharedExternEngine>> {
     let builder_box = unsafe { builder.into_inner() };
-    get_default_engine_impl(
+    let result = get_default_engine_impl(
         builder_box.url,
         builder_box.options,
         builder_box.object_store_backend,
         builder_box.multithreaded_executor_config,
         builder_box.io_config,
         builder_box.allocate_fn,
-    )
-    .into_extern_result(&builder_box.allocate_fn)
+    );
+    unsafe { result.into_extern_result(&builder_box.allocate_fn) }
 }
 
 /// # Safety
@@ -1094,7 +1096,8 @@ pub unsafe extern "C" fn get_default_engine(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<Handle<SharedExternEngine>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    get_default_default_engine_impl(url, allocate_error).into_extern_result(&allocate_error)
+    let result = get_default_default_engine_impl(url, allocate_error);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 // get the default version of the default engine :)
@@ -1200,7 +1203,7 @@ pub(crate) fn build_engine_from_store(
 #[no_mangle]
 pub unsafe extern "C" fn free_engine(engine: Handle<SharedExternEngine>) {
     debug!("engine released engine");
-    engine.drop_handle();
+    unsafe { engine.drop_handle() }
 }
 
 #[handle_descriptor(target=Schema, mutable=false, sized=true)]
@@ -1374,9 +1377,13 @@ pub unsafe extern "C" fn get_snapshot_builder(
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let source = match url {
         Ok(url) => FfiSnapshotBuilderSource::TableRoot(url),
-        Err(e) => return KernelResult::Err(e).into_extern_result(&engine_ref),
+        Err(e) => {
+            let result: KernelResult<Handle<ExclusiveSnapshotBuilder>> = Err(e);
+            return unsafe { result.into_extern_result(&engine_ref) };
+        }
     };
-    make_snapshot_builder(source, engine_arc).into_extern_result(&engine_ref)
+    let result = make_snapshot_builder(source, engine_arc);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Get a builder for incrementally updating an existing snapshot.
@@ -1397,11 +1404,11 @@ pub unsafe extern "C" fn get_snapshot_builder_from(
     let engine_ref = unsafe { engine.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
     let snapshot_arc = unsafe { prev_snapshot.clone_as_arc() };
-    make_snapshot_builder(
+    let result = make_snapshot_builder(
         FfiSnapshotBuilderSource::ExistingSnapshot(snapshot_arc),
         engine_arc,
-    )
-    .into_extern_result(&engine_ref)
+    );
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Sets an explicit target version on a snapshot builder. When omitted, a hinted build uses the
@@ -1464,9 +1471,9 @@ pub unsafe extern "C" fn snapshot_builder_with_log_tail(
     let mut builder = unsafe { builder.into_inner() };
     let engine_arc = builder.engine.clone();
     let engine_ref = engine_arc.as_ref();
-    snapshot_builder_with_log_tail_impl(&mut builder, log_tail)
-        .map(|_| builder.into())
-        .into_extern_result(&engine_ref)
+    let result = unsafe { snapshot_builder_with_log_tail_impl(&mut builder, log_tail) }
+        .map(|_| builder.into());
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 unsafe fn snapshot_builder_with_log_tail_impl(
@@ -1508,7 +1515,8 @@ pub unsafe extern "C" fn snapshot_builder_build(
     let engine_arc = unsafe { builder.as_mut() }.engine.clone();
     let engine_ref = engine_arc.as_ref();
     let builder_box = unsafe { builder.into_inner() };
-    snapshot_builder_build_impl(*builder_box).into_extern_result(&engine_ref)
+    let result = snapshot_builder_build_impl(*builder_box);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 fn snapshot_builder_build_impl(
@@ -1603,7 +1611,7 @@ fn snapshot_builder_build_impl(
 /// Caller must pass a valid builder pointer and must not use it again after this call.
 #[no_mangle]
 pub unsafe extern "C" fn free_snapshot_builder(builder: Handle<ExclusiveSnapshotBuilder>) {
-    builder.drop_handle();
+    unsafe { builder.drop_handle() }
 }
 
 /// # Safety
@@ -1612,7 +1620,7 @@ pub unsafe extern "C" fn free_snapshot_builder(builder: Handle<ExclusiveSnapshot
 #[no_mangle]
 pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
     debug!("engine released snapshot");
-    snapshot.drop_handle();
+    unsafe { snapshot.drop_handle() }
 }
 
 /// Perform a checkpoint write on the given snapshot. Mirrors the kernel's
@@ -1640,10 +1648,10 @@ pub unsafe extern "C" fn checkpoint_snapshot(
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
     let kernel_spec = spec.map(|s| s.to_kernel());
-    snapshot_ref
+    let result = snapshot_ref
         .checkpoint(engine_ref.engine().as_ref(), kernel_spec.as_ref())
-        .map(|(result, updated)| FfiCheckpointWriteResult::from_kernel(result, updated))
-        .into_extern_result(&engine_ref)
+        .map(|(result, updated)| FfiCheckpointWriteResult::from_kernel(result, updated));
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Publish unpublished catalog commits on a catalog-managed snapshot.
@@ -1670,10 +1678,10 @@ pub unsafe extern "C" fn snapshot_publish_with_committer(
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
     let committer = unsafe { committer.into_inner() };
-    snapshot_ref
+    let result = snapshot_ref
         .publish(engine_ref.engine().as_ref(), committer.as_ref())
-        .map(|updated| updated.into())
-        .into_extern_result(&engine_ref)
+        .map(|updated| updated.into());
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Get the version of the specified snapshot
@@ -1706,9 +1714,8 @@ pub unsafe extern "C" fn snapshot_timestamp(
 ) -> ExternResult<i64> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    snapshot
-        .get_timestamp(engine_ref.engine().as_ref())
-        .into_extern_result(&engine_ref)
+    let result = snapshot.get_timestamp(engine_ref.engine().as_ref());
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Statistics for the commit files selected to replay a snapshot's log segment.
@@ -1752,10 +1759,8 @@ pub unsafe extern "C" fn snapshot_log_segment_stats(
 ) -> ExternResult<FfiLogSegmentStats> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    snapshot
-        .log_segment_stats()
-        .map(FfiLogSegmentStats::from)
-        .into_extern_result(&engine_ref)
+    let result = snapshot.log_segment_stats().map(FfiLogSegmentStats::from);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// File-level statistics for a snapshot, sourced from the snapshot's CRC.
@@ -1896,13 +1901,13 @@ pub unsafe extern "C" fn get_earliest_commit(
 ) -> ExternResult<Version> {
     let engine_ref = unsafe { engine.as_ref() };
     let log_root = unsafe { unwrap_and_parse_path_as_url(log_root) };
-    get_earliest_commit_impl(
+    let result = get_earliest_commit_impl(
         engine_ref,
         log_root,
         earliest_ratified_commit_version,
         commit_type,
-    )
-    .into_extern_result(&engine_ref)
+    );
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 fn get_earliest_commit_impl(
@@ -1960,14 +1965,14 @@ pub unsafe extern "C" fn latest_version_as_of(
 ) -> ExternResult<FfiCommitAt> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    kernel_latest_version_as_of(
+    let result = kernel_latest_version_as_of(
         snapshot,
         engine_ref.engine().as_ref(),
         timestamp,
         commit_type.into(),
     )
-    .map(FfiCommitAt::from)
-    .into_extern_result(&engine_ref)
+    .map(FfiCommitAt::from);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Get the first commit (version and timestamp) within `snapshot`'s version range with a
@@ -1990,14 +1995,14 @@ pub unsafe extern "C" fn first_version_after(
 ) -> ExternResult<FfiCommitAt> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    kernel_first_version_after(
+    let result = kernel_first_version_after(
         snapshot,
         engine_ref.engine().as_ref(),
         timestamp,
         commit_type.into(),
     )
-    .map(FfiCommitAt::from)
-    .into_extern_result(&engine_ref)
+    .map(FfiCommitAt::from);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Get the logical schema of the specified snapshot
@@ -2032,7 +2037,7 @@ pub unsafe extern "C" fn snapshot_physical_schema(
 /// Engine is responsible for providing a valid schema handle.
 #[no_mangle]
 pub unsafe extern "C" fn free_schema(schema: Handle<SharedSchema>) {
-    schema.drop_handle();
+    unsafe { schema.drop_handle() }
 }
 
 /// Get the resolved root of the table. This should be used in any future calls that require
@@ -2102,7 +2107,7 @@ pub unsafe extern "C" fn snapshot_get_protocol(
 /// Caller is responsible for providing a valid, non-freed protocol handle.
 #[no_mangle]
 pub unsafe extern "C" fn free_protocol(protocol: Handle<SharedProtocol>) {
-    protocol.drop_handle();
+    unsafe { protocol.drop_handle() }
 }
 
 /// Visit all fields of the protocol in a single FFI call. The caller provides:
@@ -2210,7 +2215,7 @@ fn string_slice_next_impl(
 /// Caller is responsible for (at most once) passing a valid pointer to a [`StringSliceIterator`]
 #[no_mangle]
 pub unsafe extern "C" fn free_string_slice_data(data: Handle<StringSliceIterator>) {
-    data.drop_handle();
+    unsafe { data.drop_handle() }
 }
 
 /// A set that can identify its contents by address
@@ -2485,15 +2490,17 @@ mod tests {
         log_tail: log_path::LogPathArray,
         max_catalog_version: Option<Version>,
     ) -> ExternResult<Handle<SharedSnapshot>> {
-        let ptr = ok_or_panic(get_snapshot_builder(path, engine));
-        let ptr = snapshot_builder_with_version(ptr, version);
-        let ptr = ok_or_panic(snapshot_builder_with_log_tail(ptr, log_tail));
-        let ptr = if let Some(mcv) = max_catalog_version {
-            snapshot_builder_with_max_catalog_version(ptr, mcv)
-        } else {
-            ptr
-        };
-        snapshot_builder_build(ptr)
+        unsafe {
+            let ptr = ok_or_panic(get_snapshot_builder(path, engine));
+            let ptr = snapshot_builder_with_version(ptr, version);
+            let ptr = ok_or_panic(snapshot_builder_with_log_tail(ptr, log_tail));
+            let ptr = if let Some(mcv) = max_catalog_version {
+                snapshot_builder_with_max_catalog_version(ptr, mcv)
+            } else {
+                ptr
+            };
+            snapshot_builder_build(ptr)
+        }
     }
 
     pub(crate) fn get_default_engine(path: &str) -> Handle<SharedExternEngine> {

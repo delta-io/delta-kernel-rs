@@ -159,7 +159,7 @@ pub unsafe extern "C" fn get_uc_commit_client(
 #[no_mangle]
 pub unsafe extern "C" fn free_uc_commit_client(commit_client: Handle<SharedFfiUCCommitClient>) {
     debug!("released uc commit client");
-    commit_client.drop_handle();
+    unsafe { commit_client.drop_handle() }
 }
 
 // we need our own struct here because we want to override the calls to enter the tokio runtime
@@ -224,8 +224,8 @@ pub unsafe extern "C" fn get_uc_committer(
     table_name: KernelStringSlice,
     error_fn: AllocateErrorFn,
 ) -> ExternResult<Handle<MutableCommitter>> {
-    get_uc_committer_impl(commit_client, table_id, catalog, schema, table_name)
-        .into_extern_result(&error_fn)
+    let result = get_uc_committer_impl(commit_client, table_id, catalog, schema, table_name);
+    unsafe { result.into_extern_result(&error_fn) }
 }
 
 fn get_uc_committer_impl(
@@ -262,7 +262,7 @@ fn get_uc_committer_impl(
 #[no_mangle]
 pub unsafe extern "C" fn free_uc_committer(commit_client: Handle<MutableCommitter>) {
     debug!("released uc committer");
-    commit_client.drop_handle();
+    unsafe { commit_client.drop_handle() }
 }
 
 #[cfg(test)]

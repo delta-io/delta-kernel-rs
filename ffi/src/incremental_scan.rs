@@ -136,7 +136,8 @@ pub unsafe extern "C" fn incremental_scan_builder_with_predicate(
 ) -> ExternResult<Handle<ExclusiveIncrementalScanBuilder>> {
     let engine = unsafe { engine.as_ref() };
     let builder = unsafe { builder.into_inner() };
-    incremental_scan_builder_with_predicate_impl(*builder, predicate).into_extern_result(&engine)
+    let result = incremental_scan_builder_with_predicate_impl(*builder, predicate);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn incremental_scan_builder_with_predicate_impl(
@@ -169,7 +170,8 @@ pub unsafe extern "C" fn incremental_scan_builder_build(
 ) -> ExternResult<OptionalValue<Handle<SharedIncrementalScanStream>>> {
     let builder = unsafe { builder.into_inner() };
     let engine = builder.engine.clone();
-    incremental_scan_builder_build_impl(*builder).into_extern_result(&engine.as_ref())
+    let result = incremental_scan_builder_build_impl(*builder);
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 fn incremental_scan_builder_build_impl(
@@ -200,7 +202,7 @@ fn incremental_scan_builder_build_impl(
 pub unsafe extern "C" fn free_incremental_scan_builder(
     builder: Handle<ExclusiveIncrementalScanBuilder>,
 ) {
-    builder.drop_handle();
+    unsafe { builder.drop_handle() }
 }
 
 /// Get the next live-Add batch from the stream as Arrow via the C Data Interface.
@@ -227,7 +229,8 @@ pub unsafe extern "C" fn incremental_scan_stream_next_arrow(
     stream: Handle<SharedIncrementalScanStream>,
 ) -> ExternResult<*mut ScanMetadataArrowResult> {
     let stream = unsafe { stream.as_ref() };
-    incremental_scan_stream_next_arrow_impl(stream).into_extern_result(&stream.engine.as_ref())
+    let result = incremental_scan_stream_next_arrow_impl(stream);
+    unsafe { result.into_extern_result(&stream.engine.as_ref()) }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -287,7 +290,8 @@ pub unsafe extern "C" fn incremental_scan_stream_into_summary(
 ) -> ExternResult<Handle<SharedIncrementalScanSummary>> {
     let inner_stream = unsafe { stream.into_inner() };
     let engine = inner_stream.engine.clone();
-    incremental_scan_stream_into_summary_impl(&inner_stream).into_extern_result(&engine.as_ref())
+    let result = incremental_scan_stream_into_summary_impl(&inner_stream);
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 fn incremental_scan_stream_into_summary_impl(
@@ -406,7 +410,7 @@ fn visit_file_keys(
 /// Caller must pass a valid stream handle and must not use it again after this call.
 #[no_mangle]
 pub unsafe extern "C" fn free_incremental_scan_stream(stream: Handle<SharedIncrementalScanStream>) {
-    stream.drop_handle();
+    unsafe { stream.drop_handle() }
 }
 
 /// Free an incremental scan summary.
@@ -418,7 +422,7 @@ pub unsafe extern "C" fn free_incremental_scan_stream(stream: Handle<SharedIncre
 pub unsafe extern "C" fn free_incremental_scan_summary(
     summary: Handle<SharedIncrementalScanSummary>,
 ) {
-    summary.drop_handle();
+    unsafe { summary.drop_handle() }
 }
 
 #[cfg(test)]
@@ -468,12 +472,9 @@ mod tests {
         }
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let builder = unsafe {
-            ok_or_panic(get_snapshot_builder(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
+        let table_root = kernel_string_slice!(table_root);
+        let builder =
+            unsafe { ok_or_panic(get_snapshot_builder(table_root, engine.shallow_copy())) };
         let builder = unsafe { snapshot_builder_with_version(builder, target_version) };
         let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
         (engine, snapshot)

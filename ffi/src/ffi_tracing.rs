@@ -894,10 +894,8 @@ mod tests {
     #[test]
     fn test_enable_log_line_tracing() {
         setup_messages();
-        unsafe {
-            // record_callback_with_filter_1 filters only "Testing 1\n", "Another line\n"
-            enable_log_line_tracing(record_callback_with_filter_1, Level::INFO);
-        }
+        // record_callback_with_filter_1 filters only "Testing 1\n", "Another line\n"
+        unsafe { enable_log_line_tracing(record_callback_with_filter_1, Level::INFO) };
         let lines = [
             "Testing 1\n",
             "Another line\n",
@@ -1071,10 +1069,8 @@ mod tests {
               // comment there, however this test works if run individually.
     fn test_enable_event_tracing() {
         setup_events();
-        unsafe {
-            // Filters only "Testing 1", "Another line"
-            enable_event_tracing(event_callback_with_filter_1, Level::INFO);
-        }
+        // Filters only "Testing 1", "Another line"
+        unsafe { enable_event_tracing(event_callback_with_filter_1, Level::INFO) };
         let lines = ["Testing 1", "Another line", "Testing 2", "Yet another line"];
         // We registered record_callback_with_filter_1, which filters the first two logging lines
         let expected_lines = vec!["Testing 1", "Another line"];
@@ -1087,9 +1083,7 @@ mod tests {
         with_events(|events| assert!(events.is_none_or(|events| events.is_empty())));
 
         // Ensure we can setup again with a new callback and a new tracing level
-        unsafe {
-            enable_event_tracing(event_callback_with_filter_2, Level::DEBUG);
-        };
+        unsafe { enable_event_tracing(event_callback_with_filter_2, Level::DEBUG) };
 
         // Ensure both callback and tracing level are reloaded.
         // We registered record_callback_with_filter_2, which filters the other logging lines

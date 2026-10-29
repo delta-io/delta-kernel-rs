@@ -32,7 +32,8 @@ pub unsafe extern "C" fn get_domain_metadata(
     let engine = unsafe { engine.as_ref() };
     let domain = unsafe { String::try_from_slice(&domain) };
 
-    get_domain_metadata_impl(snapshot, domain, engine, allocate_fn).into_extern_result(&engine)
+    let result = get_domain_metadata_impl(snapshot, domain, engine, allocate_fn);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn get_domain_metadata_impl(
@@ -63,10 +64,10 @@ pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark(
 ) -> ExternResult<OptionalValue<i64>> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    snapshot
+    let result = snapshot
         .get_row_tracking_high_water_mark(engine_ref.engine().as_ref())
-        .map(OptionalValue::from)
-        .into_extern_result(&engine_ref)
+        .map(OptionalValue::from);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Signature of the callback invoked once per clustering column by
@@ -122,8 +123,8 @@ pub unsafe extern "C" fn visit_clustering_columns(
 ) -> ExternResult<OptionalValue<usize>> {
     let snapshot = unsafe { snapshot.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    visit_clustering_columns_impl(snapshot, engine, engine_context, visitor)
-        .into_extern_result(&engine)
+    let result = visit_clustering_columns_impl(snapshot, engine, engine_context, visitor);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn visit_clustering_columns_impl(
@@ -171,8 +172,8 @@ pub unsafe extern "C" fn visit_domain_metadata(
     let snapshot = unsafe { snapshot.as_ref() };
     let engine = unsafe { engine.as_ref() };
 
-    visit_domain_metadata_impl(snapshot, engine, engine_context, visitor)
-        .into_extern_result(&engine)
+    let result = visit_domain_metadata_impl(snapshot, engine, engine_context, visitor);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn visit_domain_metadata_impl(

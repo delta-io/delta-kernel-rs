@@ -316,8 +316,8 @@ pub unsafe extern "C" fn expressions_are_equal(
     expr1: &Handle<SharedExpression>,
     expr2: &Handle<SharedExpression>,
 ) -> bool {
-    let expr1: &Expr = expr1.as_ref();
-    let expr2: &Expr = expr2.as_ref();
+    let expr1: &Expr = unsafe { expr1.as_ref() };
+    let expr2: &Expr = unsafe { expr2.as_ref() };
     expr1 == expr2
 }
 
@@ -331,7 +331,7 @@ pub unsafe extern "C" fn predicates_are_equal(
     pred1: &Handle<SharedPredicate>,
     pred2: &Handle<SharedPredicate>,
 ) -> bool {
-    let pred1: &Pred = pred1.as_ref();
-    let pred2: &Pred = pred2.as_ref();
+    let pred1: &Pred = unsafe { pred1.as_ref() };
+    let pred2: &Pred = unsafe { pred2.as_ref() };
     pred1 == pred2
 }

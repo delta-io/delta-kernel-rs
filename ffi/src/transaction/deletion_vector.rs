@@ -54,7 +54,7 @@ pub extern "C" fn dv_descriptor_map_new() -> Handle<ExclusiveDvDescriptorMap> {
 /// Caller must pass a valid handle previously returned by [`dv_descriptor_map_new`].
 #[no_mangle]
 pub unsafe extern "C" fn free_dv_descriptor_map(map: Handle<ExclusiveDvDescriptorMap>) {
-    map.drop_handle();
+    unsafe { map.drop_handle() }
 }
 
 /// Free a deletion vector descriptor handle. Only call this if the descriptor has not been
@@ -65,7 +65,7 @@ pub unsafe extern "C" fn free_dv_descriptor_map(map: Handle<ExclusiveDvDescripto
 /// Caller must pass a valid descriptor handle.
 #[no_mangle]
 pub unsafe extern "C" fn free_dv_descriptor(descriptor: Handle<ExclusiveDvDescriptor>) {
-    descriptor.drop_handle();
+    unsafe { descriptor.drop_handle() }
 }
 
 // =============================================================================
@@ -151,7 +151,7 @@ pub unsafe extern "C" fn dv_descriptor_new(
             cardinality,
         )
     });
-    result.into_extern_result(&engine)
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn dv_descriptor_new_impl(
@@ -197,9 +197,8 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
     let engine_ref = unsafe { engine.as_ref() };
     let descriptor = unsafe { descriptor.into_inner() };
     let path_result = unsafe { TryFromStringSlice::try_from_slice(&data_file_path) };
-    dv_descriptor_map_insert_impl(map_ref, path_result, *descriptor)
-        .map(|_| true)
-        .into_extern_result(&engine_ref)
+    let result = dv_descriptor_map_insert_impl(map_ref, path_result, *descriptor).map(|_| true);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 fn dv_descriptor_map_insert_impl(
@@ -249,9 +248,9 @@ pub unsafe extern "C" fn update_table_txn_update_deletion_vectors(
     let dv_map = unsafe { dv_map.into_inner() };
     let scan_iter = unsafe { scan_iter.into_inner() };
     let engine_ref = unsafe { engine.as_ref() };
-    update_table_txn_update_deletion_vectors_impl(txn_ref, *dv_map, &scan_iter)
-        .map(|_| true)
-        .into_extern_result(&engine_ref)
+    let result =
+        update_table_txn_update_deletion_vectors_impl(txn_ref, *dv_map, &scan_iter).map(|_| true);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 fn update_table_txn_update_deletion_vectors_impl(
