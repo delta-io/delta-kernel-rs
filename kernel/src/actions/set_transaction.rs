@@ -23,8 +23,8 @@ impl SetTransactionScanner {
         application_id: &str,
         engine: &dyn Engine,
     ) -> KernelResult<Option<SetTransaction>> {
-        let mut transactions =
-            scan_application_transactions(log_segment, Some(application_id), engine)?;
+        let actions = replay_for_app_ids(log_segment, engine)?;
+        let mut transactions = scan_application_transactions(actions, Some(application_id))?;
         Ok(transactions.remove(application_id))
     }
 
@@ -34,7 +34,8 @@ impl SetTransactionScanner {
         log_segment: &LogSegment,
         engine: &dyn Engine,
     ) -> KernelResult<SetTransactionMap> {
-        scan_application_transactions(log_segment, None, engine)
+        let actions = replay_for_app_ids(log_segment, engine)?;
+        scan_application_transactions(actions, None)
     }
 
     /// Fetch the latest `txn` action for `application_id`, rooted in an authoritative (`Complete`)
@@ -52,27 +53,27 @@ impl SetTransactionScanner {
         base_version: Version,
         engine: &dyn Engine,
     ) -> KernelResult<Option<SetTransaction>> {
-        let tail = Self::get_one(
-            &log_segment.segment_after_version(base_version),
-            application_id,
-            engine,
-        )?;
-        Ok(tail.or_else(|| base_active.get(application_id).cloned()))
+        let actions = log_segment
+            .segment_after_version(base_version)
+            .read_actions(engine, LOG_TXN_SCHEMA.clone())?;
+        let mut tail = scan_application_transactions(actions, Some(application_id))?;
+        Ok(tail
+            .remove(application_id)
+            .or_else(|| base_active.get(application_id).cloned()))
     }
 }
 
-/// Scan the entire log for all application ids but terminate early if a specific application id
-/// is provided
+/// Folds `actions`, a newest-first read with [`LOG_TXN_SCHEMA`], into the latest `txn` per
+/// application id, stopping early once `application_id` (if given) is found.
 // TODO: we could have this track _multiple_ application ids instead of only up to one.
 fn scan_application_transactions(
-    log_segment: &LogSegment,
+    actions: impl Iterator<Item = KernelResult<ActionsBatch>>,
     application_id: Option<&str>,
-    engine: &dyn Engine,
 ) -> KernelResult<SetTransactionMap> {
     let mut visitor = SetTransactionVisitor::new(application_id.map(|s| s.to_owned()));
     // If a specific id is requested then we can terminate log replay early as soon as it was
     // found. If all ids are requested then we are forced to replay the entire log.
-    for maybe_data in replay_for_app_ids(log_segment, engine)? {
+    for maybe_data in actions {
         let txns = maybe_data?.actions;
         visitor.visit_rows_of(txns.as_ref())?;
         // if a specific id is requested and a transaction was found, then return
@@ -84,7 +85,7 @@ fn scan_application_transactions(
     Ok(visitor.set_transactions)
 }
 
-// Factored out to facilitate testing
+// The full-log `txn` read that `get_one` and `get_all` fold; factored out to facilitate testing.
 fn replay_for_app_ids(
     log_segment: &LogSegment,
     engine: &dyn Engine,

@@ -59,12 +59,11 @@ pub(crate) fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
 
 /// [`create_log_path`] with an explicit file size.
 pub(crate) fn create_log_path_with_size(path: &str, size: u64) -> ParsedLogPath<FileMeta> {
-    ParsedLogPath::try_from(FileMeta {
+    ParsedLogPath::new(FileMeta {
         location: Url::parse(path).expect("Invalid file URL"),
         last_modified: 0,
         size,
     })
-    .unwrap()
     .unwrap()
 }
 

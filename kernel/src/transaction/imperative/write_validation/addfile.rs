@@ -5,9 +5,11 @@ use std::sync::LazyLock;
 
 use super::utils::{validate_partition_keys, validate_required_field_exist};
 use super::{FileActionUniquenessValidator, StagedDataValidator, Validation};
-use crate::engine_data::{GetData, TypedGetData as _};
-use crate::schema::ColumnNamesAndTypes;
-use crate::transaction::mandatory_add_file_schema;
+use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::scan::log_replay::CLUSTERING_PROVIDER_NAME;
+use crate::schema::{column_name, schema_ref, ColumnNamesAndTypes};
+use crate::transaction::{mandatory_add_file_schema, ADD_FILE_CLUSTERING_PROVIDER_FIELD};
+use crate::utils::require;
 use crate::{EngineData, KernelError, KernelResult};
 
 /// Column indices, matching the order in [`ADD_FILE_COLUMNS_FOR_VALIDATION`].
@@ -18,6 +20,9 @@ const MODIFICATION_TIME: usize = 3;
 
 static ADD_FILE_COLUMNS_FOR_VALIDATION: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| mandatory_add_file_schema().leaves(None));
+
+static CLUSTERING_PROVIDER_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| schema_ref! { (&ADD_FILE_CLUSTERING_PROVIDER_FIELD) }.leaves(None));
 
 /// Runs mandatory validations for every staged AddFile row. When `uniqueness_validator` is
 /// provided, also validates file-action (addFile, removeFile) uniqueness across `adds` and the
@@ -30,6 +35,22 @@ pub(crate) fn validate_add_files(
 ) -> KernelResult<()> {
     StagedDataValidator::for_add_files(physical_partition_columns, uniqueness_validator)
         .validate_batches(adds)
+}
+
+/// Rejects batches with non-null clustering providers.
+pub(crate) fn validate_no_clustering_providers_set(
+    batches: &[Box<dyn EngineData>],
+) -> KernelResult<()> {
+    let mut validator = StagedDataValidator::new(
+        &CLUSTERING_PROVIDER_COLUMNS,
+        vec![Box::new(UnclusteredFile)],
+    );
+    for batch in batches {
+        if batch.has_field(&column_name!(CLUSTERING_PROVIDER_NAME)) {
+            RowVisitor::visit_rows_of(&mut validator, batch.as_ref())?;
+        }
+    }
+    Ok(())
 }
 
 impl<'a> StagedDataValidator<'a> {
@@ -122,6 +143,25 @@ impl Validation for AddFileUniquenessValidation<'_> {
         // Plain staged adds carry no deletion vector (the mandatory add-file schema has no
         // deletionVector column), so the dv-id is always None here.
         self.uniqueness_validator.record_add(path, None /* dv_id */)
+    }
+}
+
+struct UnclusteredFile;
+
+impl Validation for UnclusteredFile {
+    fn validate_row<'a>(
+        &mut self,
+        row: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> KernelResult<()> {
+        let provider: Option<&str> = getters[0].get_opt(row, CLUSTERING_PROVIDER_NAME)?;
+        require!(
+            provider.is_none(),
+            KernelError::invalid_transaction_state(
+                "clusteringProvider requires the 'clustering' writer feature"
+            )
+        );
+        Ok(())
     }
 }
 

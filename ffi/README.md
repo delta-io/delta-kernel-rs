@@ -65,6 +65,12 @@ schema changes use `update_table_txn_builder_add_column_at` and
 by `committed_transaction_post_commit_snapshot` is independently owned and must be released with
 `free_snapshot`.
 
+`create_table_txn_builder_with_clustering_columns` accepts `FfiColumnNameArray`, with each column
+represented by literal UTF-8 field-name segments. This supports nested paths and preserves dots
+inside field names. It replaces the flat string-array and count arguments, changing the C ABI.
+Rebuild connectors against the generated headers and update their calls together with the native
+library. Partition columns remain top-level names.
+
 The Rust builders share a generic `TransactionBuilder<T>` implementation, but the C API uses
 distinct create-table and update-table handles and function families. Shared setters call the
 common Rust implementation; custom setters remain specific to their transaction type. No generic
