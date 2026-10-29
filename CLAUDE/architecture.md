@@ -40,8 +40,8 @@ Generation uses local inputs. Download the catalog separately with
 `Error::Delta(DeltaError)` carries a catalog-backed failure with private fields exposed through
 accessors, ordered named string parameters, an optional original cause, and a creation-site
 backtrace. It converts into `Error` without changing its classification. `Display` renders only the
-catalog message. `std::error::Error::source()` exposes the cause, and `Debug` includes the message,
-cause, and backtrace.
+catalog message. `std::error::Error::source()` exposes the cause, and `Debug` includes every field
+and the rendered message.
 Connectors classify by condition and SQLSTATE, not diagnostic text, and own telemetry redaction.
 Construction is private. Condition-specific factories must supply the catalog's parameter names in
 template order. A Delta failure terminates the invocation, not the snapshot or process.

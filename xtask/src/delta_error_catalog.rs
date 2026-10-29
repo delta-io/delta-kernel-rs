@@ -516,7 +516,7 @@ mod tests {
             // placeholder omitted from parameter_names, independently of the extraction algorithm.
             assert!(
                 !message.contains(['<', '>']),
-                "{}: unlisted placeholder in {message:?}",
+                "{}: unlisted placeholder or literal angle bracket in {message:?}",
                 condition.name,
             );
         }

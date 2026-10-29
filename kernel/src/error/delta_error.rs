@@ -15,8 +15,8 @@ use super::DeltaErrorCondition;
 /// Catalog template details are available on [`DeltaErrorCondition`].
 ///
 /// [`fmt::Display`] renders only the catalog message. The original cause is available through
-/// [`StdError::source`], and [`fmt::Debug`] includes the message, cause, and backtrace. Diagnostic
-/// values are not redacted. Connectors are responsible for redacting telemetry.
+/// [`StdError::source`], and [`fmt::Debug`] includes every field and the rendered message.
+/// Diagnostic values are not redacted. Connectors are responsible for redacting telemetry.
 pub struct DeltaError {
     condition: DeltaErrorCondition,
     parameters: Box<[DeltaErrorParameter]>,
@@ -88,9 +88,13 @@ impl DeltaError {
                 .iter()
                 .map(DeltaErrorParameter::name)
                 .eq(condition.parameter_names().iter().copied()),
-            "{} requires parameters {:?}",
+            "{} requires parameters {:?}, got {:?}",
             condition.name(),
             condition.parameter_names(),
+            parameters
+                .iter()
+                .map(DeltaErrorParameter::name)
+                .collect::<Vec<_>>(),
         );
         Self {
             condition,
@@ -119,7 +123,7 @@ impl fmt::Debug for DeltaError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("DeltaError")
-            .field("message", &format_args!("{self}"))
+            .field("message", &self.to_string())
             .field("condition", &self.condition)
             .field("parameters", &self.parameters)
             .field("source", &self.source)
@@ -183,12 +187,13 @@ fn render_template(
 #[cfg(test)]
 mod tests {
     use std::backtrace::{Backtrace, BacktraceStatus};
-    use std::fmt;
+    use std::error::Error as StdError;
+    use std::{fmt, io};
 
     use rstest::rstest;
 
     use super::{render_template, DeltaError, DeltaErrorParameter};
-    use crate::{DeltaErrorCondition, Error};
+    use crate::{DeltaErrorCondition, Error, Result};
 
     struct LimitedWriter {
         remaining_bytes: usize,
@@ -215,6 +220,99 @@ mod tests {
     }
 
     #[test]
+    fn display_and_accessors_expose_condition_metadata_and_substituted_message() {
+        let delta = version_gap_error("0, 2", None);
+        assert_eq!(
+            delta.condition(),
+            DeltaErrorCondition::DeltaVersionsNotContiguous
+        );
+        assert_eq!(delta.name(), "DELTA_VERSIONS_NOT_CONTIGUOUS");
+        assert_eq!(delta.sql_state(), Some("KD00C"));
+        let parameters: Vec<_> = delta
+            .parameters()
+            .iter()
+            .map(|parameter| (parameter.name(), parameter.value()))
+            .collect();
+        assert_eq!(
+            parameters,
+            [
+                ("versionList", "0, 2"),
+                ("startVersion", "0"),
+                ("endVersion", "2"),
+                ("versionToLoad", "2"),
+            ]
+        );
+        assert_eq!(
+            delta.to_string(),
+            "Versions (0, 2) are not contiguous. \n\
+            A gap in the delta log between versions 0 and 2 was detected while trying to load \
+            version 2."
+        );
+        assert_eq!(delta.message(), delta.to_string());
+        assert!(delta.source().is_none());
+    }
+
+    #[rstest]
+    #[case::compact(false)]
+    #[case::pretty(true)]
+    fn debug_quotes_and_escapes_message_in_delta_and_envelope(#[case] pretty: bool) {
+        let delta = version_gap_error("\"0\",\n2", None);
+        let expected = format!("message: {:?}", delta.message());
+        let debug = if pretty {
+            format!("{delta:#?}")
+        } else {
+            format!("{delta:?}")
+        };
+        assert!(debug.contains(&expected), "{debug}");
+        let error = Error::from(delta);
+        let debug = if pretty {
+            format!("{error:#?}")
+        } else {
+            format!("{error:?}")
+        };
+        assert!(debug.contains(&expected), "{debug}");
+    }
+
+    #[test]
+    fn envelope_preserves_original_cause_without_exposing_it_in_display() {
+        let source = Box::new(io::Error::other("private cause"));
+        let original_source = std::ptr::from_ref(source.as_ref());
+        let delta = version_gap_error("0, 2", Some(source));
+        let error = Error::from(delta);
+        let Error::Delta(delta) = &error else {
+            panic!("expected a Delta error");
+        };
+        assert_eq!(error.to_string(), delta.message());
+        assert!(!error.to_string().contains("private cause"));
+        assert!(format!("{error:?}").contains("private cause"));
+        assert!(std::ptr::eq(
+            error.source().unwrap(),
+            delta.source().unwrap()
+        ));
+        assert!(std::ptr::eq(
+            error.source().unwrap().downcast_ref::<io::Error>().unwrap(),
+            original_source,
+        ));
+    }
+
+    #[test]
+    fn delta_error_propagates_through_result() {
+        let propagate = |delta: DeltaError| -> Result<()> {
+            Err(delta)?;
+            Ok(())
+        };
+        let error = propagate(version_gap_error("0, 2", None)).unwrap_err();
+        let Error::Delta(delta) = error else {
+            panic!("expected a Delta error");
+        };
+        assert_eq!(
+            delta.condition(),
+            DeltaErrorCondition::DeltaVersionsNotContiguous
+        );
+        assert_eq!(delta.parameters()[0].value(), "0, 2");
+    }
+
+    #[test]
     fn constructor_captures_backtrace_and_envelope_preserves_it() {
         let ambient = Backtrace::capture().status();
         if ambient != BacktraceStatus::Captured {
@@ -222,16 +320,7 @@ mod tests {
             return;
         }
 
-        let delta = DeltaError::new(
-            DeltaErrorCondition::DeltaVersionsNotContiguous,
-            vec![
-                DeltaErrorParameter::new("versionList", "0, 2"),
-                DeltaErrorParameter::new("startVersion", 0),
-                DeltaErrorParameter::new("endVersion", 2),
-                DeltaErrorParameter::new("versionToLoad", 2),
-            ],
-            None,
-        );
+        let delta = version_gap_error("0, 2", None);
         assert_eq!(delta.backtrace().status(), BacktraceStatus::Captured);
         let backtrace = delta.backtrace().to_string();
 
@@ -284,5 +373,21 @@ mod tests {
             render_template(template, &parameters, &mut output),
             Err(fmt::Error)
         );
+    }
+
+    fn version_gap_error(
+        version_list: &str,
+        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    ) -> DeltaError {
+        DeltaError::new(
+            DeltaErrorCondition::DeltaVersionsNotContiguous,
+            vec![
+                DeltaErrorParameter::new("versionList", version_list),
+                DeltaErrorParameter::new("startVersion", 0),
+                DeltaErrorParameter::new("endVersion", 2),
+                DeltaErrorParameter::new("versionToLoad", 2),
+            ],
+            source,
+        )
     }
 }
