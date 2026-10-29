@@ -1522,16 +1522,21 @@ mod test {
     }
 
     #[rstest]
-    // Tables whose top-level columns declare generation expressions.
-    // Without `generatedColumns` support, kernel writes the table as a normal table, as Delta Spark
-    // does.
+    // Tables whose top-level columns declare generation expressions without `generatedColumns`
+    // support. The expressions define no generated columns, so kernel writes the table as a normal
+    // table, as Delta Spark does.
     #[case::without_feature(
         generated_event_year_schema(),
         MockProtocolBuilder::new().build(),
         WriteSupport::Supported
     )]
-    // The protocol allows the expression, so kernel's write support for `generatedColumns`
-    // decides.
+    #[case::legacy_writer_below_min_version(
+        generated_event_year_schema(),
+        MockProtocolBuilder::new().with_versions(1, 2).build(),
+        WriteSupport::Supported
+    )]
+    // Tables that support `generatedColumns`, so write support depends on kernel's support for that
+    // feature. Writer version 4 also implies other features, such as `checkConstraints`.
     #[case::with_feature(
         generated_event_year_schema(),
         MockProtocolBuilder::new()
@@ -1539,20 +1544,13 @@ mod test {
             .build(),
         WriteSupport::Unsupported
     )]
-    #[case::legacy_writer_below_min_version(
-        generated_event_year_schema(),
-        MockProtocolBuilder::new().with_versions(1, 2).build(),
-        WriteSupport::Supported
-    )]
-    // Writer version 4 implies `generatedColumns` among other features, so kernel's write support
-    // for those features decides.
     #[case::legacy_writer_at_min_version(
         generated_event_year_schema(),
         MockProtocolBuilder::new().with_versions(1, 4).build(),
         WriteSupport::Unsupported
     )]
-    // Unusual metadata, detected like any other generation expression. The connector must parse
-    // these expressions and reject invalid ones.
+    // Write support depends only on the protocol, so empty and non-string expression values get the
+    // same results as a regular expression.
     #[case::empty_expression_with_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "")) },
         MockProtocolBuilder::new()
@@ -1648,8 +1646,8 @@ mod test {
         },
         true
     )]
-    // Unusual metadata, detected like any other generation expression. The connector must parse
-    // these expressions and reject invalid ones.
+    // Unusual values still count as generation expressions, since detection only checks that the
+    // key is present.
     #[case::empty_expression(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "")) },
         true
@@ -1669,8 +1667,9 @@ mod test {
         true
     )]
     // No top-level generation expressions.
+    #[case::no_expression(schema_ref! { nullable "event_time": TIMESTAMP }, false)]
     // Only top-level columns can be generated columns, so an expression on a nested field defines
-    // no generated column. Delta Spark writes such a table as a normal table.
+    // no generated column.
     #[case::nested_expression_only(
         schema_ref! {
             nullable "details": (schema! {
@@ -1695,7 +1694,6 @@ mod test {
         },
         false
     )]
-    #[case::no_expression(schema_ref! { nullable "event_time": TIMESTAMP }, false)]
     fn has_generation_expressions_detects_top_level_expressions(
         #[case] schema: SchemaRef,
         #[case] expected: bool,
