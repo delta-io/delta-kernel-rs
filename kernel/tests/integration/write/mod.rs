@@ -9,6 +9,8 @@ mod column_defaults;
 mod column_mapping;
 mod commit_info;
 mod domain_metadata;
+#[cfg(feature = "geo-type-in-dev")]
+mod geospatial;
 mod ict;
 mod interval;
 mod nested_field_ids;
