@@ -7,7 +7,7 @@ mod utils;
 
 pub use committer::UCCommitter;
 use delta_kernel::snapshot::SnapshotBuilder;
-use delta_kernel::{KernelError, KernelResult, LogPath, Snapshot};
+use delta_kernel::{DeltaError, KernelError, KernelResult, LogPath, Snapshot};
 use unity_catalog_delta_client_api::{Commit, LoadTableResponse};
 use url::Url;
 pub use utils::{
@@ -33,7 +33,7 @@ pub fn log_tail_from_commits(commits: &[Commit], table_root: Url) -> KernelResul
         .into_iter()
         .map(|c| {
             let version = c.version.try_into().map_err(|_| {
-                KernelError::generic(format!("commit version {} is negative", c.version))
+                DeltaError::invalid_version(c.version)
             })?;
             let file_size = c.file_size.try_into().map_err(|_| {
                 KernelError::generic(format!(
@@ -71,7 +71,7 @@ pub fn snapshot_builder_from_load_table(resp: &LoadTableResponse) -> KernelResul
     if let Some(version) = resp.latest_table_version {
         let max_catalog_version: u64 = version
             .try_into()
-            .map_err(|_| KernelError::generic("catalog reported a negative table version"))?;
+            .map_err(|_| DeltaError::invalid_version(version))?;
         builder = builder.with_max_catalog_version(max_catalog_version);
     }
     Ok(builder)
