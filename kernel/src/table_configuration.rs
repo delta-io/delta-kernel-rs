@@ -1513,7 +1513,7 @@ mod test {
         assert_eq!(has_check_constraints, expected);
     }
 
-    /// A schema whose top-level `event_year` column declares a generation expression.
+    /// A schema with a generation expression on the top-level `event_year` column.
     fn generated_event_year_schema() -> SchemaRef {
         schema_ref! {
             nullable "event_time": TIMESTAMP,
@@ -1534,8 +1534,8 @@ mod test {
         MockProtocolBuilder::new().with_versions(1, 2).build(),
         WriteSupport::Supported
     )]
-    // Tables that support `generatedColumns`, so write support depends on kernel's support for that
-    // feature. Writer version 4 also implies other features, such as `checkConstraints`.
+    // Kernel rejects writes to tables that support `generatedColumns`. The feature is listed in the
+    // protocol, or implied by writer version 4.
     #[case::with_feature(
         generated_event_year_schema(),
         MockProtocolBuilder::new()
@@ -1580,8 +1580,7 @@ mod test {
         MockProtocolBuilder::new().with_versions(1, 2).build(),
         WriteSupport::Supported
     )]
-    // Only top-level columns can be generated columns, so kernel ignores an expression on a nested
-    // field, like Delta Spark.
+    // Kernel ignores an expression on a nested field, like Delta Spark.
     #[case::nested_generation_expression(
         schema_ref! {
             nullable "details": (schema! {
@@ -1667,8 +1666,7 @@ mod test {
     )]
     // No top-level generation expressions.
     #[case::no_expression(schema_ref! { nullable "event_time": TIMESTAMP }, false)]
-    // Only top-level columns can be generated columns, so an expression on a nested field defines
-    // no generated column.
+    // Detection ignores an expression on a nested field, like Delta Spark.
     #[case::nested_expression_only(
         schema_ref! {
             nullable "details": (schema! {
