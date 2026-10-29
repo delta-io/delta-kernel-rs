@@ -853,8 +853,9 @@ impl TableConfiguration {
         })
     }
 
-    /// The table's [`GeneratedColumn`]s at this version, in schema order. Empty unless the
-    /// protocol supports the `generatedColumns` writer feature.
+    /// The table's [`GeneratedColumn`]s at this version, in schema order. Empty when no top-level
+    /// column declares a generation expression or the protocol doesn't support the
+    /// `generatedColumns` writer feature.
     ///
     /// # Errors
     ///
