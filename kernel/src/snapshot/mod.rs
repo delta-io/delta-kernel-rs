@@ -2,9 +2,7 @@
 //! has schema etc.)
 
 use std::collections::{HashMap, HashSet};
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use delta_kernel_derive::internal_api;
 use tracing::{debug, error, info, instrument, warn};
@@ -18,8 +16,8 @@ use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
-    ensure_standalone_checkpoint_supported, CheckpointSpec, CheckpointWriter, V2CheckpointConfig,
-    DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
+    ensure_standalone_checkpoint_supported, CheckpointShape, CheckpointSpec, CheckpointWriter,
+    V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
 };
 use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
@@ -31,7 +29,7 @@ use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::log_segment::LastManifestCommitResolution;
-use crate::log_segment::{CheckpointFileInfo, DomainMetadataMap, LogSegment, PmResolution};
+use crate::log_segment::{DomainMetadataMap, LogSegment, PmResolution};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::{
     emit_protocol_metadata_load, emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
@@ -98,9 +96,10 @@ pub enum CheckpointWriteResult {
 pub struct Snapshot {
     span: tracing::Span,
     log_segment: LogSegment,
-    // Log files are immutable. Cache successful inspection only; a failed read can be retried.
-    // Serialize discovery so concurrent consumers do not repeat footer or sidecar reads.
-    checkpoint_file_info: Mutex<Option<Arc<CheckpointFileInfo>>>,
+    // Immutable checkpoint inputs are shared by inspection and scan planning.
+    checkpoint_shape: OnceLock<CheckpointShape>,
+    // Serialize fallible initialization without locking subsequent reads. Failed I/O can retry.
+    checkpoint_shape_init: Mutex<()>,
     table_configuration: TableConfiguration,
     /// The newest CRC resolved at construction, kept so later queries and CRC writes reuse it
     /// instead of re-reading from disk. Queried via [`Snapshot::crc_at_version`] (authoritative,
@@ -286,7 +285,8 @@ impl Snapshot {
         Self {
             span,
             log_segment,
-            checkpoint_file_info: Mutex::new(None),
+            checkpoint_shape: OnceLock::new(),
+            checkpoint_shape_init: Mutex::new(()),
             table_configuration,
             crc,
             built_as_latest,
@@ -580,17 +580,23 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Vec<CheckpointFileGroup>> {
-        let info = self.checkpoint_file_info(engine)?;
+        let shape = self.checkpoint_shape(engine, true)?;
         if self.log_segment.listed.checkpoint_parts.is_empty() {
             return Ok(vec![]);
         }
         Ok(vec![CheckpointFileGroup {
-            num_files: if info.sidecars.is_empty() {
+            num_files: if shape.sidecars.is_empty() {
                 self.log_segment.listed.checkpoint_parts.len() as u64
             } else {
-                info.sidecars.len() as u64
+                shape.sidecars.len() as u64
             },
-            parquet_schema: info.parquet_schema.clone(),
+            parquet_schema: if shape.sidecars.is_empty()
+                && self.log_segment.listed.checkpoint_parts[0].is_json()
+            {
+                None
+            } else {
+                shape.leaf_checkpoint_schema().cloned()
+            },
         }])
     }
 
@@ -602,31 +608,36 @@ impl Snapshot {
     ///
     /// Returns an error if checkpoint metadata cannot be read or the sum exceeds [`u64::MAX`].
     pub fn checkpoint_size_in_bytes(&self, engine: &dyn Engine) -> KernelResult<u64> {
-        Ok(self.checkpoint_file_info(engine)?.size_in_bytes)
+        Ok(self.checkpoint_shape(engine, false)?.size_in_bytes)
     }
 
-    fn checkpoint_file_info(&self, engine: &dyn Engine) -> KernelResult<Arc<CheckpointFileInfo>> {
-        let mut cached = self
-            .checkpoint_file_info
+    /// Shares resolved checkpoint inputs, loading the leaf schema only when requested.
+    /// Failed discovery or schema reads leave the corresponding cell available for retry.
+    pub(crate) fn checkpoint_shape(
+        &self,
+        engine: &dyn Engine,
+        needs_leaf_schema: bool,
+    ) -> KernelResult<&CheckpointShape> {
+        if let Some(shape) = self.checkpoint_shape.get() {
+            if !needs_leaf_schema || shape.leaf_schema_resolved() {
+                return Ok(shape);
+            }
+        }
+        let _guard = self
+            .checkpoint_shape_init
             .lock()
             .map_err(|_| KernelError::generic("Checkpoint inspection lock poisoned"))?;
-        if let Some(info) = cached.as_ref() {
-            return Ok(info.clone());
+        let shape = match self.checkpoint_shape.get() {
+            Some(shape) => shape,
+            None => {
+                let shape = CheckpointShape::resolve(engine, self)?;
+                self.checkpoint_shape.get_or_init(|| shape)
+            }
+        };
+        if needs_leaf_schema {
+            shape.resolve_leaf_schema(engine, self)?;
         }
-        let info = Arc::new(self.log_segment.checkpoint_file_info(engine)?);
-        *cached = Some(info.clone());
-        Ok(info)
-    }
-
-    #[cfg(feature = "declarative-plans")]
-    pub(crate) fn cached_checkpoint_file_info(
-        &self,
-    ) -> KernelResult<Option<Arc<CheckpointFileInfo>>> {
-        Ok(self
-            .checkpoint_file_info
-            .lock()
-            .map_err(|_| KernelError::generic("Checkpoint inspection lock poisoned"))?
-            .clone())
+        Ok(shape)
     }
 
     /// Captures retained snapshot state as an owned hint without engine I/O.

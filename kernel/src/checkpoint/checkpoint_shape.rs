@@ -1,30 +1,30 @@
-//! Resolves a checkpoint shape:
-//! - A single-part checkpoint has one checkpoint leaf storing file actions (`add` and `remove`).
-//! - A multipart checkpoint has one checkpoint leaf per checkpoint part.
-//! - A manifest checkpoint has sidecars as its checkpoint leaves.
-//!
-//! A checkpoint leaf directly stores file actions. When requested, this module also retains the
-//! checkpoint leaf schema.
-//! Driven through a [`PlanExecutor`].
+//! Resolves the immutable checkpoint inputs shared by a snapshot's scans and inspection APIs.
 
-// No in-crate caller yet; following PRs will use this.
-#![allow(dead_code)]
+use std::sync::{Arc, OnceLock};
 
-use std::sync::Arc;
-
+#[cfg(feature = "declarative-plans")]
 use url::Url;
 
 use super::CHECKPOINT_ACTIONS_SCHEMA_V2;
+#[cfg(feature = "declarative-plans")]
 use crate::actions::visitors::SidecarVisitor;
+#[cfg(feature = "declarative-plans")]
 use crate::actions::SIDECAR_NAME;
+#[cfg(feature = "declarative-plans")]
 use crate::engine_data::RowVisitor;
+#[cfg(feature = "declarative-plans")]
 use crate::expressions::col;
-use crate::log_segment::{CheckpointFileInfo, LogSegment};
+#[cfg(feature = "declarative-plans")]
+use crate::log_segment::LogSegment;
+#[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::FileType;
+#[cfg(feature = "declarative-plans")]
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
-use crate::schema::{SchemaRef, StructType};
+use crate::schema::SchemaRef;
+#[cfg(feature = "declarative-plans")]
+use crate::schema::StructType;
 use crate::snapshot::Snapshot;
-use crate::{FileMeta, KernelResult};
+use crate::{Engine, FileMeta, KernelResult};
 
 /// Topology of a checkpoint: where the `add` / `remove` actions live.
 #[derive(Clone, Debug, PartialEq)]
@@ -37,83 +37,151 @@ pub(crate) enum CheckpointType {
     Manifest,
 }
 
-/// A snapshot's resolved checkpoint type and checkpoint leaf schema.
+/// A snapshot's resolved checkpoint inputs, with its leaf schema loaded on demand.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CheckpointShape {
-    /// What kind of checkpoint this is.
     pub(crate) checkpoint_type: CheckpointType,
-    /// Schema of the checkpoint leaves, when requested.
-    pub(crate) leaf_checkpoint_schema: Option<SchemaRef>,
+    // An empty cell means uninspected, not that the checkpoint lacks a schema.
+    pub(crate) leaf_checkpoint_schema: OnceLock<Option<SchemaRef>>,
+    pub(crate) sidecars: Vec<FileMeta>,
+    pub(crate) size_in_bytes: u64,
 }
 
 impl CheckpointShape {
-    pub(crate) fn from_file_info(segment: &LogSegment, info: &CheckpointFileInfo) -> Self {
-        Self {
-            checkpoint_type: if segment.listed.checkpoint_parts.is_empty() {
-                CheckpointType::None
-            } else if info.sidecars.is_empty() {
-                CheckpointType::Leaf
-            } else {
-                CheckpointType::Manifest
-            },
-            leaf_checkpoint_schema: info.parquet_schema.clone(),
-        }
+    pub(crate) fn resolve(engine: &dyn Engine, snapshot: &Snapshot) -> KernelResult<Self> {
+        let mut shape = Self::resolve_inputs(engine, snapshot)?;
+        shape.size_in_bytes = snapshot
+            .log_segment()
+            .listed
+            .checkpoint_parts
+            .iter()
+            .map(|part| &part.location)
+            .chain(shape.sidecars.iter())
+            .try_fold(0u64, |total, file| {
+                total.checked_add(file.size).ok_or_else(|| {
+                    crate::KernelError::generic("Checkpoint file size exceeds u64::MAX")
+                })
+            })?;
+        Ok(shape)
     }
 
-    /// Resolves `snapshot`'s checkpoint topology without retaining the checkpoint leaf schema.
-    ///
-    /// Returns an error if checkpoint metadata is invalid or required checkpoint data cannot be
-    /// read.
+    pub(crate) fn leaf_checkpoint_schema(&self) -> Option<&SchemaRef> {
+        self.leaf_checkpoint_schema.get().and_then(Option::as_ref)
+    }
+
+    pub(crate) fn leaf_schema_resolved(&self) -> bool {
+        self.leaf_checkpoint_schema.get().is_some()
+    }
+
+    // Called under Snapshot's initialization lock so schema discovery is also retryable and shared.
+    pub(crate) fn resolve_leaf_schema(
+        &self,
+        engine: &dyn Engine,
+        snapshot: &Snapshot,
+    ) -> KernelResult<()> {
+        if self.leaf_schema_resolved() {
+            return Ok(());
+        }
+        let segment = snapshot.log_segment();
+        let schema = match self.checkpoint_type {
+            CheckpointType::None => None,
+            CheckpointType::Leaf if segment.listed.checkpoint_parts[0].is_json() => {
+                Some(CHECKPOINT_ACTIONS_SCHEMA_V2.clone())
+            }
+            CheckpointType::Leaf | CheckpointType::Manifest => {
+                let (file, hint) = if let Some(sidecar) = self.sidecars.first() {
+                    (
+                        sidecar,
+                        segment.checkpoint_hint_sidecar_file_schema().map(Arc::new),
+                    )
+                } else {
+                    (
+                        &segment.listed.checkpoint_parts[0].location,
+                        segment.checkpoint_hint_schema(),
+                    )
+                };
+                Some(match hint {
+                    Some(schema) => schema,
+                    None => {
+                        #[cfg(feature = "declarative-plans")]
+                        if let Some(exec) = engine.plan_executor() {
+                            let schema = read_parquet_footer_schema(exec.as_ref(), file.clone())?;
+                            let _ = self.leaf_checkpoint_schema.set(Some(schema));
+                            return Ok(());
+                        }
+                        engine.parquet_handler().read_parquet_footer(file)?.schema
+                    }
+                })
+            }
+        };
+        let _ = self.leaf_checkpoint_schema.set(schema);
+        Ok(())
+    }
+
+    /// Resolves checkpoint topology, retaining schemas already read while discovering sidecars.
+    #[cfg(feature = "declarative-plans")]
     #[tracing::instrument(
         name = "checkpoint_shape.try_new",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub(crate) fn try_new(
-        exec: &dyn PlanExecutor,
-        snapshot: &Snapshot,
-    ) -> KernelResult<CheckpointShape> {
+    pub(crate) fn try_new(exec: &dyn PlanExecutor, snapshot: &Snapshot) -> KernelResult<Self> {
         Self::try_new_impl(exec, snapshot, false)
     }
 
-    /// Resolves `snapshot`'s checkpoint topology and retains the checkpoint leaf schema.
-    ///
-    /// Returns an error if checkpoint metadata is invalid or required checkpoint data cannot be
-    /// read.
-    #[tracing::instrument(
-        name = "checkpoint_shape.try_new_with_leaf_schema",
-        skip_all,
-        fields(enable_call_frame),
-        err
-    )]
-    pub(crate) fn try_new_with_leaf_schema(
+    fn resolve_inputs(engine: &dyn Engine, snapshot: &Snapshot) -> KernelResult<Self> {
+        #[cfg(feature = "declarative-plans")]
+        if let Some(exec) = engine.plan_executor() {
+            return Self::try_new(exec.as_ref(), snapshot);
+        }
+        let segment = snapshot.log_segment();
+        let (schema, sidecars) = segment.get_file_actions_schema_and_sidecars(engine)?;
+        let checkpoint_type = if segment.listed.checkpoint_parts.is_empty() {
+            CheckpointType::None
+        } else if sidecars.is_empty() {
+            CheckpointType::Leaf
+        } else {
+            CheckpointType::Manifest
+        };
+        let schema = schema.or_else(|| {
+            (checkpoint_type == CheckpointType::Leaf).then(|| CHECKPOINT_ACTIONS_SCHEMA_V2.clone())
+        });
+        Ok(Self {
+            checkpoint_type,
+            leaf_checkpoint_schema: schema.into(),
+            sidecars,
+            size_in_bytes: 0,
+        })
+    }
+
+    #[cfg(all(test, feature = "declarative-plans"))]
+    fn try_new_with_leaf_schema(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
-    ) -> KernelResult<CheckpointShape> {
+    ) -> KernelResult<Self> {
         Self::try_new_impl(exec, snapshot, true)
     }
 
+    #[cfg(feature = "declarative-plans")]
     fn try_new_impl(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
         needs_leaf_schema: bool,
-    ) -> KernelResult<CheckpointShape> {
+    ) -> KernelResult<Self> {
         let segment = snapshot.log_segment();
-
         let (root_checkpoint, file_type) = match segment.listed.checkpoint_parts.first() {
             Some(checkpoint) if checkpoint.is_json() => (&checkpoint.location, FileType::Json),
             Some(checkpoint) => (&checkpoint.location, FileType::Parquet),
             None => {
-                return Ok(CheckpointShape {
+                return Ok(Self {
                     checkpoint_type: CheckpointType::None,
-                    leaf_checkpoint_schema: None,
+                    leaf_checkpoint_schema: None.into(),
+                    sidecars: vec![],
+                    size_in_bytes: 0,
                 })
             }
         };
-
-        // Classify from a V2 checkpoint's `_last_checkpoint` hint when possible, else inspect the
-        // file.
         if let Some(shape) = Self::from_v2_checkpoint_hint(
             exec,
             segment,
@@ -123,53 +191,34 @@ impl CheckpointShape {
         )? {
             return Ok(shape);
         }
-
-        // A checkpoint with sidecars is a manifest, one without is a leaf.
-        match file_type {
+        let checkpoint_schema = match file_type {
             FileType::Parquet => {
-                let cp_schema = match segment.checkpoint_hint_schema() {
+                let schema = match segment.checkpoint_hint_schema() {
                     Some(schema) => schema,
                     None => read_parquet_footer_schema(exec, root_checkpoint.clone())?,
                 };
-                // No `sidecar` column means the file actions are inline, so this is a leaf.
-                if !cp_schema.contains(SIDECAR_NAME) {
-                    return Ok(Self::new_leaf(needs_leaf_schema.then_some(cp_schema)));
+                if !schema.contains(SIDECAR_NAME) {
+                    return Ok(Self::new_leaf(Some(schema)));
                 }
-                // The `sidecar` column may still be all-null (not a manifest), so scan it to
-                // confirm whether a sidecar is actually present.
-                match collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)? {
-                    Some(sidecar) => Self::try_new_manifest(
-                        exec,
-                        sidecar,
-                        needs_leaf_schema,
-                        segment.checkpoint_hint_sidecar_file_schema(),
-                    ),
-                    None => Ok(Self::new_leaf(needs_leaf_schema.then_some(cp_schema))),
-                }
+                schema
             }
-            // A JSON checkpoint has no footer schema to inspect, so try to collect a sidecar to
-            // decide if it is a manifest or a leaf.
-            FileType::Json => {
-                match collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)? {
-                    Some(sidecar) => Self::try_new_manifest(
-                        exec,
-                        sidecar,
-                        needs_leaf_schema,
-                        segment.checkpoint_hint_sidecar_file_schema(),
-                    ),
-                    None => Ok(Self::new_leaf(
-                        needs_leaf_schema.then(|| CHECKPOINT_ACTIONS_SCHEMA_V2.clone()),
-                    )),
-                }
-            }
+            FileType::Json => CHECKPOINT_ACTIONS_SCHEMA_V2.clone(),
+        };
+        let sidecars = collect_sidecars(exec, root_checkpoint, file_type, &segment.log_root)?;
+        if sidecars.is_empty() {
+            Ok(Self::new_leaf(Some(checkpoint_schema)))
+        } else {
+            Self::try_new_manifest(
+                exec,
+                sidecars,
+                needs_leaf_schema,
+                segment.checkpoint_hint_sidecar_file_schema(),
+            )
         }
     }
 
-    /// Classify the checkpoint from its `_last_checkpoint` sidecar hint, without reading the
-    /// checkpoint file. Returns `None` when the hint is absent (or was trimmed away), leaving the
-    /// caller to inspect the file. A non-empty sidecar list is a manifest; an empty list is a leaf
-    /// (the writer emits an empty list only for a leaf, and trims an oversized manifest to absent,
-    /// never to empty).
+    /// An absent sidecar list needs inspection; an empty list identifies an inline checkpoint.
+    #[cfg(feature = "declarative-plans")]
     #[tracing::instrument(
         name = "checkpoint_shape.from_v2_checkpoint_hint",
         skip_all,
@@ -182,38 +231,40 @@ impl CheckpointShape {
         root_checkpoint: &FileMeta,
         file_type: FileType,
         needs_leaf_schema: bool,
-    ) -> KernelResult<Option<CheckpointShape>> {
+    ) -> KernelResult<Option<Self>> {
         match segment.checkpoint_hint_sidecars().map(Vec::as_slice) {
-            Some([sidecar, ..]) => {
-                let sidecar_meta = sidecar.to_filemeta(&segment.log_root)?;
-                let result = Self::try_new_manifest(
+            Some([]) => {
+                let schema = match file_type {
+                    FileType::Json => Some(CHECKPOINT_ACTIONS_SCHEMA_V2.clone()),
+                    FileType::Parquet => match segment.checkpoint_hint_schema() {
+                        Some(schema) => Some(schema),
+                        None if needs_leaf_schema => {
+                            Some(read_parquet_footer_schema(exec, root_checkpoint.clone())?)
+                        }
+                        None => None,
+                    },
+                };
+                Ok(Some(Self::new_leaf(schema)))
+            }
+            Some(sidecars) => {
+                let sidecars = sidecars
+                    .iter()
+                    .map(|s| s.to_filemeta(&segment.log_root))
+                    .collect::<KernelResult<Vec<_>>>()?;
+                Self::try_new_manifest(
                     exec,
-                    sidecar_meta,
+                    sidecars,
                     needs_leaf_schema,
                     segment.checkpoint_hint_sidecar_file_schema(),
-                )?;
-                Ok(Some(result))
-            }
-            Some([]) => {
-                let leaf_schema = match (needs_leaf_schema, file_type) {
-                    (false, _) => None,
-                    (true, FileType::Json) => Some(CHECKPOINT_ACTIONS_SCHEMA_V2.clone()),
-                    (true, FileType::Parquet) => Some(match segment.checkpoint_hint_schema() {
-                        Some(schema) => schema,
-                        None => read_parquet_footer_schema(exec, root_checkpoint.clone())?,
-                    }),
-                };
-                Ok(Some(Self::new_leaf(leaf_schema)))
+                )
+                .map(Some)
             }
             None => Ok(None),
         }
     }
 
-    /// Build the shape for a manifest checkpoint. Its file actions live in the sidecars. All
-    /// sidecars of a checkpoint share one schema, so probing the first is sufficient.
-    ///
-    /// If the `_last_checkpoint` hint carries a `sidecarFileSchema`, use it directly. Otherwise,
-    /// read the sidecar's footer when the leaf schema is requested.
+    /// All sidecars share one schema. A schema hint avoids reading the first sidecar footer.
+    #[cfg(feature = "declarative-plans")]
     #[tracing::instrument(
         name = "checkpoint_shape.try_new_manifest",
         skip_all,
@@ -222,58 +273,61 @@ impl CheckpointShape {
     )]
     fn try_new_manifest(
         exec: &dyn PlanExecutor,
-        sidecar: FileMeta,
+        sidecars: Vec<FileMeta>,
         needs_leaf_schema: bool,
         hint_sidecar_schema: Option<StructType>,
-    ) -> KernelResult<CheckpointShape> {
-        let leaf_checkpoint_schema = match (needs_leaf_schema, hint_sidecar_schema) {
-            (false, _) => None,
-            (true, Some(schema)) => Some(Arc::new(schema)),
-            (true, None) => Some(read_parquet_footer_schema(exec, sidecar)?),
+    ) -> KernelResult<Self> {
+        let schema = match hint_sidecar_schema {
+            Some(schema) => Some(Arc::new(schema)),
+            None if needs_leaf_schema => {
+                Some(read_parquet_footer_schema(exec, sidecars[0].clone())?)
+            }
+            None => None,
         };
-        Ok(CheckpointShape {
+        Ok(Self {
             checkpoint_type: CheckpointType::Manifest,
-            leaf_checkpoint_schema,
+            leaf_checkpoint_schema: schema.map(|schema| Some(schema).into()).unwrap_or_default(),
+            sidecars,
+            size_in_bytes: 0,
         })
     }
 
-    fn new_leaf(leaf_checkpoint_schema: Option<SchemaRef>) -> CheckpointShape {
-        CheckpointShape {
+    #[cfg(feature = "declarative-plans")]
+    fn new_leaf(schema: Option<SchemaRef>) -> Self {
+        Self {
             checkpoint_type: CheckpointType::Leaf,
-            leaf_checkpoint_schema,
+            leaf_checkpoint_schema: schema.map(|schema| Some(schema).into()).unwrap_or_default(),
+            sidecars: vec![],
+            size_in_bytes: 0,
         }
     }
 
-    /// Returns `stats_schema` when the checkpoint has compatible parsed stats.
-    pub(crate) fn compatible_stats_parsed_schema<'a>(
+    #[cfg(all(test, feature = "declarative-plans"))]
+    fn compatible_stats_parsed_schema<'a>(
         &self,
         stats_schema: &'a SchemaRef,
     ) -> Option<&'a SchemaRef> {
-        self.leaf_checkpoint_schema
-            .as_ref()
-            .is_some_and(|checkpoint_schema| {
-                LogSegment::schema_has_compatible_stats_parsed(checkpoint_schema, stats_schema)
+        self.leaf_checkpoint_schema()
+            .is_some_and(|schema| {
+                LogSegment::schema_has_compatible_stats_parsed(schema, stats_schema)
             })
             .then_some(stats_schema)
     }
 
-    /// Returns `partition_schema` when the checkpoint has compatible parsed partition values.
-    pub(crate) fn compatible_partition_values_parsed_schema<'a>(
+    #[cfg(all(test, feature = "declarative-plans"))]
+    fn compatible_partition_values_parsed_schema<'a>(
         &self,
         partition_schema: &'a SchemaRef,
     ) -> Option<&'a SchemaRef> {
-        self.leaf_checkpoint_schema
-            .as_ref()
-            .is_some_and(|checkpoint_schema| {
-                LogSegment::schema_has_compatible_partition_values_parsed(
-                    checkpoint_schema,
-                    partition_schema,
-                )
+        self.leaf_checkpoint_schema()
+            .is_some_and(|schema| {
+                LogSegment::schema_has_compatible_partition_values_parsed(schema, partition_schema)
             })
             .then_some(partition_schema)
     }
 }
 
+#[cfg(feature = "declarative-plans")]
 #[tracing::instrument(
     name = "checkpoint_shape.read_parquet_footer_schema",
     skip_all,
@@ -284,46 +338,43 @@ fn read_parquet_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> Kernel
     Ok(exec.read_parquet_footer(file)?.schema)
 }
 
-/// Read the checkpoint `file`'s `sidecar` column, returning the first referenced sidecar's
-/// [`FileMeta`] (enough to classify and probe; not a full enumeration).
+/// Retain all sidecar descriptors so inspection and planning share the complete physical inputs.
+#[cfg(feature = "declarative-plans")]
 #[tracing::instrument(
-    name = "checkpoint_shape.collect_single_sidecar",
+    name = "checkpoint_shape.collect_sidecars",
     skip_all,
     fields(enable_call_frame),
     err
 )]
-fn collect_single_sidecar(
+fn collect_sidecars(
     exec: &dyn PlanExecutor,
     file: &FileMeta,
     file_format: FileType,
     log_root: &Url,
-) -> KernelResult<Option<FileMeta>> {
-    let read_schema = LogSegment::sidecar_read_schema();
-    // No file-constant columns: the sidecar column is read directly from each file.
+) -> KernelResult<Vec<FileMeta>> {
+    let schema = LogSegment::sidecar_read_schema();
     let plan = match file_format {
-        FileType::Parquet => PlanBuilder::scan_parquet([file.clone()], &[], read_schema),
-        FileType::Json => PlanBuilder::scan_json([file.clone()], &[], read_schema),
+        FileType::Parquet => PlanBuilder::scan_parquet([file.clone()], &[], schema),
+        FileType::Json => PlanBuilder::scan_json([file.clone()], &[], schema),
     }?
     .filter(col!(SIDECAR_NAME, "path").is_not_null())?
     .build()?;
     let data = exec.execute_op(Operation::QueryPlan(plan))?.into_data()?;
-
     let mut visitor = SidecarVisitor::default();
     for batch in data {
         visitor.visit_rows_of(batch?.as_ref())?;
-        if !visitor.sidecars.is_empty() {
-            break;
-        }
     }
-    match visitor.sidecars.first() {
-        Some(sidecar) => Ok(Some(sidecar.to_filemeta(log_root)?)),
-        None => Ok(None),
-    }
+    visitor
+        .sidecars
+        .iter()
+        .map(|sidecar| sidecar.to_filemeta(log_root))
+        .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "declarative-plans"))]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Barrier;
 
     use rstest::rstest;
 
@@ -334,10 +385,12 @@ mod tests {
     };
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
+    use crate::engine::test_delegating::DelegatingEngine;
     use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
     use crate::log_segment_files::LogSegmentFiles;
     use crate::plans::ir::nodes::Operator;
     use crate::plans::{IoOperation, PlanResult};
+    use crate::scan::StatsOptions;
     use crate::schema::{schema, schema_ref};
     use crate::unit_test_utils::{
         copy_test_table, create_log_path, create_log_path_with_size, load_test_table,
@@ -349,6 +402,7 @@ mod tests {
         inner: SyncPlanExecutor,
         query_scans: AtomicUsize,
         footer_reads: AtomicUsize,
+        fail_next_footer: AtomicBool,
     }
 
     impl CountingExecutor {
@@ -357,6 +411,7 @@ mod tests {
                 inner: SyncPlanExecutor::default(),
                 query_scans: AtomicUsize::new(0),
                 footer_reads: AtomicUsize::new(0),
+                fail_next_footer: AtomicBool::new(false),
             }
         }
     }
@@ -373,7 +428,10 @@ mod tests {
                     _ = self.query_scans.fetch_add(1, Ordering::Relaxed);
                 }
                 Operation::IoOperation(IoOperation::ParquetFooter { .. }) => {
-                    _ = self.footer_reads.fetch_add(1, Ordering::Relaxed)
+                    _ = self.footer_reads.fetch_add(1, Ordering::Relaxed);
+                    if self.fail_next_footer.swap(false, Ordering::Relaxed) {
+                        return Err(crate::KernelError::generic("injected footer failure"));
+                    }
                 }
                 _ => {}
             }
@@ -388,14 +446,36 @@ mod tests {
     #[case("v2-checkpoints-json-with-sidecars")]
     #[case("v2-checkpoints-parquet-with-sidecars")]
     #[case("v2-checkpoints-json-without-sidecars")]
-    fn checkpoint_inspection_counts_all_bytes_and_is_reused(#[case] table: &str) {
+    fn checkpoint_inspection_counts_all_bytes_and_is_reused(
+        #[case] table: &str,
+        #[values(false, true)] scan_first: bool,
+        #[values(false, true)] use_plan_executor: bool,
+    ) {
         let (table_root, _tempdir) = copy_test_table(table).unwrap();
         let engine = Arc::new(SyncEngine::new());
         let snapshot = Snapshot::builder_for(table_root)
             .build(engine.as_ref())
             .unwrap();
-        let groups = snapshot.checkpoint_file_groups(engine.as_ref()).unwrap();
-        let info = snapshot.cached_checkpoint_file_info().unwrap().unwrap();
+        let inspection_engine = if use_plan_executor {
+            DelegatingEngine::new(engine.clone())
+        } else {
+            DelegatingEngine::new(engine.clone()).without_plan_executor()
+        };
+        let plan = || {
+            snapshot
+                .clone()
+                .scan_builder()
+                .with_stats(StatsOptions::all_struct())
+                .build()
+                .unwrap()
+                .declarative_metadata_scan_plan(engine.as_ref())
+                .unwrap()
+        };
+        if scan_first {
+            plan();
+        }
+        let groups = snapshot.checkpoint_file_groups(&inspection_engine).unwrap();
+        let info = snapshot.checkpoint_shape(&inspection_engine, true).unwrap();
         let paths: Vec<_> = snapshot
             .log_segment()
             .listed
@@ -424,14 +504,103 @@ mod tests {
             snapshot.checkpoint_size_in_bytes(engine.as_ref()).unwrap(),
             expected
         );
-        // Planning must reuse both the schema and the sidecar list, with no further IO.
-        snapshot
-            .clone()
-            .scan_builder()
-            .build()
+        plan();
+    }
+
+    #[test]
+    fn snapshot_adds_leaf_schema_after_a_scan_without_stats() {
+        let (engine, snapshot, _tempdir) =
+            load_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
+        let exec = Arc::new(CountingExecutor::new());
+        let engine = DelegatingEngine::new(engine).with_plan_executor(exec.clone());
+        let plan = |stats| {
+            snapshot
+                .clone()
+                .scan_builder()
+                .with_stats(stats)
+                .build()
+                .unwrap()
+                .declarative_metadata_scan_plan(&engine)
+                .unwrap()
+        };
+        plan(StatsOptions::none());
+        assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 0);
+        assert!(!snapshot
+            .checkpoint_shape(&engine, false)
             .unwrap()
-            .declarative_metadata_scan_plan(engine.as_ref())
+            .leaf_schema_resolved());
+        let bytes = snapshot.checkpoint_size_in_bytes(&engine).unwrap();
+        assert!(bytes > 0);
+        assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 0);
+        plan(StatsOptions::all_struct());
+        let groups = snapshot.checkpoint_file_groups(&engine).unwrap();
+        assert!(groups[0].parquet_schema.is_some());
+        plan(StatsOptions::all_struct());
+        assert_eq!(snapshot.checkpoint_size_in_bytes(&engine).unwrap(), bytes);
+        assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(exec.query_scans.load(Ordering::Relaxed), 0);
+    }
+
+    #[rstest]
+    #[case("with_checkpoint_no_last_checkpoint")]
+    #[case("v2-checkpoints-parquet-with-sidecars")]
+    fn snapshot_retries_failed_checkpoint_inspection(#[case] table: &str) {
+        let (engine, snapshot, _tempdir) = load_test_table(table).unwrap();
+        let exec = Arc::new(CountingExecutor::new());
+        let engine = DelegatingEngine::new(engine).with_plan_executor(exec.clone());
+        exec.fail_next_footer.store(true, Ordering::Relaxed);
+        assert!(snapshot.checkpoint_file_groups(&engine).is_err());
+        let groups = snapshot.checkpoint_file_groups(&engine).unwrap();
+        assert!(groups[0].parquet_schema.is_some());
+        assert_eq!(snapshot.checkpoint_file_groups(&engine).unwrap(), groups);
+        assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn concurrent_inspection_and_scans_share_checkpoint_io_without_a_hint() {
+        let (root, _tempdir) = copy_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
+        let hint = Url::parse(root.as_ref())
+            .unwrap()
+            .join("_delta_log/_last_checkpoint")
             .unwrap();
+        std::fs::remove_file(hint.to_file_path().unwrap()).unwrap();
+        let base_engine = Arc::new(SyncEngine::new());
+        let snapshot = Snapshot::builder_for(root)
+            .build(base_engine.as_ref())
+            .unwrap();
+        let exec = Arc::new(CountingExecutor::new());
+        let engine = DelegatingEngine::new(base_engine).with_plan_executor(exec.clone());
+        let barrier = Barrier::new(8);
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let snapshot = &snapshot;
+                let engine = &engine;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    match i % 3 {
+                        0 => {
+                            snapshot.checkpoint_file_groups(engine).unwrap();
+                        }
+                        1 => {
+                            snapshot.checkpoint_size_in_bytes(engine).unwrap();
+                        }
+                        _ => {
+                            snapshot
+                                .clone()
+                                .scan_builder()
+                                .with_stats(StatsOptions::all_struct())
+                                .build()
+                                .unwrap()
+                                .declarative_metadata_scan_plan(engine)
+                                .unwrap();
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(exec.query_scans.load(Ordering::Relaxed), 1);
+        assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 2);
     }
 
     /// Resolves checkpoint shape and, when requested, parsed-stats availability across fixtures.
@@ -520,13 +689,14 @@ mod tests {
             ),
         }
 
-        let needs_leaf_schema = stats_schema.is_some();
-        assert_eq!(
-            shape.leaf_checkpoint_schema.is_some(),
-            needs_leaf_schema && expected_checkpoint != CheckpointType::None,
-            "{table}: checkpoint leaf schema"
-        );
-        if let Some(schema) = &shape.leaf_checkpoint_schema {
+        if stats_schema.is_some() {
+            assert_eq!(
+                shape.leaf_checkpoint_schema().is_some(),
+                expected_checkpoint != CheckpointType::None,
+                "{table}: checkpoint leaf schema"
+            );
+        }
+        if let Some(schema) = shape.leaf_checkpoint_schema() {
             assert!(schema.contains("add"), "{table}: retained add action");
             assert!(schema.contains("remove"), "{table}: retained remove action");
         }
@@ -625,7 +795,7 @@ mod tests {
             expected_footer_reads,
             "fast path reads the sidecar footer only when its schema is needed"
         );
-        assert_eq!(shape.leaf_checkpoint_schema.is_some(), needs_leaf_schema);
+        assert_eq!(shape.leaf_checkpoint_schema().is_some(), needs_leaf_schema);
     }
 
     /// Without a hint, a manifest must drain the `sidecar` column (`query_scans >= 1`).
@@ -743,7 +913,7 @@ mod tests {
         assert_eq!(shape.checkpoint_type, CheckpointType::Leaf);
         if file_type == FileType::Json && needs_leaf_schema {
             assert_eq!(
-                shape.leaf_checkpoint_schema.as_ref(),
+                shape.leaf_checkpoint_schema(),
                 Some(&*CHECKPOINT_ACTIONS_SCHEMA_V2)
             );
         }
@@ -887,12 +1057,14 @@ mod tests {
             .checkpoint_hint_sidecar_file_schema()
             .expect("table's hint carries the sidecar schema");
         let footer_shape =
-            CheckpointShape::try_new_manifest(&exec, sidecar.clone(), true, None).unwrap();
+            CheckpointShape::try_new_manifest(&exec, vec![sidecar.clone()], true, None).unwrap();
         let hinted =
-            CheckpointShape::try_new_manifest(&exec, sidecar, true, Some(hint_schema)).unwrap();
+            CheckpointShape::try_new_manifest(&exec, vec![sidecar], true, Some(hint_schema))
+                .unwrap();
 
         assert_eq!(
-            hinted.leaf_checkpoint_schema, footer_shape.leaf_checkpoint_schema,
+            hinted.leaf_checkpoint_schema(),
+            footer_shape.leaf_checkpoint_schema(),
             "hint schema must match the footer schema"
         );
     }

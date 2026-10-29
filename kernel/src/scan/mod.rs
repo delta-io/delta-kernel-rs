@@ -17,8 +17,6 @@ use crate::actions::deletion_vector::{
 };
 use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
-#[cfg(feature = "declarative-plans")]
-use crate::checkpoint::CheckpointShape;
 use crate::engine::CancellableEngine;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{
@@ -1388,19 +1386,11 @@ impl Scan {
         }
 
         let planner = scan_plan::MetadataPlanner::try_new(self)?;
-        // Resolve the checkpoint shape once. The planner owns the decision to retain the file-
-        // action schema; checkpoint discovery owns how that schema is obtained.
-        let plan_executor = engine.require_plan_executor()?;
-        let shape = if let Some(info) = self.snapshot.cached_checkpoint_file_info()? {
-            // Inspection already resolved all physical inputs. Reuse it instead of rereading
-            // the checkpoint or sidecar footer through the plan executor.
-            CheckpointShape::from_file_info(self.snapshot.log_segment(), &info)
-        } else if planner.requires_checkpoint_add_schema() {
-            CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
-        } else {
-            CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?
-        };
-        self.build_metadata_scan_plan(&shape, &planner)
+        engine.require_plan_executor()?;
+        let shape = self
+            .snapshot
+            .checkpoint_shape(engine, planner.requires_checkpoint_add_schema())?;
+        self.build_metadata_scan_plan(shape, &planner)
     }
 
     #[cfg(feature = "declarative-plans")]

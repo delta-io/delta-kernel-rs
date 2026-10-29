@@ -87,14 +87,6 @@ pub struct CheckpointFileGroup {
     pub parquet_schema: Option<SchemaRef>,
 }
 
-/// Resolved physical checkpoint inputs, shared by inspection and scan planning.
-#[derive(Debug)]
-pub(crate) struct CheckpointFileInfo {
-    pub(crate) parquet_schema: Option<SchemaRef>,
-    pub(crate) sidecars: Vec<FileMeta>,
-    pub(crate) size_in_bytes: u64,
-}
-
 /// Information about checkpoint reading for data skipping optimization.
 ///
 /// Returned alongside the actions iterator from checkpoint reading functions.
@@ -1168,55 +1160,6 @@ impl LogSegment {
         Ok(Some((file_type, Self::version_tagged_scan_files(parts)?)))
     }
 
-    /// Returns sidecars from the applicable checkpoint hint, tagged with checkpoint version.
-    #[cfg(feature = "declarative-plans")]
-    pub(crate) fn checkpoint_hint_version_tagged_sidecar_scan_files(
-        &self,
-    ) -> KernelResult<Option<Vec<ScanFile>>> {
-        let Some(sidecars) = self.checkpoint_hint_sidecars() else {
-            return Ok(None);
-        };
-        let version = self.checkpoint_version.ok_or_else(|| {
-            KernelError::invalid_checkpoint(
-                "Checkpoint hint sidecars require a selected checkpoint version",
-            )
-        })?;
-        let version = crate::version_as_i64(version)?;
-        sidecars
-            .iter()
-            .map(|sidecar| {
-                Ok(ScanFile {
-                    meta: sidecar.to_filemeta(&self.log_root)?,
-                    file_constants: vec![Scalar::Long(version)],
-                })
-            })
-            .collect::<KernelResult<Vec<_>>>()
-            .map(Some)
-    }
-
-    pub(crate) fn checkpoint_file_info(
-        &self,
-        engine: &dyn Engine,
-    ) -> KernelResult<CheckpointFileInfo> {
-        let (parquet_schema, sidecars) = self.get_file_actions_schema_and_sidecars(engine)?;
-        let size_in_bytes = self
-            .listed
-            .checkpoint_parts
-            .iter()
-            .map(|part| &part.location)
-            .chain(sidecars.iter())
-            .try_fold(0u64, |total, file| {
-                total
-                    .checked_add(file.size)
-                    .ok_or_else(|| KernelError::generic("Checkpoint file size exceeds u64::MAX"))
-            })?;
-        Ok(CheckpointFileInfo {
-            parquet_schema,
-            sidecars,
-            size_in_bytes,
-        })
-    }
-
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.
     ///
     /// This function analyzes the checkpoint to determine:
@@ -1231,7 +1174,7 @@ impl LogSegment {
     ///   footer, then check for sidecar column to distinguish
     ///   - Has sidecar column (V2): extract sidecars, read first sidecar's schema
     ///   - No sidecar column (V1): use checkpoint schema directly
-    fn get_file_actions_schema_and_sidecars(
+    pub(crate) fn get_file_actions_schema_and_sidecars(
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<(Option<SchemaRef>, Vec<FileMeta>)> {
