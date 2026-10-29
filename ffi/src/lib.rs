@@ -1816,23 +1816,22 @@ pub unsafe extern "C" fn snapshot_checkpoint_file_groups(
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
     let result = (|| -> KernelResult<bool> {
-        let groups = snapshot.checkpoint_file_groups(engine_ref.engine().as_ref())?;
-        let schemas: Vec<String> = groups
-            .iter()
-            .map(|group| match &group.parquet_schema {
-                Some(schema) => serde_json::to_string(schema),
-                None => Ok(String::new()),
-            })
-            .collect::<Result<_, _>>()?;
-        let views: Vec<_> = groups
-            .iter()
-            .zip(&schemas)
-            .map(|(group, schema)| FfiCheckpointFileGroup {
-                num_files: group.num_files,
-                parquet_schema_json: kernel_string_slice!(schema),
-            })
-            .collect();
-        unsafe { visit(context, FfiSlice::new_unsafe(views.as_slice())) };
+        let shape = snapshot.checkpoint_shape(engine_ref.engine().as_ref(), true)?;
+        let schema = shape
+            .parquet_schema()
+            .map(serde_json::to_string)
+            .transpose()?
+            .unwrap_or_default();
+        let view = FfiCheckpointFileGroup {
+            num_files: shape.num_files,
+            parquet_schema_json: kernel_string_slice!(schema),
+        };
+        let views = if shape.num_files == 0 {
+            &[]
+        } else {
+            std::slice::from_ref(&view)
+        };
+        unsafe { visit(context, FfiSlice::new_unsafe(views)) };
         Ok(true)
     })();
     result.into_extern_result(&engine_ref)

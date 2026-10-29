@@ -64,7 +64,7 @@ pub(crate) use hint::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness}
 use snapshot_crc::SnapshotCrc;
 
 pub use crate::error::SnapshotHintError;
-pub use crate::log_segment::{CheckpointFileGroup, LogSegmentStats};
+pub use crate::log_segment::LogSegmentStats;
 
 /// A shared, thread-safe reference to a [`Snapshot`].
 pub type SnapshotRef = Arc<Snapshot>;
@@ -567,42 +567,9 @@ impl Snapshot {
         self.log_segment.stats()
     }
 
-    /// Returns the checkpoint file-action groups selected for this snapshot.
-    ///
-    /// Uses `engine` to resolve sidecars and read physical Parquet schemas when necessary.
-    /// Returns an empty vector when no checkpoint was selected. JSON checkpoints without
-    /// sidecars have no Parquet schema. Does not read commit files or replay file actions.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the checkpoint or sidecar metadata cannot be read or decoded.
-    pub fn checkpoint_file_groups(
-        &self,
-        engine: &dyn Engine,
-    ) -> KernelResult<Vec<CheckpointFileGroup>> {
-        let shape = self.checkpoint_shape(engine, true)?;
-        if self.log_segment.listed.checkpoint_parts.is_empty() {
-            return Ok(vec![]);
-        }
-        Ok(vec![CheckpointFileGroup {
-            num_files: if shape.sidecars.is_empty() {
-                self.log_segment.listed.checkpoint_parts.len() as u64
-            } else {
-                shape.sidecars.len() as u64
-            },
-            parquet_schema: if shape.sidecars.is_empty()
-                && self.log_segment.listed.checkpoint_parts[0].is_json()
-            {
-                None
-            } else {
-                shape.leaf_checkpoint_schema().cloned()
-            },
-        }])
-    }
-
     /// Returns the selected checkpoint's physical size, including every top-level part and
     /// referenced sidecar. Returns zero without a checkpoint. Successful inspection is cached
-    /// and shared with [`Self::checkpoint_file_groups`] and declarative scan planning.
+    /// and shared with [`Self::checkpoint_shape`] and declarative scan planning.
     ///
     /// # Errors
     ///
@@ -611,9 +578,15 @@ impl Snapshot {
         Ok(self.checkpoint_shape(engine, false)?.size_in_bytes)
     }
 
-    /// Shares resolved checkpoint inputs, loading the leaf schema only when requested.
-    /// Failed discovery or schema reads leave the corresponding cell available for retry.
-    pub(crate) fn checkpoint_shape(
+    /// Returns this snapshot's cached checkpoint shape, borrowed for the snapshot's lifetime.
+    /// Uses `engine` to resolve checkpoint inputs; `needs_leaf_schema` additionally loads the
+    /// physical schema. File count and bytes are zero when no checkpoint was selected.
+    /// Successful inspection is shared with declarative scan planning. Failed reads can retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if checkpoint metadata cannot be read or decoded, or its size overflows.
+    pub fn checkpoint_shape(
         &self,
         engine: &dyn Engine,
         needs_leaf_schema: bool,
@@ -1868,25 +1841,24 @@ mod tests {
     use crate::utils::FoldWithOption as _;
 
     #[rstest]
-    #[case("table-without-dv-small", 0)]
-    #[case("v1-single-part-struct-stats-only", 1)]
-    #[case("v1-multi-part-struct-stats-only", 3)]
-    #[case("v1-multi-part-partitioned-struct-stats-only", 3)]
-    #[case("v2-json-sidecars-struct-stats-only", 1)]
-    #[case("v2-parquet-sidecars-struct-stats-only", 1)]
-    #[case("v2-classic-parquet-struct-stats-only", 1)]
-    fn checkpoint_file_groups_describe_file_actions(
+    #[case("table-without-dv-small", 0, false)]
+    #[case("v1-single-part-struct-stats-only", 1, true)]
+    #[case("v1-multi-part-struct-stats-only", 3, true)]
+    #[case("v1-multi-part-partitioned-struct-stats-only", 3, true)]
+    #[case("v2-json-sidecars-struct-stats-only", 1, true)]
+    #[case("v2-parquet-sidecars-struct-stats-only", 1, true)]
+    #[case("v2-classic-parquet-struct-stats-only", 1, true)]
+    #[case("v2-checkpoints-json-without-sidecars", 1, false)]
+    fn checkpoint_shape_describes_file_actions(
         #[case] table: &str,
         #[case] expected_files: u64,
+        #[case] expect_parquet_schema: bool,
     ) -> KernelResult<()> {
         let (engine, snapshot, _temp) = load_test_table(table)?;
-        let groups = snapshot.checkpoint_file_groups(engine.as_ref())?;
-        if expected_files == 0 {
-            assert!(groups.is_empty());
-        } else {
-            assert_eq!(groups.len(), 1);
-            assert_eq!(groups[0].num_files, expected_files);
-            let schema = groups[0].parquet_schema.as_ref().unwrap();
+        let shape = snapshot.checkpoint_shape(engine.as_ref(), true)?;
+        assert_eq!(shape.num_files, expected_files);
+        assert_eq!(shape.parquet_schema().is_some(), expect_parquet_schema);
+        if let Some(schema) = shape.parquet_schema() {
             let DataType::Struct(add) = schema.field("add").unwrap().data_type() else {
                 panic!("checkpoint add field must be a struct");
             };

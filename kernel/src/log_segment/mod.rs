@@ -75,18 +75,6 @@ pub struct LogSegmentStats {
     pub total_commit_file_bytes: u64,
 }
 
-/// A group of checkpoint files carrying file actions with a common physical schema.
-///
-/// Sidecars replace the top-level checkpoint in this description when present. Multipart
-/// checkpoints form one group, using the first part's schema as required by the protocol.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckpointFileGroup {
-    /// Number of files in the group, excluding a top-level checkpoint that references sidecars.
-    pub num_files: u64,
-    /// Physical Parquet schema, or `None` for a JSON checkpoint without sidecars.
-    pub parquet_schema: Option<SchemaRef>,
-}
-
 /// Information about checkpoint reading for data skipping optimization.
 ///
 /// Returned alongside the actions iterator from checkpoint reading functions.

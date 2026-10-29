@@ -139,7 +139,7 @@ mod checkpoint_transform;
 pub(crate) mod collation_stats;
 mod sidecar;
 
-pub(crate) use checkpoint_shape::CheckpointShape;
+pub use checkpoint_shape::CheckpointShape;
 #[cfg(feature = "declarative-plans")]
 pub(crate) use checkpoint_shape::CheckpointType;
 use checkpoint_transform::{
