@@ -21,7 +21,7 @@ const _: [(); 1] = [(); (ROW_TRACKING_INITIAL_HIGH_WATER_MARK
 /// # Safety
 ///
 /// Caller is responsible for passing in a valid handle
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_domain_metadata(
     snapshot: Handle<SharedSnapshot>,
     domain: KernelStringSlice,
@@ -57,7 +57,7 @@ fn get_domain_metadata_impl(
 /// # Safety
 ///
 /// Caller is responsible for passing valid snapshot and engine handles.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
@@ -114,7 +114,7 @@ pub type ClusteringColumnVisitor = extern "C" fn(
 /// Caller is responsible for passing in a valid snapshot and engine handle, a valid
 /// `engine_context` opaque pointer forwarded to each `visitor` invocation, and a valid
 /// `visitor` function pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_clustering_columns(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
@@ -158,7 +158,7 @@ fn visit_clustering_columns_impl(
 /// # Safety
 ///
 /// Caller is responsible for passing in a valid handle
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_domain_metadata(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,

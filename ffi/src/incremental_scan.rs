@@ -97,7 +97,7 @@ pub struct SharedIncrementalScanSummary;
 /// # Safety
 ///
 /// Caller must pass a valid snapshot handle and engine handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_incremental_scan_builder(
     snapshot: Handle<SharedSnapshot>,
     base_version: Version,
@@ -128,7 +128,7 @@ pub unsafe extern "C" fn snapshot_incremental_scan_builder(
 /// `builder` and `engine` must be valid handles. The `builder` handle must not be used after this
 /// call. `predicate` must be a valid, non-null [`EnginePredicate`] whose `visitor` and `predicate`
 /// fields are safe to call and read.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_builder_with_predicate(
     builder: Handle<ExclusiveIncrementalScanBuilder>,
     engine: Handle<SharedExternEngine>,
@@ -164,7 +164,7 @@ fn incremental_scan_builder_with_predicate_impl(
 /// # Safety
 ///
 /// Caller must pass a valid builder pointer and must not use it again after this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_builder_build(
     builder: Handle<ExclusiveIncrementalScanBuilder>,
 ) -> ExternResult<OptionalValue<Handle<SharedIncrementalScanStream>>> {
@@ -198,7 +198,7 @@ fn incremental_scan_builder_build_impl(
 /// # Safety
 ///
 /// Caller must pass a valid builder pointer and must not use it again after this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_incremental_scan_builder(
     builder: Handle<ExclusiveIncrementalScanBuilder>,
 ) {
@@ -224,7 +224,7 @@ pub unsafe extern "C" fn free_incremental_scan_builder(
 ///
 /// Caller must pass a valid stream handle.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_stream_next_arrow(
     stream: Handle<SharedIncrementalScanStream>,
 ) -> ExternResult<*mut ScanMetadataArrowResult> {
@@ -284,7 +284,7 @@ fn next_arrow_batch(
 /// # Safety
 ///
 /// Caller must pass a valid stream handle and must not use it again after this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_stream_into_summary(
     stream: Handle<SharedIncrementalScanStream>,
 ) -> ExternResult<Handle<SharedIncrementalScanSummary>> {
@@ -318,7 +318,7 @@ fn lock_stream(
 /// # Safety
 ///
 /// Caller must pass a valid summary handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_summary_base_version(
     summary: Handle<SharedIncrementalScanSummary>,
 ) -> Version {
@@ -330,7 +330,7 @@ pub unsafe extern "C" fn incremental_scan_summary_base_version(
 /// # Safety
 ///
 /// Caller must pass a valid summary handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_summary_target_version(
     summary: Handle<SharedIncrementalScanSummary>,
 ) -> Version {
@@ -349,7 +349,7 @@ pub unsafe extern "C" fn incremental_scan_summary_target_version(
 /// # Safety
 ///
 /// Caller must pass a valid summary handle and a non-null `callback` function pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_summary_visit_live_adds(
     summary: Handle<SharedIncrementalScanSummary>,
     engine_context: NullableCvoid,
@@ -367,7 +367,7 @@ pub unsafe extern "C" fn incremental_scan_summary_visit_live_adds(
 /// # Safety
 ///
 /// Caller must pass a valid summary handle and a non-null `callback` function pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_summary_visit_removes(
     summary: Handle<SharedIncrementalScanSummary>,
     engine_context: NullableCvoid,
@@ -408,7 +408,7 @@ fn visit_file_keys(
 /// # Safety
 ///
 /// Caller must pass a valid stream handle and must not use it again after this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_incremental_scan_stream(stream: Handle<SharedIncrementalScanStream>) {
     unsafe { stream.drop_handle() }
 }
@@ -418,7 +418,7 @@ pub unsafe extern "C" fn free_incremental_scan_stream(stream: Handle<SharedIncre
 /// # Safety
 ///
 /// Caller must pass a valid summary handle and must not use it again after this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_incremental_scan_summary(
     summary: Handle<SharedIncrementalScanSummary>,
 ) {

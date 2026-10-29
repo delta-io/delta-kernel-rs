@@ -71,7 +71,7 @@ pub struct SharedOpaqueExpressionOp;
 ///
 /// # Safety
 /// Engine is responsible for passing a valid SharedExpression
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_kernel_expression(data: Handle<SharedExpression>) {
     unsafe { data.drop_handle() }
 }
@@ -80,7 +80,7 @@ pub unsafe extern "C" fn free_kernel_expression(data: Handle<SharedExpression>) 
 ///
 /// # Safety
 /// Engine is responsible for passing a valid SharedPredicate
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_kernel_predicate(data: Handle<SharedPredicate>) {
     unsafe { data.drop_handle() }
 }
@@ -89,7 +89,7 @@ pub unsafe extern "C" fn free_kernel_predicate(data: Handle<SharedPredicate>) {
 ///
 /// # Safety
 /// Engine is responsible for passing a valid SharedOpaqueExpressionOp
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_kernel_opaque_expression_op(data: Handle<SharedOpaqueExpressionOp>) {
     unsafe { data.drop_handle() }
 }
@@ -98,7 +98,7 @@ pub unsafe extern "C" fn free_kernel_opaque_expression_op(data: Handle<SharedOpa
 ///
 /// # Safety
 /// Engine is responsible for passing a valid SharedOpaquePredicateOp
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_kernel_opaque_predicate_op(data: Handle<SharedOpaquePredicateOp>) {
     unsafe { data.drop_handle() }
 }
@@ -107,7 +107,7 @@ pub unsafe extern "C" fn free_kernel_opaque_predicate_op(data: Handle<SharedOpaq
 ///
 /// # Safety
 /// Engine is responsible for passing a valid SharedOpaqueExpressionOp
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_kernel_opaque_expression_op_name(
     op: Handle<SharedOpaqueExpressionOp>,
     data: *mut c_void,
@@ -122,7 +122,7 @@ pub unsafe extern "C" fn visit_kernel_opaque_expression_op_name(
 ///
 /// # Safety
 /// Engine is responsible for passing a valid SharedOpaquePredicateOp
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_kernel_opaque_predicate_op_name(
     op: Handle<SharedOpaquePredicateOp>,
     data: *mut c_void,
