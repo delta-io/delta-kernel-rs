@@ -3,7 +3,11 @@
 //! Each test sets up an in-memory Delta log with V2 checkpoint JSONs, commit files, and CRC files,
 //! then verifies that Protocol & Metadata loading and ICT reads resolve correctly.
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use std::cmp::Ordering;
 use std::collections::HashMap;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use std::iter;
 use std::sync::Arc;
 
 use rstest::rstest;
@@ -840,49 +844,64 @@ async fn test_lagging_checkpoint_action_defers_to_crc_pm() {
         .assert_p_m(None, crc_config.protocol(), crc_config.metadata());
 }
 
-// A CRC-seeded pruned replay (CRC below target) that finds a checkpoint action in the commits
-// after the CRC captures it: those commits include the newest, and checkpoint versions strictly
-// increase, so a hit is the latest action.
+// A CRC-seeded pruned replay captures the latest checkpoint action only when it reads the pointed
+// manifest commit: that commit must be after the CRC, and only the non-plan replay reads checkpoint
+// actions once a CRC bounds the replay. Otherwise the snapshot follows the newest commit's pointer.
 #[cfg(feature = "adaptive-metadata-in-dev")]
+#[rstest]
+#[case::pointed_commit_after_crc(1)]
+#[case::pointed_commit_at_crc(0)]
 #[tokio::test]
-async fn test_crc_seeded_replay_captures_checkpoint_action_after_crc() {
-    let crc_config =
-        adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
-    let checkpoint_config = adaptive_metadata_table_configuration(
-        test_schema_flat_with_column_mapping(),
-        &[TableFeature::TimestampWithoutTimezone],
+async fn test_crc_seeded_replay_follows_pointer_to_checkpoint_action(#[case] pointed_version: u64) {
+    let config = adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
+    let pm_actions = || {
+        [
+            protocol(config.protocol().clone()),
+            metadata(config.metadata().clone()),
+        ]
+    };
+    // Commits before the manifest commit carry the P&M, and commits after it point at it.
+    let commit_at = |test: CrcReadTest, version: u64| match version.cmp(&pointed_version) {
+        Ordering::Less => test.commit(
+            version,
+            iter::once(commit_info(DEFAULT_OPERATION, None)).chain(pm_actions()),
+        ),
+        Ordering::Equal => test.manifest_commit(
+            version,
+            version as i64,
+            config.protocol().clone(),
+            config.metadata().clone(),
+            pm_actions(),
+        ),
+        Ordering::Greater => test.commit(
+            version,
+            [last_manifest_commit_info(
+                pointed_version as i64,
+                pointed_version as i64,
+            )],
+        ),
+    };
+    let test = commit_at(CrcReadTest::new(), 0).crc(
+        0,
+        config.protocol().clone(),
+        config.metadata().clone(),
+        1000, // AMT config enables ICT, so the CRC must carry an inCommitTimestampOpt.
     );
-    let resolution = CrcReadTest::new()
-        .commit(
-            0,
-            [
-                commit_info(DEFAULT_OPERATION, None),
-                protocol(crc_config.protocol().clone()),
-                metadata(crc_config.metadata().clone()),
-            ],
-        )
-        .crc(
-            0,
-            crc_config.protocol().clone(),
-            crc_config.metadata().clone(),
-            1000, // AMT config enables ICT, so the CRC must carry an inCommitTimestampOpt.
-        )
-        .manifest_commit(
-            1,
-            1,
-            checkpoint_config.protocol().clone(),
-            checkpoint_config.metadata().clone(),
-            [
-                protocol(checkpoint_config.protocol().clone()),
-                metadata(checkpoint_config.metadata().clone()),
-            ],
-        )
-        .build()
-        .await
-        .captured_checkpoint_action();
-    assert!(
-        resolution.is_some_and(|a| a.version == 1),
-        "a checkpoint action after the CRC is the latest and must be captured, not deferred"
+    let test = commit_at(test, 1).build().await;
+    test.assert_p_m(None, config.protocol(), config.metadata());
+    let captured = test
+        .captured_checkpoint_action()
+        .map(|action| action.version);
+    let replay_reads_pointed_action = pointed_version == 1 && !cfg!(feature = "declarative-plans");
+    assert_eq!(
+        captured,
+        replay_reads_pointed_action.then_some(pointed_version as i64)
+    );
+    let (snapshot, _) = test.snapshot_at(None);
+    let action = snapshot.latest_checkpoint_action(&test.engine).unwrap();
+    assert_eq!(
+        action.map(|action| action.version),
+        Some(pointed_version as i64)
     );
 }
 

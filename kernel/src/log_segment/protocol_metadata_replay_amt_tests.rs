@@ -2,13 +2,17 @@
 //! carried by a `checkpoint` action, exercised on both the plan and non-plan replay paths.
 
 use std::sync::Arc;
+#[cfg(feature = "declarative-plans")]
+use std::sync::Mutex;
 
 use rstest::rstest;
+#[cfg(feature = "declarative-plans")]
+use test_utils::compacted_log_path_for_versions;
 use test_utils::{add_commit, assert_result_error_with_message, delta_path_for_version};
 use url::Url;
 
 use super::tests::add_checkpoint_to_store;
-use super::LogSegment;
+use super::{LastManifestCommitResolution, LogSegment};
 use crate::actions::{CheckpointAction, CommitInfo, ContentRoot, LastManifestCommit, Protocol};
 use crate::arrow::array::StringArray;
 use crate::committer::FileSystemCommitter;
@@ -16,8 +20,16 @@ use crate::crc::{Crc, FileStats, FileStatsState};
 use crate::engine::sync::SyncEngine;
 #[cfg(feature = "declarative-plans")]
 use crate::engine::test_delegating::DelegatingEngine;
+#[cfg(feature = "declarative-plans")]
+use crate::expressions::Scalar;
 use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
+#[cfg(feature = "declarative-plans")]
+use crate::path::ParsedLogPath;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::ir::nodes::Operator;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::{Operation, PlanExecutor, PlanResult};
 use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
@@ -25,7 +37,9 @@ use crate::unit_test_utils::adaptive_metadata_fixtures::last_manifest_commit_inf
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, parse_json_batch, test_schema_flat_with_column_mapping,
 };
-use crate::{Engine, FileMeta, Snapshot};
+#[cfg(feature = "declarative-plans")]
+use crate::KernelResult;
+use crate::{Engine, FileMeta, KernelError, Snapshot};
 
 fn one_column_schema() -> SchemaRef {
     test_schema_flat_with_column_mapping()
@@ -352,7 +366,8 @@ async fn latest_checkpoint_action_without_replay_follows_commit_info_pointer() {
 // - a checkpoint action in a non-first batch is still captured: replay stops only once both P&M are
 //   final, and a newer top-level `metaData` commit does not finalize Protocol, so replay continues
 //   into the older checkpoint commit;
-// - replay that resolves P&M from standalone actions reports no checkpoint action (`None`).
+// - replay that resolves P&M from standalone actions reports no checkpoint action (`None`);
+// - a newest commit pointing at an older manifest commit captures that commit's action.
 #[rstest]
 #[case::single_checkpoint_commit(vec![checkpoint_commit(0, &[], one_column_schema())], Some(0))]
 #[case::checkpoint_action_in_non_first_batch(
@@ -365,6 +380,10 @@ async fn latest_checkpoint_action_without_replay_follows_commit_info_pointer() {
 #[case::standalone_pm_has_no_checkpoint_action(
     vec![standalone_pm_commit(one_column_schema())],
     None
+)]
+#[case::pointer_to_older_manifest_commit(
+    vec![checkpoint_commit(0, &[], one_column_schema()), commit_info(Some((0, 0)))],
+    Some(0)
 )]
 #[tokio::test]
 async fn replay_resolves_latest_checkpoint_action(
@@ -406,10 +425,473 @@ async fn replay_checkpoint_action<E: Engine>(
         .captured_checkpoint_action
 }
 
+// The plan path finds checkpoint actions only through `lastManifestCommit`, so an older action is
+// not captured when the newest commit carries no pointer.
+#[cfg(feature = "declarative-plans")]
+#[tokio::test]
+async fn plan_replay_without_pointer_skips_older_checkpoint_action() {
+    let commits = [
+        checkpoint_commit(0, &[], one_column_schema()),
+        standalone_pm_commit(one_column_schema()),
+    ];
+    assert_replay_resolution(&commits, None, |store| SyncEngine::new_with_store(store)).await;
+}
+
+// The plan path fails the build when the checkpoint action it needs is missing or does not match
+// the pointer.
+#[cfg(feature = "declarative-plans")]
+#[rstest]
+#[case::pointed_commit_without_action_and_metadata(
+    vec![
+        protocol_commit(1, 2),
+        commit_info(Some((0, 0))),
+    ],
+    "that commit carries no checkpoint action"
+)]
+#[case::pointed_commit_without_action_and_protocol(
+    vec![
+        metadata_commit(one_column_schema()),
+        commit_info(Some((0, 0))),
+    ],
+    "that commit carries no checkpoint action"
+)]
+#[case::pointed_action_has_other_content_root(
+    vec![
+        protocol_commit(1, 2),
+        checkpoint_action(0, &[], one_column_schema()),
+        commit_info(Some((1, 1))),
+    ],
+    "that commit's checkpoint action has content root version 0"
+)]
+#[case::newest_action_has_other_content_root(
+    vec![
+        standalone_pm_commit(one_column_schema()),
+        carrying_pointer((1, 1), checkpoint_action(0, &[], one_column_schema())),
+    ],
+    "that commit's checkpoint action has content root version 0"
+)]
+#[case::newest_action_with_older_pointer(
+    vec![
+        checkpoint_commit(0, &[], one_column_schema()),
+        carrying_pointer((0, 0), checkpoint_action(0, &[], one_column_schema())),
+    ],
+    "commit 1 carries a checkpoint action"
+)]
+#[case::pointer_names_newest_commit_without_action(
+    vec![
+        checkpoint_commit(0, &[], one_column_schema()),
+        carrying_pointer((1, 1), standalone_pm_commit(one_column_schema())),
+    ],
+    "that commit carries no checkpoint action"
+)]
+#[case::only_older_manifest_commit_carries_action(
+    vec![
+        checkpoint_commit(0, &[], one_column_schema()),
+        carrying_pointer((1, 0), checkpoint_action(0, &[], one_column_schema())),
+        commit_info(Some((2, 0))),
+        commit_info(Some((2, 0))),
+    ],
+    "that commit carries no checkpoint action"
+)]
+#[case::newest_action_without_pointer(
+    vec![
+        standalone_pm_commit(one_column_schema()),
+        checkpoint_action(1, &[], one_column_schema()),
+    ],
+    "commit 1 carries a checkpoint action but no lastManifestCommit"
+)]
+#[tokio::test]
+async fn plan_replay_errors_when_pointed_commit_lacks_matching_action(
+    #[case] commits: Vec<String>,
+    #[case] expected_error: &str,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    for (version, commit) in commits.into_iter().enumerate() {
+        add_commit(table_root.as_str(), store.as_ref(), version as u64, commit)
+            .await
+            .unwrap();
+    }
+
+    let engine = SyncEngine::new_with_store(store);
+    let result = Snapshot::builder_for(table_root).build(&engine);
+    assert!(matches!(&result, Err(KernelError::InvalidLogSegment(_))));
+    assert_result_error_with_message(result, expected_error);
+}
+
+// When the plan path reads a pointed commit without a checkpoint action but finds Protocol and
+// Metadata anyway, the action's P&M would be older, so replay accepts the log and captures nothing.
+#[cfg(feature = "declarative-plans")]
+#[rstest]
+#[case::pm_at_pointed_version(
+    vec![standalone_pm_commit(one_column_schema()), commit_info(Some((0, 0)))]
+)]
+#[case::pointed_commit_without_action_behind_newer_pm(
+    vec![
+        standalone_pm_commit(one_column_schema()),
+        commit_info(None),
+        carrying_pointer((1, 1), standalone_pm_commit(one_column_schema())),
+        commit_info(Some((1, 1))),
+    ]
+)]
+#[tokio::test]
+async fn plan_replay_accepts_pointed_commit_without_action_when_pm_are_found(
+    #[case] commits: Vec<String>,
+) {
+    assert_replay_resolution(&commits, None, |store| SyncEngine::new_with_store(store)).await;
+}
+
+#[cfg(feature = "declarative-plans")]
+#[derive(Debug, Clone, Copy)]
+enum ReplayBound {
+    Crc,
+    Checkpoint,
+}
+
+// A replay bounded by a CRC or a checkpoint file runs one P&M plan, which still resolves the
+// newest commit's `lastManifestCommit`.
+#[cfg(feature = "declarative-plans")]
+#[rstest]
+#[tokio::test]
+async fn plan_replay_bounded_by_crc_or_checkpoint_runs_one_plan(
+    #[values(ReplayBound::Crc, ReplayBound::Checkpoint)] bound: ReplayBound,
+    #[values(false, true)] compacted: bool,
+    #[values(false, true)] newest_has_commit_info: bool,
+) {
+    let pointer = commit_info(Some((0, 0)));
+    let txn = serde_json::json!({ "txn": { "appId": "app", "version": 1 } }).to_string();
+    let newest = if newest_has_commit_info {
+        pointer.clone()
+    } else {
+        txn.clone()
+    };
+    let (store, table_root) = manifest_commit_table(&[pointer.clone(), pointer, newest]).await;
+    match bound {
+        ReplayBound::Crc => {
+            put_crc_with_pointer(&store, 1, LastManifestCommit::new(0, 0).unwrap()).await
+        }
+        ReplayBound::Checkpoint => put_pm_checkpoint(&store, 1).await,
+    }
+    let compaction = compacted_log_path_for_versions(2, 3, "json");
+    if compacted {
+        store.put(&compaction, txn.into()).await.unwrap();
+    }
+
+    let plans = Arc::new(Mutex::new(Vec::new()));
+    let engine = recording_plan_engine(store, plans.clone());
+    let storage = engine.storage_handler();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let mut log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
+    if compacted {
+        let location = table_root.join(compaction.as_ref()).unwrap();
+        let compaction = ParsedLogPath::new(FileMeta::new(location, 0, 100)).unwrap();
+        log_segment
+            .listed
+            .ascending_compaction_files
+            .push(compaction);
+    }
+    let crc = log_segment.read_latest_crc(&engine).unwrap();
+
+    let resolution = log_segment
+        .read_protocol_metadata_opt(&engine, crc.as_ref())
+        .unwrap();
+    assert!(resolution.protocol.is_some() && resolution.metadata.is_some());
+    assert!(resolution.captured_checkpoint_action.is_none());
+    let expected = if newest_has_commit_info {
+        LastManifestCommitResolution::Resolved(Some(LastManifestCommit::new(0, 0).unwrap()))
+    } else {
+        LastManifestCommitResolution::Unresolved
+    };
+    assert_eq!(resolution.last_manifest_commit, expected);
+    assert_eq!(plans.lock().unwrap().len(), 1);
+}
+
+// An unbounded plan replay reads the newest commit alone, then the older commits only when the
+// newest commit's P&M are not final. Each case lists the commit versions each plan scans.
+#[cfg(feature = "declarative-plans")]
+#[rstest]
+#[case::newest_commit_is_the_manifest_commit(
+    vec![checkpoint_commit(0, &[], one_column_schema())],
+    Some(0),
+    vec![vec![0]]
+)]
+#[case::newest_commit_has_pm(
+    vec![
+        checkpoint_commit(0, &[], one_column_schema()),
+        carrying_pointer((0, 0), standalone_pm_commit(one_column_schema())),
+    ],
+    None,
+    vec![vec![1]]
+)]
+#[case::pointer_to_older_manifest_commit(
+    vec![checkpoint_commit(0, &[], one_column_schema()), commit_info(Some((0, 0)))],
+    Some(0),
+    vec![vec![1], vec![0]]
+)]
+#[case::newest_action_lags_its_commit(
+    vec![
+        checkpoint_commit(0, &[], one_column_schema()),
+        carrying_pointer((0, 0), metadata_commit(test_schema_flat_with_column_mapping())),
+        carrying_pointer((2, 0), checkpoint_action(0, &[], one_column_schema())),
+    ],
+    Some(0),
+    vec![vec![2], vec![1]]
+)]
+#[case::no_older_commit_after_newest_action(
+    vec![
+        checkpoint_commit(0, &[], one_column_schema()),
+        carrying_pointer((1, 0), checkpoint_action(0, &[], one_column_schema())),
+    ],
+    Some(0),
+    vec![vec![1]]
+)]
+#[case::no_pointer(
+    vec![standalone_pm_commit(one_column_schema()), commit_info(None)],
+    None,
+    vec![vec![1], vec![0]]
+)]
+#[tokio::test]
+async fn plan_replay_runs_one_plan_beyond_the_newest_commit_only_when_needed(
+    #[case] commits: Vec<String>,
+    #[case] expected_version: Option<i64>,
+    #[case] expected_plans: Vec<Vec<i64>>,
+) {
+    let plans = Arc::new(Mutex::new(Vec::new()));
+    let recorded = plans.clone();
+    assert_replay_resolution(&commits, expected_version, move |store| {
+        recording_plan_engine(store, recorded)
+    })
+    .await;
+    assert_eq!(*plans.lock().unwrap(), expected_plans);
+}
+
+// A pointer whose commit the segment does not list cannot bound the replay, so the second plan
+// reads every older listed commit and captures no action. The listing drops v0 by hand.
+#[cfg(feature = "declarative-plans")]
+#[tokio::test]
+async fn plan_replay_reads_all_older_commits_when_pointed_commit_is_unlisted() {
+    let (store, table_root) = manifest_commit_table(&[
+        carrying_pointer((0, 0), standalone_pm_commit(one_column_schema())),
+        commit_info(Some((0, 0))),
+    ])
+    .await;
+    let plans = Arc::new(Mutex::new(Vec::new()));
+    let engine = recording_plan_engine(store, plans.clone());
+    let storage = engine.storage_handler();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let mut log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
+    log_segment.listed.ascending_commit_files.remove(0);
+
+    let resolution = log_segment
+        .read_protocol_metadata_opt(&engine, None)
+        .unwrap();
+    assert!(resolution.protocol.is_some() && resolution.metadata.is_some());
+    assert!(resolution.captured_checkpoint_action.is_none());
+    assert_eq!(*plans.lock().unwrap(), vec![vec![2], vec![1]]);
+}
+
+// The pointed checkpoint action holds the P&M as of its `checkpointMetadata.version`, at least its
+// content root version, so the plan path skips the commits at or below that content root, reading
+// the manifest commit itself even though it falls just below the replayed range. The unreadable v0
+// fails the build if replay reads it.
+#[cfg(feature = "declarative-plans")]
+#[tokio::test]
+async fn plan_replay_skips_commits_below_pointed_content_root() {
+    let commits = [
+        "not json".to_string(),
+        checkpoint_commit(1, &[], one_column_schema()),
+        commit_info(Some((1, 1))),
+    ];
+    assert_replay_resolution(&commits, Some(1), |store| SyncEngine::new_with_store(store)).await;
+}
+
+// The pointed manifest commit is newer than the segment's checkpoint, but its content root is not.
+// The non-plan replay reads the whole segment and captures the pointed action, but no pointer. A
+// plan replay bounded by a checkpoint file reads the pointer but no checkpoint action.
+#[tokio::test]
+async fn replay_resolves_pointed_action_above_segment_checkpoint() {
+    check_pointed_action_above_segment_checkpoint(
+        non_plan_engine,
+        Some(1),
+        LastManifestCommitResolution::Unresolved,
+    )
+    .await;
+    #[cfg(feature = "declarative-plans")]
+    check_pointed_action_above_segment_checkpoint(
+        |store| SyncEngine::new_with_store(store),
+        None,
+        LastManifestCommitResolution::Resolved(Some(LastManifestCommit::new(2, 1).unwrap())),
+    )
+    .await;
+}
+
+async fn check_pointed_action_above_segment_checkpoint<E: Engine>(
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+    expected_captured_version: Option<i64>,
+    expected_last_manifest_commit: LastManifestCommitResolution,
+) {
+    let (store, table_root) = manifest_commit_table(&[
+        commit_info(Some((0, 0))),
+        carrying_pointer((2, 1), checkpoint_action(1, &[], one_column_schema())),
+        commit_info(Some((2, 1))),
+    ])
+    .await;
+    put_pm_checkpoint(&store, 1).await;
+
+    let engine = make_engine(store);
+    let log_segment = latest_log_segment(&table_root, &engine);
+    assert_eq!(log_segment.checkpoint_version, Some(1));
+    let resolution = log_segment
+        .read_protocol_metadata_opt(&engine, None)
+        .unwrap();
+    assert!(resolution.protocol.is_some() && resolution.metadata.is_some());
+    let version = resolution
+        .captured_checkpoint_action
+        .map(|action| action.version);
+    assert_eq!(version, expected_captured_version);
+    assert_eq!(
+        resolution.last_manifest_commit,
+        expected_last_manifest_commit
+    );
+}
+
+// A plan-path engine over `store` that records into `plans` the log versions each plan scans.
+#[cfg(feature = "declarative-plans")]
+fn recording_plan_engine(store: Arc<InMemory>, plans: Arc<Mutex<Vec<Vec<i64>>>>) -> impl Engine {
+    let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new_with_store(store));
+    let executor = Arc::new(RecordingPlanExecutor {
+        inner: engine.plan_executor().unwrap(),
+        plans,
+    });
+    DelegatingEngine::new(engine).with_plan_executor(executor)
+}
+
+// A plan executor that records the log versions each plan it runs scans.
+#[cfg(feature = "declarative-plans")]
+struct RecordingPlanExecutor {
+    inner: Arc<dyn PlanExecutor>,
+    plans: Arc<Mutex<Vec<Vec<i64>>>>,
+}
+
+#[cfg(feature = "declarative-plans")]
+impl PlanExecutor for RecordingPlanExecutor {
+    fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
+        if let Operation::QueryPlan(plan) = &op {
+            let versions = plan
+                .nodes
+                .iter()
+                .flat_map(|node| match &node.op {
+                    Operator::ScanJson(scan) => scan.files.as_slice(),
+                    Operator::ScanParquet(scan) => scan.files.as_slice(),
+                    _ => &[],
+                })
+                .filter_map(|file| match file.file_constants.first() {
+                    Some(Scalar::Long(version)) => Some(*version),
+                    _ => None,
+                })
+                .collect();
+            self.plans.lock().unwrap().push(versions);
+        }
+        self.inner.execute_op(op)
+    }
+}
+
+// A standalone checkpoint written after the manifest commit hides that commit from the segment.
+// Replay still resolves P&M from the checkpoint and the newest commit's pointer without reading the
+// pointed commit, which is deleted here, but following the pointer to the action fails because the
+// segment does not list its commit.
+// TODO(#3683): once standalone checkpoints are supported, replay reads the checkpoint action from
+// the checkpoint file and this resolves.
+#[tokio::test]
+async fn standalone_checkpoint_above_pointed_commit_fails_to_read_its_action() {
+    check_standalone_checkpoint_above_pointed_commit(
+        non_plan_engine,
+        LastManifestCommitResolution::Unresolved,
+    )
+    .await;
+    #[cfg(feature = "declarative-plans")]
+    check_standalone_checkpoint_above_pointed_commit(
+        |store| SyncEngine::new_with_store(store),
+        LastManifestCommitResolution::Resolved(Some(LastManifestCommit::new(0, 0).unwrap())),
+    )
+    .await;
+}
+
+async fn check_standalone_checkpoint_above_pointed_commit<E: Engine>(
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+    expected_last_manifest_commit: LastManifestCommitResolution,
+) {
+    let pointer = commit_info(Some((0, 0)));
+    let (store, table_root) = manifest_commit_table(&[pointer.clone(), pointer]).await;
+    put_pm_checkpoint(&store, 1).await;
+    store
+        .delete(&delta_path_for_version(0, "json"))
+        .await
+        .unwrap();
+
+    let engine = make_engine(store);
+    let log_segment = latest_log_segment(&table_root, &engine);
+    assert_eq!(log_segment.checkpoint_version, Some(1));
+    let resolution = log_segment
+        .read_protocol_metadata_opt(&engine, None)
+        .unwrap();
+    assert!(resolution.protocol.is_some() && resolution.metadata.is_some());
+    assert!(resolution.captured_checkpoint_action.is_none());
+    assert_eq!(
+        resolution.last_manifest_commit,
+        expected_last_manifest_commit
+    );
+
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    assert_result_error_with_message(
+        snapshot.latest_checkpoint_action(&engine),
+        "this log segment does not list that commit",
+    );
+}
+
+// A segment that ends on a checkpoint does not list the commit at that version, so a checkpoint
+// action among the checkpoint's rows is not taken as that commit's: replay resolves P&M from the
+// checkpoint without requiring a `lastManifestCommit` and leaves the action uncaptured.
+#[tokio::test]
+async fn segment_ending_on_checkpoint_ignores_its_checkpoint_action_rows() {
+    check_segment_ending_on_checkpoint(non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    check_segment_ending_on_checkpoint(|store| SyncEngine::new_with_store(store)).await;
+}
+
+async fn check_segment_ending_on_checkpoint<E: Engine>(
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let (store, table_root) = manifest_commit_table(&[]).await;
+    let checkpoint_rows = format!(
+        "{}\n{}\n{}",
+        serde_json::json!({ "checkpointMetadata": { "version": 0 } }),
+        standalone_pm_commit(one_column_schema()),
+        checkpoint_action(0, &[], one_column_schema())
+    );
+    let checkpoint =
+        delta_path_for_version(0, "checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json");
+    store
+        .put(&checkpoint, checkpoint_rows.into())
+        .await
+        .unwrap();
+
+    let engine = make_engine(store);
+    let log_segment = latest_log_segment(&table_root, &engine);
+    assert_eq!(log_segment.checkpoint_version, Some(0));
+    let resolution = log_segment
+        .read_protocol_metadata_opt(&engine, None)
+        .unwrap();
+    assert!(resolution.protocol.is_some() && resolution.metadata.is_some());
+    assert!(resolution.captured_checkpoint_action.is_none());
+}
+
 // An incremental update resolves the latest checkpoint action for the updated snapshot: a new
 // commit carrying a newer checkpoint action surfaces that newer action, while a new commit carrying
 // none leaves the action uncaptured, so the accessor follows the new commit's `lastManifestCommit`
-// back to the base's older action.
+// back to the base's older action. Runs on both the plan and non-plan paths.
 #[rstest]
 #[case::new_commit_carries_a_newer_action(checkpoint_commit(1, &[], one_column_schema()), 1)]
 #[case::new_commit_carries_no_action(
@@ -421,9 +903,22 @@ async fn incremental_update_resolves_latest_checkpoint_action(
     #[case] new_commit: String,
     #[case] expected_version: i64,
 ) {
+    assert_incremental_update_action(&new_commit, expected_version, non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    assert_incremental_update_action(&new_commit, expected_version, |store| {
+        SyncEngine::new_with_store(store)
+    })
+    .await;
+}
+
+async fn assert_incremental_update_action<E: Engine>(
+    new_commit: &str,
+    expected_version: i64,
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
     let (store, table_root) = manifest_commit_table(&[]).await;
 
-    let engine = non_plan_engine(store.clone());
+    let engine = make_engine(store.clone());
     let base = Snapshot::builder_for(table_root.clone())
         .at_version(0)
         .build(&engine)
@@ -435,9 +930,14 @@ async fn incremental_update_resolves_latest_checkpoint_action(
         Some(0)
     );
 
-    add_commit(table_root.as_str(), store.as_ref(), 1, new_commit)
-        .await
-        .unwrap();
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        1,
+        new_commit.to_string(),
+    )
+    .await
+    .unwrap();
     let updated = Snapshot::builder_from(base).build(&engine).unwrap();
 
     assert_eq!(updated.version(), 1);
@@ -627,6 +1127,158 @@ async fn post_commit_snapshot_resolves_latest_checkpoint_action(
     assert_eq!(action.version, expected_version);
 }
 
+// The plan replay takes `lastManifestCommit` from the newest commit only: a manifest commit records
+// itself, a later log commit carries it forward, and a newest commit without one is not back-filled
+// from an older commit (a miss stays `Unresolved`). The non-plan replay reads no `commitInfo`.
+#[cfg(feature = "declarative-plans")]
+#[rstest]
+#[case::manifest_commit_records_itself(vec![], Some((0, 0)))]
+#[case::log_commit_carries_it_forward(vec![commit_info(Some((0, 0)))], Some((0, 0)))]
+#[case::newest_commit_without_it_is_not_backfilled(vec![commit_info(None)], None)]
+#[tokio::test]
+async fn replay_resolves_last_manifest_commit_from_newest_commit(
+    #[case] later_commits: Vec<String>,
+    #[case] expected: Option<(i64, i64)>,
+) {
+    let expected = match expected {
+        Some((v, c)) => {
+            LastManifestCommitResolution::Resolved(Some(LastManifestCommit::new(v, c).unwrap()))
+        }
+        None => LastManifestCommitResolution::Unresolved,
+    };
+    assert_replay_last_manifest_commit(
+        &later_commits,
+        &LastManifestCommitResolution::Unresolved,
+        non_plan_engine,
+    )
+    .await;
+    assert_replay_last_manifest_commit(&later_commits, &expected, |store| {
+        SyncEngine::new_with_store(store)
+    })
+    .await;
+}
+
+#[cfg(feature = "declarative-plans")]
+async fn assert_replay_last_manifest_commit<E: Engine>(
+    later_commits: &[String],
+    expected: &LastManifestCommitResolution,
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let (store, table_root) = manifest_commit_table(later_commits).await;
+    let engine = make_engine(store);
+    let log_segment = latest_log_segment(&table_root, &engine);
+
+    let resolution = log_segment
+        .read_protocol_metadata_opt(&engine, None)
+        .unwrap();
+    assert_eq!(&resolution.last_manifest_commit, expected);
+}
+
+// A `lastManifestCommit` naming a version after the commit that carries it is invalid, so the plan
+// replay fails instead of storing a pointer that later reads would trust, whether or not a
+// checkpoint file bounds the replay.
+#[cfg(feature = "declarative-plans")]
+#[rstest]
+#[tokio::test]
+async fn plan_replay_rejects_pointer_after_newest_commit(
+    #[values(false, true)] checkpointed: bool,
+) {
+    let later_commits = [commit_info(Some((0, 0))), commit_info(Some((5, 5)))];
+    let (store, table_root) = manifest_commit_table(&later_commits).await;
+    if checkpointed {
+        put_pm_checkpoint(&store, 1).await;
+    }
+    let engine = SyncEngine::new_with_store(store);
+    assert_result_error_with_message(
+        Snapshot::builder_for(table_root).build(&engine),
+        "lastManifestCommit version 5 exceeds commit version 2",
+    );
+}
+
+// The plan path reads the newest commit and the pointed manifest commit as their own files, not
+// through a log compaction covering them. Compaction listing is disabled, so the compaction is
+// added by hand.
+#[cfg(feature = "declarative-plans")]
+#[rstest]
+#[case::covers_newest_and_manifest_commit(
+    vec![
+        checkpoint_commit(1, &[], test_schema_flat_with_column_mapping()),
+        commit_info(Some((1, 1))),
+    ],
+    (1, 2),
+    1
+)]
+#[case::covers_manifest_commit_past_its_content_root(
+    vec![
+        carrying_pointer((0, 0), metadata_commit(test_schema_flat_with_column_mapping())),
+        carrying_pointer(
+            (2, 1),
+            checkpoint_action(1, &[], test_schema_flat_with_column_mapping()),
+        ),
+        commit_info(Some((2, 1))),
+    ],
+    (2, 3),
+    2
+)]
+#[tokio::test]
+async fn plan_replay_reads_commits_a_compaction_covers(
+    #[case] later_commits: Vec<String>,
+    #[case] (compaction_start, compaction_end): (u64, u64),
+    #[case] pointer_version: i64,
+) {
+    let (store, table_root) = manifest_commit_table(&later_commits).await;
+    let compaction = compacted_log_path_for_versions(compaction_start, compaction_end, "json");
+    let txn = serde_json::json!({ "txn": { "appId": "app", "version": 1 } }).to_string();
+    store.put(&compaction, txn.into()).await.unwrap();
+
+    let engine = SyncEngine::new_with_store(store);
+    let storage = engine.storage_handler();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let mut log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
+    let compaction_location = table_root.join(compaction.as_ref()).unwrap();
+    let compaction = ParsedLogPath::new(FileMeta::new(compaction_location, 0, 100)).unwrap();
+    log_segment
+        .listed
+        .ascending_compaction_files
+        .push(compaction);
+
+    let resolution = log_segment
+        .read_protocol_metadata_opt(&engine, None)
+        .unwrap();
+    let schema = resolution.metadata.unwrap().parse_schema().unwrap();
+    assert_eq!(&schema, test_schema_flat_with_column_mapping().as_ref());
+    let version = resolution
+        .captured_checkpoint_action
+        .map(|action| action.version);
+    assert_eq!(version, Some(1));
+    assert_eq!(
+        resolution.last_manifest_commit,
+        LastManifestCommitResolution::Resolved(Some(
+            LastManifestCommit::new(pointer_version, 1).unwrap()
+        ))
+    );
+}
+
+// A plan-replayed snapshot serves `lastManifestCommit` from build-time state: it still resolves
+// after the commit file that carried it is deleted.
+#[cfg(feature = "declarative-plans")]
+#[tokio::test]
+async fn plan_replayed_snapshot_serves_last_manifest_commit_without_reading_the_log() {
+    let (store, table_root) = manifest_commit_table(&[commit_info(Some((0, 0)))]).await;
+    let engine = SyncEngine::new_with_store(store.clone());
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+
+    store
+        .delete(&delta_path_for_version(1, "json"))
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.last_manifest_commit(&engine).unwrap(),
+        Some(LastManifestCommit::new(0, 0).unwrap())
+    );
+}
+
 // A read snapshot loaded from a CRC never captures the checkpoint action, so a plain commit's
 // post-commit snapshot follows the transaction's own `lastManifestCommit`. With the new commit file
 // deleted, only that pointer can name the manifest commit.
@@ -691,6 +1343,40 @@ async fn snapshot_with_crc_at_version_serves_last_manifest_commit_from_crc(
         .await
         .unwrap();
     assert_eq!(snapshot.last_manifest_commit(&engine).unwrap(), expected);
+}
+
+// A snapshot that sits on a checkpoint (no CRC, no later commits) cannot read commitInfo during
+// replay, so it reads `lastManifestCommit` from the commit file at the checkpoint version, and
+// errors with `MissingVersion` when that file is gone. P&M replay, and so the snapshot build,
+// succeeds either way.
+#[rstest]
+#[case::commit_file_present(false)]
+#[case::commit_file_deleted(true)]
+#[tokio::test]
+async fn snapshot_on_checkpoint_reads_last_manifest_commit_from_commit_file(
+    #[case] delete_commit_file: bool,
+) {
+    let (store, table_root) = manifest_commit_table(&[]).await;
+    put_pm_checkpoint(&store, 0).await;
+    let engine = SyncEngine::new_with_store(store.clone());
+    if delete_commit_file {
+        store
+            .delete(&delta_path_for_version(0, "json"))
+            .await
+            .unwrap();
+    }
+
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    assert_eq!(snapshot.log_segment().checkpoint_version, Some(0));
+    let result = snapshot.last_manifest_commit(&engine);
+    if delete_commit_file {
+        assert!(matches!(result, Err(KernelError::MissingVersion(0))));
+    } else {
+        assert_eq!(
+            result.unwrap(),
+            Some(LastManifestCommit::new(0, 0).unwrap())
+        );
+    }
 }
 
 // Writes a parquet checkpoint at `version` holding only top-level protocol and metaData. Kernel

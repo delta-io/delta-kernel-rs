@@ -1525,6 +1525,13 @@ impl LastManifestCommit {
             self.version, self.content_root_version
         ))
     }
+
+    /// Parses the first `commitInfo.lastManifestCommit` in `data`, if any.
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> KernelResult<Option<Self>> {
+        let mut visitor = visitors::LastManifestCommitVisitor::default();
+        visitor.visit_rows_of(data)?;
+        Ok(visitor.last_manifest_commit)
+    }
 }
 
 /// The checkpoint action embeds metadata tree state in a Delta log entry.
