@@ -1160,6 +1160,27 @@ impl LogSegment {
         Ok(Some((file_type, Self::version_tagged_scan_files(parts)?)))
     }
 
+    /// Returns sidecars tagged with checkpoint version.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn checkpoint_version_tagged_sidecar_scan_files(
+        &self,
+        sidecars: &[FileMeta],
+    ) -> KernelResult<Vec<ScanFile>> {
+        let version = self
+            .checkpoint_version
+            .ok_or_else(|| KernelError::generic("Manifest checkpoint has no version"))?;
+        let version = crate::version_as_i64(version)?;
+        sidecars
+            .iter()
+            .map(|sidecar| {
+                Ok(ScanFile {
+                    meta: sidecar.clone(),
+                    file_constants: vec![Scalar::Long(version)],
+                })
+            })
+            .collect()
+    }
+
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.
     ///
     /// This function analyzes the checkpoint to determine:

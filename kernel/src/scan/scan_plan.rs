@@ -24,7 +24,7 @@ use crate::expressions::{
     UnaryExpressionOp,
 };
 use crate::log_segment::LogSegment;
-use crate::plans::ir::nodes::{FileType, ScanFile};
+use crate::plans::ir::nodes::FileType;
 use crate::plans::ir::plan::Plan;
 use crate::schema::{
     schema, schema_ref, CheckpointFieldKind, DataType, SchemaRef, SchemaStructPatchBuilder,
@@ -33,7 +33,7 @@ use crate::schema::{
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::utils::FoldWithOption as _;
-use crate::{KernelError, KernelResult, PlanBuilder, Scalar};
+use crate::{KernelError, KernelResult, PlanBuilder};
 
 // === Internal column names ===
 
@@ -442,14 +442,8 @@ impl Scan {
                 PlanBuilder::scan_json(parts, &[VERSION], schema)
             }
             (CheckpointType::Manifest, Some(_)) => {
-                let version =
-                    crate::version_as_i64(log_segment.checkpoint_version.ok_or_else(|| {
-                        KernelError::generic("Manifest checkpoint has no version")
-                    })?)?;
-                let sidecars = shape.sidecars.iter().map(|meta| ScanFile {
-                    meta: meta.clone(),
-                    file_constants: vec![Scalar::Long(version)],
-                });
+                let sidecars =
+                    log_segment.checkpoint_version_tagged_sidecar_scan_files(&shape.sidecars)?;
                 PlanBuilder::scan_parquet(sidecars, &[VERSION], schema)
             }
             (CheckpointType::None, _) | (_, None) => PlanBuilder::values(schema, vec![]),
