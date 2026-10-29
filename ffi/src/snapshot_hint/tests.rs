@@ -11,6 +11,8 @@ use delta_kernel::crc::Crc;
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::path::ParsedLogPath;
+#[cfg(feature = "declarative-plans")]
+use delta_kernel::plans::{Operation, PlanExecutor, PlanResult};
 use delta_kernel::snapshot::{IncrementalReplay, PublicationWatermark, Snapshot};
 use delta_kernel::{
     Engine, EvaluationHandler, FileMeta, JsonHandler, ParquetHandler, StorageHandler,
@@ -30,9 +32,13 @@ use crate::{
     engine_to_handle, free_engine, free_snapshot, get_snapshot_builder, get_snapshot_builder_from,
     snapshot_builder_build, snapshot_builder_with_incremental_crc_replay,
     snapshot_builder_with_max_catalog_version, snapshot_builder_with_version,
-    snapshot_checkpoint_file_groups, snapshot_checkpoint_size_in_bytes, snapshot_log_segment_stats,
-    FfiCheckpointFileGroup, FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats, FfiSlice,
+    snapshot_log_segment_stats, FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats,
     KernelI64Slice, KernelStringSlice, OptionalValue, SharedExternEngine,
+};
+#[cfg(feature = "declarative-plans")]
+use crate::{
+    snapshot_checkpoint_file_groups, snapshot_checkpoint_size_in_bytes, FfiCheckpointFileGroup,
+    FfiSlice,
 };
 
 fn slice(value: &'static str) -> KernelStringSlice {
@@ -208,6 +214,7 @@ fn log_segment_stats_borrows_handles_and_propagates_errors_without_io(
     }
 }
 
+#[cfg(feature = "declarative-plans")]
 #[rstest::rstest]
 #[case::commits_only(false)]
 #[case::physical_schema(true)]
@@ -302,6 +309,18 @@ impl Engine for NoIoEngine {
 
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         panic!("snapshot hints must not require Parquet I/O")
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn plan_executor(&self) -> Option<Arc<dyn PlanExecutor>> {
+        Some(Arc::new(NoIoEngine))
+    }
+}
+
+#[cfg(feature = "declarative-plans")]
+impl PlanExecutor for NoIoEngine {
+    fn execute_op(&self, _op: Operation) -> delta_kernel::KernelResult<PlanResult> {
+        panic!("snapshot hints must not require plan execution")
     }
 }
 

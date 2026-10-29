@@ -1762,6 +1762,7 @@ pub unsafe extern "C" fn snapshot_log_segment_stats(
 ///
 /// Successful inspection is cached in the snapshot. Returns zero without a checkpoint.
 /// Both handles are borrowed; the scalar result requires no release.
+/// Metadata resolution requires an engine with a plan executor.
 ///
 /// # Errors
 ///
@@ -1770,6 +1771,7 @@ pub unsafe extern "C" fn snapshot_log_segment_stats(
 /// # Safety
 ///
 /// Caller must pass valid snapshot and engine handles and retain ownership of both.
+#[cfg(feature = "declarative-plans")]
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_checkpoint_size_in_bytes(
     snapshot: Handle<SharedSnapshot>,
@@ -1783,6 +1785,7 @@ pub unsafe extern "C" fn snapshot_checkpoint_size_in_bytes(
 }
 
 /// Borrowed description of checkpoint files sharing a physical schema.
+#[cfg(feature = "declarative-plans")]
 #[repr(C)]
 pub struct FfiCheckpointFileGroup {
     /// Number of files carrying file actions.
@@ -1794,7 +1797,8 @@ pub struct FfiCheckpointFileGroup {
 
 /// Visits all checkpoint file-action groups in one borrowed slice.
 ///
-/// Resolves sidecars and physical schemas through `engine`, without replaying file actions.
+/// Resolves sidecars and physical schemas through `engine`'s plan executor, without replaying
+/// file actions.
 /// Calls `visit` once and returns `true` on success, including for an empty result. Handles stay
 /// owned by the caller; the callback must copy any data it retains.
 ///
@@ -1806,6 +1810,7 @@ pub struct FfiCheckpointFileGroup {
 ///
 /// Both handles must be valid. `visit` must be valid for one synchronous call with `context`,
 /// must not unwind, and must not retain the borrowed slice or its strings.
+#[cfg(feature = "declarative-plans")]
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_checkpoint_file_groups(
     snapshot: Handle<SharedSnapshot>,

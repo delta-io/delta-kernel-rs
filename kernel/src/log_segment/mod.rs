@@ -1183,7 +1183,7 @@ impl LogSegment {
     ///   footer, then check for sidecar column to distinguish
     ///   - Has sidecar column (V2): extract sidecars, read first sidecar's schema
     ///   - No sidecar column (V1): use checkpoint schema directly
-    pub(crate) fn get_file_actions_schema_and_sidecars(
+    fn get_file_actions_schema_and_sidecars(
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<(Option<SchemaRef>, Vec<FileMeta>)> {
@@ -1250,18 +1250,9 @@ impl LogSegment {
         checkpoint: &ParsedLogPath<FileMeta>,
         checkpoint_schema: Option<&SchemaRef>,
     ) -> KernelResult<(Option<SchemaRef>, Vec<FileMeta>)> {
-        let sidecar_files = match self.checkpoint_hint_sidecars() {
-            Some(sidecars) => sidecars
-                .iter()
-                .map(|sidecar| sidecar.to_filemeta(&self.log_root))
-                .collect::<KernelResult<Vec<_>>>()?,
-            None => self.extract_sidecar_refs(engine, checkpoint)?,
-        };
+        let sidecar_files = self.extract_sidecar_refs(engine, checkpoint)?;
         let file_actions_schema = match sidecar_files.first() {
-            Some(first) => Some(match self.checkpoint_hint_sidecar_file_schema() {
-                Some(schema) => Arc::new(schema),
-                None => Self::read_footer_schema(engine, first)?,
-            }),
+            Some(first) => Some(Self::read_footer_schema(engine, first)?),
             None => checkpoint_schema.cloned(),
         };
         Ok((file_actions_schema, sidecar_files))

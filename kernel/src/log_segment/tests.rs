@@ -1860,9 +1860,6 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None,
         None,
     )?;
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
-    assert!(sidecars.is_empty());
-    assert!(schema.is_none());
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema,

@@ -2,7 +2,11 @@
 //! has schema etc.)
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
+#[cfg(feature = "declarative-plans")]
+use std::sync::Mutex;
+#[cfg(any(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+use std::sync::OnceLock;
 
 use delta_kernel_derive::internal_api;
 use tracing::{debug, error, info, instrument, warn};
@@ -15,9 +19,11 @@ use crate::actions::visitors::SetTransactionMap;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
+#[cfg(feature = "declarative-plans")]
+use crate::checkpoint::CheckpointShape;
 use crate::checkpoint::{
-    ensure_standalone_checkpoint_supported, CheckpointShape, CheckpointSpec, CheckpointWriter,
-    V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
+    ensure_standalone_checkpoint_supported, CheckpointSpec, CheckpointWriter, V2CheckpointConfig,
+    DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
 };
 use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
@@ -122,8 +128,10 @@ pub struct Snapshot {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     last_manifest_commit: OnceLock<Option<LastManifestCommit>>,
     // Immutable checkpoint inputs are shared by inspection and scan planning.
+    #[cfg(feature = "declarative-plans")]
     checkpoint_shape: OnceLock<CheckpointShape>,
     // Serialize fallible initialization without locking subsequent reads. Failed I/O can retry.
+    #[cfg(feature = "declarative-plans")]
     checkpoint_shape_init: Mutex<()>,
 }
 
@@ -296,7 +304,9 @@ impl Snapshot {
             },
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit,
+            #[cfg(feature = "declarative-plans")]
             checkpoint_shape: OnceLock::new(),
+            #[cfg(feature = "declarative-plans")]
             checkpoint_shape_init: Mutex::new(()),
         }
     }
@@ -570,22 +580,28 @@ impl Snapshot {
     /// Returns the selected checkpoint's physical size, including every top-level part and
     /// referenced sidecar. Returns zero without a checkpoint. Successful inspection is cached
     /// and shared with [`Self::checkpoint_shape`] and declarative scan planning.
+    /// Resolves metadata through `engine`'s [`PlanExecutor`](crate::plans::PlanExecutor).
     ///
     /// # Errors
     ///
-    /// Returns an error if checkpoint metadata cannot be read or the sum exceeds [`u64::MAX`].
+    /// Returns an error if `engine` has no plan executor, checkpoint metadata cannot be read,
+    /// or the sum exceeds [`u64::MAX`].
+    #[cfg(feature = "declarative-plans")]
     pub fn checkpoint_size_in_bytes(&self, engine: &dyn Engine) -> KernelResult<u64> {
         Ok(self.checkpoint_shape(engine, false)?.size_in_bytes)
     }
 
     /// Returns this snapshot's cached checkpoint shape, borrowed for the snapshot's lifetime.
-    /// Uses `engine` to resolve checkpoint inputs; `needs_leaf_schema` additionally loads the
-    /// physical schema. File count and bytes are zero when no checkpoint was selected.
+    /// Uses `engine`'s [`PlanExecutor`](crate::plans::PlanExecutor) to resolve checkpoint inputs;
+    /// `needs_leaf_schema` additionally loads the physical schema. File count and bytes are zero
+    /// when no checkpoint was selected.
     /// Successful inspection is shared with declarative scan planning. Failed reads can retry.
     ///
     /// # Errors
     ///
-    /// Returns an error if checkpoint metadata cannot be read or decoded, or its size overflows.
+    /// Returns an error if `engine` has no plan executor, checkpoint metadata cannot be read or
+    /// decoded, or its size overflows.
+    #[cfg(feature = "declarative-plans")]
     pub fn checkpoint_shape(
         &self,
         engine: &dyn Engine,
@@ -596,6 +612,7 @@ impl Snapshot {
                 return Ok(shape);
             }
         }
+        let exec = engine.require_plan_executor()?;
         let _guard = self
             .checkpoint_shape_init
             .lock()
@@ -603,12 +620,12 @@ impl Snapshot {
         let shape = match self.checkpoint_shape.get() {
             Some(shape) => shape,
             None => {
-                let shape = CheckpointShape::resolve(engine, self)?;
+                let shape = CheckpointShape::resolve(exec.as_ref(), self)?;
                 self.checkpoint_shape.get_or_init(|| shape)
             }
         };
         if needs_leaf_schema {
-            shape.resolve_leaf_schema(engine, self)?;
+            shape.resolve_leaf_schema(exec.as_ref(), self)?;
         }
         Ok(shape)
     }
@@ -1835,11 +1852,12 @@ mod tests {
     };
     use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
     use crate::transaction::create_table::create_table;
-    use crate::unit_test_utils::{
-        assert_result_error_with_message, load_test_table, string_array_to_engine_data,
-    };
+    #[cfg(feature = "declarative-plans")]
+    use crate::unit_test_utils::load_test_table;
+    use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::utils::FoldWithOption as _;
 
+    #[cfg(feature = "declarative-plans")]
     #[rstest]
     #[case("table-without-dv-small", 0, false)]
     #[case("v1-single-part-struct-stats-only", 1, true)]
