@@ -401,7 +401,7 @@ impl WriteState {
             iceberg_compat_v3_enabled: table_config
                 .is_feature_enabled(&TableFeature::IcebergCompatV3),
             column_mapping_mode: table_config.column_mapping_mode(),
-            write_tight_stats: should_write_tight_stats(table_config, &stats_columns),
+            write_tight_stats: table_config.is_adaptive_metadata_enabled(),
             stats_columns,
             logical_partition_columns: table_config.logical_partition_columns().to_vec(),
             materialize_partition_columns: table_config.should_materialize_partition_columns(),
@@ -446,26 +446,6 @@ impl WriteState {
         let patch = add_void_stripping(patch, &self.full_logical_schema);
         Expression::struct_patch(patch)
     }
-}
-
-/// Whether new files on this table should carry `tightStats`: only adaptiveMetadata tables use it,
-/// and it requires full-precision timestamp bounds, which kernel does not yet write.
-// TODO: write `tightStats` for timestamp stats columns once stats JSON keeps full precision.
-fn should_write_tight_stats(
-    table_config: &TableConfiguration,
-    stats_columns: &[ColumnName],
-) -> bool {
-    if !table_config.is_feature_enabled(&TableFeature::AdaptiveMetadataPreview) {
-        return false;
-    }
-    let leaves = table_config
-        .physical_data_schema_without_partition_columns()
-        .leaves(None);
-    let (names, types) = leaves.as_ref();
-    !names.iter().zip(types).any(|(name, data_type)| {
-        (*data_type == DataType::TIMESTAMP || *data_type == DataType::TIMESTAMP_NTZ)
-            && stats_columns.contains(name)
-    })
 }
 
 #[cfg(test)]
@@ -988,40 +968,27 @@ mod tests {
         assert!(error.to_string().contains("unknown field `unknown_field`"));
     }
 
+    /// adaptiveMetadata tables always write `tightStats`, including with timestamp stats, since
+    /// their stats JSON keeps full-precision timestamp bounds.
     #[rstest]
-    #[case::not_adaptive_metadata(false, DataType::LONG, true, false)]
-    #[case::no_timestamp(true, DataType::LONG, true, true)]
-    #[case::timestamp_stats(true, DataType::TIMESTAMP, true, false)]
-    #[case::timestamp_ntz_stats(true, DataType::TIMESTAMP_NTZ, true, false)]
-    #[case::timestamp_without_stats(true, DataType::TIMESTAMP, false, true)]
-    fn write_tight_stats_requires_adaptive_metadata_without_timestamp_stats(
-        #[case] adaptive_metadata: bool,
-        #[case] second_type: DataType,
-        #[case] second_has_stats: bool,
-        #[case] expected: bool,
-    ) {
-        let features = adaptive_metadata
-            .then_some(TableFeature::AdaptiveMetadataPreview)
-            .into_iter()
-            .chain(
-                (second_type == DataType::TIMESTAMP_NTZ)
-                    .then_some(TableFeature::TimestampWithoutTimezone),
-            );
+    fn write_tight_stats_follows_adaptive_metadata(#[values(false, true)] adaptive_metadata: bool) {
         let config = MockTableConfigurationBuilder::new()
             .with_schema(StructType::new_unchecked([
                 StructField::nullable("id", DataType::LONG),
-                StructField::nullable("second", second_type),
+                StructField::nullable("ts", DataType::TIMESTAMP),
             ]))
-            .with_protocol(MockProtocolBuilder::new().with_features(features).build())
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features(
+                        adaptive_metadata.then_some(TableFeature::AdaptiveMetadataPreview),
+                    )
+                    .build(),
+            )
             .build();
-        let mut stats_columns = vec![column_name!("id")];
-        if second_has_stats {
-            stats_columns.push(column_name!("second"));
-        }
 
-        let state = WriteState::new(&config, stats_columns);
-        assert_eq!(state.write_tight_stats, expected);
+        let state = WriteState::new(&config, vec![column_name!("id"), column_name!("ts")]);
+        assert_eq!(state.write_tight_stats, adaptive_metadata);
         let decoded = WriteState::decode(&state.encode().unwrap()).unwrap();
-        assert_eq!(decoded.write_tight_stats, expected);
+        assert_eq!(decoded.write_tight_stats, adaptive_metadata);
     }
 }

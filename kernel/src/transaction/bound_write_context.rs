@@ -175,8 +175,9 @@ impl BoundWriteContext {
     }
 
     /// Returns whether the statistics of newly written files should include `tightStats`, set to
-    /// the same value as `tightBounds`. True only for adaptiveMetadata tables whose statistics
-    /// include no timestamp columns.
+    /// the same value as `tightBounds`. True exactly for adaptiveMetadata tables, which require
+    /// it on every newly written file. Kernel keeps timestamp bounds at full precision when it
+    /// encodes those statistics.
     pub fn should_write_tight_stats(&self) -> bool {
         self.write_state.write_tight_stats
     }
