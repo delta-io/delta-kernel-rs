@@ -39,7 +39,9 @@ pub struct DecimalData {
 /// A year-month interval value stored as a signed month count and an ANSI qualifier.
 ///
 /// For example, `INTERVAL '2' YEAR` is stored as 24 months with the `YEAR` qualifier.
+/// Construction and deserialization reject `YEAR` values that are not whole multiples of 12 months.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawIntervalYearMonthData")]
 pub struct IntervalYearMonthData {
     months: i32,
     ty: IntervalYearToMonthType,
@@ -67,6 +69,31 @@ impl IntervalYearMonthData {
     /// Returns the year-month interval qualifier.
     pub fn ty(&self) -> &IntervalYearToMonthType {
         &self.ty
+    }
+}
+
+/// Creates a `YEAR TO MONTH` payload from any signed total-month count.
+impl From<i32> for IntervalYearMonthData {
+    fn from(months: i32) -> Self {
+        Self {
+            months,
+            ty: IntervalYearToMonthType::IntervalYearToMonth,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename = "IntervalYearMonthData")]
+struct RawIntervalYearMonthData {
+    months: i32,
+    ty: IntervalYearToMonthType,
+}
+
+impl TryFrom<RawIntervalYearMonthData> for IntervalYearMonthData {
+    type Error = KernelError;
+
+    fn try_from(raw: RawIntervalYearMonthData) -> KernelResult<Self> {
+        Self::try_new(raw.months, raw.ty)
     }
 }
 
@@ -1927,6 +1954,15 @@ mod tests {
     }
 
     #[rstest]
+    fn interval_year_month_from_months_preserves_full_range(
+        #[values(0, 17, -13, 24, -24, i32::MIN, i32::MAX)] months: i32,
+    ) {
+        let data = IntervalYearMonthData::from(months);
+        assert_eq!(data.months(), months);
+        assert_eq!(data.ty(), &IntervalYearToMonthType::IntervalYearToMonth);
+    }
+
+    #[rstest]
     fn interval_year_month_payload_requires_whole_years(
         #[values(0, -13, 24, -24, i32::MIN, i32::MAX)] months: i32,
         #[values(
@@ -1967,6 +2003,54 @@ mod tests {
         assert!(
             matches!(err, KernelError::InvalidInterval(message) if message.contains("not divisible by 12"))
         );
+    }
+
+    #[rstest]
+    fn interval_year_month_deserialization_rejects_unaligned_years(
+        #[values(13, -13, i32::MIN, i32::MAX)] months: i32,
+        #[values(false, true)] inside_scalar: bool,
+    ) {
+        let payload = serde_json::json!({ "months": months, "ty": "interval year" });
+        let err = if inside_scalar {
+            serde_json::from_value::<Scalar>(serde_json::json!({ "IntervalYearMonth": payload }))
+                .unwrap_err()
+        } else {
+            serde_json::from_value::<IntervalYearMonthData>(payload).unwrap_err()
+        };
+        assert!(err.to_string().contains("not divisible by 12"));
+    }
+
+    #[rstest]
+    #[case::year_zero(0, IntervalYearToMonthType::IntervalYear)]
+    #[case::year_positive(24, IntervalYearToMonthType::IntervalYear)]
+    #[case::year_negative(-24, IntervalYearToMonthType::IntervalYear)]
+    #[case::year_min_aligned(-2_147_483_640, IntervalYearToMonthType::IntervalYear)]
+    #[case::year_max_aligned(2_147_483_640, IntervalYearToMonthType::IntervalYear)]
+    #[case::month_positive(13, IntervalYearToMonthType::IntervalMonth)]
+    #[case::month_negative(-13, IntervalYearToMonthType::IntervalMonth)]
+    #[case::month_min(i32::MIN, IntervalYearToMonthType::IntervalMonth)]
+    #[case::month_max(i32::MAX, IntervalYearToMonthType::IntervalMonth)]
+    #[case::full_positive(13, IntervalYearToMonthType::IntervalYearToMonth)]
+    #[case::full_negative(-13, IntervalYearToMonthType::IntervalYearToMonth)]
+    #[case::full_min(i32::MIN, IntervalYearToMonthType::IntervalYearToMonth)]
+    #[case::full_max(i32::MAX, IntervalYearToMonthType::IntervalYearToMonth)]
+    fn interval_year_month_serde_preserves_payload_and_qualifier(
+        #[case] months: i32,
+        #[case] ty: IntervalYearToMonthType,
+        #[values(false, true)] inside_scalar: bool,
+    ) {
+        let payload = serde_json::json!({ "months": months, "ty": ty });
+        if inside_scalar {
+            let serialized = serde_json::json!({ "IntervalYearMonth": payload });
+            let scalar: Scalar = serde_json::from_value(serialized.clone()).unwrap();
+            assert_eq!(scalar, Scalar::interval_year_month(months, ty).unwrap());
+            assert_eq!(serde_json::to_value(scalar).unwrap(), serialized);
+        } else {
+            let data: IntervalYearMonthData = serde_json::from_value(payload.clone()).unwrap();
+            assert_eq!(data.months(), months);
+            assert_eq!(data.ty(), &ty);
+            assert_eq!(serde_json::to_value(data).unwrap(), payload);
+        }
     }
 
     #[rstest]

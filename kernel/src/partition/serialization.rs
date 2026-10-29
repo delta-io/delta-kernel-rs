@@ -695,20 +695,6 @@ mod tests {
         );
     }
 
-    #[rstest]
-    #[case(-13)]
-    #[case(i32::MIN)]
-    #[case(i32::MAX)]
-    fn test_year_interval_partition_serialization_rejects_unaligned_months(#[case] months: i32) {
-        let payload = serde_json::from_value(serde_json::json!({
-            "months": months,
-            "ty": "interval year"
-        }))
-        .unwrap();
-        let err = serialize_partition_value(&Scalar::IntervalYearMonth(payload)).unwrap_err();
-        assert!(matches!(err, KernelError::InvalidPartitionValues(_)));
-    }
-
     /// Kernel formats the smallest subnormal double as "5.0E-324" while Delta-Spark
     /// uses "4.9E-324" (Java's Double.MIN_VALUE.toString()). Verify both strings parse
     /// to the identical f64 value, confirming that Spark can read kernel's representation

@@ -8,7 +8,7 @@ use delta_kernel::expressions::{
     lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
     JunctionPredicateOp, Predicate, Scalar, UnaryPredicateOp,
 };
-use delta_kernel::schema::{DataType, IntervalYearToMonthType, PrimitiveType};
+use delta_kernel::schema::{DataType, PrimitiveType};
 use delta_kernel::KernelResult;
 
 #[cfg(feature = "default-engine-base")]
@@ -389,29 +389,15 @@ pub extern "C" fn visit_expression_literal_timestamp_ntz(
     wrap_expression(state, lit(Scalar::TimestampNtz(value)))
 }
 
-/// Visit an interval year-month literal (signed month count).
+/// Registers a `YEAR TO MONTH` literal containing `value` total months in `state`.
 ///
-/// Returns an allocated error if scalar construction fails.
-///
-/// # Safety
-///
-/// The caller must provide a valid `allocate_error` callback.
+/// Returns its expression ID. Every `i32` month count is valid.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visit_expression_literal_interval_year_month(
+pub extern "C" fn visit_expression_literal_interval_year_month(
     state: &mut KernelExpressionVisitorState,
     value: i32,
-    allocate_error: AllocateErrorFn,
-) -> ExternResult<usize> {
-    visit_expression_literal_interval_year_month_impl(state, value)
-        .into_extern_result(&allocate_error)
-}
-
-fn visit_expression_literal_interval_year_month_impl(
-    state: &mut KernelExpressionVisitorState,
-    value: i32,
-) -> KernelResult<usize> {
-    let scalar = Scalar::interval_year_month(value, IntervalYearToMonthType::IntervalYearToMonth)?;
-    Ok(wrap_expression(state, lit(scalar)))
+) -> usize {
+    wrap_expression(state, lit(Scalar::IntervalYearMonth(value.into())))
 }
 
 /// Visit an interval day-time literal (signed microsecond count).
@@ -1181,14 +1167,7 @@ mod tests {
         let mut state = KernelExpressionVisitorState::default();
         let id = match expected {
             Scalar::IntervalYearMonth(ref value) => {
-                // SAFETY: allocate_err is a valid test callback.
-                ok_or_panic(unsafe {
-                    visit_expression_literal_interval_year_month(
-                        &mut state,
-                        value.months(),
-                        allocate_err,
-                    )
-                })
+                visit_expression_literal_interval_year_month(&mut state, value.months())
             }
             Scalar::IntervalDayTime(value) => {
                 visit_expression_literal_interval_day_time(&mut state, value)
