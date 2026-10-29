@@ -28,14 +28,13 @@ const EXAMPLE_GENERATED_COLUMNS: &[(&str, &str)] = &[
     ("next_age", "age + 1"),
     ("age_decade", "CAST(age / 10 AS INT)"),
     ("id_or_zero", "COALESCE(id, 0)"),
-    // Unusual expressions, returned verbatim. The connector must parse these expressions and
-    // reject invalid ones.
+    // Unusual expressions, returned verbatim for the connector to validate.
     ("empty", ""),
     ("blank", "   "),
     ("broken", "YEAR("),
 ];
 
-/// The operation whose generated-column acknowledgement gate is under test.
+/// The operation under test for the generated-column acknowledgement gate.
 #[derive(Clone, Copy, PartialEq)]
 enum GatedOp {
     CommitWithData,
@@ -44,9 +43,8 @@ enum GatedOp {
     WriteState,
 }
 
-/// A schema with `id`, `age`, and `event_time` columns followed by one INTEGER column per
-/// `(name, raw_sql)` pair in `generated`, each carrying its SQL as `delta.generationExpression`
-/// metadata.
+/// A schema with `id`, `age`, and `event_time`, plus one INTEGER column with a generation
+/// expression per `(name, raw_sql)` pair in `generated`.
 fn schema_with_generated_columns(generated: &[(&str, &str)]) -> SchemaRef {
     let generated_fields = generated.iter().map(|(name, raw_sql)| {
         StructField::nullable(*name, DataType::INTEGER).add_metadata([(
@@ -64,9 +62,9 @@ fn schema_with_generated_columns(generated: &[(&str, &str)]) -> SchemaRef {
     Arc::new(StructType::try_new(fields).expect("test schema must be valid"))
 }
 
-/// Writes version 0 of an unpartitioned table at `table_path` with a table-features protocol
-/// listing `writer_features` and a schema declaring the `generated` columns. This builds a table in
-/// any generated-column and feature state without going through CREATE TABLE.
+/// Writes version 0 of an unpartitioned table at `table_path`. The protocol lists
+/// `writer_features`, and the schema has the `generated` columns. This skips CREATE TABLE, which
+/// rejects generation expressions.
 async fn write_table(
     table_path: &str,
     writer_features: &[&str],

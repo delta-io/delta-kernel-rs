@@ -8,7 +8,7 @@ use crate::KernelResult;
 /// row's other columns.
 ///
 /// The expression is stored in the column's `delta.generationExpression` metadata. Only tables
-/// whose protocol supports the `generatedColumns` writer feature have generated columns.
+/// that support the `generatedColumns` writer feature have generated columns.
 ///
 /// [generated column]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#generated-columns
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,8 +61,7 @@ mod tests {
 
     #[test]
     fn collects_top_level_generated_columns_in_schema_order() -> KernelResult<()> {
-        // Only top-level columns can be generated columns, so the expression on `details.nested`
-        // defines no generated column.
+        // Kernel ignores the expression on the nested field `details.nested`, like Delta Spark.
         let schema = schema! {
             (field_with_generation_expression("event_year", DataType::INTEGER, "YEAR(event_time)")),
             nullable "event_time": TIMESTAMP,
