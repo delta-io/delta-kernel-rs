@@ -705,4 +705,102 @@ mod tests {
             "plan failure must surface, not fall back to legacy replay"
         );
     }
+
+    // `rstest` cases glob-import their parent module, where `test_log::test` would shadow `test`.
+    mod pm_candidate {
+        use rstest::rstest;
+
+        use super::super::PmCandidate;
+        use crate::actions::{Metadata, Protocol};
+        use crate::metrics::ProtocolMetadataSource;
+
+        // A Protocol and Metadata that `writer_version` tells apart, found at the given versions.
+        #[cfg_attr(
+            not(feature = "adaptive-metadata-in-dev"),
+            allow(clippy::needless_update)
+        )]
+        fn candidate(
+            writer_version: i32,
+            protocol_version: Option<i64>,
+            metadata_version: Option<i64>,
+        ) -> PmCandidate {
+            PmCandidate {
+                protocol: protocol_version.map(|v| (v, protocol(writer_version))),
+                metadata: metadata_version.map(|v| (v, metadata(writer_version))),
+                ..Default::default()
+            }
+        }
+
+        fn protocol(writer_version: i32) -> Protocol {
+            Protocol::try_new_legacy(1, writer_version).unwrap()
+        }
+
+        fn metadata(writer_version: i32) -> Metadata {
+            Metadata::default().with_configuration_entry("writer", writer_version.to_string())
+        }
+
+        #[rstest]
+        #[case::above_version_kept(Some(3), Some(4), Some(3), Some(4))]
+        #[case::at_version_dropped(Some(2), Some(3), None, Some(3))]
+        #[case::below_version_dropped(Some(1), Some(2), None, None)]
+        fn test_newer_than_drops_pm_at_or_below_version(
+            #[case] protocol_version: Option<i64>,
+            #[case] metadata_version: Option<i64>,
+            #[case] expected_protocol_version: Option<i64>,
+            #[case] expected_metadata_version: Option<i64>,
+        ) {
+            let candidate = candidate(1, protocol_version, metadata_version).newer_than(2);
+            assert_eq!(
+                candidate.protocol.map(|(v, _)| v),
+                expected_protocol_version
+            );
+            assert_eq!(
+                candidate.metadata.map(|(v, _)| v),
+                expected_metadata_version
+            );
+        }
+
+        #[rstest]
+        #[case::self_newer(2, 1, 1)]
+        #[case::other_newer(1, 2, 2)]
+        #[case::tie_goes_to_other(1, 1, 2)]
+        fn test_merge_keeps_newer_pm(
+            #[case] self_version: i64,
+            #[case] other_version: i64,
+            #[case] expected_writer_version: i32,
+        ) {
+            let merged = candidate(1, Some(self_version), Some(self_version)).merge(candidate(
+                2,
+                Some(other_version),
+                Some(other_version),
+            ));
+            let expected_version = self_version.max(other_version);
+            assert_eq!(
+                merged.protocol,
+                Some((expected_version, protocol(expected_writer_version)))
+            );
+            assert_eq!(
+                merged.metadata,
+                Some((expected_version, metadata(expected_writer_version)))
+            );
+        }
+
+        #[test]
+        fn test_merge_keeps_pm_missing_from_one_side() {
+            let merged = candidate(1, Some(1), None).merge(candidate(2, None, Some(1)));
+            assert_eq!(merged.protocol, Some((1, protocol(1))));
+            assert_eq!(merged.metadata, Some((1, metadata(2))));
+        }
+
+        #[test]
+        fn test_into_resolution_drops_versions() {
+            let resolution =
+                candidate(1, Some(3), Some(4)).into_resolution(ProtocolMetadataSource::FullReplay);
+            assert_eq!(resolution.protocol, Some(protocol(1)));
+            assert_eq!(resolution.metadata, Some(metadata(1)));
+            assert_eq!(resolution.source, ProtocolMetadataSource::FullReplay);
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            assert!(resolution.captured_checkpoint_action.is_none());
+        }
+    }
 }
