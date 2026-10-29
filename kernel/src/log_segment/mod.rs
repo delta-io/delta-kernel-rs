@@ -1046,7 +1046,6 @@ impl LogSegment {
     /// order. Each of `required_deltas` is read as its own commit file, never through a log
     /// compaction.
     #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
-    #[cfg_attr(not(test), allow(dead_code))]
     fn find_commit_cover_paths_in_range(
         &self,
         oldest_exclusive: Option<Version>,
