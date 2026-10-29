@@ -1,23 +1,35 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use itertools::Itertools;
 use rstest::rstest;
 use test_utils::LoggingTest;
 
 use super::{
-    table_changes_action_iter, table_changes_action_iter_with_mode, TableChangesScanMetadata,
+    replay_schema, table_changes_action_iter, table_changes_action_iter_with_mode,
+    CommitBatchReader, CommitScanProcessor, LogReplayScanner, PreparePhaseVisitor,
+    TableChangesScanMetadata,
 };
 use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
+use crate::arrow::array::{RecordBatch, StringArray};
+use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+use crate::engine::arrow_data::ArrowEngineData;
+#[cfg(feature = "declarative-plans")]
+use crate::engine::plans::PlanBasedEngine;
+#[cfg(feature = "declarative-plans")]
+use crate::engine::sync::plan::SyncPlanExecutor;
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{col, lit, BinaryPredicateOp};
+use crate::engine_data::{GetData, TypedGetData};
+use crate::expressions::{col, column_name, lit, ArrayData, BinaryPredicateOp, ColumnName};
 use crate::log_segment::LogSegment;
+use crate::metrics::{MeteredDeltaEngine, MetricEvent};
 use crate::path::ParsedLogPath;
 use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
-use crate::schema::{schema, schema_ref, DataType, SchemaRef, StructField};
-use crate::table_changes::log_replay::LogReplayScanner;
+use crate::schema::{schema, schema_ref, ColumnNamesAndTypes, DataType, SchemaRef, StructField};
+use crate::table_changes::scan_file::scan_metadata_to_scan_file;
 use crate::table_changes::test_utils::{
     row_tracking_metadata, row_tracking_table_config, test_deletion_vector,
 };
@@ -28,10 +40,14 @@ use crate::table_properties::{
     ENABLE_CHANGE_DATA_FEED, ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED,
 };
 use crate::unit_test_utils::{
-    assert_result_error_with_message, Action, LocalMockTable, MockProtocolBuilder,
-    MockTableConfigurationBuilder,
+    assert_result_error_with_message, install_thread_local_metrics_reporter, Action,
+    CapturingReporter, LocalMockTable, MockProtocolBuilder, MockTableConfigurationBuilder,
 };
-use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Predicate, Version};
+use crate::{
+    Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, FileSize,
+    FilteredEngineData, JsonHandler, KernelError, KernelResult, KernelResultIterator,
+    ParquetHandler, Predicate, PredicateRef, RowVisitor, StorageHandler, Version,
+};
 
 fn get_schema() -> SchemaRef {
     schema_ref! {
@@ -168,6 +184,708 @@ fn result_to_sv(iter: impl KernelResultIterator<TableChangesScanMetadata>) -> Ve
         .flatten_ok()
         .try_collect()
         .unwrap()
+}
+
+fn file_path_batch(path: &str, row_count: usize) -> Box<dyn EngineData> {
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "_file",
+        ArrowDataType::Utf8,
+        false,
+    )]));
+    let paths = Arc::new(StringArray::from(vec![path; row_count]));
+    let batch = RecordBatch::try_new(schema, vec![paths]).unwrap();
+    Box::new(ArrowEngineData::new(batch))
+}
+
+fn nullable_file_path_batch(path: Option<&str>) -> Box<dyn EngineData> {
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "_file",
+        ArrowDataType::Utf8,
+        true,
+    )]));
+    let paths = Arc::new(StringArray::from(vec![path]));
+    let batch = RecordBatch::try_new(schema, vec![paths]).unwrap();
+    Box::new(ArrowEngineData::new(batch))
+}
+
+fn action_batches_for_commit(
+    engine: &dyn Engine,
+    commit: &ParsedLogPath,
+) -> FileDataReadResultIterator {
+    engine
+        .json_handler()
+        .read_json_files(
+            std::slice::from_ref(&commit.location),
+            replay_schema(PreparePhaseVisitor::schema()).unwrap(),
+            None,
+        )
+        .unwrap()
+}
+
+fn commit_batch_reader(
+    commits: &[ParsedLogPath],
+    batches: FileDataReadResultIterator,
+) -> CommitBatchReader {
+    let file_indices = commits
+        .iter()
+        .enumerate()
+        .map(|(index, commit)| (commit.location.location.to_string(), index))
+        .collect();
+    CommitBatchReader::new(Arc::new(file_indices), batches)
+}
+
+fn test_commits(count: u64) -> Vec<ParsedLogPath> {
+    let table_root = url::Url::parse("memory:///").unwrap();
+    (0..count)
+        .map(|version| ParsedLogPath::create_parsed_published_commit(&table_root, version))
+        .collect()
+}
+
+struct BatchingEngine {
+    inner: Arc<SyncEngine>,
+    json_handler: Arc<BatchingJsonHandler>,
+}
+
+impl Engine for BatchingEngine {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        self.inner.evaluation_handler()
+    }
+
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        self.inner.storage_handler()
+    }
+
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        self.json_handler.clone()
+    }
+
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        self.inner.parquet_handler()
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn plan_executor(&self) -> Option<Arc<dyn crate::plans::PlanExecutor>> {
+        self.inner.plan_executor()
+    }
+}
+
+struct BatchingJsonHandler {
+    inner: Arc<dyn JsonHandler>,
+    batch_sizes: [usize; 2],
+    requested_files: Mutex<Vec<Vec<String>>>,
+    batches_read: [Arc<AtomicUsize>; 2],
+    prepare_batches_live: Arc<AtomicUsize>,
+    prepare_batches_peak: Arc<AtomicUsize>,
+    readers_live: Arc<AtomicUsize>,
+    error_at: Option<(usize, usize)>,
+}
+
+impl BatchingJsonHandler {
+    fn engine(
+        batch_sizes: [usize; 2],
+        error_at: Option<(usize, usize)>,
+    ) -> (Arc<dyn Engine>, Arc<Self>) {
+        let inner = Arc::new(SyncEngine::new());
+        let handler = Arc::new(Self {
+            inner: inner.json_handler(),
+            batch_sizes,
+            requested_files: Mutex::default(),
+            batches_read: std::array::from_fn(|_| Arc::default()),
+            prepare_batches_live: Arc::default(),
+            prepare_batches_peak: Arc::default(),
+            readers_live: Arc::default(),
+            error_at,
+        });
+        let engine = Arc::new(BatchingEngine {
+            inner,
+            json_handler: handler.clone(),
+        });
+        (engine, handler)
+    }
+}
+
+impl JsonHandler for BatchingJsonHandler {
+    fn parse_json(
+        &self,
+        json_strings: Box<dyn EngineData>,
+        output_schema: SchemaRef,
+    ) -> KernelResult<Box<dyn EngineData>> {
+        self.inner.parse_json(json_strings, output_schema)
+    }
+
+    fn read_json_files(
+        &self,
+        files: &[FileMeta],
+        schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        assert!(
+            predicate.is_none(),
+            "replay must read all actions in both passes"
+        );
+        let pass = {
+            let mut calls = self.requested_files.lock().unwrap();
+            calls.push(files.iter().map(|file| file.location.to_string()).collect());
+            calls.len() - 1
+        };
+        let batch_size = self.batch_sizes[pass];
+        let batches = self.inner.read_json_files(files, schema, predicate)?;
+        let batches = batches
+            .map(move |batch| -> KernelResult<_> {
+                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(batch?)?.into();
+                Ok((0..batch.num_rows())
+                    .step_by(batch_size)
+                    .map(move |offset| {
+                        batch.slice(offset, batch_size.min(batch.num_rows() - offset))
+                    }))
+            })
+            .flatten_ok();
+        let read = self.batches_read[pass].clone();
+        let live = self.prepare_batches_live.clone();
+        let peak = self.prepare_batches_peak.clone();
+        let error_at = self.error_at;
+        let batches = batches.map(move |batch| -> KernelResult<Box<dyn EngineData>> {
+            let index = read.fetch_add(1, Ordering::Relaxed);
+            if error_at == Some((pass, index)) {
+                return Err(KernelError::generic("injected JSON read failure"));
+            }
+            let data = Box::new(ArrowEngineData::new(batch?));
+            if pass == 0 {
+                let count = live.fetch_add(1, Ordering::Relaxed) + 1;
+                peak.fetch_max(count, Ordering::Relaxed);
+                Ok(Box::new(TrackedPrepareBatch {
+                    data,
+                    live: live.clone(),
+                }))
+            } else {
+                Ok(data)
+            }
+        });
+        self.readers_live.fetch_add(1, Ordering::Relaxed);
+        Ok(Box::new(TrackedRead {
+            batches: Box::new(batches),
+            live: self.readers_live.clone(),
+        }))
+    }
+
+    fn write_json_file(
+        &self,
+        path: &url::Url,
+        data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
+        overwrite: bool,
+    ) -> KernelResult<FileSize> {
+        self.inner.write_json_file(path, data, overwrite)
+    }
+}
+
+struct TrackedRead {
+    batches: FileDataReadResultIterator,
+    live: Arc<AtomicUsize>,
+}
+
+impl Iterator for TrackedRead {
+    type Item = KernelResult<Box<dyn EngineData>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.batches.next()
+    }
+}
+
+impl Drop for TrackedRead {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct TrackedPrepareBatch {
+    data: Box<dyn EngineData>,
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for TrackedPrepareBatch {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl EngineData for TrackedPrepareBatch {
+    fn visit_rows(&self, columns: &[ColumnName], visitor: &mut dyn RowVisitor) -> KernelResult<()> {
+        self.data.visit_rows(columns, visitor)
+    }
+
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn append_columns(
+        &self,
+        schema: SchemaRef,
+        columns: Vec<ArrayData>,
+    ) -> KernelResult<Box<dyn EngineData>> {
+        self.data.append_columns(schema, columns)
+    }
+
+    fn apply_selection_vector(self: Box<Self>, _: Vec<bool>) -> KernelResult<Box<dyn EngineData>> {
+        panic!("preparation must visit all actions without filtering")
+    }
+
+    fn has_field(&self, name: &ColumnName) -> bool {
+        self.data.has_field(name)
+    }
+}
+
+#[rstest]
+#[case(None, "without a file path")]
+#[case(Some("memory:///unexpected.json"), "unrequested commit file")]
+fn rejects_batch_without_requested_file_path(
+    #[case] batch_path: Option<&str>,
+    #[case] expected_error: &str,
+) {
+    let commits = test_commits(1);
+    let batches = vec![Ok::<_, KernelError>(nullable_file_path_batch(batch_path))];
+
+    let mut reader = commit_batch_reader(&commits, Box::new(batches.into_iter()));
+    let mut batches = reader.batches_for_commit(0);
+    let result = batches.next().unwrap();
+
+    assert_result_error_with_message(result, expected_error);
+    assert!(batches.next().is_none());
+}
+
+#[test]
+fn streams_batches_without_materializing_a_commit() {
+    let commits = test_commits(3);
+    let batches_read = Arc::new(AtomicUsize::new(0));
+    let counter = batches_read.clone();
+    let files = commits.clone();
+    let batches = [0, 0, 0, 1, 2].into_iter().map(move |index| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Ok::<_, KernelError>(file_path_batch(files[index].location.location.as_str(), 1))
+    });
+    let mut reader = commit_batch_reader(&commits, Box::new(batches));
+
+    assert!(reader.next_batch_for_commit(0).unwrap().is_some());
+    assert_eq!(batches_read.load(Ordering::Relaxed), 1);
+}
+
+#[rstest]
+#[case(vec![], vec![0, 0, 0, 0])]
+#[case(vec![(1, 0), (1, 1), (1, 0), (1, 1)], vec![0, 2, 0, 0])]
+#[case(vec![(0, 0), (0, 1), (2, 0), (2, 1)], vec![1, 0, 1, 0])]
+#[case(vec![(3, 0), (3, 1)], vec![0, 0, 0, 1])]
+#[case(vec![(0, 1), (0, 1), (1, 0), (2, 1)], vec![2, 0, 1, 0])]
+fn preserves_empty_commits_in_each_position(
+    #[case] batch_rows: Vec<(usize, usize)>,
+    #[case] expected: Vec<usize>,
+) {
+    let commits = test_commits(4);
+    let files = commits.clone();
+    let batches = batch_rows.into_iter().map(move |(index, rows)| {
+        Ok(file_path_batch(
+            files[index].location.location.as_str(),
+            rows,
+        ))
+    });
+    let mut reader = commit_batch_reader(&commits, Box::new(batches));
+    let counts = (0..commits.len())
+        .map(|index| {
+            reader
+                .batches_for_commit(index)
+                .try_fold(0, |count, batch| batch.map(|_| count + 1))
+                .unwrap()
+        })
+        .collect_vec();
+    assert_eq!(counts, expected);
+}
+
+#[test]
+fn rejects_out_of_order_batches() {
+    let commits = test_commits(2);
+    let files = commits.clone();
+    let batches = [0, 1, 0]
+        .into_iter()
+        .map(move |index| Ok(file_path_batch(files[index].location.location.as_str(), 1)));
+    let mut reader = commit_batch_reader(&commits, Box::new(batches));
+    assert!(reader.next_batch_for_commit(0).unwrap().is_some());
+    assert!(reader.next_batch_for_commit(0).unwrap().is_none());
+    assert!(reader.next_batch_for_commit(1).unwrap().is_some());
+    assert_result_error_with_message(
+        reader.next_batch_for_commit(1),
+        "out-of-order JSON batch for commit file index 0 while reading commit file index 1; \
+         JsonHandler::read_json_files must return batches in requested-file order",
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn releases_prepare_batches_and_scans_lazily(#[values(2, 100)] action_count: usize) {
+    let (engine, handler) = BatchingJsonHandler::engine([1, 1], None);
+    let mut mock_table = LocalMockTable::new();
+    for _ in 0..3 {
+        mock_table
+            .commit((0..action_count).map(|index| {
+                Action::Add(Add {
+                    path: format!("file_{index}.parquet"),
+                    data_change: true,
+                    ..Default::default()
+                })
+            }))
+            .await;
+    }
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).unwrap();
+    let expected_files = commits
+        .iter()
+        .map(|commit| commit.location.location.to_string())
+        .collect_vec();
+    let root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let mut replay = table_changes_action_iter(
+        engine,
+        &get_default_table_config(&root),
+        commits,
+        get_schema(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        *handler.requested_files.lock().unwrap(),
+        vec![expected_files.clone(), expected_files]
+    );
+    assert!(handler
+        .batches_read
+        .iter()
+        .all(|count| count.load(Ordering::Relaxed) == 0));
+    replay.next().unwrap().unwrap();
+    // Preparation consumes the commit and one lookahead batch; scanning consumes just one batch.
+    assert_eq!(
+        handler.batches_read[0].load(Ordering::Relaxed),
+        action_count + 1
+    );
+    assert_eq!(handler.batches_read[1].load(Ordering::Relaxed), 1);
+    assert_eq!(handler.prepare_batches_live.load(Ordering::Relaxed), 1);
+    assert_eq!(handler.prepare_batches_peak.load(Ordering::Relaxed), 1);
+    drop(replay);
+    assert_eq!(handler.prepare_batches_live.load(Ordering::Relaxed), 0);
+    assert_eq!(handler.readers_live.load(Ordering::Relaxed), 0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn read_failure_terminates_both_passes(
+    #[values(0, 1)] pass: usize,
+    #[values(0, 2)] batch_index: usize,
+) {
+    let (engine, handler) = BatchingJsonHandler::engine([1, 1], Some((pass, batch_index)));
+    let mut mock_table = LocalMockTable::new();
+    mock_table
+        .commit((0..4).map(|index| {
+            Action::Add(Add {
+                path: format!("file_{index}.parquet"),
+                data_change: true,
+                ..Default::default()
+            })
+        }))
+        .await;
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).unwrap();
+    let root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let mut replay = table_changes_action_iter(
+        engine,
+        &get_default_table_config(&root),
+        commits,
+        get_schema(),
+        None,
+    )
+    .unwrap();
+    if pass == 1 {
+        for _ in 0..batch_index {
+            replay.next().unwrap().unwrap();
+        }
+    }
+    assert_result_error_with_message(replay.next().unwrap(), "injected JSON read failure");
+    assert_eq!(handler.prepare_batches_live.load(Ordering::Relaxed), 0);
+    assert_eq!(handler.readers_live.load(Ordering::Relaxed), 0);
+    assert!(replay.next().is_none());
+}
+
+#[rstest]
+#[tokio::test]
+async fn independent_batch_boundaries_preserve_cdc_and_dv_resolution(
+    #[values([1, 2], [2, 1])] batch_sizes: [usize; 2],
+    #[values(false, true)] has_cdc: bool,
+    #[values(CdfMode::ChangeDataFeed, CdfMode::RowTracking)] mode: CdfMode,
+) {
+    // === Set up commits and independent prepare/scan batch sizes ===
+    let (engine, handler) = BatchingJsonHandler::engine(batch_sizes, None);
+    let mut mock_table = LocalMockTable::new();
+    let old_dv = test_deletion_vector("old_dv", 1);
+    let mut actions = vec![
+        Action::Add(Add {
+            path: "paired.parquet".into(),
+            data_change: true,
+            deletion_vector: Some(test_deletion_vector("new_dv", 2)),
+            ..Default::default()
+        }),
+        Action::Add(Add {
+            path: "unpaired.parquet".into(),
+            data_change: true,
+            ..Default::default()
+        }),
+        Action::Remove(Remove {
+            path: "paired.parquet".into(),
+            data_change: true,
+            deletion_vector: Some(old_dv.clone()),
+            ..Default::default()
+        }),
+    ];
+    if has_cdc {
+        actions.push(Action::Cdc(Cdc {
+            path: "changes.parquet".into(),
+            ..Default::default()
+        }));
+    }
+    mock_table.commit(actions).await;
+    mock_table.commit(std::iter::empty()).await;
+    mock_table
+        .commit([Action::Add(Add {
+            path: "after_empty.parquet".into(),
+            data_change: true,
+            ..Default::default()
+        })])
+        .await;
+    mock_table.commit(std::iter::empty()).await;
+    let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).unwrap();
+    commits[0].location.last_modified = 101;
+    commits[2].location.last_modified = 303;
+    let root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let config = match mode {
+        CdfMode::ChangeDataFeed => get_default_table_config(&root),
+        CdfMode::RowTracking => row_tracking_table_config(root, get_schema()),
+    };
+    // === Replay both passes and collect scan files ===
+    let replay =
+        table_changes_action_iter_with_mode(engine, &config, commits, get_schema(), None, mode)
+            .unwrap();
+    let scan_files: Vec<_> = scan_metadata_to_scan_file(replay).try_collect().unwrap();
+
+    // === Check CDC selection, DV pairing, and commit attribution ===
+    let observed = scan_files
+        .iter()
+        .map(|file| {
+            (
+                file.commit_version,
+                file.commit_timestamp,
+                file.path.as_str(),
+            )
+        })
+        .collect_vec();
+    let expected = if has_cdc && mode.uses_change_data_files() {
+        vec![(0, 101, "changes.parquet"), (2, 303, "after_empty.parquet")]
+    } else {
+        assert_eq!(
+            scan_files[0].remove_dv,
+            Some(DvInfo {
+                deletion_vector: Some(old_dv)
+            })
+        );
+        vec![
+            (0, 101, "paired.parquet"),
+            (0, 101, "unpaired.parquet"),
+            (2, 303, "after_empty.parquet"),
+        ]
+    };
+    assert_eq!(observed, expected);
+    assert_eq!(handler.prepare_batches_live.load(Ordering::Relaxed), 0);
+    assert_eq!(handler.readers_live.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn reads_full_commit_range_in_two_passes() {
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let engine: Arc<dyn Engine> = Arc::new(MeteredDeltaEngine::new(Arc::new(SyncEngine::new())));
+    let mut mock_table = LocalMockTable::new();
+    for version in 0..3 {
+        mock_table
+            .commit([Action::Add(Add {
+                path: format!("file_{version}.parquet"),
+                data_change: true,
+                ..Default::default()
+            })])
+            .await;
+    }
+
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).unwrap();
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+
+    let scan_metadata =
+        table_changes_action_iter(engine, &table_config, commits, get_schema(), None).unwrap();
+    let scan_files: Vec<_> = scan_metadata_to_scan_file(scan_metadata)
+        .map_ok(|scan_file| (scan_file.commit_version, scan_file.path))
+        .try_collect()
+        .unwrap();
+
+    assert_eq!(
+        scan_files,
+        vec![
+            (0, "file_0.parquet".to_string()),
+            (1, "file_1.parquet".to_string()),
+            (2, "file_2.parquet".to_string()),
+        ]
+    );
+    let json_read_file_counts = reporter
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            MetricEvent::JsonReadCompleted(event) => Some(event.num_files),
+            _ => None,
+        })
+        .collect_vec();
+    assert_eq!(json_read_file_counts, vec![3, 3]);
+}
+
+#[tokio::test]
+async fn empty_commit_does_not_shift_following_actions() {
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+    mock_table
+        .commit([Action::Add(Add {
+            path: "file_0.parquet".to_string(),
+            data_change: true,
+            ..Default::default()
+        })])
+        .await;
+    mock_table.commit(std::iter::empty()).await;
+    mock_table
+        .commit([Action::Add(Add {
+            path: "file_2.parquet".to_string(),
+            data_change: true,
+            ..Default::default()
+        })])
+        .await;
+
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).unwrap();
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+    let scan_metadata =
+        table_changes_action_iter(engine, &table_config, commits, get_schema(), None).unwrap();
+    let scan_files: Vec<_> = scan_metadata_to_scan_file(scan_metadata)
+        .map_ok(|scan_file| (scan_file.commit_version, scan_file.path))
+        .try_collect()
+        .unwrap();
+
+    assert_eq!(
+        scan_files,
+        vec![
+            (0, "file_0.parquet".to_string()),
+            (2, "file_2.parquet".to_string()),
+        ]
+    );
+}
+
+#[derive(Default)]
+struct CommitFilePathCollector {
+    rows: Vec<(String, String)>,
+}
+
+impl RowVisitor for CommitFilePathCollector {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            (
+                vec![column_name!("_file"), column_name!("add.path")],
+                vec![DataType::STRING, DataType::STRING],
+            )
+                .into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
+        for row in 0..row_count {
+            self.rows.push((
+                getters[0].get(row, "_file")?,
+                getters[1].get(row, "add.path")?,
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[rstest]
+#[case::sync(Arc::new(SyncEngine::new()))]
+#[cfg_attr(
+    feature = "declarative-plans",
+    case::plans(Arc::new(PlanBasedEngine::new(
+        Some(Arc::new(SyncEngine::new())),
+        Arc::new(SyncPlanExecutor::default()),
+    )))
+)]
+#[tokio::test]
+async fn replay_schemas_preserve_file_paths_across_batches_and_empty_commits(
+    #[case] engine: Arc<dyn Engine>,
+    #[values(PreparePhaseVisitor::schema(), CommitScanProcessor::schema())] schema: SchemaRef,
+) {
+    let row_counts = [2050, 0, 3];
+    let mut mock_table = LocalMockTable::new();
+    for (version, row_count) in row_counts.into_iter().enumerate() {
+        mock_table
+            .commit((0..row_count).map(|row| {
+                Action::Add(Add {
+                    path: format!("file_{version}_{row}.parquet"),
+                    data_change: true,
+                    ..Default::default()
+                })
+            }))
+            .await;
+    }
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).unwrap();
+    let files = commits
+        .into_iter()
+        .map(|commit| commit.location)
+        .collect_vec();
+    let expected = files
+        .iter()
+        .enumerate()
+        .flat_map(|(version, file)| {
+            (0..row_counts[version]).map(move |row| {
+                (
+                    file.location.to_string(),
+                    format!("file_{version}_{row}.parquet"),
+                )
+            })
+        })
+        .collect_vec();
+    let batches = engine
+        .json_handler()
+        .read_json_files(&files, replay_schema(schema).unwrap(), None)
+        .unwrap();
+    let mut collector = CommitFilePathCollector::default();
+    let mut batch_counts = [0; 3];
+    for batch in batches {
+        let start = collector.rows.len();
+        collector.visit_rows_of(batch.unwrap().as_ref()).unwrap();
+        let rows = &collector.rows[start..];
+        if let Some((file_path, _)) = rows.first() {
+            assert!(
+                rows.iter().all(|(path, _)| path == file_path),
+                "JSON batches must not span files"
+            );
+            let commit_file_index = files
+                .iter()
+                .position(|file| file.location.as_str() == file_path)
+                .unwrap();
+            batch_counts[commit_file_index] += 1;
+        }
+    }
+    assert_eq!(collector.rows, expected);
+    assert!(
+        batch_counts[0] > 1,
+        "the first commit must span multiple batches"
+    );
+    assert_eq!(batch_counts[1], 0);
+    assert!(
+        batch_counts[2] > 0,
+        "the final nonempty commit must produce at least one batch"
+    );
 }
 
 #[tokio::test]
@@ -965,17 +1683,20 @@ async fn dv() {
 }
 
 // Note: Data skipping does not work on Remove actions.
+#[rstest]
 #[tokio::test]
-async fn data_skipping_filter() {
-    let engine = Arc::new(SyncEngine::new());
+async fn data_skipping_filter(#[values([1, 2], [2, 1], [usize::MAX; 2])] batch_sizes: [usize; 2]) {
+    let (engine, _) = BatchingJsonHandler::engine(batch_sizes, None);
     let mut mock_table = LocalMockTable::new();
     let deletion_vector = Some(test_deletion_vector("vBn[lx{q8@P<9BNH/isA", 2));
+    let old_deletion_vector = test_deletion_vector("old_dv", 1);
     mock_table
         .commit([
             // Remove/Add pair with max value id = 6
             Action::Remove(Remove {
                 path: "fake_path_1".into(),
                 data_change: true,
+                deletion_vector: Some(old_deletion_vector.clone()),
                 ..Default::default()
             }),
             Action::Add(Add {
@@ -1022,10 +1743,25 @@ async fn data_skipping_filter() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
+    let expected_remove_dvs = Arc::new(HashMap::from([
+        (
+            "fake_path_1".to_string(),
+            DvInfo {
+                deletion_vector: Some(old_deletion_vector),
+            },
+        ),
+        (
+            "fake_path_2".to_string(),
+            DvInfo {
+                deletion_vector: None,
+            },
+        ),
+    ]));
     let sv = table_changes_action_iter(engine, &table_config, commits, logical_schema, predicate)
         .unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
+            assert_eq!(scan_metadata.remove_dvs, expected_remove_dvs);
             scan_metadata.selection_vector
         })
         .collect_vec();
@@ -1039,9 +1775,12 @@ async fn data_skipping_filter() {
 // drops the Add in partition `y`. The Remove in partition `y` must survive: the `OR(NOT is_add,
 // ...)` guard shields non-Add rows from the predicate, so tombstones are never dropped from the
 // change feed even when their partition does not match.
+#[rstest]
 #[tokio::test]
-async fn data_skipping_filter_prunes_partition_values_but_keeps_removes() {
-    let engine = Arc::new(SyncEngine::new());
+async fn data_skipping_filter_prunes_partition_values_but_keeps_removes(
+    #[values([1, 2], [2, 1], [usize::MAX; 2])] batch_sizes: [usize; 2],
+) {
+    let (engine, _) = BatchingJsonHandler::engine(batch_sizes, None);
     let mut mock_table = LocalMockTable::new();
     mock_table
         .commit([
@@ -1104,9 +1843,12 @@ async fn data_skipping_filter_prunes_partition_values_but_keeps_removes() {
 // Stats-based pruning (as opposed to partition-value pruning) with a Remove present: `id > 4`
 // drops the out-of-range Add via its `add.stats`, keeps the in-range Add, and the standalone
 // Remove survives regardless of the predicate because non-Add rows bypass the stats filter.
+#[rstest]
 #[tokio::test]
-async fn data_skipping_filter_prunes_stats_but_keeps_removes() {
-    let engine = Arc::new(SyncEngine::new());
+async fn data_skipping_filter_prunes_stats_but_keeps_removes(
+    #[values([1, 2], [2, 1], [usize::MAX; 2])] batch_sizes: [usize; 2],
+) {
+    let (engine, _) = BatchingJsonHandler::engine(batch_sizes, None);
     let mut mock_table = LocalMockTable::new();
     mock_table
         .commit([
@@ -1220,10 +1962,11 @@ async fn file_meta_timestamp() {
     let file_meta_ts = commit.location.last_modified;
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
+    let action_batches = action_batches_for_commit(engine.as_ref(), &commit);
     let scanner = LogReplayScanner::try_new(
-        engine.as_ref(),
         &mut table_config,
         commit,
+        action_batches,
         &get_schema(),
         CdfMode::ChangeDataFeed,
     )
@@ -1508,10 +2251,11 @@ async fn test_timestamp_with_ict_enabled() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
+    let action_batches = action_batches_for_commit(engine.as_ref(), &commit);
     let scanner = LogReplayScanner::try_new(
-        engine.as_ref(),
         &mut table_config,
         commit,
+        action_batches,
         &get_schema(),
         CdfMode::ChangeDataFeed,
     )
@@ -1559,10 +2303,11 @@ async fn test_timestamp_with_ict_disabled() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
+    let action_batches = action_batches_for_commit(engine.as_ref(), &commit);
     let scanner = LogReplayScanner::try_new(
-        engine.as_ref(),
         &mut table_config,
         commit.clone(),
+        action_batches,
         &get_schema(),
         CdfMode::ChangeDataFeed,
     )
@@ -1617,10 +2362,11 @@ async fn test_timestamp_with_commit_info_not_first() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
+    let action_batches = action_batches_for_commit(engine.as_ref(), &commit);
     let result = LogReplayScanner::try_new(
-        engine.as_ref(),
         &mut table_config,
         commit,
+        action_batches,
         &get_schema(),
         CdfMode::ChangeDataFeed,
     );
