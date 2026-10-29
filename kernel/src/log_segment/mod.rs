@@ -1035,14 +1035,56 @@ impl LogSegment {
     }
 
     fn find_commit_cover_paths(&self, after: Option<Version>) -> Vec<&ParsedLogPath> {
+        Self::commit_cover_paths_using(
+            self.listed.ascending_commit_files.iter(),
+            self.listed.ascending_compaction_files.iter(),
+            after,
+        )
+    }
+
+    /// The commit cover over versions in `(oldest_exclusive, newest_inclusive]`, in descending
+    /// order. Each of `required_deltas` is read as its own commit file, never through a log
+    /// compaction.
+    #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn find_commit_cover_paths_in_range(
+        &self,
+        oldest_exclusive: Option<Version>,
+        newest_inclusive: Version,
+        required_deltas: &[Version],
+    ) -> Vec<&ParsedLogPath> {
+        let commits = self
+            .listed
+            .ascending_commit_files
+            .iter()
+            .filter(|commit| commit.version <= newest_inclusive);
+        let compactions = self
+            .listed
+            .ascending_compaction_files
+            .iter()
+            .filter(|compaction| {
+                matches!(
+                    compaction.file_type,
+                    LogPathFileType::CompactedCommit { hi } if hi <= newest_inclusive
+                        && !required_deltas.iter().any(|v| (compaction.version..=hi).contains(v))
+                )
+            });
+        Self::commit_cover_paths_using(commits, compactions, oldest_exclusive)
+    }
+
+    /// The commit cover over the ascending `commits` and `compactions`, restricted to files that
+    /// start after `after` as in [`Self::find_commit_cover_after`].
+    fn commit_cover_paths_using<'a>(
+        commits: impl Iterator<Item = &'a ParsedLogPath>,
+        compactions: impl Iterator<Item = &'a ParsedLogPath>,
+        after: Option<Version>,
+    ) -> Vec<&'a ParsedLogPath> {
         // Create an iterator sorted in ascending order by (initial version, end version), e.g.
         // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
         //  10.19.compacted.json, 11.json, ...]
-        let all_files = itertools::Itertools::merge_by(
-            self.listed.ascending_commit_files.iter(),
-            self.listed.ascending_compaction_files.iter(),
-            |path_a, path_b| path_a.version <= path_b.version,
-        )
+        let all_files = itertools::Itertools::merge_by(commits, compactions, |path_a, path_b| {
+            path_a.version <= path_b.version
+        })
         .filter(|path| after.is_none_or(|after| path.version > after));
 
         let mut last_pushed: Option<&ParsedLogPath> = None;
