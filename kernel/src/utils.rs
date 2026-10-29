@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use delta_kernel_derive::internal_api;
 use url::Url;
 
-use crate::{FileSize, KernelError, KernelResult};
+use crate::{DeltaError, FileSize, KernelError, KernelResult};
 
 /// Phantom type parameter `T`: The containing type mentions but does not own any instance of `T`.
 ///
@@ -78,9 +78,11 @@ pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> KernelResult<Url> {
         UriType::LocalPath(path) => {
             if !path.exists() {
                 // When we support writes, create a directory if we can
-                return Err(KernelError::InvalidTableLocation(format!(
-                    "Path does not exist: {path:?}"
-                )));
+                return Err(DeltaError::path_does_not_exist(
+                    uri,
+                    KernelError::InvalidTableLocation(format!("Path does not exist: {path:?}")),
+                )
+                .into());
             }
             if !path.is_dir() {
                 return Err(KernelError::InvalidTableLocation(format!(

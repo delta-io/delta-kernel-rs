@@ -623,7 +623,15 @@ impl LogSegment {
             (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
         };
 
-        LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
+        let table_root = log_root.join("../")?;
+        LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint).map_err(
+            |error| match error {
+                KernelError::EmptyLog if time_travel_version.is_none() => {
+                    crate::DeltaError::path_does_not_exist(table_root, error).into()
+                }
+                other => other.into(),
+            },
+        )
     }
 
     /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between

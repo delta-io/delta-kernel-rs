@@ -63,6 +63,15 @@ impl DeltaError {
         Ok(Self::new(condition, parameters, source))
     }
 
+    /// Reports that the requested table `path` has no Delta log or local directory.
+    pub(crate) fn path_does_not_exist(path: impl ToString, source: super::KernelError) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaPathDoesNotExist,
+            vec![DeltaErrorParameter::new("path", path)],
+            Some(Box::new(source)),
+        )
+    }
+
     /// Reports the invalid signed `version` supplied by a catalog response.
     #[internal_api]
     pub(crate) fn invalid_version(version: i64) -> Self {
