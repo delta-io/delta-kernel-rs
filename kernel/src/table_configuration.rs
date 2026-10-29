@@ -831,6 +831,14 @@ impl TableConfiguration {
         !self.table_properties.check_constraints.is_empty()
     }
 
+    /// Returns whether the protocol declares stable or preview collation support.
+    pub(crate) fn has_collations_feature(&self) -> bool {
+        self.protocol.has_table_feature(&"collations".into())
+            || self
+                .protocol
+                .has_table_feature(&"collations-preview".into())
+    }
+
     /// The physical schema ([`SchemaRef`]) of this table at this version.
     ///
     /// When column mapping is disabled, this is identical to
