@@ -962,6 +962,49 @@ async fn assert_incremental_update_action<E: Engine>(
     );
 }
 
+// An incremental update replays only the new commits, so a new manifest commit whose checkpoint
+// action lags behind the base snapshot must not roll back the base's newer Metadata.
+#[tokio::test]
+async fn incremental_update_ignores_checkpoint_action_older_than_base() {
+    assert_incremental_update_keeps_base_metadata(non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    assert_incremental_update_keeps_base_metadata(|store| SyncEngine::new_with_store(store)).await;
+}
+
+async fn assert_incremental_update_keeps_base_metadata<E: Engine>(
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let (store, table_root) = manifest_commit_table(&[carrying_pointer(
+        (0, 0),
+        metadata_commit(test_schema_flat_with_column_mapping()),
+    )])
+    .await;
+    let engine = make_engine(store.clone());
+    let base = Snapshot::builder_for(table_root.clone())
+        .build(&engine)
+        .unwrap();
+    assert_eq!(base.schema().num_fields(), 2);
+
+    // A manifest commit naming itself, whose action checkpoints v0.
+    let lagging_manifest_commit =
+        carrying_pointer((2, 0), checkpoint_action(0, &[], one_column_schema()));
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        2,
+        lagging_manifest_commit,
+    )
+    .await
+    .unwrap();
+
+    let updated = Snapshot::builder_from(base).build(&engine).unwrap();
+    let fresh = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    for snapshot in [updated, fresh] {
+        assert_eq!(snapshot.version(), 2);
+        assert_eq!(snapshot.schema().num_fields(), 2);
+    }
+}
+
 // A CRC at the target version carrying `lastManifestCommit` makes `latest_checkpoint_action` read
 // only the commit it points at, failing when that commit does not carry the expected action. Each
 // case has checkpoint commits at v0 and v2, the given v1, and a CRC at v2 holding the pointer. A

@@ -40,6 +40,7 @@ use crate::schema::{
     column_name, schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
     StructField, StructType,
 };
+use crate::utils::FoldWithOption as _;
 use crate::{
     version_as_i64, Engine, EngineData, KernelError, KernelResult, KernelResultIterator, Version,
 };
@@ -54,11 +55,32 @@ impl LogSegment {
     /// Under `adaptive-metadata-in-dev`, the result's `captured_checkpoint_action` is the latest
     /// AMT checkpoint action when replay captured it, for the caller to store on the
     /// [`Snapshot`](crate::Snapshot).
-    #[instrument(name = "log_seg.load_p_m", skip_all, fields(enable_call_frame), err)]
     pub(crate) fn read_protocol_metadata_opt(
         &self,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
+    ) -> KernelResult<PmResolution> {
+        self.read_protocol_metadata(engine, crc, None)
+    }
+
+    /// [`Self::read_protocol_metadata_opt`] for a caller that already holds the Protocol and
+    /// Metadata as of `existing_version`, such as an incremental snapshot update. Replayed P&M at
+    /// or below that version are older, so the result leaves them out.
+    pub(crate) fn read_protocol_metadata_newer_than(
+        &self,
+        engine: &dyn Engine,
+        crc: Option<&Arc<Crc>>,
+        existing_version: Version,
+    ) -> KernelResult<PmResolution> {
+        self.read_protocol_metadata(engine, crc, Some(existing_version))
+    }
+
+    #[instrument(name = "log_seg.load_p_m", skip_all, fields(enable_call_frame), err)]
+    fn read_protocol_metadata(
+        &self,
+        engine: &dyn Engine,
+        crc: Option<&Arc<Crc>>,
+        existing_version: Option<Version>,
     ) -> KernelResult<PmResolution> {
         // Case 1: If CRC at target version, use it directly and exit early.
         if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
@@ -117,7 +139,12 @@ impl LogSegment {
             Some(_) => self.replay_for_pm(engine)?,
             None => self.replay_for_pm_with_unbounded_segment(engine)?,
         };
-        Ok(candidate.into_resolution(ProtocolMetadataSource::FullReplay))
+        // As with the CRC above, a lagging AMT checkpoint action can carry P&M at or below
+        // `existing_version`, which the caller holds at least as new.
+        let floor = existing_version.map(version_as_i64).transpose()?;
+        Ok(candidate
+            .fold_with(floor, PmCandidate::newer_than)
+            .into_resolution(ProtocolMetadataSource::FullReplay))
     }
 
     /// Replays the log segment for the latest Protocol and Metadata, each with its version, in one
