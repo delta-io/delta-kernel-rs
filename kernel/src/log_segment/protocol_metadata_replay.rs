@@ -1398,8 +1398,11 @@ mod tests {
 
         #[test]
         fn test_into_resolution_drops_versions() {
-            let resolution =
-                candidate(1, Some(3), Some(4)).into_resolution(ProtocolMetadataSource::FullReplay);
+            let resolution = candidate(1, Some(3), Some(4)).into_resolution(
+                ProtocolMetadataSource::FullReplay,
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                true,
+            );
             assert_eq!(resolution.protocol, Some(protocol(1)));
             assert_eq!(resolution.metadata, Some(metadata(1)));
             assert_eq!(resolution.source, ProtocolMetadataSource::FullReplay);
