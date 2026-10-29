@@ -12,7 +12,6 @@ use std::os::raw::{c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use delta_kernel::actions::Protocol;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::history_manager::{
     first_version_after as kernel_first_version_after,
@@ -1279,9 +1278,6 @@ impl FfiCheckpointSpec {
     }
 }
 
-#[handle_descriptor(target=Protocol, mutable=false, sized=true)]
-pub struct SharedProtocol;
-
 /// Opaque builder for constructing a [`SharedSnapshot`].
 ///
 /// Create with [`get_snapshot_builder`] (from a table path) or [`get_snapshot_builder_from`]
@@ -2082,67 +2078,28 @@ pub unsafe extern "C" fn get_partition_columns(
     iter.into()
 }
 
-// === Protocol handle FFI ===
+// === Protocol FFI ===
 
-/// Get the protocol for this snapshot. The returned handle must be freed with [`free_protocol`].
+/// Visits the snapshot's complete protocol action without engine I/O.
+///
+/// Borrows `snapshot` and invokes `visitor` once with `context` and a non-null borrowed protocol
+/// view. The view and all nested pointers are read-only and valid only until the callback returns.
+/// Callers must copy any values they retain. Optional feature lists preserve absence versus a
+/// present empty list. Returns after the callback finishes, without consuming the snapshot.
 ///
 /// # Safety
-/// Caller is responsible for providing a valid snapshot handle.
+///
+/// `snapshot` must be a valid, live handle for the duration of the call. `visitor` must not unwind
+/// or invalidate the snapshot. Any non-null `context` must satisfy the visitor's requirements.
 #[no_mangle]
-pub unsafe extern "C" fn snapshot_get_protocol(
+pub unsafe extern "C" fn snapshot_visit_protocol(
     snapshot: Handle<SharedSnapshot>,
-) -> Handle<SharedProtocol> {
-    let snapshot = unsafe { snapshot.as_ref() };
-    Arc::new(snapshot.table_configuration().protocol().clone()).into()
-}
-
-/// Free a protocol handle obtained from [`snapshot_get_protocol`].
-///
-/// # Safety
-/// Caller is responsible for providing a valid, non-freed protocol handle.
-#[no_mangle]
-pub unsafe extern "C" fn free_protocol(protocol: Handle<SharedProtocol>) {
-    protocol.drop_handle();
-}
-
-/// Visit all fields of the protocol in a single FFI call. The caller provides:
-/// - `visit_versions`: called once with `(context, min_reader_version, min_writer_version)`
-/// - `visit_feature`: called once per feature with `(context, is_reader, feature_name)`.
-///   `is_reader` is `true` for reader features, `false` for writer features. If the protocol uses
-///   legacy versioning (no explicit feature lists), the `visit_feature` callback will not fire.
-///
-/// # Safety
-/// Caller is responsible for providing a valid protocol handle, a valid `context` pointer, and
-/// valid function pointers for `visit_versions` and `visit_feature`.
-#[no_mangle]
-pub unsafe extern "C" fn visit_protocol(
-    protocol: Handle<SharedProtocol>,
     context: NullableCvoid,
-    visit_versions: extern "C" fn(context: NullableCvoid, min_reader: i32, min_writer: i32),
-    visit_feature: extern "C" fn(
-        context: NullableCvoid,
-        is_reader: bool,
-        feature: KernelStringSlice,
-    ),
+    visitor: extern "C" fn(NullableCvoid, *const delta_types::FfiProtocol),
 ) {
-    let protocol = unsafe { protocol.as_ref() };
-    visit_versions(
-        context,
-        protocol.min_reader_version(),
-        protocol.min_writer_version(),
-    );
-    if let Some(features) = protocol.reader_features() {
-        for f in features {
-            let name = f.as_ref();
-            visit_feature(context, true, kernel_string_slice!(name));
-        }
-    }
-    if let Some(features) = protocol.writer_features() {
-        for f in features {
-            let name = f.as_ref();
-            visit_feature(context, false, kernel_string_slice!(name));
-        }
-    }
+    let snapshot = unsafe { snapshot.as_ref() };
+    let backing = delta_types::ProtocolBacking::new(snapshot.table_configuration().protocol());
+    visitor(context, &backing.as_ffi());
 }
 
 // === Metadata FFI ===
@@ -2269,7 +2226,7 @@ mod tests {
     use std::collections::HashMap;
     use std::ptr::NonNull;
 
-    use delta_kernel::actions::Metadata;
+    use delta_kernel::actions::{Metadata, Protocol};
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
@@ -4022,75 +3979,49 @@ mod tests {
         r#""partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#,
     );
 
-    struct ProtocolVisitState {
-        min_reader: i32,
-        min_writer: i32,
-        reader_features: Vec<String>,
-        writer_features: Vec<String>,
-    }
-
-    impl ProtocolVisitState {
-        fn new() -> Self {
-            Self {
-                min_reader: 0,
-                min_writer: 0,
-                reader_features: Vec::new(),
-                writer_features: Vec::new(),
-            }
-        }
-    }
-
-    extern "C" fn protocol_version_cb(ctx: NullableCvoid, min_reader: i32, min_writer: i32) {
-        let state = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut ProtocolVisitState) };
-        state.min_reader = min_reader;
-        state.min_writer = min_writer;
-    }
-
-    extern "C" fn protocol_feature_cb(
-        ctx: NullableCvoid,
-        is_reader: bool,
-        feature: KernelStringSlice,
-    ) {
-        let state = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut ProtocolVisitState) };
-        let name = unsafe { String::try_from_slice(&feature) }.unwrap();
-        if is_reader {
-            state.reader_features.push(name);
-        } else {
-            state.writer_features.push(name);
-        }
-    }
-
-    /// Visit protocol on a snapshot and return the collected state.
-    fn collect_protocol_state(snap: &handle::Handle<SharedSnapshot>) -> ProtocolVisitState {
-        let proto = unsafe { snapshot_get_protocol(snap.shallow_copy()) };
-        let mut state = ProtocolVisitState::new();
-        let ctx = NonNull::new(&mut state as *mut ProtocolVisitState as *mut c_void);
-        unsafe {
-            visit_protocol(
-                proto.shallow_copy(),
-                ctx,
-                protocol_version_cb,
-                protocol_feature_cb,
-            )
-        };
-        unsafe { free_protocol(proto) };
-        state
-    }
-
-    // === visit_protocol tests ===
-
+    #[rstest]
+    #[case::legacy(1, 2, None, None)]
+    #[case::empty_writer_features(1, 7, None, Some(vec![]))]
+    #[case::writer_only(1, 7, None, Some(vec!["appendOnly"]))]
+    #[case::empty_features(3, 7, Some(vec![]), Some(vec![]))]
+    #[case::with_features(
+        3,
+        7,
+        Some(vec!["columnMapping"]),
+        Some(vec!["columnMapping", "domainMetadata", "rowTracking"])
+    )]
     #[tokio::test]
-    async fn test_visit_protocol_legacy() -> KernelResult<()> {
-        let (engine, snap) = setup_snapshot(METADATA.to_string()).await?;
-        let state = collect_protocol_state(&snap);
+    async fn snapshot_visit_protocol_preserves_fields(
+        #[case] min_reader: i32,
+        #[case] min_writer: i32,
+        #[case] reader_features: Option<Vec<&str>>,
+        #[case] writer_features: Option<Vec<&str>>,
+    ) -> KernelResult<()> {
+        extern "C" fn collect(context: NullableCvoid, protocol: *const delta_types::FfiProtocol) {
+            let result = unsafe {
+                context
+                    .unwrap()
+                    .cast::<Option<KernelResult<Protocol>>>()
+                    .as_mut()
+            };
+            *result = Some(unsafe { (*protocol).try_to_kernel() });
+        }
 
-        assert_eq!(state.min_reader, 1);
-        assert_eq!(state.min_writer, 2);
-        assert!(state.reader_features.is_empty());
-        assert!(state.writer_features.is_empty());
-
-        unsafe { free_snapshot(snap) };
-        unsafe { free_engine(engine) };
+        let expected = Protocol::try_new(min_reader, min_writer, reader_features, writer_features)?;
+        let metadata = METADATA.lines().last().unwrap();
+        let commit_data = format!("{}\n{metadata}", serde_json::json!({"protocol": &expected}),);
+        let (engine, snapshot) = setup_snapshot(commit_data).await?;
+        let mut protocol_result: Option<KernelResult<Protocol>> = None;
+        unsafe {
+            snapshot_visit_protocol(
+                snapshot.shallow_copy(),
+                Some(NonNull::from(&mut protocol_result).cast()),
+                collect,
+            );
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        assert_eq!(protocol_result.unwrap()?, expected);
         Ok(())
     }
 
@@ -4137,23 +4068,6 @@ mod tests {
         );
 
         unsafe { free_engine(engine) }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_visit_protocol_with_features() -> KernelResult<()> {
-        let (engine, snap) = setup_snapshot(METADATA_WITH_FEATURES.to_string()).await?;
-        let state = collect_protocol_state(&snap);
-
-        assert_eq!(state.min_reader, 3);
-        assert_eq!(state.min_writer, 7);
-        assert_eq!(state.reader_features, vec!["columnMapping"]);
-        let mut wf = state.writer_features.clone();
-        wf.sort();
-        assert_eq!(wf, vec!["columnMapping", "domainMetadata", "rowTracking"]);
-
-        unsafe { free_snapshot(snap) };
-        unsafe { free_engine(engine) };
         Ok(())
     }
 

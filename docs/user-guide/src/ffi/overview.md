@@ -152,22 +152,21 @@ partition columns without building a scan.
 | `snapshot_table_root` | Return the table root URL as an engine-allocated string |
 | `logical_schema` | Return the table's logical schema as a `Handle<SharedSchema>` |
 | `snapshot_visit_metadata` | Invoke one callback with the complete metadata action as a borrowed `FfiMetadata`. Copy any values you keep before the callback returns |
-| `snapshot_get_protocol` | Clone the protocol into a `Handle<SharedProtocol>` |
+| `snapshot_visit_protocol` | Invoke one callback with the complete protocol action as a borrowed `FfiProtocol`. Copy any values you keep before the callback returns |
 | `get_partition_column_count` / `get_partition_columns` | Count partition columns and iterate their names as a `StringSliceIterator` |
 | `string_slice_next` / `free_string_slice_data` | Iterate and release a `StringSliceIterator` (e.g. returned by `get_partition_columns`) |
 | `get_app_id_version` | Look up the last committed transaction version for an `app_id` (the read side of [idempotent writes](../writing/idempotent_writes.md)) |
-| `free_protocol` / `free_schema` | Release the corresponding handles |
+| `free_schema` | Release a schema handle |
 
-**Schema and protocol visitors**
+**Schema and string-map visitors**
 
-Kernel exposes schemas, protocols, and metadata through visitor callbacks so
+Kernel exposes schemas and string maps through visitor callbacks so
 the engine can materialize them into its own types without Kernel allocating
 engine-owned memory.
 
 | Function | Purpose |
 |----------|---------|
 | `visit_schema` | Walk a `SharedSchema` by invoking per-field callbacks on an `EngineSchemaVisitor` |
-| `visit_protocol` | Invoke a `visit_versions` callback, then a `visit_feature` callback per reader/writer feature |
 | `visit_string_map` / `get_from_string_map` | Iterate or look up entries in an opaque `CStringMap` (used by scan-metadata partition values) |
 
 See [Visitor callbacks](#visitor-callbacks) below for the pattern.
@@ -429,7 +428,8 @@ calls return `false`.
 
 Several FFI entry points take a visitor struct (for example,
 `EngineSchemaVisitor` for `visit_schema`, `EngineExpressionVisitor` for
-`visit_expression`) or individual callbacks (as in `snapshot_visit_metadata`).
+`visit_expression`) or individual callbacks (as in `snapshot_visit_metadata`
+and `snapshot_visit_protocol`).
 The pattern is the same in every case:
 
 1. You allocate a context (a `NullableCvoid` you own) that the callbacks can
@@ -438,8 +438,8 @@ The pattern is the same in every case:
    passing the context plus node-specific arguments (names, types, literal
    values, child handles). For tree-structured inputs (schemas, expressions,
    predicates), callbacks fire in depth-first order; for flat inputs (e.g.
-   `snapshot_visit_metadata`), the callback fires once.
-3. When `visit_*` returns, the context holds your engine-side representation.
+   `snapshot_visit_metadata` and `snapshot_visit_protocol`), the callback fires once.
+3. When the function returns, the context holds your engine-side representation.
 
 Callbacks run synchronously on the same thread that called `visit_*`. Strings
 passed to callbacks (`KernelStringSlice`) are borrowed for the duration of the

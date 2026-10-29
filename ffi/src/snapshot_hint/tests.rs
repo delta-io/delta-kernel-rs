@@ -3,9 +3,9 @@ use std::error::Error as _;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use delta_kernel::actions::Metadata;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::actions::{Add, LastManifestCommit};
+use delta_kernel::actions::{Metadata, Protocol};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::crc::Crc;
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
@@ -291,6 +291,45 @@ fn read_snapshot_metadata(snapshot: &Handle<SharedSnapshot>) -> Metadata {
         );
     }
     result.unwrap().unwrap()
+}
+
+#[test]
+fn snapshot_visit_protocol_borrows_snapshot_without_io() {
+    extern "C" fn collect(context: NullableCvoid, protocol: *const FfiProtocol) {
+        let result = unsafe {
+            context
+                .unwrap()
+                .cast::<Option<KernelResult<Protocol>>>()
+                .as_mut()
+        };
+        *result = Some(unsafe { (*protocol).try_to_kernel() });
+    }
+
+    let engine = test_engine();
+    let builder = unsafe { with_minimal_hint(test_builder(&engine)) };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let expected = unsafe { snapshot.as_ref() }
+        .table_configuration()
+        .protocol()
+        .clone();
+    let mut protocol_result: Option<KernelResult<Protocol>> = None;
+    unsafe {
+        crate::snapshot_visit_protocol(
+            snapshot.shallow_copy(),
+            Some(NonNull::from(&mut protocol_result).cast()),
+            collect,
+        );
+    }
+    assert_eq!(
+        protocol_result.as_ref().unwrap().as_ref().unwrap(),
+        &expected
+    );
+    assert_eq!(unsafe { snapshot.as_ref() }.version(), 0);
+    unsafe {
+        free_snapshot(snapshot);
+        free_engine(engine);
+    }
+    assert_eq!(protocol_result.unwrap().unwrap(), expected);
 }
 
 #[test]
