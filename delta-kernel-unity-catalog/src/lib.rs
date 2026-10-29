@@ -7,7 +7,7 @@ mod utils;
 
 pub use committer::UCCommitter;
 use delta_kernel::snapshot::SnapshotBuilder;
-use delta_kernel::{KernelError, KernelResult, LogPath, Snapshot};
+use delta_kernel::{DeltaError, KernelError, KernelResult, LogPath, Snapshot};
 use unity_catalog_delta_client_api::{Commit, LoadTableResponse};
 use url::Url;
 pub use utils::{
@@ -32,9 +32,10 @@ pub fn log_tail_from_commits(commits: &[Commit], table_root: Url) -> KernelResul
     sorted
         .into_iter()
         .map(|c| {
-            let version = c.version.try_into().map_err(|_| {
-                KernelError::generic(format!("commit version {} is negative", c.version))
-            })?;
+            let version = c
+                .version
+                .try_into()
+                .map_err(|_| DeltaError::invalid_version(c.version))?;
             let file_size = c.file_size.try_into().map_err(|_| {
                 KernelError::generic(format!(
                     "commit file_size {} does not fit in FileSize",
@@ -71,7 +72,7 @@ pub fn snapshot_builder_from_load_table(resp: &LoadTableResponse) -> KernelResul
     if let Some(version) = resp.latest_table_version {
         let max_catalog_version: u64 = version
             .try_into()
-            .map_err(|_| KernelError::generic("catalog reported a negative table version"))?;
+            .map_err(|_| DeltaError::invalid_version(version))?;
         builder = builder.with_max_catalog_version(max_catalog_version);
     }
     Ok(builder)
@@ -82,7 +83,7 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel::{FileMeta, Snapshot};
+    use delta_kernel::{Error, FileMeta, Snapshot};
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use unity_catalog_delta_client_api::{Commit, InMemoryUpdateTableClient, TableData};
@@ -154,7 +155,12 @@ mod tests {
     fn snapshot_builder_from_load_table_rejects_negative_version() {
         let resp = load_table_response("memory:///my_table", -1);
         let err = snapshot_builder_from_load_table(&resp).unwrap_err();
-        assert!(err.to_string().contains("negative table version"));
+        let Error::Delta(delta) = err else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(delta.name(), "DELTA_VERSION_INVALID");
+        assert_eq!(delta.sql_state(), Some("42815"));
+        assert_eq!(delta.parameters()[0].value(), "-1");
     }
 
     #[test]
@@ -222,9 +228,12 @@ mod tests {
         let err = log_tail_from_commits(&commits, table_root).unwrap_err();
 
         let expected_kind = if expected_invalid_log_path_error {
-            matches!(err, KernelError::InvalidLogPath(_))
+            matches!(err, Error::Kernel(KernelError::InvalidLogPath(_)))
+        } else if version < 0 {
+            matches!(&err, Error::Delta(delta) if delta.name() == "DELTA_VERSION_INVALID"
+                && delta.parameters()[0].value() == version.to_string())
         } else {
-            matches!(err, KernelError::Generic(_))
+            matches!(err, Error::Kernel(KernelError::Generic(_)))
         };
         assert!(expected_kind, "{err:?}");
     }

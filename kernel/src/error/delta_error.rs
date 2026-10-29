@@ -4,6 +4,9 @@ use std::backtrace::Backtrace;
 use std::error::Error as StdError;
 use std::fmt;
 
+#[cfg(feature = "internal-api")]
+use delta_kernel_derive::internal_api;
+
 use super::DeltaErrorCondition;
 
 /// A catalog-defined Delta failure that terminates the current operation.
@@ -62,6 +65,17 @@ impl DeltaError {
         Ok(Self::new(condition, parameters, source))
     }
 
+    /// Reports the invalid signed `version` supplied by a catalog response.
+    #[cfg(feature = "internal-api")]
+    #[internal_api]
+    pub(crate) fn invalid_version(version: i64) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaVersionInvalid,
+            vec![DeltaErrorParameter::new("version", version)],
+            None,
+        )
+    }
+
     /// Returns the typed Delta condition.
     pub fn condition(&self) -> DeltaErrorCondition {
         self.condition
@@ -101,11 +115,6 @@ impl DeltaError {
     ///
     /// `parameters` must contain exactly [`DeltaErrorCondition::parameter_names`], in that order.
     /// Condition-specific factories must maintain this invariant.
-    // TODO(#3421): Remove this dead code attribute when the first delta error factory is introduced
-    #[allow(
-        dead_code,
-        reason = "Reserved for condition-specific factories (see #3421)."
-    )]
     fn new(
         condition: DeltaErrorCondition,
         parameters: Vec<DeltaErrorParameter>,
@@ -177,11 +186,6 @@ impl DeltaErrorParameter {
         &self.value
     }
 
-    // TODO(#3421): Remove this dead code attribute when the first delta error factory is introduced
-    #[allow(
-        dead_code,
-        reason = "Reserved for condition-specific factories (see #3421)."
-    )]
     fn new(name: &'static str, value: impl ToString) -> Self {
         Self {
             name,
