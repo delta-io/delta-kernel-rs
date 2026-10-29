@@ -298,41 +298,30 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
     assert_eq!(schema.num_fields(), 2);
 }
 
-// A fresh (no-CRC) load runs a full replay that captures the checkpoint action onto the snapshot:
-// `Snapshot::latest_checkpoint_action` returns `Some` with the action's version when a commit
-// carries one, and `None` when P&M come from standalone actions (a replay miss leaves the action
-// uncaptured, so the accessor follows the commit's `lastManifestCommit`, which records none).
-#[rstest]
-#[case::commit_carries_checkpoint_action(checkpoint_commit(0, &[], one_column_schema()), Some(0))]
-#[case::standalone_pm_has_no_checkpoint_action(
-    format!("{}\n{}", commit_info(None), standalone_pm_commit(one_column_schema())),
-    None
-)]
+// A fresh (no-CRC) load runs a full replay that captures the checkpoint action onto the snapshot.
+// The commit is deleted before `Snapshot::latest_checkpoint_action` runs, so following the
+// commit's `lastManifestCommit` would fail and only the captured action can answer.
 #[tokio::test]
-async fn replay_captures_latest_checkpoint_action(
-    #[case] commit: String,
-    #[case] expected_version: Option<i64>,
-) {
-    assert_latest_checkpoint_action(&commit, expected_version, non_plan_engine).await;
+async fn replay_captures_latest_checkpoint_action() {
+    assert_replay_captures_checkpoint_action(non_plan_engine).await;
     #[cfg(feature = "declarative-plans")]
-    assert_latest_checkpoint_action(&commit, expected_version, |store| {
-        SyncEngine::new_with_store(store)
-    })
-    .await;
+    assert_replay_captures_checkpoint_action(|store| SyncEngine::new_with_store(store)).await;
 }
 
-async fn assert_latest_checkpoint_action<E: Engine>(
-    commit: &str,
-    expected_version: Option<i64>,
+async fn assert_replay_captures_checkpoint_action<E: Engine>(
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
 ) {
-    let (store, table_root) = commit_table(&[commit.to_string()]).await;
+    let (store, table_root) = commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
 
-    let engine = make_engine(store);
+    let engine = make_engine(store.clone());
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    store
+        .delete(&delta_path_for_version(0, "json"))
+        .await
+        .unwrap();
 
     let action = snapshot.latest_checkpoint_action(&engine).unwrap();
-    assert_eq!(action.map(|action| action.version), expected_version);
+    assert_eq!(action.map(|action| action.version), Some(0));
 }
 
 // A snapshot built without P&M replay (`Snapshot::new`) captures no checkpoint action, so
@@ -465,6 +454,7 @@ async fn incremental_update_resolves_latest_checkpoint_action(
 // only the commit it points at, failing when that commit does not carry the expected action. Each
 // case has checkpoint commits at v0 and v2, the given v1, and a CRC at v2 holding the pointer. A
 // scan would find v2's action first, so any other expected version proves the pointer was followed.
+// A pointer naming v1 deliberately disagrees with v2's own action for that reason.
 #[rstest]
 #[case::pointer_names_latest_manifest_commit(
     checkpoint_commit(1, &[], one_column_schema()),
@@ -479,7 +469,7 @@ async fn incremental_update_resolves_latest_checkpoint_action(
     Ok(1)
 )]
 #[case::pointer_names_commit_checkpointing_older_version(
-    checkpoint_commit(0, &[], one_column_schema()),
+    carrying_pointer((1, 0), checkpoint_action(0, &[], one_column_schema())),
     1,
     0,
     Ok(0)
@@ -491,7 +481,7 @@ async fn incremental_update_resolves_latest_checkpoint_action(
     Err("that commit carries no checkpoint action")
 )]
 #[case::manifest_commit_with_other_content_root_version_fails(
-    checkpoint_commit(0, &[], one_column_schema()),
+    carrying_pointer((1, 0), checkpoint_action(0, &[], one_column_schema())),
     1,
     1,
     Err("that commit's checkpoint action has content root version 0")
@@ -572,11 +562,14 @@ async fn latest_checkpoint_action_follows_commit_info_pointer(
 }
 
 // The pointer alone decides the lookup: one naming a commit the segment does not list, below or
-// above it, is inconsistent. The segment keeps only v1, whose checkpoint action a scan would find.
+// above it, is inconsistent. The table has commits v0 and v1, and the segment keeps only v1, whose
+// checkpoint action a scan would find. So v0 is below the segment, and v5 is past the table's end.
 #[rstest]
+#[case::below_segment_start(0)]
+#[case::past_table_end(5)]
 #[tokio::test]
 async fn read_last_checkpoint_action_from_pointer_rejects_commit_outside_segment(
-    #[values(0, 5)] pointer_version: i64,
+    #[case] pointer_version: i64,
 ) {
     let (store, table_root) =
         manifest_commit_table(&[checkpoint_commit(1, &[], one_column_schema())]).await;
