@@ -324,13 +324,11 @@ pub(crate) fn checkpoint_action_batch() -> Box<dyn EngineData> {
 /// actions.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) mod adaptive_metadata_fixtures {
-    use std::iter;
-
     use super::*;
-    use crate::actions::{CheckpointAction, ContentRoot};
+    use crate::actions::{CheckpointAction, ContentRoot, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA};
     use crate::engine_data::FilteredEngineData;
     use crate::path::LogRoot;
-    use crate::version_as_i64;
+    use crate::{create_row, version_as_i64};
 
     /// The protocol and metadata of a minimal adaptiveMetadata table.
     pub(crate) fn adaptive_metadata_protocol_and_metadata() -> (Protocol, Metadata) {
@@ -390,13 +388,86 @@ pub(crate) mod adaptive_metadata_fixtures {
         version: Version,
         data: Box<dyn EngineData>,
     ) -> KernelResult<()> {
-        let filtered = FilteredEngineData::with_all_rows_selected(data);
-        let commit_path = LogRoot::new(table_root.clone())?.new_commit_path(version)?;
-        engine.json_handler().write_json_file(
-            &commit_path.location,
-            Box::new(iter::once(Ok(filtered))),
-            false,
+        write_commit_batches(engine, table_root, version, vec![data])
+    }
+
+    /// Writes a manifest commit at `version`: a `commitInfo` whose `lastManifestCommit` points at
+    /// this commit, then `checkpoint`'s protocol and metaData as top-level actions, then
+    /// `checkpoint`, whose content root must also reflect `version`.
+    pub(crate) fn write_manifest_commit(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        checkpoint: CheckpointAction,
+    ) -> KernelResult<()> {
+        let version_i64 = version_as_i64(version)?;
+        let commit_info = last_manifest_commit_info(version_i64, version_i64);
+        let commit_info = parse_json_batch(vec![commit_info.to_string()].into());
+        // A `setup_table` table starts without adaptiveMetadata, and enabling it changes the
+        // protocol, which must be written as a top-level action.
+        let protocol = create_row(
+            engine,
+            LOG_PROTOCOL_SCHEMA.clone(),
+            checkpoint.protocol().clone(),
         )?;
+        let metadata = create_row(
+            engine,
+            LOG_METADATA_SCHEMA.clone(),
+            checkpoint.metadata().clone(),
+        )?;
+        let batches = vec![
+            commit_info,
+            protocol,
+            metadata,
+            checkpoint.into_engine_data(engine)?,
+        ];
+        write_commit_batches(engine, table_root, version, batches)
+    }
+
+    /// Writes a log commit at `version`: a `commitInfo` carrying forward the `lastManifestCommit`
+    /// that names `manifest_version` (whose content root is at that version too), followed by
+    /// `data`.
+    pub(crate) fn write_commit_after_manifest_commit(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        manifest_version: Version,
+        data: Box<dyn EngineData>,
+    ) -> KernelResult<()> {
+        let manifest_version = version_as_i64(manifest_version)?;
+        let commit_info = last_manifest_commit_info(manifest_version, manifest_version);
+        let commit_info = parse_json_batch(vec![commit_info.to_string()].into());
+        write_commit_batches(engine, table_root, version, vec![commit_info, data])
+    }
+
+    /// A `commitInfo` action whose `lastManifestCommit` names `version` and
+    /// `content_root_version`.
+    pub(crate) fn last_manifest_commit_info(
+        version: i64,
+        content_root_version: i64,
+    ) -> serde_json::Value {
+        serde_json::json!({ "commitInfo": {
+            "inCommitTimestamp": 1,
+            "lastManifestCommit": {
+                "version": version,
+                "contentRootVersion": content_root_version,
+            },
+        }})
+    }
+
+    fn write_commit_batches(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        batches: Vec<Box<dyn EngineData>>,
+    ) -> KernelResult<()> {
+        let commit_path = LogRoot::new(table_root.clone())?.new_commit_path(version)?;
+        let batches = batches
+            .into_iter()
+            .map(|data| Ok(FilteredEngineData::with_all_rows_selected(data)));
+        engine
+            .json_handler()
+            .write_json_file(&commit_path.location, Box::new(batches), false)?;
         Ok(())
     }
 }

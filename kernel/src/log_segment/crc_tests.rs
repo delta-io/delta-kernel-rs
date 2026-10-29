@@ -26,6 +26,8 @@ use crate::path::ParsedLogPath;
 use crate::snapshot::{IncrementalReplay, SnapshotBuilder, SnapshotRef};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_features::TableFeature;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::unit_test_utils::adaptive_metadata_fixtures::last_manifest_commit_info;
 use crate::unit_test_utils::TestCancellationToken;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::{
@@ -287,6 +289,25 @@ impl CrcReadTest {
         let actions: Vec<serde_json::Value> = actions.into_iter().collect();
         self.ops.push(Op::Commit { version, actions });
         self
+    }
+
+    /// Write a manifest commit: a `commitInfo` whose `lastManifestCommit` names this commit and
+    /// `content_root_version`, then `actions`, then a checkpoint action at `content_root_version`
+    /// carrying `protocol` and `metadata`. A commit that changes P&M must also pass them in
+    /// `actions`, as top-level actions.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn manifest_commit(
+        self,
+        version: u64,
+        content_root_version: i64,
+        protocol: Protocol,
+        metadata: Metadata,
+        actions: impl IntoIterator<Item = serde_json::Value>,
+    ) -> Self {
+        let commit_info = last_manifest_commit_info(version as i64, content_root_version);
+        let checkpoint = amt_checkpoint_action(content_root_version, protocol, metadata);
+        let actions = [commit_info].into_iter().chain(actions).chain([checkpoint]);
+        self.commit(version, actions)
     }
 
     fn crc(
@@ -772,13 +793,12 @@ async fn test_lagging_checkpoint_action_defers_to_crc_pm() {
             crc_config.metadata().clone(),
             None,
         )
-        .commit(
+        .manifest_commit(
             2,
-            [amt_checkpoint_action(
-                0,
-                checkpoint_config.protocol().clone(),
-                checkpoint_config.metadata().clone(),
-            )],
+            0,
+            checkpoint_config.protocol().clone(),
+            checkpoint_config.metadata().clone(),
+            [],
         )
         .build()
         .await
@@ -836,13 +856,15 @@ async fn test_crc_seeded_replay_captures_checkpoint_action_after_crc() {
 async fn test_crc_at_target_captures_no_checkpoint_action() {
     let config = adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
     let resolution = CrcReadTest::new()
-        .commit(
+        .manifest_commit(
             0,
-            [amt_checkpoint_action(
-                0,
-                config.protocol().clone(),
-                config.metadata().clone(),
-            )],
+            0,
+            config.protocol().clone(),
+            config.metadata().clone(),
+            [
+                protocol(config.protocol().clone()),
+                metadata(config.metadata().clone()),
+            ],
         )
         .crc(
             0,
