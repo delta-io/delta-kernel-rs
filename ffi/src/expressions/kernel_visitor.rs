@@ -433,8 +433,8 @@ pub extern "C" fn visit_expression_literal_decimal(
     scale: u8,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
     let result = visit_expression_literal_decimal_impl(state, value_hi, value_lo, precision, scale);
+    // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
     unsafe { result.into_extern_result(&allocate_error) }
 }
 
@@ -626,8 +626,8 @@ pub extern "C" fn visit_expression_literal_null(
     scale: u8,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
     let result = visit_expression_literal_null_impl(state, type_tag, precision, scale);
+    // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
     unsafe { result.into_extern_result(&allocate_error) }
 }
 
