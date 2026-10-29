@@ -109,32 +109,31 @@ pub use crate::parallel::parallel_scan_metadata::{
 };
 
 /// Configures structured-stats output and JSON synthesis in scan metadata.
-/// Existing JSON passes through for commits and checkpoints without compatible structured stats
-/// unless stats are disabled.
+/// Imperative scans pass existing JSON through for commits and checkpoints without compatible
+/// structured stats unless stats are disabled.
 ///
-/// Declarative metadata plans disable stats and partition pruning when JSON output is requested,
-/// including both-output requests. The data-row predicate and imperative metadata path are
+/// Declarative metadata plans emit JSON stats only when JSON output is requested. JSON requests
+/// without structured output disable stats and partition pruning; statically-unsatisfiable
+/// predicates still skip the scan. The data-row predicate and imperative metadata path are
 /// unchanged.
 ///
 /// Most consumers should pick one of the named constructors:
 /// - [`Self::json_only`] (default) -- JSON stats only.
-/// - [`Self::all_struct`] -- all struct stats without JSON synthesis. Compatible checkpoints omit
-///   JSON stats; commits and checkpoints without compatible structured stats pass existing JSON
-///   through.
+/// - [`Self::all_struct`] -- all struct stats without JSON synthesis. Declarative plans omit JSON;
+///   imperative scans pass existing JSON through except on compatible checkpoints.
 /// - [`Self::struct_columns`] -- selected struct stats with the same JSON behavior.
 /// - [`Self::all`] -- both representations.
 /// - [`Self::none`] -- neither, AND disables internal data skipping. Unlike the other four
 ///   constructors, this is the only one that stops kernel from reading stats from parquet at all.
 #[derive(Clone, Debug)]
 pub struct StatsOptions {
-    /// Whether to surface JSON stats on parsed-stats checkpoints (where the
-    /// checkpoint writes stats only as a struct, not as JSON). When true, kernel
-    /// re-serializes the struct stats into JSON so engines that read JSON stats
-    /// see a populated value; when false, JSON stats are left null on such
-    /// checkpoints and the engine consumes the struct stats directly.
+    /// Whether to emit JSON stats in declarative metadata plans, synthesizing them from compatible
+    /// structured stats when the source has no JSON. When false, declarative plans omit JSON stats
+    /// from every source.
     ///
-    /// No effect on tables that write JSON stats directly, or on commit JSON --
-    /// the existing JSON is passed through regardless.
+    /// Imperative scans use this flag only for synthesis from structured checkpoint stats;
+    /// existing JSON from commits and checkpoints without compatible structured stats passes
+    /// through unless stats are disabled.
     pub(crate) synthesize_json: bool,
 
     /// Which struct stats columns to request in `stats_parsed`.
@@ -158,7 +157,7 @@ pub struct StatsOptions {
 /// stats, for example because another writer generated them.
 #[derive(Clone, Debug)]
 pub enum StructStats {
-    /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for
+    /// Don't emit `stats_parsed`. Imperative scans still read predicate-referenced stats for
     /// internal data skipping unless the caller picked [`StatsOptions::none`], which
     /// disables stats reading entirely.
     None,
@@ -199,9 +198,9 @@ impl StatsOptions {
         Self::default()
     }
 
-    /// All struct stats without JSON synthesis. Compatible checkpoints omit JSON stats and avoid
-    /// per-batch `ToJson`; commits and checkpoints without compatible structured stats pass
-    /// existing JSON through.
+    /// All struct stats without JSON synthesis. Declarative metadata plans omit JSON stats.
+    /// Imperative scans omit JSON for compatible checkpoints and otherwise pass existing JSON
+    /// through.
     pub fn all_struct() -> Self {
         Self {
             synthesize_json: false,
@@ -212,7 +211,8 @@ impl StatsOptions {
         }
     }
 
-    /// Returns struct stats for only `cols`, regardless of the table's indexed set.
+    /// Returns struct stats for only `cols`, regardless of the table's indexed set, with the JSON
+    /// behavior of [`Self::all_struct`].
     /// Predicate-only statistics may still be read for data skipping but are not returned.
     ///
     /// Names that cannot be resolved return an error. Missing per-file values read as NULL and do
@@ -225,7 +225,8 @@ impl StatsOptions {
         }
     }
 
-    /// Returns struct stats for all indexed columns and `extra_indexed`.
+    /// Returns struct stats for all indexed columns and `extra_indexed`, with the JSON behavior of
+    /// [`Self::all_struct`].
     ///
     /// Extra-indexed columns bypass the table's configured indexed set. Missing on-disk stats read
     /// as NULL and do not prune; names that cannot be resolved are ignored with a warning.
@@ -251,8 +252,8 @@ impl StatsOptions {
     /// when a predicate is set). Kernel reads no stats columns from parquet at all.
     /// Use when the engine handles its own pruning.
     ///
-    /// To get internal predicate-based skipping without `stats_parsed` output, use
-    /// [`StatsOptions::default`] (JSON only) or set `struct_stats` to `AllIndexed`/`Columns`.
+    /// To get internal predicate-based skipping, use [`Self::all_struct`]. Imperative scans also
+    /// support skipping without `stats_parsed` output via [`Self::json_only`].
     pub fn none() -> Self {
         Self {
             synthesize_json: false,
