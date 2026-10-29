@@ -324,8 +324,12 @@ pub(crate) fn checkpoint_action_batch() -> Box<dyn EngineData> {
 /// actions.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) mod adaptive_metadata_fixtures {
+    use std::iter;
+
     use super::*;
-    use crate::actions::{CheckpointAction, ContentRoot, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA};
+    use crate::actions::{
+        CheckpointAction, ContentRoot, LastManifestCommit, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA,
+    };
     use crate::engine_data::FilteredEngineData;
     use crate::path::LogRoot;
     use crate::{create_row, version_as_i64};
@@ -391,37 +395,41 @@ pub(crate) mod adaptive_metadata_fixtures {
         write_commit_batches(engine, table_root, version, vec![data])
     }
 
-    /// Writes a manifest commit at `version`: a `commitInfo` whose `lastManifestCommit` points at
-    /// this commit, then `checkpoint`'s protocol and metaData as top-level actions, then
-    /// `checkpoint`, whose content root must also reflect `version`.
+    /// Writes a manifest commit at `version`: a `commitInfo` whose `lastManifestCommit` names this
+    /// commit and `checkpoint`'s content root, then `checkpoint`'s protocol and metaData as
+    /// top-level actions, then `checkpoint`.
     pub(crate) fn write_manifest_commit(
         engine: &SyncEngine,
         table_root: &Url,
         version: Version,
         checkpoint: CheckpointAction,
     ) -> KernelResult<()> {
-        let version_i64 = version_as_i64(version)?;
-        let commit_info = last_manifest_commit_info(version_i64, version_i64);
-        let commit_info = parse_json_batch(vec![commit_info.to_string()].into());
         // A `setup_table` table starts without adaptiveMetadata, and enabling it changes the
         // protocol, which must be written as a top-level action.
-        let protocol = create_row(
-            engine,
-            LOG_PROTOCOL_SCHEMA.clone(),
-            checkpoint.protocol().clone(),
-        )?;
-        let metadata = create_row(
-            engine,
-            LOG_METADATA_SCHEMA.clone(),
-            checkpoint.metadata().clone(),
-        )?;
-        let batches = vec![
-            commit_info,
-            protocol,
-            metadata,
-            checkpoint.into_engine_data(engine)?,
+        let pm_actions = vec![
+            create_row(
+                engine,
+                LOG_PROTOCOL_SCHEMA.clone(),
+                checkpoint.protocol().clone(),
+            )?,
+            create_row(
+                engine,
+                LOG_METADATA_SCHEMA.clone(),
+                checkpoint.metadata().clone(),
+            )?,
         ];
-        write_commit_batches(engine, table_root, version, batches)
+        write_manifest_commit_with(engine, table_root, version, pm_actions, checkpoint)
+    }
+
+    /// [`write_manifest_commit`] without top-level protocol and metaData, as written by a commit
+    /// that leaves them unchanged.
+    pub(crate) fn write_manifest_commit_keeping_pm(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        checkpoint: CheckpointAction,
+    ) -> KernelResult<()> {
+        write_manifest_commit_with(engine, table_root, version, vec![], checkpoint)
     }
 
     /// Writes a log commit at `version`: a `commitInfo` carrying forward the `lastManifestCommit`
@@ -441,18 +449,37 @@ pub(crate) mod adaptive_metadata_fixtures {
     }
 
     /// A `commitInfo` action whose `lastManifestCommit` names `version` and
-    /// `content_root_version`.
+    /// `content_root_version`. The pointer is not validated, so tests can write inconsistent ones.
     pub(crate) fn last_manifest_commit_info(
         version: i64,
         content_root_version: i64,
     ) -> serde_json::Value {
-        serde_json::json!({ "commitInfo": {
-            "inCommitTimestamp": 1,
-            "lastManifestCommit": {
-                "version": version,
-                "contentRootVersion": content_root_version,
-            },
-        }})
+        let commit_info = CommitInfo {
+            in_commit_timestamp: Some(1),
+            data_change: Some(false),
+            last_manifest_commit: Some(LastManifestCommit {
+                version,
+                content_root_version,
+            }),
+            ..Default::default()
+        };
+        serde_json::json!({ "commitInfo": commit_info })
+    }
+
+    fn write_manifest_commit_with(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        top_level_actions: Vec<Box<dyn EngineData>>,
+        checkpoint: CheckpointAction,
+    ) -> KernelResult<()> {
+        let commit_info =
+            last_manifest_commit_info(version_as_i64(version)?, checkpoint.content_root_version());
+        let batches = iter::once(parse_json_batch(vec![commit_info.to_string()].into()))
+            .chain(top_level_actions)
+            .chain(iter::once(checkpoint.into_engine_data(engine)?))
+            .collect();
+        write_commit_batches(engine, table_root, version, batches)
     }
 
     fn write_commit_batches(

@@ -13,7 +13,7 @@ use url::Url;
 
 use super::LogSegment;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::CheckpointAction;
+use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, Format, Metadata, Protocol, SetTransaction};
 use crate::crc::{
     try_read_crc_file, Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState,
@@ -210,6 +210,7 @@ fn crc_json(
     metadata: &Metadata,
     ict: Option<i64>,
     file_sizes: &[i64],
+    last_manifest_commit: Option<Value>,
 ) -> serde_json::Value {
     let total_bytes: i64 = file_sizes.iter().sum();
     let num_files = file_sizes.len() as i64;
@@ -230,6 +231,9 @@ fn crc_json(
     }
     if let Some(ict) = ict {
         obj["inCommitTimestampOpt"] = json!(ict);
+    }
+    if let Some(last_manifest_commit) = last_manifest_commit {
+        obj["lastManifestCommit"] = last_manifest_commit;
     }
     obj
 }
@@ -255,6 +259,7 @@ enum Op {
         metadata: Metadata,
         ict: Option<i64>,
         file_sizes: Vec<i64>,
+        last_manifest_commit: Option<Value>,
     },
     CorruptCrc {
         version: u64,
@@ -322,19 +327,53 @@ impl CrcReadTest {
 
     /// Write a CRC file whose on-disk `fileSizeHistogram` is built from `file_sizes`.
     fn crc_with_files(
-        mut self,
+        self,
         version: u64,
         protocol: Protocol,
         metadata: Metadata,
         ict: impl Into<Option<i64>>,
         file_sizes: &[i64],
     ) -> Self {
+        self.push_crc(version, protocol, metadata, ict.into(), file_sizes, None)
+    }
+
+    /// Write a CRC file that also carries `last_manifest_commit`.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn crc_with_last_manifest_commit(
+        self,
+        version: u64,
+        protocol: Protocol,
+        metadata: Metadata,
+        ict: impl Into<Option<i64>>,
+        last_manifest_commit: LastManifestCommit,
+    ) -> Self {
+        let last_manifest_commit = serde_json::to_value(last_manifest_commit).unwrap();
+        self.push_crc(
+            version,
+            protocol,
+            metadata,
+            ict.into(),
+            &[],
+            Some(last_manifest_commit),
+        )
+    }
+
+    fn push_crc(
+        mut self,
+        version: u64,
+        protocol: Protocol,
+        metadata: Metadata,
+        ict: Option<i64>,
+        file_sizes: &[i64],
+        last_manifest_commit: Option<Value>,
+    ) -> Self {
         self.ops.push(Op::Crc {
             version,
             protocol,
             metadata,
-            ict: ict.into(),
+            ict,
             file_sizes: file_sizes.to_vec(),
+            last_manifest_commit,
         });
         self
     }
@@ -368,14 +407,10 @@ impl CrcReadTest {
                     ref metadata,
                     ict,
                     ref file_sizes,
+                    last_manifest_commit,
                 } => {
-                    put(
-                        &store,
-                        version,
-                        "crc",
-                        &crc_json(protocol, metadata, ict, file_sizes).to_string(),
-                    )
-                    .await;
+                    let crc = crc_json(protocol, metadata, ict, file_sizes, last_manifest_commit);
+                    put(&store, version, "crc", &crc.to_string()).await;
                 }
                 Op::CorruptCrc { version } => {
                     put(&store, version, "crc", "CORRUPT_CRC_DATA").await;
@@ -832,13 +867,15 @@ async fn test_crc_seeded_replay_captures_checkpoint_action_after_crc() {
             crc_config.metadata().clone(),
             1000, // AMT config enables ICT, so the CRC must carry an inCommitTimestampOpt.
         )
-        .commit(
+        .manifest_commit(
             1,
-            [amt_checkpoint_action(
-                1,
-                checkpoint_config.protocol().clone(),
-                checkpoint_config.metadata().clone(),
-            )],
+            1,
+            checkpoint_config.protocol().clone(),
+            checkpoint_config.metadata().clone(),
+            [
+                protocol(checkpoint_config.protocol().clone()),
+                metadata(checkpoint_config.metadata().clone()),
+            ],
         )
         .build()
         .await
@@ -855,7 +892,7 @@ async fn test_crc_seeded_replay_captures_checkpoint_action_after_crc() {
 #[tokio::test]
 async fn test_crc_at_target_captures_no_checkpoint_action() {
     let config = adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
-    let resolution = CrcReadTest::new()
+    let test = CrcReadTest::new()
         .manifest_commit(
             0,
             0,
@@ -866,16 +903,19 @@ async fn test_crc_at_target_captures_no_checkpoint_action() {
                 metadata(config.metadata().clone()),
             ],
         )
-        .crc(
+        .crc_with_last_manifest_commit(
             0,
             config.protocol().clone(),
             config.metadata().clone(),
             1000, // AMT config enables ICT, so the CRC must carry an inCommitTimestampOpt.
+            LastManifestCommit::new(0, 0).unwrap(),
         )
         .build()
-        .await
-        .captured_checkpoint_action();
-    assert!(resolution.is_none());
+        .await;
+    assert!(test.captured_checkpoint_action().is_none());
+    let (snapshot, _) = test.snapshot_at(None);
+    let action = snapshot.latest_checkpoint_action(&test.engine).unwrap();
+    assert_eq!(action.map(|action| action.version), Some(0));
 }
 
 // A CRC-seeded pruned replay that resolves P&M from standalone actions but finds no checkpoint
