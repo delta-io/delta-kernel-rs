@@ -10,7 +10,7 @@ use update_table::{intermediate_dv_schema, new_dv_column_schema};
 
 use super::stats_verifier::StatsColumnVerifier;
 use super::{
-    augmented_write_metadata_schema, stats_verifier, with_row_tracking_cols, CommitResult,
+    add_files_schema_with, stats_verifier, with_row_tracking_cols, CommitResult,
     EngineDataResultIterator, Imperative, NonfileCommitActions, PostCommitInputs, Transaction,
     UpdateTable,
 };
@@ -36,8 +36,9 @@ use crate::metrics::CommitFailureReason;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::{
-    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME,
-    PARTITION_VALUES_NAME, PARTITION_VALUES_PARSED_NAME, SIZE_NAME, STATS_PARSED_NAME, TAGS_NAME,
+    BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
+    FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME, PARTITION_VALUES_PARSED_NAME, SIZE_NAME,
+    STATS_PARSED_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -47,8 +48,8 @@ use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
-    create_row, version_as_i64, DataType, Engine, EngineData, Expression, KernelResult,
-    KernelResultIterator, Predicate, RowVisitor, Version,
+    create_row, version_as_i64, DataType, Engine, EngineData, Expression, ExpressionEvaluator,
+    KernelResult, KernelResultIterator, Predicate, RowVisitor, Version,
 };
 
 mod update_table;
@@ -189,9 +190,8 @@ impl<STATE> Transaction<STATE, Imperative> {
     /// add/append/insert data (files) to the table. Note that this API can be called multiple times
     /// to add multiple batches.
     ///
-    /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
-    ///
-    /// TODO(#3553): Support writing clusteringProvider to AddFile actions.
+    /// The base schema and supported optional columns for `add_metadata` are described by
+    /// [`Transaction::add_files_schema`].
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.staged_data_changes
             .add_files_metadata
@@ -315,6 +315,15 @@ impl<STATE> Transaction<STATE, Imperative> {
             self.effective_table_config.physical_partition_columns(),
         )
         .validate_batches(&self.staged_data_changes.add_files_metadata)?;
+
+        if !self
+            .effective_table_config
+            .is_feature_supported(&TableFeature::ClusteredTable)
+        {
+            write_validation::validate_no_clustering_providers_set(
+                &self.staged_data_changes.add_files_metadata,
+            )?;
+        }
 
         write_validation::StagedDataValidator::for_dv_updates(
             self.effective_table_config.physical_partition_columns(),
@@ -488,7 +497,7 @@ impl<STATE> Transaction<STATE, Imperative> {
                     .add_files_metadata
                     .iter()
                     .map(|a| Ok(a.deref())),
-                self.add_files_schema().clone(),
+                false, // no row tracking
                 self.data_change,
             )?;
             Ok((Box::new(add_actions), None))
@@ -539,11 +548,10 @@ impl<STATE> Transaction<STATE, Imperative> {
                     )
                 });
 
-        // Generate add actions including row tracking metadata
         let add_actions = build_add_actions(
             engine,
             extended_add_files,
-            augmented_write_metadata_schema()?,
+            true, // row tracking
             self.data_change,
         )?;
 
@@ -683,7 +691,7 @@ fn build_add_action_projection(
 fn build_add_actions<'a, I, T>(
     engine: &dyn Engine,
     add_files_metadata: I,
-    input_schema: SchemaRef,
+    row_tracking: bool,
     data_change: bool,
 ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + 'a>
 where
@@ -691,15 +699,33 @@ where
     T: Deref<Target = dyn EngineData> + Send + 'a,
 {
     let evaluation_handler = engine.evaluation_handler();
-    let (output_schema, adds_expr) = build_add_action_projection(&input_schema, data_change)?;
-    let adds_expr = Arc::new(adds_expr);
+    let mut last_evaluator: Option<((bool, bool), Arc<dyn ExpressionEvaluator>)> = None;
     Ok(add_files_metadata.map(move |add_files_batch| {
+        let add_files_batch = add_files_batch?;
+        let optional_columns = (
+            add_files_batch.has_field(&column_name!(TAGS_NAME)),
+            add_files_batch.has_field(&column_name!(CLUSTERING_PROVIDER_NAME)),
+        );
+        if let Some((cached_columns, evaluator)) = &last_evaluator {
+            if *cached_columns == optional_columns {
+                return evaluator.evaluate(add_files_batch.deref());
+            }
+        }
+        let input_schema = add_files_schema_with(optional_columns.0, optional_columns.1);
+        let input_schema = if row_tracking {
+            with_row_tracking_cols(input_schema)?
+        } else {
+            input_schema.clone()
+        };
+        let (output_schema, adds_expr) = build_add_action_projection(&input_schema, data_change)?;
         let adds_evaluator = evaluation_handler.new_expression_evaluator(
-            input_schema.clone(),
-            adds_expr.clone(),
-            as_log_add_schema(output_schema.clone()).into(),
+            input_schema,
+            Arc::new(adds_expr),
+            as_log_add_schema(output_schema).into(),
         )?;
-        adds_evaluator.evaluate(add_files_batch?.deref())
+        let result = adds_evaluator.evaluate(add_files_batch.deref());
+        last_evaluator = Some((optional_columns, adds_evaluator));
+        result
     }))
 }
 
@@ -792,13 +818,14 @@ fn build_remove_struct_patch(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use ::test_utils::get_column;
     use rstest::rstest;
 
     use super::*;
-    use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
+    use crate::actions::{ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
     use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
     use crate::arrow::array::{
         new_null_array, ArrayRef, BooleanArray, Int64Array, StringArray, StructArray,
@@ -810,16 +837,16 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{MapData, Scalar, StructData};
+    use crate::engine::test_delegating::DelegatingEngine;
+    use crate::expressions::{ExpressionRef, MapData, PredicateRef, Scalar, StructData};
     use crate::scan::log_replay::PATH_NAME;
     use crate::schema::{column_name, schema, MapType};
     use crate::table_configuration::TableConfiguration;
     use crate::table_properties::APPEND_ONLY;
     use crate::transaction::create_table::create_table;
     use crate::transaction::operation::UpdateTableOperation;
-    use crate::transaction::BASE_ADD_FILES_SCHEMA;
     use crate::unit_test_utils::{copy_test_table, create_valid_add_file_batch, test_schema_flat};
-    use crate::{EvaluationHandler, Snapshot};
+    use crate::{EvaluationHandler, ExpressionEvaluator, PredicateEvaluator, Snapshot};
 
     impl Transaction {
         /// Set clustering columns for testing purposes without needing a table
@@ -831,45 +858,141 @@ mod tests {
     }
 
     #[rstest]
-    #[case::base(false)]
-    #[case::row_tracking(true)]
-    fn test_add_action_projection_schema(#[case] row_tracking: bool) -> KernelResult<()> {
+    fn test_add_action_projection_schema(
+        #[values(false, true)] row_tracking: bool,
+        #[values(false, true)] tags: bool,
+        #[values(false, true)] clustering_provider: bool,
+    ) -> KernelResult<()> {
+        let add_files_schema = add_files_schema_with(tags, clustering_provider);
         let input_schema = if row_tracking {
-            with_row_tracking_cols(&BASE_ADD_FILES_SCHEMA)?
+            with_row_tracking_cols(add_files_schema)?
         } else {
-            BASE_ADD_FILES_SCHEMA.clone()
+            add_files_schema.clone()
         };
         let (schema, _) = build_add_action_projection(input_schema.as_ref(), true)?;
         let field_names: Vec<_> = schema.fields().map(|f| f.name().as_str()).collect();
-        let expected_field_names = if row_tracking {
-            vec![
-                "path",
-                "partitionValues",
-                "size",
-                "modificationTime",
-                "dataChange",
-                "stats",
-                "baseRowId",
-                "defaultRowCommitVersion",
-            ]
-        } else {
-            vec![
-                "path",
-                "partitionValues",
-                "size",
-                "modificationTime",
-                "dataChange",
-                "stats",
-            ]
-        };
+        let mut expected_field_names = vec![
+            "path",
+            "partitionValues",
+            "size",
+            "modificationTime",
+            "dataChange",
+            "stats",
+        ];
+        if tags {
+            expected_field_names.push("tags");
+        }
+        if clustering_provider {
+            expected_field_names.push("clusteringProvider");
+        }
+        if row_tracking {
+            expected_field_names.extend(["baseRowId", "defaultRowCommitVersion"]);
+        }
         assert_eq!(field_names, expected_field_names);
-        assert_eq!(
-            schema.field("dataChange"),
-            Some(&StructField::not_null("dataChange", DataType::BOOLEAN))
-        );
+        assert_eq!(schema.field("dataChange"), Some(&*DATA_CHANGE_COLUMN));
         assert_eq!(
             schema.field("stats").unwrap().data_type(),
             &DataType::STRING
+        );
+        for name in [TAGS_NAME, CLUSTERING_PROVIDER_NAME] {
+            assert_eq!(schema.field(name), input_schema.field(name));
+            if let Some(field) = schema.field(name) {
+                assert_eq!(Some(field), ADD_SCHEMA.field(name));
+            }
+        }
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct CountingEvaluationHandler {
+        evaluators_created: AtomicUsize,
+    }
+
+    impl EvaluationHandler for CountingEvaluationHandler {
+        fn new_expression_evaluator(
+            &self,
+            schema: SchemaRef,
+            expression: ExpressionRef,
+            output_type: DataType,
+        ) -> KernelResult<Arc<dyn ExpressionEvaluator>> {
+            self.evaluators_created.fetch_add(1, Ordering::Relaxed);
+            ArrowEvaluationHandler.new_expression_evaluator(schema, expression, output_type)
+        }
+
+        fn new_predicate_evaluator(
+            &self,
+            schema: SchemaRef,
+            predicate: PredicateRef,
+        ) -> KernelResult<Arc<dyn PredicateEvaluator>> {
+            ArrowEvaluationHandler.new_predicate_evaluator(schema, predicate)
+        }
+
+        fn create_many(
+            &self,
+            schema: SchemaRef,
+            rows: Vec<Vec<Scalar>>,
+        ) -> KernelResult<Box<dyn EngineData>> {
+            ArrowEvaluationHandler.create_many(schema, rows)
+        }
+    }
+
+    #[rstest]
+    #[case::base(&[(false, false), (false, false)], 1)]
+    #[case::tags(&[(true, false), (true, false)], 1)]
+    #[case::provider(&[(false, true), (false, true)], 1)]
+    #[case::both(&[(true, true), (true, true)], 1)]
+    #[case::changing_columns(
+        &[(false, false), (false, false), (true, true), (true, true), (false, false), (false, false)],
+        3
+    )]
+    fn test_add_action_evaluators_reused_for_repeated_schema(
+        #[values(false, true)] row_tracking: bool,
+        #[case] optional_columns: &[(bool, bool)],
+        #[case] max_evaluators: usize,
+    ) -> KernelResult<()> {
+        let handler = Arc::new(CountingEvaluationHandler::default());
+        let engine = DelegatingEngine::new(Arc::new(SyncEngine::new()))
+            .with_evaluation_handler(handler.clone());
+        let batches = optional_columns
+            .iter()
+            .map(|&(tags, provider)| {
+                let schema = add_files_schema_with(tags, provider);
+                let schema = if row_tracking {
+                    with_row_tracking_cols(schema)?
+                } else {
+                    schema.clone()
+                };
+                let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
+                let mut columns = create_valid_add_file_batch(false).columns().to_vec();
+                columns.extend(
+                    arrow_schema.fields()[columns.len()..]
+                        .iter()
+                        .map(|field| new_null_array(field.data_type(), 1)),
+                );
+                let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)?;
+                Ok(Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>)
+            })
+            .collect::<KernelResult<Vec<_>>>()?;
+        let actions = build_add_actions(&engine, batches.into_iter().map(Ok), row_tracking, true)?;
+        assert_eq!(handler.evaluators_created.load(Ordering::Relaxed), 0);
+        let actions = actions.collect::<KernelResult<Vec<_>>>()?;
+        assert_eq!(actions.len(), optional_columns.len());
+        for (action, &(tags, provider)) in actions.iter().zip(optional_columns) {
+            assert_eq!(action.has_field(&column_name!("add", TAGS_NAME)), tags);
+            assert_eq!(
+                action.has_field(&column_name!("add", CLUSTERING_PROVIDER_NAME)),
+                provider
+            );
+            assert_eq!(
+                action.has_field(&column_name!("add.baseRowId")),
+                row_tracking
+            );
+        }
+        let created = handler.evaluators_created.load(Ordering::Relaxed);
+        assert!(
+            created <= max_evaluators,
+            "created {created} evaluators for {} batches; expected at most {max_evaluators}",
+            optional_columns.len()
         );
         Ok(())
     }

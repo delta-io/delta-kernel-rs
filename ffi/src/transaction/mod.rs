@@ -122,6 +122,7 @@ mod tests {
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::engine_data::FilteredEngineData;
+    use delta_kernel::expressions::ColumnName;
     use delta_kernel::metrics::MetricEvent;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
@@ -131,6 +132,7 @@ mod tests {
         schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
     };
     use delta_kernel::table_features::TableFeature;
+    use delta_kernel::transaction::create_table::create_table;
     use delta_kernel::{KernelResult, Snapshot};
     use delta_kernel_ffi::delta_types::{
         FfiColumnNameArray, FfiNullableStringMap, FfiNullableStringMapEntry, FfiStringArray,
@@ -3571,12 +3573,14 @@ mod tests {
         );
 
         let col = "id";
-        let columns = [kernel_string_slice!(col)];
+        let path = [kernel_string_slice!(col)];
+        let columns = [FfiColumnName {
+            path: unsafe { FfiStringArray::new_unsafe(&path) },
+        }];
         let builder = ok_or_panic(unsafe {
             create_table_txn_builder_with_clustering_columns(
                 builder,
-                columns.as_ptr(),
-                columns.len(),
+                FfiColumnNameArray::new_unsafe(&columns),
                 engine.shallow_copy(),
             )
         });
@@ -3601,6 +3605,216 @@ mod tests {
 
         unsafe { free_engine(engine) };
         Ok(())
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn test_create_table_with_clustering_column_paths(
+        #[case] column_mapping: bool,
+    ) -> KernelResult<()> {
+        let (store, test_engine, table_url) =
+            test_utils::engine_store_setup("clustering_paths", None);
+        let engine = engine_handle_for_store(Arc::clone(&store));
+        let schema = schema_ref! {
+            nullable "parent": { nullable "child": STRING },
+            nullable "parent.child": INTEGER,
+            nullable "grandgrandparent": {
+                nullable "grandparent": { nullable "parent": { nullable "child": STRING } },
+            },
+        };
+        let mut builder = create_table(&table_url, schema, "test-engine/1.0", false)
+            .with_data_layout(DataLayout::partitioned(["parent.child"]));
+        if column_mapping {
+            builder = builder.with_table_properties([("delta.columnMapping.mode", "name")]);
+        }
+        // Drop every input allocation before build so Miri can detect retained pointers.
+        let builder = {
+            let names = [
+                "parent",
+                "child",
+                "parent.child",
+                "grandgrandparent",
+                "grandparent",
+            ]
+            .map(String::from);
+            let parent_path = Box::new([ffi_str(&names[0]), ffi_str(&names[1])]);
+            let literal_path = Box::new([ffi_str(&names[2])]);
+            let deep_path = Box::new([
+                ffi_str(&names[3]),
+                ffi_str(&names[4]),
+                ffi_str(&names[0]),
+                ffi_str(&names[1]),
+            ]);
+            let columns = Box::new([
+                FfiColumnName {
+                    path: unsafe { FfiStringArray::new_unsafe(parent_path.as_slice()) },
+                },
+                FfiColumnName {
+                    path: unsafe { FfiStringArray::new_unsafe(literal_path.as_slice()) },
+                },
+                FfiColumnName {
+                    path: unsafe { FfiStringArray::new_unsafe(deep_path.as_slice()) },
+                },
+            ]);
+            ok_or_panic(unsafe {
+                create_table_txn_builder_with_clustering_columns(
+                    Box::new(builder).into(),
+                    FfiColumnNameArray::new_unsafe(columns.as_slice()),
+                    engine.shallow_copy(),
+                )
+            })
+        };
+        build_and_commit(builder, &engine);
+        let snapshot = Snapshot::builder_for(table_url).build(&test_engine)?;
+        let infos = snapshot.get_clustering_column_infos(&test_engine)?.unwrap();
+        assert_eq!(infos.len(), 3);
+        assert_eq!(
+            infos[0].logical_column,
+            ColumnName::new(["parent", "child"])
+        );
+        assert_eq!(infos[1].logical_column, ColumnName::new(["parent.child"]));
+        assert_eq!(
+            infos[2].logical_column,
+            ColumnName::new(["grandgrandparent", "grandparent", "parent", "child"])
+        );
+        assert_eq!(infos[0].data_type, DataType::STRING);
+        assert_eq!(infos[1].data_type, DataType::INTEGER);
+        for info in &infos {
+            assert_eq!(info.physical_column != info.logical_column, column_mapping);
+        }
+        assert!(snapshot
+            .table_configuration()
+            .logical_partition_columns()
+            .is_empty());
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::no_columns(vec![], "Clustering requires at least one column")]
+    #[case::empty_path(vec![vec![]], "Column path cannot be empty")]
+    #[case::empty_segment(vec![vec![""]], "field '' not found in schema")]
+    #[case::missing_column(vec![vec!["missing"]], "field 'missing' not found in schema")]
+    #[case::duplicate_column(vec![vec!["id"], vec!["id"]], "Duplicate clustering column")]
+    #[case::dotted_not_split(
+        vec![vec!["parent.child"]],
+        "field 'parent.child' not found in schema"
+    )]
+    #[case::missing_nested_field(
+        vec![vec!["parent", "missing"]],
+        "field 'missing' not found in schema"
+    )]
+    #[case::traverse_primitive(
+        vec![vec!["id", "child"]],
+        "intermediate field 'id' is not a struct type"
+    )]
+    #[case::struct_as_leaf(vec![vec!["parent"]], "has unsupported type")]
+    #[case::duplicate_nested_path(
+        vec![vec!["parent", "child"], vec!["parent", "child"]],
+        "Duplicate clustering column"
+    )]
+    fn test_create_table_clustering_column_paths_validate_at_build(
+        #[case] paths: Vec<Vec<&str>>,
+        #[case] expected_message: &str,
+    ) {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("clustering_paths", None);
+        let engine = engine_handle_for_store(Arc::clone(&store));
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "parent": { nullable "child": STRING },
+        };
+        let builder = create_table(&table_url, schema, "test-engine/1.0", false);
+        let paths: Vec<Vec<_>> = paths
+            .iter()
+            .map(|path| path.iter().map(|part| ffi_str(part)).collect())
+            .collect();
+        let columns: Vec<_> = paths
+            .iter()
+            .map(|path| FfiColumnName {
+                path: if path.is_empty() {
+                    FfiStringArray::empty()
+                } else {
+                    unsafe { FfiStringArray::new_unsafe(path) }
+                },
+            })
+            .collect();
+        let columns = if columns.is_empty() {
+            FfiColumnNameArray::empty()
+        } else {
+            unsafe { FfiColumnNameArray::new_unsafe(&columns) }
+        };
+        let builder = ok_or_panic(unsafe {
+            create_table_txn_builder_with_clustering_columns(
+                Box::new(builder).into(),
+                columns,
+                engine.shallow_copy(),
+            )
+        });
+        let result = unsafe { create_table_txn_builder_build(builder, engine.shallow_copy()) };
+        assert_extern_result_error_contains(result, FFIKernelError::GenericError, expected_message);
+        unsafe { free_engine(engine) };
+    }
+
+    #[rstest]
+    #[case::null_array(true, false)]
+    #[case::null_path(false, false)]
+    #[case::invalid_utf8(false, true)]
+    fn test_create_table_clustering_column_paths_reject_malformed_input(
+        #[case] null_array: bool,
+        #[case] invalid_utf8: bool,
+    ) {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("clustering_paths", None);
+        let (_, engine, builder) = create_table_txn_builder(
+            false,
+            &store,
+            &table_url,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        let invalid_bytes = [0xff];
+        let path = [KernelStringSlice {
+            ptr: invalid_bytes.as_ptr().cast(),
+            len: invalid_bytes.len(),
+        }];
+        let columns = [FfiColumnName {
+            path: if invalid_utf8 {
+                unsafe { FfiStringArray::new_unsafe(&path) }
+            } else {
+                FfiStringArray {
+                    ptr: std::ptr::null(),
+                    len: 1,
+                }
+            },
+        }];
+        let columns = if null_array {
+            FfiColumnNameArray {
+                ptr: std::ptr::null(),
+                len: 1,
+            }
+        } else {
+            unsafe { FfiColumnNameArray::new_unsafe(&columns) }
+        };
+        let result = unsafe {
+            create_table_txn_builder_with_clustering_columns(
+                builder,
+                columns,
+                engine.shallow_copy(),
+            )
+        };
+        assert_extern_result_error_with_message(
+            result,
+            if invalid_utf8 {
+                FFIKernelError::Utf8Error
+            } else {
+                FFIKernelError::GenericError
+            },
+            None,
+        );
+        // The setter consumes the builder on error; Miri checks its release.
+        unsafe { free_engine(engine) };
     }
 
     #[tokio::test]
@@ -3700,12 +3914,20 @@ mod tests {
         // Two columns: order must be preserved in the serialized clustering domain metadata.
         let c0 = "id";
         let c1 = "name";
-        let columns = [kernel_string_slice!(c0), kernel_string_slice!(c1)];
+        let path0 = [kernel_string_slice!(c0)];
+        let path1 = [kernel_string_slice!(c1)];
+        let columns = [
+            FfiColumnName {
+                path: unsafe { FfiStringArray::new_unsafe(&path0) },
+            },
+            FfiColumnName {
+                path: unsafe { FfiStringArray::new_unsafe(&path1) },
+            },
+        ];
         let builder = ok_or_panic(unsafe {
             create_table_txn_builder_with_clustering_columns(
                 builder,
-                columns.as_ptr(),
-                columns.len(),
+                FfiColumnNameArray::new_unsafe(&columns),
                 engine.shallow_copy(),
             )
         });
@@ -3738,12 +3960,14 @@ mod tests {
         // Set clustering, then partition: the layouts are mutually exclusive and the last call
         // wins, so the committed table must be partitioned with no clustering domain metadata.
         let c_col = "id";
-        let c_cols = [kernel_string_slice!(c_col)];
+        let c_path = [kernel_string_slice!(c_col)];
+        let c_cols = [FfiColumnName {
+            path: unsafe { FfiStringArray::new_unsafe(&c_path) },
+        }];
         let builder = ok_or_panic(unsafe {
             create_table_txn_builder_with_clustering_columns(
                 builder,
-                c_cols.as_ptr(),
-                c_cols.len(),
+                FfiColumnNameArray::new_unsafe(&c_cols),
                 engine.shallow_copy(),
             )
         });

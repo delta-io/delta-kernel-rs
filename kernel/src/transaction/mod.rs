@@ -18,9 +18,10 @@ use crate::log_segment::LogSegment;
 use crate::metrics::MetricId;
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::scan::log_replay::STATS_NAME;
+pub use crate::scan::log_replay::{CLUSTERING_PROVIDER_NAME, TAGS_NAME};
 use crate::schema::void_utils::validate_schema_for_write;
 use crate::schema::{
-    lazy_schema_ref, ColumnDefault, SchemaRef, SchemaStructPatchBuilder, StructField,
+    lazy_schema_ref, ColumnDefault, MapType, SchemaRef, SchemaStructPatchBuilder, StructField,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
@@ -141,6 +142,41 @@ pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! 
     },
 };
 
+// The optional per-file add-files columns. Each has the type of the Add action field of the same
+// name and is copied into each Add action unchanged.
+static ADD_FILE_TAGS_FIELD: LazyLock<StructField> = LazyLock::new(|| {
+    StructField::nullable(
+        TAGS_NAME,
+        MapType::new(DataType::STRING, DataType::STRING, true),
+    )
+});
+static ADD_FILE_CLUSTERING_PROVIDER_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING));
+
+static TAGS_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    ..(BASE_ADD_FILES_SCHEMA.fields().cloned()),
+    (&ADD_FILE_TAGS_FIELD),
+};
+static CLUSTERING_PROVIDER_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    ..(BASE_ADD_FILES_SCHEMA.fields().cloned()),
+    (&ADD_FILE_CLUSTERING_PROVIDER_FIELD),
+};
+static TAGS_AND_CLUSTERING_PROVIDER_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    ..(BASE_ADD_FILES_SCHEMA.fields().cloned()),
+    (&ADD_FILE_TAGS_FIELD),
+    (&ADD_FILE_CLUSTERING_PROVIDER_FIELD),
+};
+
+/// The add-files schema with the optional columns present in a batch.
+fn add_files_schema_with(tags: bool, clustering_provider: bool) -> &'static SchemaRef {
+    match (tags, clustering_provider) {
+        (false, false) => &BASE_ADD_FILES_SCHEMA,
+        (true, false) => &TAGS_ADD_FILES_SCHEMA,
+        (false, true) => &CLUSTERING_PROVIDER_ADD_FILES_SCHEMA,
+        (true, true) => &TAGS_AND_CLUSTERING_PROVIDER_ADD_FILES_SCHEMA,
+    }
+}
+
 /// Extend a schema with row tracking columns and return a new SchemaRef.
 ///
 /// Note that this method is only useful to extend an Add action schema.
@@ -156,6 +192,7 @@ fn with_row_tracking_cols(schema: &SchemaRef) -> KernelResult<SchemaRef> {
 
 /// The row-tracking-augmented add-file write-metadata schema: [`BASE_ADD_FILES_SCHEMA`] extended
 /// with the row-tracking columns.
+#[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) fn augmented_write_metadata_schema() -> KernelResult<SchemaRef> {
     with_row_tracking_cols(&BASE_ADD_FILES_SCHEMA)
 }
@@ -415,7 +452,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         self
     }
 
-    /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting
+    /// The base schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting
     /// information about a Parquet write operation back to Kernel.
     ///
     /// Concretely, it is the expected schema for [`EngineData`] passed to [`add_files`], as it is
@@ -429,8 +466,13 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// data schema and table configuration. See [`stats_schema`] for the table-specific expected
     /// stats schema.
     ///
-    /// Note: While currently static, in the future the schema might change depending on
-    /// options set on the transaction or features enabled on the table.
+    /// The returned schema contains the required metadata columns. Batches passed to [`add_files`]
+    /// may append nullable [`tags`](TAGS_NAME) (`map<string, string>`, with nullable values) and/or
+    /// [`clusteringProvider`](CLUSTERING_PROVIDER_NAME) (`string`) columns, in that order.
+    /// Each value is copied into the file's Add action. An absent column or null value leaves
+    /// the field unset; batches may differ in which optional columns they include.
+    /// A non-null `clusteringProvider` requires the `clustering` writer feature and must name the
+    /// implementation that clustered the file.
     ///
     /// [`add_files`]: crate::transaction::Transaction::add_files
     /// [`ParquetHandler`]: crate::ParquetHandler
@@ -1874,21 +1916,20 @@ mod tests {
     }
 
     // TODO: create a finer-grained unit tests for transactions (issue#1091)
-    #[test]
-    fn test_add_files_schema() -> KernelResult<()> {
-        let engine = SyncEngine::new();
-        let path =
-            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let snapshot = Snapshot::builder_for(url)
-            .at_version(1)
-            .build(&engine)
-            .unwrap();
-        let txn = snapshot
-            .update_table(UpdateTableOperation::Write, "default engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    #[rstest]
+    fn test_add_files_schema(
+        #[values(DataLayout::None, DataLayout::clustered(["id"]))] layout: DataLayout,
+    ) -> KernelResult<()> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let txn = create_table(
+            "memory:///t",
+            schema_ref! { nullable "id": INTEGER },
+            "test",
+            true,
+        )
+        .with_data_layout(layout)
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
-        let schema = txn.add_files_schema();
         let expected = schema! {
             not_null "path": STRING,
             not_null "partitionValues": { STRING => nullable STRING },
@@ -1902,7 +1943,7 @@ mod tests {
                 nullable TIGHT_BOUNDS: BOOLEAN,
             },
         };
-        assert_eq!(*schema, expected.into());
+        assert_eq!(txn.add_files_schema().as_ref(), &expected);
         Ok(())
     }
 
