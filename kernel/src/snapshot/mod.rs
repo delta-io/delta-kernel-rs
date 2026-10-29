@@ -96,10 +96,6 @@ pub enum CheckpointWriteResult {
 pub struct Snapshot {
     span: tracing::Span,
     log_segment: LogSegment,
-    // Immutable checkpoint inputs are shared by inspection and scan planning.
-    checkpoint_shape: OnceLock<CheckpointShape>,
-    // Serialize fallible initialization without locking subsequent reads. Failed I/O can retry.
-    checkpoint_shape_init: Mutex<()>,
     table_configuration: TableConfiguration,
     /// The newest CRC resolved at construction, kept so later queries and CRC writes reuse it
     /// instead of re-reading from disk. Queried via [`Snapshot::crc_at_version`] (authoritative,
@@ -125,6 +121,10 @@ pub struct Snapshot {
     /// (see [`LastManifestCommitResolution`]). Safe to cache like [`Self::checkpoint_action`].
     #[cfg(feature = "adaptive-metadata-in-dev")]
     last_manifest_commit: OnceLock<Option<LastManifestCommit>>,
+    // Immutable checkpoint inputs are shared by inspection and scan planning.
+    checkpoint_shape: OnceLock<CheckpointShape>,
+    // Serialize fallible initialization without locking subsequent reads. Failed I/O can retry.
+    checkpoint_shape_init: Mutex<()>,
 }
 
 impl PartialEq for Snapshot {
@@ -285,8 +285,6 @@ impl Snapshot {
         Self {
             span,
             log_segment,
-            checkpoint_shape: OnceLock::new(),
-            checkpoint_shape_init: Mutex::new(()),
             table_configuration,
             crc,
             built_as_latest,
@@ -298,6 +296,8 @@ impl Snapshot {
             },
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit,
+            checkpoint_shape: OnceLock::new(),
+            checkpoint_shape_init: Mutex::new(()),
         }
     }
 
