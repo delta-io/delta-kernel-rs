@@ -2471,6 +2471,15 @@ impl DataType {
     pub const TIMESTAMP: Self = DataType::Primitive(PrimitiveType::Timestamp);
     pub const TIMESTAMP_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNtz);
     pub const VOID: Self = DataType::Primitive(PrimitiveType::Void);
+    /// ANSI `INTERVAL YEAR`, stored as a signed month count aligned to whole years.
+    pub const INTERVAL_YEAR: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth(
+        IntervalYearToMonthType::IntervalYear,
+    ));
+    /// ANSI `INTERVAL MONTH`, stored as a signed month count.
+    pub const INTERVAL_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth(
+        IntervalYearToMonthType::IntervalMonth,
+    ));
+    /// ANSI `INTERVAL YEAR TO MONTH`, stored as a signed month count.
     pub const INTERVAL_YEAR_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth(
         IntervalYearToMonthType::IntervalYearToMonth,
     ));
@@ -3271,14 +3280,8 @@ mod tests {
     #[case("date", DataType::DATE)]
     #[case("timestamp", DataType::TIMESTAMP)]
     #[case("timestamp_ntz", DataType::TIMESTAMP_NTZ)]
-    #[case(
-        "interval year",
-        DataType::interval_year_month(IntervalYearToMonthType::IntervalYear)
-    )]
-    #[case(
-        "interval month",
-        DataType::interval_year_month(IntervalYearToMonthType::IntervalMonth)
-    )]
+    #[case("interval year", DataType::INTERVAL_YEAR)]
+    #[case("interval month", DataType::INTERVAL_MONTH)]
     #[case("interval year to month", DataType::INTERVAL_YEAR_MONTH)]
     #[case("interval day", DataType::INTERVAL_DAY_TIME)]
     #[case("interval hour", DataType::INTERVAL_DAY_TIME)]
@@ -3377,14 +3380,8 @@ mod tests {
     #[case("\"date\"", DataType::DATE)]
     #[case("\"timestamp\"", DataType::TIMESTAMP)]
     #[case("\"timestamp_ntz\"", DataType::TIMESTAMP_NTZ)]
-    #[case(
-        "\"interval year\"",
-        DataType::interval_year_month(IntervalYearToMonthType::IntervalYear)
-    )]
-    #[case(
-        "\"interval month\"",
-        DataType::interval_year_month(IntervalYearToMonthType::IntervalMonth)
-    )]
+    #[case("\"interval year\"", DataType::INTERVAL_YEAR)]
+    #[case("\"interval month\"", DataType::INTERVAL_MONTH)]
     #[case("\"interval year to month\"", DataType::INTERVAL_YEAR_MONTH)]
     #[case("\"interval day to second\"", DataType::INTERVAL_DAY_TIME)]
     #[case("\"variant\"", DataType::unshredded_variant())]
@@ -3422,26 +3419,14 @@ mod tests {
     #[test]
     fn test_nested_interval_year_month_schema_round_trips_exact_qualifiers() {
         let schema = StructType::try_new([
-            StructField::nullable(
-                "year",
-                PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYear),
-            ),
+            StructField::nullable("year", DataType::INTERVAL_YEAR),
             StructField::nullable(
                 "month_array",
-                ArrayType::new(
-                    PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
-                    true,
-                ),
+                ArrayType::new(DataType::INTERVAL_MONTH, true),
             ),
             StructField::nullable(
                 "full_map",
-                MapType::new(
-                    DataType::STRING,
-                    PrimitiveType::interval_year_month(
-                        IntervalYearToMonthType::IntervalYearToMonth,
-                    ),
-                    true,
-                ),
+                MapType::new(DataType::STRING, DataType::INTERVAL_YEAR_MONTH, true),
             ),
         ])
         .unwrap();

@@ -491,7 +491,7 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use delta_kernel::schema::{schema, IntervalYearToMonthType, StructField};
+    use delta_kernel::schema::{schema, StructField};
     #[cfg(feature = "geo-type-in-dev")]
     use delta_kernel::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
 
@@ -748,14 +748,8 @@ mod tests {
     fn visit_schema_encodes_interval_fields_with_generic_tags() {
         let schema = schema! {
             nullable "ym": INTERVAL_YEAR_MONTH,
-            (StructField::nullable(
-                "narrow_year",
-                DataType::interval_year_month(IntervalYearToMonthType::IntervalYear)
-            )),
-            (StructField::nullable(
-                "narrow_month",
-                DataType::interval_year_month(IntervalYearToMonthType::IntervalMonth)
-            )),
+            nullable "narrow_year": INTERVAL_YEAR,
+            nullable "narrow_month": INTERVAL_MONTH,
             not_null "dt": INTERVAL_DAY_TIME,
             nullable "nested": {
                 nullable "inner_ym": INTERVAL_YEAR_MONTH,

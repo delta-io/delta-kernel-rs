@@ -1281,13 +1281,13 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
     Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYearToMonth).unwrap()
 )]
 #[case::year(
-    DataType::interval_year_month(IntervalYearToMonthType::IntervalYear),
+    DataType::INTERVAL_YEAR,
     Scalar::interval_year_month(12, IntervalYearToMonthType::IntervalYear).unwrap(),
     Scalar::interval_year_month(12, IntervalYearToMonthType::IntervalYear).unwrap(),
     Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap()
 )]
 #[case::month(
-    DataType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
+    DataType::INTERVAL_MONTH,
     Scalar::interval_year_month(13, IntervalYearToMonthType::IntervalMonth).unwrap(),
     Scalar::interval_year_month(13, IntervalYearToMonthType::IntervalMonth).unwrap(),
     Scalar::interval_year_month(25, IntervalYearToMonthType::IntervalMonth).unwrap()

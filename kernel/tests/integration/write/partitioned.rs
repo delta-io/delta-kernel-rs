@@ -138,12 +138,12 @@ async fn test_write_partitioned_normal_values_roundtrip(
     "INTERVAL '2-6' YEAR TO MONTH"
 )]
 #[case::year(
-    DataType::interval_year_month(IntervalYearToMonthType::IntervalYear),
+    DataType::INTERVAL_YEAR,
     Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
     "INTERVAL '2' YEAR"
 )]
 #[case::month(
-    DataType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
+    DataType::INTERVAL_MONTH,
     Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
     "INTERVAL '30' MONTH"
 )]
@@ -228,7 +228,7 @@ async fn write_partitioned_interval_roundtrip(
 async fn test_write_rejects_qualifier_mismatch() -> Result<(), Box<dyn std::error::Error>> {
     let schema = schema_ref! {
         nullable "value": INTEGER,
-        nullable "period": (DataType::interval_year_month(IntervalYearToMonthType::IntervalYear)),
+        nullable "period": INTERVAL_YEAR,
     };
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let snapshot = create_interval_partitioned_table(
@@ -269,12 +269,12 @@ async fn test_write_rejects_qualifier_mismatch() -> Result<(), Box<dyn std::erro
     "INTERVAL '2-6' YEAR TO MONTH"
 )]
 #[case::year(
-    DataType::interval_year_month(IntervalYearToMonthType::IntervalYear),
+    DataType::INTERVAL_YEAR,
     Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
     "INTERVAL '2' YEAR"
 )]
 #[case::month(
-    DataType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
+    DataType::INTERVAL_MONTH,
     Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
     "INTERVAL '30' MONTH"
 )]
