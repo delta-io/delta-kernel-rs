@@ -840,8 +840,7 @@ impl TableConfiguration {
                 .has_table_feature(&"collations-preview".into())
     }
 
-    /// Whether any top-level column of the logical schema carries `delta.generationExpression`
-    /// metadata.
+    /// Returns `true` if the schema has generation expressions.
     ///
     /// Only top-level columns can be generated columns, so nested fields are ignored.
     pub(crate) fn has_generation_expressions(&self) -> bool {
