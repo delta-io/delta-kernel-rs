@@ -61,19 +61,24 @@ outputs. Each write returns `FfiDvWriteResult` with `offset`, `size_in_bytes`, a
 
 Each row-index slice is the **complete** vector, including previous deletions, not
 just newly deleted indexes. Indexes are zero-based physical row ordinals across the
-whole data file. Unsorted indexes and duplicates are accepted and deduplicated.
+whole data file, must not exceed `i64::MAX`, and must be below that file's physical
+row count. The serializer enforces the protocol's `i64::MAX` limit; the connector
+validates the file-specific bound. Unsorted indexes and duplicates are deduplicated.
 An empty slice, including `{NULL, 0}`, serializes an empty vector.
+Omitting earlier deletions when replacing a DV would make those rows visible again.
 
 ## Output ownership and errors
 
 `FfiDvWriterOutput` contains a caller-owned context and write/flush callbacks.
-Keep this record at a stable address, exclusively borrowed by the writer, until
-finalization or `free_dv_writer`. The callbacks run synchronously. Write receives
+Creation copies the record, so it may be moved, modified, or dropped after
+`new_dv_writer` returns, including when a helper used a stack-local record. The
+callbacks and the context they reference must remain valid until finalization or
+`free_dv_writer`. The callbacks run synchronously. Write receives
 borrowed bytes and returns the number accepted; partial writes are retried. Flush
 must return success. Callbacks report failures with `EngineExecResult` using the
 existing Rust-owned error-message convention.
 
-The serializer requires no Engine. Each entry point uses the supplied error
+The serializer requires no Engine. Each fallible entry point uses the supplied error
 allocator for its FFI result. The host retains ownership of the output and context.
 Callbacks must not unwind or re-enter the same writer. If the handle moves between
 threads, the output must support those sequential calls.
@@ -92,7 +97,11 @@ plus new deletions `{7}` must be supplied as `{1, 3, 7}`.
 
 After finalization, use the write results and the caller-selected output paths to
 build descriptors with `dv_descriptor_new`, then insert them into a descriptor map.
-Use Kernel-generated DV paths where appropriate; do not reimplement path encoding.
+The serializer FFI does not generate paths: the connector chooses a location and
+uploads the finalized output. For example, `dv_descriptor_new` accepts
+`KernelDvStorageType::PersistedAbsolute` with an absolute output URL. A connector
+choosing persisted-relative descriptors is responsible for that representation's
+path encoding; no FFI path-generator entry point is provided here.
 The existing update-table transaction API can stage that map together with new-file
 metadata and commit once. Resolving locations, merging prior DVs, and staging updates
 must use the same snapshot. On conflict, load a fresh snapshot and resolve again.
