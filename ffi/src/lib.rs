@@ -77,6 +77,7 @@ pub mod ffi_metrics;
 pub mod ffi_tracing;
 pub mod incremental_scan;
 pub mod log_path;
+pub mod log_segment;
 #[cfg(feature = "declarative-plans")]
 pub mod plans;
 pub mod scan;

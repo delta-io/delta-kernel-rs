@@ -579,7 +579,11 @@ impl Snapshot {
         SnapshotHint::from_snapshot(self)
     }
 
-    /// Log segment this snapshot uses
+    /// The log segment retained by this snapshot, without performing I/O.
+    ///
+    /// Its file paths and publication watermark describe retained state, not a fresh listing.
+    /// A staged path can remain present after its commit has been published. Callers that need
+    /// current publication information must refresh it separately.
     #[internal_api]
     pub(crate) fn log_segment(&self) -> &LogSegment {
         &self.log_segment
