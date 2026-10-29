@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use column_filter::StatsColumnFilter;
 pub(crate) use column_filter::StatsConfig;
 
-use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
+use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS, TIGHT_STATS};
 use crate::schema::{
     ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, StructField, StructType,
 };
@@ -76,6 +76,11 @@ use crate::KernelResult;
 /// accurately reflect the data in the file. When `false`, the file may have deletion vectors
 /// and the statistics haven't been recomputed to exclude deleted rows.
 ///
+/// When `config.tight_stats` is set (adaptiveMetadata tables), the schema also has a `tightStats`
+/// field. It has the same tight/wide meaning as `tightBounds` but also covers timestamp columns,
+/// whose bounds must then be at microsecond precision (rather than truncated down to milliseconds,
+/// as they are for `tightBounds`).
+///
 /// See the Delta protocol for more details on statistics:
 /// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics>
 ///
@@ -87,6 +92,7 @@ use crate::KernelResult;
 ///    minValues: <derived min/max schema>,
 ///    maxValues: <derived min/max schema>,
 ///    tightBounds: boolean,
+///    tightStats: boolean, // only when `config.tight_stats`
 /// }
 /// ```
 ///
@@ -150,7 +156,7 @@ pub(crate) fn expected_stats_schema(
     required_columns: Option<&[ColumnName]>,
     requested_columns: Option<&[ColumnName]>,
 ) -> KernelResult<Schema> {
-    let mut fields = Vec::with_capacity(5);
+    let mut fields = Vec::with_capacity(6);
     fields.push(StructField::nullable(NUM_RECORDS, DataType::LONG));
 
     // generate the base stats schema:
@@ -186,6 +192,9 @@ pub(crate) fn expected_stats_schema(
     // tightBounds indicates whether min/max statistics are accurate (true) or potentially
     // outdated due to deletion vectors (false)
     fields.push(StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN));
+    if config.tight_stats {
+        fields.push(StructField::nullable(TIGHT_STATS, DataType::BOOLEAN));
+    }
 
     StructType::try_new(fields)
 }
@@ -434,7 +443,6 @@ pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "geo-type-in-dev")]
     use rstest::rstest;
 
     use super::*;
@@ -488,6 +496,28 @@ mod tests {
         let expected = expected_stats(file_schema.clone(), file_schema);
 
         assert_eq!(&expected, &stats_schema);
+    }
+
+    #[rstest]
+    fn test_stats_schema_includes_tight_stats_only_when_configured(
+        #[values(false, true)] tight_stats: bool,
+    ) {
+        let file_schema = schema! { nullable "id": LONG };
+        let config = StatsConfig {
+            tight_stats,
+            ..Default::default()
+        };
+
+        let stats_schema = expected_stats_schema(&file_schema, &config, None, None).unwrap();
+        let mut expected_fields: Vec<_> = expected_stats(file_schema.clone(), file_schema)
+            .fields()
+            .cloned()
+            .collect();
+        if tight_stats {
+            expected_fields.push(StructField::nullable(TIGHT_STATS, DataType::BOOLEAN));
+        }
+
+        assert_eq!(StructType::try_new(expected_fields).unwrap(), stats_schema);
     }
 
     #[test]

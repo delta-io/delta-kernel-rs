@@ -116,6 +116,13 @@ pub(crate) const MAX_VALUES: &str = "maxValues";
 /// Whether the min/max/nullCount stats are tight or wide. Defaults to `true` when absent.
 #[internal_api]
 pub(crate) const TIGHT_BOUNDS: &str = "tightBounds";
+/// Whether the min/max/nullCount stats are tight or wide, like [`TIGHT_BOUNDS`], but also covering
+/// timestamp columns. [`TIGHT_BOUNDS`] excludes timestamps because Delta truncates their bounds
+/// down to milliseconds; when `tightStats` is present (`true` or `false`), timestamp bounds are
+/// written at microsecond precision instead. Only defined for adaptiveMetadata tables, where it
+/// defaults to `false` when absent.
+#[internal_api]
+pub(crate) const TIGHT_STATS: &str = "tightStats";
 
 /// Struct-encoded per-file statistics column (checkpoints with `writeStatsAsStruct=true`).
 #[internal_api]

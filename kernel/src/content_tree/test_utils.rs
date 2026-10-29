@@ -42,6 +42,7 @@ pub(crate) fn added_data_entry(
         record_count: num_records,
         file_size_in_bytes: size,
         content_stats: None,
+        tight_stats: None,
         manifest_info: None,
         key_metadata: None,
         split_offsets: None,
