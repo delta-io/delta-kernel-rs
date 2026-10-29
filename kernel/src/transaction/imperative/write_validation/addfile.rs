@@ -37,6 +37,7 @@ pub(crate) fn validate_add_files(
         .validate_batches(adds)
 }
 
+// TODO(#3757): Merge this validation into StagedDataValidator::for_add_files.
 /// Rejects batches with non-null clustering providers.
 pub(crate) fn validate_no_clustering_providers_set(
     batches: &[Box<dyn EngineData>],
