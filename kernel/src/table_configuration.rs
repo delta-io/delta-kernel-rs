@@ -1628,8 +1628,9 @@ mod test {
         MockProtocolBuilder::new().with_versions(1, 2).build(),
         WriteSupport::Supported
     )]
-    // No top-level generation expressions. A table that supports `generatedColumns` is still
-    // written only with `generated-columns-in-dev`.
+    // No top-level generation expressions. Writers must implement every table feature the protocol
+    // lists, even an unused one, so a table that supports `generatedColumns` is still written only
+    // with `generated-columns-in-dev`.
     #[case::no_generation_expression_with_feature(
         schema_ref! { nullable "event_time": TIMESTAMP },
         MockProtocolBuilder::new()
