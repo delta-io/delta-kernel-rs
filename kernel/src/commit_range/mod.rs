@@ -120,7 +120,7 @@ impl CommitRange {
         self.end_version
     }
 
-    /// Maximum catalog version plumbed through the commit range, if any.
+    /// Maximum catalog version for this commit range, if any.
     pub fn max_catalog_version(&self) -> Option<Version> {
         self.max_catalog_version
     }

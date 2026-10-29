@@ -258,11 +258,7 @@ pub unsafe extern "C" fn free_commit_range(commit_range: Handle<SharedCommitRang
     commit_range.drop_handle();
 }
 
-/// Return the maximum catalog version explicitly configured for a commit range, if any.
-///
-/// `OptionalValue::None` means no maximum was configured, even when the range end was inferred.
-/// The value is independent of the range end and is returned as a copy that remains valid after
-/// the range handle is released. This accessor performs no I/O.
+/// Return the maximum catalog version for a commit range, if any.
 ///
 /// # Safety
 ///
