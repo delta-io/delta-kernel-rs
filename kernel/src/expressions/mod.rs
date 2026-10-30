@@ -1498,36 +1498,21 @@ mod tests {
         }
 
         #[rstest::rstest]
-        #[case::if_simple(Expression::if_then_else(
-            column_expr!("flag").is_null(),
-            Expression::literal(0i64),
-            column_expr!("value"),
-        ))]
-        // IF(a IS NULL, 0, IF(a > 100, 100, a)) -- a typical clamp pattern.
-        #[case::if_nested(Expression::if_then_else(
-            column_expr!("a").is_null(),
-            Expression::literal(0i64),
-            Expression::if_then_else(
-                column_expr!("a").gt(Expression::literal(100i64)),
-                Expression::literal(100i64),
-                column_expr!("a"),
-            ),
-        ))]
-        #[case::multiple_branches(Expression::case_when(
-            [
-                (column_expr!("a").is_null(), Expression::literal(0)),
-                (column_expr!("a").gt(Expression::literal(100)), Expression::literal(100)),
-            ],
-            Some(column_expr!("a")),
-        ))]
-        #[case::no_else(Expression::case_when(
-            [(column_expr!("a").is_null(), Expression::literal(0))],
-            None,
-        ))]
-        #[case::empty_with_else(Expression::case_when([], Some(Expression::literal(0))))]
-        #[case::empty_without_else(Expression::case_when([], None))]
-        fn test_case_when_expression_roundtrip(#[case] expr: Expression) {
-            assert_roundtrip(&expr);
+        fn test_case_when_expression_roundtrip(
+            #[values(0, 1, 2)] num_branches: i32,
+            #[values(None, Some(Expression::literal(0)))] else_expr: Option<Expression>,
+        ) {
+            let branches = (0..num_branches).map(|i| {
+                (
+                    column_expr!("a").gt(Expression::literal(i)),
+                    Expression::if_then_else(
+                        column_expr!("flag").is_null(),
+                        Expression::literal(i),
+                        column_expr!("value"),
+                    ),
+                )
+            });
+            assert_roundtrip(&Expression::case_when(branches, else_expr));
         }
 
         #[test]

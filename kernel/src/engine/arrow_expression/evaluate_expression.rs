@@ -1002,7 +1002,8 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::expressions::{
-        column_expr, column_expr_ref, BinaryExpressionOp, Expression as Expr, Transform,
+        column_expr, column_expr_ref, column_pred, BinaryExpressionOp, Expression as Expr,
+        Transform,
     };
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -2636,121 +2637,23 @@ mod tests {
         assert_result_error_with_message(result, "Missing Struct fields");
     }
 
-    fn int_a_batch(values: Vec<Option<i32>>, nullable: bool) -> RecordBatch {
-        let schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, nullable)]);
-        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int32Array::from(values))]).unwrap()
-    }
-
-    fn flag_batch() -> RecordBatch {
-        let schema = ArrowSchema::new(vec![ArrowField::new("flag", ArrowDataType::Boolean, true)]);
-        let flag = BooleanArray::from(vec![Some(true), None, Some(false)]);
-        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(flag)]).unwrap()
-    }
-
-    #[rstest]
-    #[case::mixed_cond_per_row_select(
-        create_test_batch(),
-        Expr::if_then_else(
-            column_expr!("a").gt(Expr::literal(2_i32)),
-            Expr::literal(10_i32),
-            Expr::literal(20_i32),
-        ),
-        vec![20, 20, 10],
-    )]
-    #[case::short_circuit_all_true_skips_else(
-        create_test_batch(),
-        Expr::if_then_else(
-            column_expr!("a").gt(Expr::literal(0_i32)),
-            Expr::literal(7_i32),
-            Expr::literal("would-error-if-eager"),
-        ),
-        vec![7, 7, 7],
-    )]
-    #[case::short_circuit_all_false_skips_then(
-        create_test_batch(),
-        Expr::if_then_else(
-            column_expr!("a").lt(Expr::literal(0_i32)),
-            Expr::literal("would-error-if-eager"),
-            Expr::literal(9_i32),
-        ),
-        vec![9, 9, 9],
-    )]
-    #[case::null_condition_selects_else(
-        flag_batch(),
-        Expr::if_then_else(
-            Predicate::BooleanExpression(column_expr!("flag")),
-            Expr::literal(1_i32),
-            Expr::literal(2_i32),
-        ),
-        vec![1, 2, 2],
-    )]
-    #[case::nested_clamp(
-        int_a_batch(vec![Some(-5), Some(0), Some(50), Some(150)], false),
-        Expr::if_then_else(
-            column_expr!("a").lt(Expr::literal(0_i32)),
-            Expr::literal(0_i32),
-            Expr::if_then_else(
-                column_expr!("a").gt(Expr::literal(100_i32)),
-                Expr::literal(100_i32),
-                column_expr!("a"),
+    fn case_when_batch() -> RecordBatch {
+        RecordBatch::try_from_iter([
+            ("a", Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef),
+            (
+                "b",
+                Arc::new(Int32Array::from(vec![Some(10), None, Some(30)])),
             ),
-        ),
-        vec![0, 0, 50, 100],
-    )]
-    // batch.a = [1, 2, 3], batch.b = [10, 20, 30], batch.c = [100, 200, 300].
-    #[case::arithmetic_branches(
-        create_test_batch(),
-        Expr::if_then_else(
-            (column_expr!("a") + column_expr!("b")).gt(Expr::literal(20_i32)),
-            column_expr!("a") * column_expr!("c"),
-            column_expr!("b") - column_expr!("a"),
-        ),
-        vec![9, 400, 900], // 1+10=11<=20 -> b-a=9; 2+20=22>20 -> a*c=400; 3+30=33>20 -> 900
-    )]
-    #[case::empty_batch(
-        int_a_batch(vec![], false),
-        Expr::if_then_else(
-            column_expr!("a").gt(Expr::literal(0_i32)),
-            Expr::literal(1_i32),
-            Expr::literal(2_i32),
-        ),
-        vec![],
-    )]
-    fn test_evaluate_case_when_int_per_row(
-        #[case] batch: RecordBatch,
-        #[case] expr: Expr,
-        #[case] expected: Vec<i32>,
-    ) {
-        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
-        let arr = result.as_primitive::<Int32Type>();
-        assert_eq!(arr.values(), expected.as_slice());
-        assert_eq!(arr.data_type(), &ArrowDataType::Int32);
-    }
-
-    #[rstest]
-    #[case::else_type(Expr::if_then_else(
-        column_expr!("a").gt(Expr::literal(2_i32)),
-        Expr::literal(1_i32),
-        Expr::literal("text"),
-    ))]
-    #[case::when_type(Expr::case_when(
-        [
-            (column_expr!("a").gt(Expr::literal(2_i32)), Expr::literal(1_i32)),
-            (Predicate::literal(true), Expr::literal("text")),
-        ],
-        None,
-    ))]
-    fn test_evaluate_case_when_branch_type_mismatch_errors(#[case] expr: Expr) {
-        // Condition `a > 2` is mixed (false, false, true), so both branches must evaluate
-        // -- the type-mismatch check fires only when neither short-circuit applies.
-        let batch = create_test_batch();
-        let result = evaluate_expression(&expr, &batch, None);
-        assert_result_error_with_message(result, "CASE WHEN branches must have the same type");
+            (
+                "flag",
+                Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
+            ),
+        ])
+        .unwrap()
     }
 
     #[rstest]
     #[case::first_true_wins(
-        create_test_batch(),
         Expr::case_when(
             [
                 (column_expr!("a").gt(Expr::literal(1)), Expr::literal(10)),
@@ -2761,41 +2664,39 @@ mod tests {
         vec![Some(20), Some(10), Some(10)],
     )]
     #[case::null_condition_falls_through(
-        flag_batch(),
         Expr::case_when(
             [
-                (Predicate::BooleanExpression(column_expr!("flag")), Expr::literal(1)),
+                (column_pred!("flag"), Expr::literal(1)),
                 (Predicate::literal(true), Expr::literal(2)),
             ],
             None,
         ),
         vec![Some(1), Some(2), Some(2)],
     )]
+    #[case::null_condition_uses_else(
+        Expr::if_then_else(column_pred!("flag"), Expr::literal(1), Expr::literal(2)),
+        vec![Some(1), Some(2), Some(2)],
+    )]
     #[case::missing_else_returns_null(
-        create_test_batch(),
-        Expr::case_when(
-            [(column_expr!("a").gt(Expr::literal(2)), Expr::literal(10))],
-            None,
-        ),
+        Expr::case_when([(column_expr!("a").gt(Expr::literal(2)), Expr::literal(10))], None),
         vec![None, None, Some(10)],
     )]
     #[case::no_matches_without_else(
-        create_test_batch(),
         Expr::case_when([(Predicate::literal(false), Expr::unknown("unselected"))], None),
         vec![None, None, None],
     )]
+    #[case::no_matches_with_else(
+        Expr::if_then_else(
+            Predicate::literal(false), Expr::unknown("unselected"), Expr::literal(9),
+        ),
+        vec![Some(9), Some(9), Some(9)],
+    )]
     #[case::empty_branches_use_else(
-        create_test_batch(),
         Expr::case_when([], Some(Expr::literal(9))),
         vec![Some(9), Some(9), Some(9)],
     )]
-    #[case::empty_case_returns_null(
-        create_test_batch(),
-        Expr::case_when([], None),
-        vec![None, None, None],
-    )]
+    #[case::empty_case_returns_null(Expr::case_when([], None), vec![None, None, None])]
     #[case::selected_null_does_not_fall_through(
-        create_test_batch(),
         Expr::case_when(
             [
                 (Predicate::literal(true), Expr::null_literal(DataType::INTEGER)),
@@ -2806,7 +2707,6 @@ mod tests {
         vec![None, None, None],
     )]
     #[case::skip_unreachable_condition_and_else(
-        create_test_batch(),
         Expr::case_when(
             [
                 (Predicate::literal(true), Expr::literal(1)),
@@ -2817,7 +2717,6 @@ mod tests {
         vec![Some(1), Some(1), Some(1)],
     )]
     #[case::then_sees_only_selected_rows(
-        create_test_batch(),
         Expr::case_when(
             [(
                 column_expr!("a").ne(Expr::literal(1)),
@@ -2828,7 +2727,6 @@ mod tests {
         vec![Some(0), Some(10), Some(5)],
     )]
     #[case::else_sees_only_unmatched_rows(
-        create_test_batch(),
         Expr::case_when(
             [(column_expr!("a").eq(Expr::literal(1)), Expr::literal(0))],
             Some(Expr::literal(10) / (column_expr!("a") - Expr::literal(1))),
@@ -2836,7 +2734,6 @@ mod tests {
         vec![Some(0), Some(10), Some(5)],
     )]
     #[case::later_condition_sees_only_unmatched_rows(
-        create_test_batch(),
         Expr::case_when(
             [
                 (column_expr!("a").eq(Expr::literal(1)), Expr::literal(0)),
@@ -2851,7 +2748,6 @@ mod tests {
         vec![Some(0), Some(7), Some(9)],
     )]
     #[case::skip_branch_matching_only_already_selected_rows(
-        create_test_batch(),
         Expr::case_when(
             [
                 (column_expr!("a").lt(Expr::literal(3)), Expr::literal(10)),
@@ -2861,131 +2757,120 @@ mod tests {
         ),
         vec![Some(10), Some(10), Some(20)],
     )]
-    #[case::empty_batch_without_else(
-        int_a_batch(vec![], false),
-        Expr::case_when([], None),
-        vec![],
+    #[case::nested_if_then_else(
+        Expr::if_then_else(
+            column_expr!("a").lt(Expr::literal(2)), Expr::literal(0),
+            Expr::if_then_else(
+                column_expr!("a").gt(Expr::literal(2)), Expr::literal(100), column_expr!("a"),
+            ),
+        ),
+        vec![Some(0), Some(2), Some(100)],
     )]
-    fn test_evaluate_case_when_nullable_int(
-        #[case] batch: RecordBatch,
+    #[case::arithmetic_branches(
+        Expr::if_then_else(
+            (column_expr!("a") + column_expr!("a")).gt(Expr::literal(3)),
+            column_expr!("a") * column_expr!("b"), column_expr!("b") - column_expr!("a"),
+        ),
+        vec![Some(9), None, Some(90)],
+    )]
+    #[case::preserves_element_nulls(
+        Expr::if_then_else(
+            column_expr!("a").ge(Expr::literal(2)), column_expr!("b"), Expr::literal(0),
+        ),
+        vec![Some(0), None, Some(30)],
+    )]
+    fn test_evaluate_case_when(
         #[case] expr: Expr,
         #[case] expected: Vec<Option<i32>>,
+        #[values(false, true)] infer_type: bool,
     ) {
-        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
-        assert_eq!(
-            result.as_primitive::<Int32Type>().iter().collect_vec(),
-            expected,
-        );
+        let result_type = (!infer_type).then_some(&DataType::INTEGER);
+        let result = evaluate_expression(&expr, &case_when_batch(), result_type).unwrap();
+        assert_eq!(result.len(), expected.len());
+        if result.data_type() == &ArrowDataType::Null {
+            assert!(infer_type && expected.iter().all(Option::is_none));
+            assert_eq!(result.logical_null_count(), expected.len());
+        } else {
+            assert_eq!(
+                result.as_primitive::<Int32Type>().iter().collect_vec(),
+                expected
+            );
+        }
     }
 
     #[test]
-    fn test_evaluate_case_when_infers_null_fallback_type_from_selected_branch() {
-        let expr = Expr::case_when(
-            [(column_expr!("a").gt(Expr::literal(2)), Expr::literal(10))],
-            None,
-        );
-        let result = evaluate_expression(&expr, &create_test_batch(), None).unwrap();
-        assert_eq!(
-            result.as_primitive::<Int32Type>().iter().collect_vec(),
-            vec![None, None, Some(10)],
-        );
-    }
-
-    #[test]
-    fn test_evaluate_empty_case_when_without_result_type_returns_untyped_null() {
+    fn test_evaluate_empty_case_when_infers_null_type() {
         let result =
-            evaluate_expression(&Expr::case_when([], None), &create_test_batch(), None).unwrap();
-        assert_eq!(result.len(), 3);
-        assert_eq!(result.logical_null_count(), 3);
+            evaluate_expression(&Expr::case_when([], None), &case_when_batch(), None).unwrap();
         assert_eq!(result.data_type(), &ArrowDataType::Null);
     }
 
-    #[test]
-    fn test_evaluate_case_when_preserves_element_nulls() {
-        // a = [1, 2, 3] (non-null); b = [Some(10), None, Some(30)] (nullable). Condition
-        // a >= 2 is mixed, so both branches evaluate; the row where the chosen branch is
-        // itself NULL must produce NULL in the output. Kept separate from the rstest above
-        // because the assertion shape uses `Vec<Option<i32>>` rather than `Vec<i32>`.
-        let schema = ArrowSchema::new(vec![
-            ArrowField::new("a", ArrowDataType::Int32, false),
-            ArrowField::new("b", ArrowDataType::Int32, true),
-        ]);
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(Int32Array::from(vec![Some(10), None, Some(30)])),
-            ],
-        )
-        .unwrap();
-        let expr = Expr::if_then_else(
-            column_expr!("a").ge(Expr::literal(2_i32)),
-            column_expr!("b"),
-            Expr::literal(0_i32),
-        );
+    #[rstest]
+    fn test_evaluate_case_when_empty_batch(
+        #[values(None, Some(Expr::literal(2)))] else_expr: Option<Expr>,
+    ) {
+        let batch = case_when_batch().slice(0, 0);
+        let expr = Expr::case_when([(column_pred!("flag"), Expr::literal(1))], else_expr);
         let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
-        // a=1 -> else (0); a=2 -> then (b=NULL); a=3 -> then (b=30)
-        assert_eq!(
-            result
-                .as_primitive::<Int32Type>()
-                .iter()
-                .collect::<Vec<_>>(),
-            vec![Some(0), None, Some(30)]
+        assert_eq!(result.len(), 0);
+        assert_eq!(result.data_type(), &ArrowDataType::Int32);
+    }
+
+    #[rstest]
+    fn test_evaluate_case_when_branch_type_mismatch_errors(#[values(false, true)] use_else: bool) {
+        let mut branches = vec![(column_expr!("a").gt(Expr::literal(2)), Expr::literal(1))];
+        let text = Expr::literal("text");
+        let fallback = if use_else {
+            Some(text)
+        } else {
+            branches.push((Predicate::literal(true), text));
+            None
+        };
+        let result = evaluate_expression(
+            &Expr::case_when(branches, fallback),
+            &case_when_batch(),
+            None,
         );
+        assert_result_error_with_message(result, "CASE WHEN branches must have the same type");
     }
 
     #[rstest]
     #[case::explicit_else(
-        Some(Expr::struct_from([Expr::literal(0_i32)])),
-        vec![true, true, true],
-        vec![Some(0), None, Some(30)],
+        Some(Expr::struct_from([Expr::literal(0)])),
+        vec![true, true, true], vec![Some(0), None, Some(30)],
     )]
-    #[case::implicit_null_else(
-        None,
-        vec![false, true, true],
-        vec![None, None, Some(30)],
-    )]
+    #[case::implicit_null_else(None, vec![false, true, true], vec![None, None, Some(30)])]
     fn test_evaluate_case_when_struct_branches_preserve_nulls(
         #[case] else_expr: Option<Expr>,
         #[case] valid: Vec<bool>,
         #[case] expected: Vec<Option<i32>>,
     ) {
-        let schema = ArrowSchema::new(vec![
-            ArrowField::new("a", ArrowDataType::Int32, false),
-            ArrowField::new("b", ArrowDataType::Int32, true),
-        ]);
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(Int32Array::from(vec![Some(10), None, Some(30)])),
-            ],
-        )
-        .unwrap();
-        let struct_ty = DataType::Struct(Box::new(
-            StructType::try_new([StructField::nullable("value", DataType::INTEGER)]).unwrap(),
-        ));
+        let struct_type = StructType::try_new([StructField::nullable("value", DataType::INTEGER)])
+            .unwrap()
+            .into();
         let expr = Expr::case_when(
             [(
-                column_expr!("a").ge(Expr::literal(2_i32)),
+                column_expr!("a").ge(Expr::literal(2)),
                 Expr::struct_from([column_expr!("b")]),
             )],
             else_expr,
         );
-        let result = evaluate_expression(&expr, &batch, Some(&struct_ty)).unwrap();
-        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
-
-        assert_eq!(structs.len(), 3);
-        for (row, valid) in valid.into_iter().enumerate() {
-            assert_eq!(structs.is_valid(row), valid);
-        }
+        let result = evaluate_expression(&expr, &case_when_batch(), Some(&struct_type)).unwrap();
+        let structs = result.as_struct();
+        assert_eq!(structs.len(), valid.len());
+        assert_eq!(
+            (0..structs.len())
+                .map(|row| structs.is_valid(row))
+                .collect_vec(),
+            valid
+        );
         assert_eq!(
             structs
                 .column(0)
                 .as_primitive::<Int32Type>()
                 .iter()
-                .collect::<Vec<_>>(),
-            expected,
+                .collect_vec(),
+            expected
         );
     }
 }

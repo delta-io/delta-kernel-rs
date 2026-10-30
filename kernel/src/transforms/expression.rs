@@ -689,130 +689,78 @@ mod tests {
         }
     }
 
-    #[rstest::rstest]
-    #[case::no_match_returns_borrowed(
-        Expr::if_then_else(column_pred!("x"), column_expr!("y"), Expr::literal(42)),
-        Expr::if_then_else(column_pred!("x"), column_expr!("y"), Expr::literal(42)),
-        true,
-    )]
-    #[case::all_arms_rewritten(
-        Expr::if_then_else(
-            column_pred!("old_col"),
-            column_expr!("old_col"),
-            column_expr!("old_col"),
-        ),
-        Expr::if_then_else(
-            column_pred!("new_col"),
-            column_expr!("new_col"),
-            column_expr!("new_col"),
-        ),
-        false,
-    )]
-    #[case::condition_arm_only(
-        Expr::if_then_else(column_pred!("old_col"), Expr::literal(1), Expr::literal(0)),
-        Expr::if_then_else(column_pred!("new_col"), Expr::literal(1), Expr::literal(0)),
-        false,
-    )]
-    #[case::then_arm_only(
-        Expr::if_then_else(column_pred!("flag"), column_expr!("old_col"), Expr::literal(0)),
-        Expr::if_then_else(column_pred!("flag"), column_expr!("new_col"), Expr::literal(0)),
-        false,
-    )]
-    #[case::else_arm_only(
-        Expr::if_then_else(column_pred!("flag"), Expr::literal(1), column_expr!("old_col")),
-        Expr::if_then_else(column_pred!("flag"), Expr::literal(1), column_expr!("new_col")),
-        false,
-    )]
-    #[case::later_branch_rewritten(
+    fn case_when_columns(names: [&str; 5]) -> Expr {
+        let [c1, r1, c2, r2, fallback] = names.map(|name| Expr::column([name]));
         Expr::case_when(
             [
-                (column_pred!("flag"), Expr::literal(0)),
-                (column_pred!("old_col"), column_expr!("old_col")),
+                (Pred::BooleanExpression(c1), r1),
+                (Pred::BooleanExpression(c2), r2),
             ],
-            None,
-        ),
-        Expr::case_when(
-            [
-                (column_pred!("flag"), Expr::literal(0)),
-                (column_pred!("new_col"), column_expr!("new_col")),
-            ],
-            None,
-        ),
-        false,
-    )]
-    #[case::empty_case_returns_borrowed(
-        Expr::case_when([], None),
-        Expr::case_when([], None),
-        true,
-    )]
-    fn test_transform_expr_case_when_recursion(
-        #[case] input: Expr,
-        #[case] expected: Expr,
-        #[case] expect_borrowed: bool,
-    ) {
-        let result = ColumnReplacer.transform_expr(&input);
-        if expect_borrowed {
-            assert!(matches!(result, Cow::Borrowed(_)));
-        } else {
-            assert!(matches!(result, Cow::Owned(_)));
-        }
-        assert_eq!(result.into_owned(), expected);
+            Some(fallback),
+        )
     }
 
     #[rstest::rstest]
-    #[case::condition_drops_pair(
-        Expr::case_when(
-            [
-                (column_pred!("dropped_col"), Expr::literal(1)),
-                (column_pred!("flag"), Expr::literal(2)),
-            ],
-            Some(Expr::literal(0)),
-        ),
-        Expr::case_when([(column_pred!("flag"), Expr::literal(2))], Some(Expr::literal(0))),
-    )]
-    #[case::result_drops_pair(
-        Expr::case_when(
-            [
-                (column_pred!("flag"), column_expr!("dropped_col")),
-                (column_pred!("other_flag"), Expr::literal(2)),
-            ],
-            Some(Expr::literal(0)),
-        ),
-        Expr::case_when([(column_pred!("other_flag"), Expr::literal(2))], Some(Expr::literal(0))),
-    )]
-    #[case::else_becomes_implicit_null(
-        Expr::case_when(
-            [(column_pred!("flag"), Expr::literal(1))],
-            Some(column_expr!("dropped_col")),
-        ),
-        Expr::case_when([(column_pred!("flag"), Expr::literal(1))], None),
-    )]
-    #[case::all_pairs_dropped_keep_else(
-        Expr::case_when(
-            [(column_pred!("dropped_col"), Expr::literal(1))],
-            Some(Expr::literal(0)),
-        ),
-        Expr::case_when([], Some(Expr::literal(0))),
-    )]
-    #[case::all_children_dropped_becomes_null(
-        Expr::case_when(
-            [(column_pred!("dropped_col"), column_expr!("dropped_col"))],
-            Some(column_expr!("dropped_col")),
-        ),
-        Expr::case_when([], None),
-    )]
-    fn test_transform_expr_case_when_filters_children(#[case] input: Expr, #[case] expected: Expr) {
-        struct ColumnRemover;
-        impl<'a> ExpressionTransform<'a> for ColumnRemover {
+    #[case::first_condition(&[0])]
+    #[case::first_result(&[1])]
+    #[case::second_condition(&[2])]
+    #[case::second_result(&[3])]
+    #[case::else_expr(&[4])]
+    #[case::all_children(&[0, 1, 2, 3, 4])]
+    #[case::no_match(&[])]
+    fn test_transform_expr_case_when_recursion(#[case] changed: &[usize]) {
+        let names = std::array::from_fn(|i| if changed.contains(&i) { "old_col" } else { "x" });
+        let input = case_when_columns(names);
+        let expected =
+            case_when_columns(names.map(|name| if name == "old_col" { "new_col" } else { name }));
+        let result = ColumnReplacer.transform_expr(&input);
+        assert_eq!(matches!(result, Cow::Borrowed(_)), changed.is_empty());
+        assert_eq!(result.into_owned(), expected);
+    }
+
+    #[test]
+    fn test_transform_empty_case_when_returns_borrowed() {
+        let expr = Expr::case_when([], None);
+        assert!(matches!(
+            ColumnReplacer.transform_expr(&expr),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[rstest::rstest]
+    #[case::condition_drops_pair(&["c1"], &[1], true)]
+    #[case::result_drops_pair(&["r1"], &[1], true)]
+    #[case::else_becomes_implicit_null(&["fallback"], &[0, 1], false)]
+    #[case::all_pairs_dropped_keep_else(&["c1", "c2"], &[], true)]
+    #[case::all_children_dropped_becomes_null(&["c1", "r1", "c2", "r2", "fallback"], &[], false)]
+    fn test_transform_expr_case_when_filters_children(
+        #[case] dropped: &[&str],
+        #[case] retained: &[usize],
+        #[case] keep_else: bool,
+    ) {
+        struct ColumnRemover<'a>(&'a [&'a str]);
+        impl<'a> ExpressionTransform<'a> for ColumnRemover<'_> {
             transform_output_type!(|'a, T| Option<Cow<'a, T>>);
             fn transform_expr_column(
                 &mut self,
                 name: &'a ColumnName,
             ) -> Option<Cow<'a, ColumnName>> {
-                (name != &ColumnName::new(["dropped_col"])).then_some(Cow::Borrowed(name))
+                (!self
+                    .0
+                    .iter()
+                    .any(|dropped| name == &ColumnName::new([*dropped])))
+                .then_some(Cow::Borrowed(name))
             }
         }
-        let result = ColumnRemover.transform_expr(&input).unwrap();
+        let input = case_when_columns(["c1", "r1", "c2", "r2", "fallback"]);
+        let Expr::CaseWhen(case_when) = &input else {
+            panic!("expected CASE WHEN")
+        };
+        let expected = Expr::case_when(
+            retained.iter().map(|&i| case_when.branches[i].clone()),
+            keep_else.then(|| column_expr!("fallback")),
+        );
+        let result = ColumnRemover(dropped).transform_expr(&input).unwrap();
         assert!(matches!(result, Cow::Owned(_)));
         assert_eq!(result.into_owned(), expected);
     }
@@ -826,32 +774,11 @@ mod tests {
                 self.0.push(name.clone());
             }
         }
-        let expr = Expr::case_when(
-            [
-                (
-                    column_pred!("first_condition"),
-                    column_expr!("first_result"),
-                ),
-                (
-                    column_pred!("second_condition"),
-                    column_expr!("second_result"),
-                ),
-            ],
-            Some(column_expr!("fallback")),
-        );
+        let names = ["c1", "r1", "c2", "r2", "fallback"];
+        let expr = case_when_columns(names);
         let mut collector = ColumnCollector(Vec::new());
         collector.transform_expr(&expr);
-        assert_eq!(
-            collector.0,
-            [
-                "first_condition",
-                "first_result",
-                "second_condition",
-                "second_result",
-                "fallback",
-            ]
-            .map(|name| ColumnName::new([name]))
-        );
+        assert_eq!(collector.0, names.map(|name| ColumnName::new([name])));
     }
 
     #[test]
