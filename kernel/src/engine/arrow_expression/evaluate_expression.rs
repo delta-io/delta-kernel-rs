@@ -2681,21 +2681,6 @@ mod tests {
         Expr::case_when([(column_expr!("a").gt(Expr::literal(2)), Expr::literal(10))], None),
         vec![None, None, Some(10)],
     )]
-    #[case::no_matches_without_else(
-        Expr::case_when([(Predicate::literal(false), Expr::unknown("unselected"))], None),
-        vec![None, None, None],
-    )]
-    #[case::no_matches_with_else(
-        Expr::if_then_else(
-            Predicate::literal(false), Expr::unknown("unselected"), Expr::literal(9),
-        ),
-        vec![Some(9), Some(9), Some(9)],
-    )]
-    #[case::empty_branches_use_else(
-        Expr::case_when([], Some(Expr::literal(9))),
-        vec![Some(9), Some(9), Some(9)],
-    )]
-    #[case::empty_case_returns_null(Expr::case_when([], None), vec![None, None, None])]
     #[case::selected_null_does_not_fall_through(
         Expr::case_when(
             [
@@ -2786,34 +2771,31 @@ mod tests {
     ) {
         let result_type = (!infer_type).then_some(&DataType::INTEGER);
         let result = evaluate_expression(&expr, &case_when_batch(), result_type).unwrap();
-        assert_eq!(result.len(), expected.len());
-        if result.data_type() == &ArrowDataType::Null {
-            assert!(infer_type && expected.iter().all(Option::is_none));
-            assert_eq!(result.logical_null_count(), expected.len());
-        } else {
-            assert_eq!(
-                result.as_primitive::<Int32Type>().iter().collect_vec(),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn test_evaluate_empty_case_when_infers_null_type() {
-        let result =
-            evaluate_expression(&Expr::case_when([], None), &case_when_batch(), None).unwrap();
-        assert_eq!(result.data_type(), &ArrowDataType::Null);
+        assert_eq!(result.to_data(), Int32Array::from(expected).to_data());
     }
 
     #[rstest]
-    fn test_evaluate_case_when_empty_batch(
-        #[values(None, Some(Expr::literal(2)))] else_expr: Option<Expr>,
+    fn test_evaluate_case_when_without_matches(
+        #[values(0, 1)] num_branches: usize,
+        #[values(None, Some(9))] else_value: Option<i32>,
+        #[values(0, 3)] num_rows: usize,
+        #[values(None, Some(&DataType::INTEGER))] result_type: Option<&DataType>,
     ) {
-        let batch = case_when_batch().slice(0, 0);
-        let expr = Expr::case_when([(column_pred!("flag"), Expr::literal(1))], else_expr);
-        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
-        assert_eq!(result.len(), 0);
-        assert_eq!(result.data_type(), &ArrowDataType::Int32);
+        let branches = (0..num_branches).map(|_| {
+            (
+                column_expr!("a").lt(Expr::literal(0)),
+                Expr::unknown("unselected"),
+            )
+        });
+        let expr = Expr::case_when(branches, else_value.map(Expr::literal));
+        let batch = case_when_batch().slice(0, num_rows);
+        let result = evaluate_expression(&expr, &batch, result_type).unwrap();
+        let expected: ArrayRef = if result_type.is_none() && else_value.is_none() {
+            new_null_array(&ArrowDataType::Null, num_rows)
+        } else {
+            Arc::new(Int32Array::from(vec![else_value; num_rows]))
+        };
+        assert_eq!(result.to_data(), expected.to_data());
     }
 
     #[rstest]
