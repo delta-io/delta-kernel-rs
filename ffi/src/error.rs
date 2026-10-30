@@ -239,7 +239,7 @@ impl<T: ExternEngine + ?Sized> AllocateError for &T {
         etype: FFIKernelError,
         msg: KernelStringSlice,
     ) -> *mut EngineError {
-        self.error_allocator().allocate_error(etype, msg)
+        unsafe { self.error_allocator().allocate_error(etype, msg) }
     }
 }
 

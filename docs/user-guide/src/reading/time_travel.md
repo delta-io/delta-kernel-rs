@@ -126,7 +126,7 @@ let updated = Snapshot::builder_from(snapshot)
 
 ## Getting the timestamp of a version
 
-`Snapshot` exposes `get_timestamp`, which returns the timestamp of the
+`SnapshotReader` exposes `get_timestamp`, which returns the timestamp of the
 snapshot's version in milliseconds since the Unix epoch. When the table has
 In-Commit Timestamps (ICT) enabled, the method returns the ICT value stored
 inside the commit. Otherwise, it falls back to the filesystem's last-modified
@@ -147,7 +147,7 @@ let snapshot = Snapshot::builder_for(&url)
     .at_version(5)
     .build(&engine)?;
 
-let timestamp_ms = snapshot.get_timestamp(&engine)?;
+let timestamp_ms = snapshot.reader().get_timestamp(&engine)?;
 println!("Version {} was committed at {} ms", snapshot.version(), timestamp_ms);
 # Ok(())
 # }

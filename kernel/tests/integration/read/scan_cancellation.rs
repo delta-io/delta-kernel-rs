@@ -70,6 +70,27 @@ async fn precancelled_scan_yields_cancelled(
     Ok(())
 }
 
+#[tokio::test]
+async fn precancelled_snapshot_reader_yields_cancelled() -> KernelResult<()> {
+    let (storage, table_root) = json_only_table().await?;
+    let engine = DefaultEngineBuilder::new(storage).build();
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+
+    let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
+    let result = snapshot
+        .reader()
+        .with_cancellation_token(token)
+        .get_app_id_version("missing-app", &engine);
+    assert!(matches!(result, Err(KernelError::Cancelled)));
+    assert_eq!(
+        snapshot
+            .reader()
+            .get_app_id_version("missing-app", &engine)?,
+        None
+    );
+    Ok(())
+}
+
 /// Asserts that `scan_metadata` reports cancellation before producing any data.
 fn assert_cancelled<
     I: Iterator<Item = delta_kernel::KernelResult<delta_kernel::scan::ScanMetadata>>,

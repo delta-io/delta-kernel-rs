@@ -52,7 +52,7 @@ fn assert_ict_state(
         );
     }
 
-    let ict = snapshot.get_in_commit_timestamp(engine)?;
+    let ict = snapshot.reader().get_in_commit_timestamp(engine)?;
     if expect_enabled {
         let ts = ict.expect("ICT should be present when enabled");
         assert!(

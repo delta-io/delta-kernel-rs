@@ -1704,7 +1704,7 @@ mod tests {
         };
         use crate::{snapshot_publish_with_committer, Handle, NullableCvoid, OptionalValue};
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         extern "C" fn test_uc_commit(
             context: NullableCvoid,
             request: CommitRequest,
@@ -2165,11 +2165,15 @@ mod tests {
             assert_eq!(unsafe { version_and_free(ok_or_panic(result)) }, 0);
             let snapshot = Snapshot::builder_for(table_url).build(&test_engine)?;
             assert_eq!(
-                snapshot.get_app_id_version("app_id1", &test_engine)?,
+                snapshot
+                    .reader()
+                    .get_app_id_version("app_id1", &test_engine)?,
                 Some(1)
             );
             assert_eq!(
-                snapshot.get_app_id_version("app_id2", &test_engine)?,
+                snapshot
+                    .reader()
+                    .get_app_id_version("app_id2", &test_engine)?,
                 Some(2)
             );
         }
@@ -3668,7 +3672,10 @@ mod tests {
         };
         build_and_commit(builder, &engine);
         let snapshot = Snapshot::builder_for(table_url).build(&test_engine)?;
-        let infos = snapshot.get_clustering_column_infos(&test_engine)?.unwrap();
+        let infos = snapshot
+            .reader()
+            .get_clustering_column_infos(&test_engine)?
+            .unwrap();
         assert_eq!(infos.len(), 3);
         assert_eq!(
             infos[0].logical_column,

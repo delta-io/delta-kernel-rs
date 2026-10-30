@@ -195,7 +195,8 @@ pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
 pub use error::{
-    DeltaErrorCondition, Error, KernelError, KernelResult, KernelResultIterator, Result,
+    DeltaError, DeltaErrorCondition, DeltaErrorParameter, Error, KernelError, KernelResult,
+    KernelResultIterator, Result,
 };
 use expressions::Scalar;
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
@@ -203,7 +204,7 @@ pub use log_compaction::{should_compact, LogCompactionWriter};
 #[cfg(feature = "declarative-plans")]
 pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
 use schema::StructField;
-pub use snapshot::{Snapshot, SnapshotRef};
+pub use snapshot::{Snapshot, SnapshotReader, SnapshotRef};
 
 #[cfg(any(
     feature = "default-engine-base",
