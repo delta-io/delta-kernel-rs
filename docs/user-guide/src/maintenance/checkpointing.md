@@ -170,6 +170,21 @@ if stats.commits_since_checkpoint >= interval {
 See [Version Checksums](./version_checksums.md) for the recommended full
 post-commit pattern that includes writing a CRC file before checkpointing.
 
+## Checkpoint protection
+
+The `checkpointProtection` table feature protects checkpoints and version history across
+table feature removal.
+
+> [!NOTE]
+> Support is gated by the `delta_kernel` Cargo feature `checkpoint-protection`. Enable it
+> only if your connector satisfies all of the feature's [writer requirements].
+
+These requirements cover preserving protected checkpoints, validating the protocol at the
+version being checkpointed, and safely cleaning up version history. Kernel does not perform
+metadata cleanup; your connector is responsible for making its cleanup comply with the feature.
+
+[writer requirements]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/checkpoint-protection.md#writer-requirements-for-checkpoint-protection
+
 ## Log compaction
 
 **Log compaction** aggregates multiple commit JSON files into a single compacted file,
