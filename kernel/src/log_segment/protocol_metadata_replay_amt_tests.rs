@@ -1382,6 +1382,8 @@ async fn snapshot_on_checkpoint_reads_last_manifest_commit_from_commit_file(
     assert_eq!(snapshot.log_segment().checkpoint_version, Some(0));
     let result = snapshot.last_manifest_commit(&engine);
     if delete_commit_file {
+        // TODO(#3683): when the checkpoint is a standalone checkpoint, read lastManifestCommit
+        // from it instead of failing on the missing commit file.
         assert!(matches!(result, Err(KernelError::MissingVersion(0))));
     } else {
         assert_eq!(

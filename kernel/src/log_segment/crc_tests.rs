@@ -3,12 +3,10 @@
 //! Each test sets up an in-memory Delta log with V2 checkpoint JSONs, commit files, and CRC files,
 //! then verifies that Protocol & Metadata loading and ICT reads resolve correctly.
 
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use std::cmp::Ordering;
 use std::collections::HashMap;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use std::iter;
 use std::sync::Arc;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use std::sync::LazyLock;
 
 use rstest::rstest;
 use serde_json::{json, Value};
@@ -28,6 +26,8 @@ use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
 use crate::path::ParsedLogPath;
 use crate::snapshot::{IncrementalReplay, SnapshotBuilder, SnapshotRef};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::table_configuration::TableConfiguration;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_features::TableFeature;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -161,6 +161,26 @@ fn amt_checkpoint_action(checkpoint_version: i64, p: Protocol, m: Metadata) -> V
         { "protocol": serde_json::to_value(&p).unwrap() },
         { "metaData": serde_json::to_value(&m).unwrap() },
     ] })
+}
+
+// A manifest commit's actions: a `commitInfo` whose `lastManifestCommit` names `version` and
+// `content_root_version`, then `actions`, then a checkpoint action at `content_root_version`
+// carrying `protocol` and `metadata`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn manifest_commit_actions(
+    version: u64,
+    content_root_version: i64,
+    protocol: Protocol,
+    metadata: Metadata,
+    actions: impl IntoIterator<Item = Value>,
+) -> Vec<Value> {
+    let commit_info = last_manifest_commit_info(version as i64, content_root_version);
+    let checkpoint = amt_checkpoint_action(content_root_version, protocol, metadata);
+    [commit_info]
+        .into_iter()
+        .chain(actions)
+        .chain([checkpoint])
+        .collect()
 }
 
 fn add(path: &str, size: i64) -> serde_json::Value {
@@ -313,10 +333,10 @@ impl CrcReadTest {
         metadata: Metadata,
         actions: impl IntoIterator<Item = serde_json::Value>,
     ) -> Self {
-        let commit_info = last_manifest_commit_info(version as i64, content_root_version);
-        let checkpoint = amt_checkpoint_action(content_root_version, protocol, metadata);
-        let actions = [commit_info].into_iter().chain(actions).chain([checkpoint]);
-        self.commit(version, actions)
+        self.commit(
+            version,
+            manifest_commit_actions(version, content_root_version, protocol, metadata, actions),
+        )
     }
 
     fn crc(
@@ -852,45 +872,30 @@ async fn test_lagging_checkpoint_action_defers_to_crc_pm() {
 // actions once a CRC bounds the replay. Otherwise the snapshot follows the newest commit's pointer.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[rstest]
-#[case::pointed_commit_after_crc(1)]
-#[case::pointed_commit_at_crc(0)]
+#[case::pointed_commit_after_crc(pm_commit_actions(), self_pointing_manifest_commit(1), 1)]
+#[case::pointed_commit_at_crc(
+    self_pointing_manifest_commit(0),
+    vec![last_manifest_commit_info(0, 0)],
+    0
+)]
 #[tokio::test]
-async fn test_crc_seeded_replay_follows_pointer_to_checkpoint_action(#[case] pointed_version: u64) {
-    let config = adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
-    let pm_actions = || {
-        [
-            protocol(config.protocol().clone()),
-            metadata(config.metadata().clone()),
-        ]
-    };
-    // Commits before the manifest commit carry the P&M, and commits after it point at it.
-    let commit_at = |test: CrcReadTest, version: u64| match version.cmp(&pointed_version) {
-        Ordering::Less => test.commit(
-            version,
-            iter::once(commit_info(DEFAULT_OPERATION, None)).chain(pm_actions()),
-        ),
-        Ordering::Equal => test.manifest_commit(
-            version,
-            version as i64,
+async fn test_crc_seeded_replay_follows_pointer_to_checkpoint_action(
+    #[case] v0: Vec<Value>,
+    #[case] v1: Vec<Value>,
+    #[case] pointed_version: i64,
+) {
+    let config = &*POINTER_TEST_CONFIG;
+    let test = CrcReadTest::new()
+        .commit(0, v0)
+        .crc(
+            0,
             config.protocol().clone(),
             config.metadata().clone(),
-            pm_actions(),
-        ),
-        Ordering::Greater => test.commit(
-            version,
-            [last_manifest_commit_info(
-                pointed_version as i64,
-                pointed_version as i64,
-            )],
-        ),
-    };
-    let test = commit_at(CrcReadTest::new(), 0).crc(
-        0,
-        config.protocol().clone(),
-        config.metadata().clone(),
-        1000, // AMT config enables ICT, so the CRC must carry an inCommitTimestampOpt.
-    );
-    let test = commit_at(test, 1).build().await;
+            1000, // AMT config enables ICT, so the CRC must carry an inCommitTimestampOpt.
+        )
+        .commit(1, v1)
+        .build()
+        .await;
     test.assert_p_m(None, config.protocol(), config.metadata());
     let captured = test
         .captured_checkpoint_action()
@@ -898,14 +903,45 @@ async fn test_crc_seeded_replay_follows_pointer_to_checkpoint_action(#[case] poi
     let replay_reads_pointed_action = pointed_version == 1 && !cfg!(feature = "declarative-plans");
     assert_eq!(
         captured,
-        replay_reads_pointed_action.then_some(pointed_version as i64)
+        replay_reads_pointed_action.then_some(pointed_version)
     );
     let (snapshot, _) = test.snapshot_at(None);
     let action = snapshot.latest_checkpoint_action(&test.engine).unwrap();
-    assert_eq!(
-        action.map(|action| action.version),
-        Some(pointed_version as i64)
-    );
+    assert_eq!(action.map(|action| action.version), Some(pointed_version));
+}
+
+// One config shared by a test's cases and body, since each new config gets a fresh Metadata id.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+static POINTER_TEST_CONFIG: LazyLock<TableConfiguration> = LazyLock::new(|| {
+    adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[])
+});
+
+// A commit carrying commitInfo and [`POINTER_TEST_CONFIG`]'s P&M as top-level actions.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn pm_commit_actions() -> Vec<Value> {
+    let config = &*POINTER_TEST_CONFIG;
+    vec![
+        commit_info(DEFAULT_OPERATION, None),
+        protocol(config.protocol().clone()),
+        metadata(config.metadata().clone()),
+    ]
+}
+
+// A manifest commit at `version` whose content root is at `version` too, carrying
+// [`POINTER_TEST_CONFIG`]'s P&M as top-level actions and in its checkpoint action.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn self_pointing_manifest_commit(version: i64) -> Vec<Value> {
+    let config = &*POINTER_TEST_CONFIG;
+    manifest_commit_actions(
+        version as u64,
+        version,
+        config.protocol().clone(),
+        config.metadata().clone(),
+        [
+            protocol(config.protocol().clone()),
+            metadata(config.metadata().clone()),
+        ],
+    )
 }
 
 // A CRC at the target version short-circuits before any replay, so no checkpoint action is
