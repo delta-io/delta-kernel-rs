@@ -34,7 +34,7 @@ use crate::table_properties::TableProperties;
 use crate::utils::{require, to_file_size};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::{Engine, Version, create_row};
-use crate::{EngineData, FileMeta, KernelError, KernelResult, RowVisitor as _};
+use crate::{EngineData, FileMeta, KernelError, KernelResult, Result, RowVisitor as _};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
@@ -490,7 +490,7 @@ impl Metadata {
     /// return [`KernelError::MalformedJson`]. The original parser failure is retained as a cause
     /// of the Delta error.
     #[internal_api]
-    pub(crate) fn parse_schema(&self) -> KernelResult<StructType> {
+    pub(crate) fn parse_schema(&self) -> Result<StructType> {
         // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
         crate::schema::decoding::decode_schema(&self.schema_string).map_err(
             |(error, diagnostic)| {
@@ -510,11 +510,14 @@ impl Metadata {
                     "Table schema is too deeply nested: decoding metaData.schemaString exceeded \
                      serde_json's recursion limit: {error}"
                 ))
-                .with_backtrace()
+                    .with_backtrace()
+                    .into()
                 } else if is_unsupported_delta_type_error(&error) {
-                    KernelError::schema(error.to_string()).with_backtrace()
+                    KernelError::schema(error.to_string())
+                        .with_backtrace()
+                        .into()
                 } else {
-                    error.into()
+                    KernelError::from(error).into()
                 }
             },
         )
@@ -2323,7 +2326,10 @@ mod tests {
                     "recursion limit: recursion limit exceeded"
                 ),
             );
-            let error = match result.unwrap_err() {
+            let crate::Error::Kernel(error) = result.unwrap_err() else {
+                panic!("expected Kernel error")
+            };
+            let error = match error {
                 KernelError::Backtraced { source, .. } => *source,
                 error => error,
             };
@@ -2379,7 +2385,10 @@ mod tests {
         };
         // Error conversion captures a backtrace only when enabled, so normalize both forms before
         // checking the underlying error.
-        let error = match metadata.parse_schema().unwrap_err() {
+        let crate::Error::Kernel(error) = metadata.parse_schema().unwrap_err() else {
+            panic!("expected Kernel error")
+        };
+        let error = match error {
             KernelError::Backtraced { source, .. } => *source,
             error => error,
         };
