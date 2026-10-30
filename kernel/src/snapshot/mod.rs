@@ -441,6 +441,17 @@ impl Snapshot {
             Some((crc, crc_source)) => PmResolution::from_crc(crc, *crc_source),
             None => log_segment
                 .read_protocol_metadata_opt(engine, base_crc.as_ref())
+                .map_err(|error| match (&error, log_segment.checkpoint_version) {
+                    (KernelError::FileNotFound(_), Some(checkpoint)) => {
+                        crate::Error::from(crate::DeltaError::log_file_not_found(
+                            log_segment.end_version,
+                            checkpoint,
+                            &log_segment.log_root,
+                            error,
+                        ))
+                    }
+                    _ => crate::Error::Kernel(error),
+                })
                 .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?,
         };
 

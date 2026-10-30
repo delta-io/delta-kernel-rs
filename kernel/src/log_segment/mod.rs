@@ -623,11 +623,28 @@ impl LogSegment {
             (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
         };
 
+        let checkpoint_version = listed_files.checkpoint_parts.first().map(|file| file.version);
+        let first_replay_version = listed_files.ascending_commit_files.iter()
+            .find(|file| checkpoint_version.is_none_or(|checkpoint| file.version > checkpoint))
+            .map(|file| file.version);
+        let target_version = time_travel_version.or_else(|| {
+            listed_files.ascending_commit_files.last().map(|file| file.version)
+        });
         let table_root = log_root.join("../").map_err(crate::KernelError::from)?;
-        LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint).map_err(
+        LogSegment::try_new(listed_files, log_root.clone(), time_travel_version, checkpoint_hint).map_err(
             |error| match error {
                 KernelError::EmptyLog if time_travel_version.is_none() => {
                     crate::DeltaError::path_does_not_exist(table_root, error).into()
+                }
+                KernelError::MissingVersion(missing)
+                    if checkpoint_version.and_then(|version| version.checked_add(1)) == Some(missing)
+                        && first_replay_version.is_some_and(|version| version > missing) => {
+                    match (target_version, checkpoint_version) {
+                        (Some(target), Some(checkpoint)) => crate::DeltaError::log_file_not_found(
+                            target, checkpoint, &log_root, error,
+                        ).into(),
+                        _ => error.into(),
+                    }
                 }
                 other => other.into(),
             },

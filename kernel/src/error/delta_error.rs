@@ -36,6 +36,26 @@ pub struct DeltaErrorParameter {
 }
 
 impl DeltaError {
+    /// Reports missing replay files for `version` after `checkpoint_version` in `log_path`.
+    /// The original listing or read failure remains available as the diagnostic source.
+    pub(crate) fn log_file_not_found(
+        version: crate::Version,
+        checkpoint_version: crate::Version,
+        log_path: impl ToString,
+        source: super::KernelError,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaLogFileNotFound,
+            vec![
+                DeltaErrorParameter::new("version", version),
+                DeltaErrorParameter::new("checkpointVersion", checkpoint_version),
+                DeltaErrorParameter::new("logPath", log_path),
+            ],
+            Some(Box::new(source)),
+        )
+    }
+
+
     /// Constructs a catalog error for downstream tests without migrating a production call site.
     ///
     /// `values` supplies one string per catalog parameter in template order. `source` is an
