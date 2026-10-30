@@ -11,7 +11,7 @@ use crate::path::ParsedLogPath;
 use crate::schema::{SchemaRef, lazy_schema_ref};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{Operation, ensure_table_can_be_read};
-use crate::{Engine, FileDataReadResultIterator, KernelError, KernelResult, Version};
+use crate::{Engine, FileDataReadResultIterator, KernelError, KernelResult, Result, Version};
 
 /// A Delta log action kind.
 ///
@@ -70,7 +70,7 @@ impl CommitAction {
         read_schema: SchemaRef,
         seed_protocol: Option<Protocol>,
         seed_metadata: Option<Metadata>,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         let timestamp = log_path.location.last_modified;
         let mut this = Self {
             table_root,

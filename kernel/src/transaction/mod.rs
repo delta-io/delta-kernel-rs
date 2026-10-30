@@ -1329,7 +1329,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         file_meta: FileMeta,
         crc_delta: CrcDelta,
         #[cfg(feature = "adaptive-metadata-in-dev")] checkpoint_action: Option<CheckpointAction>,
-    ) -> KernelResult<CommittedTransaction> {
+    ) -> Result<CommittedTransaction> {
         let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
 
         let commit_version = parsed_commit.version;
@@ -1357,7 +1357,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
                 let log_root = self
                     .effective_table_config
                     .table_root()
-                    .join("_delta_log/")?;
+                    .join("_delta_log/")
+                    .map_err(KernelError::from)?;
                 let log_segment = LogSegment::new_for_version_zero(log_root, parsed_commit)?;
                 let crc = crc_delta.into_complete_crc(0).ok_or_else(|| {
                     KernelError::internal_error(
@@ -1977,10 +1978,7 @@ mod tests {
         }
     }
 
-    fn create_dv_transaction(
-        snapshot: Arc<Snapshot>,
-        engine: &dyn Engine,
-    ) -> KernelResult<Transaction> {
+    fn create_dv_transaction(snapshot: Arc<Snapshot>, engine: &dyn Engine) -> Result<Transaction> {
         snapshot
             .update_table(UpdateTableOperation::Delete, "test_engine", true)
             .build(engine, Box::new(FileSystemCommitter::new()))
@@ -2019,7 +2017,7 @@ mod tests {
     }
 
     #[test]
-    fn test_new_deletion_vector_path() -> KernelResult<()> {
+    fn test_new_deletion_vector_path() -> Result<()> {
         let engine = SyncEngine::new();
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
@@ -2055,7 +2053,7 @@ mod tests {
     }
 
     #[test]
-    fn write_state_reflects_schema_configured_on_builder() -> KernelResult<()> {
+    fn write_state_reflects_schema_configured_on_builder() -> Result<()> {
         let (engine, snapshot) = setup_non_dv_table();
         let txn = snapshot
             .clone()
@@ -2245,7 +2243,7 @@ mod tests {
             base: &Transaction,
             schema: StructType,
             writer_features: impl IntoIterator<Item = TableFeature>,
-        ) -> KernelResult<TableConfiguration> {
+        ) -> Result<TableConfiguration> {
             let metadata = base
                 .effective_table_config
                 .metadata()
@@ -2338,7 +2336,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_context_schemas_exclude_partition_columns() -> KernelResult<()> {
+    fn test_write_context_schemas_exclude_partition_columns() -> Result<()> {
         let engine = SyncEngine::new();
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -2640,7 +2638,7 @@ mod tests {
     /// Tests that update_deletion_vectors validates table protocol requirements.
     /// Validates that attempting DV updates on unsupported tables returns protocol error.
     #[test]
-    fn test_update_deletion_vectors_unsupported_table() -> KernelResult<()> {
+    fn test_update_deletion_vectors_unsupported_table() -> Result<()> {
         let (engine, snapshot) = setup_non_dv_table();
         let mut txn = create_dv_transaction(snapshot, &engine)?;
 
@@ -2680,7 +2678,7 @@ mod tests {
     /// Tests that update_deletion_vectors validates DV descriptors match scan files.
     /// Validates detection of mismatch between provided DV descriptors and actual files.
     #[test]
-    fn test_update_deletion_vectors_mismatch_count() -> KernelResult<()> {
+    fn test_update_deletion_vectors_mismatch_count() -> Result<()> {
         let (engine, snapshot) = setup_dv_enabled_table();
         let mut txn = create_dv_transaction(snapshot, &engine)?;
 
@@ -2704,7 +2702,7 @@ mod tests {
 
     /// Tests that a mismatch after scanning some files does not leave staged DV updates behind.
     #[test]
-    fn test_update_deletion_vectors_mismatch_does_not_mutate_transaction() -> KernelResult<()> {
+    fn test_update_deletion_vectors_mismatch_does_not_mutate_transaction() -> Result<()> {
         let (engine, snapshot) = setup_dv_enabled_table();
         let mut txn = create_dv_transaction(snapshot.clone(), &engine)?;
         let scan = snapshot.scan_builder().build()?;
@@ -2748,7 +2746,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_deletion_vectors_iter_error_does_not_mutate_transaction() -> KernelResult<()> {
+    fn test_update_deletion_vectors_iter_error_does_not_mutate_transaction() -> Result<()> {
         let (engine, snapshot) = setup_dv_enabled_table();
         let mut txn = create_dv_transaction(snapshot.clone(), &engine)?;
         txn.staged_data_changes
@@ -2797,7 +2795,7 @@ mod tests {
     /// Tests that update_deletion_vectors handles empty DV updates correctly as a no-op.
     /// This edge case occurs when a DELETE operation matches no rows.
     #[test]
-    fn test_update_deletion_vectors_empty_inputs() -> KernelResult<()> {
+    fn test_update_deletion_vectors_empty_inputs() -> Result<()> {
         let (engine, snapshot) = setup_dv_enabled_table();
         let mut txn = create_dv_transaction(snapshot, &engine)?;
 
@@ -2813,7 +2811,7 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_dv_inputs_do_not_require_row_tracking_acknowledgment() -> KernelResult<()> {
+    fn unmatched_dv_inputs_do_not_require_row_tracking_acknowledgment() -> Result<()> {
         let (engine, snapshot) = setup_dv_enabled_table();
         let mut txn = create_dv_transaction(snapshot.clone(), &engine)?;
         let scan = snapshot.scan_builder().build()?;
@@ -3111,7 +3109,10 @@ mod tests {
         // If it fails, it should NOT be an InvalidTransactionState error
         if let Err(e) = result {
             assert!(
-                !matches!(e, KernelError::InvalidTransactionState(_)),
+                !matches!(
+                    e,
+                    crate::Error::Kernel(KernelError::InvalidTransactionState(_))
+                ),
                 "Blind append validation should have passed, got: {e}"
             );
         }
@@ -3436,7 +3437,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::KernelError::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
+            crate::Error::Kernel(crate::KernelError::Generic(e)) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
         ));
     }
 
@@ -3455,7 +3456,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::KernelError::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
+            crate::Error::Kernel(crate::KernelError::Generic(e)) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
         ));
     }
 

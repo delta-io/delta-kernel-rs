@@ -46,7 +46,7 @@ use crate::table_features::{
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
-use crate::{KernelError, KernelResult, Version};
+use crate::{KernelError, KernelResult, Result, Version};
 
 /// Logical and physical schemas for the structured statistics emitted by a scan.
 ///
@@ -270,10 +270,7 @@ fn build_stats_schema_for_columns(
     Ok(strip_metadata(schema))
 }
 
-fn validate_partition_columns(
-    metadata: &Metadata,
-    logical_schema: &StructType,
-) -> KernelResult<()> {
+fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) -> Result<()> {
     let mut seen = HashSet::new();
     for col in metadata.partition_columns() {
         if !seen.insert(col) {
@@ -285,7 +282,9 @@ fn validate_partition_columns(
         }
         require!(
             logical_schema.field(col).is_some(),
-            KernelError::generic(format!("Partition column '{col}' not found in schema"))
+            crate::Error::Kernel(KernelError::generic(format!(
+                "Partition column '{col}' not found in schema"
+            )))
         );
     }
     Ok(())
@@ -348,7 +347,7 @@ impl TableConfiguration {
         protocol: Protocol,
         table_root: Url,
         version: Version,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         let logical_schema = Arc::new(metadata.parse_schema()?);
         Self::try_new_inner(metadata, protocol, table_root, version, logical_schema)
     }
@@ -359,7 +358,7 @@ impl TableConfiguration {
         base: &Self,
         metadata: Metadata,
         logical_schema: SchemaRef,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         Self::try_new_inner(
             metadata,
             base.protocol.clone(),
@@ -375,7 +374,7 @@ impl TableConfiguration {
         table_root: Url,
         version: Version,
         logical_schema: SchemaRef,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
@@ -428,9 +427,9 @@ impl TableConfiguration {
         require!(
             !(table_config.table_properties.enable_row_tracking == Some(true)
                 && table_config.is_row_tracking_suspended()),
-            KernelError::invalid_protocol(
+            crate::Error::Kernel(KernelError::invalid_protocol(
                 "Row tracking cannot be enabled and suspended at the same time"
-            )
+            ))
         );
 
         // Validate schema against protocol features now that we have a TC instance.
@@ -471,7 +470,7 @@ impl TableConfiguration {
         new_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
         new_version: Version,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         // simplest case: no new P/M, just return the existing table configuration with new version
         if new_metadata.is_none() && new_protocol.is_none() {
             return Ok(Self {
@@ -511,7 +510,7 @@ impl TableConfiguration {
         new_version: Version,
         new_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         Self::try_new_from(table_configuration, new_metadata, new_protocol, new_version)
     }
 

@@ -100,7 +100,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         ),
         err
     )]
-    pub fn commit(self, engine: &dyn Engine) -> KernelResult<CommitResult<STATE>> {
+    pub fn commit(self, engine: &dyn Engine) -> Result<CommitResult<STATE>> {
         let commit_start = Instant::now();
 
         // === Pre-commit validation ===
@@ -223,7 +223,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         post_commit_inputs: PostCommitInputs,
         prepare_duration: Duration,
         committer_duration: Duration,
-    ) -> KernelResult<CommitResult<STATE>> {
+    ) -> Result<CommitResult<STATE>> {
         match commit_response {
             Ok(CommitResponse::Committed { file_meta }) => {
                 let PostCommitInputs {
@@ -271,7 +271,7 @@ impl<STATE> Transaction<STATE, Imperative> {
                     .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
                 Ok(CommitResult::Retryable(self.into_retryable(e)))
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -1093,7 +1093,7 @@ mod tests {
         DeletionVectorUpdate,
     }
 
-    fn set_append_only(txn: &mut Transaction, enabled: bool) -> KernelResult<()> {
+    fn set_append_only(txn: &mut Transaction, enabled: bool) -> Result<()> {
         let metadata = txn
             .effective_table_config
             .metadata()

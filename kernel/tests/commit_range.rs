@@ -7,7 +7,7 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::commit_range::{CommitAction, CommitOrdering, CommitRange, DeltaAction};
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-use delta_kernel::{Engine, KernelResult, Snapshot, Version};
+use delta_kernel::{Engine, KernelResult, Result, Snapshot, Version};
 use test_utils::create_default_engine;
 use url::Url;
 
@@ -68,7 +68,7 @@ fn reads_all_commits_in_requested_order(
     let actions = [DeltaAction::Add, DeltaAction::Remove];
     let commits = range
         .commits(engine.clone(), Some(anchor_snapshot), &actions)?
-        .collect::<KernelResult<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
     assert_eq!(commits.len(), expected_per_commit.len(), "commit count");
 
     for (commit, (expected_version, expected_counts)) in

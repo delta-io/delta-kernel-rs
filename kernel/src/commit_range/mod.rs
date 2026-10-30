@@ -71,7 +71,7 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Version};
+use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Result, Version};
 
 /// A range of Delta commits, holding resolved `[start_version, end_version]` bounds plus the
 /// materialized commit-file pointers in `commit_files`.
@@ -183,37 +183,37 @@ impl CommitRange {
         engine: Arc<dyn Engine>,
         start_snapshot: Option<SnapshotRef>,
         actions: &[DeltaAction],
-    ) -> KernelResult<impl KernelResultIterator<CommitAction> + use<>> {
+    ) -> Result<impl Iterator<Item = Result<CommitAction>> + Send + use<>> {
         require!(
             self.supports_commit_actions,
-            KernelError::CommitRange(
+            crate::Error::Kernel(KernelError::CommitRange(
                 "Commit action iteration is not supported for this range".to_string()
-            )
+            ))
         );
         if actions.is_empty() {
-            return Err(KernelError::CommitRange(
+            return Err(crate::Error::Kernel(KernelError::CommitRange(
                 "at least one DeltaAction must be requested".to_string(),
-            ));
+            )));
         }
 
         let (latest_protocol, latest_metadata) = match &start_snapshot {
             Some(snapshot) => {
                 if snapshot.table_root() != &self.table_root {
-                    return Err(KernelError::CommitRange(format!(
+                    return Err(crate::Error::Kernel(KernelError::CommitRange(format!(
                         "snapshot table root ({}) does not match commit range table root ({})",
                         snapshot.table_root(),
                         self.table_root,
-                    )));
+                    ))));
                 }
                 let (anchor_version, anchor_name) = match self.commit_ordering {
                     CommitOrdering::AscendingOrder => (self.start_version, "start_version"),
                     CommitOrdering::DescendingOrder => (self.end_version, "end_version"),
                 };
                 if snapshot.version() != anchor_version {
-                    return Err(KernelError::CommitRange(format!(
+                    return Err(crate::Error::Kernel(KernelError::CommitRange(format!(
                         "snapshot version {} does not match {anchor_name} ({anchor_version})",
                         snapshot.version(),
-                    )));
+                    ))));
                 }
                 let table_config = snapshot.table_configuration();
                 table_config.ensure_operation_supported(Operation::Scan)?;
@@ -313,7 +313,7 @@ impl CommitActionsIterator {
     /// Commits below the anchor are validated/timestamped best-effort against only their own
     /// actions. Another solution is to walk the commit in ascending then reversing in the
     /// [`CommitOrdering::DescendingOrder`] scenario.
-    fn try_advance(&mut self, log_path: ParsedLogPath) -> KernelResult<CommitAction> {
+    fn try_advance(&mut self, log_path: ParsedLogPath) -> Result<CommitAction> {
         let version = log_path.version;
         let commit_action = CommitAction::try_new(
             self.engine.as_ref(),
@@ -323,7 +323,10 @@ impl CommitActionsIterator {
             self.latest_protocol.clone(),
             self.latest_metadata.clone(),
         )
-        .map_err(|e| with_version_context(version, e))?;
+        .map_err(|e| match e {
+            crate::Error::Kernel(e) => with_version_context(version, e).into(),
+            other => other,
+        })?;
 
         match self.commit_ordering {
             CommitOrdering::AscendingOrder => {
@@ -354,7 +357,7 @@ fn with_version_context(version: Version, err: KernelError) -> KernelError {
 }
 
 impl Iterator for CommitActionsIterator {
-    type Item = KernelResult<CommitAction>;
+    type Item = Result<CommitAction>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let log_path = self.log_path_iter.next()?;
@@ -473,7 +476,7 @@ mod tests {
         let collected = range
             .commits(engine, Some(anchor_snapshot), &actions)
             .unwrap()
-            .collect::<KernelResult<Vec<_>>>()
+            .collect::<Result<Vec<_>>>()
             .unwrap();
 
         assert_eq!(collected.len(), 2, "yield one CommitAction per commit");
@@ -500,7 +503,10 @@ mod tests {
         }
         let result = commits.next().unwrap();
         if cancelled {
-            assert!(matches!(result, Err(KernelError::Cancelled)));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::Cancelled))
+            ));
         } else {
             assert_eq!(result.unwrap().version(), 0);
         }
@@ -805,7 +811,7 @@ mod tests {
         engine: Arc<dyn Engine>,
         start_snapshot: Option<SnapshotRef>,
         actions: &[DeltaAction],
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         for commit_res in range.commits(engine.clone(), start_snapshot, actions)? {
             let commit = commit_res?;
             for batch_res in commit.get_actions(engine.as_ref())? {
@@ -852,7 +858,10 @@ mod tests {
         let actions = [DeltaAction::Add, DeltaAction::Remove];
         let err = drain_commits(&range, engine, Some(anchor_snapshot), &actions)
             .expect_err("v=1 reader version must be rejected");
-        assert!(is_expected_err(&err), "unexpected error variant: {err:?}");
+        assert!(
+            matches!(&err, crate::Error::Kernel(error) if is_expected_err(error)),
+            "unexpected error variant: {err:?}"
+        );
     }
 
     #[rstest::rstest]
@@ -944,7 +953,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             err,
-            KernelError::CommitRange(message) if message.contains(expected_anchor_name)
+            crate::Error::Kernel(KernelError::CommitRange(message)) if message.contains(expected_anchor_name)
         ));
     }
 
@@ -965,7 +974,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             err,
-            KernelError::CommitRange(message) if message.contains("table root")
+            crate::Error::Kernel(KernelError::CommitRange(message)) if message.contains("table root")
         ));
     }
 
@@ -978,7 +987,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             err,
-            KernelError::CommitRange(message) if message.contains("DeltaAction")
+            crate::Error::Kernel(KernelError::CommitRange(message)) if message.contains("DeltaAction")
         ));
     }
 
@@ -1113,7 +1122,7 @@ mod tests {
         if expects_unsupported {
             let err = result.expect_err("commit-driven validation must reject");
             assert!(
-                matches!(err, KernelError::Unsupported(_)),
+                matches!(err, crate::Error::Kernel(KernelError::Unsupported(_))),
                 "expected KernelError::Unsupported, got: {err:?}",
             );
         } else {
@@ -1142,7 +1151,7 @@ mod tests {
         let v0_result = iter.next().expect("v=0 commit yield slot");
         match v0_result {
             Ok(_) => panic!("v=0 must reject during iter.next()"),
-            Err(KernelError::Unsupported(msg)) => {
+            Err(crate::Error::Kernel(KernelError::Unsupported(msg))) => {
                 assert!(msg.contains("futureFeature"), "got: {msg}")
             }
             Err(other) => panic!("expected KernelError::Unsupported, got: {other:?}"),
@@ -1328,7 +1337,10 @@ mod tests {
         let commits = range.commits(engine, None, &[DeltaAction::Protocol]);
         match expected_commits_err {
             Some(msg) => {
-                assert!(matches!(commits, Err(KernelError::CommitRange(_))));
+                assert!(matches!(
+                    commits,
+                    Err(crate::Error::Kernel(KernelError::CommitRange(_)))
+                ));
                 assert_result_error_with_message(commits, msg);
             }
             None => {

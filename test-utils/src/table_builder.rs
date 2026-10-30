@@ -1454,7 +1454,7 @@ async fn write_data_commit<E: TaskExecutor>(
     rows_per_file: usize,
     partition_columns: &[String],
     version: u64,
-) -> KernelResult<delta_kernel::transaction::CommitResult> {
+) -> Result<delta_kernel::transaction::CommitResult> {
     let logical_schema = snapshot.schema().clone();
     let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(logical_schema.as_ref())
         .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
