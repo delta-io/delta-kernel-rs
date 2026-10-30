@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use url::Url;
 
+use crate::arrow::array::{AsArray as _, RecordBatch};
 /// Encodes manifest deletion vector positions as a Mumbling bitmap.
 pub(crate) use crate::content_tree::mumbling::tests::encode_positions as mumbling_bitmap;
-use crate::arrow::array::{AsArray as _, RecordBatch};
 use crate::content_tree::{
     AMT_FORMAT_VERSION, ContentTreeNodeEntry, DataContentType, DataFileFormat, DeletionVectorInfo,
     ManifestInfo, TrackingInfo, TrackingStatus,
