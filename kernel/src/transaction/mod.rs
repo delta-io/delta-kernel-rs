@@ -20,6 +20,8 @@ use crate::path::{LogRoot, ParsedLogPath};
 use crate::scan::log_replay::STATS_NAME;
 pub use crate::scan::log_replay::{CLUSTERING_PROVIDER_NAME, TAGS_NAME};
 use crate::schema::void_utils::validate_schema_for_write;
+#[cfg(feature = "generated-columns-in-dev")]
+use crate::schema::GeneratedColumn;
 use crate::schema::{
     lazy_schema_ref, ColumnDefault, MapType, SchemaRef, SchemaStructPatchBuilder, StructField,
 };
@@ -332,6 +334,10 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     // constraints.
     #[cfg(feature = "check-constraints-in-dev")]
     check_constraints_acknowledged: bool,
+    // Whether the connector acknowledged responsibility for enforcing this table's generated
+    // columns.
+    #[cfg(feature = "generated-columns-in-dev")]
+    generated_columns_acknowledged: bool,
     // Whether the connector acknowledged responsibility for preserving Row IDs and Row Commit
     // Versions.
     row_tracking_preservation_acknowledged: bool,
@@ -411,6 +417,43 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     #[cfg(feature = "check-constraints-in-dev")]
     pub fn ack_check_constraints(&mut self) {
         self.check_constraints_acknowledged = true;
+    }
+
+    /// The effective [`GeneratedColumn`]s of this transaction, in schema order. Empty when the
+    /// table has none.
+    ///
+    /// Each generated column's value is defined by a SQL expression over the row's other columns.
+    /// See [`Self::ack_generated_columns`] for what a connector must do before writing to a table
+    /// with generated columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a schema error if a generated column's `delta.generationExpression` metadata is not
+    /// a string.
+    #[cfg(feature = "generated-columns-in-dev")]
+    pub fn generated_columns(&self) -> KernelResult<Vec<GeneratedColumn>> {
+        self.effective_table_config.generated_columns()
+    }
+
+    /// Acknowledges that the connector enforces this table's generated columns.
+    ///
+    /// Only the connector sees the rows it writes, so the connector evaluates generation
+    /// expressions. It must:
+    /// - Discover the generated columns of this transaction via [`Self::generated_columns`] and
+    ///   parse each one's [`raw_sql`](GeneratedColumn::raw_sql) itself. The SQL refers to logical
+    ///   column names.
+    /// - Compute each generated column from its expression when the write omits the column.
+    /// - Make every written row, including its partition values, satisfy `(<value> <=> <generation
+    ///   expression>) IS TRUE` for each generated column. `<=>` is null-safe equality, so a `NULL`
+    ///   value matches a `NULL` expression result. This includes files written for an earlier
+    ///   commit attempt, such as one that conflicted, and validated against an older table version.
+    ///
+    /// The acknowledgement covers whatever this transaction commits. Without it,
+    /// [`write_state`](Transaction::write_state) and [`commit`](Self::commit) fail whenever this
+    /// transaction has effective generated columns.
+    #[cfg(feature = "generated-columns-in-dev")]
+    pub fn ack_generated_columns(&mut self) {
+        self.generated_columns_acknowledged = true;
     }
 
     /// Replaces operation metrics recorded in `commitInfo`.
@@ -621,12 +664,15 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// configuration.
     ///
     /// Returns an error if the table has an empty or unsupported schema, or if the table declares
-    /// column defaults or CHECK constraints that the connector has not acknowledged.
+    /// column defaults, CHECK constraints, or generated columns that the connector has not
+    /// acknowledged.
     pub fn write_state(&self) -> KernelResult<Arc<WriteState>> {
         self.ensure_schema_non_empty_for_write_state()?;
         self.ensure_column_defaults_acknowledged()?;
         #[cfg(feature = "check-constraints-in-dev")]
         self.ensure_check_constraints_acknowledged()?;
+        #[cfg(feature = "generated-columns-in-dev")]
+        self.ensure_generated_columns_acknowledged()?;
         self.validate_for_data_write()?;
         // The effective table configuration can change while building a transaction, so this
         // state must be derived on demand rather than cached on the transaction. TODO(#3149):
@@ -702,6 +748,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             column_defaults_acknowledged: false,
             #[cfg(feature = "check-constraints-in-dev")]
             check_constraints_acknowledged: false,
+            #[cfg(feature = "generated-columns-in-dev")]
+            generated_columns_acknowledged: false,
             row_tracking_preservation_acknowledged: false,
             is_blind_append: false,
             #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1001,6 +1049,21 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         Ok(())
     }
 
+    /// Fails `write_state` and `commit` when this transaction has effective generated columns that
+    /// the connector hasn't acknowledged.
+    #[cfg(feature = "generated-columns-in-dev")]
+    fn ensure_generated_columns_acknowledged(&self) -> KernelResult<()> {
+        require!(
+            self.generated_columns_acknowledged
+                || self.effective_table_config.generated_columns()?.is_empty(),
+            KernelError::invalid_transaction_state(
+                "Writing to a table with generated columns requires calling \
+                 Transaction::ack_generated_columns() first",
+            )
+        );
+        Ok(())
+    }
+
     fn ensure_row_tracking_preservation_acknowledged(&self) -> KernelResult<()> {
         if !self
             .effective_table_config
@@ -1142,6 +1205,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
 
         #[cfg(feature = "check-constraints-in-dev")]
         self.ensure_check_constraints_acknowledged()?;
+        #[cfg(feature = "generated-columns-in-dev")]
+        self.ensure_generated_columns_acknowledged()?;
 
         // TODO(zach): we currently do this in two passes - can we do it in one and still keep refs
         // in the HashSet?
@@ -1638,6 +1703,8 @@ mod tests {
             column_defaults_acknowledged,
             #[cfg(feature = "check-constraints-in-dev")]
             check_constraints_acknowledged,
+            #[cfg(feature = "generated-columns-in-dev")]
+            generated_columns_acknowledged,
             row_tracking_preservation_acknowledged,
             is_blind_append,
             #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1672,6 +1739,8 @@ mod tests {
         assert!(!column_defaults_acknowledged);
         #[cfg(feature = "check-constraints-in-dev")]
         assert!(!check_constraints_acknowledged);
+        #[cfg(feature = "generated-columns-in-dev")]
+        assert!(!generated_columns_acknowledged);
         assert!(!row_tracking_preservation_acknowledged);
         assert!(!is_blind_append);
         assert!(dv_matched_files.is_empty());

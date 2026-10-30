@@ -364,10 +364,15 @@ static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
+// Enabled whenever the writer protocol supports it, even if no column declares a generation
+// expression.
 static GENERATED_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 4)),
     feature_requirements: &[],
+    #[cfg(feature = "generated-columns-in-dev")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "generated-columns-in-dev"))]
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };

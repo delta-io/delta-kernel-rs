@@ -110,6 +110,10 @@ If the table declares CHECK constraints, acknowledge that your connector enforce
 requesting write state. See [Check constraints](./check_constraints.md) for discovery and
 validation.
 
+If the table has generated columns, acknowledge that your connector enforces them before requesting
+write state. See [Generated columns](./generated_columns.md) for discovery, computing, and
+verification.
+
 Before writing data, obtain a `WriteState` from the transaction. Bind the state to create a
 `BoundWriteContext`, which bundles everything needed to correctly write Parquet files:
 

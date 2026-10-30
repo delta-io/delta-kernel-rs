@@ -34,6 +34,10 @@ pub(crate) use column_default::{try_collect_column_defaults, validate_column_def
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
+#[cfg(feature = "generated-columns-in-dev")]
+pub(crate) mod generated_column;
+#[cfg(feature = "generated-columns-in-dev")]
+pub use generated_column::GeneratedColumn;
 
 pub(crate) mod collation_utils;
 #[cfg(feature = "internal-api")]
@@ -518,6 +522,27 @@ impl StructField {
         self.metadata.get(key.as_ref())
     }
 
+    /// Returns this field's `key` metadata as a string, or `None` when the field has no such
+    /// metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a schema error if the metadata is present but not a [`MetadataValue::String`].
+    pub(crate) fn get_string_config_value(
+        &self,
+        key: &ColumnMetadataKey,
+    ) -> KernelResult<Option<&str>> {
+        match self.get_config_value(key) {
+            None => Ok(None),
+            Some(MetadataValue::String(value)) => Ok(Some(value)),
+            Some(other) => Err(KernelError::schema(format!(
+                "Field '{}' has a non-string `{}` annotation: {other}",
+                self.name,
+                key.as_ref(),
+            ))),
+        }
+    }
+
     /// Returns this field's `delta.columnMapping.id` annotation if present and well-formed.
     /// Returns `None` if the annotation is missing or carries a non-numeric value.
     pub fn column_mapping_id(&self) -> Option<i64> {
@@ -536,18 +561,11 @@ impl StructField {
     ///   `CURRENT_DEFAULT` as a SQL string, the only form the kernel writes), or rejected by
     ///   [`ColumnDefault`] (a non-NULL default on a Variant column, which the protocol forbids).
     pub fn column_default(&self) -> KernelResult<Option<ColumnDefault<'_>>> {
-        let raw_sql = match self.get_config_value(&ColumnMetadataKey::CurrentDefault) {
-            None => return Ok(None),
-            Some(MetadataValue::String(s)) => s.clone(),
-            Some(other) => {
-                return Err(KernelError::schema(format!(
-                    "Field '{}' has a non-string `{}` annotation: {other}",
-                    self.name,
-                    ColumnMetadataKey::CurrentDefault.as_ref(),
-                )))
-            }
+        let Some(raw_sql) = self.get_string_config_value(&ColumnMetadataKey::CurrentDefault)?
+        else {
+            return Ok(None);
         };
-        ColumnDefault::new(raw_sql, &self.data_type).map(Some)
+        ColumnDefault::new(raw_sql.to_string(), &self.data_type).map(Some)
     }
 
     /// Validates and extracts pre-existing column-mapping annotations on this field, returning

@@ -43,6 +43,7 @@ engine automatically activates the same version on `delta_kernel` (the two crate
 | `arrow-60` / `arrow-59` | Pin the Arrow version used by Kernel's arrow modules. |
 | `schema-diff` | Experimental schema diffing. |
 | `check-constraints-in-dev` | Experimental CHECK constraint support: discovery and connector acknowledgement. See [Check constraints](../writing/check_constraints.md). |
+| `generated-columns-in-dev` | Experimental generated column support: discovery and connector acknowledgement. See [Generated columns](../writing/generated_columns.md). |
 | `internal-api` | Expose additional APIs that aren't yet stabilized. Some examples in this guide need this. |
 | `prettyprint` | Arrow pretty-print helpers. Useful for debugging and examples. |
 | `test-utils` | Test-only constructors for downstream crate tests. Pulls in `prettyprint`. Not for production use. |
