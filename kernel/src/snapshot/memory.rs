@@ -30,8 +30,6 @@ use crate::table_features::TableFeature;
 #[internal_api]
 #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 pub(crate) enum Unavailable {
-    /// An arithmetic operation exceeded the platform's addressable size.
-    Overflow,
     /// A schema's final fields differ from those included in its construction summary.
     SchemaShape,
     /// The fixed-size shared-object accounting set was exhausted.
@@ -78,25 +76,17 @@ impl Memory {
         }
     }
     pub(crate) fn array<T>(capacity: usize) -> Self {
-        capacity
-            .checked_mul(size_of::<T>())
-            .map_or(Self::unavailable(Unavailable::Overflow), Self::precise)
+        Self::precise(capacity * size_of::<T>())
     }
     pub(crate) fn as_modeled(self) -> Self {
         self.total_bytes()
             .map_or_else(Self::unavailable, Self::modeled)
     }
     pub(crate) fn times(self, count: usize) -> Self {
-        match (
-            self.precisely_counted_bytes.checked_mul(count),
-            self.modeled_bytes.checked_mul(count),
-        ) {
-            (Some(precisely_counted_bytes), Some(modeled_bytes)) => Self {
-                precisely_counted_bytes,
-                modeled_bytes,
-                unavailable: self.unavailable,
-            },
-            _ => Self::unavailable(Unavailable::Overflow),
+        Self {
+            precisely_counted_bytes: self.precisely_counted_bytes * count,
+            modeled_bytes: self.modeled_bytes * count,
+            unavailable: self.unavailable,
         }
     }
     /// Returns the total estimate, or the reason accounting is incomplete.
@@ -106,26 +96,17 @@ impl Memory {
         if let Some(reason) = self.unavailable {
             return Err(reason);
         }
-        self.precisely_counted_bytes
-            .checked_add(self.modeled_bytes)
-            .ok_or(Unavailable::Overflow)
+        Ok(self.precisely_counted_bytes + self.modeled_bytes)
     }
 }
 
 impl Add for Memory {
     type Output = Self;
     fn add(self, rhs: Self) -> Self {
-        match (
-            self.precisely_counted_bytes
-                .checked_add(rhs.precisely_counted_bytes),
-            self.modeled_bytes.checked_add(rhs.modeled_bytes),
-        ) {
-            (Some(precisely_counted_bytes), Some(modeled_bytes)) => Self {
-                precisely_counted_bytes,
-                modeled_bytes,
-                unavailable: self.unavailable.or(rhs.unavailable),
-            },
-            _ => Self::unavailable(Unavailable::Overflow),
+        Self {
+            precisely_counted_bytes: self.precisely_counted_bytes + rhs.precisely_counted_bytes,
+            modeled_bytes: self.modeled_bytes + rhs.modeled_bytes,
+            unavailable: self.unavailable.or(rhs.unavailable),
         }
     }
 }
@@ -140,34 +121,29 @@ impl Sum for Memory {
     }
 }
 
-/// Operation-local counters for a retained schema graph. The wider sums defer usize overflow
-/// checks until the root is complete; they are never stored on schema nodes or snapshots.
-/// The owned in-memory graph cannot contain enough addressable storage to exhaust u128.
+/// Operation-local counters for a retained schema graph, stored only in the completed root summary.
 #[derive(Copy, Clone, Default)]
 pub(crate) struct SchemaMemory {
-    precise: u128,
-    modeled: u128,
+    precise: usize,
+    modeled: usize,
     unavailable: Option<Unavailable>,
 }
 
 impl SchemaMemory {
     pub(crate) fn finish(self) -> Memory {
-        match (usize::try_from(self.precise), usize::try_from(self.modeled)) {
-            (Ok(precisely_counted_bytes), Ok(modeled_bytes)) => Memory {
-                precisely_counted_bytes,
-                modeled_bytes,
-                unavailable: self.unavailable,
-            },
-            _ => Memory::unavailable(Unavailable::Overflow),
+        Memory {
+            precisely_counted_bytes: self.precise,
+            modeled_bytes: self.modeled,
+            unavailable: self.unavailable,
         }
     }
 
     pub(crate) fn add_field_metadata(&mut self, metadata: &HashMap<String, MetadataValue>) {
         *self += hash_table_bytes::<(String, MetadataValue)>(metadata.capacity());
         for (key, value) in metadata {
-            self.precise += key.capacity() as u128;
+            self.precise += key.capacity();
             match value {
-                MetadataValue::String(value) => self.precise += value.capacity() as u128,
+                MetadataValue::String(value) => self.precise += value.capacity(),
                 MetadataValue::Other(value) => self.add_json(value),
                 MetadataValue::Number(_) | MetadataValue::Boolean(_) => {}
             }
@@ -176,9 +152,9 @@ impl SchemaMemory {
 
     fn add_json(&mut self, value: &Value) {
         match value {
-            Value::String(value) => self.precise += value.capacity() as u128,
+            Value::String(value) => self.precise += value.capacity(),
             Value::Array(values) => {
-                self.precise += values.capacity() as u128 * size_of::<Value>() as u128;
+                self.precise += values.capacity() * size_of::<Value>();
                 for value in values {
                     self.add_json(value);
                 }
@@ -186,10 +162,9 @@ impl SchemaMemory {
             Value::Object(values) => {
                 let leaves = values.len().div_ceil(11);
                 let nodes = leaves + leaves.saturating_sub(1).div_ceil(12);
-                self.modeled +=
-                    (16 + 11 * (size_of::<String>() + size_of::<Value>())) as u128 * nodes as u128;
+                self.modeled += (16 + 11 * (size_of::<String>() + size_of::<Value>())) * nodes;
                 for (key, value) in values {
-                    self.precise += key.capacity() as u128;
+                    self.precise += key.capacity();
                     self.add_json(value);
                 }
             }
@@ -201,8 +176,8 @@ impl SchemaMemory {
 impl From<Memory> for SchemaMemory {
     fn from(value: Memory) -> Self {
         Self {
-            precise: value.precisely_counted_bytes as u128,
-            modeled: value.modeled_bytes as u128,
+            precise: value.precisely_counted_bytes,
+            modeled: value.modeled_bytes,
             unavailable: value.unavailable,
         }
     }
@@ -210,8 +185,8 @@ impl From<Memory> for SchemaMemory {
 
 impl AddAssign<Memory> for SchemaMemory {
     fn add_assign(&mut self, value: Memory) {
-        self.precise += value.precisely_counted_bytes as u128;
-        self.modeled += value.modeled_bytes as u128;
+        self.precise += value.precisely_counted_bytes;
+        self.modeled += value.modeled_bytes;
         self.unavailable = self.unavailable.or(value.unavailable);
     }
 }
@@ -327,12 +302,7 @@ pub(crate) fn hash_table_bytes<T>(capacity: usize) -> Memory {
     if capacity == 0 {
         return Memory::ZERO;
     }
-    let Some(buckets) = capacity
-        .checked_add(1)
-        .and_then(usize::checked_next_power_of_two)
-    else {
-        return Memory::unavailable(Unavailable::Overflow);
-    };
+    let buckets = (capacity + 1).next_power_of_two();
     // Hashbrown's bucket/control layout is private. This is a model, including after removals.
     let group_width = if cfg!(all(
         target_feature = "sse2",
@@ -343,13 +313,8 @@ pub(crate) fn hash_table_bytes<T>(capacity: usize) -> Memory {
         size_of::<usize>()
     };
     let alignment = align_of::<T>().max(group_width);
-    let bytes = buckets
-        .checked_mul(size_of::<T>())
-        .and_then(|n| n.checked_add(alignment - 1))
-        .map(|n| n & !(alignment - 1))
-        .and_then(|n| n.checked_add(buckets))
-        .and_then(|n| n.checked_add(group_width));
-    bytes.map_or(Memory::unavailable(Unavailable::Overflow), Memory::modeled)
+    let data_bytes = (buckets * size_of::<T>() + alignment - 1) & !(alignment - 1);
+    Memory::modeled(data_bytes + buckets + group_width)
 }
 
 pub(crate) fn index_map_bytes<K, V>(capacity: usize) -> Memory {
@@ -522,30 +487,7 @@ mod tests {
     use crate::FileMeta;
 
     #[test]
-    fn memory_overflow_is_unavailable_not_wrapped_or_zero() {
-        let sizes = [
-            Memory::precise(usize::MAX) + Memory::precise(1),
-            Memory::precise(usize::MAX) + Memory::modeled(1),
-            Memory::array::<u64>(usize::MAX),
-            Memory::modeled(usize::MAX).times(2),
-            hash_table_bytes::<String>(usize::MAX),
-        ];
-        for size in sizes {
-            assert_eq!(size.total_bytes(), Err(Unavailable::Overflow));
-        }
-    }
-
-    #[test]
-    fn schema_accumulation_checks_each_counter_and_the_combined_total() {
-        for (first, second) in [
-            (Memory::precise(usize::MAX), Memory::precise(1)),
-            (Memory::modeled(usize::MAX), Memory::modeled(1)),
-            (Memory::precise(usize::MAX), Memory::modeled(1)),
-        ] {
-            let mut measured = SchemaMemory::from(first);
-            measured += second;
-            assert_eq!(measured.finish().total_bytes(), Err(Unavailable::Overflow));
-        }
+    fn schema_accumulation_preserves_invariant_failure() {
         let mut measured = SchemaMemory::from(Memory::unavailable(Unavailable::SchemaShape));
         measured += Memory::precise(123);
         assert_eq!(

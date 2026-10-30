@@ -1694,7 +1694,7 @@ pub unsafe extern "C" fn version(snapshot: Handle<SharedSnapshot>) -> u64 {
 /// scan temporaries, later lazy state, engine storage, allocator overhead, and RSS. Shared storage
 /// is counted once within a snapshot, but can be counted again by a different snapshot's estimate.
 /// Container layouts and log-path sampling are estimates, not hard upper bounds.
-/// `None` indicates arithmetic overflow or an accounting invariant that could not be satisfied;
+/// `None` indicates an accounting invariant that could not be satisfied;
 /// it must not be interpreted as zero bytes.
 ///
 /// # Safety
@@ -1708,7 +1708,7 @@ pub unsafe extern "C" fn snapshot_retained_memory_at_creation(
         .retained_memory_at_creation()
         .total_bytes()
         .ok()
-        .and_then(|bytes| u64::try_from(bytes).ok())
+        .map(|bytes| bytes as u64)
         .into()
 }
 
