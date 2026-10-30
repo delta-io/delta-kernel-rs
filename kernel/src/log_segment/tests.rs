@@ -46,7 +46,8 @@ use crate::schema::{
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table, write_commit,
+    adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table,
+    write_manifest_commit, write_manifest_commit_keeping_pm,
 };
 use crate::unit_test_utils::{
     assert_batch_matches, assert_result_error_with_message, create_log_path,
@@ -5688,17 +5689,17 @@ fn latest_checkpoint_action_returns_none_without_checkpoint() -> KernelResult<()
 #[test]
 fn latest_checkpoint_action_returns_the_latest_of_multiple() -> KernelResult<()> {
     let (engine, table_root) = setup_table()?;
-    write_commit(
+    write_manifest_commit(
         &engine,
         &table_root,
         1,
-        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?.into_engine_data(&engine)?,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?,
     )?;
-    write_commit(
+    write_manifest_commit(
         &engine,
         &table_root,
         2,
-        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?.into_engine_data(&engine)?,
+        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?,
     )?;
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -5718,11 +5719,11 @@ fn latest_checkpoint_action_returns_the_latest_of_multiple() -> KernelResult<()>
 #[test]
 fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> KernelResult<()> {
     let (engine, table_root) = setup_table()?;
-    write_commit(
+    write_manifest_commit(
         &engine,
         &table_root,
         1,
-        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?.into_engine_data(&engine)?,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?,
     )?;
 
     let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
@@ -5733,11 +5734,11 @@ fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> K
     assert_eq!(first.version(), 1);
 
     // Write a newer checkpoint action AFTER the snapshot's log segment was frozen.
-    write_commit(
+    write_manifest_commit(
         &engine,
         &table_root,
         2,
-        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?.into_engine_data(&engine)?,
+        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?,
     )?;
 
     // The frozen snapshot still reports version 1.
@@ -5839,15 +5840,19 @@ async fn amt_last_checkpoint_hint_bounds_listing(
 #[test]
 fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> KernelResult<()> {
     let (engine, table_root) = setup_table()?;
-    for version in 1..=2 {
-        write_commit(
-            &engine,
-            &table_root,
-            version,
-            minimal_checkpoint_action(&format!("metadata/root-v{version}.parquet"), version)?
-                .into_engine_data(&engine)?,
-        )?;
-    }
+    write_manifest_commit(
+        &engine,
+        &table_root,
+        1,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?,
+    )?;
+    // v2 leaves P&M unchanged, so it has no top-level P&M and only its checkpoint action has them.
+    write_manifest_commit_keeping_pm(
+        &engine,
+        &table_root,
+        2,
+        minimal_checkpoint_action("metadata/root-v2.parquet", 2)?,
+    )?;
     let hint = LastCheckpointHint {
         version: 2,
         size: 1,
