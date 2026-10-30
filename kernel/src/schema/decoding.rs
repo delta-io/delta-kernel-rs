@@ -16,6 +16,7 @@ use super::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType
 /// Validation facts retained before serde erases the concrete failure type.
 pub(crate) enum SchemaDiagnostic {
     DuplicateField(String),
+    UnsupportedType(String),
 }
 
 /// Carries one operation's diagnostic through nested schema decoding.
@@ -377,9 +378,10 @@ impl<'de> DeserializeSeed<'de> for SchemaSeed<'_, DataType> {
         match &value {
             Value::String(name) if name == "variant" => Ok(DataType::unshredded_variant()),
             Value::String(name) if name == "file" => Ok(DataType::file_type()),
-            Value::String(_) => PrimitiveType::deserialize(value)
-                .map(DataType::Primitive)
-                .map_err(D::Error::custom),
+            Value::String(name) => PrimitiveType::parse::<serde_json::Error>(name.clone(), |name| {
+                *self.diagnostic.borrow_mut() = Some(SchemaDiagnostic::UnsupportedType(name.to_owned()));
+                super::unsupported_delta_type_error(name)
+            }).map(DataType::Primitive).map_err(D::Error::custom),
             Value::Object(map) if map.get("type").is_some_and(Value::is_string) => {
                 match map.get("type").and_then(Value::as_str).unwrap_or_default() {
                     "array" => SchemaSeed::<ArrayType>::new(self.diagnostic)
@@ -396,7 +398,10 @@ impl<'de> DeserializeSeed<'de> for SchemaSeed<'_, DataType> {
                         .map_err(D::Error::custom),
                     #[cfg(feature = "udt-in-dev")]
                     "udt" => self.deserialize_udt(value).map_err(D::Error::custom),
-                    name => Err(super::unsupported_delta_type_error(name)),
+                    name => {
+                        *self.diagnostic.borrow_mut() = Some(SchemaDiagnostic::UnsupportedType(name.to_owned()));
+                        Err(super::unsupported_delta_type_error(name))
+                    },
                 }
             }
             _ => Err(D::Error::custom(format!("Invalid data type: {value}"))),

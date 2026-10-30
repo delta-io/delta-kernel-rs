@@ -46,6 +46,13 @@ Connectors classify by condition and SQLSTATE, not diagnostic text, and own tele
 Construction is private. Condition-specific factories must supply the catalog's parameter names in
 template order. A Delta failure terminates the invocation, not the snapshot or process.
 
+Snapshot reconstruction classifies absent tables, required replay gaps, invalid persisted schema
+and partition declarations, and explicit adaptive-metadata mapping-mode failures at their semantic
+validation boundaries. Persisted-schema decoding retains typed validation facts alongside the
+original serde failure; ordinary schema constructors keep their Kernel contracts. Optional CRC and
+checkpoint-hint fallback does not become a terminal Delta failure. General commit-range discovery
+and undecided protocol, location, and version-bound errors retain their Kernel classifications.
+
 ## Snapshot
 
 `Snapshot` (`kernel/src/snapshot/`) is the primary entry point for operations on an existing table.

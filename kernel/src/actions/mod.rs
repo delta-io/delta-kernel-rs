@@ -23,8 +23,7 @@ use crate::expressions::{ArrayData, StructData};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::{ArrayType, DataType, schema};
 use crate::schema::{
-    SchemaRef, StructField, StructType, ToSchema as _, is_unsupported_delta_type_error,
-    lazy_schema_ref, schema_ref,
+    SchemaRef, StructField, StructType, ToSchema as _, lazy_schema_ref, schema_ref,
 };
 use crate::table_features::{
     FeatureType, LEGACY_READER_FEATURES, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
@@ -494,10 +493,14 @@ impl Metadata {
         // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
         crate::schema::decoding::decode_schema(&self.schema_string).map_err(
             |(error, diagnostic)| {
-                if let Some(crate::schema::decoding::SchemaDiagnostic::DuplicateField(name)) =
-                    diagnostic
-                {
-                    return crate::DeltaError::duplicate_schema_field(&name, error).into();
+                match diagnostic {
+                    Some(crate::schema::decoding::SchemaDiagnostic::DuplicateField(name)) => {
+                        return crate::DeltaError::duplicate_schema_field(&name, error).into();
+                    }
+                    Some(crate::schema::decoding::SchemaDiagnostic::UnsupportedType(name)) => {
+                        return crate::DeltaError::unsupported_schema_type(&name, error).into();
+                    }
+                    None => {}
                 }
                 // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
                 // matching.
@@ -512,10 +515,6 @@ impl Metadata {
                 ))
                     .with_backtrace()
                     .into()
-                } else if is_unsupported_delta_type_error(&error) {
-                    KernelError::schema(error.to_string())
-                        .with_backtrace()
-                        .into()
                 } else {
                     KernelError::from(error).into()
                 }
