@@ -1,7 +1,6 @@
 //! Read-only access to the log segment retained by a snapshot.
 
 use delta_kernel::log_segment::LogSegment;
-use delta_kernel::path::ParsedLogPath;
 
 use crate::handle::Handle;
 use crate::log_path::{FfiLogPath, LogPathArray};
@@ -26,7 +25,7 @@ pub struct FfiLogSegment {
     pub checkpoint_version: OptionalValue<u64>,
     /// Retained commit files in ascending version order, including staged commits.
     pub commit_files: LogPathArray,
-    /// Retained log compaction files, in the order held by the segment.
+    /// Retained log compaction files, sorted by start version then end version, both ascending.
     pub compaction_files: LogPathArray,
     /// Selected checkpoint's top-level files. Does not enumerate checkpoint sidecars.
     pub checkpoint_files: LogPathArray,
@@ -34,7 +33,10 @@ pub struct FfiLogSegment {
     pub latest_commit_file: *const FfiLogPath,
     /// Retained latest CRC file; its version may precede `end_version`.
     pub latest_crc_file: *const FfiLogPath,
-    /// Highest known published commit version, independently of retained staged paths.
+    /// Highest published commit version recorded by this segment.
+    /// `None` means no publication watermark is recorded, not that checkpoint or table
+    /// versions are unpublished. Retained `_staged_commits/` paths at or below the
+    /// watermark represent commits already known to be published.
     pub max_published_version: OptionalValue<u64>,
 }
 
@@ -60,22 +62,28 @@ pub unsafe extern "C" fn snapshot_log_segment(
     visit(snapshot.log_segment(), context, visitor);
 }
 
-fn file(path: &ParsedLogPath) -> FfiLogPath {
-    let location = path.location.location.as_str();
-    FfiLogPath::new(
-        kernel_string_slice!(location),
-        path.location.last_modified,
-        path.location.size,
-    )
-}
-
 fn visit(segment: &LogSegment, context: NullableCvoid, visitor: LogSegmentVisitor) {
     let files = &segment.listed;
-    let commits: Vec<_> = files.ascending_commit_files.iter().map(file).collect();
-    let compactions: Vec<_> = files.ascending_compaction_files.iter().map(file).collect();
-    let checkpoints: Vec<_> = files.checkpoint_parts.iter().map(file).collect();
-    let latest_commit = files.latest_commit_file.as_ref().map(file);
-    let latest_crc = files.latest_crc_file.as_ref().map(file);
+    let commits: Vec<_> = files
+        .ascending_commit_files
+        .iter()
+        .map(FfiLogPath::from_parsed)
+        .collect();
+    let compactions: Vec<_> = files
+        .ascending_compaction_files
+        .iter()
+        .map(FfiLogPath::from_parsed)
+        .collect();
+    let checkpoints: Vec<_> = files
+        .checkpoint_parts
+        .iter()
+        .map(FfiLogPath::from_parsed)
+        .collect();
+    let latest_commit = files
+        .latest_commit_file
+        .as_ref()
+        .map(FfiLogPath::from_parsed);
+    let latest_crc = files.latest_crc_file.as_ref().map(FfiLogPath::from_parsed);
     let log_root = segment.log_root.as_str();
     let value = FfiLogSegment {
         log_root: kernel_string_slice!(log_root),

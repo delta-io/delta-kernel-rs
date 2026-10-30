@@ -1,6 +1,7 @@
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+use delta_kernel::path::ParsedLogPath;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Version;
 use test_utils::table_builder::{LogState, TestTableBuilder};

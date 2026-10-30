@@ -639,14 +639,9 @@ fn commit_range_commit_files_next_impl(
     let Some(path) = next else {
         return Ok(false);
     };
-    let location = path.location.location.as_str();
     let commit_file = FfiCommitFile {
         version: path.version,
-        file: FfiLogPath::new(
-            kernel_string_slice!(location),
-            path.location.last_modified,
-            path.location.size,
-        ),
+        file: FfiLogPath::from_parsed(&path),
     };
     (engine_visitor)(engine_context, &commit_file);
     Ok(true)
