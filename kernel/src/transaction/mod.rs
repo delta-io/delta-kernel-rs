@@ -317,6 +317,7 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     row_tracking_preservation_acknowledged: bool,
     // Whether the connector acknowledged responsibility for encrypting the data files it adds
     // to a table with the `parquetEncryption-dev` feature.
+    #[cfg(feature = "parquet-encryption-in-dev")]
     parquet_encryption_acknowledged: bool,
     // Whether this transaction should be marked as a blind append.
     is_blind_append: bool,
@@ -623,6 +624,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// properties; it does not encrypt. Without this acknowledgement, requesting write state or
     /// committing Add actions on such a table fails, so kernel's own writers cannot add plaintext
     /// files to it. Metadata-only commits need no acknowledgement.
+    #[cfg(feature = "parquet-encryption-in-dev")]
     pub fn ack_parquet_encryption(&mut self) {
         self.parquet_encryption_acknowledged = true;
     }
@@ -738,6 +740,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     fn validate_for_data_write(&self) -> KernelResult<()> {
         self.effective_table_config
             .ensure_operation_supported(Operation::Write)?;
+        #[cfg(feature = "parquet-encryption-in-dev")]
         self.ensure_parquet_encryption_acknowledged()?;
         validate_schema_for_write(&self.effective_table_config.logical_schema())
     }
@@ -854,6 +857,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             data_change: common_state.data_change,
             column_defaults_acknowledged: false,
             row_tracking_preservation_acknowledged: false,
+            #[cfg(feature = "parquet-encryption-in-dev")]
             parquet_encryption_acknowledged: false,
             is_blind_append: false,
             #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1098,6 +1102,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         Ok(())
     }
 
+    #[cfg(feature = "parquet-encryption-in-dev")]
     fn ensure_parquet_encryption_acknowledged(&self) -> KernelResult<()> {
         require!(
             self.parquet_encryption_acknowledged
@@ -2275,6 +2280,7 @@ mod tests {
             data_change,
             column_defaults_acknowledged,
             row_tracking_preservation_acknowledged,
+            #[cfg(feature = "parquet-encryption-in-dev")]
             parquet_encryption_acknowledged,
             is_blind_append,
             #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -2307,6 +2313,7 @@ mod tests {
         assert_eq!(data_change, expected_data_change);
         assert!(!column_defaults_acknowledged);
         assert!(!row_tracking_preservation_acknowledged);
+        #[cfg(feature = "parquet-encryption-in-dev")]
         assert!(!parquet_encryption_acknowledged);
         assert!(!is_blind_append);
         assert!(dv_matched_files.is_empty());
