@@ -4,7 +4,7 @@ use delta_kernel::transaction::CommitResult;
 
 use super::ExclusiveCommittedTransaction;
 use crate::handle::Handle;
-use crate::{KernelResult, OptionalValue, SharedSnapshot};
+use crate::{OptionalValue, SharedSnapshot};
 
 /// Converts a [`CommitResult`] to an owned FFI handle, or returns an error when the commit was not
 /// successful.

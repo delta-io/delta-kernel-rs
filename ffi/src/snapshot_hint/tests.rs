@@ -13,7 +13,7 @@ use delta_kernel::log_segment::LogSegment;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::snapshot::{IncrementalReplay, PublicationWatermark, Snapshot};
 use delta_kernel::{
-    Engine, EvaluationHandler, FileMeta, JsonHandler, ParquetHandler, StorageHandler,
+    Engine, EvaluationHandler, FileMeta, JsonHandler, KernelResult, ParquetHandler, StorageHandler,
 };
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{compacted_log_path_for_versions, create_log_path, TestCatalogCommitter};

@@ -538,11 +538,11 @@ pub fn create_dv_update_transaction(
     table_url: &Url,
     engine: &dyn Engine,
 ) -> delta_kernel::Result<Transaction> {
-    Ok(Snapshot::builder_for(table_url.clone())
+    Snapshot::builder_for(table_url.clone())
         .build(engine)?
         .update_table(UpdateTableOperation::Delete, "test engine", true)
         .build(
             engine,
             Box::new(delta_kernel::committer::FileSystemCommitter::new()),
-        )?)
+        )
 }

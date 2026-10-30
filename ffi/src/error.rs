@@ -275,7 +275,7 @@ impl<T, A: AllocateError + ?Sized> IntoExternResult<T, A> for KernelResult<T> {
 }
 
 /// Allocates an envelope without changing its outer classification.
-pub trait AllocateResultError: AllocateError {
+pub(crate) trait AllocateResultError: AllocateError {
     /// Returns a connector-owned error, or NULL when allocation fails.
     ///
     /// # Safety

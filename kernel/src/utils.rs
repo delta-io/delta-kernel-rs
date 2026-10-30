@@ -67,8 +67,11 @@ impl<I: IntoIterator, T: FromIterator<I::Item>> CollectInto<T> for I {
     }
 }
 
-/// Try to parse string uri into a URL for a table path. This will do it's best to handle things
-/// like `/local/paths`, and even `../relative/paths`.
+/// Parses `uri` into a table URL, accepting absolute and relative local filesystem paths.
+///
+/// Local paths must exist and name a directory. An absent local path returns
+/// [`DeltaPathDoesNotExist`](crate::DeltaErrorCondition::DeltaPathDoesNotExist); other location
+/// failures preserve their Kernel classification.
 #[allow(unused)]
 #[internal_api]
 pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> crate::Result<Url> {

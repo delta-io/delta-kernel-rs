@@ -117,7 +117,7 @@ async fn write_data_to_table(
     }
 
     // Commit the transaction
-    Ok(txn.commit(engine.as_ref())?)
+    txn.commit(engine.as_ref())
 }
 
 /// Helper function to create a row-tracking table with a single `number: INTEGER` column.

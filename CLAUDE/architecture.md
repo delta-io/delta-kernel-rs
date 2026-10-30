@@ -22,13 +22,15 @@ deserializes the full batch into in-memory structs.
 
 ## Error Handling
 
-Kernel APIs return `KernelResult<T, E = KernelError>`, preserving `KernelError` by default while
-allowing helpers to specify another error type. `Result<T>` always uses the top-level `Error` enum.
-Converting a kernel error to that envelope requires `Error::Kernel` or `.map_err(Error::Kernel)`.
-There is no implicit `From<KernelError> for Error` conversion.
+APIs that can produce Delta failures return `Result<T>`, using the top-level `Error` envelope.
+Kernel-only APIs, including engine handlers, retain `KernelResult<T, E = KernelError>`.
+`From<KernelError> for Error` allows `?` to preserve the original Kernel failure, source, and
+backtrace. Callers propagate `Result` rather than flattening the envelope into a Kernel failure.
 
 Fallible kernel streams implement the `KernelResultIterator<T>` marker trait, including engine
 handlers and declarative-plan results, which erase it as `Box<dyn KernelResultIterator<T>>`.
+Streams that reconstruct table configuration can yield Delta failures and use
+`Iterator<Item = Result<T>> + Send`.
 
 `DeltaErrorCondition` (`kernel/src/error/delta_error_condition/`) enumerates an explicit subset of
 Delta's error catalog, each with its name, SQLSTATE, parameter names, and message template. It is
@@ -45,6 +47,13 @@ and the rendered message.
 Connectors classify by condition and SQLSTATE, not diagnostic text, and own telemetry redaction.
 Construction is private. Condition-specific factories must supply the catalog's parameter names in
 template order. A Delta failure terminates the invocation, not the snapshot or process.
+
+Snapshot reconstruction classifies absent tables, required replay gaps, invalid persisted schema
+and partition declarations, and explicit adaptive-metadata mapping-mode failures at their semantic
+validation boundaries. Persisted-schema decoding retains typed validation facts alongside the
+original serde failure; ordinary schema constructors keep their Kernel contracts. Optional CRC and
+checkpoint-hint fallback does not become a terminal Delta failure. General commit-range discovery
+and undecided protocol, location, and version-bound errors retain their Kernel classifications.
 
 ## Snapshot
 

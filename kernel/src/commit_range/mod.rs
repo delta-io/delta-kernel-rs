@@ -46,7 +46,7 @@
 //!         let _batch = batch?;
 //!     }
 //! }
-//! # Ok::<(), KernelError>(())
+//! # Ok::<(), delta_kernel::Error>(())
 //! ```
 
 mod actions;

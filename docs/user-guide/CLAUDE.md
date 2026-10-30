@@ -260,9 +260,9 @@ MUST NOT:
 - SHOULD: number the steps in comments (`// 1. Parse the table`,
   `// 2. Build engine`) for longer examples, matching the prose breakdown.
 - For **error handling**, MUST use `?` over `.unwrap()`. Hidden boilerplate
-  should include a `main()` returning `KernelResult<()>` (or
-  `KernelResult<(), Box<dyn std::error::Error>>` when mixing error types), imported from
-  `delta_kernel`. Readers
+  should include a `main()` returning `delta_kernel::Result<()>` when calling APIs that can
+  produce Delta failures. Use `KernelResult<()>` for Kernel-only examples, or
+  `KernelResult<(), Box<dyn std::error::Error>>` when mixing foreign error types. Readers
   copy examples verbatim. `.unwrap()` in examples teaches destructive habits.
 - For **async examples**, include `tokio` in the hidden boilerplate
   (`# #[tokio::main]` / `# async fn main()`). The reader should not need to

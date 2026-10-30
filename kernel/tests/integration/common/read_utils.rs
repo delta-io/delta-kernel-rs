@@ -7,7 +7,7 @@ use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::schema::MetadataColumnSpec;
-use delta_kernel::{Engine, KernelResult, Snapshot};
+use delta_kernel::{Engine, Snapshot};
 use test_utils::read_scan;
 
 /// Reads table data with the requested Row Tracking metadata columns.

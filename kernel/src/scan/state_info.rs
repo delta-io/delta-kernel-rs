@@ -694,7 +694,6 @@ pub(crate) mod tests {
     use crate::unit_test_utils::{
         assert_result_error_with_message, MockProtocolBuilder, MockTableConfigurationBuilder,
     };
-    use crate::KernelResult;
 
     #[test]
     fn stats_schemas_can_both_be_absent() {

@@ -19,7 +19,7 @@ use delta_kernel::schema::{schema, schema_ref, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{Engine, KernelResult, Snapshot};
+use delta_kernel::{Engine, Snapshot};
 use itertools::Itertools;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::{

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use delta_kernel::schema::MetadataColumnSpec;
 use delta_kernel::snapshot::ChecksumWriteResult;
-use delta_kernel::{Engine, KernelResult, Snapshot};
+use delta_kernel::{Engine, Snapshot};
 use rstest::rstest;
 use rstest_reuse::apply;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;

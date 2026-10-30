@@ -387,9 +387,11 @@ Keep this list updated when new protocol features are added to kernel.
     binding/field, a `[DataType]`/`Vec<DataType>` element, or a `&DataType` argument),
     prefer `DataType::from(ArrayType::new(...))` over
     `DataType::Array(Box::new(ArrayType::new(...)))`.
-- Kernel APIs use `KernelResult<T, E = KernelError>`, which defaults to `KernelError` and permits
-  an explicit error type. `Result<T>` is reserved for the top-level `Error` envelope. Wrap kernel
-  errors explicitly with `Error::Kernel` when returning it.
+- APIs that can produce Delta failures use `Result<T>`, whose error is the top-level `Error`
+  envelope. `KernelResult<T, E = KernelError>` remains appropriate for Kernel-only APIs and permits
+  an explicit error type. `From<KernelError> for Error` preserves the original variant, source, and
+  backtrace when propagating with `?`. Never convert an envelope back into a Kernel error to satisfy
+  a caller's signature; propagate `Result` through that caller.
 - Prefer the `KernelResultIterator<T>` marker trait over spelling
   `Iterator<Item = KernelResult<T>> + Send`, including in public APIs. Use
   `impl KernelResultIterator<T>` for unboxed streams and `Box<dyn KernelResultIterator<T>>`

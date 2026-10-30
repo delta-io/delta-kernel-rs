@@ -47,7 +47,7 @@ impl Transaction<UpdateTable, Imperative> {
     /// # fn example(
     /// #     engine: Arc<dyn Engine>,
     /// #     table_url: url::Url,
-    /// # ) -> delta_kernel::KernelResult<()> {
+    /// # ) -> delta_kernel::Result<()> {
     /// // Create a snapshot and transaction
     /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     /// let mut txn = snapshot

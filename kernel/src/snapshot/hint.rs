@@ -391,14 +391,14 @@ impl SnapshotHint {
             );
         }
 
-        Ok(Snapshot::new_with_crc(
+        Snapshot::new_with_crc(
             log_segment,
             table_configuration,
             crc,
             freshness == SnapshotHintFreshness::Latest,
             false, /* skipped_new_checkpoints */
         )
-        .map(Into::into)?)
+        .map(Into::into)
     }
 }
 

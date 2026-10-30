@@ -44,9 +44,9 @@
 //!     todo!("Write data batches to storage at path: {}", path)
 //! }
 //!
-//! # fn example(engine: &dyn Engine) -> KernelResult<()> {
+//! # fn example(engine: &dyn Engine) -> delta_kernel::Result<()> {
 //! // Create a snapshot for the table
-//! let table_root = Url::parse("file:///path/to/table")?;
+//! let table_root = Url::parse("file:///path/to/table").map_err(delta_kernel::KernelError::from)?;
 //! let snapshot = Snapshot::builder_for(table_root).build(engine)?;
 //!
 //! // Create a log compaction writer for versions 10-20

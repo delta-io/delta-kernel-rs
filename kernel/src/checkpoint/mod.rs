@@ -84,7 +84,7 @@
 //! // Finalize the checkpoint by passing the stats
 //! writer.finalize(engine, &last_checkpoint_stats)?;
 //!
-//! # Ok::<_, KernelError>(())
+//! # Ok::<_, delta_kernel::Error>(())
 //! ```
 //!
 //! ## Warning

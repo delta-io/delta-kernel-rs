@@ -239,57 +239,6 @@ pub(crate) fn assert_timestamp_is_recent(timestamp: i64) {
     );
 }
 
-#[cfg(test)]
-mod tests {
-    use std::panic;
-
-    use super::*;
-
-    #[test]
-    fn test_ok_or_panic_with_error() {
-        // Create a test error
-        let message = "Test error message";
-        let error_ptr = allocate_err(FFIKernelError::GenericError, kernel_string_slice!(message));
-        let result = ExternResult::<i32>::Err(error_ptr);
-
-        // Test that ok_or_panic panics with the expected message
-        let panic_result = panic::catch_unwind(|| {
-            ok_or_panic(result);
-        });
-
-        assert!(panic_result.is_err(), "Expected ok_or_panic to panic");
-
-        // Check that the panic message contains the error type and message
-        let panic_message = panic_result.unwrap_err();
-        let panic_str = if let Some(s) = panic_message.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "Unknown panic type".to_string()
-        };
-
-        assert!(
-            panic_str.contains("Got engine error with type"),
-            "Panic message should contain 'Got engine error with type', got: {panic_str}"
-        );
-        assert!(
-            panic_str.contains("GenericError"),
-            "Panic message should contain error type 'GenericError', got: {panic_str}"
-        );
-        assert!(
-            panic_str.contains(message),
-            "Panic message should contain error message 'Test error message', got: {panic_str}"
-        );
-    }
-
-    #[test]
-    fn test_ok_or_panic_with_ok() {
-        // Test that ok_or_panic returns the value when the result is Ok
-        let result = ExternResult::<i32>::Ok(42);
-        let value = ok_or_panic(result);
-        assert_eq!(value, 42);
-    }
-}
-
 /// Allocators for tests that recover connector errors as `EngineErrorWithMessage`.
 pub(crate) const ERROR_ALLOCATORS: ErrorAllocators = ErrorAllocators {
     context: std::ptr::null_mut(),
@@ -349,4 +298,55 @@ unsafe extern "C" fn allocate_null_delta(
     _: *const DeltaErrorAllocation,
 ) -> *mut ConnectorError {
     std::ptr::null_mut()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic;
+
+    use super::*;
+
+    #[test]
+    fn test_ok_or_panic_with_error() {
+        // Create a test error
+        let message = "Test error message";
+        let error_ptr = allocate_err(FFIKernelError::GenericError, kernel_string_slice!(message));
+        let result = ExternResult::<i32>::Err(error_ptr);
+
+        // Test that ok_or_panic panics with the expected message
+        let panic_result = panic::catch_unwind(|| {
+            ok_or_panic(result);
+        });
+
+        assert!(panic_result.is_err(), "Expected ok_or_panic to panic");
+
+        // Check that the panic message contains the error type and message
+        let panic_message = panic_result.unwrap_err();
+        let panic_str = if let Some(s) = panic_message.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic type".to_string()
+        };
+
+        assert!(
+            panic_str.contains("Got engine error with type"),
+            "Panic message should contain 'Got engine error with type', got: {panic_str}"
+        );
+        assert!(
+            panic_str.contains("GenericError"),
+            "Panic message should contain error type 'GenericError', got: {panic_str}"
+        );
+        assert!(
+            panic_str.contains(message),
+            "Panic message should contain error message 'Test error message', got: {panic_str}"
+        );
+    }
+
+    #[test]
+    fn test_ok_or_panic_with_ok() {
+        // Test that ok_or_panic returns the value when the result is Ok
+        let result = ExternResult::<i32>::Ok(42);
+        let value = ok_or_panic(result);
+        assert_eq!(value, 42);
+    }
 }

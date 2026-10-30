@@ -16,7 +16,7 @@ use crate::metrics::{
 };
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
-use crate::{Engine, KernelError, KernelResult, Version};
+use crate::{Engine, KernelError, Version};
 
 /// The assembled outcome of the listing phase of an incremental update. Listing/assembly
 /// failures surface as `Err` from [`Snapshot::build_new_segment`], not a variant here.
@@ -185,11 +185,11 @@ impl Snapshot {
         .inspect_err(|_| emit_log_segment_load_failure(metric_context))?
         {
             NewSegment::Unchanged => {
-                return Ok(Self::reuse_with_build_metadata(
+                return Self::reuse_with_build_metadata(
                     &existing_snapshot,
                     built_as_latest,
                     skipped_new_checkpoints,
-                )?);
+                );
             }
             NewSegment::Rebuild(new_log_segment) => {
                 emit_log_segment_load(

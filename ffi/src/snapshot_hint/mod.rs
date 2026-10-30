@@ -1,7 +1,7 @@
 //! Construction and export of snapshot hints.
 
 use delta_kernel::snapshot::{SnapshotHint, SnapshotHintError, SnapshotHintFreshness};
-use delta_kernel::{KernelError, KernelResult, Version};
+use delta_kernel::{KernelError, Version};
 
 use crate::delta_types::{
     FfiCrc, FfiLastCheckpoint, FfiMetadata, FfiProtocol, FfiPublicationWatermark,

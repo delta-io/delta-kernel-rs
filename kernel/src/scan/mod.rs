@@ -1504,9 +1504,10 @@ impl Scan {
     /// # use url::Url;
     /// # use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
     /// # use delta_kernel::object_store::local::LocalFileSystem;
-    /// # fn main() -> KernelResult<()> {
+    /// # fn main() -> delta_kernel::Result<()> {
     /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
-    /// let table_root = Url::parse("file:///path/to/table")?;
+    /// let table_root = Url::parse("file:///path/to/table")
+    ///     .map_err(delta_kernel::KernelError::from)?;
     ///
     /// // Build a snapshot
     /// let snapshot = Snapshot::builder_for(table_root.clone())

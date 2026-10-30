@@ -7,7 +7,7 @@ use delta_kernel::arrow::ffi::to_ffi;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::{EngineData, KernelError, KernelResult, KernelResultIterator, Version};
+use delta_kernel::{EngineData, KernelError, KernelResult, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -504,9 +504,9 @@ mod tests {
         engine: Arc<dyn Engine>,
     ) -> delta_kernel::Result<Vec<RecordBatch>> {
         let scan_results = scan.execute(engine)?;
-        Ok(scan_results
+        scan_results
             .map(|data| Ok::<_, delta_kernel::Error>(data?.try_into_record_batch()?))
-            .try_collect()?)
+            .try_collect()
     }
 
     fn filter_batches(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {

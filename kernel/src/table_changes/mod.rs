@@ -34,7 +34,7 @@
 //!
 //! // Execute the table changes scan to get a fallible iterator of `Box<dyn EngineData>`s
 //! let table_change_batches = table_changes_scan.execute(engine.clone())?;
-//! # Ok::<(), KernelError>(())
+//! # Ok::<(), delta_kernel::Error>(())
 //! ```
 use std::sync::{Arc, LazyLock};
 
@@ -218,7 +218,7 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///  let url = delta_kernel::try_parse_uri(path)?;
 ///  # let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
 ///  let table_changes = TableChanges::try_new(url, &engine, 0, Some(1))?;
-///  # Ok::<(), KernelError>(())
+///  # Ok::<(), delta_kernel::Error>(())
 ///  ````
 /// For more details, see the following sections of the protocol:
 /// - [Add CDC File](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#add-cdc-file)
