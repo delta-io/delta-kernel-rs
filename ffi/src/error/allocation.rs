@@ -104,3 +104,144 @@ impl ErrorAllocators {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::c_void;
+
+    use delta_kernel::{DeltaError, DeltaErrorCondition, Error, KernelError};
+    use rstest::rstest;
+
+    use super::{ConnectorError, DeltaErrorAllocation, ErrorAllocators, KernelErrorAllocation};
+    use crate::OptionalValue;
+
+    #[derive(Default)]
+    struct Capture {
+        fields: Vec<(String, String)>,
+        calls: usize,
+        fail: bool,
+    }
+
+    unsafe fn capture(context: *mut c_void, fields: Vec<(String, String)>) -> *mut ConnectorError {
+        let output = unsafe { &mut *context.cast::<Capture>() };
+        output.fields = fields;
+        output.calls += 1;
+        if output.fail {
+            std::ptr::null_mut()
+        } else {
+            context.cast()
+        }
+    }
+
+    unsafe extern "C" fn kernel(
+        context: *mut c_void,
+        error: *const KernelErrorAllocation,
+    ) -> *mut ConnectorError {
+        let error = unsafe { &*error };
+        unsafe {
+            capture(
+                context,
+                vec![
+                    ("code".into(), format!("{:?}", error.code)),
+                    ("message".into(), error.message.try_to_string().unwrap()),
+                ],
+            )
+        }
+    }
+
+    unsafe extern "C" fn delta(
+        context: *mut c_void,
+        error: *const DeltaErrorAllocation,
+    ) -> *mut ConnectorError {
+        let error = unsafe { &*error };
+        let mut fields = unsafe {
+            vec![
+                ("condition".into(), error.condition.try_to_string().unwrap()),
+                (
+                    "sql_state".into(),
+                    match &error.sql_state {
+                        OptionalValue::Some(value) => value.try_to_string().unwrap(),
+                        OptionalValue::None => String::new(),
+                    },
+                ),
+            ]
+        };
+        for parameter in unsafe { error.parameters.try_as_slice().unwrap() } {
+            fields.push(unsafe {
+                (
+                    parameter.key.try_to_string().unwrap(),
+                    parameter.value.try_to_string().unwrap(),
+                )
+            });
+        }
+        fields.push(("message".into(), unsafe {
+            error.message.try_to_string().unwrap()
+        }));
+        unsafe { capture(context, fields) }
+    }
+
+    #[rstest]
+    #[case::kernel(None)]
+    #[case::delta(Some(false))]
+    #[case::delta_with_kernel_source(Some(true))]
+    fn dispatch_copies_diagnostics_and_preserves_callback_pointer(
+        #[case] delta_source: Option<bool>,
+        #[values(false, true)] fail: bool,
+    ) {
+        let mut output = Box::new(Capture {
+            fail,
+            ..Default::default()
+        });
+        let context = std::ptr::from_mut(output.as_mut()).cast();
+        let allocators = ErrorAllocators {
+            context,
+            allocate_kernel_error: kernel,
+            allocate_delta_error: delta,
+        };
+        let error = match delta_source {
+            None => Error::Kernel(KernelError::MissingVersion(7)),
+            Some(with_source) => DeltaError::for_test(
+                DeltaErrorCondition::DeltaVersionsNotContiguous,
+                &["10,12\0東京", "10", "12", "12"],
+                with_source.then(|| Box::new(KernelError::MissingVersion(11)) as _),
+            )
+            .unwrap()
+            .into(),
+        };
+        let expected: Vec<(String, String)> = match &error {
+            Error::Kernel(error) => vec![
+                ("code".into(), "MissingVersionError".into()),
+                ("message".into(), error.to_string()),
+            ],
+            _ => [
+                ("condition", "DELTA_VERSIONS_NOT_CONTIGUOUS"),
+                ("sql_state", "KD00C"),
+                ("versionList", "10,12\0東京"),
+                ("startVersion", "10"),
+                ("endVersion", "12"),
+                ("versionToLoad", "12"),
+                (
+                    "message",
+                    concat!(
+                    "Versions (10,12\0東京) are not contiguous. \n",
+                    "A gap in the delta log between versions 10 and 12 was detected while trying ",
+                    "to load version 12."
+                ),
+                ),
+            ]
+            .map(|(name, value)| (name.into(), value.into()))
+            .into(),
+        };
+        let pointer = unsafe { allocators.allocate_error(error) };
+        assert_eq!(
+            pointer,
+            if fail {
+                std::ptr::null_mut()
+            } else {
+                context.cast()
+            }
+        );
+        assert_eq!(output.calls, 1);
+        assert_eq!(output.fields, expected);
+    }
+}

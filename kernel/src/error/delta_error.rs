@@ -34,6 +34,33 @@ pub struct DeltaErrorParameter {
 }
 
 impl DeltaError {
+    /// Constructs a catalog error for downstream tests without migrating a production call site.
+    ///
+    /// `values` supplies one string per catalog parameter in template order. `source` is an
+    /// optional diagnostic cause. Returns an error if the parameter count does not match.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(
+        condition: DeltaErrorCondition,
+        values: &[&str],
+        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    ) -> super::KernelResult<Self> {
+        let names = condition.parameter_names();
+        if names.len() != values.len() {
+            return Err(super::KernelError::generic(format!(
+                "{} requires {} parameters, got {}",
+                condition.name(),
+                names.len(),
+                values.len()
+            )));
+        }
+        let parameters = names
+            .iter()
+            .zip(values)
+            .map(|(name, value)| DeltaErrorParameter::new(name, value))
+            .collect();
+        Ok(Self::new(condition, parameters, source))
+    }
+
     /// Returns the typed Delta condition.
     pub fn condition(&self) -> DeltaErrorCondition {
         self.condition
