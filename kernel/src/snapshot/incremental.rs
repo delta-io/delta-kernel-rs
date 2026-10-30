@@ -110,7 +110,7 @@ impl Snapshot {
         incremental_replay: IncrementalReplay,
         checkpoint_handling: CheckpointHandling,
         built_as_latest: bool,
-    ) -> KernelResult<Arc<Self>> {
+    ) -> crate::Result<Arc<Self>> {
         let requested_version = target_version.into();
         let mut current_segment = None;
         let result = Self::try_new_from_impl(
@@ -149,7 +149,7 @@ impl Snapshot {
         checkpoint_handling: CheckpointHandling,
         built_as_latest: bool,
         current_segment: &mut Option<LogSegment>,
-    ) -> KernelResult<Arc<Self>> {
+    ) -> crate::Result<Arc<Self>> {
         let existing_snapshot_version = existing_snapshot.version();
         if let Some(requested_version) = requested_version {
             tracing::Span::current().record("version", requested_version);
@@ -159,10 +159,10 @@ impl Snapshot {
             }
             // Case B: incremental path only moves forward.
             if requested_version < existing_snapshot_version {
-                return Err(KernelError::Generic(format!(
+                return Err(crate::Error::Kernel(KernelError::Generic(format!(
                     "Requested snapshot version {requested_version} is older than snapshot \
                     hint version {existing_snapshot_version}"
-                )));
+                ))));
             }
         } else {
             tracing::Span::current().record("version", existing_snapshot_version);
@@ -185,11 +185,11 @@ impl Snapshot {
         .inspect_err(|_| emit_log_segment_load_failure(metric_context))?
         {
             NewSegment::Unchanged => {
-                return Self::reuse_with_build_metadata(
+                return Ok(Self::reuse_with_build_metadata(
                     &existing_snapshot,
                     built_as_latest,
                     skipped_new_checkpoints,
-                );
+                )?);
             }
             NewSegment::Rebuild(new_log_segment) => {
                 emit_log_segment_load(
@@ -911,7 +911,7 @@ mod tests {
         );
         assert!(matches!(
             older_version,
-            Err(KernelError::Generic(msg)) if msg.contains("older than snapshot hint version")
+            Err(crate::Error::Kernel(KernelError::Generic(msg))) if msg.contains("older than snapshot hint version")
         ));
 
         Ok(())

@@ -349,7 +349,7 @@ impl Snapshot {
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         let PreparedSnapshot {
             table_configuration,
             crc,
@@ -387,7 +387,7 @@ impl Snapshot {
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
-    ) -> KernelResult<PreparedSnapshot> {
+    ) -> crate::Result<PreparedSnapshot> {
         Self::resolve_table_configuration_and_crc(
             location,
             log_segment,
@@ -414,7 +414,7 @@ impl Snapshot {
         engine: &dyn Engine,
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
-    ) -> KernelResult<PreparedSnapshot> {
+    ) -> crate::Result<PreparedSnapshot> {
         let pm_start = std::time::Instant::now();
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
@@ -441,16 +441,18 @@ impl Snapshot {
             Some((crc, crc_source)) => PmResolution::from_crc(crc, *crc_source),
             None => log_segment
                 .read_protocol_metadata_opt(engine, base_crc.as_ref())
-                .map_err(|error| match (&error, log_segment.checkpoint_version) {
-                    (KernelError::FileNotFound(_), Some(checkpoint)) => {
-                        crate::Error::from(crate::DeltaError::log_file_not_found(
-                            log_segment.end_version,
-                            checkpoint,
-                            &log_segment.log_root,
-                            error,
-                        ))
+                .map_err(|error| {
+                    match (error.without_backtrace(), log_segment.checkpoint_version) {
+                        (KernelError::FileNotFound(_), Some(checkpoint)) => {
+                            crate::Error::from(crate::DeltaError::log_file_not_found(
+                                log_segment.end_version,
+                                checkpoint,
+                                &log_segment.log_root,
+                                error,
+                            ))
+                        }
+                        _ => crate::Error::Kernel(error),
                     }
-                    _ => crate::Error::Kernel(error),
                 })
                 .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?,
         };
@@ -458,7 +460,7 @@ impl Snapshot {
         // Fresh snapshot creation requires both Protocol and Metadata to be present.
         let fail = |e| {
             emit_protocol_metadata_load_failure(metric_context);
-            Err(e)
+            Err(crate::Error::Kernel(e))
         };
         let (metadata, protocol) = match (metadata, protocol) {
             (Some(metadata), Some(protocol)) => (metadata, protocol),
