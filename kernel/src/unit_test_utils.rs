@@ -520,8 +520,7 @@ pub(crate) mod adaptive_metadata_fixtures {
         removes: &[&str],
     ) -> Version {
         let adds = (!adds.is_empty()).then(|| {
-            let paths: ArrayRef = Arc::new(StringArray::from(adds.to_vec()));
-            let batch = replace_column(&nullable_add_files(adds.len()), "path", paths);
+            let batch = nullable_add_files(adds);
             let batch = replace_column(&batch, "stats", one_record_stats(&batch));
             Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>
         });
