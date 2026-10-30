@@ -1,17 +1,15 @@
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use delta_kernel::path::ParsedLogPath;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Version;
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{compacted_log_path_for_versions, create_log_path};
 
 use super::*;
-use crate::log_path::FfiLogPathFileType;
 use crate::{free_snapshot, TryFromStringSlice};
 
-type File = (String, i64, u64, Version, FfiLogPathFileType);
+type File = (String, i64, u64);
 
 #[derive(Default)]
 struct Captured {
@@ -27,18 +25,15 @@ struct Captured {
     published: Option<Version>,
 }
 
-fn copy_file(path: &FfiParsedLogPath) -> File {
-    let file = &path.file;
+fn copy_file(file: &FfiLogPath) -> File {
     (
         unsafe { String::try_from_slice(file.location()) }.unwrap(),
         file.last_modified(),
         file.size(),
-        path.version,
-        path.file_type,
     )
 }
 
-fn copy_files(files: &ParsedLogPathArray) -> Vec<File> {
+fn copy_files(files: &LogPathArray) -> Vec<File> {
     unsafe { files.try_as_slice() }
         .unwrap()
         .iter()
@@ -120,8 +115,6 @@ fn snapshot_segment_export_preserves_retained_files(
             path.location.location.to_string(),
             path.location.last_modified,
             path.location.size,
-            path.version,
-            FfiParsedLogPath::from_parsed(path).file_type,
         )
     };
     let expected_commits: Vec<_> = files
