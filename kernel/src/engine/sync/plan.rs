@@ -34,7 +34,7 @@ use crate::engine::arrow_utils::{coerce_columns_to_schema, to_json_bytes};
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
 use crate::plans::ir::nodes::{
-    DynamicScan, FileType, Operator, Project, RelationId, RelationRef, ScanFile, ScanJson,
+    Assert, DynamicScan, FileType, Operator, Project, RelationId, RelationRef, ScanFile, ScanJson,
     ScanParquet, SemiJoin, Values, WriteJson, FILE_META_SCHEMA,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
@@ -250,6 +250,7 @@ impl SyncPlanExecutor {
             )),
             Operator::Project(project) => eval_project(project, &results[inputs[0]]),
             Operator::Filter(filter) => eval_filter(filter.predicate, &results[inputs[0]]),
+            Operator::Assert(assert) => eval_assert(assert, &results[inputs[0]]),
             Operator::DynamicScan(dynamic_scan) => {
                 self.eval_dynamic_scan(dynamic_scan, &results[inputs[0]])
             }
@@ -589,6 +590,31 @@ fn eval_filter(predicate: PredicateRef, input: &[RecordBatch]) -> KernelResult<V
         .collect()
 }
 
+fn eval_assert(assert: Assert, input: &[RecordBatch]) -> KernelResult<Vec<RecordBatch>> {
+    let Some(first_batch) = input.iter().find(|batch| batch.num_rows() > 0) else {
+        return Ok(input.to_vec());
+    };
+    let input_schema = Arc::new(StructType::try_from_arrow(first_batch.schema().as_ref())?);
+    let evaluator =
+        ArrowEvaluationHandler.new_predicate_evaluator(input_schema, assert.predicate)?;
+    for batch in input.iter().filter(|batch| batch.num_rows() > 0) {
+        let mask = evaluator
+            .evaluate(&ArrowEngineData::new(batch.clone()))?
+            .try_into_record_batch()?;
+        let mask = mask
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                KernelError::internal_error("Assert predicate did not produce a boolean array")
+            })?;
+        if mask.true_count() != batch.num_rows() {
+            return Err(KernelError::PlanAssertionFailed);
+        }
+    }
+    Ok(input.to_vec())
+}
+
 fn eval_semi_join(
     join: SemiJoin,
     probe: &[RecordBatch],
@@ -713,10 +739,116 @@ mod tests {
     use crate::arrow::array::StructArray;
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
     use crate::engine::sync::get_bytes;
-    use crate::expressions::{col, column_name, lit, Predicate, StructData};
+    use crate::expressions::{col, column_name, lit, BinaryPredicateOp, Predicate, StructData};
     use crate::object_store::memory::InMemory;
     use crate::plans::PlanBuilder;
     use crate::schema::{schema, schema_ref, ToSchema as _};
+
+    #[rstest]
+    #[case::all_true(Predicate::TRUE, vec![Some(1), Some(2)], false)]
+    #[case::column_true(col!("id").gt(lit(0i64)), vec![Some(1), Some(2)], false)]
+    #[case::constant_in_true(
+        Predicate::binary(BinaryPredicateOp::In, lit(1i64), lit(vec![1i64, 2])),
+        vec![Some(1), Some(2)], false)]
+    #[case::constant_not_in_true(
+        Predicate::not(Predicate::binary(BinaryPredicateOp::In, lit(3i64), lit(vec![1i64, 2]))),
+        vec![Some(1), Some(2)], false)]
+    #[case::false_predicate(Predicate::FALSE, vec![Some(1)], true)]
+    #[case::null_predicate(Predicate::NULL, vec![Some(1)], true)]
+    #[case::later_row_false(col!("id").gt(lit(0i64)), vec![Some(1), Some(-1)], true)]
+    #[case::later_row_null(col!("id").gt(lit(0i64)), vec![Some(1), None], true)]
+    #[case::empty_input(Predicate::FALSE, vec![], false)]
+    fn assert_checks_every_row(
+        #[case] predicate: Predicate,
+        #[case] values: Vec<Option<i64>>,
+        #[case] fails: bool,
+        #[values(false, true)] separate_batches: bool,
+    ) -> KernelResult<()> {
+        let schema = schema_ref! { nullable "id": LONG };
+        let rows: Vec<Vec<Scalar>> = values
+            .into_iter()
+            .map(|value| {
+                vec![value
+                    .map(Scalar::Long)
+                    .unwrap_or_else(|| Scalar::null(DataType::LONG))]
+            })
+            .collect();
+        let input = if separate_batches && !rows.is_empty() {
+            let inputs = rows
+                .iter()
+                .map(|row| PlanBuilder::values(schema.clone(), vec![row.clone()]));
+            PlanBuilder::union_all(inputs.collect::<KernelResult<Vec<_>>>()?)?
+        } else {
+            PlanBuilder::values(schema.clone(), rows.clone())?
+        };
+        let plan = input.assert(predicate)?.filter(Predicate::TRUE)?.build()?;
+        let result = SyncPlanExecutor::default().execute_op(Operation::QueryPlan(plan));
+        if fails {
+            let err = result.err().expect("assertion must fail");
+            assert!(matches!(err, KernelError::PlanAssertionFailed), "{err}");
+        } else {
+            let actual = result?
+                .into_data()?
+                .map(|data| data.try_into_record_batch())
+                .collect::<KernelResult<Vec<_>>>()?;
+            let expected = values_to_record_batch(Values::new(schema, rows))?;
+            let actual = crate::arrow::compute::concat_batches(&expected.schema(), &actual)?;
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    fn assert_over_filtered_input_checks_only_remaining_rows(
+        #[values(false, true)] keep_rows: bool,
+    ) -> KernelResult<()> {
+        let plan =
+            PlanBuilder::values(schema_ref! { not_null "id": LONG }, vec![vec![1i64.into()]])?
+                .filter(Predicate::literal(keep_rows))?
+                .assert(Predicate::FALSE)?
+                .build()?;
+        let result = SyncPlanExecutor::default().execute_op(Operation::QueryPlan(plan));
+        if keep_rows {
+            assert!(matches!(result, Err(KernelError::PlanAssertionFailed)));
+        } else {
+            let rows = result?
+                .into_data()?
+                .try_fold(0, |total, data| data.map(|data| total + data.len()))?;
+            assert_eq!(rows, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn assert_propagates_predicate_evaluation_errors() -> KernelResult<()> {
+        let plan =
+            PlanBuilder::values(schema_ref! { not_null "id": LONG }, vec![vec![1i64.into()]])?
+                .assert(col!("id").gt(lit("invalid")))?
+                .build()?;
+        let err = SyncPlanExecutor::default()
+            .execute_op(Operation::QueryPlan(plan))
+            .err()
+            .expect("predicate evaluation must fail");
+        assert!(
+            matches!(err.without_backtrace(), KernelError::Arrow(_)),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn downstream_filter_does_not_hide_assertion_failure() -> KernelResult<()> {
+        let plan =
+            PlanBuilder::values(schema_ref! { not_null "id": LONG }, vec![vec![1i64.into()]])?
+                .assert(Predicate::FALSE)?
+                .filter(Predicate::FALSE)?
+                .build()?;
+        assert!(matches!(
+            SyncPlanExecutor::default().execute_op(Operation::QueryPlan(plan)),
+            Err(KernelError::PlanAssertionFailed)
+        ));
+        Ok(())
+    }
 
     fn write_plan(
         inputs: impl IntoIterator<Item = PlanBuilder>,

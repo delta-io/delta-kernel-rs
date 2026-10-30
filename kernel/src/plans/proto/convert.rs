@@ -19,8 +19,8 @@ use crate::expressions::{
     VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
-    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, RelationRef,
-    ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
+    Agg, Aggregate, Assert, DynamicScan, FileType, Filter, Operator, PrefixSum, Project,
+    RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
@@ -151,6 +151,7 @@ impl From<&Operator> for proto_plan::Operator {
             Operator::RelationSource(n) => Op::RelationSource(n.into()),
             Operator::Project(n) => Op::Project(n.into()),
             Operator::Filter(n) => Op::Filter(n.into()),
+            Operator::Assert(n) => Op::Assert(n.into()),
             Operator::DynamicScan(n) => Op::DynamicScan(n.into()),
             Operator::Aggregate(n) => Op::Aggregate(n.into()),
             Operator::PrefixSum(n) => Op::PrefixSum(n.into()),
@@ -239,6 +240,14 @@ impl From<&WriteJson> for proto_plan::WriteJsonNode {
 impl From<&Filter> for proto_plan::FilterNode {
     fn from(node: &Filter) -> Self {
         proto_plan::FilterNode {
+            predicate: Some(node.predicate.as_ref().into()),
+        }
+    }
+}
+
+impl From<&Assert> for proto_plan::AssertNode {
+    fn from(node: &Assert) -> Self {
+        Self {
             predicate: Some(node.predicate.as_ref().into()),
         }
     }
@@ -1076,15 +1085,15 @@ mod tests {
         IndirectDataSkippingPredicateEvaluator,
     };
     use crate::plans::ir::nodes::{
-        Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, RelationRef,
-        ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
+        Agg, Aggregate, Assert, DynamicScan, FileType, Filter, Operator, PrefixSum, Project,
+        RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
     use crate::plans::proto::{
         expressions as proto_expr, operation as proto_op, plan as proto_plan,
         schema as proto_schema,
     };
-    use crate::plans::{IoOperation, Operation};
+    use crate::plans::{IoOperation, Operation, PlanBuilder};
     use crate::schema::{
         schema, schema_ref, ArrayType, DataType, DecimalType, MapType, MetadataValue,
         PrimitiveType, SchemaRef, StructField, StructType, ToSchema as _,
@@ -1395,6 +1404,7 @@ mod tests {
         "project"
     )]
     #[case(Operator::Filter(Filter { predicate: Arc::new(Predicate::TRUE) }), "filter")]
+    #[case(Operator::Assert(Assert { predicate: Predicate::TRUE.into() }), "assert")]
     #[case(
         Operator::DynamicScan(DynamicScan {
             schema: sample_schema(),
@@ -1442,6 +1452,7 @@ mod tests {
             Op::RelationSource(_) => "relation_source",
             Op::Project(_) => "project",
             Op::Filter(_) => "filter",
+            Op::Assert(_) => "assert",
             Op::DynamicScan(_) => "dynamic_scan",
             Op::Aggregate(_) => "aggregate",
             Op::SemiJoin(_) => "semi_join",
@@ -1545,6 +1556,28 @@ mod tests {
         };
         let proto = proto_plan::FilterNode::from(&node);
         assert!(proto.predicate.is_some());
+    }
+
+    #[test]
+    fn assert_plan_wire_roundtrip_preserves_predicate_and_input() -> KernelResult<()> {
+        let predicate = col!("id").gt(lit(5));
+        let expected = proto_expr::Predicate::from(&predicate);
+        let schema = schema_ref! { nullable "id": INTEGER, nullable "name": STRING };
+        let plan = PlanBuilder::values(schema, vec![vec![6.into(), "alice".into()]])?
+            .assert(predicate)?
+            .build()?;
+        let decoded = decode(&Operation::QueryPlan(plan));
+        let Some(proto_op::operation::Op::QueryPlan(plan)) = decoded.op else {
+            panic!("expected QueryPlan");
+        };
+        assert_eq!(plan.nodes.len(), 2);
+        assert_eq!(plan.nodes[1].inputs, vec![0]);
+        let Some(proto_plan::operator::Op::Assert(node)) = &plan.nodes[1].op.as_ref().unwrap().op
+        else {
+            panic!("expected Assert");
+        };
+        assert_eq!(node.predicate, Some(expected));
+        Ok(())
     }
 
     fn sample_dynamic_scan_input_schema() -> SchemaRef {

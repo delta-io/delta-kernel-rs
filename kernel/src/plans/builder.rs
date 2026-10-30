@@ -43,8 +43,8 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 
 use super::ir::nodes::{
-    Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, Operator, PrefixSum, Project,
-    RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
+    Aggregate, AggregateBuilder, Assert, DynamicScan, FileType, Filter, Operator, PrefixSum,
+    Project, RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
     FILE_META_SCHEMA,
 };
 use super::ir::plan::{Plan, PlanNode};
@@ -55,22 +55,34 @@ use crate::utils::CollectInto;
 use crate::{KernelError, KernelResult};
 
 /// One node of a plan DAG: an operator, its inputs, and its output schema. Node identity is the
-/// `Arc`'s address ([`PlanBuilder::build`] dedups shared subgraphs by pointer). Inputs are always
-/// present nodes -- combinators drop or forward an absent input.
+/// `Arc`'s address ([`PlanBuilder::build`] dedups shared subgraphs by pointer). Inputs are present
+/// nodes; combinators may drop or forward an absent input, as long as input side effects are
+/// respected.
 #[derive(Debug)]
 struct BuilderNode {
     op: Operator,
     inputs: Vec<BuilderNodeRef>,
     schema: SchemaRef,
+    /// Whether this node or an input has side effects and must execute even if output is empty.
+    has_side_effects: bool,
 }
 
 type BuilderNodeRef = Arc<BuilderNode>;
 
-/// A present node, or the *absent* (uninhabited) relation, which still carries its output schema.
+/// A present node, or the absent (uninhabited) relation carrying its output schema.
 #[derive(Clone, Debug)]
 enum PlanBuilderRoot {
     Present(BuilderNodeRef),
     Absent(SchemaRef),
+}
+
+impl PlanBuilderRoot {
+    fn has_side_effects(&self) -> bool {
+        match self {
+            Self::Present(node) => node.has_side_effects,
+            Self::Absent(_) => false,
+        }
+    }
 }
 
 /// A [`Plan`] under construction. See the module docs.
@@ -81,10 +93,14 @@ pub struct PlanBuilder(PlanBuilderRoot);
 impl PlanBuilder {
     /// A present relation applying `op` (output `schema`) over `inputs`.
     fn present(schema: SchemaRef, op: impl Into<Operator>, inputs: Vec<BuilderNodeRef>) -> Self {
+        let op = op.into();
+        let has_side_effects =
+            op.has_side_effects() || inputs.iter().any(|input| input.has_side_effects);
         PlanBuilder(PlanBuilderRoot::Present(Arc::new(BuilderNode {
-            op: op.into(),
+            op,
             inputs,
             schema,
+            has_side_effects,
         })))
     }
 
@@ -352,6 +368,17 @@ impl PlanBuilder {
         Ok(self.unary_op_or_absent(schema, Filter { predicate }))
     }
 
+    /// Require `predicate` to be TRUE on every input row, returning the rows and schema unchanged.
+    /// Empty input always satisfies the assertion. See [`Assert`].
+    ///
+    /// Returns an error if `predicate` references a column absent from the input schema
+    pub fn assert(self, predicate: impl Into<PredicateRef>) -> KernelResult<Self> {
+        let predicate = predicate.into();
+        check_columns_resolve(self.schema(), predicate.references(), "assert")?;
+        let schema = Arc::clone(self.schema());
+        Ok(self.unary_op_or_absent(schema, Assert { predicate }))
+    }
+
     /// Project `self` through `expr` into rows of the caller-declared `schema`. `expr` must be a
     /// struct constructor / patch matching `schema`. See [`Project`].
     ///
@@ -612,6 +639,29 @@ impl PlanBuilder {
         }
         check_columns_resolve(self.schema(), &probe_keys, "join probe")?;
         check_columns_resolve(build.schema(), &build_keys, "join build")?;
+        let schema = Arc::clone(self.schema());
+        let node = SemiJoin {
+            inverted,
+            probe_keys,
+            build_keys,
+        };
+        // A side effect on either input prevents collapsing the join.
+        if self.0.has_side_effects() || build.0.has_side_effects() {
+            // Materialize absent inputs as empty Values so the other side can still execute.
+            let inputs = [self.0, build.0]
+                .into_iter()
+                .map(|input| match input {
+                    PlanBuilderRoot::Present(node) => node,
+                    PlanBuilderRoot::Absent(input_schema) => Arc::new(BuilderNode {
+                        op: Values::new(Arc::clone(&input_schema), vec![]).into(),
+                        inputs: vec![],
+                        schema: input_schema,
+                        has_side_effects: false,
+                    }),
+                })
+                .collect();
+            return Ok(Self::present(schema, node, inputs));
+        }
         // An uninhabited probe always produces an uninhabited result; forward it unchanged.
         let PlanBuilderRoot::Present(probe) = self.0 else {
             return Ok(self);
@@ -623,14 +673,8 @@ impl PlanBuilder {
             PlanBuilderRoot::Absent(_) if inverted => {
                 return Ok(PlanBuilder(PlanBuilderRoot::Present(probe)))
             }
-            PlanBuilderRoot::Absent(_) => return Ok(Self::absent(Arc::clone(&probe.schema))),
+            PlanBuilderRoot::Absent(_) => return Ok(Self::absent(schema)),
         };
-        let node = SemiJoin {
-            inverted,
-            probe_keys,
-            build_keys,
-        };
-        let schema = Arc::clone(&probe.schema);
         Ok(Self::present(schema, node, vec![probe, build]))
     }
 
@@ -679,7 +723,7 @@ impl PlanBuilder {
     /// single empty [`Values`] node carrying its schema, so the result is always a runnable plan.
     pub fn build(&self) -> KernelResult<Plan> {
         Ok(match &self.0 {
-            PlanBuilderRoot::Present(root) => Self::build_plan(root),
+            PlanBuilderRoot::Present(node) => Self::build_plan(node),
             PlanBuilderRoot::Absent(schema) => Plan {
                 schema: Arc::clone(schema),
                 nodes: vec![PlanNode::new(
@@ -693,7 +737,7 @@ impl PlanBuilder {
     /// Like [`Self::build`], but yields `None` for an absent relation instead of an empty plan.
     pub fn build_opt(&self) -> KernelResult<Option<Plan>> {
         Ok(match &self.0 {
-            PlanBuilderRoot::Present(root) => Some(Self::build_plan(root)),
+            PlanBuilderRoot::Present(node) => Some(Self::build_plan(node)),
             PlanBuilderRoot::Absent(_) => None,
         })
     }
@@ -789,7 +833,7 @@ mod tests {
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
-    use crate::expressions::{col, column_name, lit, Expression};
+    use crate::expressions::{col, column_name, lit, Expression, Predicate};
     use crate::plans::ir::nodes::FileType;
     use crate::schema::{
         schema, schema_ref, DataType, MetadataColumnSpec, StructField, StructType,
@@ -935,6 +979,22 @@ mod tests {
     fn filter_preserves_schema() -> KernelResult<()> {
         let filtered = vals(id_schema()).filter(col!("id").is_not_null())?;
         assert_eq!(filtered.schema(), &id_schema());
+        Ok(())
+    }
+
+    #[test]
+    fn assert_preserves_schema_and_predicate_before_downstream_filter() -> KernelResult<()> {
+        let predicate: PredicateRef = col!("id").is_not_null().into();
+        let asserted = vals(id_schema()).assert(predicate.clone())?;
+        assert_eq!(asserted.schema(), &id_schema());
+        let plan = assert_plan(
+            asserted.filter(Predicate::TRUE)?,
+            &[(&[], "values"), (&[0], "assert"), (&[1], "filter")],
+        );
+        let Operator::Assert(node) = &plan.nodes[1].op else {
+            panic!("expected Assert");
+        };
+        assert_eq!(node.predicate, predicate);
         Ok(())
     }
 
@@ -1090,6 +1150,7 @@ mod tests {
     #[case::empty_json(PlanBuilder::scan_json(Vec::<FileMeta>::new(), &[], id_schema()))]
     #[case::empty_values(PlanBuilder::values(id_schema(), vec![]))]
     #[case::filter(absent_src().filter(col!("id").is_not_null()))]
+    #[case::assert(absent_src().assert(Predicate::FALSE))]
     #[case::project(absent_src().project(Expression::struct_from([col!("id")]), id_schema()))]
     #[case::project_patch(absent_src().project_patch(|p| p.drop("id")))]
     #[case::dynamic_scan({
@@ -1147,6 +1208,74 @@ mod tests {
             [column_name!("id")],
         )?;
         assert_plan(anti, &[(&[], "values")]);
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::assertion(false, "assert")]
+    #[case::write_json(true, "write_json")]
+    fn empty_join_preserves_side_effects_through_filters(
+        #[case] write_json: bool,
+        #[case] side_effect_op: &str,
+        #[values(false, true)] effect_probe: bool,
+        #[values(false, true)] inverted: bool,
+    ) -> KernelResult<()> {
+        let (effect, schema, key) = if write_json {
+            let effect = PlanBuilder::write_json(
+                [vals(id_schema())],
+                Url::parse("memory:///output")?,
+                false,
+                false,
+            )?;
+            (effect, FILE_META_SCHEMA.clone(), column_name!("location"))
+        } else {
+            (
+                vals(id_schema()).assert(Predicate::FALSE)?,
+                id_schema(),
+                column_name!("id"),
+            )
+        };
+        let effect = effect.filter(Predicate::TRUE)?;
+        let empty = absent_over(schema);
+        let (probe, build) = if effect_probe {
+            (effect, empty)
+        } else {
+            (empty, effect)
+        };
+        let join = if inverted {
+            probe.anti_join(build, [key.clone()], [key])?
+        } else {
+            probe.semi_join(build, [key.clone()], [key])?
+        };
+        let expected: Vec<(&[usize], &str)> = if effect_probe {
+            vec![
+                (&[], "values"),
+                (&[0], side_effect_op),
+                (&[1], "filter"),
+                (&[], "values"),
+                (&[2, 3], "semi_join"),
+                (&[4], "filter"),
+            ]
+        } else {
+            vec![
+                (&[], "values"),
+                (&[], "values"),
+                (&[1], side_effect_op),
+                (&[2], "filter"),
+                (&[0, 3], "semi_join"),
+                (&[4], "filter"),
+            ]
+        };
+        let plan = assert_plan(join.filter(Predicate::TRUE)?, &expected);
+        let Operator::SemiJoin(join) = &plan.nodes[4].op else {
+            panic!("expected SemiJoin");
+        };
+        assert_eq!(join.inverted, inverted);
+        let empty_index = if effect_probe { 3 } else { 0 };
+        let Operator::Values(empty) = &plan.nodes[empty_index].op else {
+            panic!("expected empty Values");
+        };
+        assert!(empty.rows.is_empty());
         Ok(())
     }
 
@@ -1546,6 +1675,10 @@ mod tests {
     // transforms referencing an absent column
     #[case::filter_unknown_column("`nope` not found",
         || vals(id_schema()).filter(col!("nope").is_not_null()))]
+    #[case::assert_unknown_column("assert: column `nope` not found",
+        || vals(id_schema()).assert(col!("nope").is_not_null()))]
+    #[case::assert_unknown_column_on_empty_input("assert: column `nope` not found",
+        || absent_src().assert(col!("nope").is_not_null()))]
     #[case::relation_source_unknown_column("`nope` not found",
         || PlanBuilder::relation_source(RelationRef::new("relation-0", id_schema())).filter(col!("nope").is_not_null()))]
     #[case::project_unknown_column("`nope` not found",
