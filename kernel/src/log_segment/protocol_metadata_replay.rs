@@ -138,7 +138,8 @@ impl LogSegment {
     /// Replays the log segment for the latest Protocol and Metadata, each with its version.
     fn replay_for_pm(&self, engine: &dyn Engine) -> KernelResult<PmCandidate> {
         #[cfg(feature = "declarative-plans")]
-        if let Some(executor) = engine.plan_executor() {
+        if engine.use_declarative_protocol_metadata() {
+            let executor = engine.require_plan_executor()?;
             return resolve_pm_batches(self.read_pm_batches_via_plan(executor.as_ref())?);
         }
         resolve_pm_batches(self.read_pm_batches(engine)?)
@@ -555,7 +556,6 @@ mod tests {
     use std::sync::Arc;
 
     use itertools::Itertools;
-    use test_log::test;
 
     use crate::engine::sync::SyncEngine;
     #[cfg(feature = "declarative-plans")]
@@ -590,7 +590,7 @@ mod tests {
     //              type    nulls  min / max
     // txn.appId    BINARY  0      "3ae45b72-24e1-865a-a211-3..." / "3ae45b72-24e1-865a-a211-3..."
     // txn.version  INT64   0      "4390" / "4390"
-    #[test]
+    #[test_log::test]
     fn test_replay_for_metadata() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
@@ -623,7 +623,7 @@ mod tests {
     }
 
     #[cfg(feature = "declarative-plans")]
-    #[test]
+    #[test_log::test]
     fn test_declarative_pm_plan_filters_irrelevant_actions() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
@@ -651,9 +651,6 @@ mod tests {
         assert_eq!(filter.predicate.as_ref(), &expected);
     }
 
-    // With the `declarative-plans` feature flag on, `SyncEngine` resolves P&M through the
-    // declarative plan.
-    //
     // This fixture's checkpoint names its map entry fields `entries` where kernel expects
     // `key_value`. Parquet takes that name from the writer's Arrow schema unless the writer sets
     // `WriterProperties::coerce_types`, which is off by default, and Arrow's own
@@ -661,12 +658,19 @@ mod tests {
     // produces a file kernel must translate on read. Spark and kernel both write `key_value`,
     // covered by
     // `scan_plan::execution_tests::declarative_metadata_reconciles_checkpoint_with_later_commits`.
-    #[test]
-    fn test_snapshot_build_via_plan_over_parquet_checkpoint_with_entries_named_maps() {
+    #[cfg(feature = "declarative-plans")]
+    #[rstest::rstest]
+    #[test_log::test]
+    #[case(false)]
+    #[case(true)]
+    fn test_snapshot_build_via_plan_over_parquet_checkpoint_with_entries_named_maps(
+        #[case] declarative: bool,
+    ) {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine = SyncEngine::new();
+        let engine = DelegatingEngine::new(Arc::new(SyncEngine::new()))
+            .with_declarative_protocol_metadata(declarative);
 
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
@@ -678,11 +682,18 @@ mod tests {
     // fields `item` where kernel expects `element`, so it covers the other half of the naming
     // disagreement. `metaData.partitionColumns` is the array in question, and it is present in
     // every `metaData` action, so its element name is checked on every P&M replay.
-    #[test]
-    fn test_snapshot_build_via_plan_over_parquet_checkpoint_with_item_named_arrays() {
+    #[cfg(feature = "declarative-plans")]
+    #[rstest::rstest]
+    #[test_log::test]
+    #[case(false)]
+    #[case(true)]
+    fn test_snapshot_build_via_plan_over_parquet_checkpoint_with_item_named_arrays(
+        #[case] declarative: bool,
+    ) {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine = SyncEngine::new();
+        let engine = DelegatingEngine::new(Arc::new(SyncEngine::new()))
+            .with_declarative_protocol_metadata(declarative);
 
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
@@ -691,19 +702,27 @@ mod tests {
     }
 
     #[cfg(feature = "declarative-plans")]
-    #[test]
-    fn test_snapshot_build_via_failing_plan_executor_surfaces_error_without_fallback() {
+    #[rstest::rstest]
+    #[test_log::test]
+    #[case(false)]
+    #[case(true)]
+    fn test_snapshot_replay_only_uses_executor_when_opted_in(#[case] declarative: bool) {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = DelegatingEngine::new(Arc::new(SyncEngine::new()))
-            .with_plan_executor(Arc::new(FailingPlanExecutor));
+            .with_plan_executor(Arc::new(FailingPlanExecutor))
+            .with_declarative_protocol_metadata(declarative);
 
         let result = Snapshot::builder_for(url).build(&engine);
 
-        assert!(
-            result.is_err(),
-            "plan failure must surface, not fall back to legacy replay"
-        );
+        if declarative {
+            let error = result.unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("plan executor deliberately failed"));
+        } else {
+            assert_eq!(result.unwrap().version(), 1);
+        }
     }
 }

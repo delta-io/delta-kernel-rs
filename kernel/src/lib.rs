@@ -1083,6 +1083,15 @@ pub trait Engine: AsAny {
         None
     }
 
+    /// Whether snapshot Protocol and Metadata replay should use the plan executor.
+    ///
+    /// Defaults to false so executors supporting only file reads can serve snapshots. Returning
+    /// true requires an executor that supports the complete P&M plan; execution errors propagate.
+    #[cfg(feature = "declarative-plans")]
+    fn use_declarative_protocol_metadata(&self) -> bool {
+        false
+    }
+
     /// Get the connector provided [`PlanExecutor`], erroring if this engine provides none.
     ///
     /// # Errors
