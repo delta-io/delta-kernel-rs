@@ -111,8 +111,8 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   the feature are blocked.
 - `geo-type-in-dev`: geospatial type support (geometry and geography columns) (experimental,
   in development). Gates `KernelSupport` for the `geospatial` reader+writer feature: with the
-  cargo feature off, any table listing it is rejected; with it on, scans and CDF are supported
-  but writes are still blocked.
+  cargo feature off, any table listing it is rejected; with it on, scans, CDF, and writes are
+  supported, and CREATE TABLE enables the feature for schemas with geometry or geography columns.
 - `internal-api`: unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `declarative-plans`: experimental declarative-plan IR (`kernel/src/plans/`) and the prost

@@ -14,7 +14,7 @@ pub(crate) use column_mapping::{
 };
 use delta_kernel_derive::internal_api;
 #[cfg(feature = "geo-type-in-dev")]
-pub(crate) use geospatial::validate_geospatial_feature_support;
+pub(crate) use geospatial::{schema_contains_geospatial, validate_geospatial_feature_support};
 pub(crate) use iceberg_compat::v2::V2_VALIDATOR;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
 pub(crate) use iceberg_compat::{
@@ -742,12 +742,7 @@ static GEOSPATIAL_TYPE_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     #[cfg(feature = "geo-type-in-dev")]
-    kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::SnapshotLoad | Operation::Scan | Operation::Cdf => Ok(()),
-        Operation::Write => Err(KernelError::unsupported(
-            "Feature 'geospatial' is not supported for writes",
-        )),
-    }),
+    kernel_support: KernelSupport::Supported,
     #[cfg(not(feature = "geo-type-in-dev"))]
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,

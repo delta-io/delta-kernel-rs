@@ -24,11 +24,15 @@ use crate::expressions::ColumnName;
 use crate::schema::file_utils::schema_contains_file_type;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
+#[cfg(feature = "geo-type-in-dev")]
+use crate::schema::PrimitiveType;
 use crate::schema::{
     normalize_column_names_to_schema_casing, schema_contains_non_null_fields, DataType, SchemaRef,
     StructType,
 };
 use crate::table_configuration::TableConfiguration;
+#[cfg(feature = "geo-type-in-dev")]
+use crate::table_features::schema_contains_geospatial;
 use crate::table_features::{
     add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
     ensure_domain_metadata_dependency, find_max_column_id_in_schema,
@@ -85,6 +89,11 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::RowTracking,
     TableFeature::VariantType,
     TableFeature::VariantShredding,
+    // Geospatial is auto-enabled by `maybe_enable_geospatial` when the schema has geometry or
+    // geography columns. Allowing explicit `delta.feature.geospatial=supported` lets users
+    // pre-enable the feature so a later geospatial column does not need a protocol upgrade.
+    #[cfg(feature = "geo-type-in-dev")]
+    TableFeature::GeospatialType,
     // Invariants is auto-enabled by `maybe_enable_invariants` when the schema has non-null
     // fields. Allowing explicit `delta.feature.invariants=supported` lets users pre-enable
     // the feature on an all-nullable table so a later ALTER TABLE ADD COLUMN NOT NULL does
@@ -258,8 +267,8 @@ struct DataLayoutResult {
 /// 1. Top-level columns (nested paths are not supported)
 /// 2. Present in the schema
 /// 3. Not duplicated
-/// 4. Of a supported primitive type (Struct, Array, and Map are rejected because the Delta protocol
-///    does not define their partition-value serialization)
+/// 4. Of a supported primitive type (Struct, Array, Map, Geometry, and Geography are rejected
+///    because the Delta protocol does not define their partition-value serialization)
 /// 5. A strict subset of the schema columns (at least one non-partition column required)
 fn validate_partition_columns(
     schema: &StructType,
@@ -297,6 +306,17 @@ fn validate_partition_columns(
         let field = schema.field(col_name).ok_or_else(|| {
             KernelError::generic(format!("Partition column '{col}' not found in schema"))
         })?;
+
+        #[cfg(feature = "geo-type-in-dev")]
+        if let DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) =
+            field.data_type()
+        {
+            return Err(KernelError::generic(format!(
+                "Partition column '{col}' has geospatial type '{}'. \
+                 Geospatial columns cannot be partition columns.",
+                field.data_type()
+            )));
+        }
 
         let DataType::Primitive(_) = field.data_type() else {
             return Err(KernelError::generic(format!(
@@ -402,6 +422,19 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
     if schema_contains_timestamp_ntz(schema) {
         add_feature_to_lists(
             TableFeature::TimestampWithoutTimezone,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
+/// Conditionally adds the `geospatial` feature to the protocol when the schema contains geometry
+/// or geography columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
+#[cfg(feature = "geo-type-in-dev")]
+fn maybe_enable_geospatial(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    if schema_contains_geospatial(schema) {
+        add_feature_to_lists(
+            TableFeature::GeospatialType,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
@@ -1043,6 +1076,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
         maybe_enable_variant_type(&effective_schema, &mut validated);
         maybe_enable_file_type_preview(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
+        #[cfg(feature = "geo-type-in-dev")]
+        maybe_enable_geospatial(&effective_schema, &mut validated);
         maybe_enable_invariants(&effective_schema, &mut validated);
 
         // Property-driven auto-enablement: check enablement properties
@@ -2065,6 +2100,25 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("non-primitive type"));
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest::rstest]
+    #[case::geometry(crate::unit_test_utils::geometry_type("OGC:CRS84"))]
+    #[case::geography(crate::unit_test_utils::geography_type(
+        "OGC:CRS84",
+        crate::schema::EdgeInterpolationAlgorithm::Spherical
+    ))]
+    fn test_validate_partition_columns_geospatial_types_rejected(#[case] data_type: DataType) {
+        let schema = schema! {
+            not_null "id": INTEGER,
+            nullable "geo": (data_type),
+        };
+
+        let error = validate_partition_columns(&schema, &[column_name!("geo")])
+            .expect_err("geospatial partition columns must be rejected")
+            .to_string();
+        assert!(error.contains("Geospatial columns cannot be partition columns"));
     }
 
     #[rstest::rstest]
