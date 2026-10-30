@@ -105,6 +105,9 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   `Transaction::ack_check_constraints`. Kernel does not evaluate constraint SQL, so enforcement is
   the connector's responsibility. CREATE TABLE rejects `delta.constraints.*` properties in every
   build. Also gates the internal SQL tokenizer and parser.
+- `checkpoint-protection`: support for the `checkpointProtection` writer feature. Enable only
+  when the connector satisfies all feature requirements, including checkpoint protection and
+  version-history cleanup. Kernel does not perform metadata cleanup.
 - `adaptive-metadata-in-dev`: adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature. Without it, reads and writes to tables listing
@@ -156,9 +159,6 @@ Writers configure transaction intent before `build()`, then call
 `BoundWriteContext`. Distributed writers can encode and transport the state before binding it.
 Kernel assembles commit actions, enforces protocol compliance, and delegates the atomic commit to a
 `Committer`.
-Tables with `checkpointProtection` require `Transaction::ack_checkpoint_protection_requirements`
-before `write_state` or `commit`. The connector is responsible for compliant metadata cleanup;
-Kernel does not perform cleanup. This table feature does not require a Cargo feature flag.
 
 **Engine trait:** exposes `StorageHandler`, `JsonHandler`, `ParquetHandler`, and
 `EvaluationHandler`, plus an optional `PlanExecutor` under `declarative-plans`. Metrics use tracing

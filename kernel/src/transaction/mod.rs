@@ -327,8 +327,6 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     // handling. Whether the connector acknowledged responsibility for applying column
     // defaults.
     column_defaults_acknowledged: bool,
-    // Whether the connector acknowledged the checkpoint and history-cleanup requirements.
-    checkpoint_protection_requirements_acknowledged: bool,
     // Whether the connector acknowledged responsibility for enforcing this table's CHECK
     // constraints.
     #[cfg(feature = "check-constraints-in-dev")]
@@ -500,27 +498,6 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         self.column_defaults_acknowledged = true;
     }
 
-    /// Acknowledges that the connector satisfies the `checkpointProtection` writer requirements.
-    ///
-    /// Call this for each transaction on a table with `checkpointProtection` before requesting
-    /// [`write_state`](Self::write_state) or committing, including metadata-only commits.
-    /// Calling it on a table without the feature has no effect on validation.
-    ///
-    /// The connector must preserve protected checkpoints, validate the protocol at versions it
-    /// checkpoints, and follow the feature's version-history cleanup rules, including deleting
-    /// commits before their associated checkpoints. See the [writer requirements] for the
-    /// protected version boundary and permitted history-truncation exceptions.
-    ///
-    /// Kernel validates the protocol for its checkpoint writes. It does not perform or validate
-    /// the connector's metadata cleanup. Calling this method records the connector's promise;
-    /// it does not enforce these requirements. Skipping metadata cleanup satisfies the cleanup
-    /// requirements.
-    ///
-    /// [writer requirements]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/checkpoint-protection.md#writer-requirements-for-checkpoint-protection
-    pub fn ack_checkpoint_protection_requirements(&mut self) {
-        self.checkpoint_protection_requirements_acknowledged = true;
-    }
-
     /// Returns the expected schema for file statistics.
     ///
     /// The schema structure is derived from table configuration:
@@ -643,12 +620,10 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// configuration.
     ///
     /// Returns an error if the table has an empty or unsupported schema, or if the table declares
-    /// column defaults, CHECK constraints, or checkpoint protection requirements that the connector
-    /// has not acknowledged.
+    /// column defaults or CHECK constraints that the connector has not acknowledged.
     pub fn write_state(&self) -> KernelResult<Arc<WriteState>> {
         self.ensure_schema_non_empty_for_write_state()?;
         self.ensure_column_defaults_acknowledged()?;
-        self.ensure_checkpoint_protection_requirements_acknowledged()?;
         #[cfg(feature = "check-constraints-in-dev")]
         self.ensure_check_constraints_acknowledged()?;
         self.validate_for_data_write()?;
@@ -723,7 +698,6 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             user_domain_removals: vec![],
             data_change: common_state.data_change,
             column_defaults_acknowledged: false,
-            checkpoint_protection_requirements_acknowledged: false,
             #[cfg(feature = "check-constraints-in-dev")]
             check_constraints_acknowledged: false,
             row_tracking_preservation_acknowledged: false,
@@ -1010,20 +984,6 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         Ok(())
     }
 
-    fn ensure_checkpoint_protection_requirements_acknowledged(&self) -> KernelResult<()> {
-        require!(
-            self.checkpoint_protection_requirements_acknowledged
-                || !self
-                    .effective_table_config
-                    .is_feature_supported(&TableFeature::CheckpointProtection),
-            KernelError::invalid_transaction_state(
-                "Writing to a table with checkpointProtection requires calling \
-                 Transaction::ack_checkpoint_protection_requirements() first",
-            )
-        );
-        Ok(())
-    }
-
     /// Rejects writing or committing when this transaction has effective CHECK constraints that
     /// the connector has not acknowledged.
     #[cfg(feature = "check-constraints-in-dev")]
@@ -1170,8 +1130,6 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// This method does not introspect into staged file-actions (see validate_file_actions
     /// instead).
     fn validate_commit(&self) -> KernelResult<()> {
-        self.ensure_checkpoint_protection_requirements_acknowledged()?;
-
         // Kernel cannot distinguish Remove actions and DV updates that only delete rows from those
         // that accompany copied or updated rows, so both require the preservation acknowledgment.
         if self.staged_data_changes.has_removes() || self.staged_data_changes.has_dv_updates() {
@@ -1675,7 +1633,6 @@ mod tests {
             user_domain_removals,
             data_change,
             column_defaults_acknowledged,
-            checkpoint_protection_requirements_acknowledged,
             #[cfg(feature = "check-constraints-in-dev")]
             check_constraints_acknowledged,
             row_tracking_preservation_acknowledged,
@@ -1709,7 +1666,6 @@ mod tests {
         assert!(user_domain_removals.is_empty());
         assert_eq!(data_change, expected_data_change);
         assert!(!column_defaults_acknowledged);
-        assert!(!checkpoint_protection_requirements_acknowledged);
         #[cfg(feature = "check-constraints-in-dev")]
         assert!(!check_constraints_acknowledged);
         assert!(!row_tracking_preservation_acknowledged);

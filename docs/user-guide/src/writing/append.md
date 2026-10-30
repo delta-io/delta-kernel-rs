@@ -100,6 +100,10 @@ Kernel records the operation and connector name/version in the commit log.
 Use `UpdateTableOperation::Custom` for connector-specific operation names.
 These inputs cannot be changed on the returned builder or transaction.
 
+If the table supports `checkpointProtection`, enable the `checkpoint-protection` Cargo feature
+only if your connector satisfies its writer requirements. See
+[Checkpoint protection](./checkpoint_protection.md).
+
 ## WriteState and BoundWriteContext
 
 If the table declares column defaults, resolve any defaults your input needs and acknowledge them

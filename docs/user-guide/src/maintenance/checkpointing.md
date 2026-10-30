@@ -172,21 +172,8 @@ post-commit pattern that includes writing a CRC file before checkpointing.
 
 ## Checkpoint protection
 
-The `checkpointProtection` table feature protects checkpoints and version history across
-table feature removal.
-
-Before requesting write state or committing a transaction on these tables, call
-`txn.ack_checkpoint_protection_requirements()`. This acknowledgment is required for each
-transaction, including metadata-only commits. Call it only if your connector satisfies all
-of the feature's [writer requirements]. No Cargo feature flag is required.
-
-These requirements cover preserving protected checkpoints, validating the protocol at the
-version being checkpointed, and safely cleaning up version history. Kernel does not perform
-metadata cleanup; your connector is responsible for making its cleanup comply with the feature.
-Skipping metadata cleanup satisfies the cleanup requirements. Kernel's checkpoint APIs validate
-the protocol at the snapshot version being checkpointed and don't require a separate acknowledgment.
-
-[writer requirements]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/checkpoint-protection.md#writer-requirements-for-checkpoint-protection
+For feature support and connector cleanup responsibilities on tables with
+`checkpointProtection`, see [Checkpoint protection](../writing/checkpoint_protection.md).
 
 ## Log compaction
 
