@@ -792,6 +792,7 @@ mod tests {
                 ..Default::default()
             },
             last_checkpoint_metadata: None,
+            checkpoint_kind: Default::default(),
         }
     }
 

@@ -349,6 +349,7 @@ fn log_segment_stats_counts_only_replay_commits(
         checkpoint_version: checkpoint_only.then_some(0),
         log_root: Url::parse("memory:///_delta_log/").unwrap(),
         last_checkpoint_metadata: None,
+        checkpoint_kind: Default::default(),
         listed: LogSegmentFiles {
             ascending_commit_files: commits,
             checkpoint_parts: if checkpoint_only {
@@ -421,6 +422,7 @@ fn log_segment_stats_uses_selected_compactions(
         checkpoint_version: None,
         log_root: Url::parse("memory:///_delta_log/").unwrap(),
         last_checkpoint_metadata: None,
+        checkpoint_kind: Default::default(),
         listed: LogSegmentFiles {
             ascending_commit_files: commit_sizes
                 .iter()
