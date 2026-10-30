@@ -974,31 +974,15 @@ impl LogSegment {
         engine: &dyn Engine,
         pointer: &LastManifestCommit,
     ) -> KernelResult<CheckpointAction> {
-        let inconsistent = |detail: String| {
-            KernelError::invalid_log_segment(format!(
-                "lastManifestCommit names manifest commit version {} as the source of content \
-                 root version {}, but {detail}",
-                pointer.version, pointer.content_root_version
-            ))
-        };
-        let commit = self.find_pointed_commit(pointer).ok_or_else(|| {
-            inconsistent("this log segment does not list that commit".to_string())
-        })?;
+        let commit = self
+            .find_pointed_commit(pointer)
+            .ok_or_else(|| pointer.inconsistency("this log segment does not list that commit"))?;
         let files = std::slice::from_ref(&commit.location);
         let batches =
             engine
                 .json_handler()
                 .read_json_files(files, LOG_CHECKPOINT_SCHEMA.clone(), None)?;
-        let action = first_checkpoint_action(batches)?
-            .ok_or_else(|| inconsistent("that commit carries no checkpoint action".to_string()))?;
-        require!(
-            action.content_root_version() == pointer.content_root_version,
-            inconsistent(format!(
-                "that commit's checkpoint action has content root version {}",
-                action.content_root_version()
-            ))
-        );
-        Ok(action)
+        pointer.require_checkpoint_action(first_checkpoint_action(batches)?)
     }
 
     /// The listed commit at `pointer`'s version, or `None` when this segment does not list it.
@@ -1051,14 +1035,55 @@ impl LogSegment {
     }
 
     fn find_commit_cover_paths(&self, after: Option<Version>) -> Vec<&ParsedLogPath> {
+        Self::commit_cover_paths_using(
+            self.listed.ascending_commit_files.iter(),
+            self.listed.ascending_compaction_files.iter(),
+            after,
+        )
+    }
+
+    /// The commit cover over versions in `(oldest_exclusive, newest_inclusive]`, in descending
+    /// order. Each of `required_deltas` is read as its own commit file, never through a log
+    /// compaction.
+    #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+    fn find_commit_cover_paths_in_range(
+        &self,
+        oldest_exclusive: Option<Version>,
+        newest_inclusive: Version,
+        required_deltas: &[Version],
+    ) -> Vec<&ParsedLogPath> {
+        let commits = self
+            .listed
+            .ascending_commit_files
+            .iter()
+            .filter(|commit| commit.version <= newest_inclusive);
+        let compactions = self
+            .listed
+            .ascending_compaction_files
+            .iter()
+            .filter(|compaction| {
+                matches!(
+                    compaction.file_type,
+                    LogPathFileType::CompactedCommit { hi } if hi <= newest_inclusive
+                        && !required_deltas.iter().any(|v| (compaction.version..=hi).contains(v))
+                )
+            });
+        Self::commit_cover_paths_using(commits, compactions, oldest_exclusive)
+    }
+
+    /// The commit cover over the ascending `commits` and `compactions`, restricted to files that
+    /// start after `after` as in [`Self::find_commit_cover_after`].
+    fn commit_cover_paths_using<'a>(
+        commits: impl Iterator<Item = &'a ParsedLogPath>,
+        compactions: impl Iterator<Item = &'a ParsedLogPath>,
+        after: Option<Version>,
+    ) -> Vec<&'a ParsedLogPath> {
         // Create an iterator sorted in ascending order by (initial version, end version), e.g.
         // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
         //  10.19.compacted.json, 11.json, ...]
-        let all_files = itertools::Itertools::merge_by(
-            self.listed.ascending_commit_files.iter(),
-            self.listed.ascending_compaction_files.iter(),
-            |path_a, path_b| path_a.version <= path_b.version,
-        )
+        let all_files = itertools::Itertools::merge_by(commits, compactions, |path_a, path_b| {
+            path_a.version <= path_b.version
+        })
         .filter(|path| after.is_none_or(|after| path.version > after));
 
         let mut last_pushed: Option<&ParsedLogPath> = None;
