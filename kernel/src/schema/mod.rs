@@ -1706,7 +1706,8 @@ impl<'de> Deserialize<'de> for StructType {
     {
         let diagnostic = std::cell::RefCell::new(None);
         serde::de::DeserializeSeed::deserialize(
-            decoding::SchemaSeed::<Self>::new(&diagnostic), deserializer,
+            decoding::SchemaSeed::<Self>::new(&diagnostic),
+            deserializer,
         )
     }
 }
@@ -2371,7 +2372,8 @@ impl<'de> serde::Deserialize<'de> for DataType {
     {
         let diagnostic = std::cell::RefCell::new(None);
         serde::de::DeserializeSeed::deserialize(
-            decoding::SchemaSeed::<Self>::new(&diagnostic), deserializer,
+            decoding::SchemaSeed::<Self>::new(&diagnostic),
+            deserializer,
         )
     }
 }

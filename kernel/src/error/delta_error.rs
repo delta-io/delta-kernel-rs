@@ -46,7 +46,6 @@ impl DeltaError {
         )
     }
 
-
     /// Reports the explicitly stored column-mapping `mode` incompatible with adaptive metadata.
     /// `source` retains the protocol validation failure for diagnostics.
     pub(crate) fn adaptive_metadata_mapping_mode(mode: &str, source: super::KernelError) -> Self {

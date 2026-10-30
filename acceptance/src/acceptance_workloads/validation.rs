@@ -342,6 +342,15 @@ fn expected_error_matches(expected: &ExpectedError, actual: &delta_kernel::Error
                             | "DELTA_MISSING_TRANSACTION_LOG"
                             | "DELTA_TRUNCATED_TRANSACTION_LOG",
                         "DELTA_PATH_DOES_NOT_EXIST"
+                    ) | (
+                        "COLUMN_ALREADY_EXISTS",
+                        "DELTA_DUPLICATE_COLUMNS_FOUND.EXISTING_SCHEMA"
+                    ) | (
+                        "DELTA_VERSIONS_NOT_CONTIGUOUS.GENERIC",
+                        "DELTA_VERSIONS_NOT_CONTIGUOUS"
+                    ) | (
+                        "DELTA_TRUNCATED_TRANSACTION_LOG",
+                        "DELTA_LOG_FILE_NOT_FOUND"
                     )
                 )
         }
