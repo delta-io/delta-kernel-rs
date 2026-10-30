@@ -416,7 +416,7 @@ struct CheckpointV2Backing<'a> {
     _action_records: Option<Vec<CheckpointActionRecord>>,
     actions: Option<Vec<FfiCheckpointNonFileAction>>,
     _checkpoint_metadata_tags: Option<Vec<FfiStringMapEntry>>,
-    checkpoint_metadata: Option<Box<FfiCheckpointMetadata>>,
+    checkpoint_metadata: Vec<FfiCheckpointMetadata>,
 }
 
 impl<'a> CheckpointV2Backing<'a> {
@@ -469,15 +469,17 @@ impl<'a> CheckpointV2Backing<'a> {
                 .tags()
                 .map(|tags| unsafe { FfiStringMapEntry::from_map_unsafe(tags) })
         });
-        let checkpoint_metadata = source.checkpoint_metadata().map(|metadata| {
-            Box::new(FfiCheckpointMetadata {
+        let checkpoint_metadata = source
+            .checkpoint_metadata()
+            .into_iter()
+            .map(|metadata| FfiCheckpointMetadata {
                 version: metadata.version(),
                 tags: checkpoint_metadata_tags
                     .as_deref()
                     .map(|tags| unsafe { FfiSlice::new_unsafe(tags) })
                     .into(),
             })
-        });
+            .collect();
         Self {
             source,
             _checkpoint_metadata_tags: checkpoint_metadata_tags,
@@ -495,7 +497,7 @@ impl<'a> CheckpointV2Backing<'a> {
         FfiLastCheckpointV2 {
             checkpoint_metadata: self
                 .checkpoint_metadata
-                .as_deref()
+                .first()
                 .map_or(std::ptr::null(), std::ptr::from_ref),
             path: kernel_string_slice!(path),
             size_in_bytes: self.source.size_in_bytes().into(),
