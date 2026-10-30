@@ -36,6 +36,23 @@ pub struct DeltaErrorParameter {
 }
 
 impl DeltaError {
+    /// Reports a declared partition `column` absent from the logical `schema`.
+    pub(crate) fn partition_column_not_found(
+        column: &str,
+        schema: &crate::schema::StructType,
+        source: super::KernelError,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaPartitionColumnNotFound,
+            vec![
+                DeltaErrorParameter::new("columnName", column),
+                DeltaErrorParameter::new("schemaMap", schema),
+            ],
+            Some(Box::new(source)),
+        )
+    }
+
+
     /// Reports the duplicate partition column `name` stored in table metadata.
     pub(crate) fn duplicate_partition_column(name: &str, source: super::KernelError) -> Self {
         Self::new(

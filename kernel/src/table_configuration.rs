@@ -280,9 +280,10 @@ fn validate_partition_columns(
         }
         require!(
             logical_schema.field(col).is_some(),
-            crate::Error::Kernel(KernelError::generic(format!(
-                "Partition column '{col}' not found in schema"
-            )))
+            crate::DeltaError::partition_column_not_found(
+                col, logical_schema,
+                KernelError::generic(format!("Partition column '{col}' not found in schema")),
+            ).into()
         );
     }
     Ok(())
