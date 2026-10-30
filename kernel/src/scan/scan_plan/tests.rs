@@ -228,7 +228,7 @@ fn declarative_metadata_matches_imperative_scan(
         Some(col!("id").is_not_null())
     )]
     predicate: Option<Pred>,
-) -> KernelResult<()> {
+) -> crate::Result<()> {
     let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
     let predicate = predicate.map(Arc::new);
 
@@ -255,13 +255,17 @@ fn declarative_metadata_matches_imperative_scan(
     let actual = declarative_metadata(&scan, engine.as_ref())?;
 
     if table.contains("struct-stats-only") {
-        assert_metadata_eq(
+        Ok(assert_metadata_eq(
             &without_columns(&actual, &[STATS])?,
             &without_columns(&expected, &[STATS])?,
             &format!("table {table}"),
-        )
+        )?)
     } else {
-        assert_metadata_eq(&actual, &expected, &format!("table {table}"))
+        Ok(assert_metadata_eq(
+            &actual,
+            &expected,
+            &format!("table {table}"),
+        )?)
     }
 }
 
@@ -270,7 +274,7 @@ fn declarative_metadata_matches_imperative_scan(
 #[case::json_manifest("v2-checkpoints-json-with-sidecars")]
 fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
     #[case] table: &str,
-) -> KernelResult<()> {
+) -> crate::Result<()> {
     let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
     let plan = snapshot
         .scan_builder()
@@ -309,7 +313,7 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
 fn declarative_metadata_matches_imperative_across_stats_options(
     #[case] stats: StatsOptions,
     #[case] expected_stats_field_groups: &[&[&str]],
-) -> KernelResult<()> {
+) -> crate::Result<()> {
     let (engine, snapshot, _tempdir) = load_test_table("parsed-stats")?;
     let struct_stats = stats.struct_stats.clone();
     let no_stats = !stats.synthesize_json && matches!(&struct_stats, StructStats::None);
@@ -376,11 +380,11 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         // Imperative metadata retains source JSON when synthesis is disabled.
         &[STATS][..]
     };
-    assert_metadata_eq(
+    Ok(assert_metadata_eq(
         &actual,
         &without_columns(&expected, ignored_stats)?,
         "metadata output options",
-    )
+    )?)
 }
 
 const ADD_FIELDS: &[&str] = &[
@@ -520,7 +524,7 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
     #[case] expected_field_groups: &[&[&str]],
     #[values(4, 5)] version: Version,
 ) {
-    (|| -> KernelResult<()> {
+    (|| -> crate::Result<()> {
         let json_requested = stats.synthesize_json;
         let (engine, latest, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
@@ -564,7 +568,9 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
                 );
                 // JSON must retain columns omitted from the requested structured subset.
                 for stats in stats.iter().flatten() {
-                    assert!(serde_json::from_str::<Value>(stats)?["minValues"]["value"].is_string());
+                    assert!(serde_json::from_str::<Value>(stats)
+                        .map_err(crate::KernelError::from)?["minValues"]["value"]
+                        .is_string());
                 }
             }
         }
@@ -595,7 +601,7 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
 fn declarative_metadata_projects_nested_column_mapped_stats(
     #[case] requested: ColumnName,
     #[case] with_predicate: bool,
-) -> KernelResult<()> {
+) -> crate::Result<()> {
     let (engine, snapshot, _tempdir) = load_test_table("stats-writing-all-types/delta")?;
     let scan = snapshot
         .scan_builder()
@@ -665,7 +671,7 @@ fn declarative_json_only_disables_metadata_pruning(
         PartitionValuesOptions::with_struct()
     )]
     partitions: PartitionValuesOptions,
-) -> KernelResult<()> {
+) -> crate::Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(log_state)
         .with_features(features)
@@ -683,7 +689,7 @@ fn declarative_json_only_disables_metadata_pruning(
             .with_partition_values(partitions.clone())
             .with_predicate(predicate)
             .build()?;
-        declarative_metadata(&scan, &engine)
+        Ok::<_, crate::Error>(declarative_metadata(&scan, &engine)?)
     };
     let baseline = metadata(StatsOptions::json_only(), None)?;
     assert_eq!(metadata_row_count(&baseline), 4);
@@ -691,11 +697,11 @@ fn declarative_json_only_disables_metadata_pruning(
     let pruned = metadata(StatsOptions::all_struct(), predicate.clone())?;
     assert_eq!(metadata_row_count(&pruned), pruning.1);
     let actual = metadata(StatsOptions::json_only(), predicate)?;
-    assert_metadata_eq(
+    Ok(assert_metadata_eq(
         &actual,
         &baseline,
         "JSON-only disables stats and partition pruning",
-    )
+    )?)
 }
 
 #[rstest]
@@ -765,7 +771,7 @@ fn declarative_metadata_output_options_across_log_shapes(
         PartitionValuesOptions::with_struct()
     )]
     partitions: PartitionValuesOptions,
-) -> KernelResult<()> {
+) -> crate::Result<()> {
     assert_metadata_output_options(log_state, features, table_config, stats, partitions)
 }
 
@@ -798,7 +804,7 @@ fn declarative_metadata_synthesizes_json_for_struct_only_checkpoints(
 #[rstest]
 fn declarative_metadata_crc_plan_is_sparse_and_prunes(
     #[values(None, Some(col!("id").gt(lit(3i64))))] predicate: Option<Pred>,
-) -> KernelResult<()> {
+) -> crate::Result<()> {
     let (engine, latest, _tempdir) =
         load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
     let snapshot = Snapshot::builder_for(latest.table_root().clone())
@@ -848,7 +854,7 @@ fn assert_metadata_output_options(
     table_config: TableConfig,
     stats: StatsOptions,
     partitions: PartitionValuesOptions,
-) -> KernelResult<()> {
+) -> crate::Result<()> {
     let json_requested = stats.synthesize_json;
     let parsed_partitions_requested = partitions.parsed_struct;
     let table = TestTableBuilder::new()
@@ -910,11 +916,11 @@ fn assert_metadata_output_options(
     }
 
     // JSON synthesis is checked above; the imperative path cannot synthesize native stats.
-    assert_metadata_eq(
+    Ok(assert_metadata_eq(
         &without_columns(&actual, &[STATS])?,
         &without_columns(&expected, &[STATS])?,
         "metadata output options across log shapes",
-    )
+    )?)
 }
 
 #[rstest]
@@ -930,7 +936,7 @@ fn declarative_metadata_data_skipping(
     table: &str,
     #[case] predicate: Pred,
     #[case] expected_count: usize,
-) -> KernelResult<()> {
+) -> crate::Result<()> {
     let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
     let predicate = Arc::new(predicate);
     let expected = imperative_metadata(
@@ -953,11 +959,11 @@ fn declarative_metadata_data_skipping(
         .build()?;
     let actual = declarative_metadata(&scan, engine.as_ref())?;
 
-    assert_metadata_eq(
+    Ok(assert_metadata_eq(
         &without_columns(&actual, &[STATS])?,
         &without_columns(&expected, &[STATS])?,
         &format!("table {table}"),
-    )
+    )?)
 }
 
 #[rstest]
@@ -967,7 +973,7 @@ fn declarative_metadata_data_skipping(
 fn declarative_metadata_partition_values_prune_without_struct_stats(
     #[case] predicate: Pred,
     #[case] expected_count: usize,
-) -> KernelResult<()> {
+) -> crate::Result<()> {
     let (engine, snapshot, _tempdir) =
         crate::unit_test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
     let predicate = Arc::new(predicate);
@@ -993,15 +999,15 @@ fn declarative_metadata_partition_values_prune_without_struct_stats(
 
     // The reference scan requests default JSON stats; this scan disables stats to isolate
     // partition pruning. Compare the shared metadata fields.
-    assert_metadata_eq(
+    Ok(assert_metadata_eq(
         &actual,
         &without_columns(&expected, &[STATS])?,
         "partition pruning",
-    )
+    )?)
 }
 
 #[test]
-fn declarative_metadata_partition_is_null_keeps_null_partition() -> KernelResult<()> {
+fn declarative_metadata_partition_is_null_keeps_null_partition() -> crate::Result<()> {
     let (engine, snapshot, _tempdir) = load_test_table("data-reader-timestamp_ntz")?;
     let scan = snapshot
         .scan_builder()
@@ -1010,7 +1016,9 @@ fn declarative_metadata_partition_is_null_keeps_null_partition() -> KernelResult
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
     let actual = declarative_metadata(&scan, engine.as_ref())?;
-    let formatted = pretty_format_batches(&actual)?.to_string();
+    let formatted = pretty_format_batches(&actual)
+        .map_err(crate::KernelError::from)?
+        .to_string();
 
     assert_eq!(metadata_row_count(&actual), 1, "{formatted}");
     let batch = actual.first().expect("null partition metadata");
@@ -1043,7 +1051,7 @@ fn declarative_metadata_partition_is_null_keeps_null_partition() -> KernelResult
 }
 
 #[test]
-fn declarative_metadata_reconstructs_well_formed_stats_and_partitions() -> KernelResult<()> {
+fn declarative_metadata_reconstructs_well_formed_stats_and_partitions() -> crate::Result<()> {
     let (engine, snapshot, _tempdir) =
         crate::unit_test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
     let scan = snapshot
@@ -1069,23 +1077,28 @@ fn declarative_metadata_reconstructs_well_formed_stats_and_partitions() -> Kerne
             .as_any()
             .downcast_ref::<StructArray>()
             .expect("add struct");
-        projected.push(RecordBatch::try_from_iter([
-            (
-                "stats",
-                add.column_by_name(STATS_PARSED)
-                    .expect("add.stats_parsed")
-                    .clone(),
-            ),
-            (
-                "partitionValues",
-                add.column_by_name(PARTITION_VALUES_PARSED)
-                    .expect("add.partitionValues_parsed")
-                    .clone(),
-            ),
-        ])?);
+        projected.push(
+            RecordBatch::try_from_iter([
+                (
+                    "stats",
+                    add.column_by_name(STATS_PARSED)
+                        .expect("add.stats_parsed")
+                        .clone(),
+                ),
+                (
+                    "partitionValues",
+                    add.column_by_name(PARTITION_VALUES_PARSED)
+                        .expect("add.partitionValues_parsed")
+                        .clone(),
+                ),
+            ])
+            .map_err(crate::KernelError::from)?,
+        );
     }
 
-    let formatted = pretty_format_batches(&projected)?.to_string();
+    let formatted = pretty_format_batches(&projected)
+        .map_err(crate::KernelError::from)?
+        .to_string();
     let mut actual_rows: Vec<_> = formatted
         .lines()
         .filter(|line| line.starts_with("| {numRecords:"))
@@ -1113,7 +1126,7 @@ fn expected_stats_row(id: i64, partition: i32) -> String {
 }
 
 #[test]
-fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> KernelResult<()> {
+fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> crate::Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(4).with_checkpoint_at([2]))
         .build()
@@ -1139,11 +1152,15 @@ fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> KernelResu
         .build()?;
     let actual = declarative_metadata(&scan, &engine)?;
 
-    assert_metadata_eq(&actual, &expected, "checkpoint with later commits")
+    Ok(assert_metadata_eq(
+        &actual,
+        &expected,
+        "checkpoint with later commits",
+    )?)
 }
 
 #[test]
-fn declarative_metadata_pruning_keeps_remove_for_checkpoint_reconciliation() -> KernelResult<()> {
+fn declarative_metadata_pruning_keeps_remove_for_checkpoint_reconciliation() -> crate::Result<()> {
     let (engine, snapshot, _tempdir) = load_test_table("with_checkpoint_no_last_checkpoint")?;
     let scan = snapshot
         .scan_builder()
@@ -1151,7 +1168,9 @@ fn declarative_metadata_pruning_keeps_remove_for_checkpoint_reconciliation() -> 
         .with_stats(StatsOptions::all_struct())
         .build()?;
     let actual = declarative_metadata(&scan, engine.as_ref())?;
-    let formatted = pretty_format_batches(&actual)?.to_string();
+    let formatted = pretty_format_batches(&actual)
+        .map_err(crate::KernelError::from)?
+        .to_string();
 
     assert_eq!(metadata_row_count(&actual), 1, "{formatted}");
     let path = actual[0]
@@ -1184,7 +1203,7 @@ fn declarative_metadata_prunes_across_v1_log_states(
         )
     )]
     pruning: (Pred, usize),
-) -> KernelResult<()> {
+) -> crate::Result<()> {
     assert_declarative_metadata_matches_imperative(
         log_state,
         FeatureSet::new(),
@@ -1196,7 +1215,7 @@ fn declarative_metadata_prunes_across_v1_log_states(
 #[rstest]
 fn declarative_metadata_partition_prunes_v2_checkpoints(
     #[values(2, 4)] checkpoint_version: u64,
-) -> KernelResult<()> {
+) -> crate::Result<()> {
     let log_state = LogState::with_latest_version(4)
         .with_checkpoint_at([checkpoint_version])
         .with_sidecars_if_enabled(None);
@@ -1213,7 +1232,7 @@ fn assert_declarative_metadata_matches_imperative(
     features: FeatureSet,
     predicate: Pred,
     expected_count: usize,
-) -> KernelResult<()> {
+) -> crate::Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(log_state)
         .with_features(features)
@@ -1248,11 +1267,11 @@ fn assert_declarative_metadata_matches_imperative(
         .build()?;
     let actual = declarative_metadata(&scan, &engine)?;
 
-    assert_metadata_eq(&actual, &expected, table.description())
+    Ok(assert_metadata_eq(&actual, &expected, table.description())?)
 }
 
 #[test]
-fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> KernelResult<()> {
+fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> crate::Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(4).with_checkpoint_at([2]))
         .build()

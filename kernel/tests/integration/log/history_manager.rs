@@ -9,7 +9,7 @@ use delta_kernel::history_manager::{get_earliest_commit, latest_version_as_of, H
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{ObjectStore, ObjectStoreExt as _};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::{KernelResult, Snapshot, Version};
+use delta_kernel::{Snapshot, Version};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, VersionTarget};
@@ -38,13 +38,16 @@ async fn test_get_earliest_commit(
     #[case] earliest_ratified_commit_version: Option<Version>,
     #[case] commit_type: HistoryCommitType,
     #[case] expected_version: Version,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(8).with_checkpoint_at([5]))
         .build()?;
     let store = table.store().clone();
     let engine = DefaultEngineBuilder::new(store.clone()).build();
-    let log_root = Url::parse(table.table_root())?.join("_delta_log/")?;
+    let log_root = Url::parse(table.table_root())
+        .map_err(delta_kernel::KernelError::from)?
+        .join("_delta_log/")
+        .map_err(delta_kernel::KernelError::from)?;
 
     if let Some(versions) = cleanup {
         remove_commits(store.as_ref(), versions).await;
@@ -66,7 +69,7 @@ async fn test_get_earliest_commit(
 /// (see `version_at_timestamp_max`). Resolution correctness across layouts is covered by the
 /// `history_manager` unit tests.
 #[test]
-fn test_at_timestamp_resolves_to_intermediate_version() -> KernelResult<()> {
+fn test_at_timestamp_resolves_to_intermediate_version() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // v0: CreateTable
@@ -120,7 +123,7 @@ fn test_at_timestamp_resolves_to_intermediate_version() -> KernelResult<()> {
 /// querying one millisecond earlier resolves to its predecessor. Deterministic without setting
 /// commit timestamps explicitly, since ICT values are derived from the table rather than hardcoded.
 #[test]
-fn test_at_timestamp_targets_specific_commit_via_ict() -> KernelResult<()> {
+fn test_at_timestamp_targets_specific_commit_via_ict() -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
         .with_features(FeatureSet::new().ict())
         .with_log_state(LogState::with_latest_version(4))

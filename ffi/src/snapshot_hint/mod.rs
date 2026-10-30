@@ -1,7 +1,7 @@
 //! Construction and export of snapshot hints.
 
 use delta_kernel::snapshot::{SnapshotHint, SnapshotHintError, SnapshotHintFreshness};
-use delta_kernel::{KernelError, KernelResult, Version};
+use delta_kernel::{KernelError, Version};
 
 use crate::delta_types::{
     FfiCrc, FfiLastCheckpoint, FfiMetadata, FfiProtocol, FfiPublicationWatermark,
@@ -128,11 +128,11 @@ impl From<FfiSnapshotHintFreshness> for SnapshotHintFreshness {
 unsafe fn snapshot_builder_with_snapshot_hint_impl(
     builder: &mut FfiSnapshotBuilder,
     value: &FfiSnapshotHint,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let FfiSnapshotBuilderSource::TableRoot(table_root) = &builder.source else {
-        return Err(KernelError::unsupported(
+        return Err(delta_kernel::Error::Kernel(KernelError::unsupported(
             "snapshot hints cannot be set on builders created by get_snapshot_builder_from",
-        ));
+        )));
     };
     let freshness = value.freshness.into();
     let log_paths = unsafe { value.log_paths.log_paths() }

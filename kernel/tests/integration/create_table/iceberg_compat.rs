@@ -126,7 +126,7 @@ fn v3_create_table_rejects_interval_column(
 /// `delta.enableIcebergCompatV3=true` must not activate V3: column mapping stays off and
 /// no nested-id metadata is set on the Map field.
 #[test]
-fn v3_supported_but_not_enabled_skips_cm_and_nested_ids() -> KernelResult<()> {
+fn v3_supported_but_not_enabled_skips_cm_and_nested_ids() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         nullable "data": { INTEGER => nullable [nullable INTEGER] },
@@ -173,7 +173,7 @@ fn v3_supported_but_not_enabled_skips_cm_and_nested_ids() -> KernelResult<()> {
 /// and — critically — assigns `delta.columnMapping.nested.ids` to a Map column (regression guard
 /// for the nested-id gate that previously keyed only on V3).
 #[test]
-fn v2_create_table_enables_column_mapping_and_nested_ids() -> KernelResult<()> {
+fn v2_create_table_enables_column_mapping_and_nested_ids() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         nullable "id": LONG,

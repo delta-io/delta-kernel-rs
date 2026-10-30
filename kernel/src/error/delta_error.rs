@@ -4,6 +4,8 @@ use std::backtrace::Backtrace;
 use std::error::Error as StdError;
 use std::fmt;
 
+use delta_kernel_derive::internal_api;
+
 use super::DeltaErrorCondition;
 
 /// A catalog-defined Delta failure that terminates the current operation.
@@ -34,6 +36,155 @@ pub struct DeltaErrorParameter {
 }
 
 impl DeltaError {
+    /// Reports an unsupported persisted type token `name`, retaining the parser `source`.
+    pub(crate) fn unsupported_schema_type(name: &str, source: serde_json::Error) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaParsingUnsupportedDataType,
+            vec![DeltaErrorParameter::new("dataType", name)],
+            Some(Box::new(source)),
+        )
+    }
+
+    /// Reports a duplicate logical field `name` in the persisted table schema.
+    /// `source` retains the schema decoder's original failure and location.
+    pub(crate) fn duplicate_schema_field(name: &str, source: serde_json::Error) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaDuplicateColumnsFoundExistingSchema,
+            vec![DeltaErrorParameter::new("duplicateCols", name)],
+            Some(Box::new(source)),
+        )
+    }
+
+    /// Reports the explicitly stored column-mapping `mode` incompatible with adaptive metadata.
+    /// `source` retains the protocol validation failure for diagnostics.
+    pub(crate) fn adaptive_metadata_mapping_mode(mode: &str, source: super::KernelError) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaAdaptiveMetadataRequiresColumnMappingIdMode,
+            vec![
+                DeltaErrorParameter::new("feature", "adaptiveMetadata-preview"),
+                DeltaErrorParameter::new("prop", "delta.columnMapping.mode"),
+                DeltaErrorParameter::new("mode", mode),
+            ],
+            Some(Box::new(source)),
+        )
+    }
+
+    /// Reports a declared partition `column` absent from the logical `schema`.
+    pub(crate) fn partition_column_not_found(
+        column: &str,
+        schema: &crate::schema::StructType,
+        source: super::KernelError,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaPartitionColumnNotFound,
+            vec![
+                DeltaErrorParameter::new("columnName", column),
+                DeltaErrorParameter::new("schemaMap", schema),
+            ],
+            Some(Box::new(source)),
+        )
+    }
+
+    /// Reports the duplicate partition column `name` stored in table metadata.
+    pub(crate) fn duplicate_partition_column(name: &str, source: super::KernelError) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaDuplicateColumnsFoundPartitionColumns,
+            vec![DeltaErrorParameter::new("duplicateCols", name)],
+            Some(Box::new(source)),
+        )
+    }
+
+    /// Reports the observed `versions` and required bounds while loading `version_to_load`.
+    /// Bounds describe the commit interval being validated, not the table's retained history.
+    pub(crate) fn versions_not_contiguous(
+        versions: impl IntoIterator<Item = crate::Version>,
+        start_version: crate::Version,
+        end_version: crate::Version,
+        version_to_load: crate::Version,
+        source: super::KernelError,
+    ) -> Self {
+        let versions = versions
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        Self::new(
+            DeltaErrorCondition::DeltaVersionsNotContiguous,
+            vec![
+                DeltaErrorParameter::new("versionList", versions),
+                DeltaErrorParameter::new("startVersion", start_version),
+                DeltaErrorParameter::new("endVersion", end_version),
+                DeltaErrorParameter::new("versionToLoad", version_to_load),
+            ],
+            Some(Box::new(source)),
+        )
+    }
+
+    /// Reports missing replay files for `version` after `checkpoint_version` in `log_path`.
+    /// The original listing or read failure remains available as the diagnostic source.
+    pub(crate) fn log_file_not_found(
+        version: crate::Version,
+        checkpoint_version: crate::Version,
+        log_path: impl ToString,
+        source: super::KernelError,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaLogFileNotFound,
+            vec![
+                DeltaErrorParameter::new("version", version),
+                DeltaErrorParameter::new("checkpointVersion", checkpoint_version),
+                DeltaErrorParameter::new("logPath", log_path),
+            ],
+            Some(Box::new(source)),
+        )
+    }
+
+    /// Constructs a catalog error for downstream tests without migrating a production call site.
+    ///
+    /// `values` supplies one string per catalog parameter in template order. `source` is an
+    /// optional diagnostic cause. Returns an error if the parameter count does not match.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(
+        condition: DeltaErrorCondition,
+        values: &[&str],
+        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    ) -> super::KernelResult<Self> {
+        let names = condition.parameter_names();
+        if names.len() != values.len() {
+            return Err(super::KernelError::generic(format!(
+                "{} requires {} parameters, got {}",
+                condition.name(),
+                names.len(),
+                values.len()
+            )));
+        }
+        let parameters = names
+            .iter()
+            .zip(values)
+            .map(|(name, value)| DeltaErrorParameter::new(name, value))
+            .collect();
+        Ok(Self::new(condition, parameters, source))
+    }
+
+    /// Reports that the requested table `path` has no Delta log or local directory.
+    pub(crate) fn path_does_not_exist(path: impl ToString, source: super::KernelError) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaPathDoesNotExist,
+            vec![DeltaErrorParameter::new("path", path)],
+            Some(Box::new(source)),
+        )
+    }
+
+    /// Reports the invalid signed `version` supplied by a catalog response.
+    #[internal_api]
+    pub(crate) fn invalid_version(version: i64) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaVersionInvalid,
+            vec![DeltaErrorParameter::new("version", version)],
+            None,
+        )
+    }
+
     /// Returns the typed Delta condition.
     pub fn condition(&self) -> DeltaErrorCondition {
         self.condition
@@ -73,11 +224,6 @@ impl DeltaError {
     ///
     /// `parameters` must contain exactly [`DeltaErrorCondition::parameter_names`], in that order.
     /// Condition-specific factories must maintain this invariant.
-    // TODO(#3421): Remove this dead code attribute when the first delta error factory is introduced
-    #[allow(
-        dead_code,
-        reason = "Reserved for condition-specific factories (see #3421)."
-    )]
     fn new(
         condition: DeltaErrorCondition,
         parameters: Vec<DeltaErrorParameter>,
@@ -149,11 +295,6 @@ impl DeltaErrorParameter {
         &self.value
     }
 
-    // TODO(#3421): Remove this dead code attribute when the first delta error factory is introduced
-    #[allow(
-        dead_code,
-        reason = "Reserved for condition-specific factories (see #3421)."
-    )]
     fn new(name: &'static str, value: impl ToString) -> Self {
         Self {
             name,

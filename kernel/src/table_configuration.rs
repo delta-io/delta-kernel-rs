@@ -268,17 +268,24 @@ fn build_stats_schema_for_columns(
 fn validate_partition_columns(
     metadata: &Metadata,
     logical_schema: &StructType,
-) -> KernelResult<()> {
+) -> crate::Result<()> {
     let mut seen = HashSet::new();
     for col in metadata.partition_columns() {
         if !seen.insert(col) {
-            return Err(KernelError::generic(format!(
-                "Duplicate partition column: '{col}'"
-            )));
+            return Err(crate::DeltaError::duplicate_partition_column(
+                col,
+                KernelError::generic(format!("Duplicate partition column: '{col}'")),
+            )
+            .into());
         }
         require!(
             logical_schema.field(col).is_some(),
-            KernelError::generic(format!("Partition column '{col}' not found in schema"))
+            crate::DeltaError::partition_column_not_found(
+                col,
+                logical_schema,
+                KernelError::generic(format!("Partition column '{col}' not found in schema")),
+            )
+            .into()
         );
     }
     Ok(())
@@ -341,7 +348,7 @@ impl TableConfiguration {
         protocol: Protocol,
         table_root: Url,
         version: Version,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         let logical_schema = Arc::new(metadata.parse_schema()?);
         Self::try_new_inner(metadata, protocol, table_root, version, logical_schema)
     }
@@ -352,7 +359,7 @@ impl TableConfiguration {
         base: &Self,
         metadata: Metadata,
         logical_schema: SchemaRef,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         Self::try_new_inner(
             metadata,
             base.protocol.clone(),
@@ -368,7 +375,7 @@ impl TableConfiguration {
         table_root: Url,
         version: Version,
         logical_schema: SchemaRef,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
@@ -421,9 +428,9 @@ impl TableConfiguration {
         require!(
             !(table_config.table_properties.enable_row_tracking == Some(true)
                 && table_config.is_row_tracking_suspended()),
-            KernelError::invalid_protocol(
+            crate::Error::Kernel(KernelError::invalid_protocol(
                 "Row tracking cannot be enabled and suspended at the same time"
-            )
+            ))
         );
 
         // Validate schema against protocol features now that we have a TC instance.
@@ -457,7 +464,7 @@ impl TableConfiguration {
         new_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
         new_version: Version,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         // simplest case: no new P/M, just return the existing table configuration with new version
         if new_metadata.is_none() && new_protocol.is_none() {
             return Ok(Self {
@@ -497,7 +504,7 @@ impl TableConfiguration {
         new_version: Version,
         new_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         Self::try_new_from(table_configuration, new_metadata, new_protocol, new_version)
     }
 
@@ -950,39 +957,53 @@ impl TableConfiguration {
     }
 
     /// Validates that all feature requirements for a given feature are satisfied.
-    fn validate_feature_requirements(&self, feature: &TableFeature) -> KernelResult<()> {
+    fn validate_feature_requirements(&self, feature: &TableFeature) -> crate::Result<()> {
         for req in feature.info().feature_requirements {
             match req {
                 FeatureRequirement::Supported(dep) => {
                     require!(
                         self.is_feature_supported(dep),
-                        KernelError::invalid_protocol(format!(
+                        crate::Error::Kernel(KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to be supported"
-                        ))
+                        )))
                     );
                 }
                 FeatureRequirement::Enabled(dep) => {
+                    if *feature == TableFeature::AdaptiveMetadataPreview
+                        && *dep == TableFeature::ColumnMapping
+                        && self.is_feature_supported(dep)
+                        && self.table_properties.column_mapping_mode
+                            == Some(ColumnMappingMode::None)
+                    {
+                        return Err(crate::DeltaError::adaptive_metadata_mapping_mode(
+                            "none",
+                            KernelError::invalid_protocol(format!(
+                                "Feature '{feature}' requires '{dep}' to be enabled"
+                            )),
+                        )
+                        .into());
+                    }
                     require!(
                         self.is_feature_enabled(dep),
-                        KernelError::invalid_protocol(format!(
+                        crate::Error::Kernel(KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to be enabled"
-                        ))
+                        )))
                     );
                 }
                 FeatureRequirement::NotSupported(dep) => {
                     require!(
                         !self.is_feature_supported(dep),
-                        KernelError::invalid_protocol(format!(
+                        crate::Error::Kernel(KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to not be supported"
-                        ))
+                        )))
                     );
                 }
                 FeatureRequirement::NotEnabled(dep) => {
                     require!(
                         !self.is_feature_enabled(dep),
-                        KernelError::invalid_protocol(format!(
+                        crate::Error::Kernel(KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to not be enabled"
-                        ))
+                        )))
                     );
                 }
                 FeatureRequirement::Custom(check) => {
@@ -999,14 +1020,14 @@ impl TableConfiguration {
         &self,
         feature: &TableFeature,
         operation: Operation,
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         let info = feature.info();
         match &info.kernel_support {
             KernelSupport::Supported => {}
             KernelSupport::NotSupported => {
-                return Err(KernelError::unsupported(format!(
+                return Err(crate::Error::Kernel(KernelError::unsupported(format!(
                     "Feature '{feature}' is not supported"
-                )))
+                ))))
             }
             KernelSupport::Custom(check) => {
                 check(&self.protocol, &self.table_properties, operation)?;
@@ -1052,7 +1073,7 @@ impl TableConfiguration {
     /// - For `SnapshotLoad`, `Scan` and `Cdf`: checks reader version and reader features
     /// - For `Write` operations: checks writer version and writer features
     #[internal_api]
-    pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> KernelResult<()> {
+    pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> crate::Result<()> {
         match operation {
             Operation::SnapshotLoad | Operation::Scan | Operation::Cdf => {
                 self.ensure_read_supported(operation)
@@ -1062,13 +1083,13 @@ impl TableConfiguration {
     }
 
     /// Ensures Kernel supports both scanning and writing this table.
-    pub(crate) fn ensure_read_write_supported(&self) -> KernelResult<()> {
+    pub(crate) fn ensure_read_write_supported(&self) -> crate::Result<()> {
         self.ensure_operation_supported(Operation::Scan)?;
         self.ensure_operation_supported(Operation::Write)
     }
 
     /// Internal helper for read operations (Scan, Cdf, SnapshotLoad)
-    fn ensure_read_supported(&self, operation: Operation) -> KernelResult<()> {
+    fn ensure_read_supported(&self, operation: Operation) -> crate::Result<()> {
         check_reader_version_range(&self.protocol)?;
 
         // Check all enabled reader features have kernel support
@@ -1080,22 +1101,22 @@ impl TableConfiguration {
     }
 
     /// Internal helper for write operations
-    fn ensure_write_supported(&self) -> KernelResult<()> {
+    fn ensure_write_supported(&self) -> crate::Result<()> {
         // Version check: kernel supports writer versions
         // MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
         require!(
             self.protocol.min_writer_version() >= MIN_VALID_RW_VERSION,
-            KernelError::InvalidProtocol(format!(
+            crate::Error::Kernel(KernelError::InvalidProtocol(format!(
                 "min_writer_version must be >= {MIN_VALID_RW_VERSION}, got {}",
                 self.protocol.min_writer_version()
-            ))
+            )))
         );
         // Version check: kernel supports writer versions 1..=MAX_VALID_WRITER_VERSION
         if self.protocol.min_writer_version() > MAX_VALID_WRITER_VERSION {
-            return Err(KernelError::unsupported(format!(
+            return Err(crate::Error::Kernel(KernelError::unsupported(format!(
                 "Unsupported minimum writer version {}",
                 self.protocol.min_writer_version()
-            )));
+            ))));
         }
 
         // Check all enabled writer features have kernel support
@@ -1108,10 +1129,10 @@ impl TableConfiguration {
         require!(
             self.is_feature_supported(&TableFeature::CheckConstraints)
                 || !self.has_check_constraints(),
-            KernelError::invalid_protocol(
+            crate::Error::Kernel(KernelError::invalid_protocol(
                 "Table contains CHECK constraints but does not support the 'checkConstraints' \
                  writer feature",
-            )
+            ))
         );
 
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
@@ -1119,9 +1140,9 @@ impl TableConfiguration {
         if self.is_feature_supported(&TableFeature::Invariants)
             && schema_has_invariants(self.logical_schema.as_ref())
         {
-            return Err(KernelError::unsupported(
+            return Err(crate::Error::Kernel(KernelError::unsupported(
                 "Column invariants are not yet supported",
-            ));
+            )));
         }
 
         Ok(())
@@ -1347,14 +1368,28 @@ mod test {
         assert_result_error_with_message(StatsOutputSchemas::try_new(logical, physical), error);
     }
 
-    #[test]
-    fn table_configuration_rejects_partition_column_missing_from_schema() {
+    #[rstest]
+    #[case::missing(vec!["missing"])]
+    #[case::missing_before_duplicate(vec!["missing", "missing"])]
+    fn table_configuration_rejects_partition_column_missing_from_schema(
+        #[case] columns: Vec<&str>,
+    ) {
         let result = MockTableConfigurationBuilder::new()
-            .with_partition_columns(["missing"])
+            .with_partition_columns(columns)
             .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
             .try_build();
 
-        assert_result_error_with_message(result, "Partition column 'missing' not found in schema");
+        let crate::Error::Delta(error) = result.unwrap_err() else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(
+            error.condition(),
+            crate::DeltaErrorCondition::DeltaPartitionColumnNotFound
+        );
+        assert_eq!(error.sql_state(), Some("42703"));
+        assert_eq!(error.parameters()[0].value(), "missing");
+        assert!(!error.parameters()[1].value().is_empty());
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[derive(Debug, PartialEq)]
@@ -1457,8 +1492,10 @@ mod test {
 
         let write_support = match table_config.ensure_operation_supported(Operation::Write) {
             Ok(()) => WriteSupport::Supported,
-            Err(KernelError::InvalidProtocol(_)) => WriteSupport::InvalidProtocol,
-            Err(KernelError::Unsupported(_)) => WriteSupport::Unsupported,
+            Err(crate::Error::Kernel(KernelError::InvalidProtocol(_))) => {
+                WriteSupport::InvalidProtocol
+            }
+            Err(crate::Error::Kernel(KernelError::Unsupported(_))) => WriteSupport::Unsupported,
             Err(err) => panic!("unexpected write error: {err:?}"),
         };
         assert_eq!(write_support, expected_write_support);
@@ -1503,7 +1540,16 @@ mod test {
             .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
             .try_build();
 
-        assert_result_error_with_message(result, "Duplicate partition column: 'part'");
+        let crate::Error::Delta(error) = result.unwrap_err() else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(
+            error.condition(),
+            crate::DeltaErrorCondition::DeltaDuplicateColumnsFoundPartitionColumns
+        );
+        assert_eq!(error.sql_state(), Some("42711"));
+        assert_eq!(error.parameters()[0].value(), "part");
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]
@@ -3279,6 +3325,18 @@ mod test {
         all_adaptive_metadata_deps(),
         Some("column mapping in 'id' mode")
     )]
+    #[case::cm_none_mode_rejected(
+        all_adaptive_metadata_props(),
+        Some(ColumnMappingMode::None),
+        all_adaptive_metadata_deps(),
+        Some("explicit mapping mode")
+    )]
+    #[case::cm_mode_absent(
+        all_adaptive_metadata_props(),
+        None,
+        all_adaptive_metadata_deps(),
+        Some("requires 'columnMapping' to be enabled")
+    )]
     // Column mapping feature absent entirely -> the `Enabled(ColumnMapping)` arm fires first.
     #[case::column_mapping_not_supported(
         all_adaptive_metadata_props(),
@@ -3349,6 +3407,42 @@ mod test {
             )
             .build();
         let result = config.validate_feature_requirements(&TableFeature::AdaptiveMetadataPreview);
+        if matches!(
+            cm_mode,
+            Some(ColumnMappingMode::Name | ColumnMappingMode::None)
+        ) && deps.contains(&TableFeature::ColumnMapping)
+        {
+            let crate::Error::Delta(error) = result.unwrap_err() else {
+                panic!("expected Delta error")
+            };
+            assert_eq!(
+                error.condition(),
+                crate::DeltaErrorCondition::DeltaAdaptiveMetadataRequiresColumnMappingIdMode
+            );
+            assert_eq!(error.sql_state(), Some("42000"));
+            let parameters: Vec<_> = error
+                .parameters()
+                .iter()
+                .map(|p| (p.name(), p.value()))
+                .collect();
+            assert_eq!(
+                parameters,
+                vec![
+                    ("feature", "adaptiveMetadata-preview"),
+                    ("prop", "delta.columnMapping.mode"),
+                    (
+                        "mode",
+                        if cm_mode == Some(ColumnMappingMode::Name) {
+                            "name"
+                        } else {
+                            "none"
+                        }
+                    ),
+                ]
+            );
+            assert!(std::error::Error::source(&error).is_some());
+            return;
+        }
         match expected_error_substring {
             Some(msg) => assert_result_error_with_message(result, msg),
             None => assert!(result.is_ok(), "expected Ok, got {result:?}"),

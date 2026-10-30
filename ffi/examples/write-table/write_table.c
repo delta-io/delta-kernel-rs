@@ -29,7 +29,7 @@ int main(int argc, char* argv[]) {
 
   // === Build engine ===
   ExternResultHandleExclusiveEngineBuilder engine_builder_res =
-      get_engine_builder(table_path_slice, allocate_error);
+      get_engine_builder(table_path_slice, &error_allocators);
   if (engine_builder_res.tag != OkHandleExclusiveEngineBuilder) {
     print_error("Could not get engine builder.", (Error*)engine_builder_res.err);
     free_error((Error*)engine_builder_res.err);

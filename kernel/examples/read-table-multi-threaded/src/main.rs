@@ -12,7 +12,7 @@ use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, ScanFile};
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::{Engine, ExpressionRef, FileMeta, KernelResult, Snapshot};
+use delta_kernel::{Engine, ExpressionRef, FileMeta, Snapshot};
 use url::Url;
 
 /// An example program that reads a table using multiple threads. This shows the use of the
@@ -74,7 +74,7 @@ struct ScanState {
     logical_schema: SchemaRef,
 }
 
-fn try_main() -> KernelResult<()> {
+fn try_main() -> delta_kernel::Result<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Read", "read", "");
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
@@ -154,7 +154,7 @@ fn try_main() -> KernelResult<()> {
             // simply gather up all batches
             record_batch_rx.iter().collect()
         };
-        print_batches(&batches)?;
+        print_batches(&batches).map_err(delta_kernel::KernelError::from)?;
         Ok(())
     })
 }

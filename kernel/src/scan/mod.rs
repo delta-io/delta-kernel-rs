@@ -591,7 +591,7 @@ impl ScanBuilder {
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
     #[tracing::instrument(name = "scan_builder.build", skip_all, fields(enable_call_frame), err)]
-    pub fn build(self) -> KernelResult<Scan> {
+    pub fn build(self) -> crate::Result<Scan> {
         // Predicates may reference columns outside self.logical_read_schema, so resolve against the
         // full table schema
         let table_schema = self.snapshot.schema();
@@ -600,10 +600,10 @@ impl ScanBuilder {
         // counts downstream and panics in the arrow layer. Users must populate the
         // schema with ALTER TABLE ADD COLUMN before scanning.
         if table_schema.num_fields() == 0 {
-            return Err(KernelError::generic(
+            return Err(crate::Error::Kernel(KernelError::generic(
                 "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
                  to add at least one column before scanning",
-            ));
+            )));
         }
 
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
@@ -1504,9 +1504,10 @@ impl Scan {
     /// # use url::Url;
     /// # use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
     /// # use delta_kernel::object_store::local::LocalFileSystem;
-    /// # fn main() -> KernelResult<()> {
+    /// # fn main() -> delta_kernel::Result<()> {
     /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
-    /// let table_root = Url::parse("file:///path/to/table")?;
+    /// let table_root = Url::parse("file:///path/to/table")
+    ///     .map_err(delta_kernel::KernelError::from)?;
     ///
     /// // Build a snapshot
     /// let snapshot = Snapshot::builder_for(table_root.clone())

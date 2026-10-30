@@ -72,7 +72,7 @@ impl<STATE> Transaction<STATE, Imperative> {
     /// [CommitResult] with the following semantics:
     /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
     ///   transaction in case of a conflict so the user can retry, etc.)
-    /// - Err(KernelError) indicates a non-retryable error (e.g. logic/validation error).
+    /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
     ///
     /// `ALTER TABLE` returns a validation error if any data-file batches or manifest writes are
     /// staged. Empty or fully unselected data-file batches are also rejected.
@@ -100,7 +100,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         ),
         err
     )]
-    pub fn commit(self, engine: &dyn Engine) -> KernelResult<CommitResult<STATE>> {
+    pub fn commit(self, engine: &dyn Engine) -> crate::Result<CommitResult<STATE>> {
         let commit_start = Instant::now();
 
         // === Pre-commit validation ===
@@ -223,7 +223,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         post_commit_inputs: PostCommitInputs,
         prepare_duration: Duration,
         committer_duration: Duration,
-    ) -> KernelResult<CommitResult<STATE>> {
+    ) -> crate::Result<CommitResult<STATE>> {
         match commit_response {
             Ok(CommitResponse::Committed { file_meta }) => {
                 let PostCommitInputs {
@@ -271,7 +271,7 @@ impl<STATE> Transaction<STATE, Imperative> {
                     .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
                 Ok(CommitResult::Retryable(self.into_retryable(e)))
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -1055,7 +1055,7 @@ mod tests {
 
     fn existing_table_txn(
         data_change: bool,
-    ) -> KernelResult<(SyncEngine, Transaction, tempfile::TempDir)> {
+    ) -> crate::Result<(SyncEngine, Transaction, tempfile::TempDir)> {
         let (url, tempdir) = copy_test_table("table-without-dv-small")?;
         let engine = SyncEngine::new();
         let snapshot = Snapshot::builder_for(url).build(&engine)?;
@@ -1080,7 +1080,7 @@ mod tests {
         DeletionVectorUpdate,
     }
 
-    fn set_append_only(txn: &mut Transaction, enabled: bool) -> KernelResult<()> {
+    fn set_append_only(txn: &mut Transaction, enabled: bool) -> crate::Result<()> {
         let metadata = txn
             .effective_table_config
             .metadata()
@@ -1163,8 +1163,8 @@ mod tests {
     #[rstest]
     fn create_table_add_actions_preserve_data_change(
         #[values(false, true)] data_change: bool,
-    ) -> KernelResult<()> {
-        let tempdir = tempfile::tempdir()?;
+    ) -> crate::Result<()> {
+        let tempdir = tempfile::tempdir().map_err(crate::KernelError::from)?;
         let engine = SyncEngine::new();
         let mut transaction = create_table(
             tempdir.path().to_string_lossy(),
@@ -1226,7 +1226,7 @@ mod tests {
         #[case] data_change: bool,
         #[case] selection_vector: &[bool],
         #[case] expected_error: bool,
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         let (_engine, mut txn, _tempdir) = existing_table_txn(data_change)?;
         set_append_only(&mut txn, append_only)?;
         for index in 0..2 {

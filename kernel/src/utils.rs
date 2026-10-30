@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use delta_kernel_derive::internal_api;
 use url::Url;
 
-use crate::{FileSize, KernelError, KernelResult};
+use crate::{DeltaError, FileSize, KernelError, KernelResult};
 
 /// Phantom type parameter `T`: The containing type mentions but does not own any instance of `T`.
 ///
@@ -67,24 +67,33 @@ impl<I: IntoIterator, T: FromIterator<I::Item>> CollectInto<T> for I {
     }
 }
 
-/// Try to parse string uri into a URL for a table path. This will do it's best to handle things
-/// like `/local/paths`, and even `../relative/paths`.
+/// Parses `uri` into a table URL, accepting absolute and relative local filesystem paths.
+///
+/// Local paths must exist and name a directory. An absent local path returns
+/// [`DeltaPathDoesNotExist`](crate::DeltaErrorCondition::DeltaPathDoesNotExist); other location
+/// failures preserve their Kernel classification.
 #[allow(unused)]
 #[internal_api]
-pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> KernelResult<Url> {
+pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> crate::Result<Url> {
     let uri = uri.as_ref();
     let uri_type = resolve_uri_type(uri)?;
     let url = match uri_type {
         UriType::LocalPath(path) => {
-            if !path.exists() {
-                // When we support writes, create a directory if we can
-                return Err(KernelError::InvalidTableLocation(format!(
-                    "Path does not exist: {path:?}"
-                )));
+            let exists = path.try_exists().map_err(|error| {
+                KernelError::InvalidTableLocation(format!(
+                    "Invalid table location: {uri} Error: {error:?}"
+                ))
+            })?;
+            if !exists {
+                return Err(DeltaError::path_does_not_exist(
+                    uri,
+                    KernelError::InvalidTableLocation(format!("Path does not exist: {path:?}")),
+                )
+                .into());
             }
             if !path.is_dir() {
-                return Err(KernelError::InvalidTableLocation(format!(
-                    "{path:?} is not a directory"
+                return Err(crate::Error::Kernel(KernelError::InvalidTableLocation(
+                    format!("{path:?} is not a directory"),
                 )));
             }
             let path = std::fs::canonicalize(path).map_err(|err| {

@@ -45,7 +45,7 @@ use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel::{KernelResult, Snapshot};
 
 #[tokio::main]
-async fn main() -> KernelResult<()> {
+async fn main() -> delta_kernel::Result<()> {
     let table_path = std::env::args()
         .nth(1)
         .expect("usage: delta_write_example <TABLE_DIR>");
@@ -78,14 +78,14 @@ async fn main() -> KernelResult<()> {
 
     // Build an Arrow RecordBatch
     let arrow_schema: delta_kernel::arrow::datatypes::Schema =
-        schema.as_ref().try_into_arrow()?;
+        schema.as_ref().try_into_arrow().map_err(delta_kernel::KernelError::from)?;
     let batch = RecordBatch::try_new(
         Arc::new(arrow_schema),
         vec![
             Arc::new(Int32Array::from(vec![1, 2, 3])),
             Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
         ],
-    )?;
+    ).map_err(delta_kernel::KernelError::from)?;
 
     // Write Parquet and add file metadata to the transaction
     let write_state = txn.write_state()?;
@@ -118,7 +118,7 @@ async fn main() -> KernelResult<()> {
             Ok(data?.try_into_record_batch()?)
         })
         .collect::<KernelResult<Vec<_>>>()?;
-    print_batches(&batches)?;
+    print_batches(&batches).map_err(delta_kernel::KernelError::from)?;
 
     Ok(())
 }
@@ -168,14 +168,14 @@ let mut txn = snapshot
 **Build your data as an Arrow RecordBatch and wrap it:**
 ```rust,ignore
 let arrow_schema: delta_kernel::arrow::datatypes::Schema =
-    schema.as_ref().try_into_arrow()?;
+    schema.as_ref().try_into_arrow().map_err(delta_kernel::KernelError::from)?;
 let batch = RecordBatch::try_new(
     Arc::new(arrow_schema),
     vec![
         Arc::new(Int32Array::from(vec![1, 2, 3])),
         Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
     ],
-)?;
+).map_err(delta_kernel::KernelError::from)?;
 let data = ArrowEngineData::new(batch);
 ```
 

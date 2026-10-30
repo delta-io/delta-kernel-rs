@@ -104,7 +104,7 @@ impl IncrementalScanBuilder {
     ///   references a column absent from the table schema.
     /// - `Err` if the target snapshot's protocol contains an unsupported reader feature.
     /// - `Err` if the engine fails to open the commit stream.
-    pub fn build(self, engine: &dyn Engine) -> KernelResult<Option<IncrementalScanStream>> {
+    pub fn build(self, engine: &dyn Engine) -> crate::Result<Option<IncrementalScanStream>> {
         // TODO(#2493): the version validation, the snapshot-commit-list extraction and
         // clipping below, and the "snapshot covers the range" check should all be replaced
         // by a single `CommitRangeBuilder::from_snapshot(...).build(engine)` call once
@@ -112,17 +112,17 @@ impl IncrementalScanBuilder {
         let target_version = self.target_snapshot.version();
         require!(
             self.base_version < target_version,
-            KernelError::generic(format!(
+            crate::Error::Kernel(KernelError::generic(format!(
                 "IncrementalScanBuilder: base_version ({}) must be less than target_version ({})",
                 self.base_version, target_version
-            ))
+            )))
         );
         // TODO(#3702): Support returning parsed partition values in incremental scans.
         require!(
             !self.partition_values_options.parsed_struct,
-            KernelError::unsupported(
+            crate::Error::Kernel(KernelError::unsupported(
                 "Kernel does not yet support returning parsed partition values in incremental scans"
-            )
+            ))
         );
         // Resolve the predicate into an Add-side skipping strategy up front so `build` can
         // fail fast on a malformed predicate (e.g. references to unknown columns), rather

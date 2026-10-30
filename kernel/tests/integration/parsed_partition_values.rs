@@ -859,7 +859,7 @@ async fn timezone_aware_parsed_partition_values_report_invalid_input(
         .build();
     let error = match scan {
         Err(error) => error,
-        Ok(scan) => match scan.scan_metadata(engine.as_ref()) {
+        Ok(scan) => delta_kernel::Error::Kernel(match scan.scan_metadata(engine.as_ref()) {
             Err(error) => error,
             Ok(mut metadata) => {
                 let result = metadata.next().expect("one metadata result");
@@ -868,7 +868,7 @@ async fn timezone_aware_parsed_partition_values_report_invalid_input(
                 };
                 error
             }
-        },
+        }),
     };
     assert!(error.to_string().contains(expected_error), "{error}");
 }

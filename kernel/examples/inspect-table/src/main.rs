@@ -195,7 +195,7 @@ fn print_scan_file(_: &mut (), file: ScanFile) {
     );
 }
 
-fn try_main() -> KernelResult<()> {
+fn try_main() -> delta_kernel::Result<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Inspect", "inspect", "<COMMAND>");
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;

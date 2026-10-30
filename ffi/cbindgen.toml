@@ -14,6 +14,9 @@ cpp_compat = true
 "feature = default-engine-rustls" = "DEFINE_DEFAULT_ENGINE_RUSTLS"
 "feature = default-engine-base" = "DEFINE_DEFAULT_ENGINE_BASE"
 
+[export]
+include = ["ErrorAllocators"]
+
 [export.mangle]
 remove_underscores = true
 

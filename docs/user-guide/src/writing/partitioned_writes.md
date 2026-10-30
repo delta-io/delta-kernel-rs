@@ -38,9 +38,9 @@ The pattern for partitioned writes is: **group your data by partition values, cr
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::expressions::Scalar;
-# use delta_kernel::{KernelResult, Snapshot};
+# use delta_kernel::{Snapshot};
 # #[tokio::main]
-# async fn main() -> KernelResult<()> {
+# async fn main() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/partitioned_table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let snapshot = Snapshot::builder_for(url).build(&engine)?;

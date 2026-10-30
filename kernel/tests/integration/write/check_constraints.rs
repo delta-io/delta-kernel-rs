@@ -27,7 +27,10 @@ enum GatedOp {
 }
 
 /// Builds a data-changing write transaction on `snapshot`.
-fn build_write_txn(snapshot: &SnapshotRef, engine: &dyn Engine) -> KernelResult<Transaction> {
+fn build_write_txn(
+    snapshot: &SnapshotRef,
+    engine: &dyn Engine,
+) -> delta_kernel::Result<Transaction> {
     snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "Test/1.0", true)
@@ -44,11 +47,11 @@ fn stage_one_file(txn: &mut Transaction) -> KernelResult<()> {
 }
 
 /// Asserts `result` failed with the acknowledgement gate error.
-fn assert_gate_error<T: std::fmt::Debug>(result: KernelResult<T>) {
+fn assert_gate_error<T: std::fmt::Debug>(result: delta_kernel::Result<T>) {
     let err = result.expect_err("acknowledgement gate must reject this operation");
     let is_gate_error = matches!(
         &err,
-        KernelError::InvalidTransactionState(msg) if msg.contains("ack_check_constraints")
+        delta_kernel::Error::Kernel(KernelError::InvalidTransactionState(msg)) if msg.contains("ack_check_constraints")
     );
     assert!(
         is_gate_error,
@@ -71,7 +74,7 @@ async fn write_table(
     table_path: &str,
     writer_features: &[&str],
     constraints: &[(&str, &str)],
-) -> KernelResult<Url> {
+) -> delta_kernel::Result<Url> {
     let table_url = Url::from_directory_path(table_path).expect("table path must be a URL");
     let schema = schema_ref! {
         nullable "amount": LONG,
@@ -90,7 +93,7 @@ async fn write_table(
     let metadata = json!({"metaData": {
         "id": "test-id",
         "format": {"provider": "parquet", "options": {}},
-        "schemaString": serde_json::to_string(schema.as_ref())?,
+        "schemaString": serde_json::to_string(schema.as_ref()).map_err(delta_kernel::KernelError::from)?,
         "partitionColumns": [],
         "configuration": configuration,
         "createdTime": 1_700_000_000_000_i64,
@@ -109,7 +112,7 @@ async fn write_table(
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_and_transaction_return_stored_constraints_in_name_order(
     #[values(false, true)] checkpoint: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup_mt()?;
     let constraints = [
         ("NonEmptyName", "name != ''"),
@@ -150,7 +153,7 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_constraints(
     #[values(true, false)] declares_constraints: bool,
     #[values(true, false)] acknowledge: bool,
     #[values(true, false)] discover_first: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let constraints = if declares_constraints {
         POSITIVE_AMOUNT
@@ -194,7 +197,9 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_constraints(
         GatedOp::MetadataOnlyCommit | GatedOp::WriteState => {}
     }
     let result = if op == GatedOp::WriteState {
-        txn.write_state().map(|_write_state| ())
+        txn.write_state()
+            .map(|_write_state| ())
+            .map_err(delta_kernel::Error::from)
     } else {
         txn.commit(engine.as_ref()).map(|committed| {
             let _committed = committed.unwrap_committed();
@@ -209,7 +214,8 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_constraints(
 }
 
 #[tokio::test]
-async fn constraints_without_feature_are_discoverable_but_txn_build_fails() -> KernelResult<()> {
+async fn constraints_without_feature_are_discoverable_but_txn_build_fails(
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = write_table(&table_path, &[], POSITIVE_AMOUNT).await?;
 
@@ -218,7 +224,10 @@ async fn constraints_without_feature_are_discoverable_but_txn_build_fails() -> K
     assert_eq!(from_snapshot, POSITIVE_AMOUNT);
 
     let result = build_write_txn(&snapshot, engine.as_ref());
-    let rejected_as_malformed = matches!(result, Err(KernelError::InvalidProtocol(_)));
+    let rejected_as_malformed = matches!(
+        result,
+        Err(delta_kernel::Error::Kernel(KernelError::InvalidProtocol(_)))
+    );
     assert!(rejected_as_malformed);
     Ok(())
 }
@@ -227,7 +236,7 @@ async fn constraints_without_feature_are_discoverable_but_txn_build_fails() -> K
 #[tokio::test]
 async fn alter_table_commit_succeeds_only_with_ack_and_keeps_constraints(
     #[values(true, false)] acknowledge: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = write_table(&table_path, CHECK_CONSTRAINTS_FEATURE, POSITIVE_AMOUNT).await?;
 

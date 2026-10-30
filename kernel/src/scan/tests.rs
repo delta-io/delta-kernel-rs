@@ -1034,10 +1034,11 @@ fn test_missing_column_row_group_skipping() {
 }
 
 #[test_log::test]
-fn test_scan_with_checkpoint() -> KernelResult<()> {
+fn test_scan_with_checkpoint() -> crate::Result<()> {
     let path = std::fs::canonicalize(PathBuf::from(
         "./tests/data/with_checkpoint_no_last_checkpoint/",
-    ))?;
+    ))
+    .map_err(crate::KernelError::from)?;
 
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();

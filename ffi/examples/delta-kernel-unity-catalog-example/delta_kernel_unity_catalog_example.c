@@ -172,7 +172,7 @@ int main(int argc, char* argv[])
     // Get the default engine
     KernelStringSlice table_path_slice = { .ptr = table_path, .len = strlen(table_path) };
     ExternResultHandleExclusiveEngineBuilder engine_builder_res =
-        get_engine_builder(table_path_slice, allocate_error);
+        get_engine_builder(table_path_slice, &error_allocators);
 
     if (engine_builder_res.tag != OkHandleExclusiveEngineBuilder) {
         print_error("Could not get engine builder", (Error*)engine_builder_res.err);

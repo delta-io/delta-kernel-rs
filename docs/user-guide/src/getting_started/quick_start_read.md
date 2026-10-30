@@ -45,9 +45,9 @@ use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::DefaultEngine;
-use delta_kernel::{KernelResult, Snapshot};
+use delta_kernel::{Snapshot};
 
-fn main() -> KernelResult<()> {
+fn main() -> delta_kernel::Result<()> {
     // 1. Parse the table location
     let table_path = std::env::args().nth(1).expect("usage: delta_read_example <TABLE_PATH>");
     let url = delta_kernel::try_parse_uri(&table_path)?;
@@ -71,7 +71,7 @@ fn main() -> KernelResult<()> {
     }
 
     // 5. Print the results
-    print_batches(&batches)?;
+    print_batches(&batches).map_err(delta_kernel::KernelError::from)?;
     Ok(())
 }
 ```

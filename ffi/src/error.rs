@@ -5,6 +5,8 @@ use tracing::warn;
 use crate::handle::Handle;
 use crate::{kernel_string_slice, ExclusiveRustString, ExternEngine, KernelStringSlice};
 
+pub mod allocation;
+
 // We explicitly assign integer values to the error codes here because C and Rust are inconsistent
 // about values for "typedefed" features. Rust reserves the numbers for them regardless, so
 // `EngineDataTypeError` will be `3` whether or not `default-engine-base` is on becasue `ArrowError`
@@ -19,7 +21,7 @@ use crate::{kernel_string_slice, ExclusiveRustString, ExternEngine, KernelString
 // values we avoid this issue.
 
 #[repr(C)]
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 #[non_exhaustive]
 pub enum FFIKernelError {
     UnknownError = 0, // catch-all for unrecognized KernelError types
@@ -86,6 +88,12 @@ pub enum FFIKernelError {
 
 impl From<KernelError> for FFIKernelError {
     fn from(e: KernelError) -> Self {
+        Self::from(&e)
+    }
+}
+
+impl From<&KernelError> for FFIKernelError {
+    fn from(e: &KernelError) -> Self {
         match e {
             // NOTE: By definition, no KernelError maps to FFIError
             #[cfg(feature = "default-engine-base")]
@@ -139,7 +147,7 @@ impl From<KernelError> for FFIKernelError {
             KernelError::Backtraced {
                 source,
                 backtrace: _,
-            } => Self::from(*source),
+            } => Self::from(source.as_ref()),
             KernelError::InvalidExpressionEvaluation(_) => FFIKernelError::InvalidExpression,
             KernelError::InvalidLogPath(_) => FFIKernelError::InvalidLogPath,
             KernelError::InvalidLogSegment(_) => FFIKernelError::InvalidLogSegment,
@@ -248,13 +256,13 @@ impl<T: ExternEngine + ?Sized> AllocateError for &T {
 /// # Safety
 ///
 /// The allocator must be valid.
-pub(crate) trait IntoExternResult<T> {
-    unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T>;
+pub(crate) trait IntoExternResult<T, A: ?Sized> {
+    unsafe fn into_extern_result(self, alloc: &A) -> ExternResult<T>;
 }
 
 // NOTE: We can't "just" impl From<KernelResult<T>> because we require an error allocator.
-impl<T> IntoExternResult<T> for KernelResult<T> {
-    unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T> {
+impl<T, A: AllocateError + ?Sized> IntoExternResult<T, A> for KernelResult<T> {
+    unsafe fn into_extern_result(self, alloc: &A) -> ExternResult<T> {
         match self {
             Ok(ok) => ExternResult::Ok(ok),
             Err(err) => {
@@ -262,6 +270,31 @@ impl<T> IntoExternResult<T> for KernelResult<T> {
                 let err = unsafe { alloc.allocate_error(err.into(), kernel_string_slice!(msg)) };
                 ExternResult::Err(err)
             }
+        }
+    }
+}
+
+/// Allocates an envelope without changing its outer classification.
+pub(crate) trait AllocateResultError: AllocateError {
+    /// Returns a connector-owned error, or NULL when allocation fails.
+    ///
+    /// # Safety
+    ///
+    /// The registered callbacks and context must be valid for this call.
+    unsafe fn allocate_result_error(&self, error: delta_kernel::Error) -> *mut EngineError;
+}
+
+impl<T: ExternEngine + ?Sized> AllocateResultError for &T {
+    unsafe fn allocate_result_error(&self, error: delta_kernel::Error) -> *mut EngineError {
+        unsafe { self.error_allocators().allocate_error(error).cast() }
+    }
+}
+
+impl<T, A: AllocateResultError + ?Sized> IntoExternResult<T, A> for delta_kernel::Result<T> {
+    unsafe fn into_extern_result(self, alloc: &A) -> ExternResult<T> {
+        match self {
+            Ok(value) => ExternResult::Ok(value),
+            Err(error) => ExternResult::Err(unsafe { alloc.allocate_result_error(error) }),
         }
     }
 }

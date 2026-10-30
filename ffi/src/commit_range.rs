@@ -215,7 +215,7 @@ pub unsafe extern "C" fn commit_range_builder_build(
 
 fn commit_range_builder_build_impl(
     builder: FfiCommitRangeBuilder,
-) -> KernelResult<Handle<SharedCommitRange>> {
+) -> delta_kernel::Result<Handle<SharedCommitRange>> {
     let engine = builder.engine.engine();
     let mut kernel_builder = CommitRange::builder_for(builder.table_root, builder.start_version)
         .with_commit_range_validation(builder.commit_range_validation)
@@ -230,9 +230,9 @@ fn commit_range_builder_build_impl(
     } else if let Some(max_catalog_version) = builder.max_catalog_version {
         kernel_builder = kernel_builder.with_log_tail(builder.log_tail, max_catalog_version);
     } else {
-        return Err(KernelError::MaxCatalogVersion(
+        return Err(delta_kernel::Error::Kernel(KernelError::MaxCatalogVersion(
             "Max catalog version is required when providing a log tail.".to_string(),
-        ));
+        )));
     }
     let range = kernel_builder.build(engine.as_ref())?;
     Ok(Arc::new(range).into())
@@ -394,7 +394,7 @@ pub unsafe extern "C" fn free_commit_action(commit_action: Handle<SharedCommitAc
     unsafe { commit_action.drop_handle() }
 }
 
-type CommitActionIter = Box<dyn KernelResultIterator<CommitAction>>;
+type CommitActionIter = Box<dyn Iterator<Item = delta_kernel::Result<CommitAction>> + Send>;
 
 /// Iterator handle returned by [`commit_range_commits`]. Holds the boxed kernel iterator behind a
 /// mutex (so it is safe to share across threads) plus an engine reference for error allocation.
@@ -480,7 +480,7 @@ fn commit_range_commits_impl(
     engine: Arc<dyn ExternEngine>,
     start_snapshot: Option<SnapshotRef>,
     actions: Vec<KernelDeltaAction>,
-) -> KernelResult<Handle<SharedCommitActionsIterator>> {
+) -> delta_kernel::Result<Handle<SharedCommitActionsIterator>> {
     let inner = commit_range.commits(engine.engine(), start_snapshot, &actions)?;
     let boxed: CommitActionIter = Box::new(inner);
     let iter = FfiCommitActionsIterator {
@@ -520,7 +520,7 @@ fn commit_range_commits_next_impl(
         engine_context: NullableCvoid,
         commit_action: Handle<SharedCommitAction>,
     ),
-) -> KernelResult<bool> {
+) -> delta_kernel::Result<bool> {
     let mut iter = data.lock_iter()?;
     match iter.next().transpose()? {
         Some(commit_action) => {
@@ -676,8 +676,8 @@ mod tests {
     use crate::engine_funcs::{free_read_result_iter, read_result_next};
     use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
-        allocate_err, assert_extern_result_error_with_message, assert_timestamp_is_recent,
-        build_snapshot, error_only_engine_handle, ok_or_panic,
+        assert_extern_result_error_with_message, assert_timestamp_is_recent, build_snapshot,
+        error_only_engine_handle, ok_or_panic,
     };
     use crate::log_path::LogPathArray;
     use crate::{
@@ -712,7 +712,10 @@ mod tests {
             .unwrap();
         }
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        (engine_to_handle(Arc::new(engine), allocate_err), table_root)
+        (
+            engine_to_handle(Arc::new(engine), crate::ffi_test_utils::ERROR_ALLOCATORS),
+            table_root,
+        )
     }
 
     /// Build a `[start_version, end_version]` commit range handle via the FFI builder API.
@@ -911,10 +914,9 @@ mod tests {
         let result = unsafe {
             commit_range_builder_for(kernel_string_slice!(invalid_path), 0, engine.shallow_copy())
         };
-        assert_extern_result_error_with_message(
+        crate::ffi_test_utils::assert_extern_result_delta_error(
             result,
-            FFIKernelError::InvalidTableLocationError,
-            None,
+            "DELTA_PATH_DOES_NOT_EXIST",
         );
 
         unsafe { free_engine(engine) }
@@ -982,7 +984,7 @@ mod tests {
         }
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
-            allocate_err,
+            crate::ffi_test_utils::ERROR_ALLOCATORS,
         );
 
         let builder = unsafe {

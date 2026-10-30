@@ -195,7 +195,7 @@ mod tests {
     fn create_processor_with_seen_files(
         engine: &dyn crate::Engine,
         seen_paths: &[&str],
-    ) -> KernelResult<ScanLogReplayProcessor> {
+    ) -> crate::Result<ScanLogReplayProcessor> {
         let state_info = Arc::new(get_simple_state_info(test_schema(), vec![])?);
 
         let seen_file_keys: HashSet<FileActionKey> = seen_paths
@@ -205,14 +205,14 @@ mod tests {
 
         let checkpoint_info = CheckpointReadInfo::without_stats_parsed();
 
-        ScanLogReplayProcessor::new_with_seen_files(
+        Ok(ScanLogReplayProcessor::new_with_seen_files(
             engine,
             state_info,
             checkpoint_info,
             seen_file_keys,
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
-        )
+        )?)
     }
 
     // ============================================================
@@ -229,9 +229,9 @@ mod tests {
         add_paths: &[&str],
         seen_paths: &[&str],
         expected_paths: &[&str],
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///")?;
+        let url = Url::parse("memory:///").map_err(crate::KernelError::from)?;
         let engine = SyncEngine::new_with_store(store.clone());
 
         // Create sidecar with add actions
@@ -257,7 +257,7 @@ mod tests {
 
         // Create FileMeta for the sidecar
         let file_meta = FileMeta {
-            location: url.join(sidecar_path)?,
+            location: url.join(sidecar_path).map_err(crate::KernelError::from)?,
             last_modified: 0,
             size: get_file_size(&store, sidecar_path).await,
         };
@@ -285,7 +285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parallel_phase_empty_hashmap_all_adds_pass() -> KernelResult<()> {
+    async fn test_parallel_phase_empty_hashmap_all_adds_pass() -> crate::Result<()> {
         run_parallel_phase_test(
             &["file1.parquet", "file2.parquet", "file3.parquet"],
             &[],
@@ -295,7 +295,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parallel_phase_with_removes_filters_matching_adds() -> KernelResult<()> {
+    async fn test_parallel_phase_with_removes_filters_matching_adds() -> crate::Result<()> {
         run_parallel_phase_test(
             &["file1.parquet", "file2.parquet", "file3.parquet"],
             &["file2.parquet"],
@@ -305,7 +305,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parallel_phase_all_files_removed() -> KernelResult<()> {
+    async fn test_parallel_phase_all_files_removed() -> crate::Result<()> {
         run_parallel_phase_test(
             &["removed1.parquet", "removed2.parquet"],
             &["removed1.parquet", "removed2.parquet"],
@@ -315,10 +315,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parallel_phase_multiple_sidecars() -> KernelResult<()> {
+    async fn test_parallel_phase_multiple_sidecars() -> crate::Result<()> {
         // This test uses multiple sidecar files, so we need custom logic
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///")?;
+        let url = Url::parse("memory:///").map_err(crate::KernelError::from)?;
         let engine = SyncEngine::new_with_store(store.clone());
 
         // Create two sidecars
@@ -342,12 +342,12 @@ mod tests {
 
         let file_metas = vec![
             FileMeta {
-                location: url.join(sidecar1_path)?,
+                location: url.join(sidecar1_path).map_err(crate::KernelError::from)?,
                 last_modified: 0,
                 size: get_file_size(&store, sidecar1_path).await,
             },
             FileMeta {
-                location: url.join(sidecar2_path)?,
+                location: url.join(sidecar2_path).map_err(crate::KernelError::from)?,
                 last_modified: 0,
                 size: get_file_size(&store, sidecar2_path).await,
             },
@@ -384,7 +384,7 @@ mod tests {
         engine: &dyn crate::Engine,
         snapshot: &SnapshotRef,
         predicate: Option<PredicateRef>,
-    ) -> KernelResult<Vec<String>> {
+    ) -> crate::Result<Vec<String>> {
         let scan = snapshot
             .clone()
             .scan_builder()
@@ -407,7 +407,7 @@ mod tests {
         with_serde: bool,
         one_file_per_worker: bool,
         dispatcher: Option<tracing::Dispatch>,
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
         let expected_paths = get_expected_paths(engine.as_ref(), &snapshot, predicate.clone())?;
@@ -508,7 +508,7 @@ mod tests {
     fn parallel_scan_metadata_phases_carry_correlation_id(
         #[case] with_serde: bool,
         #[case] expected_parallel: Option<&str>,
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         // This table has checkpoint sidecars, so the sequential phase yields a parallel phase.
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
 
@@ -991,7 +991,7 @@ mod tests {
         #[case] test_case: ParallelLogReplayCase,
         #[values(false, true)] with_serde: bool,
         #[values(false, true)] one_file_per_worker: bool,
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         use test_utils::LoggingTest;
 
         // Set up log capture
@@ -1021,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_with_skip_stats() -> KernelResult<()> {
+    fn test_parallel_with_skip_stats() -> crate::Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
 
         // Get expected paths using single-node scan_metadata with skip_stats=true
@@ -1094,7 +1094,7 @@ mod tests {
     /// Sequential-only tables (single-part checkpoint, no sidecars) emit exactly one
     /// `ScanMetadataCompleted` event with `ScanType::SequentialPhase` when `finish()` is called.
     #[test]
-    fn sequential_done_phase_emits_sequential_scan_metadata_completed_event() -> KernelResult<()> {
+    fn sequential_done_phase_emits_sequential_scan_metadata_completed_event() -> crate::Result<()> {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
@@ -1131,7 +1131,7 @@ mod tests {
     /// `ScanMetadataCompleted` events. The `operation_id` must be the same on both
     /// events so callers can correlate them.
     #[test]
-    fn parallel_scan_emits_correlated_sequential_and_parallel_events() -> KernelResult<()> {
+    fn parallel_scan_emits_correlated_sequential_and_parallel_events() -> crate::Result<()> {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 

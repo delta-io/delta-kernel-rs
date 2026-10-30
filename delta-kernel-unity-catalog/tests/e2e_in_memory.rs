@@ -345,10 +345,10 @@ async fn test_catalog_response_rejects_duplicate_commit_versions(
         .unwrap_err();
     assert!(matches!(
         snapshot_error,
-        KernelError::LogTailVersionsNotContiguous {
+        delta_kernel::Error::Kernel(KernelError::LogTailVersionsNotContiguous {
             first_version: 1,
             second_version: 1,
-        }
+        })
     ));
 
     let range_error = CommitRange::builder_for(table_uri.as_str(), 0)
@@ -357,10 +357,10 @@ async fn test_catalog_response_rejects_duplicate_commit_versions(
         .unwrap_err();
     assert!(matches!(
         range_error,
-        KernelError::LogTailVersionsNotContiguous {
+        delta_kernel::Error::Kernel(KernelError::LogTailVersionsNotContiguous {
             first_version: 1,
             second_version: 1,
-        }
+        })
     ));
     Ok(())
 }
@@ -391,7 +391,7 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
         .commit(&engine)
         .unwrap_err();
     assert!(
-        matches!(err, delta_kernel::KernelError::Generic(msg) if msg.contains("Max unpublished commits"))
+        matches!(err, delta_kernel::Error::Kernel(delta_kernel::KernelError::Generic(msg)) if msg.contains("Max unpublished commits"))
     );
     Ok(())
 }
@@ -433,7 +433,7 @@ async fn test_cannot_checkpoint_unpublished_snapshot() -> Result<(), TestError> 
     let err = snapshot.checkpoint(&engine, None).unwrap_err();
     assert!(matches!(
         err,
-        delta_kernel::KernelError::UnpublishedVersion(1)
+        delta_kernel::Error::Kernel(delta_kernel::KernelError::UnpublishedVersion(1))
     ));
     Ok(())
 }

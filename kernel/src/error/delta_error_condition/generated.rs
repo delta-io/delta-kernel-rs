@@ -12,18 +12,82 @@ use super::ConditionMetadata;
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DeltaErrorCondition {
+    /// `DELTA_ADAPTIVE_METADATA_REQUIRES_COLUMN_MAPPING_ID_MODE` (SQLSTATE `42000`).
+    DeltaAdaptiveMetadataRequiresColumnMappingIdMode,
+    /// `DELTA_DUPLICATE_COLUMNS_FOUND.EXISTING_SCHEMA` (SQLSTATE `42711`).
+    DeltaDuplicateColumnsFoundExistingSchema,
+    /// `DELTA_DUPLICATE_COLUMNS_FOUND.PARTITION_COLUMNS` (SQLSTATE `42711`).
+    DeltaDuplicateColumnsFoundPartitionColumns,
+    /// `DELTA_LOG_FILE_NOT_FOUND` (SQLSTATE `42K03`).
+    DeltaLogFileNotFound,
+    /// `DELTA_PARSING_UNSUPPORTED_DATA_TYPE` (SQLSTATE `KD009`).
+    DeltaParsingUnsupportedDataType,
+    /// `DELTA_PARTITION_COLUMN_NOT_FOUND` (SQLSTATE `42703`).
+    DeltaPartitionColumnNotFound,
+    /// `DELTA_PATH_DOES_NOT_EXIST` (SQLSTATE `42K03`).
+    DeltaPathDoesNotExist,
     /// `DELTA_VERSIONS_NOT_CONTIGUOUS` (SQLSTATE `KD00C`).
     DeltaVersionsNotContiguous,
+    /// `DELTA_VERSION_INVALID` (SQLSTATE `42815`).
+    DeltaVersionInvalid,
 }
 
 impl DeltaErrorCondition {
     pub(super) const fn metadata(self) -> ConditionMetadata {
         match self {
+            Self::DeltaAdaptiveMetadataRequiresColumnMappingIdMode => ConditionMetadata {
+                name: "DELTA_ADAPTIVE_METADATA_REQUIRES_COLUMN_MAPPING_ID_MODE",
+                sql_state: Some("42000"),
+                parameter_names: &["feature", "prop", "mode"],
+                message_template: "The table feature '<feature>' requires column mapping mode 'id', but the table property '<prop>' is set to '<mode>'. Recreate the table with '<prop>' = 'id', or omit the property to have it set automatically.",
+            },
+            Self::DeltaDuplicateColumnsFoundExistingSchema => ConditionMetadata {
+                name: "DELTA_DUPLICATE_COLUMNS_FOUND.EXISTING_SCHEMA",
+                sql_state: Some("42711"),
+                parameter_names: &["duplicateCols"],
+                message_template: "Found duplicate column(s): <duplicateCols>. The duplicate was found in the existing table schema.",
+            },
+            Self::DeltaDuplicateColumnsFoundPartitionColumns => ConditionMetadata {
+                name: "DELTA_DUPLICATE_COLUMNS_FOUND.PARTITION_COLUMNS",
+                sql_state: Some("42711"),
+                parameter_names: &["duplicateCols"],
+                message_template: "Found duplicate column(s): <duplicateCols>. The duplicate was found in the partition columns.",
+            },
+            Self::DeltaLogFileNotFound => ConditionMetadata {
+                name: "DELTA_LOG_FILE_NOT_FOUND",
+                sql_state: Some("42K03"),
+                parameter_names: &["version", "checkpointVersion", "logPath"],
+                message_template: "Unable to retrieve the delta log files to construct table version <version> starting from checkpoint version <checkpointVersion> at <logPath>.",
+            },
+            Self::DeltaParsingUnsupportedDataType => ConditionMetadata {
+                name: "DELTA_PARSING_UNSUPPORTED_DATA_TYPE",
+                sql_state: Some("KD009"),
+                parameter_names: &["dataType"],
+                message_template: "DataType <dataType> is not supported.",
+            },
+            Self::DeltaPartitionColumnNotFound => ConditionMetadata {
+                name: "DELTA_PARTITION_COLUMN_NOT_FOUND",
+                sql_state: Some("42703"),
+                parameter_names: &["columnName", "schemaMap"],
+                message_template: "Partition column <columnName> not found in schema [<schemaMap>]",
+            },
+            Self::DeltaPathDoesNotExist => ConditionMetadata {
+                name: "DELTA_PATH_DOES_NOT_EXIST",
+                sql_state: Some("42K03"),
+                parameter_names: &["path"],
+                message_template: "<path> doesn't exist, or is not a Delta table.",
+            },
             Self::DeltaVersionsNotContiguous => ConditionMetadata {
                 name: "DELTA_VERSIONS_NOT_CONTIGUOUS",
                 sql_state: Some("KD00C"),
                 parameter_names: &["versionList", "startVersion", "endVersion", "versionToLoad"],
                 message_template: "Versions (<versionList>) are not contiguous. \nA gap in the delta log between versions <startVersion> and <endVersion> was detected while trying to load version <versionToLoad>.",
+            },
+            Self::DeltaVersionInvalid => ConditionMetadata {
+                name: "DELTA_VERSION_INVALID",
+                sql_state: Some("42815"),
+                parameter_names: &["version"],
+                message_template: "The provided version (<version>) is not a valid version.",
             },
         }
     }

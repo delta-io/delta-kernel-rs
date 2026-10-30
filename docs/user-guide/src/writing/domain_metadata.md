@@ -27,9 +27,9 @@ while writing to a built transaction before committing it.
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::transaction::UpdateTableOperation;
-# use delta_kernel::{KernelResult, Snapshot};
+# use delta_kernel::{Snapshot};
 # #[tokio::main]
-# async fn main() -> KernelResult<()> {
+# async fn main() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
@@ -88,9 +88,9 @@ that does not exist yet.
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::transaction::UpdateTableOperation;
-# use delta_kernel::{KernelResult, Snapshot};
+# use delta_kernel::{Snapshot};
 # #[tokio::main]
-# async fn main() -> KernelResult<()> {
+# async fn main() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
@@ -132,9 +132,9 @@ an operation; without it, reads retain your engine's normal cancellation and tim
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{KernelResult, Snapshot};
+# use delta_kernel::{Snapshot};
 # #[tokio::main]
-# async fn main() -> KernelResult<()> {
+# async fn main() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let snapshot = Snapshot::builder_for(url).build(&engine)?;

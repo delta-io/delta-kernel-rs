@@ -7,7 +7,7 @@ use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::schema::MetadataColumnSpec;
-use delta_kernel::{Engine, KernelResult, Snapshot};
+use delta_kernel::{Engine, Snapshot};
 use test_utils::read_scan;
 
 /// Reads table data with the requested Row Tracking metadata columns.
@@ -15,7 +15,7 @@ pub fn read_row_tracking_scan(
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn Engine>,
     metadata_columns: impl IntoIterator<Item = MetadataColumnSpec>,
-) -> KernelResult<Vec<RecordBatch>> {
+) -> delta_kernel::Result<Vec<RecordBatch>> {
     let scan_schema = metadata_columns.into_iter().try_fold(
         snapshot.schema().as_ref().clone(),
         |schema, metadata_column| {
@@ -26,7 +26,7 @@ pub fn read_row_tracking_scan(
         .scan_builder()
         .with_schema(Arc::new(scan_schema))
         .build()?;
-    read_scan(&scan, engine)
+    Ok(read_scan(&scan, engine)?)
 }
 
 pub fn read_parquet_file(path: &std::path::Path) -> RecordBatch {

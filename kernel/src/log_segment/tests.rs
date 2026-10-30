@@ -5629,7 +5629,7 @@ fn new_for_version_zero_rejects_non_commit_file() {
 }
 
 #[test]
-fn test_commit_phase_processes_commits() -> KernelResult<()> {
+fn test_commit_phase_processes_commits() -> crate::Result<()> {
     let (engine, snapshot, _tempdir) = load_test_table("app-txn-no-checkpoint")?;
     let log_segment = snapshot.log_segment();
 
@@ -5676,7 +5676,7 @@ fn test_commit_phase_processes_commits() -> KernelResult<()> {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn latest_checkpoint_action_returns_none_without_checkpoint() -> KernelResult<()> {
+fn latest_checkpoint_action_returns_none_without_checkpoint() -> crate::Result<()> {
     let (engine, table_root) = setup_table()?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert!(snapshot.latest_checkpoint_action(&engine)?.is_none());
@@ -5686,7 +5686,7 @@ fn latest_checkpoint_action_returns_none_without_checkpoint() -> KernelResult<()
 // The log is replayed newest-first, so the most recent `checkpoint` action wins.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn latest_checkpoint_action_returns_the_latest_of_multiple() -> KernelResult<()> {
+fn latest_checkpoint_action_returns_the_latest_of_multiple() -> crate::Result<()> {
     let (engine, table_root) = setup_table()?;
     write_commit(
         &engine,
@@ -5716,7 +5716,7 @@ fn latest_checkpoint_action_returns_the_latest_of_multiple() -> KernelResult<()>
 // A fresh snapshot does observe it.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> KernelResult<()> {
+fn latest_checkpoint_action_is_stable_when_newer_checkpoint_written_later() -> crate::Result<()> {
     let (engine, table_root) = setup_table()?;
     write_commit(
         &engine,
@@ -5837,7 +5837,7 @@ async fn amt_last_checkpoint_hint_bounds_listing(
 // the protocol and metadata come from the manifest commit's checkpoint action, not commit 0.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> KernelResult<()> {
+fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> crate::Result<()> {
     let (engine, table_root) = setup_table()?;
     for version in 1..=2 {
         write_commit(
@@ -5858,7 +5858,9 @@ fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> KernelResul
         }),
         ..Default::default()
     };
-    let log_root = table_root.join("_delta_log/")?;
+    let log_root = table_root
+        .join("_delta_log/")
+        .map_err(crate::KernelError::from)?;
     engine.storage_handler().put(
         &LastCheckpointHint::path(&log_root)?,
         hint.to_json_bytes().into(),
@@ -5874,4 +5876,93 @@ fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> KernelResul
         .expect("checkpoint present");
     assert_eq!(checkpoint.path(), "metadata/root-v2.parquet");
     Ok(())
+}
+
+#[rstest]
+#[case::latest(None)]
+#[case::pinned(Some(7))]
+#[tokio::test]
+async fn snapshot_checkpoint_gap_preserves_replay_context(#[case] target: Option<crate::Version>) {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(4, "checkpoint.parquet"),
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        None,
+    )
+    .await;
+    let error =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root.clone(), vec![], None, target)
+            .unwrap_err();
+    let crate::Error::Delta(error) = error else {
+        panic!("expected Delta error")
+    };
+    assert_eq!(error.name(), "DELTA_LOG_FILE_NOT_FOUND");
+    assert_eq!(error.sql_state(), Some("42K03"));
+    let parameters: Vec<_> = error
+        .parameters()
+        .iter()
+        .map(|p| (p.name(), p.value()))
+        .collect();
+    assert_eq!(
+        parameters,
+        [
+            ("version", "7"),
+            ("checkpointVersion", "4"),
+            ("logPath", log_root.as_str())
+        ]
+    );
+    assert!(matches!(
+        std::error::Error::source(&error).and_then(|source| source.downcast_ref::<KernelError>()),
+        Some(KernelError::MissingVersion(5)),
+    ));
+    assert!(matches!(
+        LogSegment::for_table_changes(storage.as_ref(), log_root, 4, Some(7)),
+        Err(KernelError::MissingVersion(_)) | Err(KernelError::StartVersionNotFound { .. }),
+    ));
+}
+
+#[rstest]
+#[case::from_origin(None, vec![0, 2, 3], "0,2,3", 1)]
+#[case::after_checkpoint(Some(4), vec![5, 7, 9], "5,7,9", 6)]
+#[tokio::test]
+async fn snapshot_commit_gap_reports_full_replay_sequence(
+    #[case] checkpoint: Option<crate::Version>,
+    #[case] versions: Vec<crate::Version>,
+    #[case] expected_versions: &str,
+    #[case] missing: crate::Version,
+) {
+    let mut files: Vec<_> = versions
+        .iter()
+        .map(|v| delta_path_for_version(*v, "json"))
+        .collect();
+    if let Some(checkpoint) = checkpoint {
+        files.push(delta_path_for_version(checkpoint, "checkpoint.parquet"));
+    }
+    let (storage, root) = build_log_with_paths_and_checkpoint(&files, None).await;
+    let error =
+        LogSegment::for_snapshot_impl(storage.as_ref(), root, vec![], None, None).unwrap_err();
+    let crate::Error::Delta(error) = error else {
+        panic!("expected Delta gap")
+    };
+    assert_eq!(error.name(), "DELTA_VERSIONS_NOT_CONTIGUOUS");
+    assert_eq!(error.sql_state(), Some("KD00C"));
+    assert_eq!(error.parameters()[0].value(), expected_versions);
+    assert_eq!(
+        error.parameters()[1].value(),
+        versions.first().unwrap().to_string()
+    );
+    assert_eq!(
+        error.parameters()[2].value(),
+        versions.last().unwrap().to_string()
+    );
+    assert_eq!(
+        error.parameters()[3].value(),
+        versions.last().unwrap().to_string()
+    );
+    assert!(matches!(
+        std::error::Error::source(&error).and_then(|source| source.downcast_ref::<KernelError>()),
+        Some(KernelError::MissingVersion(version)) if *version == missing,
+    ));
 }

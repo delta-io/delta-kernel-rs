@@ -30,7 +30,27 @@ pub enum Error {
 
     /// A failure represented by a kernel implementation error.
     #[error(transparent)]
-    Kernel(KernelError),
+    Kernel(#[from] KernelError),
+}
+
+impl Error {
+    /// Applies the matching boundary adapter to the outer error, returning its result.
+    ///
+    /// `kernel` receives a Kernel failure and `delta` receives a Delta failure, irrespective of
+    /// their diagnostic sources. This exhaustive dispatch lets boundary crates handle the
+    /// non-exhaustive envelope without a fallback that erases an unrecognized variant.
+    #[cfg(feature = "internal-api")]
+    #[delta_kernel_derive::internal_api]
+    pub(crate) fn dispatch<T>(
+        &self,
+        kernel: impl FnOnce(&KernelError) -> T,
+        delta: impl FnOnce(&DeltaError) -> T,
+    ) -> T {
+        match self {
+            Self::Kernel(error) => kernel(error),
+            Self::Delta(error) => delta(error),
+        }
+    }
 }
 
 /// Details of a failed conversion from a scalar into a Rust value.
@@ -104,9 +124,6 @@ pub(crate) fn add_scalar_path_context(
 }
 
 /// A result whose error is the top-level [`Error`].
-// Note: `delta_kernel::Result` is currently unused as part of the error migration tracked in:
-// https://github.com/delta-io/delta-kernel-rs/issues/3421.
-// First usages will come when the first `KernelError` is migrated to a `DeltaError`.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A result whose error defaults to [`KernelError`].

@@ -238,7 +238,7 @@ pub async fn write_data_and_check_result_and_stats(
     schema: SchemaRef,
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     expected_since_commit: u64,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let mut txn = test_utils::load_and_begin_transaction_with(
         table_url.clone(),
         engine.as_ref(),
@@ -308,9 +308,10 @@ pub fn set_table_properties(
     engine: &dyn Engine,
     current_version: Version,
     properties: &[(&str, &str)],
-) -> KernelResult<Arc<Snapshot>> {
+) -> delta_kernel::Result<Arc<Snapshot>> {
     let v0_path = std::path::Path::new(table_path).join("_delta_log/00000000000000000000.json");
-    let mut meta: serde_json::Value = std::fs::read_to_string(&v0_path)?
+    let mut meta: serde_json::Value = std::fs::read_to_string(&v0_path)
+        .map_err(delta_kernel::KernelError::from)?
         .lines()
         .find_map(|line| {
             serde_json::from_str::<serde_json::Value>(line)
@@ -325,7 +326,11 @@ pub fn set_table_properties(
 
     let new_commit = std::path::Path::new(table_path)
         .join(format!("_delta_log/{:020}.json", current_version + 1));
-    std::fs::write(&new_commit, serde_json::to_string(&meta)?)?;
+    std::fs::write(
+        &new_commit,
+        serde_json::to_string(&meta).map_err(delta_kernel::KernelError::from)?,
+    )
+    .map_err(delta_kernel::KernelError::from)?;
     Snapshot::builder_for(table_url.clone()).build(engine)
 }
 
@@ -403,7 +408,7 @@ pub async fn create_dv_table_with_files(
     schema: Arc<StructType>,
     partition_values: &[(&str, Option<&str>)],
     file_paths: &[&str],
-) -> KernelResult<(
+) -> delta_kernel::Result<(
     Arc<DynObjectStore>,
     Arc<dyn delta_kernel::Engine>,
     Url,
@@ -496,7 +501,7 @@ pub fn sequential_dv_descriptors(
 pub fn get_scan_files(
     snapshot: Arc<Snapshot>,
     engine: &dyn delta_kernel::Engine,
-) -> KernelResult<Vec<FilteredEngineData>> {
+) -> delta_kernel::Result<Vec<FilteredEngineData>> {
     let scan = snapshot.scan_builder().build()?;
     let all_scan_metadata: Vec<_> = scan
         .scan_metadata(engine)?
@@ -532,7 +537,7 @@ pub async fn write_deletion_vector_to_store(
 pub fn create_dv_update_transaction(
     table_url: &Url,
     engine: &dyn Engine,
-) -> KernelResult<Transaction> {
+) -> delta_kernel::Result<Transaction> {
     Snapshot::builder_for(table_url.clone())
         .build(engine)?
         .update_table(UpdateTableOperation::Delete, "test engine", true)

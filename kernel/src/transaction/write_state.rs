@@ -704,7 +704,7 @@ mod tests {
     fn physical_partition_names_differing_only_by_case_bind_separately(
         #[case] column_mapping_mode: ColumnMappingMode,
         #[case] mode_property: &str,
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         let physical_field = |logical_name: &str, physical_name: &str, id: i64| {
             StructField::not_null(logical_name, DataType::INTEGER).with_metadata([
                 ("delta.columnMapping.id", MetadataValue::Number(id)),

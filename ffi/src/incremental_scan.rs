@@ -176,7 +176,7 @@ pub unsafe extern "C" fn incremental_scan_builder_build(
 
 fn incremental_scan_builder_build_impl(
     builder: FfiIncrementalScanBuilder,
-) -> KernelResult<OptionalValue<Handle<SharedIncrementalScanStream>>> {
+) -> delta_kernel::Result<OptionalValue<Handle<SharedIncrementalScanStream>>> {
     let engine = builder.engine.engine();
     let maybe_stream = builder
         .target_snapshot
@@ -471,7 +471,7 @@ mod tests {
                 .unwrap();
         }
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), crate::ffi_test_utils::ERROR_ALLOCATORS);
         let table_root = kernel_string_slice!(table_root);
         let builder =
             unsafe { ok_or_panic(get_snapshot_builder(table_root, engine.shallow_copy())) };
@@ -1064,7 +1064,7 @@ mod tests {
                     .with_task_executor(executor)
                     .build(),
             ),
-            allocate_err,
+            crate::ffi_test_utils::ERROR_ALLOCATORS,
         );
 
         // Checkpoint at v2 so the log segment for a later snapshot starts at the checkpoint and

@@ -84,7 +84,7 @@
 //! // Finalize the checkpoint by passing the stats
 //! writer.finalize(engine, &last_checkpoint_stats)?;
 //!
-//! # Ok::<_, KernelError>(())
+//! # Ok::<_, delta_kernel::Error>(())
 //! ```
 //!
 //! ## Warning
@@ -374,7 +374,7 @@ impl RetentionCalculator for CheckpointWriter {
 
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
-    pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> KernelResult<Self> {
+    pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> crate::Result<Self> {
         snapshot
             .table_configuration()
             .ensure_read_write_supported()?;
