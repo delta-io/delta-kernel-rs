@@ -53,20 +53,11 @@ pub(crate) mod void_utils;
 /// Prefix of the error message the schema deserializers emit for an unsupported type.
 const UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX: &str = "Unsupported Delta table type";
 
-/// Builds the serde custom error for a Delta type the kernel does not support. Pairs with
-/// [`is_unsupported_delta_type_error`] for detecting whether a serde error is this kind.
+/// Builds the serde custom error for a Delta type the kernel does not support.
 fn unsupported_delta_type_error<E: serde::de::Error>(name: &str) -> E {
     E::custom(format!("{UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX}: '{name}'"))
 }
 
-/// Returns `true` if `error` is the "unsupported Delta type" failure produced by
-/// `unsupported_delta_type_error`.
-pub(crate) fn is_unsupported_delta_type_error(error: &serde_json::Error) -> bool {
-    error.is_data()
-        && error
-            .to_string()
-            .starts_with(UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX)
-}
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
@@ -2197,8 +2188,15 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
     where
         D: serde::Deserializer<'de>,
     {
-        let str_value = String::deserialize(deserializer)?;
+        Self::parse(String::deserialize(deserializer)?, unsupported_delta_type_error)
+    }
+}
 
+impl PrimitiveType {
+    fn parse<E: serde::de::Error>(
+        str_value: String,
+        unsupported: impl Fn(&str) -> E,
+    ) -> KernelResult<Self, E> {
         match str_value.as_str() {
             "string" => Ok(PrimitiveType::String),
             "long" => Ok(PrimitiveType::Long),
@@ -2215,7 +2213,7 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             "void" => Ok(PrimitiveType::Void),
             // Accept canonical and narrowed interval spellings
             s if s.starts_with("interval ") => {
-                normalize_interval_type(s).ok_or_else(|| unsupported_delta_type_error(s))
+                normalize_interval_type(s).ok_or_else(|| unsupported(s))
             }
             decimal_str if decimal_str.starts_with("decimal(") && decimal_str.ends_with(')') => {
                 // Parse decimal type
@@ -2274,7 +2272,7 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                     ))),
                 }
             }
-            unsupported => Err(unsupported_delta_type_error(unsupported)),
+            name => Err(unsupported(name)),
         }
     }
 }

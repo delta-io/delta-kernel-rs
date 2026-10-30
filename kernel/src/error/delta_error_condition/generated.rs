@@ -20,6 +20,8 @@ pub enum DeltaErrorCondition {
     DeltaDuplicateColumnsFoundPartitionColumns,
     /// `DELTA_LOG_FILE_NOT_FOUND` (SQLSTATE `42K03`).
     DeltaLogFileNotFound,
+    /// `DELTA_PARSING_UNSUPPORTED_DATA_TYPE` (SQLSTATE `KD009`).
+    DeltaParsingUnsupportedDataType,
     /// `DELTA_PARTITION_COLUMN_NOT_FOUND` (SQLSTATE `42703`).
     DeltaPartitionColumnNotFound,
     /// `DELTA_PATH_DOES_NOT_EXIST` (SQLSTATE `42K03`).
@@ -56,6 +58,12 @@ impl DeltaErrorCondition {
                 sql_state: Some("42K03"),
                 parameter_names: &["version", "checkpointVersion", "logPath"],
                 message_template: "Unable to retrieve the delta log files to construct table version <version> starting from checkpoint version <checkpointVersion> at <logPath>.",
+            },
+            Self::DeltaParsingUnsupportedDataType => ConditionMetadata {
+                name: "DELTA_PARSING_UNSUPPORTED_DATA_TYPE",
+                sql_state: Some("KD009"),
+                parameter_names: &["dataType"],
+                message_template: "DataType <dataType> is not supported.",
             },
             Self::DeltaPartitionColumnNotFound => ConditionMetadata {
                 name: "DELTA_PARTITION_COLUMN_NOT_FOUND",

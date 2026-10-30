@@ -36,6 +36,16 @@ pub struct DeltaErrorParameter {
 }
 
 impl DeltaError {
+    /// Reports an unsupported persisted type token `name`, retaining the parser `source`.
+    pub(crate) fn unsupported_schema_type(name: &str, source: serde_json::Error) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaParsingUnsupportedDataType,
+            vec![DeltaErrorParameter::new("dataType", name)],
+            Some(Box::new(source)),
+        )
+    }
+
+
     /// Reports a duplicate logical field `name` in the persisted table schema.
     /// `source` retains the schema decoder's original failure and location.
     pub(crate) fn duplicate_schema_field(name: &str, source: serde_json::Error) -> Self {
