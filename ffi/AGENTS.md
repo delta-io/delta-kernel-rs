@@ -847,6 +847,13 @@ publication watermark.
 When built with `adaptive-metadata-in-dev`, typed export rejects CRCs containing experimental
 adaptive-metadata `lastManifestCommit` or Add `backReference` state.
 
+`snapshot_log_segment(snapshot, context, visitor)` exposes the existing retained segment without
+I/O through one borrowed `FfiLogSegment` callback. It includes commit, compaction, and top-level
+checkpoint files, optional latest commit/CRC metadata, checkpoint version, and the known publication
+watermark. It preserves staged paths independently of that watermark. The snapshot is borrowed;
+copy all retained values before the callback returns. It does not implement snapshot equivalence
+or establish freshness.
+
 Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
 `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
 `num_files` / `table_size_bytes` from the CRC; `None` when the snapshot has no CRC, or its CRC lacks

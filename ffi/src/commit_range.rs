@@ -11,8 +11,8 @@ use crate::engine_funcs::{ExclusiveFileReadResultIterator, FileReadResultIterato
 use crate::handle::Handle;
 use crate::log_path::{FfiLogPath, LogPathArray};
 use crate::{
-    kernel_string_slice, unwrap_and_parse_path_as_url, ExternEngine, ExternResult,
-    IntoExternResult, KernelStringSlice, NullableCvoid, SharedExternEngine, SharedSnapshot,
+    unwrap_and_parse_path_as_url, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
+    NullableCvoid, SharedExternEngine, SharedSnapshot,
 };
 
 /// An opaque, shared handle owning a [`CommitRange`] produced by
@@ -642,14 +642,9 @@ fn commit_range_commit_files_next_impl(
     let Some(path) = next else {
         return Ok(false);
     };
-    let location = path.location.location.as_str();
     let commit_file = FfiCommitFile {
         version: path.version,
-        file: FfiLogPath::new(
-            kernel_string_slice!(location),
-            path.location.last_modified,
-            path.location.size,
-        ),
+        file: FfiLogPath::from_parsed(&path),
     };
     (engine_visitor)(engine_context, &commit_file);
     Ok(true)
@@ -686,8 +681,8 @@ mod tests {
     };
     use crate::log_path::LogPathArray;
     use crate::{
-        engine_to_handle, free_engine, free_engine_data, free_snapshot, ExclusiveEngineData,
-        TryFromStringSlice,
+        engine_to_handle, free_engine, free_engine_data, free_snapshot, kernel_string_slice,
+        ExclusiveEngineData, TryFromStringSlice,
     };
 
     /// Build an in-memory engine handle pre-loaded with a metadata-only commit at each version in
