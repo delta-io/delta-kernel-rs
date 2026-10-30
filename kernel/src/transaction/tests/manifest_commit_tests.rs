@@ -12,7 +12,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{find_max_column_id_in_schema, TableFeature};
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    minimal_checkpoint_action, setup_table, write_commit,
+    minimal_checkpoint_action, setup_table, write_commit_after_manifest_commit,
+    write_manifest_commit,
 };
 use crate::unit_test_utils::{
     assert_result_error_with_message, create_valid_add_file_batch, MockProtocolBuilder,
@@ -143,11 +144,11 @@ fn with_root_manifest_file_rejects_when_manifest_commit_staged() -> KernelResult
 #[test]
 fn manifest_commit_allows_checkpoint_covering_the_snapshot() -> KernelResult<()> {
     let (engine, table_root) = setup_table()?;
-    write_commit(
+    write_manifest_commit(
         &engine,
         &table_root,
         1,
-        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?.into_engine_data(&engine)?,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?,
     )?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert_eq!(snapshot.version(), 1);
@@ -160,18 +161,19 @@ fn manifest_commit_allows_checkpoint_covering_the_snapshot() -> KernelResult<()>
 #[test]
 fn manifest_commit_rejects_delta_commits_after_last_checkpoint() -> KernelResult<()> {
     let (engine, table_root) = setup_table()?;
-    write_commit(
+    write_manifest_commit(
         &engine,
         &table_root,
         1,
-        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?.into_engine_data(&engine)?,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?,
     )?;
     // A later delta commit bumps the snapshot past the checkpoint version.
     let domain_metadata = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
-    write_commit(
+    write_commit_after_manifest_commit(
         &engine,
         &table_root,
         2,
+        1,
         create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)?,
     )?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -210,12 +212,7 @@ fn manifest_commit_after_schema_change_uses_evolved_schema(
     checkpoint.metadata = checkpoint
         .metadata
         .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, max_column_id.to_string());
-    write_commit(
-        &engine,
-        &table_root,
-        1,
-        checkpoint.into_engine_data(&engine)?,
-    )?;
+    write_manifest_commit(&engine, &table_root, 1, checkpoint)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let initial_schema = snapshot.table_configuration().physical_schema();
     let is_alter = operation == UpdateTableOperation::AlterTable;
