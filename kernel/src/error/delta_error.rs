@@ -52,7 +52,6 @@ impl DeltaError {
         )
     }
 
-
     /// Reports the duplicate partition column `name` stored in table metadata.
     pub(crate) fn duplicate_partition_column(name: &str, source: super::KernelError) -> Self {
         Self::new(

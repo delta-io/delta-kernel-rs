@@ -281,9 +281,11 @@ fn validate_partition_columns(
         require!(
             logical_schema.field(col).is_some(),
             crate::DeltaError::partition_column_not_found(
-                col, logical_schema,
+                col,
+                logical_schema,
                 KernelError::generic(format!("Partition column '{col}' not found in schema")),
-            ).into()
+            )
+            .into()
         );
     }
     Ok(())
@@ -1352,14 +1354,28 @@ mod test {
         assert_result_error_with_message(StatsOutputSchemas::try_new(logical, physical), error);
     }
 
-    #[test]
-    fn table_configuration_rejects_partition_column_missing_from_schema() {
+    #[rstest]
+    #[case::missing(vec!["missing"])]
+    #[case::missing_before_duplicate(vec!["missing", "missing"])]
+    fn table_configuration_rejects_partition_column_missing_from_schema(
+        #[case] columns: Vec<&str>,
+    ) {
         let result = MockTableConfigurationBuilder::new()
-            .with_partition_columns(["missing"])
+            .with_partition_columns(columns)
             .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
             .try_build();
 
-        assert_result_error_with_message(result, "Partition column 'missing' not found in schema");
+        let crate::Error::Delta(error) = result.unwrap_err() else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(
+            error.condition(),
+            crate::DeltaErrorCondition::DeltaPartitionColumnNotFound
+        );
+        assert_eq!(error.sql_state(), Some("42703"));
+        assert_eq!(error.parameters()[0].value(), "missing");
+        assert!(!error.parameters()[1].value().is_empty());
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[derive(Debug, PartialEq)]
