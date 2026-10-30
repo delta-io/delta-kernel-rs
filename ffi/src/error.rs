@@ -5,6 +5,8 @@ use tracing::warn;
 use crate::handle::Handle;
 use crate::{kernel_string_slice, ExclusiveRustString, ExternEngine, KernelStringSlice};
 
+pub mod allocation;
+
 // We explicitly assign integer values to the error codes here because C and Rust are inconsistent
 // about values for "typedefed" features. Rust reserves the numbers for them regardless, so
 // `EngineDataTypeError` will be `3` whether or not `default-engine-base` is on becasue `ArrowError`
@@ -86,6 +88,12 @@ pub enum FFIKernelError {
 
 impl From<KernelError> for FFIKernelError {
     fn from(e: KernelError) -> Self {
+        Self::from(&e)
+    }
+}
+
+impl From<&KernelError> for FFIKernelError {
+    fn from(e: &KernelError) -> Self {
         match e {
             // NOTE: By definition, no KernelError maps to FFIError
             #[cfg(feature = "default-engine-base")]
@@ -139,7 +147,7 @@ impl From<KernelError> for FFIKernelError {
             KernelError::Backtraced {
                 source,
                 backtrace: _,
-            } => Self::from(*source),
+            } => Self::from(source.as_ref()),
             KernelError::InvalidExpressionEvaluation(_) => FFIKernelError::InvalidExpression,
             KernelError::InvalidLogPath(_) => FFIKernelError::InvalidLogPath,
             KernelError::InvalidLogSegment(_) => FFIKernelError::InvalidLogSegment,
