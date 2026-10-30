@@ -16,7 +16,9 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
-use delta_kernel::schema::{DataType, IntervalYearToMonthType, StructType, schema, schema_ref};
+use delta_kernel::schema::{
+    schema, schema_ref, DataType, IntervalDayToSecondType, IntervalYearToMonthType, StructType,
+};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
@@ -148,9 +150,54 @@ async fn test_write_partitioned_normal_values_roundtrip(
     "INTERVAL '30' MONTH"
 )]
 #[case::day_time(
-    DataType::INTERVAL_DAY_TIME,
-    Scalar::IntervalDayTime(131_445_000_000),
-    "INTERVAL '1 12:30:45' DAY TO SECOND"
+     DataType::INTERVAL_DAY_TIME,
+     Scalar::interval_day_time(131_445_000_000, IntervalDayToSecondType::IntervalDayToSecond).unwrap(),
+     "INTERVAL '1 12:30:45' DAY TO SECOND"
+ )]
+#[case::day(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalDay),
+    Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay).unwrap(),
+    "INTERVAL '1' DAY"
+)]
+#[case::hour(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalHour),
+    Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalHour).unwrap(),
+    "INTERVAL '26' HOUR"
+)]
+#[case::minute(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalMinute),
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalMinute).unwrap(),
+    "INTERVAL '1563' MINUTE"
+)]
+#[case::second(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalSecond),
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalSecond).unwrap(),
+    "INTERVAL '93784.5' SECOND"
+)]
+#[case::day_hour(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalDayToHour),
+    Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap(),
+    "INTERVAL '1 02' DAY TO HOUR"
+)]
+#[case::day_minute(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalDayToMinute),
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalDayToMinute).unwrap(),
+    "INTERVAL '1 02:03' DAY TO MINUTE"
+)]
+#[case::hour_minute(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToMinute),
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalHourToMinute).unwrap(),
+    "INTERVAL '26:03' HOUR TO MINUTE"
+)]
+#[case::hour_second(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToSecond),
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalHourToSecond).unwrap(),
+    "INTERVAL '26:03:04.5' HOUR TO SECOND"
+)]
+#[case::minute_second(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalMinuteToSecond),
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalMinuteToSecond).unwrap(),
+    "INTERVAL '1563:04.5' MINUTE TO SECOND"
 )]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_partitioned_interval_roundtrip(
@@ -281,9 +328,54 @@ async fn test_write_rejects_qualifier_mismatch() -> Result<(), Box<dyn std::erro
     "INTERVAL '30' MONTH"
 )]
 #[case::day_time(
-    DataType::INTERVAL_DAY_TIME,
-    Scalar::IntervalDayTime(131_445_000_000),
-    "INTERVAL '1 12:30:45' DAY TO SECOND"
+     DataType::INTERVAL_DAY_TIME,
+     Scalar::interval_day_time(131_445_000_000, IntervalDayToSecondType::IntervalDayToSecond).unwrap(),
+     "INTERVAL '1 12:30:45' DAY TO SECOND"
+ )]
+#[case::day(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalDay),
+    Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay).unwrap(),
+    "INTERVAL '1' DAY"
+)]
+#[case::hour(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalHour),
+    Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalHour).unwrap(),
+    "INTERVAL '26' HOUR"
+)]
+#[case::minute(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalMinute),
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalMinute).unwrap(),
+    "INTERVAL '1563' MINUTE"
+)]
+#[case::second(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalSecond),
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalSecond).unwrap(),
+    "INTERVAL '93784.5' SECOND"
+)]
+#[case::day_hour(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalDayToHour),
+    Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap(),
+    "INTERVAL '1 02' DAY TO HOUR"
+)]
+#[case::day_minute(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalDayToMinute),
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalDayToMinute).unwrap(),
+    "INTERVAL '1 02:03' DAY TO MINUTE"
+)]
+#[case::hour_minute(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToMinute),
+    Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalHourToMinute).unwrap(),
+    "INTERVAL '26:03' HOUR TO MINUTE"
+)]
+#[case::hour_second(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToSecond),
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalHourToSecond).unwrap(),
+    "INTERVAL '26:03:04.5' HOUR TO SECOND"
+)]
+#[case::minute_second(
+    DataType::interval_day_time(IntervalDayToSecondType::IntervalMinuteToSecond),
+    Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalMinuteToSecond).unwrap(),
+    "INTERVAL '1563:04.5' MINUTE TO SECOND"
 )]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_materialized_partitioned_interval_roundtrip(
@@ -780,7 +872,7 @@ fn assert_interval_value(batch: &RecordBatch, column_name: &str, expected: &Scal
         Scalar::IntervalDayTime(micros) => {
             assert_eq!(
                 get_column!(batch, column_name, Int64Array).value(0),
-                *micros,
+                micros.micros(),
                 "interval day-time column {column_name}"
             );
         }

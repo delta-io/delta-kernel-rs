@@ -16,8 +16,8 @@ use crate::schema::IntervalField::{Day, Hour, Minute, Month, Second, Year};
 use crate::schema::IntervalYearToMonthType::{IntervalMonth, IntervalYear, IntervalYearToMonth};
 use crate::schema::derive_macro_utils::{GetStructField, ToDataType};
 use crate::schema::{
-    ArrayType, DataType, DecimalType, IntervalFieldRange, IntervalYearToMonthType, MapType,
-    PrimitiveType, StructField, StructType, parse_interval_type,
+    ArrayType, DataType, DecimalType, IntervalDayToSecondType, IntervalFieldRange,
+    IntervalYearToMonthType, MapType, PrimitiveType, StructField, StructType, parse_interval_type,
 };
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
@@ -97,6 +97,39 @@ impl TryFrom<RawIntervalYearMonthData> for IntervalYearMonthData {
 
     fn try_from(raw: RawIntervalYearMonthData) -> KernelResult<Self> {
         Self::try_new(raw.months, raw.ty)
+    }
+}
+
+/// A day-time interval value stored as signed microseconds and an ANSI qualifier.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IntervalDayTimeData {
+    micros: i64,
+    ty: IntervalDayToSecondType,
+}
+
+impl IntervalDayTimeData {
+    /// Creates a day-time payload from microseconds and its qualifier.
+    ///
+    /// Returns an error when the microseconds contain a fraction of the qualifier's last unit.
+    pub fn try_new(micros: i64, ty: IntervalDayToSecondType) -> Result<Self> {
+        let unit = ty.unit_micros();
+        require!(
+            micros % unit == 0,
+            KernelError::invalid_interval(format!(
+                "{ty} value {micros} microseconds is not divisible by {unit}"
+            ))
+        );
+        Ok(Self { micros, ty })
+    }
+
+    /// Returns the signed total-microsecond payload.
+    pub fn micros(&self) -> i64 {
+        self.micros
+    }
+
+    /// Returns the day-time interval qualifier.
+    pub fn ty(&self) -> &IntervalDayToSecondType {
+        &self.ty
     }
 }
 
@@ -422,7 +455,8 @@ pub enum Scalar {
     #[from]
     IntervalYearMonth(IntervalYearMonthData),
     /// Day-time interval, stored as a signed 64bit count of microseconds (matches Spark Catalyst).
-    IntervalDayTime(i64),
+    #[from]
+    IntervalDayTime(IntervalDayTimeData),
     /// Date stored as a signed 32bit int days since UNIX epoch 1970-01-01
     Date(i32),
     /// Binary data
@@ -458,7 +492,7 @@ impl Scalar {
             Self::Timestamp(_) => DataType::TIMESTAMP,
             Self::TimestampNtz(_) => DataType::TIMESTAMP_NTZ,
             Self::IntervalYearMonth(data) => DataType::interval_year_month(*data.ty()),
-            Self::IntervalDayTime(_) => DataType::INTERVAL_DAY_TIME,
+            Self::IntervalDayTime(data) => DataType::interval_day_time(*data.ty()),
             Self::Date(_) => DataType::DATE,
             Self::Binary(_) => DataType::BINARY,
             Self::Decimal(d) => DataType::from(*d.ty()),
@@ -498,6 +532,15 @@ impl Scalar {
     pub fn interval_year_month(months: i32, ty: IntervalYearToMonthType) -> KernelResult<Self> {
         Ok(Self::IntervalYearMonth(IntervalYearMonthData::try_new(
             months, ty,
+        )?))
+    }
+
+    /// Constructs a day-time interval from signed microseconds and its ANSI qualifier.
+    ///
+    /// Returns an error when the microseconds contain a fraction of the qualifier's last unit.
+    pub fn interval_day_time(micros: i64, ty: IntervalDayToSecondType) -> Result<Self> {
+        Ok(Self::IntervalDayTime(IntervalDayTimeData::try_new(
+            micros, ty,
         )?))
     }
 
@@ -586,7 +629,7 @@ impl Display for Scalar {
             Self::Timestamp(ts) => write!(f, "{ts}"),
             Self::TimestampNtz(ts) => write!(f, "{ts}"),
             Self::IntervalYearMonth(data) => write!(f, "{}", data.months()),
-            Self::IntervalDayTime(micros) => write!(f, "{micros}"),
+            Self::IntervalDayTime(data) => write!(f, "{}", data.micros()),
             Self::Date(d) => write!(f, "{d}"),
             Self::Binary(b) => write!(f, "{b:?}"),
             Self::Decimal(d) => match d.scale().cmp(&0) {
@@ -706,7 +749,7 @@ impl Scalar {
             (TimestampNtz(_), _) => None,
             (IntervalYearMonth(a), IntervalYearMonth(b)) => a.months().partial_cmp(&b.months()),
             (IntervalYearMonth(_), _) => None,
-            (IntervalDayTime(a), IntervalDayTime(b)) => a.partial_cmp(b),
+            (IntervalDayTime(a), IntervalDayTime(b)) => a.micros().partial_cmp(&b.micros()),
             (IntervalDayTime(_), _) => None,
             (Date(a), Date(b)) => a.partial_cmp(b),
             (Date(_), _) => None,
@@ -807,6 +850,7 @@ impl_try_from_scalar!(
     (Binary, bytes::Bytes),
     (Decimal, DecimalData),
     (IntervalYearMonth, IntervalYearMonthData),
+    (IntervalDayTime, IntervalDayTimeData),
     (Array, ArrayData),
     (Map, MapData),
     (Struct, StructData),
@@ -1006,9 +1050,7 @@ impl PrimitiveType {
                 }
             }
             IntervalYearMonth(dtype) => parse_year_month_interval(raw, *dtype),
-            IntervalDayTime => parse_day_time_interval(raw)
-                .map(Scalar::IntervalDayTime)
-                .ok_or_else(|| self.parse_error(raw)),
+            IntervalDayTime(dtype) => parse_day_time_interval(raw, *dtype),
             // Kernel does not support parsing text into Geometry/Geography types yet.
             #[cfg(feature = "geo-type-in-dev")]
             Geometry(_) | Geography(_) => Err(KernelError::Unsupported(format!(
@@ -1242,8 +1284,19 @@ fn parse_year_month_interval(raw: &str, target: IntervalYearToMonthType) -> Kern
     Scalar::interval_year_month(months, target).map_err(|_| parse_error())
 }
 
+/// Parses a day-time interval literal into a scalar with the target qualifier.
+fn parse_day_time_interval(raw: &str, target: IntervalDayToSecondType) -> KernelResult<Scalar> {
+    let parse_error = || PrimitiveType::interval_day_time(target).parse_error(raw);
+    let (_, range) = extract_interval_literal(raw).ok_or_else(parse_error)?;
+    if range.primitive_type() != Some(PrimitiveType::interval_day_time(target)) {
+        return Err(parse_error());
+    }
+    let micros = parse_day_time_micros(raw).ok_or_else(parse_error)?;
+    Scalar::interval_day_time(micros, target).map_err(|_| parse_error())
+}
+
 /// Parses a day-time interval literal into a signed total microsecond count.
-fn parse_day_time_interval(raw: &str) -> Option<i64> {
+fn parse_day_time_micros(raw: &str) -> Option<i64> {
     let (body, field_range) = extract_interval_literal(raw)?;
     let (negative, magnitude) = interval_magnitude(body)?;
     let (days, hours, minutes, seconds, micros) = match (field_range.start, field_range.end) {
@@ -1923,7 +1976,7 @@ mod tests {
             .unwrap();
         assert_eq!(ym.data_type(), DataType::INTERVAL_YEAR_MONTH);
 
-        let dt = PrimitiveType::IntervalDayTime
+        let dt = PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond)
             .parse_scalar(INTERVAL_DT_LITERAL)
             .unwrap();
         assert_eq!(dt.data_type(), DataType::INTERVAL_DAY_TIME);
@@ -1942,12 +1995,13 @@ mod tests {
         assert_eq!(ym_larger.logical_partial_cmp(&ym), Some(Ordering::Greater));
         assert_eq!(ym.logical_partial_cmp(&ym), Some(Ordering::Equal));
 
-        let dt = PrimitiveType::IntervalDayTime
+        let dt = PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond)
             .parse_scalar(INTERVAL_DT_LITERAL)
             .unwrap();
-        let dt_larger = PrimitiveType::IntervalDayTime
-            .parse_scalar(INTERVAL_DT_LITERAL_LARGER)
-            .unwrap();
+        let dt_larger =
+            PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond)
+                .parse_scalar(INTERVAL_DT_LITERAL_LARGER)
+                .unwrap();
         assert_eq!(dt.logical_partial_cmp(&dt_larger), Some(Ordering::Less));
 
         // Comparison is defined only within a family; everything else is incomparable.
@@ -1983,9 +2037,37 @@ mod tests {
 
         assert_ne!(year, month);
         assert!(!year.physical_eq(&month));
-        assert_eq!(year.logical_partial_cmp(&Scalar::IntervalDayTime(24)), None);
+        assert_eq!(
+            year.logical_partial_cmp(
+                &Scalar::interval_day_time(24, IntervalDayToSecondType::IntervalDayToSecond)
+                    .unwrap()
+            ),
+            None
+        );
         assert_eq!(
             year.logical_partial_cmp(&Scalar::null(year.data_type())),
+            None
+        );
+    }
+
+    #[test]
+    fn interval_day_time_structural_and_logical_equality_differ() {
+        let hour = Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalHour)
+            .unwrap();
+        let day = Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay)
+            .unwrap();
+        let full =
+            Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDayToSecond)
+                .unwrap();
+
+        assert!(day.logical_eq(&hour));
+        assert!(hour.logical_eq(&full));
+        assert_eq!(day.logical_partial_cmp(&full), Some(Ordering::Equal));
+        assert_ne!(day, hour);
+        assert!(!day.physical_eq(&hour));
+        assert_eq!(day.logical_partial_cmp(&Scalar::Integer(0)), None);
+        assert_eq!(
+            day.logical_partial_cmp(&Scalar::null(day.data_type())),
             None
         );
     }
@@ -2091,6 +2173,59 @@ mod tests {
     }
 
     #[rstest]
+    fn interval_day_time_payload_requires_end_unit_alignment(
+        #[values(0, -1, 60_000_000, 3_600_000_000, 86_400_000_000, i64::MIN, i64::MAX)] micros: i64,
+        #[values(
+            IntervalDayToSecondType::IntervalDay,
+            IntervalDayToSecondType::IntervalHour,
+            IntervalDayToSecondType::IntervalMinute,
+            IntervalDayToSecondType::IntervalSecond,
+            IntervalDayToSecondType::IntervalDayToHour,
+            IntervalDayToSecondType::IntervalDayToMinute,
+            IntervalDayToSecondType::IntervalDayToSecond,
+            IntervalDayToSecondType::IntervalHourToMinute,
+            IntervalDayToSecondType::IntervalHourToSecond,
+            IntervalDayToSecondType::IntervalMinuteToSecond
+        )]
+        dtype: IntervalDayToSecondType,
+    ) {
+        let payload = IntervalDayTimeData::try_new(micros, dtype);
+        let scalar = Scalar::interval_day_time(micros, dtype);
+        if micros % dtype.unit_micros() != 0 {
+            assert!(matches!(
+                payload.unwrap_err(),
+                KernelError::InvalidInterval(_)
+            ));
+            assert!(matches!(
+                scalar.unwrap_err(),
+                KernelError::InvalidInterval(_)
+            ));
+            return;
+        }
+        let data = payload.unwrap();
+        assert_eq!(data.micros(), micros);
+        assert_eq!(data.ty(), &dtype);
+        assert_eq!(
+            scalar.unwrap().data_type(),
+            DataType::interval_day_time(dtype)
+        );
+    }
+
+    #[rstest]
+    #[case(3_600_000_001, IntervalDayToSecondType::IntervalHour)]
+    #[case(-86_400_000_001, IntervalDayToSecondType::IntervalDay)]
+    #[case(60_000_001, IntervalDayToSecondType::IntervalMinute)]
+    fn interval_day_time_constructor_rejects_unaligned_end_unit(
+        #[case] micros: i64,
+        #[case] dtype: IntervalDayToSecondType,
+    ) {
+        let err = Scalar::interval_day_time(micros, dtype).unwrap_err();
+        assert!(
+            matches!(err, KernelError::InvalidInterval(message) if message.contains("not divisible"))
+        );
+    }
+
+    #[rstest]
     #[case::year(IntervalYearToMonthType::IntervalYear, "INTERVAL '2' YEAR", 24)]
     #[case::month(IntervalYearToMonthType::IntervalMonth, "INTERVAL '24' MONTH", 24)]
     #[case::year_to_month(
@@ -2125,6 +2260,90 @@ mod tests {
         let err = primitive.parse_scalar(literal).unwrap_err();
         assert!(
             matches!(err, KernelError::ParseError(raw, ty) if raw == literal && ty == DataType::interval_year_month(dtype))
+        );
+    }
+
+    #[rstest]
+    #[case(
+        IntervalDayToSecondType::IntervalDay,
+        "INTERVAL '1' DAY",
+        86_400_000_000
+    )]
+    #[case(
+        IntervalDayToSecondType::IntervalHour,
+        "INTERVAL '26' HOUR",
+        93_600_000_000
+    )]
+    #[case(
+        IntervalDayToSecondType::IntervalMinute,
+        "INTERVAL '1563' MINUTE",
+        93_780_000_000
+    )]
+    #[case(
+        IntervalDayToSecondType::IntervalSecond,
+        "INTERVAL '93784.5' SECOND",
+        93_784_500_000
+    )]
+    #[case(
+        IntervalDayToSecondType::IntervalDayToHour,
+        "INTERVAL '1 02' DAY TO HOUR",
+        93_600_000_000
+    )]
+    #[case(
+        IntervalDayToSecondType::IntervalDayToMinute,
+        "INTERVAL '1 02:03' DAY TO MINUTE",
+        93_780_000_000
+    )]
+    #[case(
+        IntervalDayToSecondType::IntervalDayToSecond,
+        "INTERVAL '1 02:03:04.5' DAY TO SECOND",
+        93_784_500_000
+    )]
+    #[case(
+        IntervalDayToSecondType::IntervalHourToMinute,
+        "INTERVAL '26:03' HOUR TO MINUTE",
+        93_780_000_000
+    )]
+    #[case(
+        IntervalDayToSecondType::IntervalHourToSecond,
+        "INTERVAL '26:03:04.5' HOUR TO SECOND",
+        93_784_500_000
+    )]
+    #[case(
+        IntervalDayToSecondType::IntervalMinuteToSecond,
+        "INTERVAL '1563:04.5' MINUTE TO SECOND",
+        93_784_500_000
+    )]
+    fn interval_day_time_parser_requires_matching_qualifier(
+        #[case] dtype: IntervalDayToSecondType,
+        #[case] literal: &str,
+        #[case] micros: i64,
+    ) {
+        assert_eq!(
+            PrimitiveType::interval_day_time(dtype)
+                .parse_scalar(literal)
+                .unwrap(),
+            Scalar::interval_day_time(micros, dtype).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case(IntervalDayToSecondType::IntervalDay, "INTERVAL '24' HOUR")]
+    #[case(IntervalDayToSecondType::IntervalHour, "INTERVAL '1' DAY")]
+    #[case(
+        IntervalDayToSecondType::IntervalDayToSecond,
+        "INTERVAL '86400' SECOND"
+    )]
+    #[case(IntervalDayToSecondType::IntervalMinuteToSecond, "INTERVAL '1' MINUTE")]
+    fn interval_day_time_parser_rejects_cross_qualifier_literal(
+        #[case] dtype: IntervalDayToSecondType,
+        #[case] literal: &str,
+    ) {
+        let err = PrimitiveType::interval_day_time(dtype)
+            .parse_scalar(literal)
+            .unwrap_err();
+        assert!(
+            matches!(err, KernelError::ParseError(raw, ty) if raw == literal && ty == DataType::interval_day_time(dtype))
         );
     }
 
@@ -2166,19 +2385,21 @@ mod tests {
         ];
         for (literal, micros) in cases {
             assert_eq!(
-                PrimitiveType::IntervalDayTime
+                PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond)
                     .parse_scalar(literal)
                     .unwrap(),
-                Scalar::IntervalDayTime(micros),
+                Scalar::interval_day_time(micros, IntervalDayToSecondType::IntervalDayToSecond)
+                    .unwrap(),
                 "parsing {literal}"
             );
         }
         // Fractional seconds shorter than 6 digits are right-padded to microseconds.
         assert_eq!(
-            PrimitiveType::IntervalDayTime
+            PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond)
                 .parse_scalar("INTERVAL '0 00:00:00.5' DAY TO SECOND")
                 .unwrap(),
-            Scalar::IntervalDayTime(500_000)
+            Scalar::interval_day_time(500_000, IntervalDayToSecondType::IntervalDayToSecond)
+                .unwrap()
         );
     }
 
@@ -2202,7 +2423,11 @@ mod tests {
                 PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth)
                     .parse_scalar(bad)
                     .is_err()
-                    && PrimitiveType::IntervalDayTime.parse_scalar(bad).is_err(),
+                    && PrimitiveType::interval_day_time(
+                        IntervalDayToSecondType::IntervalDayToSecond
+                    )
+                    .parse_scalar(bad)
+                    .is_err(),
                 "expected {bad} to fail parsing as both interval families"
             );
         }
@@ -2218,7 +2443,9 @@ mod tests {
     #[case("INTERVAL '1 02:03:04:05' DAY TO SECOND")]
     fn test_day_time_interval_rejects_out_of_range_subordinate(#[case] bad: &str) {
         assert!(
-            PrimitiveType::IntervalDayTime.parse_scalar(bad).is_err(),
+            PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond)
+                .parse_scalar(bad)
+                .is_err(),
             "{bad}"
         );
     }
@@ -2244,30 +2471,30 @@ mod tests {
         "INTERVAL '-1-6' YEAR TO MONTH",
         Scalar::interval_year_month(-18, IntervalYearToMonthType::IntervalYearToMonth).unwrap()
     )]
-    #[case("INTERVAL '1' DAY", Scalar::IntervalDayTime(86_400_000_000))]
-    #[case("INTERVAL '25' HOUR", Scalar::IntervalDayTime(90_000_000_000))]
-    #[case("INTERVAL '90' MINUTE", Scalar::IntervalDayTime(5_400_000_000))]
-    #[case("INTERVAL '1.5' SECOND", Scalar::IntervalDayTime(1_500_000))]
-    #[case("INTERVAL '1 02' DAY TO HOUR", Scalar::IntervalDayTime(93_600_000_000))]
+    #[case("INTERVAL '1' DAY", Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay).unwrap())]
+    #[case("INTERVAL '25' HOUR", Scalar::interval_day_time(90_000_000_000, IntervalDayToSecondType::IntervalHour).unwrap())]
+    #[case("INTERVAL '90' MINUTE", Scalar::interval_day_time(5_400_000_000, IntervalDayToSecondType::IntervalMinute).unwrap())]
+    #[case("INTERVAL '1.5' SECOND", Scalar::interval_day_time(1_500_000, IntervalDayToSecondType::IntervalSecond).unwrap())]
+    #[case("INTERVAL '1 02' DAY TO HOUR", Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap())]
     #[case(
         "INTERVAL '1 02:03' DAY TO MINUTE",
-        Scalar::IntervalDayTime(93_780_000_000)
+        Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalDayToMinute).unwrap()
     )]
     #[case(
         "INTERVAL '1 02:03:04.5' DAY TO SECOND",
-        Scalar::IntervalDayTime(93_784_500_000)
+        Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalDayToSecond).unwrap()
     )]
     #[case(
         "INTERVAL '25:30' HOUR TO MINUTE",
-        Scalar::IntervalDayTime(91_800_000_000)
+        Scalar::interval_day_time(91_800_000_000, IntervalDayToSecondType::IntervalHourToMinute).unwrap()
     )]
     #[case(
         "INTERVAL '25:30:45.25' HOUR TO SECOND",
-        Scalar::IntervalDayTime(91_845_250_000)
+        Scalar::interval_day_time(91_845_250_000, IntervalDayToSecondType::IntervalHourToSecond).unwrap()
     )]
     #[case(
         "INTERVAL '90:45.25' MINUTE TO SECOND",
-        Scalar::IntervalDayTime(5_445_250_000)
+        Scalar::interval_day_time(5_445_250_000, IntervalDayToSecondType::IntervalMinuteToSecond).unwrap()
     )]
     fn test_narrowed_interval_literal_parse(#[case] literal: &str, #[case] expected: Scalar) {
         assert_eq!(
@@ -2293,14 +2520,16 @@ mod tests {
                 matches!(err, KernelError::ParseError(raw, ty) if raw == literal && ty == DataType::interval_year_month(year_month))
             );
         }
-        assert_eq!(
-            parse_day_time_interval("INTERVAL '9223372036854.775808' SECOND"),
-            None
-        );
-        assert_eq!(
-            parse_day_time_interval("INTERVAL '-9223372036854.775809' SECOND"),
-            None
-        );
+        let second = IntervalDayToSecondType::IntervalSecond;
+        for literal in [
+            "INTERVAL '9223372036854.775808' SECOND",
+            "INTERVAL '-9223372036854.775809' SECOND",
+        ] {
+            let err = parse_day_time_interval(literal, second).unwrap_err();
+            assert!(
+                matches!(err, KernelError::ParseError(raw, ty) if raw == literal && ty == DataType::interval_day_time(second))
+            );
+        }
     }
 
     #[test]
@@ -2314,8 +2543,12 @@ mod tests {
             Scalar::interval_year_month(12, IntervalYearToMonthType::IntervalYearToMonth).unwrap()
         );
         assert_eq!(
-            parse_day_time_interval("INTERVAL '0.1234567' SECOND"),
-            Some(123_456)
+            parse_day_time_interval(
+                "INTERVAL '0.1234567' SECOND",
+                IntervalDayToSecondType::IntervalSecond
+            )
+            .unwrap(),
+            Scalar::interval_day_time(123_456, IntervalDayToSecondType::IntervalSecond).unwrap()
         );
     }
 
@@ -2375,7 +2608,7 @@ mod tests {
     #[rstest]
     #[case::timestamp(Scalar::Timestamp(1), "expected i64, found timestamp")]
     #[case::timestamp_ntz(Scalar::TimestampNtz(1), "expected i64, found timestamp_ntz")]
-    #[case::interval_day_time(Scalar::IntervalDayTime(1), "expected i64, found interval_day_time")]
+    #[case::interval_day_time(Scalar::interval_day_time(1, IntervalDayToSecondType::IntervalDayToSecond).unwrap(), "expected i64, found interval_day_time")]
     #[case::integer(Scalar::Integer(1), "expected i64, found integer")]
     fn i64_conversion_rejects_other_variants(#[case] scalar: Scalar, #[case] expected: &str) {
         assert_result_error_with_message(i64::try_from(scalar), expected);

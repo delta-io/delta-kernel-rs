@@ -69,7 +69,8 @@ use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, Error as ObjectStoreError, ObjectStoreExt as _};
 use delta_kernel::schema::{
-    DataType, IntervalYearToMonthType, PrimitiveType, SchemaRef, StructType, schema_ref,
+    schema_ref, DataType, IntervalDayToSecondType, IntervalYearToMonthType, PrimitiveType,
+    SchemaRef, StructType,
 };
 use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;
@@ -1865,7 +1866,24 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
                     Scalar::interval_year_month(months, *dtype)
                         .expect("test seed produced invalid interval year-month")
                 }
-                PrimitiveType::IntervalDayTime => Scalar::IntervalDayTime((seed * 1000) as i64),
+                PrimitiveType::IntervalDayTime(dtype) => {
+                    let unit = match dtype {
+                        IntervalDayToSecondType::IntervalDay => 86_400_000_000,
+                        IntervalDayToSecondType::IntervalHour
+                        | IntervalDayToSecondType::IntervalDayToHour => 3_600_000_000,
+                        IntervalDayToSecondType::IntervalMinute
+                        | IntervalDayToSecondType::IntervalDayToMinute
+                        | IntervalDayToSecondType::IntervalHourToMinute => 60_000_000,
+                        _ => 1,
+                    };
+                    let micros = if unit == 1 {
+                        (seed * 1000) as i64
+                    } else {
+                        (seed % 100) as i64 * unit
+                    };
+                    Scalar::interval_day_time(micros, *dtype)
+                        .expect("test seed produced invalid interval day-time")
+                }
                 other => panic!("{other:?} is not a valid partition column type"),
             }
         }
