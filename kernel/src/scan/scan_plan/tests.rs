@@ -11,6 +11,8 @@ use super::*;
 use crate::arrow::array::{Array, ArrayRef, BooleanArray, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
+use crate::arrow::json::writer::JsonArray;
+use crate::arrow::json::WriterBuilder;
 use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::pretty::pretty_format_batches;
 use crate::engine::arrow_conversion::TryIntoArrow as _;
@@ -22,7 +24,7 @@ use crate::plans::ir::nodes::Operator;
 use crate::plans::Operation as PlanOperation;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
 use crate::unit_test_utils::load_test_table;
-use crate::{Engine, KernelResult, PredicateRef, Snapshot};
+use crate::{Engine, KernelResult, PredicateRef, Snapshot, Version};
 
 // Normalizes metadata for comparison: the imperative path splits fields between the data batch
 // and fileConstantValues, while the declarative path returns them in an add struct.
@@ -143,21 +145,24 @@ fn assert_metadata_eq(
     expected: &[RecordBatch],
     context: &str,
 ) -> KernelResult<()> {
-    fn sorted_pretty_lines(batches: &[RecordBatch]) -> KernelResult<Vec<String>> {
-        let formatted = pretty_format_batches(batches)?.to_string();
-        let mut lines: Vec<_> = formatted.lines().map(str::to_string).collect();
-        let len = lines.len();
-        if len > 3 {
-            lines[2..len - 1].sort_unstable();
-        }
-        Ok(lines)
+    fn sorted_json_rows(batches: &[RecordBatch]) -> KernelResult<Vec<Value>> {
+        let mut writer = WriterBuilder::new()
+            .with_explicit_nulls(true)
+            .build::<_, JsonArray>(Vec::new());
+        writer.write_batches(&batches.iter().collect::<Vec<_>>())?;
+        writer.finish()?;
+        let mut rows: Vec<Value> = serde_json::from_slice(&writer.into_inner())?;
+        // Map entry order is immaterial; retain nulls, values, and duplicate rows.
+        rows.iter_mut().for_each(Value::sort_all_objects);
+        rows.sort_by_cached_key(Value::to_string);
+        Ok(rows)
     }
 
     if let (Some(actual), Some(expected)) = (actual.first(), expected.first()) {
         assert_eq!(actual.schema(), expected.schema(), "{context}");
     }
-    let actual = sorted_pretty_lines(actual)?;
-    let expected = sorted_pretty_lines(expected)?;
+    let actual = sorted_json_rows(actual)?;
+    let expected = sorted_json_rows(expected)?;
     assert_eq!(actual, expected, "{context}");
     Ok(())
 }
@@ -513,11 +518,15 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
     #[case] stats: StatsOptions,
     #[case] partition_values: PartitionValuesOptions,
     #[case] expected_field_groups: &[&[&str]],
+    #[values(4, 5)] version: Version,
 ) {
     (|| -> KernelResult<()> {
         let json_requested = stats.synthesize_json;
-        let (engine, snapshot, _tempdir) =
+        let (engine, latest, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+        let snapshot = Snapshot::builder_for(latest.table_root().clone())
+            .at_version(version)
+            .build(engine.as_ref())?;
         let scan = snapshot
             .scan_builder()
             .with_stats(stats)
@@ -784,6 +793,53 @@ fn declarative_metadata_synthesizes_json_for_struct_only_checkpoints(
         PartitionValuesOptions::with_struct(),
     )
     .unwrap();
+}
+
+#[rstest]
+fn declarative_metadata_crc_plan_is_sparse_and_prunes(
+    #[values(None, Some(col!("id").gt(lit(3i64))))] predicate: Option<Pred>,
+) -> KernelResult<()> {
+    let (engine, latest, _tempdir) =
+        load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+    let snapshot = Snapshot::builder_for(latest.table_root().clone())
+        .at_version(4)
+        .build(engine.as_ref())?;
+    assert_eq!(snapshot.log_segment().checkpoint_version, None);
+    let crc = snapshot.base_crc().expect("fixture CRC");
+    assert_eq!(crc.version, 4);
+    assert!(crc.all_files().is_some());
+
+    let expected_count = if predicate.is_some() { 1 } else { 4 };
+    let scan = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct())
+        .with_predicate(predicate.map(Arc::new))
+        .build()?;
+    let plan = scan
+        .declarative_metadata_scan_plan(engine.as_ref())?
+        .expect("CRC metadata plan");
+    assert!(plan.schema.field(IS_ADD).is_none());
+    let values = plan
+        .nodes
+        .iter()
+        .find_map(|node| match &node.op {
+            Operator::Values(values) => Some(values),
+            _ => None,
+        })
+        .expect("CRC values source");
+    assert_eq!(values.schema.num_fields(), 1);
+    assert!(values.rows.iter().all(|row| row.len() == 1));
+    assert!(plan.nodes.iter().all(|node| match &node.op {
+        Operator::Project(project) => matches!(project.expr.as_ref(), Expr::StructPatch(_)),
+        _ => true,
+    }));
+    let actual = declarative_metadata(&scan, engine.as_ref())?;
+    assert_eq!(metadata_row_count(&actual), expected_count);
+    for batch in actual {
+        assert!(batch.column_by_name(STATS).is_none());
+        assert!(batch.column_by_name(STATS_PARSED).is_some());
+    }
+    Ok(())
 }
 
 fn assert_metadata_output_options(

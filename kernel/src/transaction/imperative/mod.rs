@@ -310,11 +310,15 @@ impl<STATE> Transaction<STATE, Imperative> {
         // return a static projection. It therefore uses dynamic per-column visitors.
         self.validate_add_files_stats(&self.staged_data_changes.add_files_metadata)?;
 
-        // Validate required fields for addFile.
-        write_validation::StagedDataValidator::for_add_files(
+        // Share the uniqueness validator across validations to detect cross-source conflicts.
+        // TODO(#3545): Pre-size the uniqueness validator's maps.
+        let mut uniqueness_validator = (!self.skip_dedup_validation)
+            .then(write_validation::FileActionUniquenessValidator::default);
+        write_validation::validate_add_files(
+            &self.staged_data_changes.add_files_metadata,
             self.effective_table_config.physical_partition_columns(),
-        )
-        .validate_batches(&self.staged_data_changes.add_files_metadata)?;
+            uniqueness_validator.as_mut(),
+        )?;
 
         if !self
             .effective_table_config
@@ -325,14 +329,16 @@ impl<STATE> Transaction<STATE, Imperative> {
             )?;
         }
 
-        write_validation::StagedDataValidator::for_dv_updates(
+        write_validation::validate_dv_matched_files(
+            &self.staged_data_changes.dv_matched_files,
             self.effective_table_config.physical_partition_columns(),
-        )?
-        .validate_selected_rows(&self.staged_data_changes.dv_matched_files)?;
+            uniqueness_validator.as_mut(),
+        )?;
 
-        // Validate required fields for RemoveFile.
-        write_validation::StagedDataValidator::for_remove_files()
-            .validate_selected_rows(&self.staged_data_changes.remove_files_metadata)?;
+        write_validation::validate_remove_files(
+            &self.staged_data_changes.remove_files_metadata,
+            uniqueness_validator.as_mut(),
+        )?;
 
         Ok(())
     }

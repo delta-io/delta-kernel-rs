@@ -303,6 +303,7 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     engine_info: String,
     engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
     staged_data_changes: MODE,
+    skip_dedup_validation: bool,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
     // HashSet::insert drops the to-be-inserted value without returning the existing one, which
@@ -690,6 +691,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             engine_info: common_state.engine_info,
             engine_commit_info: common_state.engine_commit_info,
             staged_data_changes: MODE::default(),
+            skip_dedup_validation: common_state.skip_dedup_validation,
             set_transactions,
             commit_timestamp,
             user_domain_metadata_additions: common_state.domain_metadata_additions,
@@ -1625,6 +1627,7 @@ mod tests {
                     dv_matched_files,
                     num_dv_updates,
                 },
+            skip_dedup_validation,
             set_transactions,
             commit_timestamp,
             user_domain_metadata_additions,
@@ -1658,6 +1661,7 @@ mod tests {
         assert!(engine_commit_info.is_none());
         assert!(add_files_metadata.is_empty());
         assert!(remove_files_metadata.is_empty());
+        assert!(!skip_dedup_validation);
         assert!(set_transactions.is_empty());
         assert_eq!(commit_timestamp, expected_commit_timestamp);
         assert!(user_domain_metadata_additions.is_empty());
@@ -1723,6 +1727,7 @@ mod tests {
                 transaction_ids: vec![("app-one".into(), 7), ("app-two".into(), 8)],
                 domain_metadata_additions: expected_domains.clone(),
                 data_change: false,
+                skip_dedup_validation: true,
             },
             snapshot.table_configuration().clone(),
             Box::new(MockCatalogCommitter),
@@ -1753,6 +1758,7 @@ mod tests {
         assert!(std::ptr::eq(expected_commit_info, commit_info.as_ref()));
         assert_eq!(commit_info_schema, expected_commit_info_schema);
         assert!(!transaction.data_change);
+        assert!(transaction.skip_dedup_validation);
         Ok(())
     }
 

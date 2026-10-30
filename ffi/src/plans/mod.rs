@@ -19,7 +19,7 @@ pub mod result;
 /// # Safety
 /// The `context` pointer MUST be thread-safe (Send + Sync) and MUST remain valid for as long as the
 /// executor is used. It is valid to pass NULL as the context.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_plan_executor(
     context: NullableCvoid,
     callback: CExecuteOpFn,
@@ -37,9 +37,9 @@ pub unsafe extern "C" fn get_plan_executor(
 ///
 /// Caller must pass a valid handle previously obtained from [`get_plan_executor`] and must not use
 /// it again afterwards.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_plan_executor(executor: Handle<SharedPlanExecutor>) {
-    executor.drop_handle();
+    unsafe { executor.drop_handle() }
 }
 
 /// Construct a [`PlanBasedEngine`] backed by `plan_executor`, optionally delegating operations not
@@ -57,7 +57,7 @@ pub unsafe extern "C" fn free_plan_executor(executor: Handle<SharedPlanExecutor>
 /// Caller must pass a valid [`SharedPlanExecutor`] handle obtained from [`get_plan_executor`] and a
 /// valid [`AllocateErrorFn`]. When `fallback_engine` is [`OptionalValue::Some`], it must contain a
 /// valid [`SharedExternEngine`] handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_plan_based_engine(
     plan_executor: Handle<SharedPlanExecutor>,
     fallback_engine: OptionalValue<Handle<SharedExternEngine>>,

@@ -502,6 +502,26 @@ mod tests {
         assert_eq!(names, ["P.A", "P.B", "P_Z"]);
     }
 
+    #[test]
+    fn all_catalog_parameters_render_without_residual_placeholders() {
+        let (catalog, _) = load_vendored(&crate::project_root()).unwrap();
+        for condition in parse_catalog(&catalog).unwrap() {
+            let message = condition
+                .parameter_names
+                .iter()
+                .fold(condition.template.clone(), |message, name| {
+                    message.replace(&format!("<{name}>"), "value")
+                });
+            // The vendored catalog has no literal angle brackets. A remaining bracket exposes a
+            // placeholder omitted from parameter_names, independently of the extraction algorithm.
+            assert!(
+                !message.contains(['<', '>']),
+                "{}: unlisted placeholder or literal angle bracket in {message:?}",
+                condition.name,
+            );
+        }
+    }
+
     #[rstest]
     #[case::dedup_in_first_appearance_order("<b> <a> <b>", &["b", "a"])]
     #[case::underscore_dash_and_digits("<a_b> <c-d> <e1>", &["a_b", "c-d", "e1"])]

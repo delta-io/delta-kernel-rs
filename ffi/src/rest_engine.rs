@@ -42,54 +42,54 @@ pub const AUTH_MAX_NUM_HEADERS: usize = 8;
 /// [`CAuthHeaderCallback`] is passed to
 /// [`builder_with_rest_object_store`](crate::builder_with_rest_object_store).
 pub const REST_BUILDER_OPTION_HEADER_PREFIX: &str = "header.";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_HEADER_PREFIX_KEY: [u8; 8] = *b"header.\0";
 
 /// PEM client-certificate path. mTLS is enabled only when cert, key, and CA paths are all set.
 pub const REST_BUILDER_OPTION_TLS_CERT_PATH: &str = "tls.cert_path";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_TLS_CERT_PATH_KEY: [u8; 14] = *b"tls.cert_path\0";
 
 /// PEM client-private-key path (required with [`REST_BUILDER_OPTION_TLS_CERT_PATH`] and
 /// [`REST_BUILDER_OPTION_TLS_CA_PATH`] for mTLS).
 pub const REST_BUILDER_OPTION_TLS_KEY_PATH: &str = "tls.key_path";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_TLS_KEY_PATH_KEY: [u8; 13] = *b"tls.key_path\0";
 
 /// PEM CA-bundle path used to verify the server (required with cert and key for mTLS).
 pub const REST_BUILDER_OPTION_TLS_CA_PATH: &str = "tls.ca_path";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_TLS_CA_PATH_KEY: [u8; 12] = *b"tls.ca_path\0";
 
 /// Accept server certificate hostname mismatches (default `false`). Certificate trust and
 /// validity checks remain enabled. Intended for test environments.
 pub const REST_BUILDER_OPTION_TLS_ALLOW_INVALID_HOSTNAMES: &str = "tls.allow_invalid_hostnames";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_TLS_ALLOW_INVALID_HOSTNAMES_KEY: [u8; 28] =
     *b"tls.allow_invalid_hostnames\0";
 
 /// Comma-separated DNS overrides as `host=ip:port` entries (bypasses system resolver; SNI
 /// unchanged).
 pub const REST_BUILDER_OPTION_TLS_DNS_OVERRIDE: &str = "tls.dns_override";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_TLS_DNS_OVERRIDE_KEY: [u8; 17] = *b"tls.dns_override\0";
 
 /// HTTP request timeout in seconds; unset uses the reqwest default.
 pub const REST_BUILDER_OPTION_TLS_TIMEOUT_SECS: &str = "tls.timeout_secs";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_TLS_TIMEOUT_SECS_KEY: [u8; 17] = *b"tls.timeout_secs\0";
 
 /// Maximum automatic retries for transient failures (5xx, connect/timeout) on idempotent REST
 /// requests; defaults to `0` when unset. Ambiguous `Create` puts use
 /// [`REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS`] instead.
 pub const REST_BUILDER_OPTION_RETRY_MAX_RETRIES: &str = "retry.max_retries";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_RETRY_MAX_RETRIES_KEY: [u8; 18] = *b"retry.max_retries\0";
 
 /// After an ambiguous PUT, verify object existence before treating the write as successful.
 /// Value: `true` or `false`; defaults to `false` when unset.
 pub const REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS: &str = "put.verify_on_ambiguous";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS_KEY: [u8; 24] =
     *b"put.verify_on_ambiguous\0";
 
@@ -183,14 +183,13 @@ impl FfiAuthHeaderProvider {
         let out = headers.as_mut_ptr();
         // SAFETY: `out` is valid for writes here. The callback initializes `headers[0..count]`;
         // only those slots are read below.
-        unsafe {
-            (*out).count = 0;
-            (*out).ttl_ms = 0;
-            (self.callback)(self.context, out, self.allocate_error);
-            let ttl = ((*out).ttl_ms != 0).then(|| Duration::from_millis((*out).ttl_ms));
-            let pairs = take_auth_pairs_from_c(out)?;
-            Ok((headers_from_pairs(pairs)?, ttl))
-        }
+        unsafe { (*out).count = 0 };
+        unsafe { (*out).ttl_ms = 0 };
+        (self.callback)(self.context, out, self.allocate_error);
+        let ttl_ms = unsafe { (*out).ttl_ms };
+        let ttl = (ttl_ms != 0).then(|| Duration::from_millis(ttl_ms));
+        let pairs = unsafe { take_auth_pairs_from_c(out)? };
+        Ok((headers_from_pairs(pairs)?, ttl))
     }
 }
 
@@ -218,7 +217,7 @@ pub(crate) fn rest_builder_state_from_ffi(
 unsafe fn take_auth_pairs_from_c(
     headers: *mut CAuthHeaders,
 ) -> KernelResult<Vec<(String, String)>> {
-    let count = (*headers).count as usize;
+    let count = unsafe { (*headers).count } as usize;
     if count > AUTH_MAX_NUM_HEADERS {
         return Err(KernelError::generic(format!(
             "auth header count {count} exceeds max {AUTH_MAX_NUM_HEADERS}"
@@ -227,10 +226,10 @@ unsafe fn take_auth_pairs_from_c(
 
     let mut pairs = Vec::with_capacity(count);
     for i in 0..count {
-        let slot = ptr::read(ptr::addr_of_mut!((*headers).headers[i]));
+        let slot = unsafe { ptr::read(ptr::addr_of_mut!((*headers).headers[i])) };
         // SAFETY: each handle is moved out of `CAuthHeaders` exactly once.
-        let name = *slot.name.into_inner();
-        let value = *slot.value.into_inner();
+        let name = unsafe { *slot.name.into_inner() };
+        let value = unsafe { *slot.value.into_inner() };
         pairs.push((name, value));
     }
     Ok(pairs)
