@@ -969,6 +969,18 @@ impl TableConfiguration {
                     );
                 }
                 FeatureRequirement::Enabled(dep) => {
+                    if *feature == TableFeature::AdaptiveMetadataPreview
+                        && *dep == TableFeature::ColumnMapping
+                        && self.is_feature_supported(dep)
+                        && self.table_properties.column_mapping_mode == Some(ColumnMappingMode::None)
+                    {
+                        return Err(crate::DeltaError::adaptive_metadata_mapping_mode(
+                            "none",
+                            KernelError::invalid_protocol(format!(
+                                "Feature '{feature}' requires '{dep}' to be enabled"
+                            )),
+                        ).into());
+                    }
                     require!(
                         self.is_feature_enabled(dep),
                         KernelError::invalid_protocol(format!(

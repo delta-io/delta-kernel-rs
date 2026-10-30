@@ -712,6 +712,19 @@ static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
         FeatureRequirement::Custom(|_protocol, properties| {
+            if let Some(mode) = properties.column_mapping_mode.filter(|mode| *mode != ColumnMappingMode::Id) {
+                let mode = match mode {
+                    ColumnMappingMode::None => "none",
+                    ColumnMappingMode::Name => "name",
+                    ColumnMappingMode::Id => "id",
+                };
+                return Err(crate::DeltaError::adaptive_metadata_mapping_mode(
+                    mode,
+                    KernelError::invalid_protocol(
+                        "Feature 'adaptiveMetadata-preview' requires column mapping in 'id' mode"
+                    ),
+                ).into());
+            }
             require!(
                 properties.column_mapping_mode == Some(ColumnMappingMode::Id),
                 KernelError::invalid_protocol(

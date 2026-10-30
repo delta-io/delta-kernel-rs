@@ -36,6 +36,21 @@ pub struct DeltaErrorParameter {
 }
 
 impl DeltaError {
+    /// Reports the explicitly stored column-mapping `mode` incompatible with adaptive metadata.
+    /// `source` retains the protocol validation failure for diagnostics.
+    pub(crate) fn adaptive_metadata_mapping_mode(mode: &str, source: super::KernelError) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaAdaptiveMetadataRequiresColumnMappingIdMode,
+            vec![
+                DeltaErrorParameter::new("feature", "adaptiveMetadata-preview"),
+                DeltaErrorParameter::new("prop", "delta.columnMapping.mode"),
+                DeltaErrorParameter::new("mode", mode),
+            ],
+            Some(Box::new(source)),
+        )
+    }
+
+
     /// Reports a declared partition `column` absent from the logical `schema`.
     pub(crate) fn partition_column_not_found(
         column: &str,
