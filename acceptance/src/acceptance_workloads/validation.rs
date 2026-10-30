@@ -340,6 +340,9 @@ fn expected_delta_error_matches(
                 "DELTA_TABLE_NOT_FOUND" | "DELTA_MISSING_TRANSACTION_LOG",
                 "DELTA_PATH_DOES_NOT_EXIST"
             ) | (
+                "DELTA_VERSIONS_NOT_CONTIGUOUS.GENERIC",
+                "DELTA_VERSIONS_NOT_CONTIGUOUS"
+            ) | (
                 "DELTA_TRUNCATED_TRANSACTION_LOG",
                 "DELTA_LOG_FILE_NOT_FOUND"
             )
@@ -580,6 +583,23 @@ mod tests {
         let actual = DeltaError::for_test(
             DeltaErrorCondition::DeltaLogFileNotFound,
             &["5", "2", "file:///table/_delta_log/"],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            expected_delta_error_matches(&expected_error(code), &actual),
+            matches
+        );
+    }
+
+    #[rstest]
+    #[case::legacy_generic("DELTA_VERSIONS_NOT_CONTIGUOUS.GENERIC", true)]
+    #[case::exact_condition("DELTA_VERSIONS_NOT_CONTIGUOUS", true)]
+    #[case::unrelated_truncated_log("DELTA_TRUNCATED_TRANSACTION_LOG", false)]
+    fn gap_migration_delta_error_matches(#[case] code: &str, #[case] matches: bool) {
+        let actual = DeltaError::for_test(
+            DeltaErrorCondition::DeltaVersionsNotContiguous,
+            &["0,1,3", "0", "3", "3"],
             None,
         )
         .unwrap();
