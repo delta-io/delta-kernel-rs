@@ -36,6 +36,16 @@ pub struct DeltaErrorParameter {
 }
 
 impl DeltaError {
+    /// Reports the duplicate partition column `name` stored in table metadata.
+    pub(crate) fn duplicate_partition_column(name: &str, source: super::KernelError) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaDuplicateColumnsFoundPartitionColumns,
+            vec![DeltaErrorParameter::new("duplicateCols", name)],
+            Some(Box::new(source)),
+        )
+    }
+
+
     /// Reports the observed `versions` and required bounds while loading `version_to_load`.
     /// Bounds describe the commit interval being validated, not the table's retained history.
     pub(crate) fn versions_not_contiguous(

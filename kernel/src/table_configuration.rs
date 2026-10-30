@@ -272,9 +272,9 @@ fn validate_partition_columns(
     let mut seen = HashSet::new();
     for col in metadata.partition_columns() {
         if !seen.insert(col) {
-            return Err(KernelError::generic(format!(
-                "Duplicate partition column: '{col}'"
-            )));
+            return Err(crate::DeltaError::duplicate_partition_column(
+                col, KernelError::generic(format!("Duplicate partition column: '{col}'")),
+            ).into());
         }
         require!(
             logical_schema.field(col).is_some(),
