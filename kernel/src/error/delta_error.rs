@@ -36,6 +36,17 @@ pub struct DeltaErrorParameter {
 }
 
 impl DeltaError {
+    /// Reports a duplicate logical field `name` in the persisted table schema.
+    /// `source` retains the schema decoder's original failure and location.
+    pub(crate) fn duplicate_schema_field(name: &str, source: serde_json::Error) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaDuplicateColumnsFoundExistingSchema,
+            vec![DeltaErrorParameter::new("duplicateCols", name)],
+            Some(Box::new(source)),
+        )
+    }
+
+
     /// Reports the explicitly stored column-mapping `mode` incompatible with adaptive metadata.
     /// `source` retains the protocol validation failure for diagnostics.
     pub(crate) fn adaptive_metadata_mapping_mode(mode: &str, source: super::KernelError) -> Self {

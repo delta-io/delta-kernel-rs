@@ -491,7 +491,10 @@ impl Metadata {
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> KernelResult<StructType> {
         // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
-        serde_json::from_str(&self.schema_string).map_err(|error| {
+        crate::schema::decoding::decode_schema(&self.schema_string).map_err(|(error, diagnostic)| {
+            if let Some(crate::schema::decoding::SchemaDiagnostic::DuplicateField(name)) = diagnostic {
+                return crate::DeltaError::duplicate_schema_field(&name, error).into();
+            }
             // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
             // matching.
             if error.is_syntax()

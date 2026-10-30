@@ -32,6 +32,7 @@ pub(crate) mod column_default;
 pub use column_default::ColumnDefault;
 pub(crate) use column_default::{try_collect_column_defaults, validate_column_defaults_metadata};
 pub(crate) mod compare;
+pub(crate) mod decoding;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
 
@@ -896,6 +897,13 @@ impl StructType {
     /// - the schema contains duplicate metadata columns
     /// - the schema contains nested metadata columns
     pub fn try_new(fields: impl IntoIterator<Item = StructField>) -> KernelResult<Self> {
+        Self::try_new_with_duplicate_callback(fields, |_| {})
+    }
+
+    fn try_new_with_duplicate_callback(
+        fields: impl IntoIterator<Item = StructField>,
+        mut on_duplicate: impl FnMut(&str),
+    ) -> KernelResult<Self> {
         let mut field_map = IndexMap::new();
         let mut metadata_columns = HashMap::new();
         let mut seen_lowercase_names = HashSet::new();
@@ -920,6 +928,7 @@ impl StructType {
             // only by case.
             let key = field.name.to_lowercase();
             if !seen_lowercase_names.insert(key) {
+                on_duplicate(&field.name);
                 return Err(KernelError::schema(format!(
                     "Duplicate field name (case-insensitive): '{}'",
                     field.name
@@ -1695,8 +1704,10 @@ impl<'de> Deserialize<'de> for StructType {
         D: serde::Deserializer<'de>,
         Self: Sized,
     {
-        let helper = StructTypeSerDeHelper::deserialize(deserializer)?;
-        StructType::try_new(helper.fields).map_err(serde::de::Error::custom)
+        let diagnostic = std::cell::RefCell::new(None);
+        serde::de::DeserializeSeed::deserialize(
+            decoding::SchemaSeed::<Self>::new(&diagnostic), deserializer,
+        )
     }
 }
 
@@ -2358,56 +2369,10 @@ impl<'de> serde::Deserialize<'de> for DataType {
     where
         D: serde::Deserializer<'de>,
     {
-        use serde::de::Error;
-        use serde_json::Value;
-
-        let value = Value::deserialize(deserializer)?;
-
-        // String values are either primitive types, "variant" or "file"
-        if let Value::String(s) = &value {
-            if s == "variant" {
-                return match DataType::unshredded_variant() {
-                    DataType::Variant(st) => Ok(DataType::Variant(st)),
-                    _ => Err(Error::custom("Failed to create variant type")),
-                };
-            }
-            if s == "file" {
-                return Ok(DataType::file_type());
-            }
-
-            // Try PrimitiveType - this will give us good error messages for unsupported types
-            return PrimitiveType::deserialize(value.clone())
-                .map(DataType::Primitive)
-                .map_err(|e| Error::custom(e.to_string()));
-        }
-
-        // Object values are complex types - dispatch based on "type" field
-        if let Value::Object(map) = &value {
-            if let Some(Value::String(type_str)) = map.get("type") {
-                return match type_str.as_str() {
-                    "array" => ArrayType::deserialize(value)
-                        .map(DataType::from)
-                        .map_err(|e| Error::custom(e.to_string())),
-                    "struct" => StructType::deserialize(value)
-                        .map(DataType::from)
-                        .map_err(|e| Error::custom(e.to_string())),
-                    "map" => MapType::deserialize(value)
-                        .map(DataType::from)
-                        .map_err(|e| Error::custom(e.to_string())),
-                    #[cfg(feature = "udt-in-dev")]
-                    "udt" => UserDefinedType::deserialize(value)
-                        .map(DataType::UserDefined)
-                        .map_err(Error::custom),
-                    _ => Err(unsupported_delta_type_error(type_str)),
-                };
-            }
-        }
-
-        // Fallback error with the actual value that failed
-        Err(Error::custom(format!(
-            "Invalid data type: {}",
-            serde_json::to_string(&value).unwrap_or_else(|_| format!("{value:?}"))
-        )))
+        let diagnostic = std::cell::RefCell::new(None);
+        serde::de::DeserializeSeed::deserialize(
+            decoding::SchemaSeed::<Self>::new(&diagnostic), deserializer,
+        )
     }
 }
 

@@ -14,6 +14,8 @@ use super::ConditionMetadata;
 pub enum DeltaErrorCondition {
     /// `DELTA_ADAPTIVE_METADATA_REQUIRES_COLUMN_MAPPING_ID_MODE` (SQLSTATE `42000`).
     DeltaAdaptiveMetadataRequiresColumnMappingIdMode,
+    /// `DELTA_DUPLICATE_COLUMNS_FOUND.EXISTING_SCHEMA` (SQLSTATE `42711`).
+    DeltaDuplicateColumnsFoundExistingSchema,
     /// `DELTA_DUPLICATE_COLUMNS_FOUND.PARTITION_COLUMNS` (SQLSTATE `42711`).
     DeltaDuplicateColumnsFoundPartitionColumns,
     /// `DELTA_LOG_FILE_NOT_FOUND` (SQLSTATE `42K03`).
@@ -36,6 +38,12 @@ impl DeltaErrorCondition {
                 sql_state: Some("42000"),
                 parameter_names: &["feature", "prop", "mode"],
                 message_template: "The table feature '<feature>' requires column mapping mode 'id', but the table property '<prop>' is set to '<mode>'. Recreate the table with '<prop>' = 'id', or omit the property to have it set automatically.",
+            },
+            Self::DeltaDuplicateColumnsFoundExistingSchema => ConditionMetadata {
+                name: "DELTA_DUPLICATE_COLUMNS_FOUND.EXISTING_SCHEMA",
+                sql_state: Some("42711"),
+                parameter_names: &["duplicateCols"],
+                message_template: "Found duplicate column(s): <duplicateCols>. The duplicate was found in the existing table schema.",
             },
             Self::DeltaDuplicateColumnsFoundPartitionColumns => ConditionMetadata {
                 name: "DELTA_DUPLICATE_COLUMNS_FOUND.PARTITION_COLUMNS",
