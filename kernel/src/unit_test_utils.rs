@@ -334,12 +334,51 @@ pub(crate) mod adaptive_metadata_fixtures {
 
     /// The protocol and metadata of a minimal adaptiveMetadata table.
     pub(crate) fn adaptive_metadata_protocol_and_metadata() -> (Protocol, Metadata) {
-        let table_config =
-            adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
+        adaptive_metadata_pm(test_schema_flat_with_column_mapping(), &[])
+    }
+
+    /// The protocol and metadata of an adaptiveMetadata table with `schema`, partitioned by
+    /// `partition_columns`.
+    pub(crate) fn adaptive_metadata_pm(
+        schema: SchemaRef,
+        partition_columns: &[&str],
+    ) -> (Protocol, Metadata) {
+        let table_config = adaptive_metadata_table_configuration(schema, &[]);
+        let mut metadata = serde_json::to_value(table_config.metadata()).unwrap();
+        metadata["partitionColumns"] = serde_json::json!(partition_columns);
         (
             table_config.protocol().clone(),
-            table_config.metadata().clone(),
+            serde_json::from_value(metadata).unwrap(),
         )
+    }
+
+    /// Commit lines holding the top-level protocol and metadata of [`adaptive_metadata_pm`], and
+    /// no checkpoint action.
+    pub(crate) fn protocol_and_metadata_lines(
+        schema: SchemaRef,
+        partition_columns: &[&str],
+    ) -> String {
+        let (protocol, metadata) = adaptive_metadata_pm(schema, partition_columns);
+        format!(
+            "{}\n{}",
+            serde_json::json!({ "protocol": protocol }),
+            serde_json::json!({ "metaData": metadata }),
+        )
+    }
+
+    /// A `commitInfo` line with In-Commit Timestamp `timestamp` and, when given, a
+    /// `lastManifestCommit` `(version, contentRootVersion)`, as an AMT writer records on every
+    /// commit.
+    pub(crate) fn commit_info_line(timestamp: i64, pointer: Option<(i64, i64)>) -> String {
+        let mut commit_info =
+            serde_json::json!({ "timestamp": timestamp, "inCommitTimestamp": timestamp });
+        if let Some((version, content_root_version)) = pointer {
+            commit_info["lastManifestCommit"] = serde_json::json!({
+                "version": version,
+                "contentRootVersion": content_root_version,
+            });
+        }
+        serde_json::json!({ "commitInfo": commit_info }).to_string()
     }
 
     /// A minimal `checkpoint` action referencing `path` as the content root at `version`.
