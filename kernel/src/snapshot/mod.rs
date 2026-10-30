@@ -67,6 +67,7 @@ mod cancellation_tests;
 mod crc_write_tests;
 mod hint;
 mod incremental;
+mod provenance;
 mod reader;
 mod snapshot_crc;
 #[cfg(test)]
@@ -77,8 +78,9 @@ pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder
 #[allow(unused_imports)]
 #[internal_api]
 pub(crate) use hint::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
+pub use provenance::{CrcProvenance, CrcSource, SelectedCheckpointKind};
 pub use reader::SnapshotReader;
-use snapshot_crc::SnapshotCrc;
+use snapshot_crc::{CrcOrigin, SnapshotCrc};
 
 pub use crate::error::SnapshotHintError;
 pub use crate::log_segment::LogSegmentStats;
@@ -275,6 +277,11 @@ impl Snapshot {
             table_configuration.version(),
             log_segment.checkpoint_version,
         )
+    }
+
+    fn with_crc_origin(mut self, origin: CrcOrigin) -> Self {
+        self.crc.origin = origin;
+        self
     }
 
     /// `captured_checkpoint_action` is the latest checkpoint action when the build already has it
@@ -507,8 +514,14 @@ impl Snapshot {
             log_segment.end_version,
         )?;
 
+        let origin = SnapshotCrc::resolved_origin(
+            base_crc.as_ref(),
+            None,
+            log_segment.listed.latest_crc_file.is_some(),
+        );
         let crc = crc_at_version.map(|(crc, _)| crc).or(base_crc);
-        let crc = Self::validate_configuration_and_crc(log_segment, &table_configuration, crc)?;
+        let crc = Self::validate_configuration_and_crc(log_segment, &table_configuration, crc)?
+            .with_origin(origin);
         Ok(PreparedSnapshot {
             table_configuration,
             crc,
@@ -585,7 +598,8 @@ impl Snapshot {
             &new_log_segment,
             &new_table_configuration,
             new_crc,
-        )?;
+        )?
+        .with_origin(self.crc.origin);
         // A successful commit means the post-commit snapshot is the latest version.
         Ok(Self::new_with_validated_crc(
             new_log_segment,
@@ -615,6 +629,19 @@ impl Snapshot {
     /// Returns an error if the total commit file size exceeds [`u64::MAX`].
     pub fn log_segment_stats(&self) -> KernelResult<LogSegmentStats> {
         self.log_segment.stats()
+    }
+
+    /// Returns retained checksum provenance without performing engine I/O.
+    pub fn crc_provenance(&self) -> CrcProvenance {
+        self.crc.provenance()
+    }
+
+    /// Returns the selected checkpoint specification without performing engine I/O.
+    ///
+    /// Ordinary checkpoint reads may refine an unknown observation. The table's configured
+    /// checkpoint policy does not determine this value.
+    pub fn selected_checkpoint_kind(&self) -> SelectedCheckpointKind {
+        self.log_segment.selected_checkpoint_kind()
     }
 
     /// Captures retained snapshot state as an owned hint without engine I/O.
@@ -1503,13 +1530,16 @@ impl Snapshot {
             Ok(bytes_written) => {
                 info!("Wrote CRC file at {}", crc_path.location);
                 let new_log_segment = self.log_segment.try_new_with_crc_file(crc_path)?;
-                let new_snapshot = Arc::new(Snapshot::new_with_crc(
-                    new_log_segment,
-                    self.table_configuration().clone(),
-                    Some(crc),
-                    self.built_as_latest,
-                    self.skipped_new_checkpoints,
-                )?);
+                let new_snapshot = Arc::new(
+                    Snapshot::new_with_crc(
+                        new_log_segment,
+                        self.table_configuration().clone(),
+                        Some(crc),
+                        self.built_as_latest,
+                        self.skipped_new_checkpoints,
+                    )?
+                    .with_crc_origin(CrcOrigin::Disk(self.version())),
+                );
                 tracing::Span::current().record("bytes_written", bytes_written);
                 Ok((ChecksumWriteResult::Written, new_snapshot))
             }
@@ -1782,6 +1812,11 @@ impl Snapshot {
         let new_log_segment = self
             .log_segment
             .try_new_with_checkpoint(checkpoint_log_path)?;
+        new_log_segment.observe_checkpoint_kind(if v2_supported {
+            SelectedCheckpointKind::V2
+        } else {
+            SelectedCheckpointKind::V1
+        });
         // Carry only an at-version CRC forward: the checkpoint drops the commits below it, so a
         // stale base could no longer be advanced over them.
         let new_snapshot = Arc::new(Snapshot::new_with_crc(
@@ -1790,7 +1825,7 @@ impl Snapshot {
             self.crc_at_version().cloned(),
             self.built_as_latest,
             false, /* skipped_new_checkpoints */
-        )?);
+        )?.with_crc_origin(self.crc.origin));
         span.record(
             "bytes_written",
             info.last_checkpoint_stats.size_in_bytes as u64,
@@ -1892,7 +1927,7 @@ impl Snapshot {
             self.base_crc().cloned(),
             self.built_as_latest,
             self.skipped_new_checkpoints,
-        )?))
+        )?.with_crc_origin(self.crc.origin)))
     }
 }
 
