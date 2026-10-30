@@ -105,9 +105,7 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   `Transaction::ack_check_constraints`. Kernel does not evaluate constraint SQL, so enforcement is
   the connector's responsibility. CREATE TABLE rejects `delta.constraints.*` properties in every
   build. Also gates the internal SQL tokenizer and parser.
-- `checkpoint-protection`: support for the `checkpointProtection` writer feature. Enable only
-  when the connector satisfies all feature requirements, including checkpoint protection and
-  version-history cleanup. Kernel does not perform metadata cleanup.
+- `checkpoint-protection`: support for the `checkpointProtection` writer feature.
 - `adaptive-metadata-in-dev`: adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature. Without it, reads and writes to tables listing

@@ -107,12 +107,7 @@ pub(crate) enum TableFeature {
     Invariants,
     /// Check constraints on columns
     CheckConstraints,
-    /// Protects checkpoints and version history across table feature removal.
-    ///
-    /// Support is gated by the `checkpoint-protection` Cargo feature. Enable it only if the
-    /// connector satisfies all writer requirements in the checkpoint protection specification:
-    ///
-    /// <https://github.com/delta-io/delta/blob/master/protocol_rfcs/checkpoint-protection.md>
+    /// Protects checkpoints and JSON logs.
     CheckpointProtection,
     /// CDF on a table
     ChangeDataFeed,

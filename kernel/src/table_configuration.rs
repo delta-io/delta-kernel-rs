@@ -2394,7 +2394,7 @@ mod test {
 
     #[rstest]
     fn checkpoint_protection_gates_writes_but_allows_reads(
-        #[values(1, 3)] reader_version: i32,
+        #[values(1, 2, 3)] reader_version: i32,
         #[values(
             Operation::SnapshotLoad,
             Operation::Scan,

@@ -172,8 +172,8 @@ post-commit pattern that includes writing a CRC file before checkpointing.
 
 ## Checkpoint protection
 
-For feature support and connector cleanup responsibilities on tables with
-`checkpointProtection`, see [Checkpoint protection](../writing/checkpoint_protection.md).
+For support on tables with `checkpointProtection`, see
+[Checkpoint protection](../writing/checkpoint_protection.md).
 
 ## Log compaction
 
