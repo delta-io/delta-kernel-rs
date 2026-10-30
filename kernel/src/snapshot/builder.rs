@@ -455,7 +455,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         version: Option<Version>,
         max_catalog_version: Option<Version>,
         log_tail: &[crate::path::ParsedLogPath],
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         validate_catalog_managed_log_tail(version, max_catalog_version, log_tail).map_err(|error| {
             match error.without_backtrace() {
                 KernelError::LogTailVersionsNotContiguous {

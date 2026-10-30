@@ -139,11 +139,9 @@ mod tests {
         );
         let values: Vec<_> = error.parameters().iter().map(|p| p.value()).collect();
         assert_eq!(values, ["1,3", "1", "3", "3"]);
-        assert!(
-            std::error::Error::source(&error)
-                .and_then(|source| source.downcast_ref::<KernelError>())
-                .is_some()
-        );
+        assert!(std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<KernelError>())
+            .is_some());
     }
 
     /// Builds a `LoadTableResponse` with no commits at the given location and ratified version.
