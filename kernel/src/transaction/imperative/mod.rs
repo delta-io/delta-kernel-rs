@@ -529,6 +529,7 @@ impl<STATE> Transaction<STATE, Imperative> {
             None
         } else {
             self.read_snapshot()?
+                .reader()
                 .get_row_tracking_high_water_mark(engine)?
         };
 

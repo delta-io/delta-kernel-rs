@@ -55,8 +55,9 @@ pub struct SnapshotReader<'a> {
 mod tests;
 
 impl<'a> SnapshotReader<'a> {
-    /// Sets the cancellation token for this reader's handler-backed reads, or clears it with
-    /// `None`.
+    /// Sets the cancellation token for this reader's handler-backed reads.
+    ///
+    /// Each call replaces the reader's token binding. Passing `None` clears an existing binding.
     ///
     /// Reads return [`crate::KernelError::Cancelled`] when the engine observes cancellation.
     /// The original token is forwarded unchanged, and getters remain synchronous. This does not

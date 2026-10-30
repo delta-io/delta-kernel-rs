@@ -3672,7 +3672,10 @@ mod tests {
         };
         build_and_commit(builder, &engine);
         let snapshot = Snapshot::builder_for(table_url).build(&test_engine)?;
-        let infos = snapshot.get_clustering_column_infos(&test_engine)?.unwrap();
+        let infos = snapshot
+            .reader()
+            .get_clustering_column_infos(&test_engine)?
+            .unwrap();
         assert_eq!(infos.len(), 3);
         assert_eq!(
             infos[0].logical_column,

@@ -27,7 +27,7 @@ use crate::unit_test_utils::{
 use crate::utils::try_parse_uri;
 use crate::{
     CancellationTokenRef, Engine, EngineData, FileMeta, FileSlice, FilteredEngineData, KernelError,
-    KernelResult, KernelResultIterator, Snapshot, StorageHandler,
+    KernelResult, KernelResultIterator, Snapshot, SnapshotReader, StorageHandler,
 };
 
 /// Handler entry point selected for a read.
@@ -622,7 +622,7 @@ fn post_build_metadata_reads_inherit_operation_token(
     if cancelled {
         reads.token.cancel();
     }
-    let load = |reader: &crate::SnapshotReader<'_>, engine: &dyn Engine| -> KernelResult<()> {
+    let load = |reader: &SnapshotReader<'_>, engine: &dyn Engine| -> KernelResult<()> {
         match read {
             MetadataRead::Domain => assert_eq!(
                 reader.get_domain_metadata("test", engine)?,
@@ -672,12 +672,11 @@ fn post_build_metadata_reads_inherit_operation_token(
     load(&snapshot.reader(), reads.inner.as_ref()).unwrap();
 }
 
-/// Stops metadata replay at JSON or Parquet entry and on the next pull after a JSON batch.
 #[rstest]
 #[case::json_entry("app-txn-no-checkpoint", Read::Json, false)]
 #[case::json_batch("app-txn-no-checkpoint", Read::Json, true)]
 #[case::parquet_entry("app-txn-checkpoint", Read::Parquet, false)]
-fn reader_cancellation_during_replay(
+fn reader_cancellation_during_replay_persists_across_reads(
     #[case] table: &str,
     #[case] boundary: Read,
     #[case] after_batch: bool,
@@ -687,12 +686,15 @@ fn reader_cancellation_during_replay(
     let snapshot = Snapshot::builder_for(format!("tests/data/{table}"))
         .build(reads.inner.as_ref())
         .unwrap();
-    let result = snapshot
+    let reader = snapshot
         .reader()
-        .with_cancellation_token(reads.token.clone() as CancellationTokenRef)
-        .get_app_id_version("missing-app", &reads.engine());
+        .with_cancellation_token(reads.token.clone() as CancellationTokenRef);
+    let result = reader.get_app_id_version("missing-app", &reads.engine());
     assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
     assert_eq!(reads.events.lock().unwrap().last(), Some(&boundary));
+
+    let result = reader.get_app_id_version("missing-app", reads.inner.as_ref());
+    assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
 }
 
 /// Checks that cancelling a JSON read after successful batches terminates its iterator.
