@@ -443,8 +443,17 @@ async fn test_app_id_versions_read_across_a_root_manifest_commit(
         |builder| builder.with_transaction_id("app-1", 6),
     )?;
 
-    assert_eq!(snapshot.get_app_id_version("app-1", &engine)?, Some(6));
-    assert_eq!(snapshot.get_app_id_version("app-2", &engine)?, Some(7));
-    assert_eq!(snapshot.get_app_id_version("app-3", &engine)?, None);
+    assert_eq!(
+        snapshot.reader().get_app_id_version("app-1", &engine)?,
+        Some(6)
+    );
+    assert_eq!(
+        snapshot.reader().get_app_id_version("app-2", &engine)?,
+        Some(7)
+    );
+    assert_eq!(
+        snapshot.reader().get_app_id_version("app-3", &engine)?,
+        None
+    );
     Ok(())
 }
