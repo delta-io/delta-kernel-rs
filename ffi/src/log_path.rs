@@ -75,7 +75,7 @@ impl FfiLogPath {
     /// # Safety
     ///
     /// The `self.location` string slice must be valid UTF-8 and represent a valid URL.
-    unsafe fn log_path(&self) -> KernelResult<LogPath> {
+    pub(crate) unsafe fn log_path(&self) -> KernelResult<LogPath> {
         let location_str = unsafe { TryFromStringSlice::try_from_slice(&self.location) }?;
         let url = Url::parse(location_str)?;
         let file_meta = FileMeta {
