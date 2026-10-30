@@ -12,6 +12,8 @@ use super::ConditionMetadata;
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DeltaErrorCondition {
+    /// `DELTA_DUPLICATE_COLUMNS_FOUND.PARTITION_COLUMNS` (SQLSTATE `42711`).
+    DeltaDuplicateColumnsFoundPartitionColumns,
     /// `DELTA_LOG_FILE_NOT_FOUND` (SQLSTATE `42K03`).
     DeltaLogFileNotFound,
     /// `DELTA_PATH_DOES_NOT_EXIST` (SQLSTATE `42K03`).
@@ -25,6 +27,12 @@ pub enum DeltaErrorCondition {
 impl DeltaErrorCondition {
     pub(super) const fn metadata(self) -> ConditionMetadata {
         match self {
+            Self::DeltaDuplicateColumnsFoundPartitionColumns => ConditionMetadata {
+                name: "DELTA_DUPLICATE_COLUMNS_FOUND.PARTITION_COLUMNS",
+                sql_state: Some("42711"),
+                parameter_names: &["duplicateCols"],
+                message_template: "Found duplicate column(s): <duplicateCols>. The duplicate was found in the partition columns.",
+            },
             Self::DeltaLogFileNotFound => ConditionMetadata {
                 name: "DELTA_LOG_FILE_NOT_FOUND",
                 sql_state: Some("42K03"),

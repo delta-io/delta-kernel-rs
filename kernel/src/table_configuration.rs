@@ -277,9 +277,11 @@ fn validate_partition_columns(
     let mut seen = HashSet::new();
     for col in metadata.partition_columns() {
         if !seen.insert(col) {
-            return Err(KernelError::generic(format!(
-                "Duplicate partition column: '{col}'"
-            )));
+            return Err(crate::DeltaError::duplicate_partition_column(
+                col,
+                KernelError::generic(format!("Duplicate partition column: '{col}'")),
+            )
+            .into());
         }
         require!(
             logical_schema.field(col).is_some(),
@@ -1836,7 +1838,16 @@ mod test {
             .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
             .try_build();
 
-        assert_result_error_with_message(result, "Duplicate partition column: 'part'");
+        let crate::Error::Delta(error) = result.unwrap_err() else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(
+            error.condition(),
+            crate::DeltaErrorCondition::DeltaDuplicateColumnsFoundPartitionColumns
+        );
+        assert_eq!(error.sql_state(), Some("42711"));
+        assert_eq!(error.parameters()[0].value(), "part");
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]
