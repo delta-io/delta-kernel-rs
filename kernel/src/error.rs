@@ -33,6 +33,26 @@ pub enum Error {
     Kernel(KernelError),
 }
 
+impl Error {
+    /// Applies the matching boundary adapter to the outer error, returning its result.
+    ///
+    /// `kernel` receives a Kernel failure and `delta` receives a Delta failure, irrespective of
+    /// their diagnostic sources. This exhaustive dispatch lets boundary crates handle the
+    /// non-exhaustive envelope without a fallback that erases an unrecognized variant.
+    #[cfg(feature = "internal-api")]
+    #[delta_kernel_derive::internal_api]
+    pub(crate) fn dispatch<T>(
+        &self,
+        kernel: impl FnOnce(&KernelError) -> T,
+        delta: impl FnOnce(&DeltaError) -> T,
+    ) -> T {
+        match self {
+            Self::Kernel(error) => kernel(error),
+            Self::Delta(error) => delta(error),
+        }
+    }
+}
+
 /// Details of a failed conversion from a scalar into a Rust value.
 ///
 /// Conversion code adds path elements as an error unwinds, producing a path from the outermost

@@ -1,0 +1,106 @@
+//! Outgoing Kernel/Delta allocation primitives, independent of engine registration.
+//!
+//! Existing FFI entry points use the legacy allocator. These descriptors define the structured
+//! contract for migrating those entry points; Engine-error allocation and native causes are absent.
+
+use std::ffi::c_void;
+
+use delta_kernel::Error;
+
+use super::FFIKernelError;
+use crate::delta_types::{FfiStringMap, FfiStringMapEntry};
+use crate::{kernel_string_slice, FfiSlice, KernelStringSlice, OptionalValue};
+
+/// An opaque connector-owned allocation. Kernel neither reads nor frees it.
+pub struct ConnectorError {
+    _private: (),
+}
+
+/// Borrowed Kernel classification and diagnostics, valid only during the allocation callback.
+#[repr(C)]
+pub struct KernelErrorAllocation {
+    /// Existing numeric Kernel classification.
+    pub code: FFIKernelError,
+    /// Rendered diagnostic message, without a trailing NUL.
+    pub message: KernelStringSlice,
+}
+
+/// Borrowed catalog diagnostics, valid only during the allocation callback.
+///
+/// Classify by condition/SQLSTATE. Values and message are unredacted diagnostics; Rust sources and
+/// backtraces are excluded. The parameter array and every referenced UTF-8 string are borrowed.
+#[repr(C)]
+pub struct DeltaErrorAllocation {
+    /// Stable catalog condition.
+    pub condition: KernelStringSlice,
+    /// Catalog SQLSTATE, absent when undefined.
+    pub sql_state: OptionalValue<KernelStringSlice>,
+    /// Named string parameters in catalog template order.
+    pub parameters: FfiStringMap,
+    /// Rendered catalog message.
+    pub message: KernelStringSlice,
+}
+
+/// Connector context and required callbacks for structured Kernel/Delta allocation.
+///
+/// Callbacks copy retained descriptor fields and return allocations the connector frees, or NULL
+/// on allocation failure. They must not unwind. Context and callback code must remain valid for
+/// every use and support concurrent calls if shared across threads. Null context is permitted.
+/// Engine-error allocation and native causes require a separate ABI change.
+#[repr(C)]
+pub struct ErrorAllocators {
+    /// Connector state forwarded unchanged to the selected callback.
+    pub context: *mut c_void,
+    /// Allocates a Kernel error from a borrowed descriptor.
+    pub allocate_kernel_error:
+        unsafe extern "C" fn(*mut c_void, *const KernelErrorAllocation) -> *mut ConnectorError,
+    /// Allocates a Delta error from a borrowed descriptor.
+    pub allocate_delta_error:
+        unsafe extern "C" fn(*mut c_void, *const DeltaErrorAllocation) -> *mut ConnectorError,
+}
+
+impl ErrorAllocators {
+    /// Allocates `error` by its outer variant, returning the connector pointer unchanged, even
+    /// NULL.
+    ///
+    /// A Delta error retaining a Kernel source still invokes only the Delta callback. Descriptors
+    /// and their backing storage stay valid until that callback returns. Call only for failures;
+    /// successful operations must bypass allocation.
+    ///
+    /// # Safety
+    ///
+    /// Context and callbacks must satisfy [`ErrorAllocators`]'s lifetime and concurrency contract.
+    pub unsafe fn allocate_error(&self, error: Error) -> *mut ConnectorError {
+        error.dispatch(
+            |error| {
+                let message = error.to_string();
+                let descriptor = KernelErrorAllocation {
+                    code: error.into(),
+                    message: kernel_string_slice!(message),
+                };
+                unsafe { (self.allocate_kernel_error)(self.context, &descriptor) }
+            },
+            |error| {
+                let message = error.message();
+                let parameters: Vec<_> = error
+                    .parameters()
+                    .iter()
+                    .map(|parameter| FfiStringMapEntry {
+                        key: unsafe { KernelStringSlice::new_unsafe(parameter.name()) },
+                        value: unsafe { KernelStringSlice::new_unsafe(parameter.value()) },
+                    })
+                    .collect();
+                let descriptor = DeltaErrorAllocation {
+                    condition: unsafe { KernelStringSlice::new_unsafe(error.name()) },
+                    sql_state: error
+                        .sql_state()
+                        .map(|state| kernel_string_slice!(state))
+                        .into(),
+                    parameters: unsafe { FfiSlice::new_unsafe(&parameters) },
+                    message: kernel_string_slice!(message),
+                };
+                unsafe { (self.allocate_delta_error)(self.context, &descriptor) }
+            },
+        )
+    }
+}
