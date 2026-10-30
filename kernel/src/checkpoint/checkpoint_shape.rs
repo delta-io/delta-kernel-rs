@@ -700,7 +700,7 @@ mod tests {
     /// action with a synthetic `sidecarFileSchema` tag, exercising the footer-read short-circuit.
     /// When `compatible`, the tagged schema's `add.stats_parsed` matches [`probe_stats_schema`];
     /// otherwise `add` has no `stats_parsed` field at all, so the compatibility check fails.
-    fn segment_with_manifest_hint(extension: &str, compatible: bool) -> LogSegment {
+    fn segment_with_manifest_hint(extension: &str, compatible: bool, source: &str) -> LogSegment {
         let columns = || schema! { nullable "id": LONG, nullable "value": STRING };
         let stats_parsed = schema! {
             nullable NUM_RECORDS: LONG,
@@ -725,6 +725,45 @@ mod tests {
         );
         let checkpoint_file = log_root.join(&selected).unwrap().to_string();
         let commit = create_log_path(log_root.join("00000000000000000002.json").unwrap().as_str());
+        let metadata = CheckpointMetadata {
+            version: 1,
+            tags: Some(tags),
+        };
+        let independent = !matches!(source, "actions" | "trimmed");
+        let actions = (!independent).then(|| {
+            let mut actions = vec![HintAction::CheckpointMetadata(metadata.clone())];
+            if source == "trimmed" {
+                actions.extend(vec![
+                    HintAction::Protocol(crate::actions::Protocol::default());
+                    30
+                ]);
+            }
+            actions
+        });
+        let hint = LastCheckpointHint::from_parts(
+            1,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(LastCheckpointV2::from_parts(
+                selected,
+                None,
+                None,
+                Some(vec![Sidecar {
+                    path: "sidecar-1.parquet".to_string(),
+                    size_in_bytes: 1,
+                    modification_time: 0,
+                    tags: None,
+                }]),
+                actions,
+                independent.then_some(metadata),
+            )),
+        )
+        .unwrap();
         LogSegment::try_new(
             LogSegmentFiles {
                 checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
@@ -734,26 +773,7 @@ mod tests {
             },
             log_root,
             None,
-            Some(LastCheckpointHint {
-                version: 1,
-                v2_checkpoint: Some(LastCheckpointV2 {
-                    path: selected,
-                    sidecar_files: Some(vec![Sidecar {
-                        path: "sidecar-1.parquet".to_string(),
-                        size_in_bytes: 1,
-                        modification_time: 0,
-                        tags: None,
-                    }]),
-                    non_file_actions: Some(vec![HintAction::CheckpointMetadata(
-                        CheckpointMetadata {
-                            version: 1,
-                            tags: Some(tags),
-                        },
-                    )]),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
+            Some(hint),
         )
         .unwrap()
     }
@@ -770,8 +790,9 @@ mod tests {
         #[case] extension: &str,
         #[case] compatible: bool,
         #[case] expect_parsed: bool,
+        #[values("actions", "independent", "trimmed")] source: &str,
     ) {
-        let segment = segment_with_manifest_hint(extension, compatible);
+        let segment = segment_with_manifest_hint(extension, compatible, source);
         let root = &segment.listed.checkpoint_parts[0].location;
         let file_type = match extension {
             "json" => FileType::Json,
@@ -803,14 +824,94 @@ mod tests {
         );
     }
 
+    #[rstest]
+    fn unusable_independent_checkpoint_metadata_reads_footer(
+        #[values("malformed", "mismatched")] source: &str,
+    ) {
+        let (_engine, snapshot, _tempdir) =
+            load_test_table("v2-parquet-sidecars-struct-stats-only").unwrap();
+        let mut segment = snapshot.log_segment().clone();
+        let v2 = segment
+            .last_checkpoint_metadata
+            .as_mut()
+            .unwrap()
+            .v2_checkpoint
+            .as_mut()
+            .unwrap();
+        let mut metadata = v2
+            .non_file_actions
+            .take()
+            .unwrap()
+            .into_iter()
+            .find_map(|action| match action {
+                HintAction::CheckpointMetadata(metadata) => Some(metadata),
+                _ => None,
+            })
+            .unwrap();
+        if source == "malformed" {
+            metadata.tags.as_mut().unwrap().insert(
+                SIDECAR_FILE_SCHEMA_TAG.to_string(),
+                "invalid schema".to_string(),
+            );
+        } else {
+            metadata.version += 1;
+        }
+        v2.checkpoint_metadata = Some(metadata);
+        let exec = CountingExecutor::new();
+        let root = &segment.listed.checkpoint_parts[0].location;
+        CheckpointShape::from_v2_checkpoint_hint(&exec, &segment, root, FileType::Parquet, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(exec.query_scans.load(Ordering::Relaxed), 0);
+    }
+
     /// The hint schema must match the sidecar's actual parquet footer, so substituting it is
     /// behavior-preserving. Uses a real table whose parquet sidecars carry compatible struct stats.
-    #[test]
-    fn manifest_hint_schema_matches_footer_read_result() {
+    #[rstest]
+    fn manifest_hint_schema_matches_footer_read_result(#[values(false, true)] trimmed: bool) {
         let (_engine, snapshot, _tempdir) =
             load_test_table("v2-parquet-sidecars-struct-stats-only").unwrap();
         let exec = SyncPlanExecutor::default();
-        let segment = snapshot.log_segment();
+        let mut segment = snapshot.log_segment().clone();
+        if trimmed {
+            let hint = segment.last_checkpoint_metadata.as_mut().unwrap();
+            let actions = hint
+                .v2_checkpoint
+                .as_mut()
+                .unwrap()
+                .non_file_actions
+                .as_mut()
+                .unwrap();
+            actions.extend(vec![
+                HintAction::Protocol(crate::actions::Protocol::default());
+                31
+            ]);
+            *hint = LastCheckpointHint::from_parts(
+                hint.version,
+                hint.size,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                hint.v2_checkpoint.take(),
+            )
+            .unwrap();
+            assert!(hint
+                .v2_checkpoint
+                .as_ref()
+                .unwrap()
+                .non_file_actions
+                .is_none());
+            assert!(hint
+                .v2_checkpoint
+                .as_ref()
+                .unwrap()
+                .checkpoint_metadata
+                .is_some());
+        }
         let sidecar = segment
             .checkpoint_hint_sidecars()
             .and_then(|s| s.first())

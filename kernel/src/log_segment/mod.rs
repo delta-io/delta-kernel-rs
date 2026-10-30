@@ -479,19 +479,25 @@ impl LogSegment {
     /// `checkpointMetadata.tags["sidecarFileSchema"]`.
     ///
     /// `None` when the hint is absent/mismatched, carried no `checkpointMetadata`
-    /// (e.g. `nonFileActions` was trimmed), lacked the tag, or the value failed to parse.
+    /// either independently or in `nonFileActions`, lacked the tag, or the value failed to parse.
     #[allow(unused)] // consumed by the scan-shape checkpoint classifier
     pub(crate) fn checkpoint_hint_sidecar_file_schema(&self) -> Option<StructType> {
-        let non_file_actions = self
-            .checkpoint_hint()?
-            .v2_checkpoint
-            .as_ref()?
-            .non_file_actions
-            .as_ref()?;
-        let tags = non_file_actions.iter().find_map(|action| match action {
-            HintAction::CheckpointMetadata(cp) => cp.tags.as_ref(),
-            _ => None,
-        })?;
+        let hint = self.checkpoint_hint()?;
+        let v2 = hint.v2_checkpoint.as_ref()?;
+        let metadata = v2
+            .checkpoint_metadata
+            .as_ref()
+            .filter(|metadata| u64::try_from(metadata.version()).ok() == Some(hint.version))
+            .or_else(|| {
+                v2.non_file_actions
+                    .as_ref()?
+                    .iter()
+                    .find_map(|action| match action {
+                        HintAction::CheckpointMetadata(metadata) => Some(metadata),
+                        _ => None,
+                    })
+            })?;
+        let tags = metadata.tags.as_ref()?;
         let raw = tags.get(SIDECAR_FILE_SCHEMA_TAG)?;
         serde_json::from_str::<StructType>(raw)
             .inspect_err(|e| warn!("Unparseable sidecarFileSchema tag, ignoring: {e}"))

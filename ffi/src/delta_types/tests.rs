@@ -299,6 +299,7 @@ fn typed_components_construct_rich_snapshot_state() {
         }),
     };
     let v2 = FfiLastCheckpointV2 {
+        checkpoint_metadata: std::ptr::null(),
         path: slice("00000000000000000005.checkpoint.uuid.parquet"),
         size_in_bytes: none_i64(),
         modification_time: none_i64(),
@@ -577,6 +578,7 @@ fn typed_arrays_preserve_absent_and_present_empty() {
     );
 
     let v2 = FfiLastCheckpointV2 {
+        checkpoint_metadata: std::ptr::null(),
         path: slice("checkpoint.parquet"),
         size_in_bytes: OptionalValue::None,
         modification_time: OptionalValue::None,
@@ -993,6 +995,7 @@ fn typed_nested_arrays_reject_null_nonempty_pointers() {
     assert!(unsafe { invalid_bytes.try_to_kernel() }.is_err());
 
     let checkpoint = FfiLastCheckpointV2 {
+        checkpoint_metadata: std::ptr::null(),
         path: slice("checkpoint.parquet"),
         size_in_bytes: none_i64(),
         modification_time: none_i64(),
@@ -1005,6 +1008,7 @@ fn typed_nested_arrays_reject_null_nonempty_pointers() {
     assert!(unsafe { checkpoint.try_to_kernel() }.is_err());
 
     let checkpoint = FfiLastCheckpointV2 {
+        checkpoint_metadata: std::ptr::null(),
         path: slice("checkpoint.parquet"),
         size_in_bytes: none_i64(),
         modification_time: none_i64(),
@@ -1231,6 +1235,7 @@ fn typed_add_rejects_invalid_nested_state() {
 #[test]
 fn typed_checkpoint_and_crc_reject_invalid_nested_state() {
     let invalid_v2 = FfiLastCheckpointV2 {
+        checkpoint_metadata: std::ptr::null(),
         path: invalid_utf8(),
         size_in_bytes: none_i64(),
         modification_time: none_i64(),
@@ -1275,6 +1280,7 @@ fn typed_checkpoint_and_crc_reject_invalid_nested_state() {
     assert!(unsafe { checkpoint.try_to_kernel() }.is_err());
 
     let invalid_v2 = FfiLastCheckpointV2 {
+        checkpoint_metadata: std::ptr::null(),
         path: invalid_utf8(),
         size_in_bytes: OptionalValue::None,
         modification_time: OptionalValue::None,
@@ -1495,4 +1501,36 @@ fn typed_crc_rejects_inconsistent_aggregates() {
         unsafe { crc.try_to_kernel() },
         "allFiles/deletedRecordCountsHistogramOpt bins do not match",
     );
+}
+
+#[rstest]
+fn independent_checkpoint_metadata_roundtrips_without_non_file_actions(
+    #[values(false, true)] present: bool,
+) {
+    let metadata = present.then(|| {
+        CheckpointMetadata::new(
+            5,
+            Some(HashMap::from([(
+                "sidecarFileSchema".to_string(),
+                r#"{"type":"struct","fields":[]}"#.to_string(),
+            )])),
+        )
+    });
+    let expected = LastCheckpointV2::from_parts(
+        "checkpoint.parquet".to_string(),
+        None,
+        None,
+        None,
+        None,
+        metadata,
+    );
+    let decoded = {
+        let source = expected.clone();
+        let backing = CheckpointV2Backing::new(&source);
+        let borrowed = backing.as_ffi();
+        assert_eq!(borrowed.checkpoint_metadata.is_null(), !present);
+        unsafe { borrowed.try_to_kernel() }.unwrap()
+    };
+    assert_eq!(decoded, expected);
+    assert!(decoded.non_file_actions().is_none());
 }

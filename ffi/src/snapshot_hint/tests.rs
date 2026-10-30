@@ -2050,6 +2050,7 @@ fn typed_v2_checkpoint_build(with_schema: bool) {
         FfiCheckpointNonFileAction::DomainMetadata(&domains[1]),
     ];
     let v2 = FfiLastCheckpointV2 {
+        checkpoint_metadata: std::ptr::null(),
         path: slice(CHECKPOINT),
         size_in_bytes: none_i64(),
         modification_time: none_i64(),
@@ -2098,6 +2099,7 @@ fn typed_v2_checkpoint_build(with_schema: bool) {
                     .map(|value| unsafe { value.try_to_kernel() }.unwrap())
                     .collect(),
             ),
+            None,
         )),
     )
     .unwrap();
