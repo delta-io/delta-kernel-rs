@@ -503,7 +503,7 @@ pub fn sequential_dv_descriptors(
 pub fn get_scan_files(
     snapshot: Arc<Snapshot>,
     engine: &dyn delta_kernel::Engine,
-) -> KernelResult<Vec<FilteredEngineData>> {
+) -> Result<Vec<FilteredEngineData>> {
     let scan = snapshot.scan_builder().build()?;
     let all_scan_metadata: Vec<_> = scan
         .scan_metadata(engine)?

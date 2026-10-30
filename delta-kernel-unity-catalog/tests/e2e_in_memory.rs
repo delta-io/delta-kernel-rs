@@ -433,7 +433,7 @@ async fn test_cannot_checkpoint_unpublished_snapshot() -> Result<(), TestError> 
     let err = snapshot.checkpoint(&engine, None).unwrap_err();
     assert!(matches!(
         err,
-        delta_kernel::KernelError::UnpublishedVersion(1)
+        delta_kernel::Error::Kernel(delta_kernel::KernelError::UnpublishedVersion(1))
     ));
     Ok(())
 }

@@ -975,14 +975,14 @@ async fn test_no_row_tracking_fields_without_feature() -> Result<()> {
 fn read_row_id_scan(
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn delta_kernel::Engine>,
-) -> KernelResult<Vec<RecordBatch>> {
+) -> Result<Vec<RecordBatch>> {
     read_row_tracking_scan(snapshot, engine, [MetadataColumnSpec::RowId])
 }
 
 fn read_row_commit_version_scan(
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn delta_kernel::Engine>,
-) -> KernelResult<Vec<RecordBatch>> {
+) -> Result<Vec<RecordBatch>> {
     read_row_tracking_scan(snapshot, engine, [MetadataColumnSpec::RowCommitVersion])
 }
 

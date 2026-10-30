@@ -709,7 +709,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> Result<()> {
 
     assert!(matches!(
         snapshot.create_checkpoint_writer(&engine).unwrap_err(),
-        crate::KernelError::UnpublishedVersion(1)
+        crate::Error::Kernel(crate::KernelError::UnpublishedVersion(1))
     ));
     Ok(())
 }

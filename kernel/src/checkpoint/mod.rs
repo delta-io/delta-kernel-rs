@@ -130,7 +130,7 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, Version,
+    Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, Result, Version,
     version_as_i64,
 };
 
@@ -374,7 +374,7 @@ impl RetentionCalculator for CheckpointWriter {
 
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
-    pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> KernelResult<Self> {
+    pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> Result<Self> {
         snapshot
             .table_configuration()
             .ensure_read_write_supported()?;

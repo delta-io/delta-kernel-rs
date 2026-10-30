@@ -992,15 +992,15 @@ impl TableConfiguration {
     }
 
     /// Validates that all feature requirements for a given feature are satisfied.
-    fn validate_feature_requirements(&self, feature: &TableFeature) -> KernelResult<()> {
+    fn validate_feature_requirements(&self, feature: &TableFeature) -> Result<()> {
         for req in feature.info().feature_requirements {
             match req {
                 FeatureRequirement::Supported(dep) => {
                     require!(
                         self.is_feature_supported(dep),
-                        KernelError::invalid_protocol(format!(
+                        crate::Error::Kernel(KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to be supported"
-                        ))
+                        )))
                     );
                 }
                 FeatureRequirement::Enabled(dep) => {
@@ -1020,25 +1020,25 @@ impl TableConfiguration {
                     }
                     require!(
                         self.is_feature_enabled(dep),
-                        KernelError::invalid_protocol(format!(
+                        crate::Error::Kernel(KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to be enabled"
-                        ))
+                        )))
                     );
                 }
                 FeatureRequirement::NotSupported(dep) => {
                     require!(
                         !self.is_feature_supported(dep),
-                        KernelError::invalid_protocol(format!(
+                        crate::Error::Kernel(KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to not be supported"
-                        ))
+                        )))
                     );
                 }
                 FeatureRequirement::NotEnabled(dep) => {
                     require!(
                         !self.is_feature_enabled(dep),
-                        KernelError::invalid_protocol(format!(
+                        crate::Error::Kernel(KernelError::invalid_protocol(format!(
                             "Feature '{feature}' requires '{dep}' to not be enabled"
-                        ))
+                        )))
                     );
                 }
                 FeatureRequirement::Custom(check) => {
@@ -1051,18 +1051,14 @@ impl TableConfiguration {
 
     /// Checks that kernel supports a feature for the given operation.
     /// Returns an error if the feature is unknown, not supported, or fails validation.
-    fn check_feature_support(
-        &self,
-        feature: &TableFeature,
-        operation: Operation,
-    ) -> KernelResult<()> {
+    fn check_feature_support(&self, feature: &TableFeature, operation: Operation) -> Result<()> {
         let info = feature.info();
         match &info.kernel_support {
             KernelSupport::Supported => {}
             KernelSupport::NotSupported => {
-                return Err(KernelError::unsupported(format!(
+                return Err(crate::Error::Kernel(KernelError::unsupported(format!(
                     "Feature '{feature}' is not supported"
-                )));
+                ))));
             }
             KernelSupport::Custom(check) => {
                 check(&self.protocol, &self.table_properties, operation)?;
@@ -1108,7 +1104,7 @@ impl TableConfiguration {
     /// - For `SnapshotLoad`, `Scan` and `Cdf`: checks reader version and reader features
     /// - For `Write` operations: checks writer version and writer features
     #[internal_api]
-    pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> KernelResult<()> {
+    pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> Result<()> {
         match operation {
             Operation::SnapshotLoad | Operation::Scan | Operation::Cdf => {
                 self.ensure_read_supported(operation)
@@ -1118,13 +1114,13 @@ impl TableConfiguration {
     }
 
     /// Ensures Kernel supports both scanning and writing this table.
-    pub(crate) fn ensure_read_write_supported(&self) -> KernelResult<()> {
+    pub(crate) fn ensure_read_write_supported(&self) -> Result<()> {
         self.ensure_operation_supported(Operation::Scan)?;
         self.ensure_operation_supported(Operation::Write)
     }
 
     /// Internal helper for read operations (Scan, Cdf, SnapshotLoad)
-    fn ensure_read_supported(&self, operation: Operation) -> KernelResult<()> {
+    fn ensure_read_supported(&self, operation: Operation) -> Result<()> {
         check_reader_version_range(&self.protocol)?;
 
         // Check all enabled reader features have kernel support
@@ -1136,22 +1132,22 @@ impl TableConfiguration {
     }
 
     /// Internal helper for write operations
-    pub(crate) fn ensure_write_supported(&self) -> KernelResult<()> {
+    pub(crate) fn ensure_write_supported(&self) -> Result<()> {
         // Version check: kernel supports writer versions
         // MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
         require!(
             self.protocol.min_writer_version() >= MIN_VALID_RW_VERSION,
-            KernelError::InvalidProtocol(format!(
+            crate::Error::Kernel(KernelError::InvalidProtocol(format!(
                 "min_writer_version must be >= {MIN_VALID_RW_VERSION}, got {}",
                 self.protocol.min_writer_version()
-            ))
+            )))
         );
         // Version check: kernel supports writer versions 1..=MAX_VALID_WRITER_VERSION
         if self.protocol.min_writer_version() > MAX_VALID_WRITER_VERSION {
-            return Err(KernelError::unsupported(format!(
+            return Err(crate::Error::Kernel(KernelError::unsupported(format!(
                 "Unsupported minimum writer version {}",
                 self.protocol.min_writer_version()
-            )));
+            ))));
         }
 
         // Check all enabled writer features have kernel support
@@ -1166,10 +1162,10 @@ impl TableConfiguration {
         require!(
             self.is_feature_supported(&TableFeature::CheckConstraints)
                 || !self.has_check_constraints(),
-            KernelError::invalid_protocol(
+            crate::Error::Kernel(KernelError::invalid_protocol(
                 "Table contains CHECK constraints but does not support the 'checkConstraints' \
                  writer feature",
-            )
+            ))
         );
 
         // Run discovery to assert that every generated column's expression is a string, because
@@ -1182,9 +1178,9 @@ impl TableConfiguration {
         if self.is_feature_supported(&TableFeature::Invariants)
             && schema_has_invariants(self.logical_schema.as_ref())
         {
-            return Err(KernelError::unsupported(
+            return Err(crate::Error::Kernel(KernelError::unsupported(
                 "Column invariants are not yet supported",
-            ));
+            )));
         }
 
         Ok(())
@@ -1497,9 +1493,9 @@ mod test {
         fn for_table_config(table_config: &TableConfiguration) -> Self {
             match table_config.ensure_operation_supported(Operation::Write) {
                 Ok(()) => Self::Supported,
-                Err(KernelError::InvalidProtocol(_)) => Self::InvalidProtocol,
-                Err(KernelError::Schema(_)) => Self::InvalidSchema,
-                Err(KernelError::Unsupported(_)) => Self::Unsupported,
+                Err(crate::Error::Kernel(KernelError::InvalidProtocol(_))) => Self::InvalidProtocol,
+                Err(crate::Error::Kernel(KernelError::Schema(_))) => Self::InvalidSchema,
+                Err(crate::Error::Kernel(KernelError::Unsupported(_))) => Self::Unsupported,
                 Err(err) => panic!("unexpected write error: {err:?}"),
             }
         }
