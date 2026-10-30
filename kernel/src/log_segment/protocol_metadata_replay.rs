@@ -141,10 +141,7 @@ impl LogSegment {
     }
 
     /// [`Self::replay_for_pm`] for a segment that no CRC or checkpoint file bounds, whose P&M may
-    /// be only in the checkpoint action the newest commit's `lastManifestCommit` points at. A plan
-    /// replay reads the newest commit first. If its P&M are not final, one more plan reads the
-    /// older commits, starting at the pointed content root when the segment lists the commit
-    /// containing that checkpoint action.
+    /// be only in the checkpoint action the newest commit's `lastManifestCommit` points at.
     fn replay_for_pm_with_unbounded_segment(
         &self,
         engine: &dyn Engine,
@@ -152,22 +149,24 @@ impl LogSegment {
         #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
         if let (Some(plan_executor), Some(_)) = (engine.plan_executor(), self.newest_commit()) {
             let executor = plan_executor.as_ref();
-            let newest = self
+            let newest_pm_candidate = self
                 .replay_for_pm_via_plan(executor, PmPlanSegment::NewestCommit)?
                 .validated_pointer(self.end_version)?;
-            if newest.is_final_at(self.end_version)? {
-                return Ok(newest);
+            if newest_pm_candidate.is_final_at(self.end_version)? {
+                return Ok(newest_pm_candidate);
             }
-            let Some(older) = PmPlanSegment::older_commits(self, &newest)? else {
+            let Some(older) = PmPlanSegment::older_commits(self, &newest_pm_candidate)? else {
                 // Nothing older to read: the segment has no older commits, or the newest commit's
                 // own checkpoint action has the P&M as of the commit before it. A P or M that is
                 // still missing is reported upstream, by the snapshot build that consumes this
                 // resolution.
-                return Ok(newest);
+                return Ok(newest_pm_candidate);
             };
-            let resolved = newest.merge(self.replay_for_pm_via_plan(executor, older)?);
+            let resolved = newest_pm_candidate.merge(self.replay_for_pm_via_plan(executor, older)?);
             // The pointed action must exist when replay lacks Protocol or Metadata without it, and
-            // must match the pointer whenever it was read.
+            // must match the pointer whenever it was read. The Protocol and Metadata checks keep
+            // this consistent with imperative reads, which error when the pointed commit carries no
+            // checkpoint action.
             if older.reads_checkpoint_action()
                 && (resolved.checkpoint.is_some()
                     || resolved.protocol.is_none()
@@ -248,11 +247,11 @@ impl LogSegment {
                     .max_non_null_by(metadata(), metadata(), version())
                     .aggregate_as(
                         Agg::max_non_null_by(version(), protocol(), version()),
-                        "protocol_version",
+                        PROTOCOL_VERSION_COLUMN,
                     )
                     .aggregate_as(
                         Agg::max_non_null_by(version(), metadata(), version()),
-                        "metadata_version",
+                        METADATA_VERSION_COLUMN,
                     );
                 extra_actions.iter().fold(aggregate, |aggregate, action| {
                     let column = || ColumnName::new([action.field.name()]);
@@ -862,7 +861,16 @@ fn action_at_version(action: &str, version: Version) -> KernelResult<Predicate> 
     ))
 }
 
-/// Reads the `protocol_version` and `metadata_version` columns the plan aggregate emits.
+// === P&M plan output columns: the versions the newest of each action was found at ===
+
+#[cfg(feature = "declarative-plans")]
+const PROTOCOL_VERSION_COLUMN: &str = "protocol_version";
+#[cfg(feature = "declarative-plans")]
+const METADATA_VERSION_COLUMN: &str = "metadata_version";
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+const COMMIT_INFO_VERSION_COLUMN: &str = "commit_info_version";
+
+/// Reads the [`PROTOCOL_VERSION_COLUMN`] and [`METADATA_VERSION_COLUMN`] the plan aggregate emits.
 #[cfg(feature = "declarative-plans")]
 fn pm_versions_from_plan_output(
     actions: &dyn EngineData,
@@ -870,8 +878,8 @@ fn pm_versions_from_plan_output(
     static COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
         (
             vec![
-                column_name!("protocol_version"),
-                column_name!("metadata_version"),
+                ColumnName::new([PROTOCOL_VERSION_COLUMN]),
+                ColumnName::new([METADATA_VERSION_COLUMN]),
             ],
             vec![DataType::LONG, DataType::LONG],
         )
@@ -880,10 +888,6 @@ fn pm_versions_from_plan_output(
     let [protocol, metadata] = versions_from_plan_output(actions, &COLUMNS)?;
     Ok((protocol, metadata))
 }
-
-/// The P&M plan output column holding the version the newest `commitInfo` was found at.
-#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
-const COMMIT_INFO_VERSION_COLUMN: &str = "commit_info_version";
 
 /// Reads the [`COMMIT_INFO_VERSION_COLUMN`] the plan aggregate emits when it reads `commitInfo`.
 #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
