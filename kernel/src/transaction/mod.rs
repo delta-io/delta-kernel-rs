@@ -1538,6 +1538,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         // add or remove row lacks `size` (see `FileStatsVisitor::visit` in
         // `kernel/src/crc/file_stats.rs`). So at this point every size is known to be
         // present, and only operation classification can flip `is_incremental_safe`.
+        // TODO(#3714): Preserve incremental file stats for commits without add/remove actions,
+        // matching replay's safety rule.
         let is_incremental_safe = self.operation.is_incremental_safe();
         Ok(CrcDelta {
             file_stats,
