@@ -2,7 +2,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
-use common::{LocationArgs, ParseWithExamples};
+use common::{LocationArgs, LoggingArgs, ParseWithExamples};
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::parquet::arrow::async_writer::AsyncFileWriter;
@@ -23,6 +23,9 @@ use futures::future::{BoxFuture, FutureExt};
 #[command(propagate_version = true)]
 struct Cli {
     #[command(flatten)]
+    logging_args: LoggingArgs,
+
+    #[command(flatten)]
     location_args: LocationArgs,
 
     /// This program doesn't use put-if-absent, or a catalog based commit, so it is UNSAFE.  As
@@ -34,7 +37,6 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    env_logger::init();
     match try_main().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -60,6 +62,7 @@ async fn write_data<W: AsyncFileWriter>(
 
 async fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Write", "write", "");
+    common::init_logging(&cli.logging_args)?;
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     println!("Checkpointing Delta table at: {url}");

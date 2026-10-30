@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use common::{LocationArgs, ParseWithExamples};
+use common::{LocationArgs, LoggingArgs, ParseWithExamples};
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
@@ -13,6 +13,9 @@ use itertools::Itertools;
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
+    #[command(flatten)]
+    logging_args: LoggingArgs,
+
     #[command(flatten)]
     location_args: LocationArgs,
 
@@ -31,6 +34,7 @@ fn main() -> KernelResult<()> {
         "read changes in",
         "",
     );
+    common::init_logging(&cli.logging_args)?;
     let url = delta_kernel::try_parse_uri(cli.location_args.path.as_str())?;
     let engine = common::get_engine(&url, &cli.location_args)?;
     let table_changes = TableChanges::try_new(url, &engine, cli.start_version, cli.end_version)?;

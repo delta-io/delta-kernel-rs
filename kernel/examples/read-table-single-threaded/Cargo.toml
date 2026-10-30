@@ -19,7 +19,6 @@ delta_kernel = { path = "../../../kernel", features = [
   "prettyprint",
 ] }
 delta_kernel_default_engine = { path = "../../../default-engine", features = ["rustls"] }
-env_logger = "0.11.8"
 itertools = "0.14"
 
 # for cargo-release

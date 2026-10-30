@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use clap::{Args, CommandFactory, FromArgMatches};
 use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::metrics::{LoggingMetricsReporter, WithMetricsReporterLayer};
 use delta_kernel::object_store::aws::AmazonS3Builder;
 use delta_kernel::object_store::azure::MicrosoftAzureBuilder;
 use delta_kernel::object_store::gcp::GoogleCloudStorageBuilder;
@@ -15,7 +16,21 @@ use delta_kernel::{KernelResult, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::storage::store_from_url_opts;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 use url::Url;
+
+/// Logging options shared by the example programs.
+#[derive(Args)]
+pub struct LoggingArgs {
+    /// Disable logging
+    #[arg(long, conflicts_with = "log_metrics")]
+    pub no_log: bool,
+
+    /// Log kernel metrics at INFO level
+    #[arg(long)]
+    pub log_metrics: bool,
+}
 
 #[derive(Args)]
 pub struct LocationArgs {
@@ -121,6 +136,36 @@ where
             Err(e) => e.exit(),
         }
     }
+}
+
+/// Initialize logging from RUST_LOG using the supplied options.
+///
+/// Returns success without installing a subscriber when `args.no_log` is set.
+///
+/// # Errors
+/// Returns an error if a global subscriber or logger is already installed.
+pub fn init_logging(args: &LoggingArgs) -> KernelResult<()> {
+    if args.no_log {
+        return Ok(());
+    }
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
+    let filter = tracing_subscriber::EnvFilter::from_default_env();
+
+    let result = if args.log_metrics {
+        subscriber
+            .with_metrics_reporter_layer(Arc::new(LoggingMetricsReporter::new(
+                tracing::Level::INFO,
+            )))
+            .with(filter)
+            .try_init()
+    } else {
+        subscriber.with(filter).try_init()
+    };
+
+    result.map_err(|error| {
+        delta_kernel::KernelError::generic(format!("Logging initialization failed: {error}"))
+    })
 }
 
 /// Get an engine configured to read table at `url` and `LocationArgs`

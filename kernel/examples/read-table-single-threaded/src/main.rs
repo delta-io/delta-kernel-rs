@@ -2,7 +2,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
-use common::{LocationArgs, ParseWithExamples, ScanArgs};
+use common::{LocationArgs, LoggingArgs, ParseWithExamples, ScanArgs};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
@@ -14,6 +14,9 @@ use itertools::Itertools;
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
+    #[command(flatten)]
+    logging_args: LoggingArgs,
+
     // today we don't have any args unique to this version, but we keep this as flattened this way
     // for consistency with the multi-threaded version and to make it easy to add unique options in
     // the future
@@ -25,7 +28,6 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
-    env_logger::init();
     match try_main() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -37,6 +39,7 @@ fn main() -> ExitCode {
 
 fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Read", "read", "");
+    common::init_logging(&cli.logging_args)?;
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     println!("Reading {url}");
     let engine = common::get_engine(&url, &cli.location_args)?;

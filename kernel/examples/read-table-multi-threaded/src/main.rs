@@ -4,7 +4,7 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 
 use clap::Parser;
-use common::{LocationArgs, ParseWithExamples, ScanArgs};
+use common::{LocationArgs, LoggingArgs, ParseWithExamples, ScanArgs};
 use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::record_batch::RecordBatch;
@@ -23,6 +23,9 @@ use url::Url;
 #[command(propagate_version = true)]
 struct Cli {
     #[command(flatten)]
+    logging_args: LoggingArgs,
+
+    #[command(flatten)]
     location_args: LocationArgs,
 
     #[command(flatten)]
@@ -38,7 +41,6 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
-    env_logger::init();
     match try_main() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -76,6 +78,7 @@ struct ScanState {
 
 fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Read", "read", "");
+    common::init_logging(&cli.logging_args)?;
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     println!("Reading {url}");

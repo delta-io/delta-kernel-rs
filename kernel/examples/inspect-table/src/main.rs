@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::process::ExitCode;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use clap::{Parser, Subcommand};
-use common::{LocationArgs, ParseWithExamples};
+use common::{LocationArgs, LoggingArgs, ParseWithExamples};
 use delta_kernel::actions::visitors::{
     visit_metadata_at, visit_protocol_at, AddVisitor, CdcVisitor, RemoveVisitor,
     SetTransactionVisitor, SidecarVisitor,
@@ -14,18 +14,18 @@ use delta_kernel::actions::{
 };
 use delta_kernel::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use delta_kernel::expressions::ColumnName;
-use delta_kernel::metrics::{LoggingMetricsReporter, WithMetricsReporterLayer};
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
 use delta_kernel::{KernelError, KernelResult, Snapshot};
-use tracing_subscriber::layer::SubscriberExt as _;
-use tracing_subscriber::util::SubscriberInitExt as _;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
+    #[command(flatten)]
+    logging_args: LoggingArgs,
+
     #[command(subcommand)]
     command: Commands,
 
@@ -52,14 +52,6 @@ enum Commands {
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NONE),
-        )
-        .with_metrics_reporter_layer(Arc::new(LoggingMetricsReporter::new(tracing::Level::INFO)))
-        .with(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
     match try_main() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -197,6 +189,7 @@ fn print_scan_file(_: &mut (), file: ScanFile) {
 
 fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Inspect", "inspect", "<COMMAND>");
+    common::init_logging(&cli.logging_args)?;
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     let engine = common::get_engine(&url, &cli.location_args)?;

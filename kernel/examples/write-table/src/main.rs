@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
-use common::{LocationArgs, ParseWithExamples};
+use common::{LocationArgs, LoggingArgs, ParseWithExamples};
 use delta_kernel::arrow::array::{
     ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
     TimestampMicrosecondArray,
@@ -28,6 +28,9 @@ use url::Url;
 #[command(propagate_version = true)]
 struct Cli {
     #[command(flatten)]
+    logging_args: LoggingArgs,
+
+    #[command(flatten)]
     location_args: LocationArgs,
 
     /// Comma-separated schema specification of the form `field_name:data_type`
@@ -48,7 +51,6 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    env_logger::init();
     match try_main().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -61,6 +63,7 @@ async fn main() -> ExitCode {
 // TODO: Update the example once official write APIs are introduced (issue#1123)
 async fn try_main() -> KernelResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Write", "write", "");
+    common::init_logging(&cli.logging_args)?;
 
     // Check if path is a directory and if not, create it
     if !Path::new(&cli.location_args.path).exists() {
