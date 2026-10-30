@@ -16,7 +16,8 @@ use delta_kernel::kernel_predicates::{
     IndirectDataSkippingPredicateEvaluator,
 };
 use delta_kernel::schema::{
-    ArrayType, DataType, IntervalYearToMonthType, MapType, StructField, StructType,
+    ArrayType, DataType, IntervalDayToSecondType, IntervalYearToMonthType, MapType, StructField,
+    StructType,
 };
 
 use crate::expressions::{SharedExpression, SharedPredicate};
@@ -255,7 +256,10 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
         lit(
             Scalar::interval_year_month(-13, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
         ),
-        lit(Scalar::IntervalDayTime(9_876_543_210)),
+        lit(
+            Scalar::interval_day_time(9_876_543_210, IntervalDayToSecondType::IntervalDayToSecond)
+                .unwrap(),
+        ),
         null_lit(DataType::INTEGER),
         null_lit(DataType::decimal(10, 5).unwrap()),
         Expr::binary(BinaryExpressionOp::Plus, lit(10), lit(20)),

@@ -631,7 +631,7 @@ fn visit_expression_scalar(
                 visitor,
                 visit_literal_interval_day_time,
                 sibling_list_id,
-                *val
+                val.micros()
             )
         }
         Scalar::Struct(struct_data) => {
@@ -787,7 +787,7 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
 #[cfg(test)]
 mod tests {
     use delta_kernel::expressions::{Expression, MapToStructOptions, Scalar, lit};
-    use delta_kernel::schema::IntervalYearToMonthType;
+    use delta_kernel::schema::{IntervalDayToSecondType, IntervalYearToMonthType};
     use rstest::rstest;
 
     use super::*;
@@ -1017,8 +1017,16 @@ mod tests {
         LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: 26 }
     )]
     #[case(
-        lit(Scalar::IntervalDayTime(987_654)),
+        lit(Scalar::interval_day_time(987_654, IntervalDayToSecondType::IntervalDayToSecond).unwrap()),
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: 987_654 }
+    )]
+    #[case(
+        lit(Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay).unwrap()),
+        LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: 86_400_000_000 }
+    )]
+    #[case(
+        lit(Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalHourToMinute).unwrap()),
+        LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: 93_780_000_000 }
     )]
     #[case(
         lit(Scalar::interval_year_month(-13, IntervalYearToMonthType::IntervalYearToMonth).unwrap()),
@@ -1033,15 +1041,15 @@ mod tests {
         LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: i32::MAX }
     )]
     #[case(
-        lit(Scalar::IntervalDayTime(-86_400_000_000)),
+        lit(Scalar::interval_day_time(-86_400_000_000, IntervalDayToSecondType::IntervalDayToSecond).unwrap()),
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: -86_400_000_000 }
     )]
     #[case(
-        lit(Scalar::IntervalDayTime(i64::MIN)),
+        lit(Scalar::interval_day_time(i64::MIN, IntervalDayToSecondType::IntervalDayToSecond).unwrap()),
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: i64::MIN }
     )]
     #[case(
-        lit(Scalar::IntervalDayTime(i64::MAX)),
+        lit(Scalar::interval_day_time(i64::MAX, IntervalDayToSecondType::IntervalDayToSecond).unwrap()),
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: i64::MAX }
     )]
     fn visit_expression_uses_interval_literal_callbacks(

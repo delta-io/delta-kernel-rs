@@ -1986,10 +1986,9 @@ pub enum PrimitiveType {
     #[serde(rename = "timestamp_ntz")]
     TimestampNtz,
     Void,
-    /// Day-time interval: a signed count of microseconds (ANSI `INTERVAL DAY TO SECOND` and
-    /// its narrowed `DAY` / `HOUR` / `MINUTE` / `SECOND` spellings).
-    #[serde(rename = "interval day to second")]
-    IntervalDayTime,
+    /// Day-time interval: a signed count of microseconds with an ANSI qualifier.
+    #[serde(serialize_with = "serialize_interval_day_time", untagged)]
+    IntervalDayTime(IntervalDayToSecondType),
     #[from]
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
@@ -2019,11 +2018,16 @@ impl PrimitiveType {
         Self::IntervalYearMonth(ty)
     }
 
+    /// Constructs a day-time interval primitive with the given ANSI qualifier.
+    pub fn interval_day_time(ty: IntervalDayToSecondType) -> Self {
+        Self::IntervalDayTime(ty)
+    }
+
     /// Returns whether this is one of the ANSI interval primitive types.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn is_interval(&self) -> bool {
-        matches!(self, Self::IntervalYearMonth(_) | Self::IntervalDayTime)
+        matches!(self, Self::IntervalYearMonth(_) | Self::IntervalDayTime(_))
     }
 
     /// Returns `true` if this primitive type can be widened to the `target` type.
@@ -2137,6 +2141,86 @@ impl Display for IntervalYearToMonthType {
     }
 }
 
+/// The supported qualifiers for Delta's day-time interval family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum IntervalDayToSecondType {
+    /// ANSI `INTERVAL DAY`.
+    #[serde(rename = "interval day")]
+    IntervalDay,
+    /// ANSI `INTERVAL HOUR`.
+    #[serde(rename = "interval hour")]
+    IntervalHour,
+    /// ANSI `INTERVAL MINUTE`.
+    #[serde(rename = "interval minute")]
+    IntervalMinute,
+    /// ANSI `INTERVAL SECOND`.
+    #[serde(rename = "interval second")]
+    IntervalSecond,
+    /// ANSI `INTERVAL DAY TO HOUR`.
+    #[serde(rename = "interval day to hour")]
+    IntervalDayToHour,
+    /// ANSI `INTERVAL DAY TO MINUTE`.
+    #[serde(rename = "interval day to minute")]
+    IntervalDayToMinute,
+    /// ANSI `INTERVAL DAY TO SECOND`.
+    #[serde(rename = "interval day to second")]
+    IntervalDayToSecond,
+    /// ANSI `INTERVAL HOUR TO MINUTE`.
+    #[serde(rename = "interval hour to minute")]
+    IntervalHourToMinute,
+    /// ANSI `INTERVAL HOUR TO SECOND`.
+    #[serde(rename = "interval hour to second")]
+    IntervalHourToSecond,
+    /// ANSI `INTERVAL MINUTE TO SECOND`.
+    #[serde(rename = "interval minute to second")]
+    IntervalMinuteToSecond,
+}
+
+impl IntervalDayToSecondType {
+    /// Returns true for the broad `INTERVAL DAY TO SECOND` qualifier.
+    pub fn is_full_range(&self) -> bool {
+        *self == Self::IntervalDayToSecond
+    }
+
+    pub(crate) fn unit_micros(&self) -> i64 {
+        use IntervalDayToSecondType::*;
+        match self {
+            IntervalDay => 86_400_000_000,
+            IntervalHour | IntervalDayToHour => 3_600_000_000,
+            IntervalMinute | IntervalDayToMinute | IntervalHourToMinute => 60_000_000,
+            IntervalSecond
+            | IntervalDayToSecond
+            | IntervalHourToSecond
+            | IntervalMinuteToSecond => 1,
+        }
+    }
+}
+
+impl Display for IntervalDayToSecondType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::IntervalDay => "interval day",
+            Self::IntervalHour => "interval hour",
+            Self::IntervalMinute => "interval minute",
+            Self::IntervalSecond => "interval second",
+            Self::IntervalDayToHour => "interval day to hour",
+            Self::IntervalDayToMinute => "interval day to minute",
+            Self::IntervalDayToSecond => "interval day to second",
+            Self::IntervalHourToMinute => "interval hour to minute",
+            Self::IntervalHourToSecond => "interval hour to second",
+            Self::IntervalMinuteToSecond => "interval minute to second",
+        };
+        f.write_str(name)
+    }
+}
+
+fn serialize_interval_day_time<S: serde::Serializer>(
+    dtype: &IntervalDayToSecondType,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&dtype.to_string())
+}
+
 fn serialize_interval_year_month<S: serde::Serializer>(
     dtype: &IntervalYearToMonthType,
     serializer: S,
@@ -2180,7 +2264,7 @@ pub(crate) struct IntervalFieldRange {
 }
 
 impl IntervalFieldRange {
-    fn primitive_type(self) -> Option<PrimitiveType> {
+    pub(crate) fn primitive_type(self) -> Option<PrimitiveType> {
         match (self.start, self.end) {
             (IntervalField::Year, IntervalField::Year) => Some(PrimitiveType::IntervalYearMonth(
                 IntervalYearToMonthType::IntervalYear,
@@ -2191,13 +2275,36 @@ impl IntervalFieldRange {
             (IntervalField::Year, IntervalField::Month) => Some(PrimitiveType::IntervalYearMonth(
                 IntervalYearToMonthType::IntervalYearToMonth,
             )),
-            (
-                IntervalField::Day
-                | IntervalField::Hour
-                | IntervalField::Minute
-                | IntervalField::Second,
-                _,
-            ) => Some(PrimitiveType::IntervalDayTime),
+            (IntervalField::Day, IntervalField::Day) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalDay,
+            )),
+            (IntervalField::Hour, IntervalField::Hour) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalHour,
+            )),
+            (IntervalField::Minute, IntervalField::Minute) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalMinute,
+            )),
+            (IntervalField::Second, IntervalField::Second) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalSecond,
+            )),
+            (IntervalField::Day, IntervalField::Hour) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalDayToHour,
+            )),
+            (IntervalField::Day, IntervalField::Minute) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalDayToMinute,
+            )),
+            (IntervalField::Day, IntervalField::Second) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalDayToSecond,
+            )),
+            (IntervalField::Hour, IntervalField::Minute) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalHourToMinute,
+            )),
+            (IntervalField::Hour, IntervalField::Second) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalHourToSecond,
+            )),
+            (IntervalField::Minute, IntervalField::Second) => Some(PrimitiveType::IntervalDayTime(
+                IntervalDayToSecondType::IntervalMinuteToSecond,
+            )),
             _ => None,
         }
     }
@@ -2230,8 +2337,8 @@ fn normalize_interval_type(s: &str) -> Option<PrimitiveType> {
 }
 
 // Custom Deserialize to provide clear error messages for unsupported types.
-// The derived impl would produce: "unknown variant `interval second`, expected one of ..."
-// This impl produces: "Unsupported Delta table type: 'interval second'"
+// The derived impl would produce: "unknown variant `interval fortnight`, expected one of ..."
+// This impl produces: "Unsupported Delta table type: 'interval fortnight'"
 impl<'de> serde::Deserialize<'de> for PrimitiveType {
     fn deserialize<D>(deserializer: D) -> KernelResult<Self, D::Error>
     where
@@ -2335,7 +2442,7 @@ impl Display for PrimitiveType {
             PrimitiveType::Timestamp => write!(f, "timestamp"),
             PrimitiveType::TimestampNtz => write!(f, "timestamp_ntz"),
             PrimitiveType::IntervalYearMonth(dtype) => write!(f, "{dtype}"),
-            PrimitiveType::IntervalDayTime => write!(f, "interval day to second"),
+            PrimitiveType::IntervalDayTime(dtype) => write!(f, "{dtype}"),
             PrimitiveType::Decimal(dtype) => {
                 write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
@@ -2502,7 +2609,9 @@ impl DataType {
     pub const INTERVAL_YEAR_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth(
         IntervalYearToMonthType::IntervalYearToMonth,
     ));
-    pub const INTERVAL_DAY_TIME: Self = DataType::Primitive(PrimitiveType::IntervalDayTime);
+    pub const INTERVAL_DAY_TIME: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalDayToSecond,
+    ));
 
     /// Resolves a path to a mutable nested struct.
     ///
@@ -2579,6 +2688,11 @@ impl DataType {
     /// Constructs a year-month interval data type with the given ANSI qualifier.
     pub fn interval_year_month(ty: IntervalYearToMonthType) -> Self {
         PrimitiveType::interval_year_month(ty).into()
+    }
+
+    /// Constructs a day-time interval data type with the given ANSI qualifier.
+    pub fn interval_day_time(ty: IntervalDayToSecondType) -> Self {
+        PrimitiveType::interval_day_time(ty).into()
     }
 
     /// Create a new struct type with the given fields.
@@ -3270,12 +3384,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_invalid_interval_field_range_has_no_primitive_type() {
-        let range = IntervalFieldRange {
-            start: IntervalField::Month,
-            end: IntervalField::Year,
-        };
+    #[rstest]
+    #[case(IntervalField::Month, IntervalField::Year)]
+    #[case(IntervalField::Second, IntervalField::Day)]
+    fn test_invalid_interval_field_range_has_no_primitive_type(
+        #[case] start: IntervalField,
+        #[case] end: IntervalField,
+    ) {
+        let range = IntervalFieldRange { start, end };
         assert_eq!(range.primitive_type(), None);
     }
 
@@ -3295,16 +3411,43 @@ mod tests {
     #[case("interval year", DataType::INTERVAL_YEAR)]
     #[case("interval month", DataType::INTERVAL_MONTH)]
     #[case("interval year to month", DataType::INTERVAL_YEAR_MONTH)]
-    #[case("interval day", DataType::INTERVAL_DAY_TIME)]
-    #[case("interval hour", DataType::INTERVAL_DAY_TIME)]
-    #[case("interval minute", DataType::INTERVAL_DAY_TIME)]
-    #[case("interval second", DataType::INTERVAL_DAY_TIME)]
-    #[case("interval day to hour", DataType::INTERVAL_DAY_TIME)]
-    #[case("interval day to minute", DataType::INTERVAL_DAY_TIME)]
+    #[case(
+        "interval day",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalDay)
+    )]
+    #[case(
+        "interval hour",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalHour)
+    )]
+    #[case(
+        "interval minute",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalMinute)
+    )]
+    #[case(
+        "interval second",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalSecond)
+    )]
+    #[case(
+        "interval day to hour",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalDayToHour)
+    )]
+    #[case(
+        "interval day to minute",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalDayToMinute)
+    )]
     #[case("interval day to second", DataType::INTERVAL_DAY_TIME)]
-    #[case("interval hour to minute", DataType::INTERVAL_DAY_TIME)]
-    #[case("interval hour to second", DataType::INTERVAL_DAY_TIME)]
-    #[case("interval minute to second", DataType::INTERVAL_DAY_TIME)]
+    #[case(
+        "interval hour to minute",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToMinute)
+    )]
+    #[case(
+        "interval hour to second",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToSecond)
+    )]
+    #[case(
+        "interval minute to second",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalMinuteToSecond)
+    )]
     fn test_primitive_type_deserialization_still_works(
         #[case] type_str: &str,
         #[case] expected_type: DataType,
@@ -3395,7 +3538,43 @@ mod tests {
     #[case("\"interval year\"", DataType::INTERVAL_YEAR)]
     #[case("\"interval month\"", DataType::INTERVAL_MONTH)]
     #[case("\"interval year to month\"", DataType::INTERVAL_YEAR_MONTH)]
+    #[case(
+        "\"interval day\"",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalDay)
+    )]
+    #[case(
+        "\"interval hour\"",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalHour)
+    )]
+    #[case(
+        "\"interval minute\"",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalMinute)
+    )]
+    #[case(
+        "\"interval second\"",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalSecond)
+    )]
+    #[case(
+        "\"interval day to hour\"",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalDayToHour)
+    )]
+    #[case(
+        "\"interval day to minute\"",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalDayToMinute)
+    )]
     #[case("\"interval day to second\"", DataType::INTERVAL_DAY_TIME)]
+    #[case(
+        "\"interval hour to minute\"",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToMinute)
+    )]
+    #[case(
+        "\"interval hour to second\"",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToSecond)
+    )]
+    #[case(
+        "\"interval minute to second\"",
+        DataType::interval_day_time(IntervalDayToSecondType::IntervalMinuteToSecond)
+    )]
     #[case("\"variant\"", DataType::unshredded_variant())]
     fn test_data_type_deserialization(#[case] type_json: &str, #[case] expected: DataType) {
         let data_type: DataType = serde_json::from_str(type_json).unwrap();
@@ -3415,7 +3594,46 @@ mod tests {
         PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
         "interval year to month"
     )]
-    #[case(PrimitiveType::IntervalDayTime, "interval day to second")]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDay),
+        "interval day"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalHour),
+        "interval hour"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalMinute),
+        "interval minute"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalSecond),
+        "interval second"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToHour),
+        "interval day to hour"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToMinute),
+        "interval day to minute"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond),
+        "interval day to second"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalHourToMinute),
+        "interval hour to minute"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalHourToSecond),
+        "interval hour to second"
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalMinuteToSecond),
+        "interval minute to second"
+    )]
     fn test_interval_type_name_round_trips(#[case] ptype: PrimitiveType, #[case] name: &str) {
         assert_eq!(ptype.to_string(), name);
         assert_eq!(
@@ -3447,6 +3665,40 @@ mod tests {
         assert!(json.contains(r#""type":"interval year""#));
         assert!(json.contains(r#""elementType":"interval month""#));
         assert!(json.contains(r#""valueType":"interval year to month""#));
+        assert_eq!(serde_json::from_str::<StructType>(&json).unwrap(), schema);
+    }
+
+    #[test]
+    fn test_nested_interval_day_time_schema_round_trips_exact_qualifiers() {
+        let schema = StructType::try_new([
+            StructField::nullable(
+                "day",
+                PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDay),
+            ),
+            StructField::nullable(
+                "hour_array",
+                ArrayType::new(
+                    PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalHour),
+                    true,
+                ),
+            ),
+            StructField::nullable(
+                "minute_second_map",
+                MapType::new(
+                    DataType::STRING,
+                    PrimitiveType::interval_day_time(
+                        IntervalDayToSecondType::IntervalMinuteToSecond,
+                    ),
+                    true,
+                ),
+            ),
+        ])
+        .unwrap();
+
+        let json = serde_json::to_string(&schema).unwrap();
+        assert!(json.contains(r#""type":"interval day""#));
+        assert!(json.contains(r#""elementType":"interval hour""#));
+        assert!(json.contains(r#""valueType":"interval minute to second""#));
         assert_eq!(serde_json::from_str::<StructType>(&json).unwrap(), schema);
     }
 
