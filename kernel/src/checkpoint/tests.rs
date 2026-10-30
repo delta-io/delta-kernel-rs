@@ -911,7 +911,7 @@ async fn test_checkpoint_preserves_domain_metadata() -> KernelResult<()> {
     // ===== Case 1: Verify domain metadata is preserved *before* checkpoint =====
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     assert_eq!(snapshot.version(), 2);
-    let domain_value = snapshot.get_domain_metadata("foo", &engine)?;
+    let domain_value = snapshot.reader().get_domain_metadata("foo", &engine)?;
     assert_eq!(domain_value, Some("bar2".to_string()));
 
     // Trigger checkpoint
@@ -921,7 +921,7 @@ async fn test_checkpoint_preserves_domain_metadata() -> KernelResult<()> {
     let snapshot = Snapshot::builder_for(table_url)
         .at_version(2)
         .build(&engine)?;
-    let domain_value = snapshot.get_domain_metadata("foo", &engine)?;
+    let domain_value = snapshot.reader().get_domain_metadata("foo", &engine)?;
     assert_eq!(domain_value, Some("bar2".to_string()));
 
     Ok(())
@@ -982,7 +982,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> KernelResult<(
     // Verify domain exists before removal
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     assert_eq!(
-        snapshot.get_domain_metadata("foo", &engine)?,
+        snapshot.reader().get_domain_metadata("foo", &engine)?,
         Some("bar".to_string())
     );
 
@@ -997,7 +997,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> KernelResult<(
 
     // Verify domain is gone before checkpoint
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    assert_eq!(snapshot.get_domain_metadata("foo", &engine)?, None);
+    assert_eq!(snapshot.reader().get_domain_metadata("foo", &engine)?, None);
 
     // ===== Write checkpoint =====
     snapshot.checkpoint(&engine, None)?;
@@ -1006,7 +1006,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> KernelResult<(
     let snapshot = Snapshot::builder_for(table_url)
         .at_version(snapshot.version())
         .build(&engine)?;
-    assert_eq!(snapshot.get_domain_metadata("foo", &engine)?, None);
+    assert_eq!(snapshot.reader().get_domain_metadata("foo", &engine)?, None);
 
     Ok(())
 }

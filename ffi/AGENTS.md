@@ -847,12 +847,17 @@ publication watermark.
 When built with `adaptive-metadata-in-dev`, typed export rejects CRCs containing experimental
 adaptive-metadata `lastManifestCommit` or Add `backReference` state.
 
-Snapshot accessors (`ffi/src/lib.rs`) read a built `SharedSnapshot` without I/O -- e.g. `version`,
-`snapshot_timestamp`, and `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
+Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
+`snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
 `num_files` / `table_size_bytes` from the CRC; `None` when the snapshot has no CRC, or its CRC lacks
 complete file stats). `visit_file_size_histogram` exposes the optional variable-length histogram in
 the same file stats: it invokes one callback with borrowed `i64` slices for bin boundaries, file
 counts, and total bytes; callers must copy values they retain after the callback.
+
+`snapshot_timestamp` uses a synchronous `SnapshotReader` and may read commit JSON when the
+In-Commit Timestamp is unavailable from retained CRC state. Domain-metadata and transaction-version
+FFI reads also use an unscoped reader, preserving the engine's cancellation and timeout behavior.
+The C API signatures do not expose reader state or a cancellation token.
 
 Domain-metadata reads live in `ffi/src/domain_metadata.rs`: `get_domain_metadata` /
 `visit_domain_metadata` for user domains, and `visit_clustering_columns`, which reports one

@@ -43,6 +43,7 @@ fn get_domain_metadata_impl(
     allocate_fn: AllocateStringFn,
 ) -> KernelResult<NullableCvoid> {
     Ok(snapshot
+        .reader()
         .get_domain_metadata(&domain?, extern_engine.engine().as_ref())?
         .and_then(|config| allocate_fn(kernel_string_slice!(config))))
 }
@@ -65,6 +66,7 @@ pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark(
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
     let result = snapshot
+        .reader()
         .get_row_tracking_high_water_mark(engine_ref.engine().as_ref())
         .map(OptionalValue::from);
     unsafe { result.into_extern_result(&engine_ref) }
@@ -133,7 +135,10 @@ fn visit_clustering_columns_impl(
     engine_context: NullableCvoid,
     visitor: ClusteringColumnVisitor,
 ) -> KernelResult<OptionalValue<usize>> {
-    let Some(infos) = snapshot.get_clustering_column_infos(extern_engine.engine().as_ref())? else {
+    let Some(infos) = snapshot
+        .reader()
+        .get_clustering_column_infos(extern_engine.engine().as_ref())?
+    else {
         return Ok(OptionalValue::None);
     };
     for info in &infos {
@@ -186,7 +191,9 @@ fn visit_domain_metadata_impl(
         value: KernelStringSlice,
     ),
 ) -> KernelResult<bool> {
-    let res = snapshot.get_all_domain_metadata(extern_engine.engine().as_ref())?;
+    let res = snapshot
+        .reader()
+        .get_all_domain_metadata(extern_engine.engine().as_ref())?;
     res.iter().for_each(|metadata| {
         let domain = &metadata.domain();
         let configuration = &metadata.configuration();
