@@ -485,7 +485,10 @@ async fn test_domain_metadata_read_across_a_root_manifest_commit(
         ("domain.c", None),
     ] {
         assert_eq!(
-            snapshot.get_domain_metadata(domain, &engine)?.as_deref(),
+            snapshot
+                .reader()
+                .get_domain_metadata(domain, &engine)?
+                .as_deref(),
             expected,
             "domain {domain}"
         );
