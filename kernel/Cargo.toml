@@ -133,6 +133,9 @@ adaptive-metadata-in-dev = []
 # Experimental, temporary, test-only feature flag guarding the in-progress geospatial
 # (geometry/geography) type work. TODO(#2949): remove once full geo support ships.
 geo-type-in-dev = []
+# Experimental feature flag for the `parquetEncryption-dev` table feature (Parquet Modular
+# Encryption, draft RFC delta-io/delta#6195). Remove once the RFC is standardised.
+parquet-encryption-in-dev = []
 # Enables experimental user-defined schema types.
 udt-in-dev = []
 # Enables shared Arrow-based engine support modules (arrow_data, arrow_expression,

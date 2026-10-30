@@ -2330,6 +2330,21 @@ mod test {
                 r#"Feature 'geospatial' is not supported for writes"#,
             );
         }
+
+        #[cfg(feature = "parquet-encryption-in-dev")]
+        {
+            let config = MockTableConfigurationBuilder::new()
+                .with_protocol(
+                    MockProtocolBuilder::new()
+                        .with_features([TableFeature::ParquetEncryptionDev])
+                        .build(),
+                )
+                .build();
+            // Supported at the protocol level; data writes are guarded by
+            // `Transaction::ack_parquet_encryption` instead.
+            assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+            assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+        }
     }
 
     #[cfg(not(feature = "geo-type-in-dev"))]

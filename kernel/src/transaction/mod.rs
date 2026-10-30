@@ -48,7 +48,7 @@ use crate::schema::{
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::TableFeature;
+use crate::table_features::{Operation, TableFeature};
 use crate::utils::{require, PhantomType};
 use crate::{
     create_row, version_as_i64, DataType, Engine, EngineData, Expression, FileMeta, KernelResult,
@@ -315,6 +315,10 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     // Whether the connector acknowledged responsibility for preserving Row IDs and Row Commit
     // Versions.
     row_tracking_preservation_acknowledged: bool,
+    // Whether the connector acknowledged responsibility for encrypting the data files it adds
+    // to a table with the `parquetEncryption-dev` feature.
+    #[cfg(feature = "parquet-encryption-in-dev")]
+    parquet_encryption_acknowledged: bool,
     // Whether this transaction should be marked as a blind append.
     is_blind_append: bool,
     // The manifest this transaction will write, if any. The two ways of writing it are mutually
@@ -612,6 +616,19 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         self.column_defaults_acknowledged = true;
     }
 
+    /// Acknowledges that the connector encrypts the data files it adds to a table with the
+    /// `parquetEncryption-dev` feature (draft RFC delta-io/delta#6195) and writes no statistics
+    /// for encrypted columns.
+    ///
+    /// Kernel only carries the feature through the protocol and its `delta.encryption.*`
+    /// properties; it does not encrypt. Without this acknowledgement, requesting write state or
+    /// committing Add actions on such a table fails, so kernel's own writers cannot add plaintext
+    /// files to it. Metadata-only commits need no acknowledgement.
+    #[cfg(feature = "parquet-encryption-in-dev")]
+    pub fn ack_parquet_encryption(&mut self) {
+        self.parquet_encryption_acknowledged = true;
+    }
+
     /// Returns the expected schema for file statistics.
     ///
     /// The schema structure is derived from table configuration:
@@ -715,8 +732,16 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     ///
     /// We perform this same check during [`commit`](Transaction::commit) as defense-in-depth, for
     /// callers that directly use [`add_files`](Transaction::add_files) without going through
-    /// [`write_state`](Self::write_state)
+    /// [`write_state`](Self::write_state).
+    ///
+    /// Data files may only be written to a table whose protocol kernel supports for writes and
+    /// whose schema is writable. Update-table transactions already verified write support when
+    /// they were created; CREATE TABLE AS SELECT has no snapshot, so it is checked here.
     fn validate_for_data_write(&self) -> KernelResult<()> {
+        self.effective_table_config
+            .ensure_operation_supported(Operation::Write)?;
+        #[cfg(feature = "parquet-encryption-in-dev")]
+        self.ensure_parquet_encryption_acknowledged()?;
         validate_schema_for_write(&self.effective_table_config.logical_schema())
     }
 
@@ -832,6 +857,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             data_change: common_state.data_change,
             column_defaults_acknowledged: false,
             row_tracking_preservation_acknowledged: false,
+            #[cfg(feature = "parquet-encryption-in-dev")]
+            parquet_encryption_acknowledged: false,
             is_blind_append: false,
             #[cfg(feature = "adaptive-metadata-in-dev")]
             manifest_write: None,
@@ -1075,6 +1102,22 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         Ok(())
     }
 
+    #[cfg(feature = "parquet-encryption-in-dev")]
+    fn ensure_parquet_encryption_acknowledged(&self) -> KernelResult<()> {
+        require!(
+            self.parquet_encryption_acknowledged
+                || !self
+                    .effective_table_config
+                    .is_feature_enabled(&TableFeature::ParquetEncryptionDev),
+            KernelError::invalid_transaction_state(
+                "Writing data to a table with the parquetEncryption-dev feature requires \
+                 calling Transaction::ack_parquet_encryption() first: kernel does not encrypt \
+                 data files",
+            )
+        );
+        Ok(())
+    }
+
     fn ensure_row_tracking_preservation_acknowledged(&self) -> KernelResult<()> {
         if !self
             .effective_table_config
@@ -1235,10 +1278,10 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         #[cfg(feature = "adaptive-metadata-in-dev")]
         self.validate_iceberg_native_v4_semantics()?;
 
-        // Validate that the schema supports data writes when files are being added. Reads and
+        // Validate that the table supports data writes when files are being added. Reads and
         // metadata-only commits are always allowed.
         if self.staged_data_changes.has_adds() {
-            validate_schema_for_write(&self.effective_table_config.logical_schema())?;
+            self.validate_for_data_write()?;
         }
 
         // If a data-changing transaction has add files together with remove files or DV updates,
@@ -2237,6 +2280,8 @@ mod tests {
             data_change,
             column_defaults_acknowledged,
             row_tracking_preservation_acknowledged,
+            #[cfg(feature = "parquet-encryption-in-dev")]
+            parquet_encryption_acknowledged,
             is_blind_append,
             #[cfg(feature = "adaptive-metadata-in-dev")]
             manifest_write,
@@ -2268,6 +2313,8 @@ mod tests {
         assert_eq!(data_change, expected_data_change);
         assert!(!column_defaults_acknowledged);
         assert!(!row_tracking_preservation_acknowledged);
+        #[cfg(feature = "parquet-encryption-in-dev")]
+        assert!(!parquet_encryption_acknowledged);
         assert!(!is_blind_append);
         assert!(dv_matched_files.is_empty());
         assert_eq!(num_dv_updates, 0);
@@ -3448,7 +3495,11 @@ mod tests {
         txn.effective_table_config = MockTableConfigurationBuilder::new()
             .with_protocol(
                 MockProtocolBuilder::new()
-                    .with_features([TableFeature::RowTracking, TableFeature::ChangeDataFeed])
+                    .with_features([
+                        TableFeature::RowTracking,
+                        TableFeature::DomainMetadata,
+                        TableFeature::ChangeDataFeed,
+                    ])
                     .build(),
             )
             .with_properties([(ENABLE_ROW_TRACKING, true), (ENABLE_CHANGE_DATA_FEED, true)])
@@ -3652,6 +3703,35 @@ mod tests {
         let error = result.expect_err("invalid internal operation must be rejected");
         assert!(matches!(&error, KernelError::InvalidTransactionState(_)));
         assert!(error.to_string().contains(expected), "{error}");
+        Ok(())
+    }
+
+    /// CREATE TABLE AS SELECT on a table whose features kernel cannot write is refused before any
+    /// data file is produced and again at commit, while a metadata-only CREATE TABLE still works
+    /// and a connector that encrypts its files acknowledges that to proceed.
+    #[cfg(feature = "parquet-encryption-in-dev")]
+    #[test]
+    fn create_table_as_select_requires_encryption_acknowledgement() -> KernelResult<()> {
+        let tempdir = tempfile::tempdir()?;
+        let engine = SyncEngine::new();
+        let mut txn = create_table(
+            tempdir.path().to_string_lossy(),
+            test_schema_flat(),
+            "test-engine",
+            true,
+        )
+        .with_table_properties([("delta.encryption.footer_key", "footer-key")])
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        let expected = "requires calling Transaction::ack_parquet_encryption() first";
+
+        txn.validate_commit()?;
+        assert_result_error_with_message(txn.write_state(), expected);
+        add_dummy_file(&mut txn);
+        assert_result_error_with_message(txn.validate_commit(), expected);
+
+        txn.ack_parquet_encryption();
+        txn.write_state()?;
+        txn.validate_commit()?;
         Ok(())
     }
 

@@ -108,6 +108,13 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP => {
             props.in_commit_timestamp_enablement_timestamp = Some(parse_non_negative(v)?)
         }
+        ENCRYPTION_KMS_ID => props.encryption_kms_id = Some(v.to_string()),
+        ENCRYPTION_KMS_CONFIGURATION => props.encryption_kms_configuration = Some(v.to_string()),
+        ENCRYPTION_FOOTER_KEY => props.encryption_footer_key = Some(v.to_string()),
+        ENCRYPTION_PLAINTEXT_FOOTER => props.encryption_plaintext_footer = Some(parse_bool(v)?),
+        ENCRYPTION_COLUMN_KEYS => {
+            props.encryption_column_keys = Some(parse_encryption_column_keys(v)?)
+        }
         _ => {
             let name = strip_check_constraint_prefix(k)?;
             props.check_constraints.push(CheckConstraint {
@@ -153,6 +160,32 @@ pub(crate) fn parse_column_names(s: &str) -> Option<Vec<ColumnName>> {
     ColumnName::parse_column_name_list(s)
         .inspect_err(|e| warn!("column name list failed to parse: {e}"))
         .ok()
+}
+
+/// Deserialize `delta.encryption.column_keys` (`<keyId>:<col>,<col>;<keyId>:<col>`) into one
+/// entry per master key. Column names follow the protocol's field-path scheme, so `a.b` is a
+/// nested field and a name containing a dot is backtick-quoted. The value is split on `;` and the
+/// first `:` of each segment before the quoting is read, so a quoted name may not contain `;`
+/// and a key ID may not contain `:`. An empty string is `Some(vec![])` (uniform encryption); a
+/// segment without a key ID, without columns, with an empty column name, or with an unparsable
+/// column list makes the whole value `None`.
+pub(crate) fn parse_encryption_column_keys(s: &str) -> Option<Vec<EncryptionColumnKey>> {
+    s.split(';')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            let (key_id, columns) = segment.split_once(':')?;
+            let key_id = key_id.trim();
+            let columns = parse_column_names(columns)?;
+            let well_formed = !key_id.is_empty()
+                && !columns.is_empty()
+                && columns.iter().all(|column| !column.path().is_empty());
+            well_formed.then(|| EncryptionColumnKey {
+                key_id: key_id.to_string(),
+                columns,
+            })
+        })
+        .collect()
 }
 
 /// Deserialize an interval string of the form "interval 5 days" into an `Option<Duration>`.
