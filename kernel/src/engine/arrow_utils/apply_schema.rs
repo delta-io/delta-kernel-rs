@@ -1,6 +1,6 @@
 use std::borrow::Borrow;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
 
@@ -18,7 +18,9 @@ use crate::arrow::datatypes::{
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::KernelError;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use crate::schema::{ArrayType, ColumnMetadataKey, DataType, MapType, Schema, StructField};
+use crate::schema::{
+    ArrayType, ColumnMetadataKey, DataType, MapType, Schema, StructField, FILE_FIELDS,
+};
 use crate::KernelResult;
 
 // Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch` where
@@ -275,11 +277,8 @@ fn apply_schema_to_map(
 // take the kernel's metadata, so sub-field ids a writer put on them are dropped.
 fn apply_schema_to_file(array: &ArrayRef) -> KernelResult<StructArray> {
     // Every `file` has the canonical sub-fields, so the canonical type is the kernel schema.
-    let kernel_type = DataType::file_type();
-    let DataType::File(file_fields) = &kernel_type else {
-        return Err(KernelError::internal_error("`file_type()` is not a `file`"));
-    };
-    ensure_data_types(&kernel_type, array.data_type(), ValidationMode::Full)?;
+    static KERNEL_FILE_TYPE: LazyLock<DataType> = LazyLock::new(DataType::file_type);
+    ensure_data_types(&KERNEL_FILE_TYPE, array.data_type(), ValidationMode::Full)?;
     let Some(sa) = array.as_struct_opt() else {
         return Err(make_arrow_error(
             "Arrow claimed to be a struct but isn't a StructArray",
@@ -291,7 +290,7 @@ fn apply_schema_to_file(array: &ArrayRef) -> KernelResult<StructArray> {
         .enumerate()
         .map(|(index, field)| (field.name().as_str(), index))
         .collect();
-    let (fields, columns): (Vec<_>, Vec<_>) = file_fields
+    let (fields, columns): (Vec<_>, Vec<_>) = FILE_FIELDS
         .fields()
         .map(|kernel_field| {
             let index = *index_by_name
@@ -306,7 +305,7 @@ fn apply_schema_to_file(array: &ArrayRef) -> KernelResult<StructArray> {
         })
         .process_results(|iter| iter.unzip())?;
     let ordered = StructArray::try_new(fields.into(), columns, sa.nulls().cloned())?;
-    apply_schema_to_struct(&ordered, file_fields)
+    apply_schema_to_struct(&ordered, &FILE_FIELDS)
 }
 
 // Apply `schema` to `array`. This handles renaming, and adjusting nullability and metadata. if the
@@ -1029,5 +1028,71 @@ mod file_tests {
         let batch = apply_schema(&data, &DataType::Struct(Box::new(schema))).unwrap();
 
         assert_canonical(batch.column(0).as_list::<i32>().values().as_struct());
+    }
+
+    /// Wraps `values` as the values of a one-row map column `m`, with one string key per value.
+    fn map_column(values: ArrayRef, value_type: DataType) -> (StructArray, StructType) {
+        let keys = StringArray::from_iter_values((0..values.len()).map(|i| i.to_string()));
+        let entries = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false)),
+                Arc::new(keys) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("value", values.data_type().clone(), true)),
+                values,
+            ),
+        ]);
+        let map = MapArray::new(
+            Arc::new(ArrowField::new(
+                "key_value",
+                ArrowDataType::Struct(entries.fields().clone()),
+                false,
+            )),
+            OffsetBuffer::from_lengths([entries.len()]),
+            entries,
+            None,
+            false,
+        );
+        let schema = StructType::new_unchecked([StructField::nullable(
+            "m",
+            MapType::new(DataType::STRING, value_type, true),
+        )]);
+        let data = StructArray::from(vec![(
+            Arc::new(ArrowField::new("m", map.data_type().clone(), true)),
+            Arc::new(map) as ArrayRef,
+        )]);
+        (data, schema)
+    }
+
+    /// The same holds for `file` values that are map values.
+    #[test]
+    fn test_apply_schema_to_file_in_map() {
+        let (data, schema) = map_column(Arc::new(reversed_file()), DataType::file_type());
+
+        let batch = apply_schema(&data, &DataType::Struct(Box::new(schema))).unwrap();
+
+        assert_canonical(batch.column(0).as_map().values().as_struct());
+    }
+
+    /// The same holds for `file` values that are list elements in a map value.
+    #[test]
+    fn test_apply_schema_to_file_in_list_in_map() {
+        let file = reversed_file();
+        let list = ListArray::new(
+            Arc::new(ArrowField::new("element", file.data_type().clone(), true)),
+            OffsetBuffer::from_lengths([2]),
+            Arc::new(file),
+            None,
+        );
+        let (data, schema) = map_column(
+            Arc::new(list),
+            ArrayType::new(DataType::file_type(), true).into(),
+        );
+
+        let batch = apply_schema(&data, &DataType::Struct(Box::new(schema))).unwrap();
+
+        let list = batch.column(0).as_map().values().as_list::<i32>();
+        assert_canonical(list.values().as_struct());
     }
 }
