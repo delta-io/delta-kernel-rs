@@ -623,32 +623,79 @@ impl LogSegment {
             (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
         };
 
-        let checkpoint_version = listed_files.checkpoint_parts.first().map(|file| file.version);
-        let first_replay_version = listed_files.ascending_commit_files.iter()
+        Self::try_new_for_snapshot(listed_files, log_root, time_travel_version, checkpoint_hint)
+    }
+
+    /// Validates snapshot replay files and classifies missing history with the selected checkpoint
+    /// and target. Shared log consumers use `try_new` to retain their Kernel error contracts.
+    pub(crate) fn try_new_for_snapshot(
+        listed_files: LogSegmentFiles,
+        log_root: Url,
+        time_travel_version: Option<Version>,
+        checkpoint_hint: Option<LastCheckpointHint>,
+    ) -> crate::Result<Self> {
+        let checkpoint_version = listed_files
+            .checkpoint_parts
+            .first()
+            .map(|file| file.version);
+        let first_replay_version = listed_files
+            .ascending_commit_files
+            .iter()
             .find(|file| checkpoint_version.is_none_or(|checkpoint| file.version > checkpoint))
             .map(|file| file.version);
         let target_version = time_travel_version.or_else(|| {
-            listed_files.ascending_commit_files.last().map(|file| file.version)
+            listed_files
+                .ascending_commit_files
+                .last()
+                .map(|file| file.version)
         });
+        let gap_versions = listed_files.ascending_commit_files.windows(2)
+            .any(|pair| {
+                checkpoint_version.is_none_or(|checkpoint| pair[0].version > checkpoint)
+                    && pair[0].version.checked_add(1).is_some_and(|next| next < pair[1].version)
+            })
+            .then(|| listed_files.ascending_commit_files.iter()
+                .filter(|file| checkpoint_version.is_none_or(|checkpoint| file.version > checkpoint))
+                .map(|file| file.version).collect::<Vec<_>>());
         let table_root = log_root.join("../").map_err(crate::KernelError::from)?;
-        LogSegment::try_new(listed_files, log_root.clone(), time_travel_version, checkpoint_hint).map_err(
-            |error| match error {
-                KernelError::EmptyLog if time_travel_version.is_none() => {
-                    crate::DeltaError::path_does_not_exist(table_root, error).into()
-                }
-                KernelError::MissingVersion(missing)
-                    if checkpoint_version.and_then(|version| version.checked_add(1)) == Some(missing)
-                        && first_replay_version.is_some_and(|version| version > missing) => {
-                    match (target_version, checkpoint_version) {
-                        (Some(target), Some(checkpoint)) => crate::DeltaError::log_file_not_found(
-                            target, checkpoint, &log_root, error,
-                        ).into(),
-                        _ => error.into(),
-                    }
-                }
-                other => other.into(),
-            },
+        LogSegment::try_new(
+            listed_files,
+            log_root.clone(),
+            time_travel_version,
+            checkpoint_hint,
         )
+        .map_err(|error| match error {
+            KernelError::EmptyLog if time_travel_version.is_none() => {
+                crate::DeltaError::path_does_not_exist(table_root, error).into()
+            }
+            KernelError::MissingVersion(missing)
+                if checkpoint_version.and_then(|version| version.checked_add(1))
+                    == Some(missing)
+                    && first_replay_version.is_some_and(|version| version > missing) =>
+            {
+                match (target_version, checkpoint_version) {
+                    (Some(target), Some(checkpoint)) => {
+                        crate::DeltaError::log_file_not_found(target, checkpoint, &log_root, error)
+                            .into()
+                    }
+                    _ => error.into(),
+                }
+            }
+            KernelError::MissingVersion(_) if gap_versions.is_some() => {
+                match (gap_versions, target_version) {
+                    (Some(versions), Some(target)) => {
+                        match (versions.first().copied(), versions.last().copied()) {
+                            (Some(start), Some(end)) => crate::DeltaError::versions_not_contiguous(
+                                versions, start, end, target, error,
+                            ).into(),
+                            _ => error.into(),
+                        }
+                    }
+                    _ => error.into(),
+                }
+            }
+            other => other.into(),
+        })
     }
 
     /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between

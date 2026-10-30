@@ -36,6 +36,29 @@ pub struct DeltaErrorParameter {
 }
 
 impl DeltaError {
+    /// Reports the observed `versions` and required bounds while loading `version_to_load`.
+    /// Bounds describe the commit interval being validated, not the table's retained history.
+    pub(crate) fn versions_not_contiguous(
+        versions: impl IntoIterator<Item = crate::Version>,
+        start_version: crate::Version,
+        end_version: crate::Version,
+        version_to_load: crate::Version,
+        source: super::KernelError,
+    ) -> Self {
+        let versions = versions.into_iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
+        Self::new(
+            DeltaErrorCondition::DeltaVersionsNotContiguous,
+            vec![
+                DeltaErrorParameter::new("versionList", versions),
+                DeltaErrorParameter::new("startVersion", start_version),
+                DeltaErrorParameter::new("endVersion", end_version),
+                DeltaErrorParameter::new("versionToLoad", version_to_load),
+            ],
+            Some(Box::new(source)),
+        )
+    }
+
+
     /// Reports missing replay files for `version` after `checkpoint_version` in `log_path`.
     /// The original listing or read failure remains available as the diagnostic source.
     pub(crate) fn log_file_not_found(
@@ -54,7 +77,6 @@ impl DeltaError {
             Some(Box::new(source)),
         )
     }
-
 
     /// Constructs a catalog error for downstream tests without migrating a production call site.
     ///
