@@ -407,7 +407,7 @@ mod tests {
         with_serde: bool,
         one_file_per_worker: bool,
         dispatcher: Option<tracing::Dispatch>,
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
         let expected_paths = get_expected_paths(engine.as_ref(), &snapshot, predicate.clone())?;
@@ -508,7 +508,7 @@ mod tests {
     fn parallel_scan_metadata_phases_carry_correlation_id(
         #[case] with_serde: bool,
         #[case] expected_parallel: Option<&str>,
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         // This table has checkpoint sidecars, so the sequential phase yields a parallel phase.
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
 
@@ -991,7 +991,7 @@ mod tests {
         #[case] test_case: ParallelLogReplayCase,
         #[values(false, true)] with_serde: bool,
         #[values(false, true)] one_file_per_worker: bool,
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         use test_utils::LoggingTest;
 
         // Set up log capture
@@ -1021,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_with_skip_stats() -> KernelResult<()> {
+    fn test_parallel_with_skip_stats() -> crate::Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
 
         // Get expected paths using single-node scan_metadata with skip_stats=true
@@ -1094,7 +1094,7 @@ mod tests {
     /// Sequential-only tables (single-part checkpoint, no sidecars) emit exactly one
     /// `ScanMetadataCompleted` event with `ScanType::SequentialPhase` when `finish()` is called.
     #[test]
-    fn sequential_done_phase_emits_sequential_scan_metadata_completed_event() -> KernelResult<()> {
+    fn sequential_done_phase_emits_sequential_scan_metadata_completed_event() -> crate::Result<()> {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
@@ -1131,7 +1131,7 @@ mod tests {
     /// `ScanMetadataCompleted` events. The `operation_id` must be the same on both
     /// events so callers can correlate them.
     #[test]
-    fn parallel_scan_emits_correlated_sequential_and_parallel_events() -> KernelResult<()> {
+    fn parallel_scan_emits_correlated_sequential_and_parallel_events() -> crate::Result<()> {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 

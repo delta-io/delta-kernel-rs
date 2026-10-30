@@ -398,7 +398,7 @@ pub(crate) mod adaptive_metadata_fixtures {
     }
 
     /// Creates an empty in-memory table and returns its engine and table-root URL.
-    pub(crate) fn setup_table() -> KernelResult<(SyncEngine, Url)> {
+    pub(crate) fn setup_table() -> crate::Result<(SyncEngine, Url)> {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///", schema, "test", true)
@@ -1214,7 +1214,7 @@ pub(crate) fn test_deep_nested_schema_missing_leaf_cm() -> StructType {
 pub(crate) fn setup_column_mapping_txn(
     schema: SchemaRef,
     mode: ColumnMappingMode,
-) -> KernelResult<(Arc<dyn Engine>, Transaction<CreateTable>)> {
+) -> crate::Result<(Arc<dyn Engine>, Transaction<CreateTable>)> {
     let mode_str = match mode {
         ColumnMappingMode::Name => "name",
         ColumnMappingMode::Id => "id",
@@ -1336,7 +1336,7 @@ pub(crate) fn copy_test_table(table_name: &str) -> KernelResult<(Url, TempDir)> 
 /// for the duration of the test to prevent premature cleanup of extracted files.
 pub(crate) fn load_test_table(
     table_name: &str,
-) -> KernelResult<(Arc<dyn Engine>, SnapshotRef, Option<TempDir>)> {
+) -> crate::Result<(Arc<dyn Engine>, SnapshotRef, Option<TempDir>)> {
     let (path, tempdir) = resolve_test_table_path(table_name)?;
 
     let url = Url::from_directory_path(&path)

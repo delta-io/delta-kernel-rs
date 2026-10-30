@@ -17,7 +17,13 @@ pub enum AssertionError {
     InvalidTestCase,
 
     #[error("Kernel error: {0}")]
-    KernelError(#[from] KernelError),
+    KernelError(#[from] delta_kernel::Error),
+}
+
+impl From<KernelError> for AssertionError {
+    fn from(error: KernelError) -> Self {
+        Self::KernelError(error.into())
+    }
 }
 
 pub type TestResult<T, E = AssertionError> = std::result::Result<T, E>;

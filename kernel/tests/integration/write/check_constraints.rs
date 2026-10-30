@@ -71,7 +71,7 @@ async fn write_table(
     table_path: &str,
     writer_features: &[&str],
     constraints: &[(&str, &str)],
-) -> KernelResult<Url> {
+) -> delta_kernel::Result<Url> {
     let table_url = Url::from_directory_path(table_path).expect("table path must be a URL");
     let schema = schema_ref! {
         nullable "amount": LONG,
@@ -90,7 +90,7 @@ async fn write_table(
     let metadata = json!({"metaData": {
         "id": "test-id",
         "format": {"provider": "parquet", "options": {}},
-        "schemaString": serde_json::to_string(schema.as_ref())?,
+        "schemaString": serde_json::to_string(schema.as_ref()).map_err(delta_kernel::KernelError::from)?,
         "partitionColumns": [],
         "configuration": configuration,
         "createdTime": 1_700_000_000_000_i64,
@@ -109,7 +109,7 @@ async fn write_table(
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_and_transaction_return_stored_constraints_in_name_order(
     #[values(false, true)] checkpoint: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup_mt()?;
     let constraints = [
         ("NonEmptyName", "name != ''"),
@@ -150,7 +150,7 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_constraints(
     #[values(true, false)] declares_constraints: bool,
     #[values(true, false)] acknowledge: bool,
     #[values(true, false)] discover_first: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let constraints = if declares_constraints {
         POSITIVE_AMOUNT
@@ -209,7 +209,8 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_constraints(
 }
 
 #[tokio::test]
-async fn constraints_without_feature_are_discoverable_but_txn_build_fails() -> KernelResult<()> {
+async fn constraints_without_feature_are_discoverable_but_txn_build_fails(
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = write_table(&table_path, &[], POSITIVE_AMOUNT).await?;
 
@@ -227,7 +228,7 @@ async fn constraints_without_feature_are_discoverable_but_txn_build_fails() -> K
 #[tokio::test]
 async fn alter_table_commit_succeeds_only_with_ack_and_keeps_constraints(
     #[values(true, false)] acknowledge: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = write_table(&table_path, CHECK_CONSTRAINTS_FEATURE, POSITIVE_AMOUNT).await?;
 

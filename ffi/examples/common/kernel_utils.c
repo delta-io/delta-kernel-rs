@@ -21,7 +21,11 @@ void print_diag(char* fmt, ...)
 void print_error(const char* msg, Error* err)
 {
   printf("[ERROR] %s\n", msg);
-  printf("  Kernel Code: %i\n", err->etype.etype);
+  if (err->condition) {
+    printf("  Delta Condition: %s\n", err->condition);
+  } else {
+    printf("  Kernel Code: %i\n", err->etype.etype);
+  }
   printf("  Kernel Msg: %s\n", err->msg);
 }
 
@@ -29,6 +33,7 @@ void print_error(const char* msg, Error* err)
 void free_error(Error* error)
 {
   free(error->msg);
+  free(error->condition);
   free(error);
 }
 
@@ -38,6 +43,7 @@ EngineError* allocate_error(FFIKernelError etype, const KernelStringSlice msg)
 {
   Error* error = malloc(sizeof(Error));
   error->etype.etype = etype;
+  error->condition = NULL;
   char* charmsg = allocate_string(msg);
   error->msg = charmsg;
   return (EngineError*)error;
@@ -565,3 +571,23 @@ void print_metric(MetricEvent event) {
   default: printf("\n\n WARNING: Got an unknown metric \n\n"); return;
   }
 }
+
+static ConnectorError* allocate_kernel_error(void* context, const KernelErrorAllocation* descriptor)
+{
+  (void)context;
+  return (ConnectorError*)allocate_error(descriptor->code, descriptor->message);
+}
+
+static ConnectorError* allocate_delta_error(void* context, const DeltaErrorAllocation* descriptor)
+{
+  (void)context;
+  Error* error = (Error*)allocate_error(GenericError, descriptor->message);
+  error->condition = allocate_string(descriptor->condition);
+  return (ConnectorError*)error;
+}
+
+const ErrorAllocators error_allocators = {
+  .context = NULL,
+  .allocate_kernel_error = allocate_kernel_error,
+  .allocate_delta_error = allocate_delta_error,
+};

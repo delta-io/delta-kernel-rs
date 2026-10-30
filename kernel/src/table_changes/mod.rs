@@ -257,7 +257,7 @@ impl TableChanges {
         engine: &dyn Engine,
         start_version: Version,
         end_version: Option<Version>,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         Self::try_new_internal(
             table_root,
             engine,
@@ -298,7 +298,7 @@ impl TableChanges {
         engine: &dyn Engine,
         start_version: Version,
         end_version: Option<Version>,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         Self::try_new_internal(
             table_root,
             engine,
@@ -314,8 +314,10 @@ impl TableChanges {
         start_version: Version,
         end_version: Option<Version>,
         mode: CdfMode,
-    ) -> KernelResult<Self> {
-        let log_root = table_root.join("_delta_log/")?;
+    ) -> crate::Result<Self> {
+        let log_root = table_root
+            .join("_delta_log/")
+            .map_err(crate::KernelError::from)?;
         let log_segment = LogSegment::for_table_changes(
             engine.storage_handler().as_ref(),
             log_root,
@@ -363,21 +365,21 @@ impl TableChanges {
             let properties = end_snapshot.table_properties();
             require!(
                 properties.materialized_row_id_column_name.is_some(),
-                KernelError::generic(format!(
+                crate::Error::Kernel(KernelError::generic(format!(
                     "Row tracking is enabled at version {}, but metadata property {} is missing",
                     end_snapshot.version(),
                     MATERIALIZED_ROW_ID_COLUMN_NAME
-                ))
+                )))
             );
             require!(
                 properties
                     .materialized_row_commit_version_column_name
                     .is_some(),
-                KernelError::generic(format!(
+                crate::Error::Kernel(KernelError::generic(format!(
                     "Row tracking is enabled at version {}, but metadata property {} is missing",
                     end_snapshot.version(),
                     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME
-                ))
+                )))
             );
         }
 
@@ -386,7 +388,9 @@ impl TableChanges {
         let start_schema = start_snapshot.schema();
         let end_schema = end_snapshot.schema();
         if !mode.schemas_compatible(start_schema.as_ref(), end_schema.as_ref()) {
-            return Err(mode.boundary_schema_error(start_schema.as_ref(), end_schema.as_ref()));
+            return Err(crate::Error::Kernel(
+                mode.boundary_schema_error(start_schema.as_ref(), end_schema.as_ref()),
+            ));
         }
 
         let schema = try_schema! {
@@ -614,7 +618,9 @@ mod tests {
             );
             assert!(matches!(
                 res,
-                Err(KernelError::ChangeDataFeedUnsupported(_))
+                Err(crate::Error::Kernel(
+                    KernelError::ChangeDataFeedUnsupported(_)
+                ))
             ))
         }
     }
@@ -627,7 +633,9 @@ mod tests {
 
         // A field in the schema goes from being nullable to non-nullable
         let table_changes_res = TableChanges::try_new(url, engine.as_ref(), 3, Some(4));
-        assert!(matches!(table_changes_res, Err(KernelError::Generic(msg)) if msg == expected_msg));
+        assert!(
+            matches!(table_changes_res, Err(crate::Error::Kernel(KernelError::Generic(msg))) if msg == expected_msg)
+        );
     }
 
     #[test]
@@ -707,7 +715,12 @@ mod tests {
         let url = delta_kernel::try_parse_uri(path).unwrap();
         let res = TableChanges::try_new_row_tracking_cdf_listing(url, engine.as_ref(), 0, Some(1));
         assert!(
-            matches!(&res, Err(KernelError::RowTrackingChangeFeedUnsupported(_))),
+            matches!(
+                &res,
+                Err(crate::Error::Kernel(
+                    KernelError::RowTrackingChangeFeedUnsupported(_)
+                ))
+            ),
             "expected a row-tracking-disabled error, got {res:?}"
         );
     }
@@ -758,7 +771,9 @@ mod tests {
         assert!(
             matches!(
                 &res,
-                Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+                Err(crate::Error::Kernel(
+                    KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+                ))
             ),
             "expected an incompatible start schema to be rejected, got {res:?}"
         );

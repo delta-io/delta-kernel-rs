@@ -6,13 +6,16 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 #[cfg(test)]
-use delta_kernel::{object_store::memory::InMemory, Engine, KernelResult};
+use delta_kernel::{object_store::memory::InMemory, Engine};
 #[cfg(test)]
 use delta_kernel_default_engine::DefaultEngineBuilder;
 #[cfg(test)]
 use test_utils::add_commit;
 
-use crate::error::{AllocateError, AllocateErrorFn, EngineError, ExternResult, FFIKernelError};
+use crate::error::allocation::{
+    ConnectorError, DeltaErrorAllocation, ErrorAllocators, KernelErrorAllocation,
+};
+use crate::error::{EngineError, ExternResult, FFIKernelError};
 #[cfg(test)]
 use crate::{
     engine_to_handle, free_snapshot, get_snapshot_builder, kernel_string_slice,
@@ -31,6 +34,7 @@ use crate::{KernelBytesSlice, KernelStringSlice, NullableCvoid, TryFromStringSli
 pub(crate) struct EngineErrorWithMessage {
     pub(crate) etype: FFIKernelError,
     pub(crate) message: String,
+    pub(crate) condition: Option<String>,
 }
 
 #[unsafe(no_mangle)]
@@ -39,7 +43,11 @@ pub(crate) extern "C" fn allocate_err(
     message: KernelStringSlice,
 ) -> *mut EngineError {
     let message = unsafe { String::try_from_slice(&message).unwrap() };
-    let boxed = Box::new(EngineErrorWithMessage { etype, message });
+    let boxed = Box::new(EngineErrorWithMessage {
+        etype,
+        message,
+        condition: None,
+    });
 
     Box::into_raw(boxed) as *mut EngineError
 }
@@ -88,7 +96,7 @@ pub(crate) fn ok_or_panic<T>(result: ExternResult<T>) -> T {
 }
 
 struct ErrorOnlyExternEngine {
-    allocate_error: AllocateErrorFn,
+    allocate_error: ErrorAllocators,
 }
 
 impl ExternEngine for ErrorOnlyExternEngine {
@@ -96,7 +104,7 @@ impl ExternEngine for ErrorOnlyExternEngine {
         panic!("error-only test engine does not expose a kernel engine")
     }
 
-    fn error_allocator(&self) -> &dyn AllocateError {
+    fn error_allocators(&self) -> &ErrorAllocators {
         &self.allocate_error
     }
 }
@@ -104,7 +112,7 @@ impl ExternEngine for ErrorOnlyExternEngine {
 /// Return a lightweight engine handle for tests that only exercise FFI error allocation.
 pub(crate) fn error_only_engine_handle() -> crate::handle::Handle<SharedExternEngine> {
     let engine: Arc<dyn ExternEngine> = Arc::new(ErrorOnlyExternEngine {
-        allocate_error: allocate_err,
+        allocate_error: ERROR_ALLOCATORS,
     });
     engine.into()
 }
@@ -155,7 +163,7 @@ pub(crate) fn engine_handle_for_store(
     store: Arc<delta_kernel::object_store::DynObjectStore>,
 ) -> crate::handle::Handle<SharedExternEngine> {
     let engine = DefaultEngineBuilder::new(store).build();
-    engine_to_handle(Arc::new(engine), allocate_err)
+    engine_to_handle(Arc::new(engine), crate::ffi_test_utils::ERROR_ALLOCATORS)
 }
 
 /// Create an in-memory engine and snapshot from the given commit data. Returns
@@ -163,7 +171,7 @@ pub(crate) fn engine_handle_for_store(
 #[cfg(test)]
 pub(crate) async fn setup_snapshot(
     commit_data: String,
-) -> KernelResult<(
+) -> delta_kernel::Result<(
     crate::handle::Handle<crate::SharedExternEngine>,
     crate::handle::Handle<crate::SharedSnapshot>,
 )> {
@@ -171,7 +179,7 @@ pub(crate) async fn setup_snapshot(
     let storage = Arc::new(InMemory::new());
     add_commit(table_root, storage.as_ref(), 0, commit_data).await?;
     let engine = DefaultEngineBuilder::new(storage.clone()).build();
-    let engine = engine_to_handle(Arc::new(engine), allocate_err);
+    let engine = engine_to_handle(Arc::new(engine), crate::ffi_test_utils::ERROR_ALLOCATORS);
     let snap = unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
     Ok((engine, snap))
 }
@@ -280,4 +288,65 @@ mod tests {
         let value = ok_or_panic(result);
         assert_eq!(value, 42);
     }
+}
+
+/// Allocators for tests that recover connector errors as `EngineErrorWithMessage`.
+pub(crate) const ERROR_ALLOCATORS: ErrorAllocators = ErrorAllocators {
+    context: std::ptr::null_mut(),
+    allocate_kernel_error: allocate_kernel,
+    allocate_delta_error: allocate_delta,
+};
+
+/// Allocators for tests exercising allocation failure.
+pub(crate) const NULL_ERROR_ALLOCATORS: ErrorAllocators = ErrorAllocators {
+    context: std::ptr::null_mut(),
+    allocate_kernel_error: allocate_null_kernel,
+    allocate_delta_error: allocate_null_delta,
+};
+
+unsafe extern "C" fn allocate_kernel(
+    _: *mut c_void,
+    error: *const KernelErrorAllocation,
+) -> *mut ConnectorError {
+    let error = unsafe { &*error };
+    let message = unsafe { error.message.try_to_string() }.unwrap();
+    allocate_err(error.code, crate::kernel_string_slice!(message)).cast()
+}
+
+unsafe extern "C" fn allocate_delta(
+    _: *mut c_void,
+    error: *const DeltaErrorAllocation,
+) -> *mut ConnectorError {
+    let error = unsafe { &*error };
+    let message = unsafe { error.message.try_to_string() }.unwrap();
+    let condition = Some(unsafe { error.condition.try_to_string() }.unwrap());
+    Box::into_raw(Box::new(EngineErrorWithMessage {
+        etype: FFIKernelError::GenericError,
+        message,
+        condition,
+    }))
+    .cast()
+}
+
+/// Requires a structured Delta classification and frees the test connector allocation.
+pub(crate) fn assert_extern_result_delta_error<T>(result: ExternResult<T>, condition: &str) {
+    let ExternResult::Err(error) = result else {
+        panic!("expected a Delta error")
+    };
+    let error = unsafe { recover_error(error) };
+    assert_eq!(error.condition.as_deref(), Some(condition));
+}
+
+unsafe extern "C" fn allocate_null_kernel(
+    _: *mut c_void,
+    _: *const KernelErrorAllocation,
+) -> *mut ConnectorError {
+    std::ptr::null_mut()
+}
+
+unsafe extern "C" fn allocate_null_delta(
+    _: *mut c_void,
+    _: *const DeltaErrorAllocation,
+) -> *mut ConnectorError {
+    std::ptr::null_mut()
 }

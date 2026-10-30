@@ -288,7 +288,7 @@ The REST authentication callback similarly fills a caller-provided record:
 pub type CAuthHeaderCallback = extern "C" fn(
     context: NullableCvoid,
     out: *mut CAuthHeaders,
-    allocate_error: AllocateErrorFn,
+    allocate_error: *const ErrorAllocators,
 );
 ```
 
@@ -451,33 +451,25 @@ There are two error directions, with opposite message owners:
 
 | Direction | Result envelope | Message construction | Final owner |
 | :---- | :---- | :---- | :---- |
-| Kernel to engine | `ExternResult<T>::Err(*mut EngineError)` | Kernel calls the engine's `AllocateErrorFn` with a temporary `KernelStringSlice`. | The engine owns and frees the returned `EngineError`. |
+| Kernel to engine | `ExternResult<T>::Err(*mut EngineError)` | Kernel selects a callback from the engine's `ErrorAllocators` table using the outer error variant. | The engine owns and frees the returned `EngineError`. |
 | Engine to Kernel | `EngineExecResult<T>::Failure(EngineExecError)` | The engine calls `allocate_kernel_string` to copy its message into an `ExclusiveRustString` handle. | Kernel consumes and frees the string handle. |
 
 #### Kernel errors returned to the engine
 
-`AllocateErrorFn` is the one underlying ABI:
+Engine construction registers a borrowed `*const ErrorAllocators`. Kernel copies the table,
+including its connector context, into the builder and engine. Context and callbacks must remain
+valid through all derived iterator uses and support concurrent invocation. A Kernel failure invokes
+`allocate_kernel_error`; a Delta failure invokes `allocate_delta_error`, including when it retains a
+Kernel source. Only the selected callback runs. The descriptor and its nested strings/slices are
+borrowed until the callback returns; the connector copies any data it retains.
 
-```rust
-pub type AllocateErrorFn = extern "C" fn(
-    error_type: FFIKernelError,
-    message: KernelStringSlice,
-) -> *mut EngineError;
-```
+Success bypasses allocation. The connector owns the returned allocation, which Kernel passes through
+unchanged in `ExternResult::Err`, including NULL on allocation failure. Kernel never reads or frees
+that allocation. Engine errors and native-source transport require a separate ABI change.
 
-Kernel may reach it in two ways:
-
-```rust
-result.into_extern_result(&allocate_error); // No engine handle exists yet.
-result.into_extern_result(&engine.as_ref()); // The engine stores the callback.
-```
-
-Use the allocator stored on the engine, builder, or another live owner when one is already
-available. Accept an explicit `AllocateErrorFn` only when the API has no such owner, for example
-while constructing an engine or inside a standalone visitor API. Do not require both. In either
-form, Kernel owns the source message only until `AllocateErrorFn` returns. The callback must copy
-the message into engine-owned memory and return an `EngineError` pointer. Kernel immediately places
-that pointer in ExternResult::Err and never frees it.
+Kernel-only standalone utilities retain `AllocateErrorFn` for numeric-code/message allocation.
+REST authentication callbacks receive the registered table and use
+`allocate_kernel_string_with_allocators` when producing Rust string handles.
 
 #### Engine errors returned to Kernel
 

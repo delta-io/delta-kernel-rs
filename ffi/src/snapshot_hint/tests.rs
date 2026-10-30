@@ -22,8 +22,7 @@ use super::*;
 use crate::delta_types::*;
 use crate::error::FFIKernelError;
 use crate::ffi_test_utils::{
-    allocate_err, assert_extern_result_error_contains, assert_extern_result_error_with_message,
-    ok_or_panic,
+    assert_extern_result_error_contains, assert_extern_result_error_with_message, ok_or_panic,
 };
 use crate::log_path::FfiLogPath;
 use crate::{
@@ -140,7 +139,10 @@ fn empty_crc() -> FfiCrc {
 }
 
 fn test_engine() -> Handle<SharedExternEngine> {
-    engine_to_handle(Arc::new(NoIoEngine), allocate_err)
+    engine_to_handle(
+        Arc::new(NoIoEngine),
+        crate::ffi_test_utils::ERROR_ALLOCATORS,
+    )
 }
 
 #[rstest::rstest]

@@ -865,7 +865,7 @@ mod tests {
         miri,
         ignore = "local-filesystem commit calls `linkat`, unsupported under Miri"
     )]
-    async fn test_partitioned_append() -> KernelResult<()> {
+    async fn test_partitioned_append() -> delta_kernel::Result<()> {
         // Partition column `part` is listed last in the schema; the physical write schema must
         // exclude it (CM=none, partition columns are not materialized).
         let schema = schema_ref! {
@@ -923,7 +923,8 @@ mod tests {
             let write_dir_str = recover_string(
                 unsafe { get_write_dir(write_context.shallow_copy(), allocate_str) }.unwrap(),
             );
-            let write_dir_url = Url::parse(&write_dir_str)?;
+            let write_dir_url =
+                Url::parse(&write_dir_str).map_err(delta_kernel::KernelError::from)?;
             assert!(
                 write_dir_url.path().ends_with("part=100/"),
                 "unexpected write dir: {write_dir_str}"
@@ -955,22 +956,30 @@ mod tests {
             ])
             .unwrap();
             let dir_path = write_dir_url.to_file_path().unwrap();
-            std::fs::create_dir_all(&dir_path)?;
+            std::fs::create_dir_all(&dir_path).map_err(delta_kernel::KernelError::from)?;
             let file_name = "my_file.parquet";
             let file_fs_path = dir_path.join(file_name);
-            let parquet_file = std::fs::File::create(&file_fs_path)?;
+            let parquet_file =
+                std::fs::File::create(&file_fs_path).map_err(delta_kernel::KernelError::from)?;
             let mut writer = ArrowWriter::try_new(
                 parquet_file,
                 batch.schema(),
                 Some(WriterProperties::builder().build()),
-            )?;
-            writer.write(&batch)?;
-            let parquet_meta = writer.close()?;
+            )
+            .map_err(delta_kernel::KernelError::from)?;
+            writer
+                .write(&batch)
+                .map_err(delta_kernel::KernelError::from)?;
+            let parquet_meta = writer.close().map_err(delta_kernel::KernelError::from)?;
             let num_rows = parquet_meta.file_metadata().num_rows();
-            let size = std::fs::metadata(&file_fs_path)?.len();
+            let size = std::fs::metadata(&file_fs_path)
+                .map_err(delta_kernel::KernelError::from)?
+                .len();
 
             // Resolve the relative add.path from the absolute file URL.
-            let file_url = write_dir_url.join(file_name)?;
+            let file_url = write_dir_url
+                .join(file_name)
+                .map_err(delta_kernel::KernelError::from)?;
             let file_url_str = file_url.as_str();
             let add_path = recover_string(
                 ok_or_panic(unsafe {
@@ -991,7 +1000,8 @@ mod tests {
             );
             let metadata_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() }
                 .as_ref()
-                .try_into_arrow()?;
+                .try_into_arrow()
+                .map_err(delta_kernel::KernelError::from)?;
             let file_info = create_arrow_ffi_from_json(metadata_schema, &metadata_json)?;
             let file_info_engine_data = ok_or_panic(unsafe {
                 get_engine_data(file_info.array, &file_info.schema, allocate_err)
@@ -1008,10 +1018,17 @@ mod tests {
                 .unwrap();
             let commit1 = store
                 .get(&Path::from_url_path(commit1_url.path()).unwrap())
-                .await?;
-            let parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
-                .into_iter::<serde_json::Value>()
-                .try_collect()?;
+                .await
+                .map_err(delta_kernel::KernelError::from)?;
+            let parsed_commits: Vec<_> = Deserializer::from_slice(
+                &commit1
+                    .bytes()
+                    .await
+                    .map_err(delta_kernel::KernelError::from)?,
+            )
+            .into_iter::<serde_json::Value>()
+            .try_collect()
+            .map_err(delta_kernel::KernelError::from)?;
             let add = &parsed_commits[1]["add"];
             assert_eq!(add["path"], json!("part=100/my_file.parquet"));
             assert_eq!(add["partitionValues"], json!({ "part": "100" }));
@@ -2117,7 +2134,7 @@ mod tests {
     async fn create_table_transaction_ids(
         #[case] builder_ids: usize,
         #[case] duplicate_app_id: bool,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         let (store, test_engine, table_url) =
             test_utils::engine_store_setup("test_create_transaction_ids", None);
         let (_table_path, engine, mut builder) = create_table_txn_builder(
@@ -3617,7 +3634,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_table_with_clustering_column_paths(
         #[case] column_mapping: bool,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         let (store, test_engine, table_url) =
             test_utils::engine_store_setup("clustering_paths", None);
         let engine = engine_handle_for_store(Arc::clone(&store));
@@ -4367,7 +4384,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_table_txn_builder_applies_nested_schema_changes() -> KernelResult<()> {
+    async fn test_update_table_txn_builder_applies_nested_schema_changes(
+    ) -> delta_kernel::Result<()> {
         let (store, kernel_engine, table_url) =
             test_utils::engine_store_setup("test_nested_schema_changes", None);
         let nested =
@@ -4567,7 +4585,7 @@ mod tests {
     fn assert_no_active_files(
         kernel_engine: &Arc<dyn delta_kernel::Engine>,
         table_path: &str,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         let snapshot =
             delta_kernel::snapshot::Snapshot::builder_for(delta_kernel::try_parse_uri(table_path)?)
                 .build(kernel_engine.as_ref())?;
@@ -4598,7 +4616,7 @@ mod tests {
     async fn setup_remove_files_test(
         store: &Arc<DynObjectStore>,
         table_url: &Url,
-    ) -> KernelResult<(
+    ) -> delta_kernel::Result<(
         Box<dyn delta_kernel::EngineData>,
         Vec<bool>,
         Handle<ExclusiveUpdateTableTransaction>,
@@ -4638,7 +4656,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remove_files_with_null_sv_commits_and_removes_all() -> KernelResult<()> {
+    async fn test_remove_files_with_null_sv_commits_and_removes_all() -> delta_kernel::Result<()> {
         let (store, _test_engine, table_url) =
             test_utils::engine_store_setup("test_remove_files", None);
         let (data, sv, txn, engine, kernel_engine, table_path) =
@@ -4689,7 +4707,7 @@ mod tests {
 
     /// End-to-end FFI round trip for connector-authored deletion vector updates.
     #[tokio::test]
-    async fn test_dv_update_round_trip_via_ffi() -> KernelResult<()> {
+    async fn test_dv_update_round_trip_via_ffi() -> delta_kernel::Result<()> {
         use delta_kernel::actions::deletion_vector_writer::{
             KernelDeletionVector, StreamingDeletionVectorWriter,
         };
@@ -4721,17 +4739,22 @@ mod tests {
         let batch = RecordBatch::try_from_iter(vec![(
             "id",
             Arc::new(Int32Array::from(vec![10, 20, 30, 40])) as ArrayRef,
-        )])?;
+        )])
+        .map_err(delta_kernel::KernelError::from)?;
         let parquet_bytes = record_batch_to_bytes(&batch);
         let parquet_len = parquet_bytes.len();
         let data_file_path = "data_file.parquet".to_string();
-        let data_url = table_url.join(&data_file_path)?;
+        let data_url = table_url
+            .join(&data_file_path)
+            .map_err(delta_kernel::KernelError::from)?;
         store
             .put(
-                &ObjectStorePath::from_url_path(data_url.path())?,
+                &ObjectStorePath::from_url_path(data_url.path())
+                    .map_err(delta_kernel::KernelError::from)?,
                 parquet_bytes.into(),
             )
-            .await?;
+            .await
+            .map_err(delta_kernel::KernelError::from)?;
 
         // Add the file via a kernel transaction so the table has something to scan.
         // Build the kernel engine over the seeded store: `create_default_engine` resolves a fresh
@@ -4760,13 +4783,17 @@ mod tests {
         let mut dv_writer = StreamingDeletionVectorWriter::new(&mut dv_bytes);
         let dv_write_result = dv_writer.write_deletion_vector(dv)?;
         dv_writer.finalize()?;
-        let dv_url = table_url.join("connector_dv.bin")?;
+        let dv_url = table_url
+            .join("connector_dv.bin")
+            .map_err(delta_kernel::KernelError::from)?;
         store
             .put(
-                &ObjectStorePath::from_url_path(dv_url.path())?,
+                &ObjectStorePath::from_url_path(dv_url.path())
+                    .map_err(delta_kernel::KernelError::from)?,
                 dv_bytes.into(),
             )
-            .await?;
+            .await
+            .map_err(delta_kernel::KernelError::from)?;
 
         // === FFI surface under test ===
         let table_path_str = table_url.as_str();
@@ -4854,7 +4881,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remove_files_with_non_empty_sv_exercises_from_raw_parts() -> KernelResult<()> {
+    async fn test_remove_files_with_non_empty_sv_exercises_from_raw_parts(
+    ) -> delta_kernel::Result<()> {
         // Exercises the from_raw_parts code path in the remove_files FFI wrapper by passing
         // a non-null selection vector pointer with non-zero length. The null-SV test always
         // passes a null pointer because scan_metadata for a single-file table returns an

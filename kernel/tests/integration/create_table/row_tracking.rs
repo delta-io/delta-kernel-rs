@@ -17,7 +17,6 @@ use delta_kernel::table_features::{
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::KernelResult;
 use rstest::rstest;
 use test_utils::{
     get_materialized_row_tracking_column_names, get_row_tracking_add_actions, insert_data,
@@ -72,7 +71,7 @@ async fn test_create_table_with_row_tracking(
     )]
     activation: (&str, &str),
     #[values(false, true)] with_data: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (key, value) = activation;
     let expect_property_enabled = key == "delta.enableRowTracking";
 
@@ -85,7 +84,12 @@ async fn test_create_table_with_row_tracking(
 
     if with_data {
         // Write one parquet file with 5 rows
-        let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
+        let arrow_schema = Arc::new(
+            schema
+                .as_ref()
+                .try_into_arrow()
+                .map_err(delta_kernel::KernelError::from)?,
+        );
         let batch = RecordBatch::try_new(
             arrow_schema,
             vec![
@@ -193,7 +197,7 @@ async fn test_create_table_with_row_tracking(
 /// Verifies that CTAS with multiple files assigns non-overlapping baseRowId ranges and
 /// computes the correct cumulative high water mark.
 #[tokio::test]
-async fn test_create_table_with_multiple_files_and_row_tracking() -> KernelResult<()> {
+async fn test_create_table_with_multiple_files_and_row_tracking() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = super::simple_schema()?;
@@ -201,8 +205,12 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> KernelResul
         .with_table_properties([("delta.enableRowTracking", "true")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-    let arrow_schema: Arc<delta_kernel::arrow::datatypes::Schema> =
-        Arc::new(schema.as_ref().try_into_arrow()?);
+    let arrow_schema: Arc<delta_kernel::arrow::datatypes::Schema> = Arc::new(
+        schema
+            .as_ref()
+            .try_into_arrow()
+            .map_err(delta_kernel::KernelError::from)?,
+    );
 
     // Write two separate parquet files: 3 rows and 5 rows
     let batch1 = RecordBatch::try_new(
@@ -268,7 +276,7 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> KernelResul
 /// DomainMetadata, which should appear exactly once in the protocol. Both domain metadata
 /// entries (delta.rowTracking and delta.clustering) should be present in the commit.
 #[test]
-fn test_create_table_with_row_tracking_and_clustering() -> KernelResult<()> {
+fn test_create_table_with_row_tracking_and_clustering() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let committed = create_table(&table_path, super::simple_schema()?, "Test/1.0", true)
@@ -319,7 +327,7 @@ fn test_create_table_with_row_tracking_and_clustering() -> KernelResult<()> {
 /// Both features generate domain metadata and the add files need row tracking columns.
 /// Verifies that both domain metadata entries survive when add files are also written.
 #[tokio::test]
-async fn test_create_table_with_row_tracking_and_clustering_and_data() -> KernelResult<()> {
+async fn test_create_table_with_row_tracking_and_clustering_and_data() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = super::simple_schema()?;
@@ -328,7 +336,12 @@ async fn test_create_table_with_row_tracking_and_clustering_and_data() -> Kernel
         .with_data_layout(DataLayout::clustered(["id"]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-    let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
+    let arrow_schema = Arc::new(
+        schema
+            .as_ref()
+            .try_into_arrow()
+            .map_err(delta_kernel::KernelError::from)?,
+    );
     let batch = RecordBatch::try_new(
         arrow_schema,
         vec![
@@ -407,7 +420,8 @@ async fn test_create_table_with_row_tracking_and_clustering_and_data() -> Kernel
 /// subsequent data append. The initial create writes `rowIdHighWaterMark = -1`; the append must
 /// read that and assign `baseRowId = 0` to the first file.
 #[tokio::test]
-async fn test_feature_signal_create_then_append_assigns_correct_base_row_id() -> KernelResult<()> {
+async fn test_feature_signal_create_then_append_assigns_correct_base_row_id(
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create empty table with feature signal only (no enablement property)

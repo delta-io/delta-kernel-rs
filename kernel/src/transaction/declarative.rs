@@ -92,7 +92,7 @@ mod tests {
         #[values(false, true)] add_files: bool,
         #[values(false, true)] remove_files: bool,
         #[values(false, true)] update_dvs: bool,
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
@@ -125,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_returns_unsupported_error() -> KernelResult<()> {
+    fn commit_returns_unsupported_error() -> crate::Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)

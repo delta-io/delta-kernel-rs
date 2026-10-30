@@ -257,7 +257,7 @@ fn is_file_not_found_error(error: &Error) -> bool {
     }
 }
 
-fn expected_error_matches(expected: &ExpectedError, actual: &Error) -> bool {
+fn expected_kernel_error_matches(expected: &ExpectedError, actual: &Error) -> bool {
     let actual = actual.without_backtrace();
     match (expected.error_code.as_str(), actual) {
         (
@@ -330,7 +330,29 @@ fn expected_error_matches(expected: &ExpectedError, actual: &Error) -> bool {
     }
 }
 
-fn validate_expected_error(actual: &Error, expected: &ExpectedError) -> KernelResult<(), String> {
+fn expected_error_matches(expected: &ExpectedError, actual: &delta_kernel::Error) -> bool {
+    match actual {
+        delta_kernel::Error::Kernel(error) => expected_kernel_error_matches(expected, error),
+        delta_kernel::Error::Delta(error) => {
+            expected.error_code == error.name()
+                || matches!(
+                    (expected.error_code.as_str(), error.name()),
+                    (
+                        "DELTA_TABLE_NOT_FOUND"
+                            | "DELTA_MISSING_TRANSACTION_LOG"
+                            | "DELTA_TRUNCATED_TRANSACTION_LOG",
+                        "DELTA_PATH_DOES_NOT_EXIST"
+                    )
+                )
+        }
+        _ => false,
+    }
+}
+
+fn validate_expected_error(
+    actual: &delta_kernel::Error,
+    expected: &ExpectedError,
+) -> KernelResult<(), String> {
     if expected_error_matches(expected, actual) {
         debug!(
             "Got expected error '{}' with message: {:?}\nKernel error: {}",
@@ -405,7 +427,7 @@ fn read_expected_data(expected_dir: &Path) -> KernelResult<RecordBatch, String> 
 
 /// Validate read results against expected outcome.
 pub fn validate_read_result(
-    result: KernelResult<ReadResult>,
+    result: delta_kernel::Result<ReadResult>,
     expected_dir: &Path,
     expected: &ReadExpected,
 ) -> KernelResult<(), String> {
@@ -449,7 +471,7 @@ pub fn validate_read_result(
 
 /// Validate snapshot result against expected outcome.
 pub fn validate_snapshot(
-    result: KernelResult<SnapshotResult>,
+    result: delta_kernel::Result<SnapshotResult>,
     time_travel: Option<&TimeTravel>,
     expected: &SnapshotExpected,
 ) -> KernelResult<(), String> {
@@ -527,23 +549,31 @@ mod tests {
     #[test]
     fn expected_error_rejects_unrelated_kernel_error() {
         let expected = expected_error("DELTA_STATE_RECOVER_ERROR");
-        assert!(validate_expected_error(&Error::MissingMetadata, &expected).is_ok());
         assert!(validate_expected_error(
-            &Error::InvalidCheckpoint(
+            &delta_kernel::Error::Kernel(Error::MissingMetadata),
+            &expected
+        )
+        .is_ok());
+        assert!(validate_expected_error(
+            &delta_kernel::Error::Kernel(Error::InvalidCheckpoint(
                 "Had a _last_checkpoint hint but didn't find any checkpoints".to_string()
-            ),
+            )),
             &expected
         )
         .is_ok());
 
-        let error = validate_expected_error(&Error::FileNotFound("x".into()), &expected)
-            .expect_err("wrong error category must fail");
+        let error = validate_expected_error(
+            &delta_kernel::Error::Kernel(Error::FileNotFound("x".into())),
+            &expected,
+        )
+        .expect_err("wrong error category must fail");
         assert!(error.contains("Expected error category 'DELTA_STATE_RECOVER_ERROR'"));
     }
 
     #[test]
     fn protocol_error_categories_do_not_overlap() {
-        let invalid_version = Error::unsupported("Unsupported minimum reader version 4");
+        let invalid_version =
+            delta_kernel::Error::Kernel(Error::unsupported("Unsupported minimum reader version 4"));
         assert!(expected_error_matches(
             &expected_error("DELTA_INVALID_PROTOCOL_VERSION"),
             &invalid_version
@@ -553,7 +583,8 @@ mod tests {
             &invalid_version
         ));
 
-        let unsupported_feature = Error::unsupported("Feature 'future' is not supported");
+        let unsupported_feature =
+            delta_kernel::Error::Kernel(Error::unsupported("Feature 'future' is not supported"));
         assert!(expected_error_matches(
             &expected_error("DELTA_UNSUPPORTED_FEATURES_FOR_READ"),
             &unsupported_feature
@@ -563,9 +594,9 @@ mod tests {
             &unsupported_feature
         ));
 
-        let feature_mismatch = Error::invalid_protocol(
+        let feature_mismatch = delta_kernel::Error::Kernel(Error::invalid_protocol(
             "Reader features must contain only ReaderWriter features that are also listed in writer features",
-        );
+        ));
         assert!(expected_error_matches(
             &expected_error("DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH"),
             &feature_mismatch
@@ -575,9 +606,9 @@ mod tests {
             &feature_mismatch
         ));
 
-        let missing_writer_features = Error::invalid_protocol(
+        let missing_writer_features = delta_kernel::Error::Kernel(Error::invalid_protocol(
             "Writer features must be present when minimum writer version = 7",
-        );
+        ));
         assert!(expected_error_matches(
             &expected_error("DELTA_UNSUPPORTED_READER_VERSION"),
             &missing_writer_features
@@ -592,7 +623,7 @@ mod tests {
     fn versions_not_contiguous_accepts_missing_version() {
         assert!(expected_error_matches(
             &expected_error("DELTA_VERSIONS_NOT_CONTIGUOUS"),
-            &Error::MissingVersion(2)
+            &delta_kernel::Error::Kernel(Error::MissingVersion(2))
         ));
     }
 
@@ -603,7 +634,7 @@ mod tests {
         );
         assert!(expected_error_matches(
             &expected_error("COLUMN_ALREADY_EXISTS"),
-            &Error::MalformedJson(malformed_json)
+            &delta_kernel::Error::Kernel(Error::MalformedJson(malformed_json))
         ));
     }
 
@@ -611,7 +642,9 @@ mod tests {
     fn unresolved_column_accepts_unknown_predicate_identifier() {
         assert!(expected_error_matches(
             &expected_error("UNRESOLVED_COLUMN"),
-            &Error::generic("Cannot determine types for: Identifier(nonExistentCol) and Value(1)")
+            &delta_kernel::Error::Kernel(Error::generic(
+                "Cannot determine types for: Identifier(nonExistentCol) and Value(1)"
+            ))
         ));
     }
 
@@ -619,15 +652,17 @@ mod tests {
     fn version_errors_match_kernel_version_failures() {
         assert!(expected_error_matches(
             &expected_error("DELTA_VERSION_NOT_FOUND"),
-            &Error::MissingVersion(2)
+            &delta_kernel::Error::Kernel(Error::MissingVersion(2))
         ));
         assert!(expected_error_matches(
             &expected_error("DELTA_VERSION_NOT_FOUND"),
-            &Error::EmptyLog
+            &delta_kernel::Error::Kernel(Error::EmptyLog)
         ));
         assert!(expected_error_matches(
             &expected_error("DELTA_TABLE_RESTORE_VERSION_INVALID"),
-            &Error::generic("Only non-negative snapshot versions are supported")
+            &delta_kernel::Error::Kernel(Error::generic(
+                "Only non-negative snapshot versions are supported"
+            ))
         ));
     }
 
@@ -636,17 +671,19 @@ mod tests {
         let expected = expected_error("FAILED_READ_FILE.DBR_FILE_NOT_EXIST");
         assert!(expected_error_matches(
             &expected,
-            &Error::FileNotFound("missing.parquet".to_string())
+            &delta_kernel::Error::Kernel(Error::FileNotFound("missing.parquet".to_string()))
         ));
         assert!(!expected_error_matches(
             &expected,
-            &Error::ObjectStore(delta_kernel::object_store::Error::Generic {
-                store: "test",
-                source: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "permission denied"
-                )),
-            })
+            &delta_kernel::Error::Kernel(Error::ObjectStore(
+                delta_kernel::object_store::Error::Generic {
+                    store: "test",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "permission denied"
+                    )),
+                }
+            ))
         ));
     }
 
@@ -654,12 +691,16 @@ mod tests {
     fn expected_categories_reject_harness_limitations() {
         assert!(!expected_error_matches(
             &expected_error("DELTA_TIMESTAMP_GREATER_THAN_COMMIT"),
-            &Error::generic("Timestamp-based time travel is not yet supported")
+            &delta_kernel::Error::Kernel(Error::generic(
+                "Timestamp-based time travel is not yet supported"
+            ))
         ));
         assert!(!expected_error_matches(
             &expected_error("DELTA_INVALID_PROTOCOL_VERSION"),
-            &Error::Arrow(delta_kernel::arrow::error::ArrowError::JsonError(
-                "metadata decode failed".to_string()
+            &delta_kernel::Error::Kernel(Error::Arrow(
+                delta_kernel::arrow::error::ArrowError::JsonError(
+                    "metadata decode failed".to_string()
+                )
             ))
         ));
     }

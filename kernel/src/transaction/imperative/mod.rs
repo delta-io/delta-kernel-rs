@@ -1055,7 +1055,7 @@ mod tests {
 
     fn existing_table_txn(
         data_change: bool,
-    ) -> KernelResult<(SyncEngine, Transaction, tempfile::TempDir)> {
+    ) -> crate::Result<(SyncEngine, Transaction, tempfile::TempDir)> {
         let (url, tempdir) = copy_test_table("table-without-dv-small")?;
         let engine = SyncEngine::new();
         let snapshot = Snapshot::builder_for(url).build(&engine)?;
@@ -1163,8 +1163,8 @@ mod tests {
     #[rstest]
     fn create_table_add_actions_preserve_data_change(
         #[values(false, true)] data_change: bool,
-    ) -> KernelResult<()> {
-        let tempdir = tempfile::tempdir()?;
+    ) -> crate::Result<()> {
+        let tempdir = tempfile::tempdir().map_err(crate::KernelError::from)?;
         let engine = SyncEngine::new();
         let mut transaction = create_table(
             tempdir.path().to_string_lossy(),
@@ -1226,7 +1226,7 @@ mod tests {
         #[case] data_change: bool,
         #[case] selection_vector: &[bool],
         #[case] expected_error: bool,
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         let (_engine, mut txn, _tempdir) = existing_table_txn(data_change)?;
         set_append_only(&mut txn, append_only)?;
         for index in 0..2 {

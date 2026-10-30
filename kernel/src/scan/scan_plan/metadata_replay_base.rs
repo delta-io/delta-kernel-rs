@@ -82,7 +82,7 @@ mod tests {
         #[case] version: Version,
         #[case] checkpoint_version: Option<Version>,
         #[case] has_all_files: bool,
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         let (engine, latest, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
         let snapshot = Snapshot::builder_for(latest.table_root().clone())
@@ -121,7 +121,7 @@ mod tests {
         #[case] target_version: Version,
         #[case] empty_crc: bool,
         #[case] expected_rows: usize,
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         let (engine, latest, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
         let target = Snapshot::builder_for(latest.table_root().clone())

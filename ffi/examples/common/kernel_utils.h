@@ -9,6 +9,7 @@ typedef struct Error
 {
   struct EngineError etype;
   char* msg;
+  char* condition;
 } Error;
 
 void print_diag(char* fmt, ...);
@@ -21,6 +22,7 @@ void* allocate_string(const KernelStringSlice slice);
 // kernel will call this to allocate our errors. This can be used to create an "engine native" type
 // error
 EngineError* allocate_error(FFIKernelError etype, const KernelStringSlice msg);
+extern const ErrorAllocators error_allocators;
 // utility function to convert key/val into slices and set them on a builder
 // returns false on failure
 bool set_builder_opt(HandleExclusiveEngineBuilder* engine_builder, char* key, char* val);

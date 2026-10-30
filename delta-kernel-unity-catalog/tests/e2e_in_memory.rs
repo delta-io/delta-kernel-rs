@@ -345,10 +345,10 @@ async fn test_catalog_response_rejects_duplicate_commit_versions(
         .unwrap_err();
     assert!(matches!(
         snapshot_error,
-        KernelError::LogTailVersionsNotContiguous {
+        delta_kernel::Error::Kernel(KernelError::LogTailVersionsNotContiguous {
             first_version: 1,
             second_version: 1,
-        }
+        })
     ));
 
     let range_error = CommitRange::builder_for(table_uri.as_str(), 0)
@@ -357,10 +357,10 @@ async fn test_catalog_response_rejects_duplicate_commit_versions(
         .unwrap_err();
     assert!(matches!(
         range_error,
-        KernelError::LogTailVersionsNotContiguous {
+        delta_kernel::Error::Kernel(KernelError::LogTailVersionsNotContiguous {
             first_version: 1,
             second_version: 1,
-        }
+        })
     ));
     Ok(())
 }

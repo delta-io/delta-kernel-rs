@@ -545,7 +545,7 @@ impl LogSegment {
         log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
         metric_context: SnapshotLoadMetricContext,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         let time_travel_version = time_travel_version.into();
         let start = std::time::Instant::now();
         let build = || {
@@ -583,7 +583,7 @@ impl LogSegment {
         log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         // The end_version is the time_travel_version, if present
         // TODO: When max catalog version is implemented, we would use that as end_version if
         // time_travel_version is not present
@@ -623,7 +623,7 @@ impl LogSegment {
             (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
         };
 
-        let table_root = log_root.join("../")?;
+        let table_root = log_root.join("../").map_err(crate::KernelError::from)?;
         LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint).map_err(
             |error| match error {
                 KernelError::EmptyLog if time_travel_version.is_none() => {

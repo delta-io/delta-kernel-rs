@@ -332,7 +332,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         fields(path = %self.table_path(), report, enable_call_frame, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
         err
     )]
-    pub fn build(self, engine: &dyn Engine) -> KernelResult<SnapshotRef> {
+    pub fn build(self, engine: &dyn Engine) -> crate::Result<SnapshotRef> {
         // Fold the context into the message string rather than passing structured fields: this
         // `info!` fires inside the `snap.build` metrics span, where any field the
         // `SnapshotBuildSuccess` event doesn't recognize would trip a spurious "Invalid field"
@@ -403,7 +403,9 @@ impl<Mode> SnapshotBuilder<Mode> {
                 let table_url = try_parse_uri(table_root)?;
                 let log_segment = LogSegment::for_snapshot(
                     engine.storage_handler().as_ref(),
-                    table_url.join(DELTA_LOG_DIR_WITH_SLASH)?,
+                    table_url
+                        .join(DELTA_LOG_DIR_WITH_SLASH)
+                        .map_err(crate::KernelError::from)?,
                     log_tail,
                     effective_version,
                     metric_context.clone(),
@@ -419,9 +421,9 @@ impl<Mode> SnapshotBuilder<Mode> {
                 .map(Into::into)?
             } else {
                 let Some(existing_snapshot) = existing_snapshot else {
-                    return Err(KernelError::internal_error(
+                    return Err(crate::Error::Kernel(KernelError::internal_error(
                         "SnapshotBuilder should have either table_root or existing_snapshot",
-                    ));
+                    )));
                 };
                 Snapshot::try_new_from(
                     existing_snapshot,
@@ -527,6 +529,7 @@ impl<Mode> SnapshotBuilder<Mode> {
 
 #[cfg(test)]
 pub(super) mod tests {
+    use std::error::Error as _;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -700,14 +703,43 @@ pub(super) mod tests {
         Ok(())
     }
 
+    #[test]
+    fn nonexistent_local_table_reports_requested_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("absent");
+        let (engine, _, _) = setup_test();
+        let error = Snapshot::builder_for(path.to_str().unwrap())
+            .build(engine.as_ref())
+            .unwrap_err();
+        let crate::Error::Delta(delta) = error else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(delta.name(), "DELTA_PATH_DOES_NOT_EXIST");
+        assert_eq!(delta.parameters()[0].value(), path.to_str().unwrap());
+        assert!(matches!(
+            delta.source().unwrap().downcast_ref::<KernelError>(),
+            Some(KernelError::InvalidTableLocation(_))
+        ));
+    }
+
     #[test_log::test(tokio::test)]
     async fn log_segment_load_failure_emits_metric_on_empty_log() -> KernelResult<()> {
         let (engine, _store, table_root) = setup_test();
         let (reporter, _guard) = measuring_reporter();
 
-        assert!(SnapshotBuilder::new_for(table_root)
+        let error = SnapshotBuilder::new_for(&table_root)
             .build(engine.as_ref())
-            .is_err());
+            .unwrap_err();
+        let crate::Error::Delta(delta) = error else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(delta.name(), "DELTA_PATH_DOES_NOT_EXIST");
+        assert_eq!(delta.sql_state(), Some("42K03"));
+        assert_eq!(delta.parameters()[0].value(), table_root);
+        assert!(matches!(
+            delta.source().unwrap().downcast_ref::<KernelError>(),
+            Some(KernelError::EmptyLog)
+        ));
 
         let events = reporter.events();
         let failure = events
@@ -735,9 +767,13 @@ pub(super) mod tests {
         .await?;
         let (reporter, _guard) = measuring_reporter();
 
-        assert!(SnapshotBuilder::new_for(table_root)
+        let error = SnapshotBuilder::new_for(table_root)
             .build(engine.as_ref())
-            .is_err());
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::Kernel(KernelError::MissingMetadataAndProtocol)
+        ));
 
         let events = reporter.events();
         assert!(
@@ -957,7 +993,10 @@ pub(super) mod tests {
                 .with_log_tail(log_tail)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -971,7 +1010,10 @@ pub(super) mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -996,7 +1038,10 @@ pub(super) mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -1008,7 +1053,10 @@ pub(super) mod tests {
 
             let result = SnapshotBuilder::new_for(table_root).build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -1025,7 +1073,10 @@ pub(super) mod tests {
                 .with_max_catalog_version(0)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -1049,7 +1100,10 @@ pub(super) mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -1103,7 +1157,10 @@ pub(super) mod tests {
             // Incremental update without mcv should fail
             let result = SnapshotBuilder::new_from(initial).build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -1139,7 +1196,9 @@ pub(super) mod tests {
 
             assert!(matches!(
                 result,
-                Err(KernelError::LogTailVersionsNotContiguous { .. })
+                Err(crate::Error::Kernel(
+                    KernelError::LogTailVersionsNotContiguous { .. }
+                ))
             ));
 
             Ok(())
@@ -1166,7 +1225,10 @@ pub(super) mod tests {
                 .with_max_catalog_version(1)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::InvalidLogPath(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::InvalidLogPath(_)))
+            ));
 
             Ok(())
         }

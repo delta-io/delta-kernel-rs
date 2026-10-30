@@ -1327,7 +1327,7 @@ mod tests {
         created_time: 1739313200623,
         config: &[("delta.checkpointPolicy", "v2")],
     })]
-    fn v2_last_checkpoint_hint_contents(#[case] expected: ExpectedHint) -> KernelResult<()> {
+    fn v2_last_checkpoint_hint_contents(#[case] expected: ExpectedHint) -> crate::Result<()> {
         use crate::unit_test_utils::load_test_table;
 
         let ExpectedHint {

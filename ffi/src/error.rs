@@ -21,7 +21,7 @@ pub mod allocation;
 // values we avoid this issue.
 
 #[repr(C)]
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 #[non_exhaustive]
 pub enum FFIKernelError {
     UnknownError = 0, // catch-all for unrecognized KernelError types
@@ -256,13 +256,13 @@ impl<T: ExternEngine + ?Sized> AllocateError for &T {
 /// # Safety
 ///
 /// The allocator must be valid.
-pub(crate) trait IntoExternResult<T> {
-    unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T>;
+pub(crate) trait IntoExternResult<T, A: ?Sized> {
+    unsafe fn into_extern_result(self, alloc: &A) -> ExternResult<T>;
 }
 
 // NOTE: We can't "just" impl From<KernelResult<T>> because we require an error allocator.
-impl<T> IntoExternResult<T> for KernelResult<T> {
-    unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T> {
+impl<T, A: AllocateError + ?Sized> IntoExternResult<T, A> for KernelResult<T> {
+    unsafe fn into_extern_result(self, alloc: &A) -> ExternResult<T> {
         match self {
             Ok(ok) => ExternResult::Ok(ok),
             Err(err) => {
@@ -270,6 +270,31 @@ impl<T> IntoExternResult<T> for KernelResult<T> {
                 let err = unsafe { alloc.allocate_error(err.into(), kernel_string_slice!(msg)) };
                 ExternResult::Err(err)
             }
+        }
+    }
+}
+
+/// Allocates an envelope without changing its outer classification.
+pub trait AllocateResultError: AllocateError {
+    /// Returns a connector-owned error, or NULL when allocation fails.
+    ///
+    /// # Safety
+    ///
+    /// The registered callbacks and context must be valid for this call.
+    unsafe fn allocate_result_error(&self, error: delta_kernel::Error) -> *mut EngineError;
+}
+
+impl<T: ExternEngine + ?Sized> AllocateResultError for &T {
+    unsafe fn allocate_result_error(&self, error: delta_kernel::Error) -> *mut EngineError {
+        unsafe { self.error_allocators().allocate_error(error).cast() }
+    }
+}
+
+impl<T, A: AllocateResultError + ?Sized> IntoExternResult<T, A> for delta_kernel::Result<T> {
+    unsafe fn into_extern_result(self, alloc: &A) -> ExternResult<T> {
+        match self {
+            Ok(value) => ExternResult::Ok(value),
+            Err(error) => ExternResult::Err(unsafe { alloc.allocate_result_error(error) }),
         }
     }
 }

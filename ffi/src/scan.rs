@@ -959,8 +959,8 @@ pub unsafe extern "C" fn selection_vector_from_dv(
 fn selection_vector_from_dv_impl(
     dv_info: &DvInfo,
     extern_engine: &dyn ExternEngine,
-    root_url: KernelResult<Url>,
-) -> KernelResult<KernelBoolSlice> {
+    root_url: delta_kernel::Result<Url>,
+) -> delta_kernel::Result<KernelBoolSlice> {
     match dv_info.get_selection_vector(extern_engine.engine().as_ref(), &root_url?)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelBoolSlice::empty()),
@@ -986,8 +986,8 @@ pub unsafe extern "C" fn row_indexes_from_dv(
 fn row_indexes_from_dv_impl(
     dv_info: &DvInfo,
     extern_engine: &dyn ExternEngine,
-    root_url: KernelResult<Url>,
-) -> KernelResult<KernelRowIndexArray> {
+    root_url: delta_kernel::Result<Url>,
+) -> delta_kernel::Result<KernelRowIndexArray> {
     match dv_info.get_row_indexes(extern_engine.engine().as_ref(), &root_url?)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelRowIndexArray::empty()),
@@ -2349,7 +2349,7 @@ mod tests {
         use crate::expressions::kernel_visitor::{
             visit_expression_literal_bool, KernelExpressionVisitorState,
         };
-        use crate::ffi_test_utils::{allocate_err, ok_or_panic, setup_snapshot};
+        use crate::ffi_test_utils::{ok_or_panic, setup_snapshot};
         use crate::handle::Handle;
         use crate::plans::result::CPlanResult;
         use crate::plans::{get_plan_based_engine, get_plan_executor};
@@ -2382,7 +2382,7 @@ mod tests {
                 get_plan_based_engine(
                     executor,
                     OptionalValue::Some(fallback.shallow_copy()),
-                    allocate_err,
+                    &crate::ffi_test_utils::ERROR_ALLOCATORS,
                 )
             }
         }

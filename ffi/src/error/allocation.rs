@@ -1,7 +1,6 @@
-//! Outgoing Kernel/Delta allocation primitives, independent of engine registration.
+//! Outgoing Kernel/Delta allocation for registered engines.
 //!
-//! Existing FFI entry points use the legacy allocator. These descriptors define the structured
-//! contract for migrating those entry points; Engine-error allocation and native causes are absent.
+//! Engine errors and native causes require a separate ABI change.
 
 use std::ffi::c_void;
 
@@ -48,6 +47,7 @@ pub struct DeltaErrorAllocation {
 /// every use and support concurrent calls if shared across threads. Null context is permitted.
 /// Engine-error allocation and native causes require a separate ABI change.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct ErrorAllocators {
     /// Connector state forwarded unchanged to the selected callback.
     pub context: *mut c_void,
@@ -57,6 +57,28 @@ pub struct ErrorAllocators {
     /// Allocates a Delta error from a borrowed descriptor.
     pub allocate_delta_error:
         unsafe extern "C" fn(*mut c_void, *const DeltaErrorAllocation) -> *mut ConnectorError,
+}
+
+// Safety: every invocation is unsafe and requires the context and callbacks to support concurrent
+// use. Copying the table neither accesses nor transfers ownership of the context.
+unsafe impl Send for ErrorAllocators {}
+unsafe impl Sync for ErrorAllocators {}
+
+impl super::AllocateError for ErrorAllocators {
+    unsafe fn allocate_error(
+        &self,
+        code: FFIKernelError,
+        message: KernelStringSlice,
+    ) -> *mut super::EngineError {
+        let descriptor = KernelErrorAllocation { code, message };
+        unsafe { (self.allocate_kernel_error)(self.context, &descriptor).cast() }
+    }
+}
+
+impl super::AllocateResultError for ErrorAllocators {
+    unsafe fn allocate_result_error(&self, error: Error) -> *mut super::EngineError {
+        unsafe { self.allocate_error(error).cast() }
+    }
 }
 
 impl ErrorAllocators {
@@ -243,5 +265,45 @@ mod tests {
         );
         assert_eq!(output.calls, 1);
         assert_eq!(output.fields, expected);
+    }
+    #[cfg(feature = "default-engine-base")]
+    #[test]
+    fn absent_snapshot_dispatches_condition_and_parameters_through_registered_engine() {
+        let mut output = Box::<Capture>::default();
+        let context = std::ptr::from_mut(output.as_mut()).cast();
+        let engine = delta_kernel_default_engine::DefaultEngineBuilder::new(std::sync::Arc::new(
+            delta_kernel::object_store::memory::InMemory::new(),
+        ))
+        .build();
+        let handle = crate::engine_to_handle(
+            std::sync::Arc::new(engine),
+            ErrorAllocators {
+                context,
+                allocate_kernel_error: kernel,
+                allocate_delta_error: delta,
+            },
+        );
+        let table_path = "memory:///";
+        let builder = unsafe {
+            crate::get_snapshot_builder(
+                crate::kernel_string_slice!(table_path),
+                handle.shallow_copy(),
+            )
+        };
+        let crate::ExternResult::Ok(builder) = builder else {
+            panic!("valid table URL must produce a builder")
+        };
+        assert_eq!(output.calls, 0);
+        output.fail = true;
+        let result = unsafe { crate::snapshot_builder_build(builder) };
+        assert!(matches!(result, crate::ExternResult::Err(pointer) if pointer.is_null()));
+        assert_eq!(output.calls, 1);
+        assert_eq!(
+            output.fields[0],
+            ("condition".into(), "DELTA_PATH_DOES_NOT_EXIST".into())
+        );
+        assert_eq!(output.fields[1], ("sql_state".into(), "42K03".into()));
+        assert_eq!(output.fields[2], ("path".into(), "memory:///".into()));
+        unsafe { crate::free_engine(handle) };
     }
 }

@@ -58,7 +58,7 @@ async fn write_data<W: AsyncFileWriter>(
     Ok(())
 }
 
-async fn try_main() -> KernelResult<()> {
+async fn try_main() -> delta_kernel::Result<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Write", "write", "");
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
@@ -90,7 +90,9 @@ async fn try_main() -> KernelResult<()> {
         // we'll use the first batch to determine the schema
         let first = batch_iter.next();
         let Some(first) = first else {
-            return Err(KernelError::generic("No batches in checkpoint data"));
+            return Err(delta_kernel::Error::Kernel(KernelError::generic(
+                "No batches in checkpoint data",
+            )));
         };
         // Note that with `FilteredEngineData` it's important to `apply_selection_vector` to remove
         // any filtered out rows. It's also possible to use `into_parts` to get the
@@ -104,9 +106,13 @@ async fn try_main() -> KernelResult<()> {
         println!("--unsafe-i-know-what-im-doing not specified, just doing a dry run");
         // this block just writes the checkpoint to a blackhole
         let mut parquet_writer =
-            AsyncArrowWriter::try_new(BlackholeWriter::default(), first_batch.schema(), None)?;
+            AsyncArrowWriter::try_new(BlackholeWriter::default(), first_batch.schema(), None)
+                .map_err(delta_kernel::KernelError::from)?;
         write_data(&first_batch, batch_iter, &mut parquet_writer).await?;
-        parquet_writer.finish().await?;
+        parquet_writer
+            .finish()
+            .await
+            .map_err(delta_kernel::KernelError::from)?;
         let blackhole_writer = parquet_writer.into_inner();
         println!(
             "Would have written a checkpoint as:\n\tpath: {checkpoint_path}\n\tsize: {}",

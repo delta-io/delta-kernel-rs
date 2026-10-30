@@ -2076,7 +2076,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_domain_metadata() -> KernelResult<()> {
+    async fn test_domain_metadata() -> crate::Result<()> {
         let table_root = "memory:///test_table/";
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
@@ -2221,7 +2221,7 @@ mod tests {
         #[case] expected: Option<i64>,
         #[case] expected_error: Option<&str>,
         #[case] table_root: &str,
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
         commit(
@@ -2371,7 +2371,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_timestamp_enablement_version_in_future() -> KernelResult<()> {
+    async fn test_get_timestamp_enablement_version_in_future() -> crate::Result<()> {
         // Test invalid state where snapshot has enablement version in the future - should error
         let table_root = "memory:///test_table/";
         let store = Arc::new(InMemory::new());
@@ -2422,7 +2422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_timestamp_missing_ict_when_enabled() -> KernelResult<()> {
+    async fn test_get_timestamp_missing_ict_when_enabled() -> crate::Result<()> {
         // Test missing ICT when it should be present - should error
         let table_root = "memory:///test_table/";
         let store = Arc::new(InMemory::new());
@@ -2455,11 +2455,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_timestamp_fails_when_commit_missing() -> KernelResult<()> {
+    async fn test_get_timestamp_fails_when_commit_missing() -> crate::Result<()> {
         // When ICT is enabled but commit file is not found in log segment,
         // get_in_commit_timestamp should return an error
 
-        let url = Url::parse("memory:///")?;
+        let url = Url::parse("memory:///").map_err(crate::KernelError::from)?;
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
 
@@ -2493,7 +2493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_timestamp_with_checkpoint_and_commit_same_version() -> KernelResult<()> {
+    async fn test_get_timestamp_with_checkpoint_and_commit_same_version() -> crate::Result<()> {
         // Test the scenario where both checkpoint and commit exist at the same version with ICT
         // enabled.
         let table_root = "memory:///test_table/";
@@ -2541,12 +2541,18 @@ mod tests {
         let checkpoint: RecordBatch = checkpoint.into();
 
         let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new(&mut buffer, checkpoint.schema(), None)?;
-        writer.write(&checkpoint)?;
-        writer.close()?;
+        let mut writer = ArrowWriter::try_new(&mut buffer, checkpoint.schema(), None)
+            .map_err(crate::KernelError::from)?;
+        writer
+            .write(&checkpoint)
+            .map_err(crate::KernelError::from)?;
+        writer.close().map_err(crate::KernelError::from)?;
 
         let checkpoint_path = delta_path_for_version(1, "checkpoint.parquet");
-        store.put(&checkpoint_path, buffer.into()).await?;
+        store
+            .put(&checkpoint_path, buffer.into())
+            .await
+            .map_err(crate::KernelError::from)?;
 
         // Create 00000000000000000001.json with ICT
         let expected_ict = 1587968586200i64;
@@ -2569,7 +2575,7 @@ mod tests {
     #[rstest]
     #[case::ict_disabled(false)]
     #[case::ict_enabled(true)]
-    fn test_get_timestamp_returns_valid_timestamp(#[case] ict_enabled: bool) -> KernelResult<()> {
+    fn test_get_timestamp_returns_valid_timestamp(#[case] ict_enabled: bool) -> crate::Result<()> {
         let temp_dir = tempfile::tempdir().unwrap();
         let table_path = Url::from_directory_path(temp_dir.path())
             .unwrap()
@@ -2610,8 +2616,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_timestamp_errors_when_commit_file_missing(
         #[case] ict_enabled: bool,
-    ) -> KernelResult<()> {
-        let url = Url::parse("memory:///")?;
+    ) -> crate::Result<()> {
+        let url = Url::parse("memory:///").map_err(crate::KernelError::from)?;
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
 
@@ -2656,7 +2662,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_timestamp_preserves_commit_read_error() -> KernelResult<()> {
+    async fn test_get_timestamp_preserves_commit_read_error() -> crate::Result<()> {
         let table_root = "memory:///";
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
@@ -2681,7 +2687,10 @@ mod tests {
             false,
             false, /* skipped_new_checkpoints */
         )?;
-        store.delete(&delta_path_for_version(0, "json")).await?;
+        store
+            .delete(&delta_path_for_version(0, "json"))
+            .await
+            .map_err(crate::KernelError::from)?;
 
         let result = snapshot.get_timestamp(&engine);
         assert!(
@@ -2693,7 +2702,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_timestamp_errors_when_ict_missing_from_commit_info() -> KernelResult<()> {
+    async fn test_get_timestamp_errors_when_ict_missing_from_commit_info() -> crate::Result<()> {
         // ICT is enabled and commit file IS present in the log segment, but the commitInfo
         // action does not carry an inCommitTimestamp value (corrupt/incomplete commit).
         let store = Arc::new(InMemory::new());

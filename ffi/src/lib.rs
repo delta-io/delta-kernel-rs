@@ -67,6 +67,7 @@ pub mod error;
 pub mod rest_engine;
 #[cfg(feature = "default-engine-base")]
 pub mod table_changes;
+use error::allocation::ErrorAllocators;
 use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
 #[cfg(feature = "delta-kernel-unity-catalog")]
 pub mod delta_kernel_unity_catalog;
@@ -483,6 +484,24 @@ pub unsafe extern "C" fn allocate_kernel_string(
     unsafe { result.into_extern_result(&error_fn) }
 }
 
+/// Copies `kernel_str` into a Rust-owned string handle using registered error callbacks.
+///
+/// Kernel consumes a successful handle when passed to an API that takes ownership of a Rust
+/// string. Invalid UTF-8 is reported through the Kernel allocator.
+///
+/// # Safety
+///
+/// `kernel_str` must be valid for this call. `allocators` must point to a valid callback table;
+/// its context and callbacks must satisfy [`ErrorAllocators`]'s contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn allocate_kernel_string_with_allocators(
+    kernel_str: KernelStringSlice,
+    allocators: *const ErrorAllocators,
+) -> ExternResult<Handle<ExclusiveRustString>> {
+    let result = allocate_kernel_string_impl(kernel_str);
+    unsafe { result.into_extern_result(&*allocators) }
+}
+
 fn allocate_kernel_string_impl(
     kernel_str: KernelStringSlice,
 ) -> KernelResult<Handle<ExclusiveRustString>> {
@@ -748,7 +767,12 @@ pub unsafe extern "C" fn free_engine_data(engine_data: Handle<ExclusiveEngineDat
 // A wrapper for Engine which defines additional FFI-specific methods.
 pub trait ExternEngine: Send + Sync {
     fn engine(&self) -> Arc<dyn Engine>;
-    fn error_allocator(&self) -> &dyn AllocateError;
+    /// Returns the registered callbacks and connector context for outgoing errors.
+    fn error_allocators(&self) -> &ErrorAllocators;
+    /// Returns the Kernel allocator used by APIs that cannot emit Delta errors.
+    fn error_allocator(&self) -> &dyn AllocateError {
+        self.error_allocators()
+    }
 }
 
 #[handle_descriptor(target=dyn ExternEngine, mutable=false)]
@@ -758,7 +782,7 @@ pub struct SharedExternEngine;
 struct ExternEngineVtable {
     // Actual engine instance to use
     engine: Arc<dyn Engine>,
-    allocate_error: AllocateErrorFn,
+    allocate_error: ErrorAllocators,
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -792,7 +816,7 @@ impl ExternEngine for ExternEngineVtable {
     fn engine(&self) -> Arc<dyn Engine> {
         self.engine.clone()
     }
-    fn error_allocator(&self) -> &dyn AllocateError {
+    fn error_allocators(&self) -> &ErrorAllocators {
         &self.allocate_error
     }
 }
@@ -800,7 +824,7 @@ impl ExternEngine for ExternEngineVtable {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid path pointer.
-unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> KernelResult<Url> {
+unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> delta_kernel::Result<Url> {
     let path: &str = unsafe { TryFromStringSlice::try_from_slice(&path) }?;
     delta_kernel::try_parse_uri(path)
 }
@@ -825,7 +849,7 @@ pub(crate) enum ObjectStoreBackend {
 #[cfg(feature = "default-engine-base")]
 pub struct FfiEngineBuilder {
     url: Url,
-    allocate_fn: AllocateErrorFn,
+    allocate_fn: ErrorAllocators,
     options: HashMap<String, String>,
     object_store_backend: ObjectStoreBackend,
     /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
@@ -873,13 +897,16 @@ pub struct ExclusiveEngineBuilder;
 /// [`builder_build`] or [`free_engine_builder`].
 ///
 /// # Safety
-/// Caller is responsible for passing a valid path pointer.
+/// `path` must be valid for this call. `allocate_error` must point to a valid callback table.
+/// Kernel copies the table; its context and callbacks must remain valid until the builder, engine,
+/// and all derived iterators are released, and must support concurrent calls.
 #[cfg(feature = "default-engine-base")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_engine_builder(
     path: KernelStringSlice,
-    allocate_error: AllocateErrorFn,
+    allocate_error: *const ErrorAllocators,
 ) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
+    let allocate_error = unsafe { *allocate_error };
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let result = get_engine_builder_impl(url, allocate_error);
     unsafe { result.into_extern_result(&allocate_error) }
@@ -887,9 +914,9 @@ pub unsafe extern "C" fn get_engine_builder(
 
 #[cfg(feature = "default-engine-base")]
 fn get_engine_builder_impl(
-    url: KernelResult<Url>,
-    allocate_fn: AllocateErrorFn,
-) -> KernelResult<Handle<ExclusiveEngineBuilder>> {
+    url: delta_kernel::Result<Url>,
+    allocate_fn: ErrorAllocators,
+) -> delta_kernel::Result<Handle<ExclusiveEngineBuilder>> {
     let builder = Box::new(FfiEngineBuilder {
         url: url?,
         allocate_fn,
@@ -1088,13 +1115,16 @@ pub unsafe extern "C" fn builder_build(
 
 /// # Safety
 ///
-/// Caller is responsible for passing a valid path pointer.
+/// `path` must be valid for this call. `allocate_error` must point to a valid callback table.
+/// Kernel copies the table; its context and callbacks must remain valid until the builder, engine,
+/// and all derived iterators are released, and must support concurrent calls.
 #[cfg(feature = "default-engine-base")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_default_engine(
     path: KernelStringSlice,
-    allocate_error: AllocateErrorFn,
+    allocate_error: *const ErrorAllocators,
 ) -> ExternResult<Handle<SharedExternEngine>> {
+    let allocate_error = unsafe { *allocate_error };
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let result = get_default_default_engine_impl(url, allocate_error);
     unsafe { result.into_extern_result(&allocate_error) }
@@ -1103,17 +1133,17 @@ pub unsafe extern "C" fn get_default_engine(
 // get the default version of the default engine :)
 #[cfg(feature = "default-engine-base")]
 fn get_default_default_engine_impl(
-    url: KernelResult<Url>,
-    allocate_error: AllocateErrorFn,
-) -> KernelResult<Handle<SharedExternEngine>> {
-    get_default_engine_impl(
+    url: delta_kernel::Result<Url>,
+    allocate_error: ErrorAllocators,
+) -> delta_kernel::Result<Handle<SharedExternEngine>> {
+    Ok(get_default_engine_impl(
         url?,
         Default::default(),
         ObjectStoreBackend::default(),
         None,
         IoConcurrencyConfig::default(),
         allocate_error,
-    )
+    )?)
 }
 
 /// Safety
@@ -1122,7 +1152,7 @@ fn get_default_default_engine_impl(
 #[cfg(feature = "default-engine-base")]
 fn engine_to_handle(
     engine: Arc<dyn Engine>,
-    allocate_error: AllocateErrorFn,
+    allocate_error: ErrorAllocators,
 ) -> Handle<SharedExternEngine> {
     let engine: Arc<dyn ExternEngine> = Arc::new(ExternEngineVtable {
         engine,
@@ -1142,7 +1172,7 @@ fn get_default_engine_impl(
     object_store_backend: ObjectStoreBackend,
     executor_config: Option<MultithreadedExecutorConfig>,
     io_config: IoConcurrencyConfig,
-    allocate_error: AllocateErrorFn,
+    allocate_error: ErrorAllocators,
 ) -> KernelResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::storage::store_from_url_opts;
 
@@ -1162,7 +1192,7 @@ pub(crate) fn build_engine_from_store(
     store: Arc<dyn ObjectStore>,
     executor_config: Option<MultithreadedExecutorConfig>,
     io_config: IoConcurrencyConfig,
-    allocate_error: AllocateErrorFn,
+    allocate_error: ErrorAllocators,
 ) -> KernelResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::DefaultEngineBuilder;
 
@@ -1378,7 +1408,7 @@ pub unsafe extern "C" fn get_snapshot_builder(
     let source = match url {
         Ok(url) => FfiSnapshotBuilderSource::TableRoot(url),
         Err(e) => {
-            let result: KernelResult<Handle<ExclusiveSnapshotBuilder>> = Err(e);
+            let result: delta_kernel::Result<Handle<ExclusiveSnapshotBuilder>> = Err(e);
             return unsafe { result.into_extern_result(&engine_ref) };
         }
     };
@@ -1521,7 +1551,7 @@ pub unsafe extern "C" fn snapshot_builder_build(
 
 fn snapshot_builder_build_impl(
     builder: FfiSnapshotBuilder,
-) -> KernelResult<Handle<SharedSnapshot>> {
+) -> delta_kernel::Result<Handle<SharedSnapshot>> {
     let FfiSnapshotBuilder {
         engine,
         source,
@@ -1548,9 +1578,10 @@ fn snapshot_builder_build_impl(
         apply_snapshot_hint: impl FnOnce(
             delta_kernel::snapshot::SnapshotBuilder<Mode>,
             Box<SnapshotHint>,
-        )
-            -> KernelResult<delta_kernel::snapshot::SnapshotBuilder<Mode>>,
-    ) -> KernelResult<SnapshotRef> {
+        ) -> delta_kernel::Result<
+            delta_kernel::snapshot::SnapshotBuilder<Mode>,
+        >,
+    ) -> delta_kernel::Result<SnapshotRef> {
         let BuildOptions {
             version,
             incremental_replay,
@@ -1595,9 +1626,9 @@ fn snapshot_builder_build_impl(
             |_, _| {
                 // The public API rejects this combination; retain the invariant here for
                 // internal construction paths.
-                Err(snapshot_hint::invalid(
+                Err(delta_kernel::Error::Kernel(snapshot_hint::invalid(
                     "A snapshot hint cannot be used with Snapshot::builder_from",
-                ))
+                )))
             },
         ),
     }?;
@@ -1914,16 +1945,16 @@ pub unsafe extern "C" fn get_earliest_commit(
 
 fn get_earliest_commit_impl(
     extern_engine: &dyn ExternEngine,
-    log_root: KernelResult<Url>,
+    log_root: delta_kernel::Result<Url>,
     earliest_ratified_commit_version: OptionalValue<Version>,
     commit_type: FfiHistoryCommitType,
-) -> KernelResult<Version> {
-    kernel_get_earliest_commit(
+) -> delta_kernel::Result<Version> {
+    Ok(kernel_get_earliest_commit(
         extern_engine.engine().as_ref(),
         &log_root?,
         earliest_ratified_commit_version.into(),
         commit_type.into(),
-    )
+    )?)
 }
 
 /// A commit located by a timestamp query: a commit version paired with its timestamp. FFI-safe
@@ -2297,9 +2328,8 @@ mod tests {
     use super::*;
     use crate::error::{EngineError, FFIKernelError};
     use crate::ffi_test_utils::{
-        allocate_err, allocate_str, assert_extern_result_error_contains,
-        assert_extern_result_error_with_message, build_snapshot, ok_or_panic, recover_string,
-        setup_snapshot,
+        allocate_str, assert_extern_result_error_contains, assert_extern_result_error_with_message,
+        build_snapshot, ok_or_panic, recover_string, setup_snapshot,
     };
 
     #[unsafe(no_mangle)]
@@ -2392,7 +2422,7 @@ mod tests {
     fn snapshot_builder_log_tail_rejects_null_nonempty_pointer() {
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(Arc::new(InMemory::new())).build()),
-            allocate_err,
+            crate::ffi_test_utils::ERROR_ALLOCATORS,
         );
         let table_root = "memory:///test_table/";
         let builder = unsafe {
@@ -2430,7 +2460,7 @@ mod tests {
     /// engine and snapshot handles.
     async fn make_engine_and_v0_snapshot(
         path: &str,
-    ) -> KernelResult<(
+    ) -> delta_kernel::Result<(
         Arc<InMemory>,
         Handle<SharedExternEngine>,
         Handle<SharedSnapshot>,
@@ -2445,7 +2475,7 @@ mod tests {
         .await?;
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
-            allocate_err,
+            crate::ffi_test_utils::ERROR_ALLOCATORS,
         );
         let snap = unsafe { build_snapshot(kernel_string_slice!(path), engine.shallow_copy()) };
         Ok((storage, engine, snap))
@@ -2455,7 +2485,7 @@ mod tests {
     /// snapshot is built with `max_catalog_version = 0`.
     async fn make_catalog_managed_engine_and_v0_snapshot(
         path: &str,
-    ) -> KernelResult<(
+    ) -> delta_kernel::Result<(
         Arc<InMemory>,
         Handle<SharedExternEngine>,
         Handle<SharedSnapshot>,
@@ -2470,7 +2500,7 @@ mod tests {
         .await?;
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
-            allocate_err,
+            crate::ffi_test_utils::ERROR_ALLOCATORS,
         );
         let snap = unsafe {
             let ptr = ok_or_panic(get_snapshot_builder(
@@ -2507,7 +2537,12 @@ mod tests {
 
     pub(crate) fn get_default_engine(path: &str) -> Handle<SharedExternEngine> {
         let path = kernel_string_slice!(path);
-        let builder = unsafe { ok_or_panic(get_engine_builder(path, allocate_err)) };
+        let builder = unsafe {
+            ok_or_panic(get_engine_builder(
+                path,
+                &crate::ffi_test_utils::ERROR_ALLOCATORS,
+            ))
+        };
         unsafe { ok_or_panic(builder_build(builder)) }
     }
 
@@ -2523,7 +2558,10 @@ mod tests {
     fn free_engine_builder_drops_unbuilt_builder() {
         let path = "memory:///doesntmatter/foo";
         unsafe {
-            let builder = ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
+            let builder = ok_or_panic(get_engine_builder(
+                kernel_string_slice!(path),
+                &crate::ffi_test_utils::ERROR_ALLOCATORS,
+            ));
             free_engine_builder(builder);
         }
     }
@@ -2534,7 +2572,10 @@ mod tests {
         let key = "custom-option";
         let value = "value";
         unsafe {
-            let builder = ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
+            let builder = ok_or_panic(get_engine_builder(
+                kernel_string_slice!(path),
+                &crate::ffi_test_utils::ERROR_ALLOCATORS,
+            ));
             let builder = ok_or_panic(builder_with_option(
                 builder,
                 kernel_string_slice!(key),
@@ -2558,7 +2599,10 @@ mod tests {
             len: invalid_utf8.len(),
         };
         unsafe {
-            let builder = ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
+            let builder = ok_or_panic(get_engine_builder(
+                kernel_string_slice!(path),
+                &crate::ffi_test_utils::ERROR_ALLOCATORS,
+            ));
             assert_extern_result_error_with_message(
                 builder_with_option(builder, invalid_key, kernel_string_slice!(value)),
                 FFIKernelError::Utf8Error,
@@ -2572,7 +2616,10 @@ mod tests {
     fn builder_build_error_consumes_builder() {
         let path = "unsupported-scheme:///doesntmatter/foo";
         unsafe {
-            let builder = ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
+            let builder = ok_or_panic(get_engine_builder(
+                kernel_string_slice!(path),
+                &crate::ffi_test_utils::ERROR_ALLOCATORS,
+            ));
             assert_extern_result_error_contains(
                 builder_build(builder),
                 FFIKernelError::ObjectStoreError,
@@ -2585,7 +2632,10 @@ mod tests {
     fn rest_object_store_error_consumes_builder() {
         let path = "memory:///doesntmatter/foo";
         unsafe {
-            let builder = ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
+            let builder = ok_or_panic(get_engine_builder(
+                kernel_string_slice!(path),
+                &crate::ffi_test_utils::ERROR_ALLOCATORS,
+            ));
             assert_extern_result_error_contains(
                 builder_with_rest_object_store(builder, std::ptr::null(), None, None),
                 FFIKernelError::GenericError,
@@ -2595,7 +2645,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot() -> KernelResult<()> {
+    async fn test_snapshot() -> delta_kernel::Result<()> {
         let table_root = "memory:///test_table/";
         let (_, engine, snapshot1) = make_engine_and_v0_snapshot(table_root).await?;
 
@@ -2657,7 +2707,10 @@ mod tests {
             .with_log_state(LogState::with_latest_version(1).with_crc_at([0]))
             .build()?;
         let table_root = table.table_root();
-        let engine = engine_to_handle(Arc::new(table.engine()), allocate_err);
+        let engine = engine_to_handle(
+            Arc::new(table.engine()),
+            crate::ffi_test_utils::ERROR_ALLOCATORS,
+        );
 
         let snapshot = unsafe {
             let builder = if from_existing {
@@ -2745,8 +2798,9 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_row_tracking_high_water_mark_present() -> KernelResult<()> {
-        let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")?;
+    fn test_snapshot_row_tracking_high_water_mark_present() -> delta_kernel::Result<()> {
+        let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")
+            .map_err(delta_kernel::KernelError::from)?;
         let table_root = Url::from_directory_path(&table_path)
             .map_err(|()| delta_kernel::KernelError::generic("invalid table path"))?
             .to_string();
@@ -2771,7 +2825,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_row_tracking_high_water_mark_absent() -> KernelResult<()> {
+    async fn test_snapshot_row_tracking_high_water_mark_absent() -> delta_kernel::Result<()> {
         let table_root = "memory:///test_row_tracking_high_water_mark_absent/";
         let (_storage, engine, snapshot) = make_engine_and_v0_snapshot(table_root).await?;
 
@@ -2791,7 +2845,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_file_stats_absent_without_crc() -> KernelResult<()> {
+    async fn test_snapshot_file_stats_absent_without_crc() -> delta_kernel::Result<()> {
         // A metadata-only table has no CRC, so file stats are absent.
         let table_root = "memory:///test_file_stats_no_crc/";
         let (_storage, engine, snapshot) = make_engine_and_v0_snapshot(table_root).await?;
@@ -2869,7 +2923,7 @@ mod tests {
                     .unwrap();
                 engine_to_handle(
                     Arc::new(DefaultEngineBuilder::new(storage).build()),
-                    allocate_err,
+                    crate::ffi_test_utils::ERROR_ALLOCATORS,
                 )
             }
             EarliestCommitTableSetupScenario::NoCommits => get_default_engine(table_root),
@@ -2951,7 +3005,7 @@ mod tests {
     // TODO: (PR #2307) will introduce a helper function for setting up storage, engine.
     // The test will need to refactor to use the helper function.
     #[tokio::test]
-    async fn test_snapshot_timestamp_no_ict() -> KernelResult<()> {
+    async fn test_snapshot_timestamp_no_ict() -> delta_kernel::Result<()> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
         add_commit(
@@ -2963,7 +3017,7 @@ mod tests {
         .await?;
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), crate::ffi_test_utils::ERROR_ALLOCATORS);
         let snap =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
@@ -3012,7 +3066,7 @@ mod tests {
         .await?;
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), crate::ffi_test_utils::ERROR_ALLOCATORS);
         let snap =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
@@ -3064,7 +3118,7 @@ mod tests {
         .await?;
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), crate::ffi_test_utils::ERROR_ALLOCATORS);
         let snap =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
@@ -3108,7 +3162,7 @@ mod tests {
         storage: &DynObjectStore,
         table_root: &str,
         num_add_actions: usize,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         add_commit(
             table_root,
             storage,
@@ -3134,7 +3188,7 @@ mod tests {
         storage: &InMemory,
         table_root: &str,
         num_add_actions: usize,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         add_commit(
             table_root,
             storage,
@@ -3192,7 +3246,7 @@ mod tests {
     async fn setup_checkpoint_test(
         is_v2: bool,
         num_add_actions: usize,
-    ) -> KernelResult<(
+    ) -> delta_kernel::Result<(
         Arc<InMemory>,
         Handle<SharedExternEngine>,
         Handle<SharedSnapshot>,
@@ -3214,7 +3268,7 @@ mod tests {
                     .with_task_executor(executor)
                     .build(),
             ),
-            allocate_err,
+            crate::ffi_test_utils::ERROR_ALLOCATORS,
         );
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
@@ -3266,7 +3320,7 @@ mod tests {
         #[case] num_add_actions: usize,
         #[case] spec: Option<FfiCheckpointSpec>,
         #[case] expected_sidecars: usize,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         let (storage, engine, snapshot) = setup_checkpoint_test(is_v2, num_add_actions).await?;
 
         let result = unsafe {
@@ -3291,8 +3345,8 @@ mod tests {
     // A zero sidecar hint is invalid: the kernel requires `file_actions_per_sidecar_hint > 0`,
     // surfaced through the FFI as `CheckpointWriteError`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_snapshot_v2_with_sidecars_zero_hint_returns_error() -> KernelResult<()>
-    {
+    async fn test_checkpoint_snapshot_v2_with_sidecars_zero_hint_returns_error(
+    ) -> delta_kernel::Result<()> {
         let (_storage, engine, snapshot) = setup_checkpoint_test(true, 3).await?;
 
         let spec = FfiCheckpointSpec::V2WithSidecar {
@@ -3315,7 +3369,7 @@ mod tests {
     // Checkpoint on V1 table with V2 spec => `FFIKernelError::CheckpointWriteError`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_v2_on_non_v2_table_returns_checkpoint_write_error(
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         let (_storage, engine, snapshot) = setup_checkpoint_test(false, 1).await?;
 
         let spec = FfiCheckpointSpec::V2NoSidecar;
@@ -3353,8 +3407,8 @@ mod tests {
         ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
     )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_snapshot_second_call_returns_consistent_snapshot() -> KernelResult<()>
-    {
+    async fn test_checkpoint_snapshot_second_call_returns_consistent_snapshot(
+    ) -> delta_kernel::Result<()> {
         let (_storage, engine, snapshot) = setup_checkpoint_test(false, 2).await?;
         let input_version = unsafe { version(snapshot.shallow_copy()) };
 
@@ -3402,7 +3456,7 @@ mod tests {
         ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
     )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_snapshot_written_snapshot_is_usable() -> KernelResult<()> {
+    async fn test_checkpoint_snapshot_written_snapshot_is_usable() -> delta_kernel::Result<()> {
         let (storage, engine, snapshot) = setup_checkpoint_test(false, 2).await?;
         let input_version = unsafe { version(snapshot.shallow_copy()) };
 
@@ -3422,8 +3476,16 @@ mod tests {
         // (b) `_last_checkpoint` exists and describes the checkpoint we just wrote.
         let last_checkpoint = storage
             .get(&Path::from("_delta_log/_last_checkpoint"))
-            .await?;
-        let v: Value = serde_json::from_slice(last_checkpoint.bytes().await?.as_ref())?;
+            .await
+            .map_err(delta_kernel::KernelError::from)?;
+        let v: Value = serde_json::from_slice(
+            last_checkpoint
+                .bytes()
+                .await
+                .map_err(delta_kernel::KernelError::from)?
+                .as_ref(),
+        )
+        .map_err(delta_kernel::KernelError::from)?;
         assert_eq!(v["version"].as_u64(), Some(2));
         // 2 adds at versions 1..=2, no removes => 2 live add files.
         assert_eq!(v["numOfAddFiles"].as_u64(), Some(2));
@@ -3431,7 +3493,11 @@ mod tests {
         assert_eq!(v["size"].as_u64(), Some(4));
         // Cross-check the checkpoint parquet file size against `_last_checkpoint.sizeInBytes`.
         let checkpoint_path = Path::from("_delta_log/00000000000000000002.checkpoint.parquet");
-        let checkpoint_size = storage.head(&checkpoint_path).await?.size;
+        let checkpoint_size = storage
+            .head(&checkpoint_path)
+            .await
+            .map_err(delta_kernel::KernelError::from)?
+            .size;
         assert_eq!(v["sizeInBytes"].as_u64(), Some(checkpoint_size));
 
         // (c) chain a second checkpoint_snapshot(returned_snap, engine, None) =>
@@ -3464,11 +3530,11 @@ mod tests {
     // coverage under Miri.
     #[cfg(feature = "default-engine-base")]
     #[test]
-    fn test_setting_multithread_executor() -> KernelResult<()> {
+    fn test_setting_multithread_executor() -> delta_kernel::Result<()> {
         use delta_kernel::object_store::local::LocalFileSystem;
         use tempfile::tempdir;
 
-        let tmp_dir = tempdir()?;
+        let tmp_dir = tempdir().map_err(delta_kernel::KernelError::from)?;
         let tmp_path = tmp_dir.path();
         let table_root = tmp_path
             .to_str()
@@ -3478,7 +3544,7 @@ mod tests {
         // Use a temporary runtime for async setup, then drop it before the FFI calls so the engine
         // built below drives all async work through its own (FFI-configured) executor.
         {
-            let rt = tokio::runtime::Runtime::new()?;
+            let rt = tokio::runtime::Runtime::new().map_err(delta_kernel::KernelError::from)?;
             rt.block_on(seed_v1_table(storage.as_ref(), table_root, 2))?;
         } // runtime dropped here, before FFI calls
 
@@ -3486,7 +3552,7 @@ mod tests {
         let builder = unsafe {
             ok_or_panic(get_engine_builder(
                 kernel_string_slice!(table_root),
-                allocate_err,
+                &crate::ffi_test_utils::ERROR_ALLOCATORS,
             ))
         };
         let builder = unsafe { builder_with_multithreaded_executor(builder, 2, 0) };
@@ -3527,11 +3593,11 @@ mod tests {
     fn test_setting_io_concurrency(
         #[case] buffer_size: usize,
         #[case] batch_size: usize,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         use delta_kernel::object_store::local::LocalFileSystem;
         use tempfile::tempdir;
 
-        let tmp_dir = tempdir()?;
+        let tmp_dir = tempdir().map_err(delta_kernel::KernelError::from)?;
         let tmp_path = tmp_dir.path();
         let table_root = tmp_path
             .to_str()
@@ -3545,7 +3611,7 @@ mod tests {
             .join("\n");
 
         {
-            let rt = tokio::runtime::Runtime::new()?;
+            let rt = tokio::runtime::Runtime::new().map_err(delta_kernel::KernelError::from)?;
             rt.block_on(async {
                 add_commit(&table_root, storage.as_ref(), 0, protocol_and_metadata).await?;
                 add_commit(
@@ -3558,14 +3624,14 @@ mod tests {
                     ]),
                 )
                 .await?;
-                Ok::<_, delta_kernel::KernelError>(())
+                Ok::<_, delta_kernel::Error>(())
             })?;
         }
 
         let builder = unsafe {
             ok_or_panic(get_engine_builder(
                 kernel_string_slice!(table_root),
-                allocate_err,
+                &crate::ffi_test_utils::ERROR_ALLOCATORS,
             ))
         };
         let builder = unsafe { builder_with_io_concurrency(builder, buffer_size, batch_size) };
@@ -3582,7 +3648,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_partition_cols() -> KernelResult<()> {
+    async fn test_snapshot_partition_cols() -> delta_kernel::Result<()> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
 
@@ -3594,7 +3660,7 @@ mod tests {
         )
         .await?;
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), crate::ffi_test_utils::ERROR_ALLOCATORS);
 
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
@@ -3620,7 +3686,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allocate_null_err_okay() -> KernelResult<()> {
+    async fn allocate_null_err_okay() -> delta_kernel::Result<()> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///";
 
@@ -3632,7 +3698,10 @@ mod tests {
         )
         .await?;
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_null_err);
+        let engine = engine_to_handle(
+            Arc::new(engine),
+            crate::ffi_test_utils::NULL_ERROR_ALLOCATORS,
+        );
 
         // Get a non-existent snapshot, this will call allocate_null_err
         let snapshot_at_non_existent_version = unsafe {
@@ -3650,7 +3719,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_log_tail() -> KernelResult<()> {
+    async fn test_snapshot_log_tail() -> delta_kernel::Result<()> {
         let table_root = "memory:///test_table/";
         let (storage, engine, snap) =
             make_catalog_managed_engine_and_v0_snapshot(table_root).await?;
@@ -3749,7 +3818,7 @@ mod tests {
         #[case] catalog_managed: bool,
         #[case] max_catalog_version: Option<Version>,
         #[case] expected_message: &str,
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
         let actions = if catalog_managed {
@@ -3760,7 +3829,7 @@ mod tests {
         add_commit(table_root, storage.as_ref(), 0, actions).await?;
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
-            allocate_err,
+            crate::ffi_test_utils::ERROR_ALLOCATORS,
         );
 
         let result = unsafe {
@@ -3787,7 +3856,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_builder_from_existing_snapshot_advances_to_latest_and_pinned_version(
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         let path = "memory:///";
         let (storage, engine, snapshot_at_v0) = make_engine_and_v0_snapshot(path).await?;
         assert_eq!(unsafe { version(snapshot_at_v0.shallow_copy()) }, 0);
@@ -3834,7 +3903,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_from_existing_snapshot_rejects_earlier_version() -> KernelResult<()> {
+    async fn test_builder_from_existing_snapshot_rejects_earlier_version(
+    ) -> delta_kernel::Result<()> {
         let path = "memory:///";
         let (storage, engine, snapshot_at_v0) = make_engine_and_v0_snapshot(path).await?;
 
@@ -3885,7 +3955,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_with_prev_snapshot_and_log_tail() -> KernelResult<()> {
+    async fn test_snapshot_with_prev_snapshot_and_log_tail() -> delta_kernel::Result<()> {
         let path = "memory:///";
         let (storage, engine, snapshot_at_v0) =
             make_catalog_managed_engine_and_v0_snapshot(path).await?;
@@ -3961,7 +4031,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_from_table_path_builds_latest_version() -> KernelResult<()> {
+    async fn test_builder_from_table_path_builds_latest_version() -> delta_kernel::Result<()> {
         let storage = Arc::new(InMemory::new());
         let path = "memory:///";
         add_commit(
@@ -3980,7 +4050,7 @@ mod tests {
         .await?;
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
-            allocate_err,
+            crate::ffi_test_utils::ERROR_ALLOCATORS,
         );
 
         let snapshot_at_v1 = unsafe {
@@ -3998,7 +4068,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_free_snapshot_builder_without_building() -> KernelResult<()> {
+    async fn test_free_snapshot_builder_without_building() -> delta_kernel::Result<()> {
         let path = "memory:///";
         let (_, engine, snap) = make_engine_and_v0_snapshot(path).await?;
         unsafe { free_snapshot(snap) };
@@ -4089,7 +4159,7 @@ mod tests {
     // === visit_protocol tests ===
 
     #[tokio::test]
-    async fn test_visit_protocol_legacy() -> KernelResult<()> {
+    async fn test_visit_protocol_legacy() -> delta_kernel::Result<()> {
         let (engine, snap) = setup_snapshot(METADATA.to_string()).await?;
         let state = collect_protocol_state(&snap);
 
@@ -4104,21 +4174,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_with_nonexistent_path_returns_error() -> KernelResult<()> {
+    async fn test_builder_with_nonexistent_path_returns_error() -> delta_kernel::Result<()> {
         let storage = Arc::new(InMemory::new());
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
-            allocate_err,
+            crate::ffi_test_utils::ERROR_ALLOCATORS,
         );
 
         let result = unsafe {
             let invalid_path = "not a valid url!";
             get_snapshot_builder(kernel_string_slice!(invalid_path), engine.shallow_copy())
         };
-        assert_extern_result_error_with_message(
+        crate::ffi_test_utils::assert_extern_result_delta_error(
             result,
-            FFIKernelError::InvalidTableLocationError,
-            None,
+            "DELTA_PATH_DOES_NOT_EXIST",
         );
 
         unsafe { free_engine(engine) }
@@ -4126,7 +4195,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_at_nonexistent_version_returns_error() -> KernelResult<()> {
+    async fn test_builder_at_nonexistent_version_returns_error() -> delta_kernel::Result<()> {
         let path = "memory:///";
         let (_, engine, snap) = make_engine_and_v0_snapshot(path).await?;
         unsafe { free_snapshot(snap) };
@@ -4150,7 +4219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_visit_protocol_with_features() -> KernelResult<()> {
+    async fn test_visit_protocol_with_features() -> delta_kernel::Result<()> {
         let (engine, snap) = setup_snapshot(METADATA_WITH_FEATURES.to_string()).await?;
         let state = collect_protocol_state(&snap);
 
@@ -4234,7 +4303,7 @@ mod tests {
         #[case] created_time: Option<i64>,
         #[case] format_options: &[(&str, &str)],
         #[case] configuration: &[(&str, &str)],
-    ) -> KernelResult<()> {
+    ) -> delta_kernel::Result<()> {
         fn to_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
             entries
                 .iter()

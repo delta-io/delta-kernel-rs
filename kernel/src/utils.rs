@@ -71,13 +71,17 @@ impl<I: IntoIterator, T: FromIterator<I::Item>> CollectInto<T> for I {
 /// like `/local/paths`, and even `../relative/paths`.
 #[allow(unused)]
 #[internal_api]
-pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> KernelResult<Url> {
+pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> crate::Result<Url> {
     let uri = uri.as_ref();
     let uri_type = resolve_uri_type(uri)?;
     let url = match uri_type {
         UriType::LocalPath(path) => {
-            if !path.exists() {
-                // When we support writes, create a directory if we can
+            let exists = path.try_exists().map_err(|error| {
+                KernelError::InvalidTableLocation(format!(
+                    "Invalid table location: {uri} Error: {error:?}"
+                ))
+            })?;
+            if !exists {
                 return Err(DeltaError::path_does_not_exist(
                     uri,
                     KernelError::InvalidTableLocation(format!("Path does not exist: {path:?}")),
@@ -85,8 +89,8 @@ pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> KernelResult<Url> {
                 .into());
             }
             if !path.is_dir() {
-                return Err(KernelError::InvalidTableLocation(format!(
-                    "{path:?} is not a directory"
+                return Err(crate::Error::Kernel(KernelError::InvalidTableLocation(
+                    format!("{path:?} is not a directory"),
                 )));
             }
             let path = std::fs::canonicalize(path).map_err(|err| {
