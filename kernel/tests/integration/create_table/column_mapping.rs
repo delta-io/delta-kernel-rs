@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use delta_kernel::Result;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
@@ -16,7 +17,6 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{KernelResult, Result};
 use test_utils::{
     column_mapping_fixtures as fixtures, create_table_and_load_snapshot, test_table_setup,
 };

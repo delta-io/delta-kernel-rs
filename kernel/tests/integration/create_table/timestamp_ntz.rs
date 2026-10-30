@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use delta_kernel::Result;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{StructType, schema_ref};
 use delta_kernel::snapshot::Snapshot;
@@ -14,7 +15,6 @@ use delta_kernel::table_features::{
     TableFeature,
 };
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::{KernelResult, Result};
 use test_utils::{
     cm_properties, multiple_ntz_schema, nested_ntz_schema, test_table_setup, top_level_ntz_schema,
 };

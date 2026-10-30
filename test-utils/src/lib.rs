@@ -1410,14 +1410,14 @@ pub fn load_and_begin_transaction_with(
     configure: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
 ) -> Result<Transaction> {
     let snapshot = Snapshot::builder_for(table_url).build(engine)?;
-    Ok(begin_transaction_with(
+    begin_transaction_with(
         snapshot,
         engine,
         operation,
         engine_info,
         data_change,
         configure,
-    )?)
+    )
 }
 
 // Helper function to set json values in a serde_json Values

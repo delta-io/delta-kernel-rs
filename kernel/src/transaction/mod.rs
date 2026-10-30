@@ -2893,10 +2893,10 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_ctas_rejected_on_iceberg_native_v4_table() -> KernelResult<()> {
-        let tempdir = tempfile::tempdir()?;
+    fn test_ctas_rejected_on_iceberg_native_v4_table() -> Result<()> {
+        let tempdir = tempfile::tempdir().map_err(KernelError::from)?;
         let table_path = tempdir.path().join("table");
-        std::fs::create_dir(&table_path)?;
+        std::fs::create_dir(&table_path).map_err(KernelError::from)?;
         let engine = SyncEngine::new();
         let mut txn = create_table(
             table_path.to_string_lossy(),

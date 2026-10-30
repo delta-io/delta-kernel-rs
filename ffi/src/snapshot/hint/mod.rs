@@ -1,7 +1,7 @@
 //! Construction and export of snapshot hints.
 
 use delta_kernel::snapshot::{SnapshotHint, SnapshotHintError, SnapshotHintFreshness};
-use delta_kernel::{KernelError, KernelResult, Result, Version};
+use delta_kernel::{KernelError, Result, Version};
 
 use super::builder::{ExclusiveSnapshotBuilder, FfiSnapshotBuilder, FfiSnapshotBuilderSource};
 use crate::delta_types::{

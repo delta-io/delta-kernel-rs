@@ -684,6 +684,7 @@ pub(crate) mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::Result;
     use crate::actions::{MAX_VALUES, MIN_VALUES};
     use crate::expressions::{Predicate as Pred, col, column_name, lit};
     #[cfg(feature = "geo-type-in-dev")]
@@ -695,7 +696,6 @@ pub(crate) mod tests {
     use crate::unit_test_utils::{
         MockProtocolBuilder, MockTableConfigurationBuilder, assert_result_error_with_message,
     };
-    use crate::{KernelResult, Result};
 
     #[test]
     fn stats_schemas_can_both_be_absent() {

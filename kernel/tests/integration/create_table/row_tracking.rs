@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use delta_kernel::Result;
 use delta_kernel::arrow::array::{Int32Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
@@ -17,7 +18,6 @@ use delta_kernel::table_features::{
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{KernelResult, Result};
 use rstest::rstest;
 use test_utils::{
     get_materialized_row_tracking_column_names, get_row_tracking_add_actions, insert_data,

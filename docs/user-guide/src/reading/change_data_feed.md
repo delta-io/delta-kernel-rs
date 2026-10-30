@@ -22,13 +22,13 @@ optional end version. It validates that CDF is enabled and that the schema is co
 across the requested range.
 
 ```rust,no_run
+# use delta_kernel::Result;
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::table_changes::TableChanges;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
+# fn example() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/my-table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -42,13 +42,13 @@ If you omit the end version by passing `None`, Kernel defaults to the latest ver
 table at the time of the call.
 
 ```rust,no_run
+# use delta_kernel::Result;
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::table_changes::TableChanges;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
+# fn example() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/my-table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -94,8 +94,8 @@ project columns with `with_schema` and filter rows with `with_predicate`.
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::expressions::{col, lit};
 # use delta_kernel::table_changes::TableChanges;
-# use delta_kernel::{KernelResult, Predicate};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::{Predicate, Result};
+# fn example() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/my-table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -145,14 +145,14 @@ after building the scan), use `scan_builder` on an `Arc<TableChanges>` instead o
 `into_scan_builder`:
 
 ```rust,no_run
+# use delta_kernel::Result;
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::table_changes::TableChanges;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
+# fn example() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/my-table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();

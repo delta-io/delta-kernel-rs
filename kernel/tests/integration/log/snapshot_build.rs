@@ -10,7 +10,7 @@ use delta_kernel::snapshot::{
     CheckpointWriteResult, ChecksumWriteResult, IncrementalReplay, SnapshotBuilder,
 };
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::{KernelError, KernelResult, Result, Snapshot, Version};
+use delta_kernel::{KernelError, Result, Snapshot, Version};
 use rstest::rstest;
 use serde_json::json;
 use test_utils::delta_kernel_default_engine::DefaultEngine;

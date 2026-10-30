@@ -2938,7 +2938,7 @@ fn batch_with_invalid_row_tracking_meta(
     snapshot: Arc<Snapshot>,
     engine: &dyn Engine,
     modification: ScanFileModification,
-) -> KernelResult<(RecordBatch, RecordBatch)> {
+) -> Result<(RecordBatch, RecordBatch)> {
     let scan_file = selected_scan_file_batch(snapshot, engine)?;
     assert_eq!(scan_file.data().len(), 3);
     let original = into_record_batch(scan_file.apply_selection_vector()?);
@@ -2997,7 +2997,7 @@ fn assert_row_tracking_files(
     snapshot: Arc<Snapshot>,
     engine: &dyn Engine,
     expected: &HashMap<String, AddActionRowTracking>,
-) -> KernelResult<()> {
+) -> Result<()> {
     let mut actual = HashMap::new();
     for scan_files in get_scan_files(snapshot, engine)? {
         let batch = into_record_batch(scan_files.apply_selection_vector()?);

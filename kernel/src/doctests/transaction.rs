@@ -88,7 +88,7 @@ pub struct SharedConfiguration;
 /// use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
 /// use delta_kernel::engine_data::FilteredEngineData;
 /// use delta_kernel::transaction::{CommitResult, UpdateTable, Imperative, Transaction};
-/// use delta_kernel::{Engine, EngineData, KernelResult, KernelResultIterator};
+/// use delta_kernel::{Engine, EngineData, KernelResult, KernelResultIterator, Result};
 ///
 /// fn stage_and_commit(
 ///     txn: Transaction,
@@ -97,7 +97,7 @@ pub struct SharedConfiguration;
 ///     remove_metadata: FilteredEngineData,
 ///     new_dv_descriptors: HashMap<String, DeletionVectorDescriptor>,
 ///     existing_data_files: impl KernelResultIterator<FilteredEngineData>,
-/// ) -> KernelResult<CommitResult> {
+/// ) -> Result<CommitResult> {
 ///     let mut txn: Transaction<UpdateTable, Imperative> = txn;
 ///     txn.add_files(add_metadata);
 ///     txn.remove_files(remove_metadata);
@@ -118,13 +118,13 @@ pub struct ImperativeCommit;
 /// use delta_kernel::transaction::{
 ///     CreateTable, Imperative, Transaction, UpdateTable, UpdateTableOperation,
 /// };
-/// use delta_kernel::{Engine, KernelResult};
+/// use delta_kernel::{Engine, KernelResult, Result};
 ///
 /// fn write_states(
 ///     snapshot: SnapshotRef,
 ///     engine: &dyn Engine,
 ///     schema: SchemaRef,
-/// ) -> KernelResult<()> {
+/// ) -> Result<()> {
 ///     let update = snapshot
 ///         .update_table(UpdateTableOperation::Write, "connector/1.0", true)
 ///         .build(engine, Box::new(FileSystemCommitter::new()))?;
@@ -160,7 +160,7 @@ pub struct ModeSelectionRequiresDeclarativePlans;
 /// use delta_kernel::plans::{RelationRef, ScopedPlanExecutor};
 /// use delta_kernel::snapshot::SnapshotRef;
 /// use delta_kernel::transaction::{CommitResult, Declarative, UpdateTable, UpdateTableOperation};
-/// use delta_kernel::{KernelResult, Engine};
+/// use delta_kernel::{KernelResult, Engine, Result};
 ///
 /// fn commit(
 ///     snapshot: SnapshotRef,
@@ -168,7 +168,7 @@ pub struct ModeSelectionRequiresDeclarativePlans;
 ///     executor: &dyn ScopedPlanExecutor,
 ///     adds: RelationRef,
 ///     removes: RelationRef,
-/// ) -> KernelResult<CommitResult<UpdateTable, Declarative>> {
+/// ) -> Result<CommitResult<UpdateTable, Declarative>> {
 ///     let mut txn = snapshot
 ///         .update_table(UpdateTableOperation::Write, "connector/1.0", true)
 ///         .with_execution_mode::<Declarative>()
@@ -176,7 +176,7 @@ pub struct ModeSelectionRequiresDeclarativePlans;
 ///         .build(engine, Box::new(FileSystemCommitter::new()))?;
 ///     txn.add_files_ref(adds);
 ///     txn.remove_files_ref(removes);
-///     txn.commit_declarative(executor)
+///     Ok(txn.commit_declarative(executor)?)
 /// }
 /// ```
 #[cfg(feature = "declarative-plans")]
@@ -190,20 +190,20 @@ pub struct DeclarativeCommit;
 /// use delta_kernel::schema::SchemaRef;
 /// use delta_kernel::transaction::create_table::create_table;
 /// use delta_kernel::transaction::{CommitResult, CreateTable, Declarative};
-/// use delta_kernel::{Engine, KernelResult};
+/// use delta_kernel::{Engine, KernelResult, Result};
 ///
 /// fn create(
 ///     engine: &dyn Engine,
 ///     executor: &dyn ScopedPlanExecutor,
 ///     schema: SchemaRef,
 ///     adds: RelationRef,
-/// ) -> KernelResult<CommitResult<CreateTable, Declarative>> {
+/// ) -> Result<CommitResult<CreateTable, Declarative>> {
 ///     let mut txn = create_table("/path/to/new-table", schema, "connector/1.0", true)
 ///         .with_execution_mode::<Declarative>()
 ///         .with_table_properties([("app.version", "1")])
 ///         .build(engine, Box::new(FileSystemCommitter::new()))?;
 ///     txn.add_files_ref(adds);
-///     txn.commit_declarative(executor)
+///     Ok(txn.commit_declarative(executor)?)
 /// }
 /// ```
 #[cfg(feature = "declarative-plans")]

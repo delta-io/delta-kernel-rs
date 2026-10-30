@@ -648,7 +648,7 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(&error, KernelError::InvalidTransactionState(message)
+            matches!(&error, crate::Error::Kernel(KernelError::InvalidTransactionState(message))
             if message == &format!("custom operation name '{operation}' is reserved"))
         );
         Ok(())

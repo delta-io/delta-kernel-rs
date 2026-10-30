@@ -1159,14 +1159,14 @@ pub(crate) fn ensure_table_can_be_read(protocol: &Protocol) -> KernelResult<()> 
 fn check_iceberg_native_v4_allowed_writer_features(
     protocol: &Protocol,
     _properties: &TableProperties,
-) -> KernelResult<()> {
+) -> Result<()> {
     let writer_features = protocol.writer_features().unwrap_or_default();
     if let Some(feature) = writer_features
         .iter()
         .find(|f| !ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURE_SET.contains(*f))
     {
-        return Err(KernelError::invalid_protocol(format!(
-            "Feature 'icebergNativeV4-preview' requires '{feature}' to not be supported"
+        return Err(crate::Error::Kernel(KernelError::invalid_protocol(
+            format!("Feature 'icebergNativeV4-preview' requires '{feature}' to not be supported"),
         )));
     }
     Ok(())

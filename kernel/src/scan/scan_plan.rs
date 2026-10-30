@@ -1054,7 +1054,7 @@ mod tests {
         #[case] stats: StatsOptions,
         #[case] preserve_json: bool,
         #[values(CheckpointType::Leaf, CheckpointType::Manifest)] checkpoint_type: CheckpointType,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
         let config = MockTableConfigurationBuilder::new()
             .with_schema(partitioned_schema())

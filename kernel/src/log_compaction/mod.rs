@@ -30,6 +30,7 @@
 //! ## Example
 //!
 //! ```no_run
+//! # use delta_kernel::Result;
 //! # use std::sync::Arc;
 //! # use delta_kernel::{ActionReconciliationIterator, LogCompactionWriter};
 //! # use delta_kernel::{Engine, Snapshot, KernelResult, KernelError, FileMeta};
@@ -44,9 +45,9 @@
 //!     todo!("Write data batches to storage at path: {}", path)
 //! }
 //!
-//! # fn example(engine: &dyn Engine) -> KernelResult<()> {
+//! # fn example(engine: &dyn Engine) -> Result<()> {
 //! // Create a snapshot for the table
-//! let table_root = Url::parse("file:///path/to/table")?;
+//! let table_root = Url::parse("file:///path/to/table").map_err(delta_kernel::KernelError::from)?;
 //! let snapshot = Snapshot::builder_for(table_root).build(engine)?;
 //!
 //! // Create a log compaction writer for versions 10-20

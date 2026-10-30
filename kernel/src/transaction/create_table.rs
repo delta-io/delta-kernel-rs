@@ -7,12 +7,13 @@
 //! # Example
 //!
 //! ```rust,no_run
+//! # use delta_kernel::Result;
 //! use delta_kernel::transaction::create_table::create_table;
 //! use delta_kernel::schema::{StructType, StructField, DataType};
 //! use delta_kernel::committer::FileSystemCommitter;
 //! use std::sync::Arc;
 //! # use delta_kernel::Engine;
-//! # fn example(engine: &dyn Engine) -> delta_kernel::KernelResult<()> {
+//! # fn example(engine: &dyn Engine) -> Result<()> {
 //!
 //! let schema = Arc::new(StructType::try_new(vec![
 //!     StructField::nullable("id", DataType::INTEGER),
@@ -59,8 +60,8 @@ use crate::transaction::{CreateTable, Imperative, Transaction};
 /// use delta_kernel::schema::{StructType, StructField, DataType};
 /// use delta_kernel::committer::FileSystemCommitter;
 /// use std::sync::Arc;
-/// # use delta_kernel::Engine;
-/// # fn example(engine: &dyn Engine) -> delta_kernel::KernelResult<()> {
+/// # use delta_kernel::{Engine, Result};
+/// # fn example(engine: &dyn Engine) -> Result<()> {
 ///
 /// let schema = Arc::new(StructType::try_new(vec![
 ///     StructField::nullable("id", DataType::INTEGER),
@@ -119,6 +120,7 @@ pub type CreateTableTransaction<MODE = Imperative> = Transaction<CreateTable, MO
 /// # Example
 ///
 /// ```no_run
+/// # use delta_kernel::Result;
 /// use std::sync::Arc;
 /// use delta_kernel::transaction::create_table::create_table;
 /// use delta_kernel::schema::{DataType, StructField, StructType};
@@ -126,13 +128,13 @@ pub type CreateTableTransaction<MODE = Imperative> = Transaction<CreateTable, MO
 /// use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 /// use test_utils::delta_kernel_default_engine::storage::store_from_url;
 ///
-/// # fn main() -> delta_kernel::KernelResult<()> {
+/// # fn main() -> Result<()> {
 /// let schema = Arc::new(StructType::try_new([
 ///     StructField::nullable("id", DataType::INTEGER),
 ///     StructField::nullable("name", DataType::STRING),
 /// ])?);
 ///
-/// let url = url::Url::parse("file:///tmp/my_table")?;
+/// let url = url::Url::parse("file:///tmp/my_table").map_err(delta_kernel::KernelError::from)?;
 /// let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
 ///
 /// let transaction = create_table("/tmp/my_table", schema, "MyApp/1.0", /* data_change */ true)

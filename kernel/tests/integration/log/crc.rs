@@ -686,7 +686,9 @@ async fn test_post_commit_crc_metadata_only_custom_op_makes_file_stats_indetermi
     assert!(crc_v2.file_stats_state().is_indeterminate());
     assert!(matches!(
         snapshot_v2.write_checksum(engine.as_ref()),
-        Err(KernelError::ChecksumWriteUnsupported(_))
+        Err(delta_kernel::Error::Kernel(
+            KernelError::ChecksumWriteUnsupported(_)
+        ))
     ));
 
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -765,7 +767,7 @@ async fn test_write_checksum_preserves_stats_across_metadata_only_commits(
     #[case] root: WriteRoot,
     #[case] checkpoint: Option<CheckpointSpec>,
     #[values("VACUUM START", "VACUUM END", "SET TBLPROPERTIES", "ANALYZE STATS")] operation: &str,
-) -> KernelResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let mut builder = create_table(
         &table_path,

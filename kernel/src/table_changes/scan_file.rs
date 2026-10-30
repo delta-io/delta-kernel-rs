@@ -17,7 +17,7 @@ use crate::expressions::{Expression, col, lit};
 use crate::scan::state::DvInfo;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef, lazy_schema_ref};
 use crate::utils::require;
-use crate::{KernelError, KernelResult, KernelResultIterator, Result, RowVisitor};
+use crate::{KernelError, KernelResult, Result, RowVisitor};
 
 // The type of action associated with a [`CdfScanFile`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

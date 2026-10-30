@@ -33,7 +33,7 @@ async fn test_metric_events_carry_table_type(#[case] catalog_managed: bool) -> R
         } else {
             builder
         };
-        Ok(builder.build(engine.as_ref())?)
+        builder.build(engine.as_ref())
     };
 
     // Given: a table (path-based or catalog-managed) with one appended row.

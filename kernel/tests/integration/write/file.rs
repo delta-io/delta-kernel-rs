@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::KernelResult;
+use delta_kernel::Result;
 use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, BinaryArray, Int32Array, Int64Array, ListArray, MapArray,
     RecordBatch, StringArray, StructArray,
@@ -141,7 +141,7 @@ type WrittenTable = (
     tempfile::TempDir,
     String,
     Arc<DefaultEngine<TokioMultiThreadExecutor>>,
-    KernelResult<SnapshotRef>,
+    Result<SnapshotRef>,
 );
 
 /// Creates a table with columns `id` and `c` in `cm_mode` and writes one batch holding `column`.
@@ -149,7 +149,7 @@ async fn write_table(
     cm_mode: &str,
     data_type: DataType,
     column: ArrayRef,
-) -> Result<WrittenTable, Box<dyn std::error::Error>> {
+) -> std::result::Result<WrittenTable, Box<dyn std::error::Error>> {
     let ids: ArrayRef = Arc::new(Int32Array::from_iter_values(0..column.len() as i32));
     write_columns(
         vec![
@@ -165,7 +165,7 @@ async fn write_table(
 async fn write_columns(
     columns: Vec<(StructField, ArrayRef)>,
     properties: &[(&str, &str)],
-) -> Result<WrittenTable, Box<dyn std::error::Error>> {
+) -> std::result::Result<WrittenTable, Box<dyn std::error::Error>> {
     let (fields, arrays): (Vec<_>, Vec<_>) = columns.into_iter().unzip();
     let schema = Arc::new(StructType::try_new(fields)?);
     let (tmp_dir, table_path, engine) = test_table_setup_mt()?;
@@ -181,7 +181,7 @@ async fn write_columns(
 fn data_file_stats(
     snapshot: &SnapshotRef,
     engine: &DefaultEngine<TokioMultiThreadExecutor>,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+) -> std::result::Result<serde_json::Value, Box<dyn std::error::Error>> {
     let add_files = read_add_infos(snapshot, engine)?;
     assert_eq!(add_files.len(), 1);
     Ok(add_files[0]
@@ -221,7 +221,7 @@ fn stats_columns(stats: &serde_json::Value, kind: &str) -> Vec<String> {
 async fn test_write_and_read_nested_file_column(
     #[values("top_level", "in_struct", "array_element", "map_value")] layout: &str,
     #[values("none", "id", "name")] cm_mode: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (data_type, column) = file_column(layout, file_values(), None);
     let (_tmp_dir, table_path, engine, snapshot) =
         write_table(cm_mode, data_type, column.clone()).await?;
@@ -299,7 +299,7 @@ async fn test_write_rejects_invalid_file_value(
     #[case] value: Value<'static>,
     #[case] problem: &str,
     #[values("top_level", "in_struct", "array_element", "map_value")] layout: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let files = file_array(&[Some((Some("s3://b/a"), None, None, None)), Some(value)]);
     let (data_type, column) = file_column(layout, files, None);
     let (_tmp_dir, table_path, _engine, result) = write_table("none", data_type, column).await?;
@@ -310,7 +310,7 @@ async fn test_write_rejects_invalid_file_value(
     assert!(error.contains(problem), "got: {error}");
     let data_files = walkdir::WalkDir::new(&table_path)
         .into_iter()
-        .filter_map(Result::ok)
+        .filter_map(std::result::Result::ok)
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "parquet"))
         .count();
     assert_eq!(data_files, 0, "no data file is written");
@@ -319,7 +319,8 @@ async fn test_write_rejects_invalid_file_value(
 
 /// The default writer rejects a `file` value whose `checksum` is malformed, writing no data file.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_write_rejects_malformed_checksum() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_write_rejects_malformed_checksum()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     let (fields, mut columns, nulls) =
         file_array(&[Some((Some("s3://b/a"), None, None, None))]).into_parts();
     let index = fields.iter().position(|f| f.name() == "checksum").unwrap();
@@ -334,7 +335,7 @@ async fn test_write_rejects_malformed_checksum() -> Result<(), Box<dyn std::erro
     assert!(error.contains("`checksum` digest"), "got: {error}");
     let data_files = walkdir::WalkDir::new(&table_path)
         .into_iter()
-        .filter_map(Result::ok)
+        .filter_map(std::result::Result::ok)
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "parquet"))
         .count();
     assert_eq!(data_files, 0, "no data file is written");
@@ -343,8 +344,8 @@ async fn test_write_rejects_malformed_checksum() -> Result<(), Box<dyn std::erro
 
 /// A `file` value under a null struct is not validated, as on reads.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_write_ignores_file_value_under_null_struct() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn test_write_ignores_file_value_under_null_struct()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     let files = file_array(&[
         Some((Some("s3://b/a"), None, None, None)),
         Some((None, None, None, None)),
@@ -362,7 +363,7 @@ async fn test_write_ignores_file_value_under_null_struct() -> Result<(), Box<dyn
 fn test_create_table_with_iceberg_compat_rejects_file_column(
     #[values("top_level", "in_struct", "array_element", "map_value")] layout: &str,
     #[values("delta.enableIcebergCompatV2", "delta.enableIcebergCompatV3")] property: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (data_type, _) = file_column(layout, file_values(), None);
     let schema = Arc::new(StructType::try_new([
         StructField::nullable("id", DataType::INTEGER),
@@ -390,7 +391,7 @@ fn test_create_table_with_iceberg_compat_rejects_file_column(
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_collects_no_stats_for_file_column(
     #[values("top_level", "in_struct", "array_element", "map_value")] layout: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (data_type, column) = file_column(layout, file_values(), None);
     let (_tmp_dir, _table_path, engine, snapshot) = write_table("none", data_type, column).await?;
     let stats = data_file_stats(&snapshot?, engine.as_ref())?;
@@ -419,7 +420,7 @@ async fn test_write_collects_no_stats_for_file_column(
 async fn test_write_file_column_with_stats_column_settings(
     #[case] property: (&str, &str),
     #[case] expected: &[&str],
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let ints = || Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
     let (_tmp_dir, _table_path, engine, snapshot) = write_columns(
         vec![
@@ -448,7 +449,7 @@ fn scan_file_count(
     snapshot: &SnapshotRef,
     engine: &DefaultEngine<TokioMultiThreadExecutor>,
     predicate: Pred,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> std::result::Result<usize, Box<dyn std::error::Error>> {
     let scan = snapshot
         .clone()
         .scan_builder()
@@ -464,7 +465,8 @@ fn scan_file_count(
 /// A `file` column has no statistics, so a predicate on its sub-fields never skips a data file,
 /// while one on another column still does.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_predicate_on_file_column_skips_no_files() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_predicate_on_file_column_skips_no_files()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, _table_path, engine, snapshot) =
         write_table("none", DataType::file_type(), Arc::new(file_values())).await?;
     let mut snapshot = snapshot?;
@@ -504,8 +506,8 @@ async fn test_predicate_on_file_column_skips_no_files() -> Result<(), Box<dyn st
 /// may write, so a predicate on a sub-field skips no data file even when those statistics rule
 /// it out, while one on another column still does.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_predicate_on_file_column_ignores_file_stats() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn test_predicate_on_file_column_ignores_file_stats()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(StructType::try_new([
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable("c", DataType::file_type()),

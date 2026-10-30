@@ -131,10 +131,10 @@ let schema = StructType::try_new([
 `StructType::builder()` provides a builder for incremental construction:
 
 ```rust,no_run
+# use delta_kernel::Result;
 # extern crate delta_kernel;
-# use delta_kernel::KernelResult;
 # use delta_kernel::schema::{DataType, StructField, StructType};
-# fn main() -> KernelResult<()> {
+# fn main() -> Result<()> {
 let schema = StructType::builder()
     .add_field(StructField::not_null("id", DataType::LONG))
     .add_field(StructField::nullable("name", DataType::STRING))
@@ -215,8 +215,8 @@ Every `Snapshot` exposes the table's schema:
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{KernelResult, Snapshot};
-# fn main() -> KernelResult<()> {
+# use delta_kernel::{Snapshot, Result};
+# fn main() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let snapshot = Snapshot::builder_for(url).build(&engine)?;

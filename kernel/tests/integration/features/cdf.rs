@@ -8,7 +8,7 @@ use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::expressions::{Predicate as Pred, col, lit};
 use delta_kernel::schema::schema_ref;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::{KernelError, KernelResult, PredicateRef, Result, Version};
+use delta_kernel::{KernelError, PredicateRef, Result, Version};
 use itertools::Itertools;
 use test_utils::{
     add_commit, create_default_engine, create_default_engine_with_batch, create_table,

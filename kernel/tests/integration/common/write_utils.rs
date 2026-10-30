@@ -537,11 +537,11 @@ pub async fn write_deletion_vector_to_store(
 
 /// Begin a transaction set up for deletion vector updates.
 pub fn create_dv_update_transaction(table_url: &Url, engine: &dyn Engine) -> Result<Transaction> {
-    Ok(Snapshot::builder_for(table_url.clone())
+    Snapshot::builder_for(table_url.clone())
         .build(engine)?
         .update_table(UpdateTableOperation::Delete, "test engine", true)
         .build(
             engine,
             Box::new(delta_kernel::committer::FileSystemCommitter::new()),
-        )?)
+        )
 }

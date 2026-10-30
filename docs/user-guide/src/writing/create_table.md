@@ -10,6 +10,7 @@ table, writes data, and reads it back, see
 The `create_table` function returns a builder that you configure and then commit:
 
 ```rust,no_run
+# use delta_kernel::Result;
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
@@ -18,8 +19,7 @@ The `create_table` function returns a builder that you configure and then commit
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
+# fn example() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let schema = Arc::new(StructType::try_new([
@@ -132,6 +132,7 @@ discarding matching files with binary predicates.
 You can set custom application properties on the table:
 
 ```rust,no_run
+# use delta_kernel::Result;
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
@@ -140,8 +141,7 @@ You can set custom application properties on the table:
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
+# fn example() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let schema = Arc::new(StructType::try_new([
@@ -168,6 +168,7 @@ You can create a clustered table using `with_data_layout`. Clustering optimizes 
 layout for queries that filter on the clustering columns:
 
 ```rust,no_run
+# use delta_kernel::Result;
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
@@ -177,8 +178,7 @@ layout for queries that filter on the clustering columns:
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::transaction::data_layout::DataLayout;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
+# fn example() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let schema = Arc::new(StructType::try_new([
@@ -224,6 +224,7 @@ data files into directories based on partition column values, which allows reade
 entire directories when filtering on those columns.
 
 ```rust,no_run
+# use delta_kernel::Result;
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
@@ -233,8 +234,7 @@ entire directories when filtering on those columns.
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::transaction::data_layout::DataLayout;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
+# fn example() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let schema = Arc::new(StructType::try_new([

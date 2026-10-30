@@ -90,12 +90,12 @@ reader does not inherit the token used to build its `Snapshot`.
 
 ```rust,no_run
 # extern crate delta_kernel;
-# use delta_kernel::{CancellationTokenRef, Engine, KernelResult, Snapshot};
+# use delta_kernel::{CancellationTokenRef, Engine, Snapshot, Result};
 # fn read_metadata(
 #     engine: &dyn Engine,
 #     table_root: &str,
 #     token: CancellationTokenRef,
-# ) -> KernelResult<()> {
+# ) -> Result<()> {
 let snapshot = Snapshot::builder_for(table_root)
     .with_cancellation_token(token.clone())
     .build(engine)?;
@@ -167,14 +167,14 @@ The `DefaultEngine` is a batteries-included implementation that works out of the
 To construct one, create an object store and pass it to the builder:
 
 ```rust,no_run
+# use delta_kernel::Result;
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # extern crate url;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
-let url = url::Url::parse("file:///path/to/table")?;
+# fn example() -> Result<()> {
+let url = url::Url::parse("file:///path/to/table").map_err(delta_kernel::KernelError::from)?;
 let store = store_from_url(&url)?;
 let engine = DefaultEngine::builder(store).build();
 # Ok(())

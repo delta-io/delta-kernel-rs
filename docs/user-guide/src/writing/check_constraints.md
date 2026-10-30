@@ -61,8 +61,8 @@ from the table, through `raw_sql()`.
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{KernelResult, Snapshot};
-# fn main() -> KernelResult<()> {
+# use delta_kernel::{Snapshot, Result};
+# fn main() -> Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/people")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let snapshot = Snapshot::builder_for(url).build(&engine)?;
@@ -96,7 +96,7 @@ row. Kernel doesn't provide a SQL evaluator for constraints.
 # use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
-# use delta_kernel::{KernelError, KernelResult, SnapshotRef};
+# use delta_kernel::{KernelError, KernelResult, SnapshotRef, Result};
 # use delta_kernel_default_engine::executor::TaskExecutor;
 # use delta_kernel_default_engine::DefaultEngine;
 # type CompiledCheck = Box<dyn Fn(&RecordBatch) -> KernelResult<BooleanArray>>;
@@ -105,7 +105,7 @@ async fn append_with_check_constraints(
     snapshot: SnapshotRef,
     batches: impl IntoIterator<Item = KernelResult<RecordBatch>>,
     compile_check: impl Fn(&str) -> KernelResult<CompiledCheck>,
-) -> KernelResult<CommitResult> {
+) -> Result<CommitResult> {
     // 1. Start the transaction.
     let mut txn = snapshot
         .update_table(UpdateTableOperation::Write, "my-app/1.0", /* data_change */ true)
@@ -133,7 +133,9 @@ async fn append_with_check_constraints(
             // `true_count` skips nulls, so a `NULL` result fails the check like `false` does.
             let passed = check(&batch)?;
             if passed.true_count() != batch.num_rows() {
-                return Err(KernelError::generic(format!("CHECK constraint {name} violated")));
+                return Err(
+                    KernelError::generic(format!("CHECK constraint {name} violated")).into(),
+                );
             }
         }
         let data = ArrowEngineData::new(batch);

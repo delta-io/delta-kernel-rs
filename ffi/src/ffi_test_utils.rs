@@ -6,7 +6,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 #[cfg(test)]
-use delta_kernel::{Engine, KernelResult, object_store::memory::InMemory};
+use delta_kernel::{Engine, Result, object_store::memory::InMemory};
 #[cfg(test)]
 use delta_kernel_default_engine::DefaultEngineBuilder;
 #[cfg(test)]
@@ -184,7 +184,7 @@ pub(crate) fn engine_handle_for_store(
 #[cfg(test)]
 pub(crate) async fn setup_snapshot(
     commit_data: String,
-) -> KernelResult<(
+) -> Result<(
     crate::handle::Handle<crate::SharedExternEngine>,
     crate::handle::Handle<crate::SharedSnapshot>,
 )> {

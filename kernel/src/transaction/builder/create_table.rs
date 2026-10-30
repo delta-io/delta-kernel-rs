@@ -1178,10 +1178,10 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
         // TODO(#3695): Support creating tables with generated columns.
         if table_configuration.has_generation_expressions() {
-            return Err(KernelError::unsupported(
+            return Err(crate::Error::Kernel(KernelError::unsupported(
                 "Setting `delta.generationExpression` column metadata is not supported during \
                  CREATE TABLE",
-            ));
+            )));
         }
 
         // Create Transaction<CreateTable> with the effective table configuration
@@ -1203,7 +1203,7 @@ fn try_new_create_table<MODE: ExecutionMode>(
     system_domain_metadata: Vec<DomainMetadata>,
     clustering_columns: Option<Vec<ColumnName>>,
     common_state: TransactionBuilderState,
-) -> KernelResult<Transaction<CreateTable, MODE>> {
+) -> Result<Transaction<CreateTable, MODE>> {
     validate_iceberg_compat_if_needed(
         &effective_table_config,
         &V2_VALIDATOR,
@@ -1528,7 +1528,10 @@ mod tests {
         )
         .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()));
 
-        let is_unsupported = matches!(&result, Err(KernelError::Unsupported(_)));
+        let is_unsupported = matches!(
+            &result,
+            Err(crate::Error::Kernel(KernelError::Unsupported(_)))
+        );
         assert!(is_unsupported);
         assert_result_error_with_message(result, "delta.generationExpression");
         Ok(())
@@ -2819,10 +2822,10 @@ mod tests {
     fn build_create_table_txn(
         schema: SchemaRef,
         properties: &[(&str, &str)],
-    ) -> KernelResult<CreateTableTransaction> {
-        let tempdir = tempfile::tempdir()?;
+    ) -> Result<CreateTableTransaction> {
+        let tempdir = tempfile::tempdir().map_err(KernelError::from)?;
         let table_path = tempdir.path().join("table");
-        std::fs::create_dir(&table_path)?;
+        std::fs::create_dir(&table_path).map_err(KernelError::from)?;
         CreateTableTransactionBuilder::new(
             table_path.to_string_lossy(),
             schema,

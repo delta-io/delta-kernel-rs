@@ -72,7 +72,7 @@ impl<STATE> Transaction<STATE, Imperative> {
     /// [CommitResult] with the following semantics:
     /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
     ///   transaction in case of a conflict so the user can retry, etc.)
-    /// - Err(KernelError) indicates a non-retryable error (e.g. logic/validation error).
+    /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
     ///
     /// `ALTER TABLE` returns a validation error if any data-file batches or manifest writes are
     /// staged. Empty or fully unselected data-file batches are also rejected.

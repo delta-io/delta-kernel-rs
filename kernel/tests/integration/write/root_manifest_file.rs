@@ -7,7 +7,7 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{DataType, StructField, schema_ref};
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use delta_kernel::transaction::{Transaction, UpdateTableOperation};
-use delta_kernel::{Engine, FileMeta, KernelError, KernelResult, Result};
+use delta_kernel::{Engine, FileMeta, KernelError, Result};
 use rstest::rstest;
 use serde_json::{Value, json};
 use tempfile::TempDir;

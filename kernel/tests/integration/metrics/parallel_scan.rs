@@ -31,7 +31,7 @@ async fn test_parallel_scan_metadata_events_carry_table_type(
         } else {
             builder
         };
-        Ok(builder.build(engine.as_ref())?)
+        builder.build(engine.as_ref())
     };
 
     // Given: a table with one appended row.

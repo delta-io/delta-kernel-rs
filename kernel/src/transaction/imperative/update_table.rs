@@ -47,13 +47,13 @@ impl Transaction<UpdateTable, Imperative> {
     ///
     /// ```no_run
     /// # use std::sync::Arc;
-    /// # use delta_kernel::Engine;
+    /// # use delta_kernel::{Engine, Result};
     /// # use delta_kernel::snapshot::Snapshot;
     /// # use delta_kernel::committer::FileSystemCommitter;
     /// # fn example(
     /// #     engine: Arc<dyn Engine>,
     /// #     table_url: url::Url,
-    /// # ) -> delta_kernel::KernelResult<()> {
+    /// # ) -> Result<()> {
     /// // Create a snapshot and transaction
     /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     /// let mut txn = snapshot

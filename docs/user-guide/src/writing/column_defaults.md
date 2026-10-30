@@ -109,7 +109,7 @@ and per-row `DEFAULT` requests need separate handling.
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel::expressions::Scalar;
 # use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
-# use delta_kernel::{KernelResult, KernelError, SnapshotRef};
+# use delta_kernel::{KernelResult, KernelError, SnapshotRef, Result};
 # use delta_kernel_default_engine::executor::TaskExecutor;
 # use delta_kernel_default_engine::DefaultEngine;
 // Describe how each table column gets its values.
@@ -123,7 +123,7 @@ async fn append_with_defaults(
     snapshot: SnapshotRef,
     input_schema: ArrowSchemaRef,
     batches: impl IntoIterator<Item = KernelResult<RecordBatch>>,
-) -> KernelResult<CommitResult> {
+) -> Result<CommitResult> {
     // 1. Start the transaction.
     let table_schema = snapshot.schema();
     let mut txn = snapshot
@@ -156,7 +156,10 @@ async fn append_with_defaults(
     txn.ack_column_defaults();
     let write_state = txn.write_state()?;
     let write_context = write_state.write_context_builder().build()?;
-    let output_schema = Arc::new(write_context.logical_data_schema().as_ref().try_into_arrow()?);
+    let output_schema = Arc::new(
+        write_context.logical_data_schema().as_ref().try_into_arrow()
+            .map_err(delta_kernel::KernelError::from)?,
+    );
 
     // 4. Fill omitted columns and write each incoming batch without collecting them.
     for batch in batches {
@@ -171,7 +174,8 @@ async fn append_with_defaults(
                 ColumnSource::Default(scalar) => scalar.to_array(batch.num_rows()),
             })
             .collect::<KernelResult<Vec<_>>>()?;
-        let output_batch = RecordBatch::try_new(Arc::clone(&output_schema), columns)?;
+        let output_batch = RecordBatch::try_new(Arc::clone(&output_schema), columns)
+            .map_err(delta_kernel::KernelError::from)?;
         let data = ArrowEngineData::new(output_batch);
         let file_metadata = engine.write_parquet(&data, &write_context).await?;
         txn.add_files(file_metadata);

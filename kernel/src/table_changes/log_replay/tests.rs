@@ -31,7 +31,7 @@ use crate::unit_test_utils::{
     Action, LocalMockTable, MockProtocolBuilder, MockTableConfigurationBuilder,
     assert_result_error_with_message,
 };
-use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Predicate, Result, Version};
+use crate::{Engine, KernelError, KernelResult, Predicate, Result, Version};
 
 fn get_schema() -> SchemaRef {
     schema_ref! {
