@@ -12,6 +12,7 @@ use crate::arrow::compute::interleave;
 use crate::arrow::datatypes::DataType as ArrowDataType;
 use crate::arrow::row::OwnedRow;
 use crate::engine::arrow_conversion::TryIntoArrow as _;
+use crate::engine::arrow_data::fix_nested_null_masks;
 use crate::engine::arrow_expression::evaluate_expression::{extract_column, extract_column_ref};
 use crate::expressions::ColumnName;
 use crate::plans::ir::nodes::{Agg, Aggregate, NonNullByOperands};
@@ -38,8 +39,8 @@ trait BoundAggregate {
 }
 
 /// Evaluates an [`Aggregate`].
-/// Currently supports Min, Max, Sum, Count, CountStar, MinNonNullBy, and MaxNonNullBy. Comparison
-/// and arithmetic operands are LONG-only; Count accepts an arbitrary column or `COUNT(*)`.
+/// Comparison and arithmetic operands are LONG-only. Counts and selectors support arbitrary
+/// operand types, including structs.
 pub(super) fn eval_aggregate(
     aggregate: &Aggregate,
     input: &[RecordBatch],
@@ -119,8 +120,69 @@ fn bind_aggregate(agg: &Agg, output_type: &DataType) -> KernelResult<Box<dyn Bou
         Agg::Sum(value) => LongAccumulatorAgg::try_new(value, output_type, LongAccumulator::Sum),
         Agg::Count(value) => CountAgg::try_new(Some(value), output_type),
         Agg::CountStar => CountAgg::try_new(None, output_type),
+        Agg::FirstNonNull(value) => Ok(Box::new(FirstNonNullAgg::try_new(value, output_type)?)),
         Agg::MinNonNullBy(ops) => NonNullByAgg::try_new(ops, output_type, Comparison::Min),
         Agg::MaxNonNullBy(ops) => NonNullByAgg::try_new(ops, output_type, Comparison::Max),
+    }
+}
+
+struct FirstNonNullAgg {
+    value: ColumnName,
+    output_type: ArrowDataType,
+}
+
+impl FirstNonNullAgg {
+    fn try_new(value: &ColumnName, output_type: &DataType) -> KernelResult<Self> {
+        Ok(Self {
+            value: value.clone(),
+            output_type: output_type.try_into_arrow()?,
+        })
+    }
+}
+
+struct FirstNonNullState(Option<ArrayRef>);
+
+impl BoundAggregate for FirstNonNullAgg {
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(FirstNonNullState(None))
+    }
+
+    fn prepare<'a>(&'a self, batch: &'a RecordBatch) -> KernelResult<Box<dyn AggUpdater + 'a>> {
+        // A nested operand must inherit its parents' nulls before selecting the first value.
+        let value = if self.value.len() > 1 {
+            let batch = RecordBatch::from(fix_nested_null_masks(batch.clone().into()));
+            extract_column(&batch, &self.value)?
+        } else {
+            extract_column(batch, &self.value)?
+        };
+        Ok(Box::new(FirstNonNullUpdater(value)))
+    }
+
+    fn finalize(&self, states: &[&dyn Any], _input: &[RecordBatch]) -> KernelResult<ArrayRef> {
+        let arrays: Vec<_> = states
+            .iter()
+            .map(|state| -> KernelResult<_> {
+                Ok(downcast_state::<FirstNonNullState>(*state)?
+                    .0
+                    .clone()
+                    .unwrap_or_else(|| new_null_array(&self.output_type, 1)))
+            })
+            .try_collect()?;
+        let rows: Vec<_> = (0..arrays.len()).map(|i| (i, 0)).collect();
+        interleave_column_values(&arrays, &rows)
+    }
+}
+
+struct FirstNonNullUpdater(ArrayRef);
+
+impl AggUpdater for FirstNonNullUpdater {
+    fn update(&self, state: &mut dyn Any, (_, row): InputRow) -> KernelResult<()> {
+        let state = downcast_state_mut::<FirstNonNullState>(state)?;
+        if state.0.is_none() && self.0.is_valid(row) {
+            // Copy only the selected row so the state does not retain source batch buffers.
+            state.0 = Some(interleave(&[self.0.as_ref()], &[(0, row)])?);
+        }
+        Ok(())
     }
 }
 
@@ -374,12 +436,151 @@ fn downcast_state_mut<T: 'static>(state: &mut dyn Any) -> KernelResult<&mut T> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::arrow::array::{BooleanArray, StringArray, StructArray};
+    use crate::arrow::buffer::NullBuffer;
     use crate::arrow::datatypes::Field;
     use crate::arrow::util::pretty::pretty_format_batches;
     use crate::expressions::column_name;
     use crate::schema::schema_ref;
+
+    #[rstest]
+    #[case(vec![], None)]
+    #[case(vec![None, None], None)]
+    #[case(vec![None, Some("first"), Some("later")], Some("first"))]
+    fn first_non_null_scalar(
+        #[case] values: Vec<Option<&str>>,
+        #[case] expected: Option<&str>,
+    ) -> KernelResult<()> {
+        let input = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(StringArray::from(values)) as ArrayRef,
+        )])?;
+        let aggregate = Aggregate::ungrouped(schema_ref! { nullable "value": STRING })
+            .first_non_null(column_name!("value"))
+            .build()?;
+        assert!(
+            aggregate
+                .schema
+                .field_at(&column_name!("value"))?
+                .is_nullable()
+        );
+        let output = eval_aggregate(&aggregate, &[input])?;
+        let values = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), [expected]);
+        Ok(())
+    }
+
+    // Test that first_non_null works on structs (and preserves nested child fields' nullability).
+    //
+    // Input:
+    //     - batch 1: [NULL struct] (child buffers contain "hidden" value)
+    //     - batch 2: [{path: NULL or "missing-size", size: NULL}, {path: "later", size: 10}]
+    // Expected Output:
+    //     - [{path: NULL or "missing-size", size: NULL}]
+    #[rstest]
+    fn first_non_null_on_struct_field(
+        #[values(false, true)] all_children_null: bool,
+    ) -> KernelResult<()> {
+        let fields: crate::arrow::datatypes::Fields = vec![
+            Arc::new(Field::new("path", ArrowDataType::Utf8, true)),
+            Arc::new(Field::new("size", ArrowDataType::Int64, true)),
+        ]
+        .into();
+        let make_batch =
+            |paths: Vec<Option<&str>>, sizes: Vec<Option<i64>>, validity: Vec<bool>| {
+                let sample = StructArray::new(
+                    fields.clone(),
+                    vec![
+                        Arc::new(StringArray::from(paths)),
+                        Arc::new(Int64Array::from(sizes)),
+                    ],
+                    Some(NullBuffer::from(validity)),
+                );
+                RecordBatch::try_from_iter([("sample", Arc::new(sample) as ArrayRef)])
+            };
+        let aggregate = Aggregate::ungrouped(schema_ref! {
+            nullable "sample": { nullable "path": STRING, nullable "size": LONG },
+        })
+        .first_non_null(column_name!("sample"))
+        .build()?;
+        let output = {
+            let inputs = vec![
+                make_batch(vec![Some("hidden")], vec![Some(100)], vec![false])?,
+                make_batch(
+                    vec![
+                        if all_children_null {
+                            None
+                        } else {
+                            Some("missing-size")
+                        },
+                        Some("later"),
+                    ],
+                    vec![None, Some(10)],
+                    vec![true, true],
+                )?,
+            ];
+            eval_aggregate(&aggregate, &inputs)?
+        };
+        let sample = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(sample.is_valid(0));
+        assert!(sample.column(1).is_null(0));
+        let paths = sample
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            paths.iter().collect::<Vec<_>>(),
+            [if all_children_null {
+                None
+            } else {
+                Some("missing-size")
+            }]
+        );
+        Ok(())
+    }
+
+    // Test that first_non_null agg respects parent struct's nullability.
+    //
+    // Input:
+    //     - parent validity buffer: [false, true]
+    //     - child values: [99, 7]
+    //     - effective values: [NULL, 7]
+    // Expected Output:
+    //     - [7]
+    #[test]
+    fn first_non_null_nested_operand_respects_parent_null() -> KernelResult<()> {
+        let nested = StructArray::new(
+            vec![Arc::new(Field::new("value", ArrowDataType::Int64, true))].into(),
+            vec![Arc::new(Int64Array::from(vec![99, 7]))],
+            Some(NullBuffer::from(vec![false, true])),
+        );
+        let input = RecordBatch::try_from_iter([("nested", Arc::new(nested) as ArrayRef)])?;
+        let aggregate = Aggregate::ungrouped(schema_ref! {
+            nullable "nested": { nullable "value": LONG },
+        })
+        .first_non_null(column_name!("nested.value"))
+        .build()?;
+        let output = eval_aggregate(&aggregate, &[input])?;
+        let values = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), [Some(7)]);
+        Ok(())
+    }
 
     /// Asserts `batches` pretty-print equal to `expected`, sorting data rows so HashMap group order
     /// does not matter. `expected` is the full pretty table (header, body, footer).
