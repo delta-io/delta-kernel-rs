@@ -12,6 +12,8 @@ use super::ConditionMetadata;
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DeltaErrorCondition {
+    /// `DELTA_ADAPTIVE_METADATA_REQUIRES_COLUMN_MAPPING_ID_MODE` (SQLSTATE `42000`).
+    DeltaAdaptiveMetadataRequiresColumnMappingIdMode,
     /// `DELTA_DUPLICATE_COLUMNS_FOUND.PARTITION_COLUMNS` (SQLSTATE `42711`).
     DeltaDuplicateColumnsFoundPartitionColumns,
     /// `DELTA_LOG_FILE_NOT_FOUND` (SQLSTATE `42K03`).
@@ -29,6 +31,12 @@ pub enum DeltaErrorCondition {
 impl DeltaErrorCondition {
     pub(super) const fn metadata(self) -> ConditionMetadata {
         match self {
+            Self::DeltaAdaptiveMetadataRequiresColumnMappingIdMode => ConditionMetadata {
+                name: "DELTA_ADAPTIVE_METADATA_REQUIRES_COLUMN_MAPPING_ID_MODE",
+                sql_state: Some("42000"),
+                parameter_names: &["feature", "prop", "mode"],
+                message_template: "The table feature '<feature>' requires column mapping mode 'id', but the table property '<prop>' is set to '<mode>'. Recreate the table with '<prop>' = 'id', or omit the property to have it set automatically.",
+            },
             Self::DeltaDuplicateColumnsFoundPartitionColumns => ConditionMetadata {
                 name: "DELTA_DUPLICATE_COLUMNS_FOUND.PARTITION_COLUMNS",
                 sql_state: Some("42711"),
