@@ -4,11 +4,11 @@ use std::ffi::c_void;
 
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
-    ColumnName, Expression, ExpressionRef, IfExpression, JunctionPredicate, JunctionPredicateOp,
-    MapData, MapToStructExpression, OpaqueExpression, OpaqueExpressionOpRef, OpaquePredicate,
-    OpaquePredicateOpRef, ParseJsonExpression, Predicate, Scalar, StructData, Transform,
-    UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression,
-    VariadicExpressionOp,
+    CaseWhenExpression, ColumnName, Expression, ExpressionRef, JunctionPredicate,
+    JunctionPredicateOp, MapData, MapToStructExpression, OpaqueExpression, OpaqueExpressionOpRef,
+    OpaquePredicate, OpaquePredicateOpRef, ParseJsonExpression, Predicate, Scalar, StructData,
+    Transform, UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp,
+    VariadicExpression, VariadicExpressionOp,
 };
 
 use super::kernel_visitor::NullTypeTag;
@@ -272,14 +272,14 @@ pub struct EngineExpressionVisitor {
     /// list identified by `sibling_list_id`.
     pub visit_unknown:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
-    /// Visits the conditional `If(condition, then_expr, else_expr)` expression belonging to
-    /// the list identified by `sibling_list_id`. The three operands will be in a three-element
-    /// child list identified by `child_list_id`, in order: condition (a predicate),
-    /// then-expression, else-expression.
+    /// Visits a CASE WHEN expression belonging to the list identified by `sibling_list_id`.
+    /// The child list contains alternating condition (predicate) and result (expression) pairs,
+    /// followed by ELSE when present. An odd list length indicates an ELSE; an even length
+    /// indicates an implicit NULL fallback. The list may be empty.
     ///
     /// Engines MUST provide a non-null callback for this slot; kernel dispatches to it
-    /// whenever an `If` expression is encountered.
-    pub visit_if: VisitVariadicFn,
+    /// whenever a CASE WHEN expression is encountered.
+    pub visit_case_when: VisitVariadicFn,
 }
 
 /// Visit the expression of the passed [`SharedExpression`] Handle using the provided `visitor`.
@@ -676,16 +676,20 @@ fn visit_expression_impl(
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
-        Expression::If(IfExpression {
-            condition,
-            then_expr,
+        Expression::CaseWhen(CaseWhenExpression {
+            branches,
             else_expr,
         }) => {
-            let child_list_id = call!(visitor, make_field_list, 3);
-            visit_predicate_impl(visitor, condition, child_list_id);
-            visit_expression_impl(visitor, then_expr, child_list_id);
-            visit_expression_impl(visitor, else_expr, child_list_id);
-            call!(visitor, visit_if, sibling_list_id, child_list_id);
+            let child_count = 2 * branches.len() + usize::from(else_expr.is_some());
+            let child_list_id = call!(visitor, make_field_list, child_count);
+            for (condition, result) in branches {
+                visit_predicate_impl(visitor, condition, child_list_id);
+                visit_expression_impl(visitor, result, child_list_id);
+            }
+            if let Some(else_expr) = else_expr {
+                visit_expression_impl(visitor, else_expr, child_list_id);
+            }
+            call!(visitor, visit_case_when, sibling_list_id, child_list_id);
         }
         Expression::Opaque(OpaqueExpression { op, exprs }) => {
             visit_expression_opaque(visitor, op, exprs, sibling_list_id)

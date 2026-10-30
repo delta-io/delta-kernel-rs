@@ -184,7 +184,7 @@ pub trait KernelPredicateEvaluator {
             | Expr::Unary(_)
             | Expr::Binary(_)
             | Expr::Variadic(_)
-            | Expr::If(_)
+            | Expr::CaseWhen(_)
             | Expr::ParseJson(_)
             | Expr::MapToStruct(_)
             | Expr::Unknown(_) => None,
@@ -214,7 +214,7 @@ pub trait KernelPredicateEvaluator {
                 | Expr::Unary(_)
                 | Expr::Binary(_)
                 | Expr::Variadic(_)
-                | Expr::If(_)
+                | Expr::CaseWhen(_)
                 | Expr::Opaque(_)
                 | Expr::ParseJson { .. }
                 | Expr::MapToStruct(_)
@@ -643,7 +643,7 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                 };
                 op_fn(&self.eval_expr(left)?, &self.eval_expr(right)?)
             }
-            Expr::Variadic(_) | Expr::If(_) => None, // TODO
+            Expr::Variadic(_) | Expr::CaseWhen(_) => None, // TODO
             Expr::Opaque(OpaqueExpression { op, exprs }) => op
                 .eval_expr_scalar(&|expr| self.eval_expr(expr), exprs)
                 .inspect_err(|err| {

@@ -65,7 +65,7 @@ enum ExpressionType {
   OpaquePredicate,
   Unknown,
   MapToStruct,
-  If,
+  CaseWhen,
 };
 enum VariadicType {
   And,
@@ -116,8 +116,8 @@ struct Unknown {
 struct MapToStructExpr {
   ExpressionItemList child_expr;
 };
-struct IfExpr {
-  // Three-element list: [condition, then_expr, else_expr].
+struct CaseWhenExpr {
+  // Alternating condition/result pairs, followed by an optional ELSE.
   ExpressionItemList branches;
 };
 struct BinaryData {
@@ -316,10 +316,10 @@ DEFINE_VARIADIC(visit_expr_or, Or)
 DEFINE_VARIADIC(visit_expr_struct_expr, StructExpression)
 #undef DEFINE_VARIADIC
 
-void visit_expr_if(void* data, uintptr_t sibling_list_id, uintptr_t child_list_id) {
-  struct IfExpr* if_expr = malloc(sizeof(struct IfExpr));
-  if_expr->branches = get_expr_list(data, child_list_id);
-  put_expr_item(data, sibling_list_id, if_expr, If);
+void visit_expr_case_when(void* data, uintptr_t sibling_list_id, uintptr_t child_list_id) {
+  struct CaseWhenExpr* case_when = malloc(sizeof(struct CaseWhenExpr));
+  case_when->branches = get_expr_list(data, child_list_id);
+  put_expr_item(data, sibling_list_id, case_when, CaseWhen);
 }
 
 // Sort by field name, breaking ties by pointer address to ensure stability.
@@ -525,7 +525,7 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_opaque_expr = visit_opaque_expr,
     .visit_unknown = visit_unknown,
     .visit_map_to_struct = visit_map_to_struct_expr,
-    .visit_if = visit_expr_if,
+    .visit_case_when = visit_expr_case_when,
   };
   uintptr_t top_level_id = visit_expression(&expression, &visitor);
   ExpressionItemList top_level_expr = data.lists[top_level_id];
@@ -573,7 +573,7 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_opaque_expr = visit_opaque_expr,
     .visit_unknown = visit_unknown,
     .visit_map_to_struct = visit_map_to_struct_expr,
-    .visit_if = visit_expr_if,
+    .visit_case_when = visit_expr_case_when,
   };
   uintptr_t top_level_id = visit_predicate(&predicate, &visitor);
   ExpressionItemList top_level_expr = data.lists[top_level_id];
@@ -692,10 +692,10 @@ void free_expression_item(ExpressionItem ref) {
       free(m2s);
       break;
     }
-    case If: {
-      struct IfExpr* if_expr = ref.ref;
-      free_expression_list(if_expr->branches);
-      free(if_expr);
+    case CaseWhen: {
+      struct CaseWhenExpr* case_when = ref.ref;
+      free_expression_list(case_when->branches);
+      free(case_when);
       break;
     }
   }

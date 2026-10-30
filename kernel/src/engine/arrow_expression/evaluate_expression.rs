@@ -15,9 +15,11 @@ use crate::arrow::array::{
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
+use crate::arrow::compute::kernels::interleave::interleave;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
-use crate::arrow::compute::kernels::zip::zip;
-use crate::arrow::compute::{and_kleene, cast, is_not_null, is_null, not, or_kleene};
+use crate::arrow::compute::{
+    and_kleene, cast, filter_record_batch, is_not_null, is_null, not, or_kleene,
+};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
     Schema as ArrowSchema, TimeUnit,
@@ -33,8 +35,8 @@ use crate::engine::arrow_utils::{parse_json_impl, prim_array_cmp};
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
-    BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
-    ExpressionRef, IfExpression, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
+    BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, CaseWhenExpression,
+    Expression, ExpressionRef, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
     OpaquePredicate, Predicate, Scalar, Transform, UnaryExpression, UnaryExpressionOp,
     UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
@@ -372,48 +374,78 @@ pub fn evaluate_expression(
             "MapToStruct expression requires a DataType::Struct result type, but got {dt:?}"
         ))),
         (Unknown(name), _) => Err(Error::unsupported(format!("Unknown expression: {name:?}"))),
-        (
-            If(IfExpression {
-                condition,
-                then_expr,
-                else_expr,
-            }),
-            result_type,
-        ) => {
-            let cond = evaluate_predicate(condition, batch, false)?;
-            // Skip evaluating the unselected branch when one side covers every row. NULL
-            // entries select `else_expr` per the IR contract, so "every row picks then"
-            // means `true_count == len` AND `null_count == 0`; "no row picks then" just
-            // means `true_count == 0` (nulls already get else).
-            if cond.true_count() == cond.len() && cond.null_count() == 0 {
-                return validate_array_type(
-                    evaluate_expression(then_expr, batch, result_type)?,
-                    result_type,
-                );
+        (CaseWhen(case_when), result_type) => evaluate_case_when(case_when, batch, result_type),
+    }
+}
+
+fn evaluate_case_when(
+    case_when: &CaseWhenExpression,
+    batch: &RecordBatch,
+    result_type: Option<&DataType>,
+) -> DeltaResult<ArrayRef> {
+    let mut remaining_batch = batch.clone();
+    let mut remaining_rows: Vec<_> = (0..batch.num_rows()).collect();
+    let mut arrays: Vec<ArrayRef> = Vec::new();
+    let mut indices = vec![(0, 0); batch.num_rows()];
+
+    for (condition, result) in &case_when.branches {
+        if remaining_rows.is_empty() {
+            break;
+        }
+        let condition = evaluate_predicate(condition, &remaining_batch, false)?;
+        if condition.true_count() == 0 {
+            continue;
+        }
+        let selected =
+            BooleanArray::from_iter(condition.iter().map(|value| Some(value == Some(true))));
+        let selected_batch = filter_record_batch(&remaining_batch, &selected)?;
+        let values = evaluate_expression(result, &selected_batch, result_type)?;
+        let mut selected_row = 0;
+        for (row, &original_row) in remaining_rows.iter().enumerate() {
+            if selected.value(row) {
+                indices[original_row] = (arrays.len(), selected_row);
+                selected_row += 1;
             }
-            if cond.true_count() == 0 {
-                return validate_array_type(
-                    evaluate_expression(else_expr, batch, result_type)?,
-                    result_type,
-                );
-            }
-            let then_arr = evaluate_expression(then_expr, batch, result_type)?;
-            let else_arr = evaluate_expression(else_expr, batch, result_type)?;
-            // Shadow Arrow's "data types differ" error from `zip` with a clearer message that
-            // identifies the kernel-side construct. `zip` itself would also reject this.
-            if then_arr.data_type() != else_arr.data_type() {
-                return Err(Error::generic(format!(
-                    "If branches must have the same type: then={:?}, else={:?}",
-                    then_arr.data_type(),
-                    else_arr.data_type()
-                )));
-            }
-            // `zip` selects truthy where mask is true, falsy where mask is false or NULL --
-            // matches the IR contract that NULL conditions fall through to `else_expr`
-            // (see `IfExpression`).
-            validate_array_type(zip(&cond, &then_arr, &else_arr)?, result_type)
+        }
+        arrays.push(values);
+
+        // Later conditions and results see only rows not selected by an earlier WHEN.
+        remaining_rows = remaining_rows
+            .into_iter()
+            .enumerate()
+            .filter_map(|(row, original_row)| (!selected.value(row)).then_some(original_row))
+            .collect();
+        if !remaining_rows.is_empty() {
+            remaining_batch = filter_record_batch(&remaining_batch, &not(&selected)?)?;
         }
     }
+
+    if arrays.is_empty() || !remaining_rows.is_empty() {
+        let fallback = if let Some(else_expr) = &case_when.else_expr {
+            evaluate_expression(else_expr, &remaining_batch, result_type)?
+        } else {
+            let data_type = match (result_type, arrays.first()) {
+                (Some(data_type), _) => data_type.try_into_arrow()?,
+                (None, Some(values)) => values.data_type().clone(),
+                (None, None) => ArrowDataType::Null,
+            };
+            new_null_array(&data_type, remaining_rows.len())
+        };
+        for (row, &original_row) in remaining_rows.iter().enumerate() {
+            indices[original_row] = (arrays.len(), row);
+        }
+        arrays.push(fallback);
+    }
+
+    if arrays.len() == 1 {
+        return validate_array_type(arrays.remove(0), result_type);
+    }
+    let data_type = arrays[0].data_type();
+    if arrays.iter().any(|values| values.data_type() != data_type) {
+        return Err(Error::generic("CASE WHEN branches must have the same type"));
+    }
+    let values = arrays.iter().map(|array| array.as_ref()).collect_vec();
+    validate_array_type(interleave(&values, &indices)?, result_type)
 }
 
 /// Direction for casting between Arrow view and non-view string/binary types.
@@ -2604,30 +2636,17 @@ mod tests {
         assert_result_error_with_message(result, "Missing Struct fields");
     }
 
-    /// Single-column Int32 batch (column `a`) of arbitrary length / nullability. Used to
-    /// drive the `num_rows == 0` boundary and the multi-row clamp pattern.
     fn int_a_batch(values: Vec<Option<i32>>, nullable: bool) -> RecordBatch {
         let schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, nullable)]);
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int32Array::from(values))]).unwrap()
     }
 
-    /// Single-column nullable Boolean batch (column `flag`) with mixed true/null/false rows
-    /// -- exercises the IR contract that NULL conditions select `else_expr`.
     fn flag_batch() -> RecordBatch {
         let schema = ArrowSchema::new(vec![ArrowField::new("flag", ArrowDataType::Boolean, true)]);
         let flag = BooleanArray::from(vec![Some(true), None, Some(false)]);
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(flag)]).unwrap()
     }
 
-    // Happy-path If evaluation over Int32: each case checks one contract.
-    // - `mixed_cond_per_row_select` drives the `zip` path.
-    // - The two short-circuit cases use a sentinel string literal in the unselected branch to prove
-    //   it is never evaluated (eager evaluation would fail the type-mismatch check).
-    // - `null_condition_selects_else` exercises the NULL-as-false contract.
-    // - `nested_clamp` is the canonical `IF(a < 0, 0, IF(a > 100, 100, a))` shape.
-    // - `arithmetic_branches` is the realistic FSR shape: condition and branches are arbitrary
-    //   expression trees (binary ops + nested If).
-    // - `empty_batch` is the `num_rows = 0` boundary.
     #[rstest]
     #[case::mixed_cond_per_row_select(
         create_test_batch(),
@@ -2679,8 +2698,6 @@ mod tests {
         vec![0, 0, 50, 100],
     )]
     // batch.a = [1, 2, 3], batch.b = [10, 20, 30], batch.c = [100, 200, 300].
-    // IF(a + b > 20, a * c, b - a) -- arithmetic in condition and both branches; this is
-    // the realistic FSR dedup-key shape where If is part of a larger expression tree.
     #[case::arithmetic_branches(
         create_test_batch(),
         Expr::if_then_else(
@@ -2699,7 +2716,7 @@ mod tests {
         ),
         vec![],
     )]
-    fn test_evaluate_if_int_per_row(
+    fn test_evaluate_case_when_int_per_row(
         #[case] batch: RecordBatch,
         #[case] expr: Expr,
         #[case] expected: Vec<i32>,
@@ -2710,22 +2727,181 @@ mod tests {
         assert_eq!(arr.data_type(), &ArrowDataType::Int32);
     }
 
-    #[test]
-    fn test_evaluate_if_branch_type_mismatch_errors() {
+    #[rstest]
+    #[case::else_type(Expr::if_then_else(
+        column_expr!("a").gt(Expr::literal(2_i32)),
+        Expr::literal(1_i32),
+        Expr::literal("text"),
+    ))]
+    #[case::when_type(Expr::case_when(
+        [
+            (column_expr!("a").gt(Expr::literal(2_i32)), Expr::literal(1_i32)),
+            (Predicate::literal(true), Expr::literal("text")),
+        ],
+        None,
+    ))]
+    fn test_evaluate_case_when_branch_type_mismatch_errors(#[case] expr: Expr) {
         // Condition `a > 2` is mixed (false, false, true), so both branches must evaluate
         // -- the type-mismatch check fires only when neither short-circuit applies.
         let batch = create_test_batch();
-        let expr = Expr::if_then_else(
-            column_expr!("a").gt(Expr::literal(2_i32)),
-            Expr::literal(1_i32),
-            Expr::literal("text"),
-        );
         let result = evaluate_expression(&expr, &batch, None);
-        assert_result_error_with_message(result, "If branches must have the same type");
+        assert_result_error_with_message(result, "CASE WHEN branches must have the same type");
+    }
+
+    #[rstest]
+    #[case::first_true_wins(
+        create_test_batch(),
+        Expr::case_when(
+            [
+                (column_expr!("a").gt(Expr::literal(1)), Expr::literal(10)),
+                (column_expr!("a").gt(Expr::literal(0)), Expr::literal(20)),
+            ],
+            Some(Expr::literal(30)),
+        ),
+        vec![Some(20), Some(10), Some(10)],
+    )]
+    #[case::null_condition_falls_through(
+        flag_batch(),
+        Expr::case_when(
+            [
+                (Predicate::BooleanExpression(column_expr!("flag")), Expr::literal(1)),
+                (Predicate::literal(true), Expr::literal(2)),
+            ],
+            None,
+        ),
+        vec![Some(1), Some(2), Some(2)],
+    )]
+    #[case::missing_else_returns_null(
+        create_test_batch(),
+        Expr::case_when(
+            [(column_expr!("a").gt(Expr::literal(2)), Expr::literal(10))],
+            None,
+        ),
+        vec![None, None, Some(10)],
+    )]
+    #[case::no_matches_without_else(
+        create_test_batch(),
+        Expr::case_when([(Predicate::literal(false), Expr::unknown("unselected"))], None),
+        vec![None, None, None],
+    )]
+    #[case::empty_branches_use_else(
+        create_test_batch(),
+        Expr::case_when([], Some(Expr::literal(9))),
+        vec![Some(9), Some(9), Some(9)],
+    )]
+    #[case::empty_case_returns_null(
+        create_test_batch(),
+        Expr::case_when([], None),
+        vec![None, None, None],
+    )]
+    #[case::selected_null_does_not_fall_through(
+        create_test_batch(),
+        Expr::case_when(
+            [
+                (Predicate::literal(true), Expr::null_literal(DataType::INTEGER)),
+                (Predicate::literal(true), Expr::literal(2)),
+            ],
+            Some(Expr::literal(3)),
+        ),
+        vec![None, None, None],
+    )]
+    #[case::skip_unreachable_condition_and_else(
+        create_test_batch(),
+        Expr::case_when(
+            [
+                (Predicate::literal(true), Expr::literal(1)),
+                (Predicate::unknown("unselected"), Expr::unknown("unselected")),
+            ],
+            Some(Expr::unknown("unselected")),
+        ),
+        vec![Some(1), Some(1), Some(1)],
+    )]
+    #[case::then_sees_only_selected_rows(
+        create_test_batch(),
+        Expr::case_when(
+            [(
+                column_expr!("a").ne(Expr::literal(1)),
+                Expr::literal(10) / (column_expr!("a") - Expr::literal(1)),
+            )],
+            Some(Expr::literal(0)),
+        ),
+        vec![Some(0), Some(10), Some(5)],
+    )]
+    #[case::else_sees_only_unmatched_rows(
+        create_test_batch(),
+        Expr::case_when(
+            [(column_expr!("a").eq(Expr::literal(1)), Expr::literal(0))],
+            Some(Expr::literal(10) / (column_expr!("a") - Expr::literal(1))),
+        ),
+        vec![Some(0), Some(10), Some(5)],
+    )]
+    #[case::later_condition_sees_only_unmatched_rows(
+        create_test_batch(),
+        Expr::case_when(
+            [
+                (column_expr!("a").eq(Expr::literal(1)), Expr::literal(0)),
+                (
+                    (Expr::literal(10) / (column_expr!("a") - Expr::literal(1)))
+                        .gt(Expr::literal(8)),
+                    Expr::literal(7),
+                ),
+            ],
+            Some(Expr::literal(9)),
+        ),
+        vec![Some(0), Some(7), Some(9)],
+    )]
+    #[case::skip_branch_matching_only_already_selected_rows(
+        create_test_batch(),
+        Expr::case_when(
+            [
+                (column_expr!("a").lt(Expr::literal(3)), Expr::literal(10)),
+                (column_expr!("a").lt(Expr::literal(3)), Expr::unknown("unselected")),
+            ],
+            Some(Expr::literal(20)),
+        ),
+        vec![Some(10), Some(10), Some(20)],
+    )]
+    #[case::empty_batch_without_else(
+        int_a_batch(vec![], false),
+        Expr::case_when([], None),
+        vec![],
+    )]
+    fn test_evaluate_case_when_nullable_int(
+        #[case] batch: RecordBatch,
+        #[case] expr: Expr,
+        #[case] expected: Vec<Option<i32>>,
+    ) {
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
+        assert_eq!(
+            result.as_primitive::<Int32Type>().iter().collect_vec(),
+            expected,
+        );
     }
 
     #[test]
-    fn test_evaluate_if_preserves_element_nulls() {
+    fn test_evaluate_case_when_infers_null_fallback_type_from_selected_branch() {
+        let expr = Expr::case_when(
+            [(column_expr!("a").gt(Expr::literal(2)), Expr::literal(10))],
+            None,
+        );
+        let result = evaluate_expression(&expr, &create_test_batch(), None).unwrap();
+        assert_eq!(
+            result.as_primitive::<Int32Type>().iter().collect_vec(),
+            vec![None, None, Some(10)],
+        );
+    }
+
+    #[test]
+    fn test_evaluate_empty_case_when_without_result_type_returns_untyped_null() {
+        let result =
+            evaluate_expression(&Expr::case_when([], None), &create_test_batch(), None).unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result.logical_null_count(), 3);
+        assert_eq!(result.data_type(), &ArrowDataType::Null);
+    }
+
+    #[test]
+    fn test_evaluate_case_when_preserves_element_nulls() {
         // a = [1, 2, 3] (non-null); b = [Some(10), None, Some(30)] (nullable). Condition
         // a >= 2 is mixed, so both branches evaluate; the row where the chosen branch is
         // itself NULL must produce NULL in the output. Kept separate from the rstest above
@@ -2758,12 +2934,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_evaluate_if_struct_branch_preserves_inner_null_field() {
-        // The chosen branch is a Struct whose struct-level value is always non-null, but
-        // whose single nullable field can carry a null. `zip` must preserve the inner null
-        // through to the output -- it operates per-row on the struct-level validity, while
-        // inner field validity flows through the struct's own child buffers.
+    #[rstest]
+    #[case::explicit_else(
+        Some(Expr::struct_from([Expr::literal(0_i32)])),
+        vec![true, true, true],
+        vec![Some(0), None, Some(30)],
+    )]
+    #[case::implicit_null_else(
+        None,
+        vec![false, true, true],
+        vec![None, None, Some(30)],
+    )]
+    fn test_evaluate_case_when_struct_branches_preserve_nulls(
+        #[case] else_expr: Option<Expr>,
+        #[case] valid: Vec<bool>,
+        #[case] expected: Vec<Option<i32>>,
+    ) {
         let schema = ArrowSchema::new(vec![
             ArrowField::new("a", ArrowDataType::Int32, false),
             ArrowField::new("b", ArrowDataType::Int32, true),
@@ -2779,29 +2965,27 @@ mod tests {
         let struct_ty = DataType::Struct(Box::new(
             StructType::try_new([StructField::nullable("value", DataType::INTEGER)]).unwrap(),
         ));
-        // Cond a >= 2 -> row 0 picks else, rows 1+2 pick then. Row 1's chosen branch carries
-        // a null in the `value` field.
-        let expr = Expr::if_then_else(
-            column_expr!("a").ge(Expr::literal(2_i32)),
-            Expr::struct_from([column_expr!("b")]),
-            Expr::struct_from([Expr::literal(0_i32)]),
+        let expr = Expr::case_when(
+            [(
+                column_expr!("a").ge(Expr::literal(2_i32)),
+                Expr::struct_from([column_expr!("b")]),
+            )],
+            else_expr,
         );
         let result = evaluate_expression(&expr, &batch, Some(&struct_ty)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
-        // Every struct row is struct-level non-null.
         assert_eq!(structs.len(), 3);
-        for row in 0..3 {
-            assert!(structs.is_valid(row));
+        for (row, valid) in valid.into_iter().enumerate() {
+            assert_eq!(structs.is_valid(row), valid);
         }
-        // Inner field: row 0 = 0 (else), row 1 = NULL (then=b[1]), row 2 = 30 (then=b[2]).
         assert_eq!(
             structs
                 .column(0)
                 .as_primitive::<Int32Type>()
                 .iter()
                 .collect::<Vec<_>>(),
-            vec![Some(0), None, Some(30)]
+            expected,
         );
     }
 }

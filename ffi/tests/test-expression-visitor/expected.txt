@@ -68,10 +68,18 @@ StructExpression
   Unknown(mystery)
   MapToStruct
     Column(pv)
-  If
+  CaseWhen
     Column(flag)
     Integer(10)
+    Column(other_flag)
     Integer(20)
+    Integer(30)
+  CaseWhen
+    Column(flag)
+    Integer(10)
+  CaseWhen
+    Integer(40)
+  CaseWhen
   Divide
     Integer(0)
     Integer(0)

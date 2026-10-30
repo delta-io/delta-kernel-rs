@@ -1049,15 +1049,13 @@ fn test_sql_where() {
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 }
 
-// Pin the contract: kernel predicate evaluator does not push `If` down -- regardless of the
-// condition shape (simple column, compound predicate, literal-true) -- it must return None.
 #[rstest::rstest]
 #[case::simple_column_cond(column_pred!("flag"))]
 #[case::compound_cond(Pred::and(column_pred!("a"), column_pred!("b")))]
 #[case::literal_true(Pred::literal(true))]
 #[case::literal_false(Pred::literal(false))]
-fn test_eval_expr_if_returns_none(#[case] cond: Pred) {
+fn test_eval_expr_case_when_returns_none(#[case] cond: Pred) {
     let empty_filter = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
-    let if_expr = Expr::if_then_else(cond, Expr::literal(1i64), Expr::literal(2i64));
-    expect_eq!(empty_filter.eval_expr(&if_expr), None, "If(...) => None");
+    let expr = Expr::case_when([(cond, Expr::literal(1i64))], Some(Expr::literal(2i64)));
+    expect_eq!(empty_filter.eval_expr(&expr), None, "CaseWhen(...) => None");
 }

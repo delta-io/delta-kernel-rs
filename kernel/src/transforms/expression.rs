@@ -2,13 +2,13 @@ use std::borrow::{Cow, ToOwned};
 use std::sync::Arc;
 
 use crate::expressions::{
-    BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef, IfExpression,
+    BinaryExpression, BinaryPredicate, CaseWhenExpression, ColumnName, Expression, ExpressionRef,
     JunctionPredicate, MapToStructExpression, OpaqueExpression, OpaquePredicate,
     ParseJsonExpression, Predicate, Scalar, Transform, UnaryExpression, UnaryPredicate,
     VariadicExpression,
 };
 use crate::transforms::{
-    map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, map_owned_trio_or_else,
+    carrier_into_inner_opt, map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else,
     transform_output_type, Carrier,
 };
 use crate::{DeltaResult, Error};
@@ -38,10 +38,6 @@ use crate::{DeltaResult, Error};
 ///
 /// * Binary (two children) - If either child was filtered out, filter out the parent. If at least
 ///   one child changed, build a new parent around them. Otherwise, return the parent unchanged.
-///
-/// * Ternary (three children) - If any child was filtered out, filter out the parent. If at least
-///   one child changed, build a new parent around them. Otherwise, return the parent unchanged.
-///   Children may have heterogeneous types (e.g. `If(Predicate, Expression, Expression)`).
 ///
 /// * Variadic (0+ children) - If no children remain (all filtered out), filter out the parent.
 ///   Otherwise, if at least one child changed or was filtered out, build a new parent around the
@@ -191,10 +187,13 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_expr_variadic(expr)
     }
 
-    /// Called for each conditional `If` expression encountered during the traversal. The provided
-    /// implementation just forwards to [`Self::recurse_into_expr_if`].
-    fn transform_expr_if(&mut self, expr: &'a IfExpression) -> Self::Output<IfExpression> {
-        self.recurse_into_expr_if(expr)
+    /// Called for each CASE WHEN expression encountered during the traversal. The provided
+    /// implementation just forwards to [`Self::recurse_into_expr_case_when`].
+    fn transform_expr_case_when(
+        &mut self,
+        expr: &'a CaseWhenExpression,
+    ) -> Self::Output<CaseWhenExpression> {
+        self.recurse_into_expr_case_when(expr)
     }
 
     /// Called for each junction predicate encountered during the traversal. The provided
@@ -257,9 +256,9 @@ pub trait ExpressionTransform<'a> {
                 let child = self.transform_expr_variadic(v);
                 map_owned_or_else(expr, child, Expression::Variadic)
             }
-            Expression::If(i) => {
-                let child = self.transform_expr_if(i);
-                map_owned_or_else(expr, child, Expression::If)
+            Expression::CaseWhen(c) => {
+                let child = self.transform_expr_case_when(c);
+                map_owned_or_else(expr, child, Expression::CaseWhen)
             }
             Expression::Opaque(o) => {
                 let child = self.transform_expr_opaque(o);
@@ -411,13 +410,41 @@ pub trait ExpressionTransform<'a> {
         map_owned_children_or_else(v, children, |exprs| VariadicExpression::new(v.op, exprs))
     }
 
-    /// Recursively transforms an `If` expression's three children (ternary). If any child is
-    /// filtered out the whole expression is filtered out -- a partial `If` is not meaningful.
-    fn recurse_into_expr_if(&mut self, i: &'a IfExpression) -> Self::Output<IfExpression> {
-        let condition = self.transform_pred(&i.condition);
-        let then_expr = self.transform_expr(&i.then_expr);
-        let else_expr = self.transform_expr(&i.else_expr);
-        map_owned_trio_or_else(i, condition, then_expr, else_expr, IfExpression::new)
+    /// Recursively transforms CASE WHEN branches and the optional ELSE. Filtering a condition or
+    /// result drops its pair; filtering ELSE removes the fallback. An empty CASE returns NULL.
+    fn recurse_into_expr_case_when(
+        &mut self,
+        c: &'a CaseWhenExpression,
+    ) -> Self::Output<CaseWhenExpression> {
+        let mut changed = false;
+        let mut branches = Vec::new();
+        for (condition, result) in &c.branches {
+            let condition = carrier_into_inner_opt!(self.transform_pred(condition));
+            let result = carrier_into_inner_opt!(self.transform_expr(result));
+            if let (Some(condition), Some(result)) = (condition, result) {
+                changed |= matches!(condition, Cow::Owned(_)) || matches!(result, Cow::Owned(_));
+                branches.push((condition, result));
+            } else {
+                changed = true;
+            }
+        }
+        let else_expr = if let Some(else_expr) = &c.else_expr {
+            let transformed = carrier_into_inner_opt!(self.transform_expr(else_expr));
+            changed |= !matches!(transformed, Some(Cow::Borrowed(_)));
+            transformed
+        } else {
+            None
+        };
+        Carrier::from_inner(if changed {
+            Cow::Owned(CaseWhenExpression::new(
+                branches
+                    .into_iter()
+                    .map(|(condition, result)| (condition.into_owned(), result.into_owned())),
+                else_expr.map(Cow::into_owned),
+            ))
+        } else {
+            Cow::Borrowed(c)
+        })
     }
 
     /// Recursively transforms a junction predicate's children (variadic).
@@ -532,6 +559,10 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
 
     fn transform_expr_binary(&mut self, expr: &'a BinaryExpression) -> DeltaResult<()> {
         self.depth_limited(Self::recurse_into_expr_binary, expr)
+    }
+
+    fn transform_expr_case_when(&mut self, expr: &'a CaseWhenExpression) -> DeltaResult<()> {
+        self.depth_limited(Self::recurse_into_expr_case_when, expr)
     }
 
     fn transform_pred_binary(&mut self, pred: &'a BinaryPredicate) -> DeltaResult<()> {
@@ -658,10 +689,6 @@ mod tests {
         }
     }
 
-    // Pin the contract that `If` recurses into condition / then / else arms and that each arm
-    // participates in the column rewrite. Without this guard, a transform pass that handles
-    // `Variadic` but forgets `If` would silently leave references un-rewritten in the
-    // conditional, which is a real footgun for FSR-style filter-out semantics.
     #[rstest::rstest]
     #[case::no_match_returns_borrowed(
         Expr::if_then_else(column_pred!("x"), column_expr!("y"), Expr::literal(42)),
@@ -696,7 +723,29 @@ mod tests {
         Expr::if_then_else(column_pred!("flag"), Expr::literal(1), column_expr!("new_col")),
         false,
     )]
-    fn test_transform_expr_if_recursion(
+    #[case::later_branch_rewritten(
+        Expr::case_when(
+            [
+                (column_pred!("flag"), Expr::literal(0)),
+                (column_pred!("old_col"), column_expr!("old_col")),
+            ],
+            None,
+        ),
+        Expr::case_when(
+            [
+                (column_pred!("flag"), Expr::literal(0)),
+                (column_pred!("new_col"), column_expr!("new_col")),
+            ],
+            None,
+        ),
+        false,
+    )]
+    #[case::empty_case_returns_borrowed(
+        Expr::case_when([], None),
+        Expr::case_when([], None),
+        true,
+    )]
+    fn test_transform_expr_case_when_recursion(
         #[case] input: Expr,
         #[case] expected: Expr,
         #[case] expect_borrowed: bool,
@@ -710,38 +759,99 @@ mod tests {
         assert_eq!(result.into_owned(), expected);
     }
 
-    // The "any child filtered out drops the parent" contract must hold for any of the three
-    // arms -- condition, then, or else. A filtering carrier that drops column references
-    // verifies this independent of arm position.
     #[rstest::rstest]
-    #[case::dropped_in_condition(Expr::if_then_else(
-        column_pred!("dropped_col"),
-        Expr::literal(1),
-        Expr::literal(0),
-    ))]
-    #[case::dropped_in_then(Expr::if_then_else(
-        column_pred!("flag"),
-        column_expr!("dropped_col"),
-        Expr::literal(0),
-    ))]
-    #[case::dropped_in_else(Expr::if_then_else(
-        column_pred!("flag"),
-        Expr::literal(1),
-        column_expr!("dropped_col"),
-    ))]
-    fn test_transform_expr_if_arm_filter_drops_expression(#[case] if_expr: Expr) {
+    #[case::condition_drops_pair(
+        Expr::case_when(
+            [
+                (column_pred!("dropped_col"), Expr::literal(1)),
+                (column_pred!("flag"), Expr::literal(2)),
+            ],
+            Some(Expr::literal(0)),
+        ),
+        Expr::case_when([(column_pred!("flag"), Expr::literal(2))], Some(Expr::literal(0))),
+    )]
+    #[case::result_drops_pair(
+        Expr::case_when(
+            [
+                (column_pred!("flag"), column_expr!("dropped_col")),
+                (column_pred!("other_flag"), Expr::literal(2)),
+            ],
+            Some(Expr::literal(0)),
+        ),
+        Expr::case_when([(column_pred!("other_flag"), Expr::literal(2))], Some(Expr::literal(0))),
+    )]
+    #[case::else_becomes_implicit_null(
+        Expr::case_when(
+            [(column_pred!("flag"), Expr::literal(1))],
+            Some(column_expr!("dropped_col")),
+        ),
+        Expr::case_when([(column_pred!("flag"), Expr::literal(1))], None),
+    )]
+    #[case::all_pairs_dropped_keep_else(
+        Expr::case_when(
+            [(column_pred!("dropped_col"), Expr::literal(1))],
+            Some(Expr::literal(0)),
+        ),
+        Expr::case_when([], Some(Expr::literal(0))),
+    )]
+    #[case::all_children_dropped_becomes_null(
+        Expr::case_when(
+            [(column_pred!("dropped_col"), column_expr!("dropped_col"))],
+            Some(column_expr!("dropped_col")),
+        ),
+        Expr::case_when([], None),
+    )]
+    fn test_transform_expr_case_when_filters_children(#[case] input: Expr, #[case] expected: Expr) {
         struct ColumnRemover;
         impl<'a> ExpressionTransform<'a> for ColumnRemover {
             transform_output_type!(|'a, T| Option<Cow<'a, T>>);
             fn transform_expr_column(
                 &mut self,
-                _name: &'a ColumnName,
+                name: &'a ColumnName,
             ) -> Option<Cow<'a, ColumnName>> {
-                None
+                (name != &ColumnName::new(["dropped_col"])).then_some(Cow::Borrowed(name))
             }
         }
-        let result = ColumnRemover.transform_expr(&if_expr);
-        assert!(result.is_none());
+        let result = ColumnRemover.transform_expr(&input).unwrap();
+        assert!(matches!(result, Cow::Owned(_)));
+        assert_eq!(result.into_owned(), expected);
+    }
+
+    #[test]
+    fn test_transform_expr_case_when_visitor_visits_all_children() {
+        struct ColumnCollector(Vec<ColumnName>);
+        impl<'a> ExpressionTransform<'a> for ColumnCollector {
+            transform_output_type!(|'a, T| ());
+            fn transform_expr_column(&mut self, name: &'a ColumnName) {
+                self.0.push(name.clone());
+            }
+        }
+        let expr = Expr::case_when(
+            [
+                (
+                    column_pred!("first_condition"),
+                    column_expr!("first_result"),
+                ),
+                (
+                    column_pred!("second_condition"),
+                    column_expr!("second_result"),
+                ),
+            ],
+            Some(column_expr!("fallback")),
+        );
+        let mut collector = ColumnCollector(Vec::new());
+        collector.transform_expr(&expr);
+        assert_eq!(
+            collector.0,
+            [
+                "first_condition",
+                "first_result",
+                "second_condition",
+                "second_result",
+                "fallback",
+            ]
+            .map(|name| ColumnName::new([name]))
+        );
     }
 
     #[test]
@@ -1056,6 +1166,16 @@ mod tests {
                 panic!("Expected binary expression");
             }
         }
+    }
+
+    #[test]
+    fn test_case_when_depth_checker_counts_nested_cases() {
+        let mut expr = Expr::literal(1);
+        for _ in 0..8 {
+            expr = Expr::case_when([(Pred::literal(true), expr)], None);
+        }
+        assert_eq!(ExpressionDepthChecker::check_expr(&expr, 10), 7);
+        assert_eq!(ExpressionDepthChecker::check_expr(&expr, 3), 4);
     }
 
     #[test]
