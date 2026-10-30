@@ -9,6 +9,7 @@ use crate::delta_types::{
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
+use crate::snapshot_provenance::{FfiCrcProvenance, FfiSelectedCheckpointKind};
 use crate::{
     ExclusiveSnapshotBuilder, FfiSnapshotBuilder, FfiSnapshotBuilderSource, NullableCvoid,
     SharedExternEngine, SharedSnapshot,
@@ -96,6 +97,67 @@ pub struct FfiSnapshotHint {
     pub publication_watermark: FfiPublicationWatermark,
 }
 
+/// Versioned hint representation preserving snapshot provenance and stale checksum baselines.
+/// All nested pointers are borrowed for the import call or export callback only.
+#[repr(C)]
+pub struct FfiSnapshotHintV2 {
+    /// Original hint fields, including only an at-version CRC in `base.crc`.
+    pub base: FfiSnapshotHint,
+    /// Selected checkpoint specification.
+    pub checkpoint_kind: FfiSelectedCheckpointKind,
+    /// Retained checksum observation.
+    pub crc_provenance: FfiCrcProvenance,
+    /// Retained checksum baseline, including a stale CRC. Null means absent.
+    /// Imports use this field as the authoritative CRC and ignore `base.crc`.
+    pub base_crc: *const FfiCrc,
+}
+
+/// Receives one borrowed V2 hint; all nested storage expires on return.
+pub type SnapshotHintVisitorV2 =
+    extern "C" fn(context: NullableCvoid, hint: *const FfiSnapshotHintV2);
+
+/// Exports a hint with provenance without engine I/O. Invokes `visitor` once on success.
+/// Uses `engine` only to allocate errors; errors follow [`snapshot_to_snapshot_hint`].
+///
+/// # Safety
+/// Both handles must remain valid and owned by the caller throughout the call. The callback
+/// must not consume either handle, retain borrowed pointers, or unwind across the FFI boundary.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_to_snapshot_hint_v2(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+    context: NullableCvoid,
+    visitor: SnapshotHintVisitorV2,
+) -> ExternResult<bool> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    let result = snapshot
+        .to_snapshot_hint()
+        .and_then(|hint| export::visit_v2(&hint, context, visitor))
+        .map(|()| true);
+    unsafe { result.into_extern_result(&engine) }
+}
+
+/// Copies and installs a V2 hint, preserving provenance without reading storage.
+/// Validation and errors follow [`snapshot_builder_with_snapshot_hint`]. Provenance consistency
+/// is checked when the snapshot is built. The existing hint layout remains unchanged.
+///
+/// # Safety
+/// The builder is consumed unconditionally. All enum tags and selected nested pointers must
+/// be valid, aligned, and initialized for their declared types and lengths throughout the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint_v2(
+    builder: Handle<ExclusiveSnapshotBuilder>,
+    value: &FfiSnapshotHintV2,
+) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
+    let mut builder = unsafe { builder.into_inner() };
+    let engine = builder.engine.clone();
+    let result =
+        unsafe { snapshot_builder_with_snapshot_hint_impl(&mut builder, &value.base, Some(value)) }
+            .map(|_| builder.into());
+    unsafe { result.into_extern_result(&engine.as_ref()) }
+}
+
 fn invalid_with_source(message: impl Into<String>, source: KernelError) -> KernelError {
     SnapshotHintError::Connector {
         message: message.into(),
@@ -128,6 +190,7 @@ impl From<FfiSnapshotHintFreshness> for SnapshotHintFreshness {
 unsafe fn snapshot_builder_with_snapshot_hint_impl(
     builder: &mut FfiSnapshotBuilder,
     value: &FfiSnapshotHint,
+    provenance: Option<&FfiSnapshotHintV2>,
 ) -> KernelResult<()> {
     let FfiSnapshotBuilderSource::TableRoot(table_root) = &builder.source else {
         return Err(KernelError::unsupported(
@@ -145,7 +208,8 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         .map(|checkpoint| unsafe { checkpoint.try_to_kernel() })
         .transpose()
         .map_err(|source| invalid_with_source("supplied _last_checkpoint is invalid", source))?;
-    let crc = unsafe { value.crc.as_ref() }
+    let crc_pointer = provenance.map_or(value.crc, |hint| hint.base_crc);
+    let crc = unsafe { crc_pointer.as_ref() }
         .map(|crc_value| unsafe { crc_value.try_to_kernel() })
         .map(|result| result.map_err(invalid_crc))
         .transpose()?
@@ -161,6 +225,11 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         crc,
         freshness,
     )?;
+    let snapshot_hint = match provenance {
+        Some(hint) => snapshot_hint
+            .with_provenance(hint.checkpoint_kind.into(), hint.crc_provenance.to_kernel()),
+        None => snapshot_hint,
+    };
     builder.snapshot_hint = Some(Box::new(snapshot_hint));
     Ok(())
 }
@@ -196,7 +265,7 @@ pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint(
 ) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
     let mut builder = unsafe { builder.into_inner() };
     let engine = builder.engine.clone();
-    let result = unsafe { snapshot_builder_with_snapshot_hint_impl(&mut builder, value) }
+    let result = unsafe { snapshot_builder_with_snapshot_hint_impl(&mut builder, value, None) }
         .map(|_| builder.into());
     unsafe { result.into_extern_result(&engine.as_ref()) }
 }

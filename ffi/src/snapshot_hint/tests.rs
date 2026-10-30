@@ -647,6 +647,102 @@ struct VisitedHint {
     visits: usize,
 }
 
+extern "C" fn install_visited_hint_v2(context: NullableCvoid, hint: *const FfiSnapshotHintV2) {
+    let state = unsafe { &mut *context.unwrap().as_ptr().cast::<VisitedHint>() };
+    state.visits += 1;
+    state.result = Some(unsafe {
+        snapshot_builder_with_snapshot_hint_v2(state.builder.take().unwrap(), &*hint)
+    });
+}
+
+#[rstest::rstest]
+#[case::at_version(crate::snapshot_provenance::FfiCrcSource::AtVersion, Some(2), Some(2))]
+#[case::reconstructed(crate::snapshot_provenance::FfiCrcSource::Reconstructed { num_commits: 2 }, Some(0), Some(2))]
+#[case::stale(crate::snapshot_provenance::FfiCrcSource::Stale, Some(0), Some(1))]
+#[case::missing(crate::snapshot_provenance::FfiCrcSource::Missing, None, None)]
+#[case::unusable(crate::snapshot_provenance::FfiCrcSource::Unusable, None, None)]
+#[case::unknown(crate::snapshot_provenance::FfiCrcSource::Unknown, None, Some(2))]
+fn versioned_hint_preserves_provenance_without_io(
+    #[case] source: crate::snapshot_provenance::FfiCrcSource,
+    #[case] base_version: Option<u64>,
+    #[case] crc_version: Option<u64>,
+) {
+    use crate::snapshot_provenance::{snapshot_crc_provenance, snapshot_selected_checkpoint_kind};
+    let engine = test_engine();
+    let paths = [
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+            0,
+            1,
+        ),
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000001.json"),
+            0,
+            1,
+        ),
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000002.json"),
+            0,
+            1,
+        ),
+    ];
+    let mut crc = empty_crc();
+    crc.version = crc_version.unwrap_or(0);
+    let hint = FfiSnapshotHintV2 {
+        base: test_snapshot_hint(&paths, 2, FfiSnapshotHintFreshness::Latest),
+        checkpoint_kind: FfiSelectedCheckpointKind::None,
+        crc_provenance: FfiCrcProvenance {
+            source,
+            base_version: base_version.into(),
+        },
+        base_crc: if crc_version.is_some() {
+            &crc
+        } else {
+            std::ptr::null()
+        },
+    };
+    let builder = unsafe {
+        ok_or_panic(snapshot_builder_with_snapshot_hint_v2(
+            test_builder(&engine),
+            &hint,
+        ))
+    };
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let mut observed = std::mem::MaybeUninit::uninit();
+    unsafe { snapshot_crc_provenance(snapshot.shallow_copy(), observed.as_mut_ptr()) };
+    assert_eq!(unsafe { observed.assume_init() }, hint.crc_provenance);
+    assert_eq!(
+        unsafe { snapshot_selected_checkpoint_kind(snapshot.shallow_copy()) },
+        hint.checkpoint_kind
+    );
+    let mut state = VisitedHint {
+        builder: Some(test_builder(&engine)),
+        result: None,
+        watermark: None,
+        visits: 0,
+    };
+    assert!(unsafe {
+        ok_or_panic(snapshot_to_snapshot_hint_v2(
+            snapshot.shallow_copy(),
+            engine.shallow_copy(),
+            Some(NonNull::from(&mut state).cast()),
+            install_visited_hint_v2,
+        ))
+    });
+    assert_eq!(state.visits, 1);
+    unsafe { free_snapshot(snapshot) };
+    let rebuilt =
+        unsafe { ok_or_panic(snapshot_builder_build(ok_or_panic(state.result.unwrap()))) };
+    assert_eq!(
+        unsafe { rebuilt.as_ref() }.crc_provenance(),
+        hint.crc_provenance.to_kernel()
+    );
+    unsafe {
+        free_snapshot(rebuilt);
+        free_engine(engine);
+    }
+}
+
 extern "C" fn install_visited_hint(context: NullableCvoid, hint: *const FfiSnapshotHint) {
     let state = unsafe { &mut *context.unwrap().as_ptr().cast::<VisitedHint>() };
     let hint = unsafe { &*hint };

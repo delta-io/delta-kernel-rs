@@ -83,6 +83,7 @@ pub mod scan;
 pub mod schema;
 pub mod schema_visitor;
 pub mod snapshot_hint;
+pub mod snapshot_provenance;
 
 #[cfg(test)]
 mod ffi_test_utils;

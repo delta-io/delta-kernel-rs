@@ -118,6 +118,7 @@ impl CheckpointShape {
                     Some(schema) => schema,
                     None => read_parquet_footer_schema(exec, root_checkpoint.clone())?,
                 };
+                segment.observe_checkpoint_schema(&cp_schema);
                 // No `sidecar` column means the file actions are inline, so this is a leaf.
                 if !cp_schema.contains(SIDECAR_NAME) {
                     return Ok(Self::new_leaf(needs_leaf_schema.then_some(cp_schema)));
@@ -125,12 +126,16 @@ impl CheckpointShape {
                 // The `sidecar` column may still be all-null (not a manifest), so scan it to
                 // confirm whether a sidecar is actually present.
                 match collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)? {
-                    Some(sidecar) => Self::try_new_manifest(
-                        exec,
-                        sidecar,
-                        needs_leaf_schema,
-                        segment.checkpoint_hint_sidecar_file_schema(),
-                    ),
+                    Some(sidecar) => {
+                        segment
+                            .observe_checkpoint_kind(crate::snapshot::SelectedCheckpointKind::V2);
+                        Self::try_new_manifest(
+                            exec,
+                            sidecar,
+                            needs_leaf_schema,
+                            segment.checkpoint_hint_sidecar_file_schema(),
+                        )
+                    }
                     None => Ok(Self::new_leaf(needs_leaf_schema.then_some(cp_schema))),
                 }
             }
