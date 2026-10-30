@@ -269,6 +269,46 @@ fn apply_schema_to_map(
     )?)
 }
 
+// Rebuild a `file` struct with its sub-fields in the kernel's order. A `file`'s sub-fields are
+// matched by name, in any order (see [`ensure_data_types`]), whereas [`apply_schema_to_struct`]
+// matches by position, so they are first picked by name. As for any struct, the rebuilt fields
+// take the kernel's metadata, so sub-field ids a writer put on them are dropped.
+fn apply_schema_to_file(array: &ArrayRef) -> KernelResult<StructArray> {
+    // Every `file` has the canonical sub-fields, so the canonical type is the kernel schema.
+    let kernel_type = DataType::file_type();
+    let DataType::File(file_fields) = &kernel_type else {
+        return Err(KernelError::internal_error("`file_type()` is not a `file`"));
+    };
+    ensure_data_types(&kernel_type, array.data_type(), ValidationMode::Full)?;
+    let Some(sa) = array.as_struct_opt() else {
+        return Err(make_arrow_error(
+            "Arrow claimed to be a struct but isn't a StructArray",
+        ));
+    };
+    let index_by_name: HashMap<&str, usize> = sa
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| (field.name().as_str(), index))
+        .collect();
+    let (fields, columns): (Vec<_>, Vec<_>) = file_fields
+        .fields()
+        .map(|kernel_field| {
+            let index = *index_by_name
+                .get(kernel_field.name().as_str())
+                .ok_or_else(|| {
+                    make_arrow_error(format!(
+                        "File struct is missing field `{}`",
+                        kernel_field.name()
+                    ))
+                })?;
+            Ok::<_, KernelError>((sa.fields()[index].clone(), sa.column(index).clone()))
+        })
+        .process_results(|iter| iter.unzip())?;
+    let ordered = StructArray::try_new(fields.into(), columns, sa.nulls().cloned())?;
+    apply_schema_to_struct(&ordered, file_fields)
+}
+
 // Apply `schema` to `array`. This handles renaming, and adjusting nullability and metadata. if the
 // actual data types don't match, this will return an error.
 pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> KernelResult<ArrayRef> {
@@ -375,6 +415,7 @@ fn apply_schema_to_inner(
             apply_schema_to_inner(array, udt.sql_type(), None, "")?
         }
         Struct(stype) => Arc::new(apply_schema_to_struct(array, stype)?),
+        File(_) => Arc::new(apply_schema_to_file(array)?),
         Array(atype) => Arc::new(apply_schema_to_list(array, atype, ancestor, relative_path)?),
         Map(mtype) => Arc::new(apply_schema_to_map(array, mtype, ancestor, relative_path)?),
         _ => {
@@ -856,5 +897,137 @@ mod apply_schema_validation_tests {
             None,
         )
         .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod file_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::arrow::array::{BinaryArray, Int64Array, StringArray};
+    use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
+    use crate::arrow::datatypes::Int64Type;
+    use crate::engine::arrow_conversion::TryIntoArrow as _;
+    use crate::schema::StructType;
+
+    /// Two `file` values whose sub-fields are in reverse order and carry field ids; the second
+    /// value is null.
+    fn reversed_file() -> StructArray {
+        let column = |name: &str, data_type: ArrowDataType, id: i32, values: ArrayRef| {
+            let field = ArrowField::new(name, data_type, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )]));
+            (Arc::new(field), values)
+        };
+        let (fields, columns): (Vec<_>, Vec<_>) = [
+            column(
+                "inline",
+                ArrowDataType::Binary,
+                7,
+                Arc::new(BinaryArray::from(vec![None::<&[u8]>, None])),
+            ),
+            column(
+                "checksum",
+                ArrowDataType::Utf8,
+                6,
+                Arc::new(StringArray::from(vec![None::<&str>, None])),
+            ),
+            column(
+                "content_type",
+                ArrowDataType::Utf8,
+                5,
+                Arc::new(StringArray::from(vec![Some("image/png"), None])),
+            ),
+            column(
+                "size",
+                ArrowDataType::Int64,
+                4,
+                Arc::new(Int64Array::from(vec![Some(10), None])),
+            ),
+            column(
+                "offset",
+                ArrowDataType::Int64,
+                3,
+                Arc::new(Int64Array::from(vec![Some(4), None])),
+            ),
+            column(
+                "uri",
+                ArrowDataType::Utf8,
+                2,
+                Arc::new(StringArray::from(vec![Some("s3://b/a"), None])),
+            ),
+        ]
+        .into_iter()
+        .unzip();
+        let fields: Vec<ArrowField> = fields.into_iter().map(|f| f.as_ref().clone()).collect();
+        StructArray::try_new(
+            fields.into(),
+            columns,
+            Some(NullBuffer::from(vec![true, false])),
+        )
+        .unwrap()
+    }
+
+    /// Asserts that `file` has the kernel's `file` type and holds [`reversed_file`]'s values.
+    fn assert_canonical(file: &StructArray) {
+        let expected_type: ArrowDataType = (&DataType::file_type()).try_into_arrow().unwrap();
+        assert_eq!(file.data_type(), &expected_type);
+        let offset = file
+            .column_by_name("offset")
+            .unwrap()
+            .as_primitive::<Int64Type>();
+        let size = file
+            .column_by_name("size")
+            .unwrap()
+            .as_primitive::<Int64Type>();
+        assert_eq!((offset.value(0), size.value(0)), (4, 10));
+        assert_eq!(file.column(0).as_string::<i32>().value(0), "s3://b/a");
+        assert!(
+            file.is_valid(0) && file.is_null(1),
+            "the null value stays null"
+        );
+    }
+
+    /// A `file` struct whose sub-fields are in another order and carry field ids comes back in the
+    /// kernel's order, without the ids, with each value under its own name and nulls kept.
+    #[test]
+    fn test_apply_schema_to_file_matches_sub_fields_by_name() {
+        let file = reversed_file();
+        let schema = StructType::new_unchecked([StructField::nullable("f", DataType::file_type())]);
+        let data = StructArray::from(vec![(
+            Arc::new(ArrowField::new("f", file.data_type().clone(), true)),
+            Arc::new(file) as ArrayRef,
+        )]);
+
+        let batch = apply_schema(&data, &DataType::Struct(Box::new(schema))).unwrap();
+
+        assert_canonical(batch.column(0).as_struct());
+    }
+
+    /// The same holds for `file` values that are list elements.
+    #[test]
+    fn test_apply_schema_to_file_in_list() {
+        let file = reversed_file();
+        let list = ListArray::new(
+            Arc::new(ArrowField::new("element", file.data_type().clone(), true)),
+            OffsetBuffer::from_lengths([2]),
+            Arc::new(file),
+            None,
+        );
+        let schema = StructType::new_unchecked([StructField::nullable(
+            "a",
+            ArrayType::new(DataType::file_type(), true),
+        )]);
+        let data = StructArray::from(vec![(
+            Arc::new(ArrowField::new("a", list.data_type().clone(), true)),
+            Arc::new(list) as ArrayRef,
+        )]);
+
+        let batch = apply_schema(&data, &DataType::Struct(Box::new(schema))).unwrap();
+
+        assert_canonical(batch.column(0).as_list::<i32>().values().as_struct());
     }
 }

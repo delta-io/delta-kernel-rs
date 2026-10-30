@@ -33,6 +33,24 @@ pub(crate) fn writer_options() -> ArrowWriterOptions {
     ArrowWriterOptions::new().with_skip_arrow_metadata(true)
 }
 
+/// Returns the [`ArrowWriterOptions`] for writing batches of `arrow_schema` as a data file with
+/// `physical_kernel_schema`: the [`writer_options`], with each `file` column written as a group
+/// annotated with the Parquet `FILE` logical type whose sub-fields carry the field ids the column
+/// reserves. Fails if `physical_kernel_schema` has a `file` column and the `arrow-60` feature is
+/// not enabled, if a `file` column is missing from `arrow_schema`, or if its sub-field ids
+/// overflow.
+#[cfg(feature = "arrow-expression")]
+#[internal_api]
+pub(crate) fn data_file_writer_options(
+    arrow_schema: &crate::arrow::datatypes::Schema,
+    physical_kernel_schema: &crate::schema::StructType,
+) -> crate::KernelResult<ArrowWriterOptions> {
+    parquet_file_type::with_file_columns(writer_options(), arrow_schema, physical_kernel_schema)
+}
+
+#[cfg(feature = "arrow-expression")]
+mod parquet_file_type;
+
 #[cfg(feature = "arrow-conversion")]
 pub mod arrow_conversion;
 

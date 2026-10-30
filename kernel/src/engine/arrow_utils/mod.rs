@@ -1,7 +1,7 @@
 //! Some utilities for working with arrow data types
 
 pub(crate) mod apply_schema;
-mod file_values;
+pub(crate) mod file_values;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -236,11 +236,12 @@ impl RowIndexBuilder {
 /// `DataTypeCompat::NeedsCast` into an actual `arrow::compute::cast`, so post-reorder leaf types
 /// are `Identical` to the kernel target.
 ///
-/// **File values.** A non-null `file` value that resolves to no referent (neither `uri` nor
-/// `inline` set, or `offset` set without `uri`) fails the read, as the File type requires.
+/// **File values.** A non-null `file` value that the File type requires readers to reject fails
+/// the read; `validate_file_values` in `file_values.rs` lists the rules.
 ///
-/// **Cost.** O(F) per batch where F is the total number of fields (including nested). Row data
-/// (Arrow buffers, offsets, null buffers) is shared via `Arc` and never copied.
+/// **Cost.** O(F) per batch where F is the total number of fields (including nested), plus O(R)
+/// per `file` column for R rows. Row data (Arrow buffers, offsets, null buffers) is shared via
+/// `Arc` and never copied.
 #[internal_api]
 pub(crate) fn fixup_parquet_read(
     batch: RecordBatch,
@@ -259,6 +260,18 @@ pub(crate) fn fixup_parquet_read(
         data
     };
     Ok(data.into())
+}
+
+/// Fails if a `file` value in `batch` is invalid for a writer to write: it breaks a rule reads
+/// apply (see [`fixup_parquet_read`]) or has a malformed `checksum`, so a writer never writes a
+/// data file that readers reject. Columns are matched to `kernel_schema` by name, and a `file`
+/// column missing from `batch` is an error.
+#[internal_api]
+pub(crate) fn validate_file_values_for_write(
+    batch: &RecordBatch,
+    kernel_schema: &StructType,
+) -> KernelResult<()> {
+    file_values::validate_file_values_for_write(&batch.clone().into(), kernel_schema)
 }
 
 /*
