@@ -32,7 +32,7 @@ use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::{
     BoundWriteContext, CommitResult, Transaction, UpdateTableOperation,
 };
-use delta_kernel::{Engine, KernelResult, Snapshot, Version};
+use delta_kernel::{Engine, KernelResult, Result, Snapshot, Version};
 use serde_json::json;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
@@ -53,12 +53,12 @@ pub const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
 pub fn rewrite_commit(
     table_path: &str,
     version: Version,
-    mut edit: impl FnMut(&mut serde_json::Value) -> Result<(), Box<dyn std::error::Error>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    mut edit: impl FnMut(&mut serde_json::Value) -> std::result::Result<(), Box<dyn std::error::Error>>,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let path = std::path::Path::new(table_path).join(format!("_delta_log/{version:020}.json"));
     let mut actions = serde_json::Deserializer::from_reader(File::open(&path)?)
         .into_iter::<serde_json::Value>()
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     for action in &mut actions {
         edit(action)?;
     }
@@ -240,7 +240,7 @@ pub async fn write_data_and_check_result_and_stats(
     schema: SchemaRef,
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     expected_since_commit: u64,
-) -> KernelResult<()> {
+) -> Result<()> {
     let mut txn = test_utils::load_and_begin_transaction_with(
         table_url.clone(),
         engine.as_ref(),
@@ -310,9 +310,10 @@ pub fn set_table_properties(
     engine: &dyn Engine,
     current_version: Version,
     properties: &[(&str, &str)],
-) -> KernelResult<Arc<Snapshot>> {
+) -> Result<Arc<Snapshot>> {
     let v0_path = std::path::Path::new(table_path).join("_delta_log/00000000000000000000.json");
-    let mut meta: serde_json::Value = std::fs::read_to_string(&v0_path)?
+    let mut meta: serde_json::Value = std::fs::read_to_string(&v0_path)
+        .map_err(delta_kernel::KernelError::from)?
         .lines()
         .find_map(|line| {
             serde_json::from_str::<serde_json::Value>(line)
@@ -327,7 +328,11 @@ pub fn set_table_properties(
 
     let new_commit = std::path::Path::new(table_path)
         .join(format!("_delta_log/{:020}.json", current_version + 1));
-    std::fs::write(&new_commit, serde_json::to_string(&meta)?)?;
+    std::fs::write(
+        &new_commit,
+        serde_json::to_string(&meta).map_err(delta_kernel::KernelError::from)?,
+    )
+    .map_err(delta_kernel::KernelError::from)?;
     Snapshot::builder_for(table_url.clone()).build(engine)
 }
 
@@ -405,7 +410,7 @@ pub async fn create_dv_table_with_files(
     schema: Arc<StructType>,
     partition_values: &[(&str, Option<&str>)],
     file_paths: &[&str],
-) -> KernelResult<(
+) -> Result<(
     Arc<DynObjectStore>,
     Arc<dyn delta_kernel::Engine>,
     Url,
@@ -531,15 +536,12 @@ pub async fn write_deletion_vector_to_store(
 }
 
 /// Begin a transaction set up for deletion vector updates.
-pub fn create_dv_update_transaction(
-    table_url: &Url,
-    engine: &dyn Engine,
-) -> KernelResult<Transaction> {
-    Snapshot::builder_for(table_url.clone())
+pub fn create_dv_update_transaction(table_url: &Url, engine: &dyn Engine) -> Result<Transaction> {
+    Ok(Snapshot::builder_for(table_url.clone())
         .build(engine)?
         .update_table(UpdateTableOperation::Delete, "test engine", true)
         .build(
             engine,
             Box::new(delta_kernel::committer::FileSystemCommitter::new()),
-        )
+        )?)
 }

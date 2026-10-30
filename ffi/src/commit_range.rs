@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use delta_kernel::commit_range::{CommitAction, CommitRange, DeltaAction as KernelDeltaAction};
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{KernelError, KernelResult, KernelResultIterator, LogPath, Version};
+use delta_kernel::{KernelError, KernelResult, KernelResultIterator, LogPath, Result, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
@@ -215,7 +215,7 @@ pub unsafe extern "C" fn commit_range_builder_build(
 
 fn commit_range_builder_build_impl(
     builder: FfiCommitRangeBuilder,
-) -> KernelResult<Handle<SharedCommitRange>> {
+) -> Result<Handle<SharedCommitRange>> {
     let engine = builder.engine.engine();
     let mut kernel_builder = CommitRange::builder_for(builder.table_root, builder.start_version)
         .with_commit_range_validation(builder.commit_range_validation)
@@ -230,9 +230,9 @@ fn commit_range_builder_build_impl(
     } else if let Some(max_catalog_version) = builder.max_catalog_version {
         kernel_builder = kernel_builder.with_log_tail(builder.log_tail, max_catalog_version);
     } else {
-        return Err(KernelError::MaxCatalogVersion(
+        return Err(delta_kernel::Error::Kernel(KernelError::MaxCatalogVersion(
             "Max catalog version is required when providing a log tail.".to_string(),
-        ));
+        )));
     }
     let range = kernel_builder.build(engine.as_ref())?;
     Ok(Arc::new(range).into())

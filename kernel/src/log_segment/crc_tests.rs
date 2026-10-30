@@ -34,7 +34,7 @@ use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
 };
 use crate::utils::FoldWithOption as _;
-use crate::{Engine, KernelError, KernelResult, Snapshot, Version};
+use crate::{Engine, KernelError, KernelResult, Result, Snapshot, Version};
 
 // ============================================================================
 // Expected values
@@ -468,12 +468,12 @@ struct BuiltCrcTest {
 impl BuiltCrcTest {
     /// Construct a `LogSegment` directly from the store state (no `Snapshot`) and run
     /// `build_crc_from_base` against `base`.
-    fn incrementally_build_crc(&self, base: &Crc) -> KernelResult<Crc> {
+    fn incrementally_build_crc(&self, base: &Crc) -> Result<Crc> {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
             LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None)?;
-        log_segment.build_crc_from_base(&self.engine, base)
+        Ok(log_segment.build_crc_from_base(&self.engine, base)?)
     }
 
     /// List with the fixture engine, then read the CRC with `engine` and `in_memory_base`.
@@ -481,7 +481,7 @@ impl BuiltCrcTest {
         &self,
         engine: &dyn Engine,
         in_memory_base: Option<&Arc<Crc>>,
-    ) -> KernelResult<Option<Version>> {
+    ) -> Result<Option<Version>> {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
@@ -1547,7 +1547,10 @@ async fn pick_latest_base_crc_preserves_cancellation_with_in_memory_base(
     let engine = CancellableEngine::new(&built.engine, token);
     let result = built.pick_latest_base_crc(&engine, Some(&base));
     if cancelled {
-        assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
+        assert!(
+            matches!(result, Err(crate::Error::Kernel(KernelError::Cancelled))),
+            "{result:?}"
+        );
     } else {
         assert_eq!(result.unwrap(), Some(if corrupt { 0 } else { 1 }));
     }

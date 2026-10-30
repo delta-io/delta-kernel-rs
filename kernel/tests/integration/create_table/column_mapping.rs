@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use delta_kernel::KernelResult;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
@@ -17,6 +16,7 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::{KernelResult, Result};
 use test_utils::{
     column_mapping_fixtures as fixtures, create_table_and_load_snapshot, test_table_setup,
 };
@@ -139,7 +139,7 @@ pub(super) fn assert_column_mapping_config(snapshot: &Snapshot, expected_mode: C
 }
 
 #[test]
-fn test_create_table_with_column_mapping_name_mode() -> KernelResult<()> {
+fn test_create_table_with_column_mapping_name_mode() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = simple_schema()?;
@@ -172,7 +172,7 @@ fn test_create_table_with_column_mapping_name_mode() -> KernelResult<()> {
 }
 
 #[test]
-fn test_create_table_with_column_mapping_id_mode() -> KernelResult<()> {
+fn test_create_table_with_column_mapping_id_mode() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! { nullable "id": INTEGER };
@@ -198,7 +198,7 @@ fn test_create_table_with_column_mapping_id_mode() -> KernelResult<()> {
 }
 
 #[test]
-fn test_column_mapping_mode_none_no_annotations() -> KernelResult<()> {
+fn test_column_mapping_mode_none_no_annotations() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = simple_schema()?;
@@ -230,7 +230,7 @@ fn test_column_mapping_mode_none_no_annotations() -> KernelResult<()> {
 /// is in the protocol but column mapping is not active (mode resolves to `None`).
 /// The schema should NOT have column mapping IDs or physical names.
 #[test]
-fn test_column_mapping_feature_only_without_mode() -> KernelResult<()> {
+fn test_column_mapping_feature_only_without_mode() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = simple_schema()?;
@@ -292,7 +292,7 @@ fn test_create_table_strips_stale_column_mapping_when_disabled(
         ColumnMetadataKey::ParquetFieldNestedIds
     )]
     key: ColumnMetadataKey,
-) -> KernelResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {
@@ -326,7 +326,7 @@ fn test_create_table_column_mapping_strip_is_none_mode_only(
     #[case] expected_mode: ColumnMappingMode,
     #[case] properties: &[(&str, &str)],
     #[case] annotation_kept: bool,
-) -> KernelResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {
@@ -356,7 +356,7 @@ fn test_create_table_column_mapping_strip_is_none_mode_only(
 fn test_create_clustered_table_with_column_mapping(
     #[case] clustering_cols: &[&str],
     #[case] description: &str,
-) -> KernelResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = simple_schema()?;
@@ -408,7 +408,7 @@ fn test_create_clustered_table_with_column_mapping(
 }
 
 #[test]
-fn test_column_mapping_nested_schema() -> KernelResult<()> {
+fn test_column_mapping_nested_schema() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create nested schema
@@ -467,7 +467,7 @@ fn test_column_mapping_nested_schema() -> KernelResult<()> {
 /// E2E test: create a table with column mapping on a schema containing map and array types,
 /// then read it back via snapshot and verify column mapping metadata survives the roundtrip.
 #[test]
-fn test_column_mapping_schema_with_maps_and_arrays() -> KernelResult<()> {
+fn test_column_mapping_schema_with_maps_and_arrays() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Schema:
@@ -536,7 +536,7 @@ fn clustering_cm_test_schema() -> Arc<StructType> {
 fn test_create_clustered_table_nested_with_column_mapping(
     #[case] col_paths: Vec<Vec<&str>>,
     #[case] cm_mode: &str,
-) -> KernelResult<()> {
+) -> Result<()> {
     use delta_kernel::expressions::ColumnName;
 
     let (_temp_dir, table_path, engine) = test_table_setup()?;
@@ -606,7 +606,7 @@ fn test_create_clustered_table_nested_with_column_mapping(
 #[case::multiple_columns(&["id", "date"])]
 fn test_partitioned_table_stores_logical_column_names_with_column_mapping(
     #[case] partition_cols: &[&str],
-) -> KernelResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = super::partition_test_schema()?;
 
@@ -676,7 +676,7 @@ fn test_create_table_dup_physical_name(
     #[case] schema: StructType,
     #[case] expected_error_substring: Option<&str>,
     #[values("name", "id")] cm_mode: &str,
-) -> KernelResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let result = create_table(&table_path, Arc::new(schema), "Test/1.0", true)
         .with_table_properties([("delta.columnMapping.mode", cm_mode)])
@@ -724,7 +724,7 @@ fn test_create_table_preserves_or_fills_cm_metadata(
     #[case] field: StructField,
     #[case] expected_id: Option<i64>,
     #[case] expected_physical: Option<&str>,
-) -> KernelResult<()> {
+) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! { (field) };
 
@@ -763,7 +763,7 @@ fn test_create_table_preserves_or_fills_cm_metadata(
 /// preserved max, in field order, and `maxColumnId` (checked by `assert_column_mapping_config`)
 /// lands on the largest assigned id.
 #[test]
-fn test_create_table_sparse_preserved_ids_seed_assignment() -> KernelResult<()> {
+fn test_create_table_sparse_preserved_ids_seed_assignment() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {
@@ -808,7 +808,7 @@ fn test_create_table_sparse_preserved_ids_seed_assignment() -> KernelResult<()> 
 /// Preserved CM metadata under a nested struct is kept verbatim; bare fields elsewhere are
 /// assigned ids strictly above the nested preserved max, in field order.
 #[test]
-fn test_create_table_preserves_preexisting_metadata_in_nested_types() -> KernelResult<()> {
+fn test_create_table_preserves_preexisting_metadata_in_nested_types() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Nested struct with one fully-annotated leaf preserved at id=42.

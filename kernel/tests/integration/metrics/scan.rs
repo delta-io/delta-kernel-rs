@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use delta_kernel::{Engine, KernelResult, Snapshot};
+use delta_kernel::{Engine, Result, Snapshot};
 
 use super::{LogState, TestTableBuilder, measuring_engine};
 
@@ -23,7 +23,7 @@ use super::{LogState, TestTableBuilder, measuring_engine};
 /// actions for scan metadata), so `json_read_calls` is non-zero even after the
 /// reporter reset.
 #[test]
-fn scan_execute_contributes_parquet_data_file_reads() -> KernelResult<()> {
+fn scan_execute_contributes_parquet_data_file_reads() -> Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(2))
         .with_data(1, 1)

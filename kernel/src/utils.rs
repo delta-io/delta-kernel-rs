@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use delta_kernel_derive::internal_api;
 use url::Url;
 
-use crate::{DeltaError, FileSize, KernelError, KernelResult};
+use crate::{DeltaError, FileSize, KernelError, KernelResult, Result};
 
 /// Phantom type parameter `T`: The containing type mentions but does not own any instance of `T`.
 ///
@@ -74,7 +74,7 @@ impl<I: IntoIterator, T: FromIterator<I::Item>> CollectInto<T> for I {
 /// failures preserve their Kernel classification.
 #[allow(unused)]
 #[internal_api]
-pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> KernelResult<Url> {
+pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> Result<Url> {
     let uri = uri.as_ref();
     let uri_type = resolve_uri_type(uri)?;
     let url = match uri_type {
@@ -92,8 +92,8 @@ pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> KernelResult<Url> {
                 .into());
             }
             if !path.is_dir() {
-                return Err(KernelError::InvalidTableLocation(format!(
-                    "{path:?} is not a directory"
+                return Err(crate::Error::Kernel(KernelError::InvalidTableLocation(
+                    format!("{path:?} is not a directory"),
                 )));
             }
             let path = std::fs::canonicalize(path).map_err(|err| {

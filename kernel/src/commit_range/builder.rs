@@ -11,7 +11,7 @@ use crate::log_segment_files::LogSegmentFiles;
 use crate::path::ParsedLogPath;
 use crate::snapshot::SnapshotRef;
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult, LogPath, Version};
+use crate::{Engine, KernelError, KernelResult, LogPath, Result, Version};
 
 /// Builder for a [`CommitRange`].
 ///
@@ -132,11 +132,11 @@ impl CommitRangeBuilder {
     /// versions exist, [`KernelError::EmptyLog`] if nothing is available in the requested range at
     /// all, and [`KernelError::CommitRange`] if the resolved version range is invalid
     /// (start > end).
-    pub fn build(self, engine: &dyn Engine) -> KernelResult<CommitRange> {
+    pub fn build(self, engine: &dyn Engine) -> Result<CommitRange> {
         self.validate_supported_modes()?;
 
         let table_root = Self::parse_table_root(&self.table_root)?;
-        let log_root = table_root.join("_delta_log/")?;
+        let log_root = table_root.join("_delta_log/").map_err(KernelError::from)?;
         self.validate_inputs()?;
         let CommitRangeBuilder {
             table_root: _,
@@ -282,7 +282,7 @@ impl CommitRangeBuilder {
     }
 
     /// Parse the stored table-root string into a [`Url`].
-    fn parse_table_root(table_root: &str) -> KernelResult<Url> {
+    fn parse_table_root(table_root: &str) -> Result<Url> {
         crate::utils::try_parse_uri(table_root)
     }
 }
@@ -427,7 +427,10 @@ mod tests {
             .build(&engine);
 
         assert!(
-            matches!(result, Err(KernelError::CommitRange(_))),
+            matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::CommitRange(_)))
+            ),
             "expected CommitRange error"
         );
         assert_result_error_with_message(result, "only supported for path-based commit ranges");
@@ -443,7 +446,10 @@ mod tests {
             .build(&engine);
 
         assert!(
-            matches!(result, Err(KernelError::CommitRange(_))),
+            matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::CommitRange(_)))
+            ),
             "expected CommitRange error"
         );
         assert_result_error_with_message(result, "requires ascending commit ordering");
@@ -457,7 +463,10 @@ mod tests {
             .with_commit_range_validation(false)
             .build(&engine);
 
-        assert!(matches!(result, Err(KernelError::EmptyLog)));
+        assert!(matches!(
+            result,
+            Err(crate::Error::Kernel(KernelError::EmptyLog))
+        ));
     }
 
     #[rstest::rstest]
@@ -480,9 +489,11 @@ mod tests {
             .expect_err("must error");
         match expected_missing_version {
             Some(version) => {
-                assert!(matches!(err, KernelError::MissingVersion(v) if v == version));
+                assert!(
+                    matches!(err, crate::Error::Kernel(KernelError::MissingVersion(v)) if v == version)
+                );
             }
-            None => assert!(matches!(err, KernelError::EmptyLog)),
+            None => assert!(matches!(err, crate::Error::Kernel(KernelError::EmptyLog))),
         }
     }
 
@@ -499,7 +510,7 @@ mod tests {
             .expect_err("must error");
         assert!(matches!(
             err,
-            KernelError::CommitRange(message)
+            crate::Error::Kernel(KernelError::CommitRange(message))
                 if message.contains("start_version (1) must be <= end_version (0)")
         ));
     }
@@ -521,10 +532,10 @@ mod tests {
             .expect_err("commit at version 1 must be unavailable after checkpoint filtering");
         assert!(matches!(
             err,
-            KernelError::StartVersionNotFound {
+            crate::Error::Kernel(KernelError::StartVersionNotFound {
                 requested: 1,
                 earliest: 3
-            }
+            })
         ));
     }
 
@@ -619,7 +630,10 @@ mod tests {
             .build(&engine)
             .unwrap_err();
 
-        assert!(matches!(err, KernelError::MissingVersion(2)));
+        assert!(matches!(
+            err,
+            crate::Error::Kernel(KernelError::MissingVersion(2))
+        ));
     }
 
     #[rstest::rstest]
@@ -696,7 +710,7 @@ mod tests {
         if let Some(expected_error) = expected_error {
             assert!(matches!(
                 result.unwrap_err(),
-                KernelError::MaxCatalogVersion(message) if message.contains(expected_error)
+                crate::Error::Kernel(KernelError::MaxCatalogVersion(message)) if message.contains(expected_error)
             ));
         } else {
             let range = result.unwrap();
@@ -733,7 +747,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            KernelError::LogTailVersionsNotContiguous { .. }
+            crate::Error::Kernel(KernelError::LogTailVersionsNotContiguous { .. })
         ));
     }
 
@@ -786,7 +800,10 @@ mod tests {
             .build(&engine)
             .unwrap_err();
 
-        assert!(matches!(err, KernelError::InvalidLogPath(_)));
+        assert!(matches!(
+            err,
+            crate::Error::Kernel(KernelError::InvalidLogPath(_))
+        ));
     }
 
     #[test]
@@ -797,14 +814,20 @@ mod tests {
             .with_max_catalog_version(1)
             .build(&engine)
             .unwrap_err();
-        assert!(matches!(start_err, KernelError::MaxCatalogVersion(_)));
+        assert!(matches!(
+            start_err,
+            crate::Error::Kernel(KernelError::MaxCatalogVersion(_))
+        ));
 
         let end_err = CommitRange::builder_for(table_root.as_str(), 0)
             .with_end_version(2)
             .with_max_catalog_version(1)
             .build(&engine)
             .unwrap_err();
-        assert!(matches!(end_err, KernelError::MaxCatalogVersion(_)));
+        assert!(matches!(
+            end_err,
+            crate::Error::Kernel(KernelError::MaxCatalogVersion(_))
+        ));
     }
 
     #[test]

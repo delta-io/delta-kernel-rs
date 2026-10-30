@@ -16,7 +16,7 @@ use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as create_delta_table;
 use delta_kernel::transaction::{CommitResult, RetryableTransaction, UpdateTableOperation};
-use delta_kernel::{Engine, KernelError, KernelResult, Snapshot, SnapshotRef};
+use delta_kernel::{Engine, KernelError, KernelResult, Result, Snapshot, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use itertools::Itertools;
@@ -59,7 +59,7 @@ async fn main() -> ExitCode {
 }
 
 // TODO: Update the example once official write APIs are introduced (issue#1123)
-async fn try_main() -> KernelResult<()> {
+async fn try_main() -> Result<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Write", "write", "");
 
     // Check if path is a directory and if not, create it
@@ -106,9 +106,9 @@ async fn try_main() -> KernelResult<()> {
     let mut retries = 0;
     let committed = loop {
         if retries > 5 {
-            return Err(KernelError::generic(
+            return Err(delta_kernel::Error::Kernel(KernelError::generic(
                 "Exceeded maximum 5 retries for committing transaction",
-            ));
+            )));
         }
         txn = match txn.commit(&engine)? {
             CommitResult::Committed(committed) => break committed,
@@ -117,7 +117,9 @@ async fn try_main() -> KernelResult<()> {
                 println!(
                     "✗ Failed to write data, transaction conflicted with version: {conflicting_version}"
                 );
-                return Err(KernelError::generic("Commit failed"));
+                return Err(delta_kernel::Error::Kernel(KernelError::generic(
+                    "Commit failed",
+                )));
             }
             CommitResult::Retryable(RetryableTransaction { transaction, error }) => {
                 println!("✗ Failed to commit, retrying... retryable error: {error}");
@@ -143,7 +145,7 @@ async fn create_or_get_base_snapshot(
     url: &Url,
     engine: &dyn Engine,
     schema_str: &str,
-) -> KernelResult<SnapshotRef> {
+) -> Result<SnapshotRef> {
     // Check if table already exists
     match Snapshot::builder_for(url.clone()).build(engine) {
         Ok(snapshot) => {
@@ -195,11 +197,7 @@ fn parse_schema(schema_str: &str) -> KernelResult<SchemaRef> {
 }
 
 /// Create a new Delta table with the given schema using the official CreateTable API.
-async fn create_table(
-    table_url: &Url,
-    schema: &SchemaRef,
-    engine: &dyn Engine,
-) -> KernelResult<()> {
+async fn create_table(table_url: &Url, schema: &SchemaRef, engine: &dyn Engine) -> Result<()> {
     // Use the create_table API to create the table
     let table_path = table_url.as_str();
     let _result = create_delta_table(
@@ -269,7 +267,7 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> KernelResult<Arrow
 async fn read_and_display_data(
     table_url: &Url,
     engine: DefaultEngine<TokioBackgroundExecutor>,
-) -> KernelResult<()> {
+) -> Result<()> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let scan = snapshot.scan_builder().build()?;
 
@@ -278,6 +276,6 @@ async fn read_and_display_data(
         .map(EngineDataArrowExt::try_into_record_batch)
         .try_collect()?;
 
-    print_batches(&batches)?;
+    print_batches(&batches).map_err(delta_kernel::KernelError::from)?;
     Ok(())
 }

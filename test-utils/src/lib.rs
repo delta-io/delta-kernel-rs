@@ -238,7 +238,7 @@ use delta_kernel::{
     CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
     FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData, JsonHandler, KernelError,
     KernelResult, KernelResultIterator, LogPath, ParquetFooter, ParquetHandler, PredicateRef,
-    Snapshot, try_parse_uri,
+    Result, Snapshot, try_parse_uri,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
@@ -478,12 +478,14 @@ pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suf
 }
 
 // Resolve a table from a root and relative path
-pub(crate) fn resolve_table_path(
-    table_root: impl AsRef<str>,
-    relative: &Path,
-) -> KernelResult<Path> {
+pub(crate) fn resolve_table_path(table_root: impl AsRef<str>, relative: &Path) -> Result<Path> {
     let url = try_parse_uri(table_root)?;
-    Ok(Path::from_url_path(url.join(relative.as_ref())?.path())?)
+    Ok(Path::from_url_path(
+        url.join(relative.as_ref())
+            .map_err(delta_kernel::KernelError::from)?
+            .path(),
+    )
+    .map_err(delta_kernel::KernelError::from)?)
 }
 
 /// Write a Delta commit JSON file at the given version into `store`.
@@ -502,10 +504,13 @@ pub async fn add_commit(
     store: &DynObjectStore,
     version: u64,
     data: String,
-) -> KernelResult<()> {
+) -> Result<()> {
     let relative_path = delta_path_for_version(version, "json");
     let table_path = resolve_table_path(table_root, &relative_path)?;
-    store.put(&table_path, data.into()).await?;
+    store
+        .put(&table_path, data.into())
+        .await
+        .map_err(delta_kernel::KernelError::from)?;
     Ok(())
 }
 
@@ -528,10 +533,13 @@ pub async fn add_staged_commit(
     store: &DynObjectStore,
     version: u64,
     data: String,
-) -> KernelResult<Path> {
+) -> Result<Path> {
     let relative_path = staged_commit_path_for_version(version);
     let table_path = resolve_table_path(table_root, &relative_path)?;
-    store.put(&table_path, data.into()).await?;
+    store
+        .put(&table_path, data.into())
+        .await
+        .map_err(delta_kernel::KernelError::from)?;
     Ok(table_path)
 }
 
@@ -1221,11 +1229,7 @@ pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> KernelResult<Vec<Recor
         .try_collect()
 }
 
-pub fn test_read(
-    expected: &ArrowEngineData,
-    url: &Url,
-    engine: Arc<dyn Engine>,
-) -> KernelResult<()> {
+pub fn test_read(expected: &ArrowEngineData, url: &Url, engine: Arc<dyn Engine>) -> Result<()> {
     let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;
@@ -1383,7 +1387,7 @@ impl Committer for TestCatalogCommitter {
 pub fn load_and_begin_transaction(
     table_url: impl AsRef<str>,
     engine: &dyn Engine,
-) -> KernelResult<Transaction> {
+) -> Result<Transaction> {
     load_and_begin_transaction_with(
         table_url,
         engine,
@@ -1406,16 +1410,16 @@ pub fn load_and_begin_transaction_with(
     engine_info: impl Into<String>,
     data_change: bool,
     configure: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
-) -> KernelResult<Transaction> {
+) -> Result<Transaction> {
     let snapshot = Snapshot::builder_for(table_url).build(engine)?;
-    begin_transaction_with(
+    Ok(begin_transaction_with(
         snapshot,
         engine,
         operation,
         engine_info,
         data_change,
         configure,
-    )
+    )?)
 }
 
 // Helper function to set json values in a serde_json Values
@@ -2089,7 +2093,7 @@ pub fn create_table_and_load_snapshot(
     schema: SchemaRef,
     engine: &dyn Engine,
     properties: &[(&str, &str)],
-) -> KernelResult<Arc<Snapshot>> {
+) -> Result<Arc<Snapshot>> {
     use delta_kernel::committer::FileSystemCommitter;
     use delta_kernel::transaction::create_table::create_table;
 

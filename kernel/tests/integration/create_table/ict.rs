@@ -12,7 +12,7 @@ use delta_kernel::table_features::{
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
 };
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::{Engine, KernelResult};
+use delta_kernel::{Engine, KernelResult, Result};
 use test_utils::test_table_setup;
 
 /// Asserts the ICT protocol and enablement state of a snapshot, returning the ICT value.
@@ -73,7 +73,7 @@ fn test_create_table_ict(
     #[case] properties: &[(&str, &str)],
     #[case] expect_ict_feature_supported: bool,
     #[case] expect_ict_enabled: bool,
-) -> KernelResult<()> {
+) -> Result<()> {
     let test_start_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()

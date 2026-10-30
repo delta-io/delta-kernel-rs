@@ -137,7 +137,7 @@ mod tests {
     use std::ffi::c_void;
     use std::sync::Arc;
 
-    use delta_kernel::{DeltaError, DeltaErrorCondition, Engine, Error, KernelError};
+    use delta_kernel::{DeltaError, DeltaErrorCondition, Engine, Error, KernelError, Result};
     use rstest::rstest;
 
     use super::{DeltaErrorInfo, ErrorAllocators, KernelErrorInfo};
@@ -301,12 +301,12 @@ mod tests {
                 unsafe { result.into_extern_result(&allocators) }
             }
             (EntryPoint::Result, error) => {
-                let result: delta_kernel::Result<()> = Err(error);
+                let result: Result<()> = Err(error);
                 unsafe { result.into_extern_result(&allocators) }
             }
             (EntryPoint::EngineResult, error) => {
                 let engine = AllocationOnlyEngine { allocators };
-                let result: delta_kernel::Result<()> = Err(error);
+                let result: Result<()> = Err(error);
                 unsafe { result.into_extern_result(&&engine) }
             }
             (EntryPoint::Direct, error) => {
@@ -330,7 +330,7 @@ mod tests {
             allocate_delta_error: delta,
         };
         let result = if top_level {
-            let result: delta_kernel::Result<_> = Ok(7);
+            let result: Result<_> = Ok(7);
             unsafe { result.into_extern_result(&allocators) }
         } else {
             let result: delta_kernel::KernelResult<_> = Ok(7);

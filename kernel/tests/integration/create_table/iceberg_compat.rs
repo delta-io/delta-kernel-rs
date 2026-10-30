@@ -1,6 +1,5 @@
 //! IcebergCompat integration tests for the CreateTable API.
 
-use delta_kernel::KernelResult;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, schema, schema_ref,
@@ -8,6 +7,7 @@ use delta_kernel::schema::{
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::{KernelResult, Result};
 use rstest::rstest;
 use serde_json::json;
 use test_utils::{assert_result_error_with_message, test_table_setup};
@@ -126,7 +126,7 @@ fn v3_create_table_rejects_interval_column(
 /// IcebergCompatV3 is supported. CREATE runs the write path checks, which require the
 /// requirements of every listed writer feature to hold.
 #[test]
-fn v3_supported_but_not_enabled_requires_column_mapping() -> KernelResult<()> {
+fn v3_supported_but_not_enabled_requires_column_mapping() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         nullable "data": { INTEGER => nullable [nullable INTEGER] },
@@ -146,7 +146,7 @@ fn v3_supported_but_not_enabled_requires_column_mapping() -> KernelResult<()> {
 /// and — critically — assigns `delta.columnMapping.nested.ids` to a Map column (regression guard
 /// for the nested-id gate that previously keyed only on V3).
 #[test]
-fn v2_create_table_enables_column_mapping_and_nested_ids() -> KernelResult<()> {
+fn v2_create_table_enables_column_mapping_and_nested_ids() -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         nullable "id": LONG,

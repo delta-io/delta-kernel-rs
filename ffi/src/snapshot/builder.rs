@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use delta_kernel::snapshot::{IncrementalReplay, Snapshot, SnapshotHint, SnapshotRef};
-use delta_kernel::{Engine, KernelResult, LogPath, Version};
+use delta_kernel::{Engine, KernelResult, LogPath, Result, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
@@ -87,7 +87,7 @@ pub unsafe extern "C" fn get_snapshot_builder(
     let source = match url {
         Ok(url) => FfiSnapshotBuilderSource::TableRoot(url),
         Err(e) => {
-            let result: KernelResult<Handle<ExclusiveSnapshotBuilder>> = Err(e);
+            let result: Result<Handle<ExclusiveSnapshotBuilder>> = Err(e);
             return unsafe { result.into_extern_result(&engine_ref) };
         }
     };
@@ -260,9 +260,7 @@ unsafe fn snapshot_builder_with_log_tail_impl(
     Ok(())
 }
 
-fn snapshot_builder_build_impl(
-    builder: FfiSnapshotBuilder,
-) -> KernelResult<Handle<SharedSnapshot>> {
+fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> Result<Handle<SharedSnapshot>> {
     let FfiSnapshotBuilder {
         engine,
         source,
@@ -290,8 +288,8 @@ fn snapshot_builder_build_impl(
             delta_kernel::snapshot::SnapshotBuilder<Mode>,
             Box<SnapshotHint>,
         )
-            -> KernelResult<delta_kernel::snapshot::SnapshotBuilder<Mode>>,
-    ) -> KernelResult<SnapshotRef> {
+            -> Result<delta_kernel::snapshot::SnapshotBuilder<Mode>>,
+    ) -> Result<SnapshotRef> {
         let BuildOptions {
             version,
             incremental_replay,
@@ -336,9 +334,9 @@ fn snapshot_builder_build_impl(
             |_, _| {
                 // The public API rejects this combination; retain the invariant here for
                 // internal construction paths.
-                Err(hint::invalid(
+                Err(delta_kernel::Error::Kernel(hint::invalid(
                     "A snapshot hint cannot be used with Snapshot::builder_from",
-                ))
+                )))
             },
         ),
     }?;

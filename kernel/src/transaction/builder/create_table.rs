@@ -55,7 +55,7 @@ use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
 use crate::transaction::{CommitOperation, CreateTable, ExecutionMode, Imperative, Transaction};
 use crate::utils::{current_time_ms, try_parse_uri};
-use crate::{Engine, KernelError, KernelResult, StorageHandler};
+use crate::{Engine, KernelError, KernelResult, Result, StorageHandler};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
 ///
@@ -1062,14 +1062,14 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
         self,
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
-    ) -> KernelResult<CreateTableTransaction<MODE>> {
+    ) -> Result<CreateTableTransaction<MODE>> {
         self.common_state.validate()?;
 
         // Validate path
         let table_url = try_parse_uri(&self.local_state.path)?;
 
         // Check if table already exists by looking for _delta_log directory
-        let delta_log_url = table_url.join("_delta_log/")?;
+        let delta_log_url = table_url.join("_delta_log/").map_err(KernelError::from)?;
         let storage = engine.storage_handler();
         ensure_table_does_not_exist(storage.as_ref(), &delta_log_url, &self.local_state.path)?;
 
@@ -1289,10 +1289,10 @@ mod tests {
     fn common_builder_state_preserves_data_change_through_empty_commit(
         #[values(false, true)] expected_data_change: bool,
         #[values(false, true)] skip_dedup_validation: bool,
-    ) -> KernelResult<()> {
-        let tempdir = tempfile::tempdir()?;
+    ) -> Result<()> {
+        let tempdir = tempfile::tempdir().map_err(KernelError::from)?;
         let table_path = tempdir.path().join("table");
-        std::fs::create_dir(&table_path)?;
+        std::fs::create_dir(&table_path).map_err(KernelError::from)?;
         let engine = SyncEngine::new();
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());

@@ -9,7 +9,9 @@ use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
 use delta_kernel::schema::MetadataValue;
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{Expression, ExpressionRef, KernelError, KernelResult, KernelResultIterator};
+use delta_kernel::{
+    Expression, ExpressionRef, KernelError, KernelResult, KernelResultIterator, Result,
+};
 use delta_kernel_ffi_macros::handle_descriptor;
 use derive_more::From;
 use tracing::debug;
@@ -963,8 +965,8 @@ pub unsafe extern "C" fn selection_vector_from_dv(
 fn selection_vector_from_dv_impl(
     dv_info: &DvInfo,
     extern_engine: &dyn ExternEngine,
-    root_url: KernelResult<Url>,
-) -> KernelResult<KernelBoolSlice> {
+    root_url: Result<Url>,
+) -> Result<KernelBoolSlice> {
     match dv_info.get_selection_vector(extern_engine.engine().as_ref(), &root_url?)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelBoolSlice::empty()),
@@ -990,8 +992,8 @@ pub unsafe extern "C" fn row_indexes_from_dv(
 fn row_indexes_from_dv_impl(
     dv_info: &DvInfo,
     extern_engine: &dyn ExternEngine,
-    root_url: KernelResult<Url>,
-) -> KernelResult<KernelRowIndexArray> {
+    root_url: Result<Url>,
+) -> Result<KernelRowIndexArray> {
     match dv_info.get_row_indexes(extern_engine.engine().as_ref(), &root_url?)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelRowIndexArray::empty()),
@@ -1410,7 +1412,7 @@ mod scan_builder_tests {
 
     #[cfg(feature = "geo-type-in-dev")]
     #[test]
-    fn test_scan_builder_with_geo_schema() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_scan_builder_with_geo_schema() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let table_path = std::fs::canonicalize("../kernel/tests/data/table-with-geo/")?;
         let table_root = Url::from_directory_path(&table_path)
             .map_err(|()| delta_kernel::KernelError::generic("invalid table path"))?
@@ -2285,7 +2287,7 @@ mod tests {
     #[case::minimum(Some(i64::MIN), Err("cardinality must be non-negative"))]
     fn test_cardinality_from_dv(
         #[case] cardinality: Option<i64>,
-        #[case] expected: Result<Option<u64>, &str>,
+        #[case] expected: std::result::Result<Option<u64>, &str>,
     ) {
         let dv_info: DvInfo = cardinality
             .map(|cardinality| {

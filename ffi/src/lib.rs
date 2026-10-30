@@ -23,7 +23,7 @@ use delta_kernel::history_manager::{
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, LogSegmentStats, Snapshot, SnapshotRef};
-use delta_kernel::{Engine, EngineData, FileStats, KernelResult, Version};
+use delta_kernel::{Engine, EngineData, FileStats, KernelResult, Result, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -795,7 +795,7 @@ impl ExternEngine for ExternEngineVtable {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid path pointer.
-unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> KernelResult<Url> {
+unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> Result<Url> {
     let path: &str = unsafe { TryFromStringSlice::try_from_slice(&path) }?;
     delta_kernel::try_parse_uri(path)
 }
@@ -887,9 +887,9 @@ pub unsafe extern "C" fn get_engine_builder(
 
 #[cfg(feature = "default-engine-base")]
 fn get_engine_builder_impl(
-    url: KernelResult<Url>,
+    url: Result<Url>,
     error_allocators: ErrorAllocators,
-) -> KernelResult<Handle<ExclusiveEngineBuilder>> {
+) -> Result<Handle<ExclusiveEngineBuilder>> {
     let builder = Box::new(FfiEngineBuilder {
         url: url?,
         error_allocators,
@@ -1110,17 +1110,17 @@ pub unsafe extern "C" fn get_default_engine(
 // get the default version of the default engine :)
 #[cfg(feature = "default-engine-base")]
 fn get_default_default_engine_impl(
-    url: KernelResult<Url>,
+    url: Result<Url>,
     error_allocators: ErrorAllocators,
-) -> KernelResult<Handle<SharedExternEngine>> {
-    get_default_engine_impl(
+) -> Result<Handle<SharedExternEngine>> {
+    Ok(get_default_engine_impl(
         url?,
         Default::default(),
         ObjectStoreBackend::default(),
         None,
         IoConcurrencyConfig::default(),
         error_allocators,
-    )
+    )?)
 }
 
 /// Safety
@@ -1592,16 +1592,16 @@ pub unsafe extern "C" fn get_earliest_commit(
 
 fn get_earliest_commit_impl(
     extern_engine: &dyn ExternEngine,
-    log_root: KernelResult<Url>,
+    log_root: Result<Url>,
     earliest_ratified_commit_version: OptionalValue<Version>,
     commit_type: FfiHistoryCommitType,
-) -> KernelResult<Version> {
-    kernel_get_earliest_commit(
+) -> Result<Version> {
+    Ok(kernel_get_earliest_commit(
         extern_engine.engine().as_ref(),
         &log_root?,
         earliest_ratified_commit_version.into(),
         commit_type.into(),
-    )
+    )?)
 }
 
 /// A commit located by a timestamp query: a commit version paired with its timestamp. FFI-safe
@@ -2111,7 +2111,7 @@ mod tests {
     /// engine and snapshot handles.
     async fn make_engine_and_v0_snapshot(
         path: &str,
-    ) -> KernelResult<(
+    ) -> Result<(
         Arc<InMemory>,
         Handle<SharedExternEngine>,
         Handle<SharedSnapshot>,
@@ -2136,7 +2136,7 @@ mod tests {
     /// snapshot is built with `max_catalog_version = 0`.
     async fn make_catalog_managed_engine_and_v0_snapshot(
         path: &str,
-    ) -> KernelResult<(
+    ) -> Result<(
         Arc<InMemory>,
         Handle<SharedExternEngine>,
         Handle<SharedSnapshot>,
@@ -2291,7 +2291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot() -> KernelResult<()> {
+    async fn test_snapshot() -> Result<()> {
         let table_root = "memory:///test_table/";
         let (_, engine, snapshot1) = make_engine_and_v0_snapshot(table_root).await?;
 
@@ -2348,7 +2348,7 @@ mod tests {
         #[case] mode: Option<FfiIncrementalReplay>,
         #[case] expect_file_stats: bool,
         #[values(false, true)] from_existing: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let table = TestTableBuilder::new()
             .with_log_state(LogState::with_latest_version(1).with_crc_at([0]))
             .build()?;
@@ -2441,8 +2441,9 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_row_tracking_high_water_mark_present() -> KernelResult<()> {
-        let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")?;
+    fn test_snapshot_row_tracking_high_water_mark_present() -> Result<()> {
+        let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")
+            .map_err(delta_kernel::KernelError::from)?;
         let table_root = Url::from_directory_path(&table_path)
             .map_err(|()| delta_kernel::KernelError::generic("invalid table path"))?
             .to_string();
@@ -2467,7 +2468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_row_tracking_high_water_mark_absent() -> KernelResult<()> {
+    async fn test_snapshot_row_tracking_high_water_mark_absent() -> Result<()> {
         let table_root = "memory:///test_row_tracking_high_water_mark_absent/";
         let (_storage, engine, snapshot) = make_engine_and_v0_snapshot(table_root).await?;
 
@@ -2487,7 +2488,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_file_stats_absent_without_crc() -> KernelResult<()> {
+    async fn test_snapshot_file_stats_absent_without_crc() -> Result<()> {
         // A metadata-only table has no CRC, so file stats are absent.
         let table_root = "memory:///test_file_stats_no_crc/";
         let (_storage, engine, snapshot) = make_engine_and_v0_snapshot(table_root).await?;
@@ -2647,7 +2648,7 @@ mod tests {
     // TODO: (PR #2307) will introduce a helper function for setting up storage, engine.
     // The test will need to refactor to use the helper function.
     #[tokio::test]
-    async fn test_snapshot_timestamp_no_ict() -> KernelResult<()> {
+    async fn test_snapshot_timestamp_no_ict() -> Result<()> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
         add_commit(
@@ -2804,7 +2805,7 @@ mod tests {
         storage: &DynObjectStore,
         table_root: &str,
         num_add_actions: usize,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         add_commit(
             table_root,
             storage,
@@ -2830,7 +2831,7 @@ mod tests {
         storage: &InMemory,
         table_root: &str,
         num_add_actions: usize,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         add_commit(
             table_root,
             storage,
@@ -2888,7 +2889,7 @@ mod tests {
     async fn setup_checkpoint_test(
         is_v2: bool,
         num_add_actions: usize,
-    ) -> KernelResult<(
+    ) -> Result<(
         Arc<InMemory>,
         Handle<SharedExternEngine>,
         Handle<SharedSnapshot>,
@@ -2962,7 +2963,7 @@ mod tests {
         #[case] num_add_actions: usize,
         #[case] spec: Option<FfiCheckpointSpec>,
         #[case] expected_sidecars: usize,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (storage, engine, snapshot) = setup_checkpoint_test(is_v2, num_add_actions).await?;
 
         let result = unsafe {
@@ -2987,8 +2988,7 @@ mod tests {
     // A zero sidecar hint is invalid: the kernel requires `file_actions_per_sidecar_hint > 0`,
     // surfaced through the FFI as `CheckpointWriteError`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_snapshot_v2_with_sidecars_zero_hint_returns_error() -> KernelResult<()>
-    {
+    async fn test_checkpoint_snapshot_v2_with_sidecars_zero_hint_returns_error() -> Result<()> {
         let (_storage, engine, snapshot) = setup_checkpoint_test(true, 3).await?;
 
         let spec = FfiCheckpointSpec::V2WithSidecar {
@@ -3011,7 +3011,7 @@ mod tests {
     // Checkpoint on V1 table with V2 spec => `FFIKernelError::CheckpointWriteError`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_v2_on_non_v2_table_returns_checkpoint_write_error()
-    -> KernelResult<()> {
+    -> Result<()> {
         let (_storage, engine, snapshot) = setup_checkpoint_test(false, 1).await?;
 
         let spec = FfiCheckpointSpec::V2NoSidecar;
@@ -3051,8 +3051,7 @@ mod tests {
         ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
     )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_snapshot_second_call_returns_consistent_snapshot() -> KernelResult<()>
-    {
+    async fn test_checkpoint_snapshot_second_call_returns_consistent_snapshot() -> Result<()> {
         let (_storage, engine, snapshot) = setup_checkpoint_test(false, 2).await?;
         let input_version = unsafe { version(snapshot.shallow_copy()) };
 
@@ -3100,7 +3099,7 @@ mod tests {
         ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
     )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_snapshot_written_snapshot_is_usable() -> KernelResult<()> {
+    async fn test_checkpoint_snapshot_written_snapshot_is_usable() -> Result<()> {
         let (storage, engine, snapshot) = setup_checkpoint_test(false, 2).await?;
         let input_version = unsafe { version(snapshot.shallow_copy()) };
 
@@ -3120,8 +3119,16 @@ mod tests {
         // (b) `_last_checkpoint` exists and describes the checkpoint we just wrote.
         let last_checkpoint = storage
             .get(&Path::from("_delta_log/_last_checkpoint"))
-            .await?;
-        let v: Value = serde_json::from_slice(last_checkpoint.bytes().await?.as_ref())?;
+            .await
+            .map_err(delta_kernel::KernelError::from)?;
+        let v: Value = serde_json::from_slice(
+            last_checkpoint
+                .bytes()
+                .await
+                .map_err(delta_kernel::KernelError::from)?
+                .as_ref(),
+        )
+        .map_err(delta_kernel::KernelError::from)?;
         assert_eq!(v["version"].as_u64(), Some(2));
         // 2 adds at versions 1..=2, no removes => 2 live add files.
         assert_eq!(v["numOfAddFiles"].as_u64(), Some(2));
@@ -3129,7 +3136,11 @@ mod tests {
         assert_eq!(v["size"].as_u64(), Some(4));
         // Cross-check the checkpoint parquet file size against `_last_checkpoint.sizeInBytes`.
         let checkpoint_path = Path::from("_delta_log/00000000000000000002.checkpoint.parquet");
-        let checkpoint_size = storage.head(&checkpoint_path).await?.size;
+        let checkpoint_size = storage
+            .head(&checkpoint_path)
+            .await
+            .map_err(delta_kernel::KernelError::from)?
+            .size;
         assert_eq!(v["sizeInBytes"].as_u64(), Some(checkpoint_size));
 
         // (c) chain a second checkpoint_snapshot(returned_snap, engine, None) =>
@@ -3162,11 +3173,11 @@ mod tests {
     // coverage under Miri.
     #[cfg(feature = "default-engine-base")]
     #[test]
-    fn test_setting_multithread_executor() -> KernelResult<()> {
+    fn test_setting_multithread_executor() -> Result<()> {
         use delta_kernel::object_store::local::LocalFileSystem;
         use tempfile::tempdir;
 
-        let tmp_dir = tempdir()?;
+        let tmp_dir = tempdir().map_err(delta_kernel::KernelError::from)?;
         let tmp_path = tmp_dir.path();
         let table_root = tmp_path
             .to_str()
@@ -3176,7 +3187,7 @@ mod tests {
         // Use a temporary runtime for async setup, then drop it before the FFI calls so the engine
         // built below drives all async work through its own (FFI-configured) executor.
         {
-            let rt = tokio::runtime::Runtime::new()?;
+            let rt = tokio::runtime::Runtime::new().map_err(delta_kernel::KernelError::from)?;
             rt.block_on(seed_v1_table(storage.as_ref(), table_root, 2))?;
         } // runtime dropped here, before FFI calls
 
@@ -3225,11 +3236,11 @@ mod tests {
     fn test_setting_io_concurrency(
         #[case] buffer_size: usize,
         #[case] batch_size: usize,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         use delta_kernel::object_store::local::LocalFileSystem;
         use tempfile::tempdir;
 
-        let tmp_dir = tempdir()?;
+        let tmp_dir = tempdir().map_err(delta_kernel::KernelError::from)?;
         let tmp_path = tmp_dir.path();
         let table_root = tmp_path
             .to_str()
@@ -3243,7 +3254,7 @@ mod tests {
             .join("\n");
 
         {
-            let rt = tokio::runtime::Runtime::new()?;
+            let rt = tokio::runtime::Runtime::new().map_err(delta_kernel::KernelError::from)?;
             rt.block_on(async {
                 add_commit(&table_root, storage.as_ref(), 0, protocol_and_metadata).await?;
                 add_commit(
@@ -3256,7 +3267,7 @@ mod tests {
                     ]),
                 )
                 .await?;
-                Ok::<_, delta_kernel::KernelError>(())
+                Ok::<_, delta_kernel::Error>(())
             })?;
         }
 
@@ -3280,7 +3291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_partition_cols() -> KernelResult<()> {
+    async fn test_snapshot_partition_cols() -> Result<()> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
 
@@ -3318,7 +3329,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allocate_null_err_okay() -> KernelResult<()> {
+    async fn allocate_null_err_okay() -> Result<()> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///";
 
@@ -3354,7 +3365,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_log_tail() -> KernelResult<()> {
+    async fn test_snapshot_log_tail() -> Result<()> {
         let table_root = "memory:///test_table/";
         let (storage, engine, snap) =
             make_catalog_managed_engine_and_v0_snapshot(table_root).await?;
@@ -3453,7 +3464,7 @@ mod tests {
         #[case] catalog_managed: bool,
         #[case] max_catalog_version: Option<Version>,
         #[case] expected_message: &str,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
         let actions = if catalog_managed {
@@ -3491,7 +3502,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_builder_from_existing_snapshot_advances_to_latest_and_pinned_version()
-    -> KernelResult<()> {
+    -> Result<()> {
         let path = "memory:///";
         let (storage, engine, snapshot_at_v0) = make_engine_and_v0_snapshot(path).await?;
         assert_eq!(unsafe { version(snapshot_at_v0.shallow_copy()) }, 0);
@@ -3538,7 +3549,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_from_existing_snapshot_rejects_earlier_version() -> KernelResult<()> {
+    async fn test_builder_from_existing_snapshot_rejects_earlier_version() -> Result<()> {
         let path = "memory:///";
         let (storage, engine, snapshot_at_v0) = make_engine_and_v0_snapshot(path).await?;
 
@@ -3591,7 +3602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_with_prev_snapshot_and_log_tail() -> KernelResult<()> {
+    async fn test_snapshot_with_prev_snapshot_and_log_tail() -> Result<()> {
         let path = "memory:///";
         let (storage, engine, snapshot_at_v0) =
             make_catalog_managed_engine_and_v0_snapshot(path).await?;
@@ -3667,7 +3678,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_from_table_path_builds_latest_version() -> KernelResult<()> {
+    async fn test_builder_from_table_path_builds_latest_version() -> Result<()> {
         let storage = Arc::new(InMemory::new());
         let path = "memory:///";
         add_commit(
@@ -3704,7 +3715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_free_snapshot_builder_without_building() -> KernelResult<()> {
+    async fn test_free_snapshot_builder_without_building() -> Result<()> {
         let path = "memory:///";
         let (_, engine, snap) = make_engine_and_v0_snapshot(path).await?;
         unsafe { free_snapshot(snap) };
@@ -3795,7 +3806,7 @@ mod tests {
     // === visit_protocol tests ===
 
     #[tokio::test]
-    async fn test_visit_protocol_legacy() -> KernelResult<()> {
+    async fn test_visit_protocol_legacy() -> Result<()> {
         let (engine, snap) = setup_snapshot(METADATA.to_string()).await?;
         let state = collect_protocol_state(&snap);
 
@@ -3810,7 +3821,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_with_nonexistent_path_returns_error() -> KernelResult<()> {
+    async fn test_builder_with_nonexistent_path_returns_error() -> Result<()> {
         let storage = Arc::new(InMemory::new());
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
@@ -3831,7 +3842,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_at_nonexistent_version_returns_error() -> KernelResult<()> {
+    async fn test_builder_at_nonexistent_version_returns_error() -> Result<()> {
         let path = "memory:///";
         let (_, engine, snap) = make_engine_and_v0_snapshot(path).await?;
         unsafe { free_snapshot(snap) };
@@ -3855,7 +3866,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_visit_protocol_with_features() -> KernelResult<()> {
+    async fn test_visit_protocol_with_features() -> Result<()> {
         let (engine, snap) = setup_snapshot(METADATA_WITH_FEATURES.to_string()).await?;
         let state = collect_protocol_state(&snap);
 
@@ -3939,7 +3950,7 @@ mod tests {
         #[case] created_time: Option<i64>,
         #[case] format_options: &[(&str, &str)],
         #[case] configuration: &[(&str, &str)],
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         fn to_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
             entries
                 .iter()

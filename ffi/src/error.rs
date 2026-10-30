@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 
 use delta_kernel::snapshot::SnapshotHintError;
-use delta_kernel::{Error, KernelError, KernelResult};
+use delta_kernel::{Error, KernelError, KernelResult, Result};
 use tracing::warn;
 
 use crate::handle::Handle;
@@ -245,7 +245,7 @@ impl<T: ExternEngine + ?Sized> AllocateError for &T {
     }
 }
 
-/// Converts [`KernelResult`] or [`delta_kernel::Result`] to an FFI result.
+/// Converts [`KernelResult`] or [`Result`] to an FFI result.
 ///
 /// Only errors invoke the allocator.
 pub(crate) trait IntoExternResult<T> {
@@ -266,7 +266,7 @@ impl<T> IntoExternResult<T> for KernelResult<T> {
     }
 }
 
-impl<T> IntoExternResult<T> for delta_kernel::Result<T> {
+impl<T> IntoExternResult<T> for Result<T> {
     unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T> {
         match self {
             Ok(value) => ExternResult::Ok(value),

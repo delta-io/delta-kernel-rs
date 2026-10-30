@@ -15,7 +15,7 @@ use crate::metrics::{MetricId, SnapshotLoadMetricContext, SnapshotLoadType};
 use crate::path::DELTA_LOG_DIR_WITH_SLASH;
 use crate::snapshot::{SnapshotHint, SnapshotRef};
 use crate::utils::{PhantomType, require, try_parse_uri};
-use crate::{Engine, KernelError, KernelResult, Snapshot, Version};
+use crate::{Engine, KernelError, KernelResult, Result, Snapshot, Version};
 
 /// Marker for builders that load a snapshot from a table root.
 #[doc(hidden)]
@@ -332,7 +332,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         fields(path = %self.table_path(), report, enable_call_frame, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
         err
     )]
-    pub fn build(self, engine: &dyn Engine) -> KernelResult<SnapshotRef> {
+    pub fn build(self, engine: &dyn Engine) -> Result<SnapshotRef> {
         // Fold the context into the message string rather than passing structured fields: this
         // `info!` fires inside the `snap.build` metrics span, where any field the
         // `SnapshotBuildSuccess` event doesn't recognize would trip a spurious "Invalid field"
@@ -403,7 +403,9 @@ impl<Mode> SnapshotBuilder<Mode> {
                 let table_url = try_parse_uri(table_root)?;
                 let log_segment = LogSegment::for_snapshot(
                     engine.storage_handler().as_ref(),
-                    table_url.join(DELTA_LOG_DIR_WITH_SLASH)?,
+                    table_url
+                        .join(DELTA_LOG_DIR_WITH_SLASH)
+                        .map_err(KernelError::from)?,
                     log_tail,
                     effective_version,
                     metric_context.clone(),
@@ -419,9 +421,9 @@ impl<Mode> SnapshotBuilder<Mode> {
                 .map(Into::into)?
             } else {
                 let Some(existing_snapshot) = existing_snapshot else {
-                    return Err(KernelError::internal_error(
+                    return Err(crate::Error::Kernel(KernelError::internal_error(
                         "SnapshotBuilder should have either table_root or existing_snapshot",
-                    ));
+                    )));
                 };
                 Snapshot::try_new_from(
                     existing_snapshot,
@@ -991,7 +993,10 @@ pub(super) mod tests {
                 .with_log_tail(log_tail)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -1005,7 +1010,10 @@ pub(super) mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -1030,7 +1038,10 @@ pub(super) mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -1042,7 +1053,10 @@ pub(super) mod tests {
 
             let result = SnapshotBuilder::new_for(table_root).build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -1059,7 +1073,10 @@ pub(super) mod tests {
                 .with_max_catalog_version(0)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -1083,7 +1100,10 @@ pub(super) mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -1137,7 +1157,10 @@ pub(super) mod tests {
             // Incremental update without mcv should fail
             let result = SnapshotBuilder::new_from(initial).build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::MaxCatalogVersion(_)))
+            ));
 
             Ok(())
         }
@@ -1173,7 +1196,9 @@ pub(super) mod tests {
 
             assert!(matches!(
                 result,
-                Err(KernelError::LogTailVersionsNotContiguous { .. })
+                Err(crate::Error::Kernel(
+                    KernelError::LogTailVersionsNotContiguous { .. }
+                ))
             ));
 
             Ok(())
@@ -1200,7 +1225,10 @@ pub(super) mod tests {
                 .with_max_catalog_version(1)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(KernelError::InvalidLogPath(_))));
+            assert!(matches!(
+                result,
+                Err(crate::Error::Kernel(KernelError::InvalidLogPath(_)))
+            ));
 
             Ok(())
         }

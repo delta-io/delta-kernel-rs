@@ -1,11 +1,11 @@
 //! Interval-type integration tests for the CreateTable API.
 
-use delta_kernel::KernelResult;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::column_name;
 use delta_kernel::schema::{DataType, schema_ref};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::{KernelResult, Result};
 use test_utils::test_table_setup;
 
 #[rstest::rstest]
@@ -80,7 +80,7 @@ mod supported {
         )
             -> SchemaRef,
         #[values("none", "name", "id")] cm_mode: &str,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let (_temp_dir, table_path, engine) = test_table_setup()?;
         let schema = make_schema(interval);
 

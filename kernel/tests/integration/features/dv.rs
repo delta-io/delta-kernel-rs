@@ -14,7 +14,7 @@ use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
-use delta_kernel::{EngineData, KernelResult, KernelResultIterator, Snapshot};
+use delta_kernel::{EngineData, KernelResult, KernelResultIterator, Result, Snapshot};
 use itertools::Itertools;
 use tempfile::tempdir;
 use test_utils::{
@@ -61,8 +61,9 @@ fn count_total_scan_rows(
 #[test_log::test(rstest::rstest)]
 #[case::with_dv("./tests/data/table-with-dv-small/", 8)]
 #[case::without_dv("./tests/data/table-without-dv-small/", 10)]
-fn test_table_scan(#[case] table_path: &str, #[case] expected_rows: usize) -> KernelResult<()> {
-    let path = std::fs::canonicalize(PathBuf::from(table_path))?;
+fn test_table_scan(#[case] table_path: &str, #[case] expected_rows: usize) -> Result<()> {
+    let path = std::fs::canonicalize(PathBuf::from(table_path))
+        .map_err(delta_kernel::KernelError::from)?;
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = test_utils::create_default_engine(&url)?;
 
@@ -136,7 +137,7 @@ fn verify_sorted_scan_results(
 /// 5. Commits the deletion vectors in a transaction
 /// 6. Verifies that scanning only returns non-deleted rows
 #[tokio::test]
-async fn test_write_deletion_vectors_end_to_end() -> KernelResult<()> {
+async fn test_write_deletion_vectors_end_to_end() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
     // Create a table schema with id and value columns
@@ -146,7 +147,7 @@ async fn test_write_deletion_vectors_end_to_end() -> KernelResult<()> {
     };
 
     // Setup table with deletion vector support
-    let temp_dir = tempdir()?;
+    let temp_dir = tempdir().map_err(delta_kernel::KernelError::from)?;
     let base_url = url::Url::from_directory_path(temp_dir.path()).unwrap();
     let (store, engine, table_url) = engine_store_setup("test_table", Some(&base_url));
     let engine = Arc::new(engine);
@@ -170,7 +171,8 @@ async fn test_write_deletion_vectors_end_to_end() -> KernelResult<()> {
             "value",
             vec!["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"].into_arrow_array(),
         ),
-    ])?;
+    ])
+    .map_err(delta_kernel::KernelError::from)?;
 
     let data_batch_2 = generate_batch(vec![
         (
@@ -181,7 +183,8 @@ async fn test_write_deletion_vectors_end_to_end() -> KernelResult<()> {
             "value",
             vec!["k", "l", "m", "n", "o", "p", "q", "r", "s", "t"].into_arrow_array(),
         ),
-    ])?;
+    ])
+    .map_err(delta_kernel::KernelError::from)?;
 
     let (data_file_path_1, parquet_data_len_1) =
         write_parquet_file(&store, &table_url, "1", &data_batch_1).await?;
@@ -336,19 +339,20 @@ async fn test_write_deletion_vectors_end_to_end() -> KernelResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dv_update_stats_tight_bound(
     #[case] initial_tight_bounds: Option<bool>,
-) -> KernelResult<()> {
+) -> Result<()> {
     // Nested schema: a `point` struct with two leaf columns.
     let schema = schema_ref! {
         nullable "point": { nullable "x": INTEGER, nullable "y": INTEGER },
     };
 
-    let temp_dir = tempdir()?;
+    let temp_dir = tempdir().map_err(delta_kernel::KernelError::from)?;
     let base_url = url::Url::from_directory_path(temp_dir.path()).unwrap();
     let (store, engine, table_url) = engine_store_setup("test_table", Some(&base_url));
     let engine = Arc::new(engine);
 
     // Hand-write v0 as create table doesn't support `delta.checkpoint.writeStatsAsStruct`.
-    std::fs::create_dir_all(table_url.to_file_path().unwrap())?;
+    std::fs::create_dir_all(table_url.to_file_path().unwrap())
+        .map_err(delta_kernel::KernelError::from)?;
     let protocol = serde_json::json!({
         "protocol": {
             "minReaderVersion": 3,
@@ -361,7 +365,7 @@ async fn test_dv_update_stats_tight_bound(
         "metaData": {
             "id": "test_id",
             "format": {"provider": "parquet", "options": {}},
-            "schemaString": serde_json::to_string(&schema)?,
+            "schemaString": serde_json::to_string(&schema).map_err(delta_kernel::KernelError::from)?,
             "partitionColumns": [],
             "configuration": {
                 "delta.enableDeletionVectors": "true",
@@ -372,8 +376,8 @@ async fn test_dv_update_stats_tight_bound(
     });
     let v0 = format!(
         "{}\n{}\n",
-        serde_json::to_string(&protocol)?,
-        serde_json::to_string(&metadata)?
+        serde_json::to_string(&protocol).map_err(delta_kernel::KernelError::from)?,
+        serde_json::to_string(&metadata).map_err(delta_kernel::KernelError::from)?
     );
     add_commit(table_url.as_str(), store.as_ref(), 0, v0).await?;
 
@@ -389,7 +393,7 @@ async fn test_dv_update_stats_tight_bound(
     if let Some(tb) = initial_tight_bounds {
         stats["tightBounds"] = serde_json::Value::Bool(tb);
     }
-    let stats_str = serde_json::to_string(&stats)?;
+    let stats_str = serde_json::to_string(&stats).map_err(delta_kernel::KernelError::from)?;
     let add = serde_json::json!({
         "add": {
             "path": data_file_path,
@@ -404,7 +408,7 @@ async fn test_dv_update_stats_tight_bound(
         table_url.as_str(),
         store.as_ref(),
         1,
-        serde_json::to_string(&add)?,
+        serde_json::to_string(&add).map_err(delta_kernel::KernelError::from)?,
     )
     .await?;
 
@@ -429,7 +433,8 @@ async fn test_dv_update_stats_tight_bound(
         v2_adds[0]["stats"]
             .as_str()
             .expect("add stats should be a JSON string"),
-    )?;
+    )
+    .map_err(delta_kernel::KernelError::from)?;
     assert_eq!(
         add_stats["tightBounds"].as_bool(),
         Some(false),
@@ -456,7 +461,8 @@ async fn test_dv_update_stats_tight_bound(
         v2_removes[0]["stats"]
             .as_str()
             .expect("remove stats should be a JSON string"),
-    )?;
+    )
+    .map_err(delta_kernel::KernelError::from)?;
     assert_eq!(
         remove_stats["tightBounds"].as_bool(),
         initial_tight_bounds,

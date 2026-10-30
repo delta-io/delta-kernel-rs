@@ -7,7 +7,7 @@ use delta_kernel::arrow::ffi::to_ffi;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::table_changes::scan::TableChangesScan;
-use delta_kernel::{EngineData, KernelError, KernelResult, KernelResultIterator, Version};
+use delta_kernel::{EngineData, KernelError, KernelResult, KernelResultIterator, Result, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -71,11 +71,11 @@ pub unsafe extern "C" fn table_changes_between_versions(
 }
 
 fn table_changes_impl(
-    url: KernelResult<Url>,
+    url: Result<Url>,
     extern_engine: &dyn ExternEngine,
     start_version: Version,
     end_version: Option<Version>,
-) -> KernelResult<Handle<ExclusiveTableChanges>> {
+) -> Result<Handle<ExclusiveTableChanges>> {
     let table_changes = TableChanges::try_new(
         url?,
         extern_engine.engine().as_ref(),
@@ -419,8 +419,11 @@ mod tests {
         storage: &DynObjectStore,
         version: u64,
         file: String,
-    ) -> KernelResult<()> {
-        let metadata = storage.head(&Path::from(file.as_ref())).await?;
+    ) -> Result<()> {
+        let metadata = storage
+            .head(&Path::from(file.as_ref()))
+            .await
+            .map_err(delta_kernel::KernelError::from)?;
         add_commit(
             table_root,
             storage,
@@ -441,8 +444,11 @@ mod tests {
         storage: &DynObjectStore,
         version: u64,
         file: String,
-    ) -> KernelResult<()> {
-        let metadata = storage.head(&Path::from(file.as_ref())).await?;
+    ) -> Result<()> {
+        let metadata = storage
+            .head(&Path::from(file.as_ref()))
+            .await
+            .map_err(delta_kernel::KernelError::from)?;
         add_commit(
             table_root,
             storage,
@@ -537,12 +543,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_changes_getters() -> KernelResult<()> {
+    async fn test_table_changes_getters() -> Result<()> {
         let storage = Arc::new(InMemory::new());
 
-        let batch = generate_batch_with_id(1)?;
+        let batch = generate_batch_with_id(1).map_err(delta_kernel::KernelError::from)?;
         put_file(storage.as_ref(), PARQUET_FILE1.to_string(), &batch).await?;
-        let batch = generate_batch_with_id(4)?;
+        let batch = generate_batch_with_id(4).map_err(delta_kernel::KernelError::from)?;
         put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
 
         let table_root = "memory:///";
@@ -625,12 +631,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_changes_scan() -> KernelResult<()> {
+    async fn test_table_changes_scan() -> Result<()> {
         let storage = Arc::new(InMemory::new());
 
-        let batch = generate_batch_with_id(1)?;
+        let batch = generate_batch_with_id(1).map_err(delta_kernel::KernelError::from)?;
         put_file(storage.as_ref(), PARQUET_FILE1.to_string(), &batch).await?;
-        let batch = generate_batch_with_id(4)?;
+        let batch = generate_batch_with_id(4).map_err(delta_kernel::KernelError::from)?;
         put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
 
         let table_root = "memory:///";
@@ -655,17 +661,25 @@ mod tests {
         let filtered_batches: Vec<RecordBatch> = filter_batches(batches);
 
         let table_schema = get_batch_schema();
-        let expected = &ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(table_schema.as_ref().try_into_arrow()?),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])),
-                Arc::new(StringArray::from(vec!["a", "b", "c", "a", "b", "c"])),
-                Arc::new(StringArray::from(vec![
-                    "insert", "insert", "insert", "insert", "insert", "insert",
-                ])),
-                Arc::new(Int32Array::from(vec![0, 0, 0, 1, 1, 1])),
-            ],
-        )?);
+        let expected = &ArrowEngineData::new(
+            RecordBatch::try_new(
+                Arc::new(
+                    table_schema
+                        .as_ref()
+                        .try_into_arrow()
+                        .map_err(delta_kernel::KernelError::from)?,
+                ),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])),
+                    Arc::new(StringArray::from(vec!["a", "b", "c", "a", "b", "c"])),
+                    Arc::new(StringArray::from(vec![
+                        "insert", "insert", "insert", "insert", "insert", "insert",
+                    ])),
+                    Arc::new(Int32Array::from(vec![0, 0, 0, 1, 1, 1])),
+                ],
+            )
+            .map_err(delta_kernel::KernelError::from)?,
+        );
 
         let formatted = pretty_format_batches(&filtered_batches)
             .unwrap()
@@ -682,12 +696,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_changes_scan_iterator() -> KernelResult<()> {
+    async fn test_table_changes_scan_iterator() -> Result<()> {
         let storage = Arc::new(InMemory::new());
 
-        let batch = generate_batch_with_id(1)?;
+        let batch = generate_batch_with_id(1).map_err(delta_kernel::KernelError::from)?;
         put_file(storage.as_ref(), PARQUET_FILE1.to_string(), &batch).await?;
-        let batch = generate_batch_with_id(4)?;
+        let batch = generate_batch_with_id(4).map_err(delta_kernel::KernelError::from)?;
         put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
 
         let table_root = "memory:///";
@@ -735,17 +749,25 @@ mod tests {
             .to_string();
 
         let table_schema = get_batch_schema();
-        let expected = &ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(table_schema.as_ref().try_into_arrow()?),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])),
-                Arc::new(StringArray::from(vec!["a", "b", "c", "a", "b", "c"])),
-                Arc::new(StringArray::from(vec![
-                    "insert", "insert", "insert", "insert", "insert", "insert",
-                ])),
-                Arc::new(Int32Array::from(vec![0, 0, 0, 1, 1, 1])),
-            ],
-        )?);
+        let expected = &ArrowEngineData::new(
+            RecordBatch::try_new(
+                Arc::new(
+                    table_schema
+                        .as_ref()
+                        .try_into_arrow()
+                        .map_err(delta_kernel::KernelError::from)?,
+                ),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])),
+                    Arc::new(StringArray::from(vec!["a", "b", "c", "a", "b", "c"])),
+                    Arc::new(StringArray::from(vec![
+                        "insert", "insert", "insert", "insert", "insert", "insert",
+                    ])),
+                    Arc::new(Int32Array::from(vec![0, 0, 0, 1, 1, 1])),
+                ],
+            )
+            .map_err(delta_kernel::KernelError::from)?,
+        );
 
         let expected = pretty_format_batches(&[expected.record_batch().clone()])
             .unwrap()
@@ -764,12 +786,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_changes_between_commits() -> KernelResult<()> {
+    async fn test_table_changes_between_commits() -> Result<()> {
         let storage = Arc::new(InMemory::new());
 
-        let batch = generate_batch_with_id(1)?;
+        let batch = generate_batch_with_id(1).map_err(delta_kernel::KernelError::from)?;
         put_file(storage.as_ref(), PARQUET_FILE1.to_string(), &batch).await?;
-        let batch = generate_batch_with_id(4)?;
+        let batch = generate_batch_with_id(4).map_err(delta_kernel::KernelError::from)?;
         put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
 
         let table_root = "memory:///";
@@ -806,17 +828,25 @@ mod tests {
             nullable "_change_type": STRING,
             nullable "_commit_version": INTEGER,
         };
-        let expected = &ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(table_schema.as_ref().try_into_arrow()?),
-            vec![
-                Arc::new(Int32Array::from(vec![4, 5, 6, 1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c", "a", "b", "c"])),
-                Arc::new(StringArray::from(vec![
-                    "insert", "insert", "insert", "delete", "delete", "delete",
-                ])),
-                Arc::new(Int32Array::from(vec![1, 1, 1, 2, 2, 2])),
-            ],
-        )?);
+        let expected = &ArrowEngineData::new(
+            RecordBatch::try_new(
+                Arc::new(
+                    table_schema
+                        .as_ref()
+                        .try_into_arrow()
+                        .map_err(delta_kernel::KernelError::from)?,
+                ),
+                vec![
+                    Arc::new(Int32Array::from(vec![4, 5, 6, 1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["a", "b", "c", "a", "b", "c"])),
+                    Arc::new(StringArray::from(vec![
+                        "insert", "insert", "insert", "delete", "delete", "delete",
+                    ])),
+                    Arc::new(Int32Array::from(vec![1, 1, 1, 2, 2, 2])),
+                ],
+            )
+            .map_err(delta_kernel::KernelError::from)?,
+        );
 
         let formatted = pretty_format_batches(&filtered_batches)
             .unwrap()

@@ -10,7 +10,7 @@ use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predic
 use delta_kernel::expressions::Predicate;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{Engine, KernelError, KernelResult, Version};
+use delta_kernel::{Engine, KernelError, KernelResult, Result, Version};
 use delta_kernel_workloads::models::{ReadSpec, SnapshotConstructionSpec, Spec, TimeTravel};
 use delta_kernel_workloads::predicate_parser::parse_predicate;
 use itertools::Itertools;
@@ -45,7 +45,7 @@ fn build_snapshot(
     engine: &dyn Engine,
     table_root: &Url,
     time_travel: Option<&TimeTravel>,
-) -> KernelResult<Arc<Snapshot>> {
+) -> Result<Arc<Snapshot>> {
     let version = time_travel
         .map(TimeTravel::as_version)
         .transpose()
@@ -63,7 +63,7 @@ pub fn execute_read_workload(
     engine: Arc<dyn Engine>,
     table_root: &Url,
     read_spec: &ReadSpec,
-) -> KernelResult<ReadResult> {
+) -> Result<ReadResult> {
     let snapshot = build_snapshot(engine.as_ref(), table_root, read_spec.time_travel.as_ref())?;
 
     let table_schema = snapshot.schema();
@@ -172,7 +172,7 @@ pub fn execute_snapshot_workload(
     engine: Arc<dyn Engine>,
     table_root: &Url,
     snapshot_spec: &SnapshotConstructionSpec,
-) -> KernelResult<SnapshotResult> {
+) -> Result<SnapshotResult> {
     let snapshot = build_snapshot(
         engine.as_ref(),
         table_root,

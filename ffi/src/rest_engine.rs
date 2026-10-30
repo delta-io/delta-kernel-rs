@@ -118,8 +118,9 @@ pub struct CRestEndpointConfig {
 
 /// One HTTP header name/value pair produced by a [`CAuthHeaderCallback`].
 ///
-/// Set each field with [`allocate_kernel_string`](crate::allocate_kernel_string); ownership
-/// transfers to the kernel when the callback returns.
+/// Set each field with
+/// [`allocate_kernel_string`](crate::allocate_kernel_string);
+/// ownership transfers to the kernel when the callback returns.
 #[repr(C)]
 pub struct CAuthHeaderPair {
     pub name: Handle<ExclusiveRustString>,
@@ -129,7 +130,8 @@ pub struct CAuthHeaderPair {
 /// Output buffer for a [`CAuthHeaderCallback`] invocation.
 ///
 /// Set `count`, fill `headers[0..count]` with
-/// [`allocate_kernel_string`](crate::allocate_kernel_string) handles, and optionally set `ttl_ms`.
+/// [`allocate_kernel_string`](crate::allocate_kernel_string)
+/// handles, and optionally set `ttl_ms`.
 #[repr(C)]
 pub struct CAuthHeaders {
     pub count: u32,
@@ -216,8 +218,8 @@ pub(crate) fn rest_builder_state_from_ffi(
 ///
 /// `(*headers).count` must not exceed [`AUTH_MAX_NUM_HEADERS`], and every slot in
 /// `headers[0..count]` must hold handles produced by
-/// [`allocate_kernel_string`](crate::allocate_kernel_string). Padding slots are never read or
-/// dropped.
+/// [`allocate_kernel_string`](crate::allocate_kernel_string).
+/// Padding slots are never read or dropped.
 unsafe fn take_auth_pairs_from_c(
     headers: *mut CAuthHeaders,
 ) -> KernelResult<Vec<(String, String)>> {
