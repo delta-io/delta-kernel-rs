@@ -12,6 +12,8 @@
 //!
 //! As with all fields in Iceberg, statistics are projected by field ID.
 
+use std::mem;
+
 use tracing::warn;
 
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT};
@@ -460,60 +462,109 @@ impl<'a> CategoryScopes<'a> {
     }
 }
 
-/// Drives the table-schema walk for AMT `content_stats` schema generation
-/// ([`collect_stats_schema`]): it descends structs, threads the optional Delta stat projection
-/// through each descent, and invokes `on_leaf` once for every non-struct leaf the projection did
-/// not drop, with the leaf field, its root-to-leaf path, and its category membership (`None` when
-/// not projecting). Stat-eligibility (field IDs, geospatial, array/map producing no stats) is left
-/// to the sink. A leaf that a projection drops entirely (present in no category) is skipped before
-/// `on_leaf` is called.
+/// A fold over the table schema driven by [`StatsLeafWalker`]: every surviving leaf and every
+/// struct becomes an [`Output`](Self::Output), with a struct's output built from its children's.
+/// `path` runs from the root to the visited field (its last segment is the field itself).
+trait StatsLeafVisitor<'a> {
+    type Output;
+
+    /// Folds a non-struct leaf the projection does not drop. `categories` is the leaf's category
+    /// membership, or `None` when not projecting.
+    fn on_leaf(
+        &self,
+        field: &'a StructField,
+        path: &[String],
+        categories: Option<StatCategories>,
+    ) -> KernelResult<Self::Output>;
+
+    /// Folds a struct field from its surviving children's outputs, in field order. Called for every
+    /// struct, so `children` is empty for an empty struct or one whose leaves the projection drops
+    /// entirely. `projection` is the struct's own scope, or `None` when not projecting.
+    fn on_struct(
+        &self,
+        field: &'a StructField,
+        path: &[String],
+        projection: Option<&CategoryScopes<'a>>,
+        children: Vec<Self::Output>,
+    ) -> KernelResult<Self::Output>;
+}
+
+/// Drives a [`StatsLeafVisitor`] fold over a table schema for AMT `content_stats` generation: it
+/// descends structs, threads the optional Delta stat projection through each descent, and drops a
+/// leaf that a projection omits from every category before the visitor sees it. Stat-eligibility
+/// (field IDs, geospatial, array/map producing no stats) is left to the visitor.
 ///
-/// Uses the `KernelResult<()>` carrier: the rebuilt output is discarded, the `on_leaf` sink
-/// is the real result, and an `Err` short-circuits the walk.
-struct StatsLeafWalker<'a, F> {
-    /// Field names from the root to the current node; the last segment is the leaf being visited.
+/// Uses the `KernelResult<()>` carrier: the rebuilt schema is discarded, the folded outputs
+/// accumulate in `outputs`, and an `Err` short-circuits the walk.
+struct StatsLeafWalker<'a, 'v, V: StatsLeafVisitor<'a>> {
+    /// Field names from the root to the current node; the last segment is the field being visited.
     path: Vec<String>,
     /// Delta stat categories in scope at the current position, or `None` to visit every leaf.
     projection: Option<CategoryScopes<'a>>,
-    /// Invoked once per surviving leaf with `(field, path, categories)`.
-    on_leaf: F,
+    /// Outputs of the current struct's already-visited fields, in field order.
+    outputs: Vec<V::Output>,
+    visitor: &'v V,
 }
 
-impl<'a, F> SchemaTransform<'a> for StatsLeafWalker<'a, F>
-where
-    F: FnMut(&'a StructField, &[String], Option<StatCategories>) -> KernelResult<()>,
-{
+impl<'a, 'v, V: StatsLeafVisitor<'a>> StatsLeafWalker<'a, 'v, V> {
+    /// Folds `table_struct` with `visitor` under the optional Delta stat `projection`, returning
+    /// the top-level fields' outputs in field order.
+    ///
+    /// Errors if the visitor errors, or if the projection is a scalar where the table nests a
+    /// struct (see [`CategoryScopes::descend`]).
+    fn walk(
+        table_struct: &'a StructType,
+        projection: Option<CategoryScopes<'a>>,
+        visitor: &'v V,
+    ) -> KernelResult<Vec<V::Output>> {
+        let mut walker = Self {
+            path: Vec::new(),
+            projection,
+            outputs: Vec::new(),
+            visitor,
+        };
+        walker.transform_struct(table_struct)?;
+        Ok(walker.outputs)
+    }
+}
+
+impl<'a, V: StatsLeafVisitor<'a>> SchemaTransform<'a> for StatsLeafWalker<'a, '_, V> {
     transform_output_type!(|'a, T| KernelResult<()>);
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> KernelResult<()> {
         self.path.push(field.name().to_string());
-        // Descend into structs; every other type is a leaf. On `Err` the walk aborts and `path` is
-        // discarded, so the skipped pop is harmless.
-        let result = if let DataType::Struct(_) = field.data_type() {
-            // The stat-category scopes step into this struct's sub-schema and are restored on the
-            // way back up so siblings are unaffected. A category that is a scalar where the table
-            // nests a struct (an internal invariant violation) aborts the walk here.
+        // Descend into structs; every other type is a leaf. On `Err` the walk aborts and `walk`
+        // drops the walker, so the skipped `path` pop and state restores are harmless.
+        if let DataType::Struct(_) = field.data_type() {
+            // The stat-category scopes step into this struct's sub-schema, and the parent's scope
+            // and sibling outputs are restored on the way back up. A category that is a scalar
+            // where the table nests a struct (an internal invariant violation) aborts the walk.
             let saved_projection = self.projection;
             self.projection = self
                 .projection
                 .map(|s| s.descend(field.name(), &self.path))
                 .transpose()?;
-            let result = self.recurse_into_struct_field(field);
+            let siblings = mem::take(&mut self.outputs);
+            self.recurse_into_struct_field(field)?;
+            let children = mem::replace(&mut self.outputs, siblings);
+            let output =
+                self.visitor
+                    .on_struct(field, &self.path, self.projection.as_ref(), children)?;
+            self.outputs.push(output);
             self.projection = saved_projection;
-            result
         } else {
             // Every non-struct type is a leaf -- including variants (never descended into: their
-            // inner fields carry no field IDs) and array/map columns (which produce no stats). When
-            // projecting, a leaf absent from every category is dropped here.
+            // inner fields carry no field IDs) and array/map columns (values nested in a list or
+            // map carry no `content_stats` entry, matching Iceberg). When projecting, a leaf
+            // absent from every category is dropped here.
             let categories = self.projection.map(|s| s.leaf_categories(field.name()));
-            if categories.is_some_and(|c| !c.any()) {
-                Ok(())
-            } else {
-                (self.on_leaf)(field, &self.path, categories)
+            if categories.is_none_or(|c| c.any()) {
+                let output = self.visitor.on_leaf(field, &self.path, categories)?;
+                self.outputs.push(output);
             }
-        };
+        }
         self.path.pop();
-        result
+        Ok(())
     }
 }
 
@@ -577,24 +628,45 @@ fn collect_stats_schema<'a>(
     table_struct: &'a StructType,
     projection: Option<CategoryScopes<'a>>,
 ) -> KernelResult<StructType> {
-    let mut fields: Vec<StructField> = Vec::new();
-    {
-        let mut walker = StatsLeafWalker {
-            path: Vec::new(),
-            projection,
-            on_leaf: |field: &'a StructField, path: &[String], categories| {
-                leaf_stats_field(field, path, categories).map(|stats| fields.extend(stats))
-            },
-        };
-        walker.transform_struct(table_struct)?;
-    }
+    let fields = StatsLeafWalker::walk(table_struct, projection, &StatsSchemaCollector)?;
     // `new_unchecked` skips name dedup; safe because `ColumnName`'s `Display` is lossless -- a leaf
     // whose name contains a dot is backtick-escaped, so it never collides with a nested path.
-    Ok(StructType::new_unchecked(fields))
+    Ok(StructType::new_unchecked(fields.into_iter().flatten()))
+}
+
+/// Folds each leaf into its flat `content_stats` field (see [`leaf_stats_field`]) and each struct
+/// into its children's fields, so the walk yields the flat list.
+struct StatsSchemaCollector;
+
+impl<'a> StatsLeafVisitor<'a> for StatsSchemaCollector {
+    type Output = Vec<StructField>;
+
+    fn on_leaf(
+        &self,
+        field: &'a StructField,
+        path: &[String],
+        categories: Option<StatCategories>,
+    ) -> KernelResult<Vec<StructField>> {
+        Ok(leaf_stats_field(field, path, categories)?
+            .into_iter()
+            .collect())
+    }
+
+    fn on_struct(
+        &self,
+        _field: &'a StructField,
+        _path: &[String],
+        _projection: Option<&CategoryScopes<'a>>,
+        children: Vec<Vec<StructField>>,
+    ) -> KernelResult<Vec<StructField>> {
+        Ok(children.into_iter().flatten().collect())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use rstest::rstest;
 
     use super::*;
@@ -1670,5 +1742,141 @@ mod tests {
             .is_some());
         let projected = projected_stats_schema(&table, &delta).expect("should succeed");
         assert_eq!(projected, expected);
+    }
+
+    // === StatsLeafWalker ===
+
+    /// Renders the walk as `name` per leaf and `name<scope>{children}` per struct, where `<scope>`
+    /// is the struct's `[nullCount|minValues|maxValues]` field names (`-` for an omitted category),
+    /// or empty when not projecting. Records each callback's path and fails at `fail_at`.
+    #[derive(Default)]
+    struct TreeRenderer {
+        visited: RefCell<Vec<String>>,
+        fail_at: Option<&'static str>,
+    }
+
+    impl TreeRenderer {
+        fn visit(&self, path: &[String]) -> KernelResult<()> {
+            let path = ColumnName::new(path).to_string();
+            self.visited.borrow_mut().push(path.clone());
+            if self.fail_at == Some(path.as_str()) {
+                return Err(KernelError::generic(format!(
+                    "injected failure at '{path}'"
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    impl<'a> StatsLeafVisitor<'a> for TreeRenderer {
+        type Output = String;
+
+        fn on_leaf(
+            &self,
+            field: &'a StructField,
+            path: &[String],
+            _categories: Option<StatCategories>,
+        ) -> KernelResult<String> {
+            self.visit(path)?;
+            Ok(field.name().clone())
+        }
+
+        fn on_struct(
+            &self,
+            field: &'a StructField,
+            path: &[String],
+            projection: Option<&CategoryScopes<'a>>,
+            children: Vec<String>,
+        ) -> KernelResult<String> {
+            self.visit(path)?;
+            let scope = projection.map_or(String::new(), |scopes| {
+                let names = scopes.categories.map(|scope| {
+                    scope.map_or("-".to_string(), |s| {
+                        s.field_names().cloned().collect::<Vec<_>>().join(",")
+                    })
+                });
+                format!("[{}]", names.join("|"))
+            });
+            Ok(format!("{}{scope}{{{}}}", field.name(), children.join(",")))
+        }
+    }
+
+    /// `p: struct{x: struct{a: int}, y: struct{b: int}}`.
+    fn sibling_structs() -> StructField {
+        let child = |name: &str, leaf: &str| {
+            StructField::nullable(
+                name,
+                StructType::new_unchecked([StructField::nullable(leaf, DataType::INTEGER)]),
+            )
+        };
+        StructField::nullable(
+            "p",
+            StructType::new_unchecked([child("x", "a"), child("y", "b")]),
+        )
+    }
+
+    #[rstest]
+    #[case::nested_and_sibling_structs(
+        vec![
+            sibling_structs(),
+            StructField::nullable("arr", ArrayType::new(DataType::INTEGER, true)),
+            StructField::nullable("m", MapType::new(DataType::STRING, DataType::INTEGER, true)),
+            StructField::nullable("d", DataType::LONG),
+        ],
+        None,
+        &["p{x{a},y{b}}", "arr", "m", "d"],
+    )]
+    #[case::empty_struct(
+        vec![StructField::nullable("e", StructType::new_unchecked([]))],
+        None,
+        &["e{}"],
+    )]
+    #[case::fully_dropped_struct(
+        vec![
+            StructField::nullable("a", stat_cols(["b"])),
+            StructField::nullable("d", DataType::LONG),
+        ],
+        Some(delta_stats(Some(stat_cols(["d"])), None, None)),
+        &["a[-|-|-]{}", "d"],
+    )]
+    #[case::scope_is_structs_own(
+        vec![sibling_structs()],
+        Some(delta_stats(
+            Some(StructType::new_unchecked([StructField::nullable("p", nested_cat("x", ["a"]))])),
+            Some(StructType::new_unchecked([StructField::nullable("p", nested_cat("y", ["b"]))])),
+            None,
+        )),
+        &["p[x|y|-]{x[a|-|-]{a},y[-|b|-]{b}}"],
+    )]
+    fn walker_folds_structs_and_leaves(
+        #[case] table: Vec<StructField>,
+        #[case] delta_stats_schema: Option<StructType>,
+        #[case] expected: &[&str],
+    ) {
+        let table = StructType::new_unchecked(table);
+        let projection = delta_stats_schema
+            .as_ref()
+            .map(|s| CategoryScopes::from_delta_stats_schema(s).unwrap());
+        let rendered = StatsLeafWalker::walk(&table, projection, &TreeRenderer::default()).unwrap();
+        assert_eq!(rendered, expected);
+    }
+
+    #[rstest]
+    #[case::leaf_hook("p.x.a", &["p.x.a"])]
+    #[case::struct_hook("p.x", &["p.x.a", "p.x"])]
+    fn walker_error_stops_later_callbacks(
+        #[case] fail_at: &'static str,
+        #[case] expected_visited: &[&str],
+    ) {
+        let table = StructType::new_unchecked([sibling_structs()]);
+        let renderer = TreeRenderer {
+            fail_at: Some(fail_at),
+            ..Default::default()
+        };
+        let err = StatsLeafWalker::walk(&table, None, &renderer).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains(&format!("injected failure at '{fail_at}'")));
+        assert_eq!(*renderer.visited.borrow(), expected_visited);
     }
 }
