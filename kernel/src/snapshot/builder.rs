@@ -32,8 +32,8 @@ pub struct FromSnapshot;
 /// ```no_run
 /// # use delta_kernel::{Snapshot, Engine};
 /// # use url::Url;
-/// # fn example(engine: &dyn Engine) -> delta_kernel::KernelResult<()> {
-/// let table_root = Url::parse("file:///path/to/table")?;
+/// # fn example(engine: &dyn Engine) -> delta_kernel::Result<()> {
+/// let table_root = Url::parse("file:///path/to/table").map_err(delta_kernel::KernelError::from)?;
 ///
 /// // Build a snapshot
 /// let snapshot = Snapshot::builder_for(table_root.clone())
@@ -321,6 +321,13 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// # Parameters
     ///
     /// - `engine`: Implementation of [`Engine`] apis.
+    ///
+    /// # Errors
+    ///
+    /// Delta failures report absent table roots, missing required history, invalid persisted
+    /// schemas or partition declarations, and incompatible adaptive-metadata mapping modes.
+    /// Classify these by [`DeltaError::condition`](crate::DeltaError::condition). Other failures
+    /// preserve their Kernel classification, including cancellation and invalid hints.
     ///
     /// [`MetricEvent::SnapshotBuildSuccess`]: crate::metrics::MetricEvent::SnapshotBuildSuccess
     /// [`MetricEvent::SnapshotBuildFailure`]: crate::metrics::MetricEvent::SnapshotBuildFailure
@@ -659,16 +666,19 @@ pub(super) mod tests {
         let path = Path::from("_delta_log/00000000000000000000.json");
         store.put(&path, commit0_data.into()).await?;
 
-        // Try to build a snapshot and expect a clear error message
         let result = SnapshotBuilder::new_for(table_root.clone()).build(engine);
-        assert!(result.is_err());
-
-        let err = result.unwrap_err();
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("Unsupported Delta table type: 'interval year to second'"),
-            "Expected clear error message about unsupported type, got: {err_msg}"
+        let crate::Error::Delta(error) = result.unwrap_err() else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(
+            error.condition(),
+            crate::DeltaErrorCondition::DeltaParsingUnsupportedDataType
         );
+        assert_eq!(error.sql_state(), Some("KD009"));
+        assert_eq!(error.parameters()[0].value(), "interval year to second");
+        assert!(std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<serde_json::Error>())
+            .is_some());
 
         Ok(())
     }

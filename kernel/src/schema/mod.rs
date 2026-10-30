@@ -58,7 +58,6 @@ fn unsupported_delta_type_error<E: serde::de::Error>(name: &str) -> E {
     E::custom(format!("{UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX}: '{name}'"))
 }
 
-
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
 
@@ -2181,14 +2180,17 @@ fn normalize_interval_type(s: &str) -> Option<PrimitiveType> {
 }
 
 // Custom Deserialize to provide clear error messages for unsupported types.
-// The derived impl would produce: "unknown variant `interval second`, expected one of ..."
-// This impl produces: "Unsupported Delta table type: 'interval second'"
+// Unsupported tokens retain their names in diagnostics, e.g. "Unsupported Delta table type:
+// 'time(6)'", instead of serde's list of enum variants.
 impl<'de> serde::Deserialize<'de> for PrimitiveType {
     fn deserialize<D>(deserializer: D) -> KernelResult<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        Self::parse(String::deserialize(deserializer)?, unsupported_delta_type_error)
+        Self::parse(
+            String::deserialize(deserializer)?,
+            unsupported_delta_type_error,
+        )
     }
 }
 

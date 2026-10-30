@@ -15,7 +15,9 @@ use super::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType
 
 /// Validation facts retained before serde erases the concrete failure type.
 pub(crate) enum SchemaDiagnostic {
+    /// The logical field name rejected by case-insensitive struct validation.
     DuplicateField(String),
+    /// The serialized primitive or complex type token rejected by type decoding.
     UnsupportedType(String),
 }
 
@@ -378,10 +380,15 @@ impl<'de> DeserializeSeed<'de> for SchemaSeed<'_, DataType> {
         match &value {
             Value::String(name) if name == "variant" => Ok(DataType::unshredded_variant()),
             Value::String(name) if name == "file" => Ok(DataType::file_type()),
-            Value::String(name) => PrimitiveType::parse::<serde_json::Error>(name.clone(), |name| {
-                *self.diagnostic.borrow_mut() = Some(SchemaDiagnostic::UnsupportedType(name.to_owned()));
-                super::unsupported_delta_type_error(name)
-            }).map(DataType::Primitive).map_err(D::Error::custom),
+            Value::String(name) => {
+                PrimitiveType::parse::<serde_json::Error>(name.clone(), |name| {
+                    *self.diagnostic.borrow_mut() =
+                        Some(SchemaDiagnostic::UnsupportedType(name.to_owned()));
+                    super::unsupported_delta_type_error(name)
+                })
+                .map(DataType::Primitive)
+                .map_err(D::Error::custom)
+            }
             Value::Object(map) if map.get("type").is_some_and(Value::is_string) => {
                 match map.get("type").and_then(Value::as_str).unwrap_or_default() {
                     "array" => SchemaSeed::<ArrayType>::new(self.diagnostic)
@@ -399,9 +406,10 @@ impl<'de> DeserializeSeed<'de> for SchemaSeed<'_, DataType> {
                     #[cfg(feature = "udt-in-dev")]
                     "udt" => self.deserialize_udt(value).map_err(D::Error::custom),
                     name => {
-                        *self.diagnostic.borrow_mut() = Some(SchemaDiagnostic::UnsupportedType(name.to_owned()));
+                        *self.diagnostic.borrow_mut() =
+                            Some(SchemaDiagnostic::UnsupportedType(name.to_owned()));
                         Err(super::unsupported_delta_type_error(name))
-                    },
+                    }
                 }
             }
             _ => Err(D::Error::custom(format!("Invalid data type: {value}"))),
@@ -412,8 +420,8 @@ impl<'de> DeserializeSeed<'de> for SchemaSeed<'_, DataType> {
 #[cfg(feature = "udt-in-dev")]
 impl SchemaSeed<'_, DataType> {
     fn deserialize_udt(self, value: Value) -> Result<DataType, serde_json::Error> {
-        // The derived UDT decoder validates annotation fields in map order before constructing
-        // the UDT. Decode its physical type with this seed to retain nested diagnostics.
+        // UDT annotations are validated after the required fields. Retain the physical type's
+        // diagnostic before validating annotations, including annotations that precede sqlType.
         let Value::Object(mut map) = value else {
             return Err(serde_json::Error::custom("Expected UDT object"));
         };
