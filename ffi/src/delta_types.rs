@@ -416,7 +416,7 @@ struct CheckpointV2Backing<'a> {
     _action_records: Option<Vec<CheckpointActionRecord>>,
     actions: Option<Vec<FfiCheckpointNonFileAction>>,
     _checkpoint_metadata_tags: Option<Vec<FfiStringMapEntry>>,
-    checkpoint_metadata: Option<FfiCheckpointMetadata>,
+    checkpoint_metadata: Option<Box<FfiCheckpointMetadata>>,
 }
 
 impl<'a> CheckpointV2Backing<'a> {
@@ -469,16 +469,15 @@ impl<'a> CheckpointV2Backing<'a> {
                 .tags()
                 .map(|tags| unsafe { FfiStringMapEntry::from_map_unsafe(tags) })
         });
-        let checkpoint_metadata =
-            source
-                .checkpoint_metadata()
-                .map(|metadata| FfiCheckpointMetadata {
-                    version: metadata.version(),
-                    tags: checkpoint_metadata_tags
-                        .as_deref()
-                        .map(|tags| unsafe { FfiSlice::new_unsafe(tags) })
-                        .into(),
-                });
+        let checkpoint_metadata = source.checkpoint_metadata().map(|metadata| {
+            Box::new(FfiCheckpointMetadata {
+                version: metadata.version(),
+                tags: checkpoint_metadata_tags
+                    .as_deref()
+                    .map(|tags| unsafe { FfiSlice::new_unsafe(tags) })
+                    .into(),
+            })
+        });
         Self {
             source,
             _checkpoint_metadata_tags: checkpoint_metadata_tags,
@@ -496,7 +495,7 @@ impl<'a> CheckpointV2Backing<'a> {
         FfiLastCheckpointV2 {
             checkpoint_metadata: self
                 .checkpoint_metadata
-                .as_ref()
+                .as_deref()
                 .map_or(std::ptr::null(), std::ptr::from_ref),
             path: kernel_string_slice!(path),
             size_in_bytes: self.source.size_in_bytes().into(),
@@ -559,7 +558,7 @@ impl<'a> CheckpointBacking<'a> {
             .tags()
             .map(|values| unsafe { FfiStringMapEntry::from_map_unsafe(values) });
         let v2_backing = source.v2_checkpoint().map(CheckpointV2Backing::new);
-        // The V2 record points into vector buffers, which remain stable when their owners move.
+        // The V2 record points into heap allocations, which remain stable when their owners move.
         let v2 = v2_backing.as_ref().map(CheckpointV2Backing::as_ffi);
         Ok(Self {
             source,

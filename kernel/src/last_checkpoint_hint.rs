@@ -196,8 +196,9 @@ pub(crate) struct LastCheckpointV2 {
     pub(crate) non_file_actions: Option<Vec<HintAction>>,
 
     /// Checkpoint metadata retained independently of the optional non-file action collection.
-    /// Carries schema tags even when that collection exceeds its size limit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Carries schema tags even when that collection exceeds its size limit. This is retained
+    /// reader state, not an additional field in the `_last_checkpoint` JSON representation.
+    #[serde(skip)]
     pub(crate) checkpoint_metadata: Option<CheckpointMetadata>,
 }
 
@@ -556,7 +557,7 @@ impl LastCheckpointV2 {
 }
 
 impl LastCheckpointV2 {
-    /// Reconstructs V2 checkpoint state from its serialized fields.
+    /// Reconstructs V2 checkpoint state, including independently retained reader metadata.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn from_parts(
@@ -1248,6 +1249,22 @@ mod tests {
         );
         assert_eq!(v2.sidecar_files.as_ref().map(Vec::len), expected_count);
         assert_eq!(v2.non_file_actions.as_ref().map(Vec::len), expected_count);
+    }
+
+    #[test]
+    fn independent_checkpoint_metadata_is_not_a_last_checkpoint_json_field() {
+        let v2 = LastCheckpointV2::from_parts(
+            "checkpoint.parquet".to_string(),
+            None,
+            None,
+            None,
+            None,
+            Some(CheckpointMetadata::new(1, None)),
+        );
+        let json = serde_json::to_value(&v2).unwrap();
+        assert!(json.get("checkpointMetadata").is_none());
+        let decoded: LastCheckpointV2 = serde_json::from_value(json).unwrap();
+        assert!(decoded.checkpoint_metadata.is_none());
     }
 
     #[test]

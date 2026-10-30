@@ -1525,11 +1525,27 @@ fn independent_checkpoint_metadata_roundtrips_without_non_file_actions(
         metadata,
     );
     let decoded = {
-        let source = expected.clone();
-        let backing = CheckpointV2Backing::new(&source);
+        let source = LastCheckpointHint::from_parts(
+            5,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(expected.clone()),
+        )
+        .unwrap();
+        let backing = CheckpointBacking::try_new(&source).unwrap();
         let borrowed = backing.as_ffi();
-        assert_eq!(borrowed.checkpoint_metadata.is_null(), !present);
-        unsafe { borrowed.try_to_kernel() }.unwrap()
+        let v2 = unsafe { borrowed.v2_checkpoint.as_ref() }.unwrap();
+        assert_eq!(v2.checkpoint_metadata.is_null(), !present);
+        unsafe { borrowed.try_to_kernel() }
+            .unwrap()
+            .v2_checkpoint()
+            .unwrap()
+            .clone()
     };
     assert_eq!(decoded, expected);
     assert!(decoded.non_file_actions().is_none());
