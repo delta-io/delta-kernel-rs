@@ -455,11 +455,16 @@ impl<Mode> SnapshotBuilder<Mode> {
         version: Option<Version>,
         max_catalog_version: Option<Version>,
         log_tail: &[crate::path::ParsedLogPath],
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         validate_catalog_managed_log_tail(version, max_catalog_version, log_tail).map_err(|error| {
             match error.without_backtrace() {
-                KernelError::LogTailVersionsNotContiguous { first_version, second_version }
-                    if first_version.checked_add(1).is_some_and(|next| next < *second_version) => {
+                KernelError::LogTailVersionsNotContiguous {
+                    first_version,
+                    second_version,
+                } if first_version
+                    .checked_add(1)
+                    .is_some_and(|next| next < *second_version) =>
+                {
                     match (log_tail.first(), log_tail.last()) {
                         (Some(first), Some(last)) => crate::DeltaError::versions_not_contiguous(
                             log_tail.iter().map(|file| file.version),
@@ -467,7 +472,8 @@ impl<Mode> SnapshotBuilder<Mode> {
                             last.version,
                             version.or(max_catalog_version).unwrap_or(last.version),
                             error,
-                        ).into(),
+                        )
+                        .into(),
                         _ => error.into(),
                     }
                 }
@@ -1211,12 +1217,22 @@ pub(super) mod tests {
                 .with_max_catalog_version(mcv)
                 .build(engine.as_ref());
 
-            assert!(matches!(
-                result,
-                Err(crate::Error::Kernel(
-                    KernelError::LogTailVersionsNotContiguous { .. }
-                ))
-            ));
+            if log_tail_versions == [1, 3] {
+                let crate::Error::Delta(error) = result.unwrap_err() else {
+                    panic!("expected Delta gap")
+                };
+                assert_eq!(error.name(), "DELTA_VERSIONS_NOT_CONTIGUOUS");
+                assert_eq!(error.sql_state(), Some("KD00C"));
+                let values: Vec<_> = error.parameters().iter().map(|p| p.value()).collect();
+                assert_eq!(values, ["1,3", "1", "3", "3"]);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(crate::Error::Kernel(
+                        KernelError::LogTailVersionsNotContiguous { .. }
+                    ))
+                ));
+            }
 
             Ok(())
         }

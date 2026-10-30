@@ -5922,3 +5922,47 @@ async fn snapshot_checkpoint_gap_preserves_replay_context(#[case] target: Option
         Err(KernelError::MissingVersion(_)) | Err(KernelError::StartVersionNotFound { .. }),
     ));
 }
+
+#[rstest]
+#[case::from_origin(None, vec![0, 2, 3], "0,2,3", 1)]
+#[case::after_checkpoint(Some(4), vec![5, 7, 9], "5,7,9", 6)]
+#[tokio::test]
+async fn snapshot_commit_gap_reports_full_replay_sequence(
+    #[case] checkpoint: Option<crate::Version>,
+    #[case] versions: Vec<crate::Version>,
+    #[case] expected_versions: &str,
+    #[case] missing: crate::Version,
+) {
+    let mut files: Vec<_> = versions
+        .iter()
+        .map(|v| delta_path_for_version(*v, "json"))
+        .collect();
+    if let Some(checkpoint) = checkpoint {
+        files.push(delta_path_for_version(checkpoint, "checkpoint.parquet"));
+    }
+    let (storage, root) = build_log_with_paths_and_checkpoint(&files, None).await;
+    let error =
+        LogSegment::for_snapshot_impl(storage.as_ref(), root, vec![], None, None).unwrap_err();
+    let crate::Error::Delta(error) = error else {
+        panic!("expected Delta gap")
+    };
+    assert_eq!(error.name(), "DELTA_VERSIONS_NOT_CONTIGUOUS");
+    assert_eq!(error.sql_state(), Some("KD00C"));
+    assert_eq!(error.parameters()[0].value(), expected_versions);
+    assert_eq!(
+        error.parameters()[1].value(),
+        versions.first().unwrap().to_string()
+    );
+    assert_eq!(
+        error.parameters()[2].value(),
+        versions.last().unwrap().to_string()
+    );
+    assert_eq!(
+        error.parameters()[3].value(),
+        versions.last().unwrap().to_string()
+    );
+    assert!(matches!(
+        std::error::Error::source(&error).and_then(|source| source.downcast_ref::<KernelError>()),
+        Some(KernelError::MissingVersion(version)) if *version == missing,
+    ));
+}

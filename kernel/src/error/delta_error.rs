@@ -45,7 +45,11 @@ impl DeltaError {
         version_to_load: crate::Version,
         source: super::KernelError,
     ) -> Self {
-        let versions = versions.into_iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
+        let versions = versions
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         Self::new(
             DeltaErrorCondition::DeltaVersionsNotContiguous,
             vec![
@@ -57,7 +61,6 @@ impl DeltaError {
             Some(Box::new(source)),
         )
     }
-
 
     /// Reports missing replay files for `version` after `checkpoint_version` in `log_path`.
     /// The original listing or read failure remains available as the diagnostic source.

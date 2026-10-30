@@ -130,10 +130,18 @@ mod tests {
             .with_max_catalog_version(max_catalog_version)
             .build(&engine);
 
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Log tail versions 1 and 3 are not contiguous"));
+        let delta_kernel::Error::Delta(error) = result.unwrap_err() else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(
+            error.condition(),
+            delta_kernel::DeltaErrorCondition::DeltaVersionsNotContiguous
+        );
+        let values: Vec<_> = error.parameters().iter().map(|p| p.value()).collect();
+        assert_eq!(values, ["1,3", "1", "3", "3"]);
+        assert!(std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<KernelError>())
+            .is_some());
     }
 
     /// Builds a `LoadTableResponse` with no commits at the given location and ratified version.

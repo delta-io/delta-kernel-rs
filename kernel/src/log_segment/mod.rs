@@ -649,14 +649,26 @@ impl LogSegment {
                 .last()
                 .map(|file| file.version)
         });
-        let gap_versions = listed_files.ascending_commit_files.windows(2)
+        let gap_versions = listed_files
+            .ascending_commit_files
+            .windows(2)
             .any(|pair| {
                 checkpoint_version.is_none_or(|checkpoint| pair[0].version > checkpoint)
-                    && pair[0].version.checked_add(1).is_some_and(|next| next < pair[1].version)
+                    && pair[0]
+                        .version
+                        .checked_add(1)
+                        .is_some_and(|next| next < pair[1].version)
             })
-            .then(|| listed_files.ascending_commit_files.iter()
-                .filter(|file| checkpoint_version.is_none_or(|checkpoint| file.version > checkpoint))
-                .map(|file| file.version).collect::<Vec<_>>());
+            .then(|| {
+                listed_files
+                    .ascending_commit_files
+                    .iter()
+                    .filter(|file| {
+                        checkpoint_version.is_none_or(|checkpoint| file.version > checkpoint)
+                    })
+                    .map(|file| file.version)
+                    .collect::<Vec<_>>()
+            });
         let table_root = log_root.join("../").map_err(crate::KernelError::from)?;
         LogSegment::try_new(
             listed_files,
@@ -687,7 +699,8 @@ impl LogSegment {
                         match (versions.first().copied(), versions.last().copied()) {
                             (Some(start), Some(end)) => crate::DeltaError::versions_not_contiguous(
                                 versions, start, end, target, error,
-                            ).into(),
+                            )
+                            .into(),
                             _ => error.into(),
                         }
                     }

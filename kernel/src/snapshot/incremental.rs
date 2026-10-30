@@ -329,7 +329,7 @@ impl Snapshot {
         log_tail: Vec<ParsedLogPath>,
         requested_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
-    ) -> KernelResult<NewSegment> {
+    ) -> crate::Result<NewSegment> {
         let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
 
@@ -369,7 +369,7 @@ impl Snapshot {
                 // Case C.1: caller requested a specific version (necessarily >
                 // existing_snapshot_version since cases A and B were handled above), but
                 // no such commit exists in the log.
-                Some(_) => Err(KernelError::MissingVersion(existing_snapshot_version + 1)),
+                Some(_) => Err(KernelError::MissingVersion(existing_snapshot_version + 1).into()),
                 // Case C.2: no new commits and no explicit target; latest is existing.
                 None => Ok(NewSegment::Unchanged),
             };
@@ -383,16 +383,22 @@ impl Snapshot {
         // hint. If the new segment has a checkpoint, we will return it as is. Otherwise, we
         // will preserve last_checkpoint_metadata when merging the new log segment with the
         // old one.
-        let mut new_log_segment =
-            LogSegment::try_new_for_snapshot(new_listed_files, log_root.clone(), requested_version, None)?;
+        let mut new_log_segment = LogSegment::try_new_for_snapshot(
+            new_listed_files,
+            log_root.clone(),
+            requested_version,
+            None,
+        )?;
 
         let new_end_version = new_log_segment.end_version;
         if new_end_version < existing_snapshot_version {
             // we should never see a new log segment with a version < the existing snapshot
             // version, that would mean a commit was incorrectly deleted from the log
-            return Err(KernelError::invalid_log_segment(format!(
-                "Unexpected state: the newest version in the log {new_end_version} is \
+            return Err(crate::Error::Kernel(KernelError::invalid_log_segment(
+                format!(
+                    "Unexpected state: the newest version in the log {new_end_version} is \
                  older than the existing snapshot version {existing_snapshot_version}"
+                ),
             )));
         }
         if let Some(new_checkpoint_version) = new_log_segment.checkpoint_version {
@@ -1260,9 +1266,14 @@ mod tests {
 
         // ===== THEN =====
         let error = updated.expect_err("the missing commit must not be hidden by the checkpoint");
+        let crate::Error::Delta(error) = error else {
+            panic!("expected Delta gap")
+        };
+        assert_eq!(error.name(), "DELTA_VERSIONS_NOT_CONTIGUOUS");
         assert!(matches!(
-            error,
-            crate::Error::Kernel(KernelError::MissingVersion(3))
+            std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<KernelError>()),
+            Some(KernelError::MissingVersion(3)),
         ));
 
         Ok(())
