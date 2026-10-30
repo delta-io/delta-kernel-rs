@@ -340,6 +340,9 @@ fn expected_delta_error_matches(
                 "DELTA_TABLE_NOT_FOUND" | "DELTA_MISSING_TRANSACTION_LOG",
                 "DELTA_PATH_DOES_NOT_EXIST"
             ) | (
+                "COLUMN_ALREADY_EXISTS",
+                "DELTA_DUPLICATE_COLUMNS_FOUND.EXISTING_SCHEMA"
+            ) | (
                 "DELTA_VERSIONS_NOT_CONTIGUOUS.GENERIC",
                 "DELTA_VERSIONS_NOT_CONTIGUOUS"
             ) | (
@@ -603,6 +606,39 @@ mod tests {
             None,
         )
         .unwrap();
+        assert_eq!(
+            expected_delta_error_matches(&expected_error(code), &actual),
+            matches
+        );
+    }
+
+    #[rstest]
+    #[case::column_already_exists(
+        "COLUMN_ALREADY_EXISTS",
+        DeltaErrorCondition::DeltaDuplicateColumnsFoundExistingSchema,
+        true
+    )]
+    #[case::exact_condition(
+        "DELTA_DUPLICATE_COLUMNS_FOUND.EXISTING_SCHEMA",
+        DeltaErrorCondition::DeltaDuplicateColumnsFoundExistingSchema,
+        true
+    )]
+    #[case::duplicate_partition_is_not_duplicate_schema(
+        "COLUMN_ALREADY_EXISTS",
+        DeltaErrorCondition::DeltaDuplicateColumnsFoundPartitionColumns,
+        false
+    )]
+    #[case::exact_partition_condition(
+        "DELTA_DUPLICATE_COLUMNS_FOUND.PARTITION_COLUMNS",
+        DeltaErrorCondition::DeltaDuplicateColumnsFoundPartitionColumns,
+        true
+    )]
+    fn duplicate_schema_migration_delta_error_matches(
+        #[case] code: &str,
+        #[case] condition: DeltaErrorCondition,
+        #[case] matches: bool,
+    ) {
+        let actual = DeltaError::for_test(condition, &["id"], None).unwrap();
         assert_eq!(
             expected_delta_error_matches(&expected_error(code), &actual),
             matches
