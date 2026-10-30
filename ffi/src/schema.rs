@@ -491,9 +491,11 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use delta_kernel::schema::{schema, StructField};
+    use delta_kernel::schema::schema;
     #[cfg(feature = "geo-type-in-dev")]
-    use delta_kernel::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
+    use delta_kernel::schema::{
+        EdgeInterpolationAlgorithm, GeographyType, GeometryType, StructField,
+    };
 
     use super::*;
     use crate::TryFromStringSlice;
