@@ -1673,7 +1673,7 @@ mod tests {
     #[case::suspended(RowTrackingState::Suspended)]
     fn test_row_commit_version_patch(
         #[case] row_tracking_state: RowTrackingState,
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         let schema: SchemaRef = schema_ref! { nullable "value": INTEGER };
         let state_info = get_state_info(
             schema,
@@ -1875,7 +1875,7 @@ mod tests {
     }
 
     #[test]
-    fn test_serialization_with_timezone() -> KernelResult<()> {
+    fn test_serialization_with_timezone() -> crate::Result<()> {
         let engine = SyncEngine::new();
         let schema = schema_ref! {
             nullable "ts": TIMESTAMP,

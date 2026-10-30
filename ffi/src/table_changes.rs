@@ -236,7 +236,8 @@ pub unsafe extern "C" fn table_changes_scan_physical_schema(
     table_changes_scan.physical_schema().clone().into()
 }
 
-type TableChangesData = Mutex<Box<dyn KernelResultIterator<Box<dyn EngineData>>>>;
+type TableChangesData =
+    Mutex<Box<dyn Iterator<Item = delta_kernel::Result<Box<dyn EngineData>>> + Send>>;
 
 pub struct ScanTableChangesIterator {
     data: TableChangesData,
@@ -273,7 +274,7 @@ pub unsafe extern "C" fn table_changes_scan_execute(
 fn table_changes_scan_execute_impl(
     table_changes_scan: &TableChangesScan,
     engine: Arc<dyn ExternEngine>,
-) -> KernelResult<Handle<SharedScanTableChangesIterator>> {
+) -> delta_kernel::Result<Handle<SharedScanTableChangesIterator>> {
     let table_changes_iter = table_changes_scan.execute(engine.engine().clone())?;
     let data = ScanTableChangesIterator {
         data: Mutex::new(Box::new(table_changes_iter)),
@@ -315,7 +316,7 @@ pub unsafe extern "C" fn scan_table_changes_next(
 
 fn scan_table_changes_next_impl(
     data: &ScanTableChangesIterator,
-) -> KernelResult<*mut ArrowFFIData> {
+) -> delta_kernel::Result<*mut ArrowFFIData> {
     let mut data = data
         .data
         .lock()
@@ -329,7 +330,7 @@ fn scan_table_changes_next_impl(
 
     let batch_struct_array: StructArray = record_batch.into();
     let array_data: ArrayData = batch_struct_array.into_data();
-    let (out_array, out_schema) = to_ffi(&array_data)?;
+    let (out_array, out_schema) = to_ffi(&array_data).map_err(delta_kernel::KernelError::from)?;
     Ok(Box::into_raw(Box::new(ArrowFFIData {
         array: out_array,
         schema: out_schema,
@@ -501,11 +502,11 @@ mod tests {
     fn read_scan(
         scan: &TableChangesScan,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<Vec<RecordBatch>> {
+    ) -> delta_kernel::Result<Vec<RecordBatch>> {
         let scan_results = scan.execute(engine)?;
-        scan_results
-            .map(EngineDataArrowExt::try_into_record_batch)
-            .try_collect()
+        Ok(scan_results
+            .map(|data| Ok::<_, delta_kernel::Error>(data?.try_into_record_batch()?))
+            .try_collect()?)
     }
 
     fn filter_batches(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {

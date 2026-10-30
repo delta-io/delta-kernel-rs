@@ -107,7 +107,7 @@ fn assert_top_level_default(
     engine: &dyn Engine,
     column: &str,
     expected: Scalar,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "test-engine", true)

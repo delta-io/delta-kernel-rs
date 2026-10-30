@@ -391,7 +391,7 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
         .commit(&engine)
         .unwrap_err();
     assert!(
-        matches!(err, delta_kernel::KernelError::Generic(msg) if msg.contains("Max unpublished commits"))
+        matches!(err, delta_kernel::Error::Kernel(delta_kernel::KernelError::Generic(msg)) if msg.contains("Max unpublished commits"))
     );
     Ok(())
 }

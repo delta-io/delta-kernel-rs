@@ -268,17 +268,21 @@ fn build_stats_schema_for_columns(
 fn validate_partition_columns(
     metadata: &Metadata,
     logical_schema: &StructType,
-) -> KernelResult<()> {
+) -> crate::Result<()> {
     let mut seen = HashSet::new();
     for col in metadata.partition_columns() {
         if !seen.insert(col) {
             return Err(crate::DeltaError::duplicate_partition_column(
-                col, KernelError::generic(format!("Duplicate partition column: '{col}'")),
-            ).into());
+                col,
+                KernelError::generic(format!("Duplicate partition column: '{col}'")),
+            )
+            .into());
         }
         require!(
             logical_schema.field(col).is_some(),
-            KernelError::generic(format!("Partition column '{col}' not found in schema"))
+            crate::Error::Kernel(KernelError::generic(format!(
+                "Partition column '{col}' not found in schema"
+            )))
         );
     }
     Ok(())
@@ -341,7 +345,7 @@ impl TableConfiguration {
         protocol: Protocol,
         table_root: Url,
         version: Version,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         let logical_schema = Arc::new(metadata.parse_schema()?);
         Self::try_new_inner(metadata, protocol, table_root, version, logical_schema)
     }
@@ -352,7 +356,7 @@ impl TableConfiguration {
         base: &Self,
         metadata: Metadata,
         logical_schema: SchemaRef,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         Self::try_new_inner(
             metadata,
             base.protocol.clone(),
@@ -368,7 +372,7 @@ impl TableConfiguration {
         table_root: Url,
         version: Version,
         logical_schema: SchemaRef,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
@@ -421,9 +425,9 @@ impl TableConfiguration {
         require!(
             !(table_config.table_properties.enable_row_tracking == Some(true)
                 && table_config.is_row_tracking_suspended()),
-            KernelError::invalid_protocol(
+            crate::Error::Kernel(KernelError::invalid_protocol(
                 "Row tracking cannot be enabled and suspended at the same time"
-            )
+            ))
         );
 
         // Validate schema against protocol features now that we have a TC instance.
@@ -457,7 +461,7 @@ impl TableConfiguration {
         new_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
         new_version: Version,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         // simplest case: no new P/M, just return the existing table configuration with new version
         if new_metadata.is_none() && new_protocol.is_none() {
             return Ok(Self {
@@ -497,7 +501,7 @@ impl TableConfiguration {
         new_version: Version,
         new_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         Self::try_new_from(table_configuration, new_metadata, new_protocol, new_version)
     }
 
@@ -1503,7 +1507,16 @@ mod test {
             .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
             .try_build();
 
-        assert_result_error_with_message(result, "Duplicate partition column: 'part'");
+        let crate::Error::Delta(error) = result.unwrap_err() else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(
+            error.condition(),
+            crate::DeltaErrorCondition::DeltaDuplicateColumnsFoundPartitionColumns
+        );
+        assert_eq!(error.sql_state(), Some("42711"));
+        assert_eq!(error.parameters()[0].value(), "part");
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]

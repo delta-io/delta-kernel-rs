@@ -2370,7 +2370,7 @@ async fn commit_with_dm_and_txn<E: TaskExecutor>(
     snapshot: SnapshotRef,
     engine: &Arc<DefaultEngine<E>>,
     v: i64,
-) -> KernelResult<SnapshotRef> {
+) -> delta_kernel::Result<SnapshotRef> {
     commit_data(snapshot, engine, v, |builder| {
         builder
             .with_domain_metadata("domain", format!("value_{v}"))
@@ -2386,8 +2386,9 @@ async fn commit_data<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     v: i64,
     customize: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
-) -> KernelResult<SnapshotRef> {
-    let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
+) -> delta_kernel::Result<SnapshotRef> {
+    let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())
+        .map_err(delta_kernel::KernelError::from)?;
     let batch = RecordBatch::try_new(
         Arc::new(arrow_schema),
         vec![Arc::new(Int32Array::from(vec![v as i32]))],

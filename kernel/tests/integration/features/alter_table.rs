@@ -263,7 +263,7 @@ async fn alter_table_commit_rejects_staged_files(
 
     let error = transaction.commit(engine.as_ref()).unwrap_err();
     assert!(
-        matches!(&error, KernelError::InvalidTransactionState(message)
+        matches!(&error, delta_kernel::Error::Kernel(KernelError::InvalidTransactionState(message))
         if message == "ALTER TABLE cannot include data-file actions")
     );
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;

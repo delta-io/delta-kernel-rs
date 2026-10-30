@@ -678,7 +678,7 @@ mod row_tracking_preservation {
         snapshot: Arc<Snapshot>,
         engine: &Arc<DefaultEngine<TokioMultiThreadExecutor>>,
         batch: RecordBatch,
-    ) -> KernelResult<Arc<Snapshot>> {
+    ) -> delta_kernel::Result<Arc<Snapshot>> {
         let source_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Optimize, "test-engine", false)

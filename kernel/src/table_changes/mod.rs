@@ -522,12 +522,12 @@ impl TableChanges {
         self: Arc<Self>,
         engine: Arc<dyn Engine>,
         mode: TableChangesListingMode,
-    ) -> KernelResult<impl KernelResultIterator<TableChangesFileAction>> {
+    ) -> crate::Result<impl KernelResultIterator<TableChangesFileAction>> {
         if self.mode != CdfMode::RowTracking {
-            return Err(KernelError::unsupported(
+            return Err(crate::Error::Kernel(KernelError::unsupported(
                 "scan_file_listing is only supported for row-tracking change feeds; construct \
                  the TableChanges with TableChanges::try_new_row_tracking_cdf_listing",
-            ));
+            )));
         }
 
         let commits = self.log_segment.listed.ascending_commit_files.clone();
@@ -542,8 +542,8 @@ impl TableChanges {
         )?;
         // Any listing error surfaces here rather than mid-iteration.
         let actions = scan_metadata_to_scan_file(scan_metadata)
-            .map(|scan_file| TableChangesFileAction::try_from_scan_file(scan_file?))
-            .collect::<KernelResult<Vec<_>>>()?;
+            .map(|scan_file| Ok(TableChangesFileAction::try_from_scan_file(scan_file?)?))
+            .collect::<crate::Result<Vec<_>>>()?;
         let actions = match mode {
             TableChangesListingMode::AllChanges => actions,
             TableChangesListingMode::NetChanges => net_changes::collapse_net_changes(actions)?,
@@ -674,7 +674,7 @@ mod tests {
         );
         let res = table_changes.scan_file_listing(engine, TableChangesListingMode::AllChanges);
         assert!(
-            matches!(res, Err(KernelError::Unsupported(_))),
+            matches!(res, Err(crate::Error::Kernel(KernelError::Unsupported(_)))),
             "scan_file_listing on a cdc-file TableChanges must return an unsupported error"
         );
     }

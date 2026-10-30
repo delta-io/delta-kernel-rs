@@ -232,7 +232,7 @@ fn manifest_commit_after_schema_change_uses_evolved_schema(
     if is_alter {
         let error = txn.commit(&engine).unwrap_err();
         assert!(
-            matches!(&error, KernelError::InvalidTransactionState(message)
+            matches!(&error, crate::Error::Kernel(KernelError::InvalidTransactionState(message))
             if message == "ALTER TABLE cannot include manifest writes")
         );
     }

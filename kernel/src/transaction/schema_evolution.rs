@@ -256,7 +256,7 @@ pub(crate) fn apply_schema_operations(
 pub(crate) fn evolve_table_config(
     table_config: &TableConfiguration,
     operations: Vec<SchemaOperation>,
-) -> KernelResult<TableConfiguration> {
+) -> crate::Result<TableConfiguration> {
     let schema = Arc::unwrap_or_clone(table_config.logical_schema());
     let column_mapping_mode = table_config.column_mapping_mode();
     let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;

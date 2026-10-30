@@ -37,7 +37,7 @@ fn main() -> delta_kernel::Result<()> {
     let table_changes_scan = table_changes.into_scan_builder().build()?;
     let batches: Vec<RecordBatch> = table_changes_scan
         .execute(Arc::new(engine))?
-        .map(EngineDataArrowExt::try_into_record_batch)
+        .map(|data| Ok::<_, delta_kernel::Error>(data?.try_into_record_batch()?))
         .try_collect()?;
     print_batches(&batches).map_err(delta_kernel::KernelError::from)?;
     Ok(())

@@ -68,7 +68,7 @@ fn execute_row_tracking(
     engine: Arc<dyn Engine>,
     mock_table: &LocalMockTable,
     end_schema: SchemaRef,
-) -> KernelResult<Vec<TableChangesScanMetadata>> {
+) -> crate::Result<Vec<TableChangesScanMetadata>> {
     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)?.into_iter();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = row_tracking_table_config(table_root_url, get_schema());
@@ -109,7 +109,7 @@ fn execute_table_changes(
     mock_table: &LocalMockTable,
     start_version: Version,
     end_version: Option<Version>,
-) -> KernelResult<Vec<TableChangesScanMetadata>> {
+) -> crate::Result<Vec<TableChangesScanMetadata>> {
     let commits = get_segment(
         engine.as_ref(),
         mock_table.table_root(),
@@ -134,14 +134,24 @@ fn assert_midstream_failure(engine: Arc<dyn Engine>, mock_table: &LocalMockTable
     // Reading commits 0-1 should fail
     let res_v0_v1 = execute_table_changes(engine.clone(), mock_table, 0, Some(1));
     assert!(
-        matches!(res_v0_v1, Err(KernelError::ChangeDataFeedUnsupported(_))),
+        matches!(
+            res_v0_v1,
+            Err(crate::Error::Kernel(
+                KernelError::ChangeDataFeedUnsupported(_)
+            ))
+        ),
         "Reading versions 0-1 should fail"
     );
 
     // Reading just commit 1 should also fail
     let res_v1 = execute_table_changes(engine, mock_table, 1, Some(1));
     assert!(
-        matches!(res_v1, Err(KernelError::ChangeDataFeedUnsupported(_))),
+        matches!(
+            res_v1,
+            Err(crate::Error::Kernel(
+                KernelError::ChangeDataFeedUnsupported(_)
+            ))
+        ),
         "Reading version 1 alone should fail"
     );
 }
@@ -163,7 +173,9 @@ fn get_segment(
     Ok(log_segment.listed.ascending_commit_files)
 }
 
-fn result_to_sv(iter: impl KernelResultIterator<TableChangesScanMetadata>) -> Vec<bool> {
+fn result_to_sv(
+    iter: impl Iterator<Item = crate::Result<TableChangesScanMetadata>> + Send,
+) -> Vec<bool> {
     iter.map_ok(|scan_metadata| scan_metadata.selection_vector.into_iter())
         .flatten_ok()
         .try_collect()
@@ -232,14 +244,16 @@ async fn cdf_not_enabled() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let res: KernelResult<Vec<_>> =
+    let res: crate::Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
 
     assert!(matches!(
         res,
-        Err(KernelError::ChangeDataFeedUnsupported(_))
+        Err(crate::Error::Kernel(
+            KernelError::ChangeDataFeedUnsupported(_)
+        ))
     ));
 }
 
@@ -270,14 +284,16 @@ async fn unsupported_reader_feature() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let res: KernelResult<Vec<_>> =
+    let res: crate::Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
 
     assert!(matches!(
         res,
-        Err(KernelError::ChangeDataFeedUnsupported(_))
+        Err(crate::Error::Kernel(
+            KernelError::ChangeDataFeedUnsupported(_)
+        ))
     ));
 }
 
@@ -347,7 +363,7 @@ async fn column_mapping_should_succeed() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let res: KernelResult<Vec<_>> =
+    let res: crate::Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, cm_schema, None)
             .unwrap()
             .try_collect();
@@ -405,7 +421,12 @@ async fn row_tracking_unavailable_midstream_fails(#[case] properties: &[(&str, &
 
     let res = execute_row_tracking(engine, &mock_table, get_schema()).map(|_| ());
     assert!(
-        matches!(&res, Err(KernelError::RowTrackingChangeFeedUnsupported(1))),
+        matches!(
+            &res,
+            Err(crate::Error::Kernel(
+                KernelError::RowTrackingChangeFeedUnsupported(1)
+            ))
+        ),
         "expected row tracking to be unavailable at version 1, got {res:?}"
     );
 }
@@ -459,7 +480,9 @@ async fn row_tracking_schema_compatibility(
         assert!(
             matches!(
                 &res,
-                Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+                Err(crate::Error::Kernel(
+                    KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+                ))
             ),
             "expected incompatible-schema error, got {res:?}"
         );
@@ -559,7 +582,10 @@ async fn row_tracking_protocol_failure_preserves_the_underlying_error() {
 
     let result = execute_row_tracking(engine, &mock_table, get_schema()).map(|_| ());
     assert!(
-        matches!(&result, Err(KernelError::Unsupported(_))),
+        matches!(
+            &result,
+            Err(crate::Error::Kernel(KernelError::Unsupported(_)))
+        ),
         "expected the protocol support error, got {result:?}"
     );
 }
@@ -590,14 +616,16 @@ async fn incompatible_schemas_fail() {
 
         let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let table_config = get_default_table_config(&table_root_url);
-        let res: KernelResult<Vec<_>> =
+        let res: crate::Result<Vec<_>> =
             table_changes_action_iter(engine, &table_config, commits, cdf_schema, None)
                 .unwrap()
                 .try_collect();
 
         assert!(matches!(
             res,
-            Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+            Err(crate::Error::Kernel(
+                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+            ))
         ));
     }
 
@@ -661,7 +689,7 @@ async fn incompatible_schemas_fail() {
 async fn test_schema_evolution(
     initial_schema: SchemaRef,
     evolved_schema: SchemaRef,
-) -> KernelResult<Vec<TableChangesScanMetadata>> {
+) -> crate::Result<Vec<TableChangesScanMetadata>> {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
 
@@ -725,7 +753,9 @@ async fn demonstration_schema_evolution_failures() {
     assert!(
         matches!(
             res,
-            Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+            Err(crate::Error::Kernel(
+                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+            ))
         ),
         "Expected ChangeDataFeedIncompatibleSchema error for adding nullable column"
     );
@@ -745,7 +775,9 @@ async fn demonstration_schema_evolution_failures() {
     assert!(
         matches!(
             res,
-            Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+            Err(crate::Error::Kernel(
+                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+            ))
         ),
         "Expected ChangeDataFeedIncompatibleSchema error for type widening"
     );
@@ -765,7 +797,9 @@ async fn demonstration_schema_evolution_failures() {
     assert!(
         matches!(
             res,
-            Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+            Err(crate::Error::Kernel(
+                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+            ))
         ),
         "Expected ChangeDataFeedIncompatibleSchema error for nullability change"
     );
@@ -1188,7 +1222,7 @@ async fn failing_protocol() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let res: KernelResult<Vec<_>> =
+    let res: crate::Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
@@ -1274,7 +1308,7 @@ async fn print_table_configuration() {
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
 
-    let _scan_batches: KernelResult<Vec<_>> =
+    let _scan_batches: crate::Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
@@ -1339,7 +1373,7 @@ async fn print_table_info_post_phase1() {
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
 
-    let _scan_batches: KernelResult<Vec<_>> =
+    let _scan_batches: crate::Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
@@ -1383,7 +1417,7 @@ async fn print_table_info_post_phase1_has_cdc() {
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
 
-    let _scan_batches: KernelResult<Vec<_>> =
+    let _scan_batches: crate::Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
@@ -1438,7 +1472,7 @@ async fn print_table_info_post_phase1_has_dv() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let _scan_batches: KernelResult<Vec<_>> =
+    let _scan_batches: crate::Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();

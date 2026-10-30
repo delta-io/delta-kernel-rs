@@ -57,7 +57,7 @@ pub(crate) fn table_changes_action_iter(
     commit_files: impl IntoIterator<Item = ParsedLogPath, IntoIter: Send>,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
-) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
+) -> crate::Result<impl Iterator<Item = crate::Result<TableChangesScanMetadata>> + Send> {
     // The data-reading (`execute`) path always uses change-data-file semantics.
     table_changes_action_iter_with_mode(
         engine,
@@ -81,7 +81,7 @@ pub(crate) fn table_changes_action_iter_with_mode(
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
     mode: CdfMode,
-) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
+) -> crate::Result<impl Iterator<Item = crate::Result<TableChangesScanMetadata>> + Send> {
     // Skip against the raw `{ add, remove, ... }` action batch: table_changes must resolve
     // deletion vector pairs before filtering, so unlike the scan path it operates on raw
     // batches with stats parsed from `add.stats` JSON.
@@ -100,7 +100,7 @@ pub(crate) fn table_changes_action_iter_with_mode(
     let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
         .into_iter()
-        .map(move |commit_file| -> KernelResult<_> {
+        .map(move |commit_file| -> crate::Result<_> {
             let scanner = LogReplayScanner::try_new(
                 engine.as_ref(),
                 &mut current_configuration,
@@ -108,10 +108,10 @@ pub(crate) fn table_changes_action_iter_with_mode(
                 &table_schema,
                 mode,
             )?;
-            scanner.into_scan_batches(engine.clone(), filter.clone())
+            Ok(scanner.into_scan_batches(engine.clone(), filter.clone())?)
         }) //Iterator-Result-Iterator-Result
         .flatten_ok() // Iterator-Result-Result
-        .map(|x| x?); // Iterator-Result
+        .map(|x| x?.map_err(crate::Error::from)); // Iterator-Result
     Ok(result)
 }
 
@@ -185,7 +185,7 @@ impl LogReplayScanner {
         commit_file: ParsedLogPath,
         table_schema: &SchemaRef,
         mode: CdfMode,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         let visitor_schema = PreparePhaseVisitor::schema();
 
         // Note: We do not perform data skipping yet because we need to visit all add and
@@ -238,10 +238,12 @@ impl LogReplayScanner {
                 // Compatibility is evaluated against the end version's logical schema.
                 require!(
                     mode.schemas_compatible(&schema, table_schema.as_ref()),
-                    KernelError::change_data_feed_incompatible_schema_at_version(
-                        table_schema,
-                        &schema,
-                        commit_file.version
+                    crate::Error::Kernel(
+                        KernelError::change_data_feed_incompatible_schema_at_version(
+                            table_schema,
+                            &schema,
+                            commit_file.version
+                        )
                     )
                 );
             }
@@ -277,7 +279,7 @@ impl LogReplayScanner {
             if has_metadata_update {
                 require!(
                     table_configuration.is_feature_enabled(&mode.required_feature()),
-                    mode.feature_disabled_error(commit_file.version)
+                    crate::Error::Kernel(mode.feature_disabled_error(commit_file.version))
                 );
             }
 
@@ -301,10 +303,10 @@ impl LogReplayScanner {
         let timestamp = if table_configuration.is_feature_enabled(&TableFeature::InCommitTimestamp)
         {
             let Some(in_commit_timestamp) = in_commit_timestamp_opt else {
-                return Err(KernelError::generic(format!(
+                return Err(crate::Error::Kernel(KernelError::generic(format!(
                     "In-commit timestamp is enabled but not found in commit at version {}",
                     commit_file.version
-                )));
+                ))));
             };
             in_commit_timestamp
         } else {

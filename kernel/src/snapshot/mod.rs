@@ -509,23 +509,23 @@ impl Snapshot {
         commit: ParsedLogPath,
         crc_delta: CrcDelta,
         #[cfg(feature = "adaptive-metadata-in-dev")] checkpoint_action: Option<CheckpointAction>,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         require!(
             commit.is_commit(),
-            KernelError::internal_error(format!(
+            crate::Error::Kernel(KernelError::internal_error(format!(
                 "Cannot create post-commit Snapshot. Log file is not a commit file. \
                 Path: {}, Type: {:?}.",
                 commit.location.location, commit.file_type
-            ))
+            )))
         );
         let read_version = self.version();
         let new_version = commit.version;
         require!(
             new_version == read_version.wrapping_add(1),
-            KernelError::internal_error(format!(
+            crate::Error::Kernel(KernelError::internal_error(format!(
                 "Cannot create post-commit Snapshot. Log file version ({new_version}) does not \
                 equal Snapshot version ({read_version}) + 1."
-            ))
+            )))
         );
 
         let new_table_configuration = TableConfiguration::new_post_commit(

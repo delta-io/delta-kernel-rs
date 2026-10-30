@@ -45,7 +45,6 @@ impl DeltaError {
         )
     }
 
-
     /// Reports the observed `versions` and required bounds while loading `version_to_load`.
     /// Bounds describe the commit interval being validated, not the table's retained history.
     pub(crate) fn versions_not_contiguous(

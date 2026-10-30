@@ -163,7 +163,7 @@ impl TableChangesScan {
     fn scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
+    ) -> crate::Result<impl Iterator<Item = crate::Result<TableChangesScanMetadata>> + Send> {
         let commits = self
             .table_changes
             .log_segment
@@ -220,7 +220,7 @@ impl TableChangesScan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>>> {
+    ) -> crate::Result<impl Iterator<Item = crate::Result<Box<dyn EngineData>>> + Send> {
         let scan_metadata = self.scan_metadata(engine.clone())?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
@@ -234,9 +234,10 @@ impl TableChangesScan {
         let result = scan_files
             .map(move |scan_file| {
                 resolve_scan_file_dv(dv_engine_ref.as_ref(), &table_root, scan_file?)
+                    .map_err(crate::Error::from)
             }) // Iterator-Result-Iterator
             .flatten_ok() // Iterator-Result
-            .map(move |resolved_scan_file| -> KernelResult<_> {
+            .map(move |resolved_scan_file| -> crate::Result<_> {
                 read_scan_file(
                     engine.as_ref(),
                     resolved_scan_file?,
@@ -244,9 +245,10 @@ impl TableChangesScan {
                     state_info.as_ref(),
                     physical_predicate.clone(),
                 )
+                .map_err(crate::Error::from)
             }) // Iterator-Result-Iterator-Result
             .flatten_ok() // Iterator-Result-Result
-            .map(|x| x?); // Iterator-Result
+            .map(|x| x?.map_err(crate::Error::from)); // Iterator-Result
 
         Ok(result)
     }

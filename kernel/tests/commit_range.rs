@@ -68,7 +68,7 @@ fn reads_all_commits_in_requested_order(
     let actions = [DeltaAction::Add, DeltaAction::Remove];
     let commits = range
         .commits(engine.clone(), Some(anchor_snapshot), &actions)?
-        .collect::<KernelResult<Vec<_>>>()?;
+        .collect::<delta_kernel::Result<Vec<_>>>()?;
     assert_eq!(commits.len(), expected_per_commit.len(), "commit count");
 
     for (commit, (expected_version, expected_counts)) in

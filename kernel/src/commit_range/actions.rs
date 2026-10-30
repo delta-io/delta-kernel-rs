@@ -70,7 +70,7 @@ impl CommitAction {
         read_schema: SchemaRef,
         seed_protocol: Option<Protocol>,
         seed_metadata: Option<Metadata>,
-    ) -> KernelResult<Self> {
+    ) -> crate::Result<Self> {
         let timestamp = log_path.location.last_modified;
         let mut this = Self {
             table_root,

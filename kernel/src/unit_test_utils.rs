@@ -572,7 +572,7 @@ impl MockTableConfigurationBuilder {
         self.try_build().unwrap()
     }
 
-    pub(crate) fn try_build(self) -> KernelResult<TableConfiguration> {
+    pub(crate) fn try_build(self) -> crate::Result<TableConfiguration> {
         let schema = self
             .schema
             .unwrap_or_else(|| schema_ref! { nullable "value": INTEGER });

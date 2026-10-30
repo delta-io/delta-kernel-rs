@@ -138,7 +138,7 @@ fn update_table_txn_builder_build_with_committer_impl(
     builder: UpdateTableTransactionBuilder,
     extern_engine: &dyn ExternEngine,
     committer: Box<dyn Committer>,
-) -> KernelResult<Handle<ExclusiveUpdateTableTransaction>> {
+) -> delta_kernel::Result<Handle<ExclusiveUpdateTableTransaction>> {
     let engine = extern_engine.engine();
     let transaction = builder.build(engine.as_ref(), committer);
     Ok(Box::new(transaction?).into())

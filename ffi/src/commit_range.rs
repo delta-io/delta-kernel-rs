@@ -394,7 +394,7 @@ pub unsafe extern "C" fn free_commit_action(commit_action: Handle<SharedCommitAc
     unsafe { commit_action.drop_handle() }
 }
 
-type CommitActionIter = Box<dyn KernelResultIterator<CommitAction>>;
+type CommitActionIter = Box<dyn Iterator<Item = delta_kernel::Result<CommitAction>> + Send>;
 
 /// Iterator handle returned by [`commit_range_commits`]. Holds the boxed kernel iterator behind a
 /// mutex (so it is safe to share across threads) plus an engine reference for error allocation.
@@ -480,7 +480,7 @@ fn commit_range_commits_impl(
     engine: Arc<dyn ExternEngine>,
     start_snapshot: Option<SnapshotRef>,
     actions: Vec<KernelDeltaAction>,
-) -> KernelResult<Handle<SharedCommitActionsIterator>> {
+) -> delta_kernel::Result<Handle<SharedCommitActionsIterator>> {
     let inner = commit_range.commits(engine.engine(), start_snapshot, &actions)?;
     let boxed: CommitActionIter = Box::new(inner);
     let iter = FfiCommitActionsIterator {
@@ -520,7 +520,7 @@ fn commit_range_commits_next_impl(
         engine_context: NullableCvoid,
         commit_action: Handle<SharedCommitAction>,
     ),
-) -> KernelResult<bool> {
+) -> delta_kernel::Result<bool> {
     let mut iter = data.lock_iter()?;
     match iter.next().transpose()? {
         Some(commit_action) => {

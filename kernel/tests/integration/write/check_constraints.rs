@@ -27,7 +27,10 @@ enum GatedOp {
 }
 
 /// Builds a data-changing write transaction on `snapshot`.
-fn build_write_txn(snapshot: &SnapshotRef, engine: &dyn Engine) -> KernelResult<Transaction> {
+fn build_write_txn(
+    snapshot: &SnapshotRef,
+    engine: &dyn Engine,
+) -> delta_kernel::Result<Transaction> {
     snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "Test/1.0", true)
@@ -44,11 +47,11 @@ fn stage_one_file(txn: &mut Transaction) -> KernelResult<()> {
 }
 
 /// Asserts `result` failed with the acknowledgement gate error.
-fn assert_gate_error<T: std::fmt::Debug>(result: KernelResult<T>) {
+fn assert_gate_error<T: std::fmt::Debug>(result: delta_kernel::Result<T>) {
     let err = result.expect_err("acknowledgement gate must reject this operation");
     let is_gate_error = matches!(
         &err,
-        KernelError::InvalidTransactionState(msg) if msg.contains("ack_check_constraints")
+        delta_kernel::Error::Kernel(KernelError::InvalidTransactionState(msg)) if msg.contains("ack_check_constraints")
     );
     assert!(
         is_gate_error,
@@ -194,7 +197,9 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_constraints(
         GatedOp::MetadataOnlyCommit | GatedOp::WriteState => {}
     }
     let result = if op == GatedOp::WriteState {
-        txn.write_state().map(|_write_state| ())
+        txn.write_state()
+            .map(|_write_state| ())
+            .map_err(delta_kernel::Error::from)
     } else {
         txn.commit(engine.as_ref()).map(|committed| {
             let _committed = committed.unwrap_committed();
@@ -219,7 +224,10 @@ async fn constraints_without_feature_are_discoverable_but_txn_build_fails(
     assert_eq!(from_snapshot, POSITIVE_AMOUNT);
 
     let result = build_write_txn(&snapshot, engine.as_ref());
-    let rejected_as_malformed = matches!(result, Err(KernelError::InvalidProtocol(_)));
+    let rejected_as_malformed = matches!(
+        result,
+        Err(delta_kernel::Error::Kernel(KernelError::InvalidProtocol(_)))
+    );
     assert!(rejected_as_malformed);
     Ok(())
 }

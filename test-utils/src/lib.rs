@@ -1269,7 +1269,7 @@ pub async fn insert_data<E: TaskExecutor>(
     snapshot: Arc<Snapshot>,
     engine: &Arc<DefaultEngine<E>>,
     columns: Vec<ArrayRef>,
-) -> KernelResult<CommitResult> {
+) -> delta_kernel::Result<CommitResult> {
     insert_data_with(
         snapshot,
         engine,
@@ -1293,8 +1293,9 @@ pub async fn insert_data_with<E: TaskExecutor>(
     operation: &str,
     data_change: bool,
     is_blind_append: bool,
-) -> KernelResult<CommitResult> {
-    let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
+) -> delta_kernel::Result<CommitResult> {
+    let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())
+        .map_err(delta_kernel::KernelError::from)?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
         .map_err(|e| delta_kernel::KernelError::generic(e.to_string()))?;
     let operation = match operation {
@@ -1328,7 +1329,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
 pub fn begin_transaction(
     snapshot: Arc<Snapshot>,
     engine: &dyn Engine,
-) -> KernelResult<Transaction> {
+) -> delta_kernel::Result<Transaction> {
     begin_transaction_with(
         snapshot,
         engine,
@@ -1351,7 +1352,7 @@ pub fn begin_transaction_with(
     engine_info: impl Into<String>,
     data_change: bool,
     configure: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
-) -> KernelResult<Transaction> {
+) -> delta_kernel::Result<Transaction> {
     configure(snapshot.update_table(operation, engine_info, data_change))
         .build(engine, Box::new(FileSystemCommitter::new()))
 }
@@ -1790,7 +1791,7 @@ pub async fn write_batch_to_table(
     engine: &DefaultEngine<impl delta_kernel_default_engine::executor::TaskExecutor>,
     data: RecordBatch,
     partition_values: HashMap<String, Scalar>,
-) -> KernelResult<Arc<Snapshot>> {
+) -> delta_kernel::Result<Arc<Snapshot>> {
     let mut txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "DefaultEngine", true)
@@ -2266,7 +2267,7 @@ pub fn remove_all_and_get_remove_actions(
     snapshot: &Arc<Snapshot>,
     table_url: &Url,
     engine: &impl Engine,
-) -> KernelResult<Vec<serde_json::Value>> {
+) -> delta_kernel::Result<Vec<serde_json::Value>> {
     let scan = snapshot.clone().scan_builder().build()?;
     let all_scan_metadata: Vec<_> = scan
         .scan_metadata(engine)?
@@ -2283,7 +2284,11 @@ pub fn remove_all_and_get_remove_actions(
         CommitResult::Committed(c) => c,
         _ => panic!("Transaction should be committed"),
     };
-    read_actions_from_commit(table_url, committed.commit_version(), "remove")
+    Ok(read_actions_from_commit(
+        table_url,
+        committed.commit_version(),
+        "remove",
+    )?)
 }
 
 /// Build a `serde_json::Value` mapping nested dot-paths to ids.
