@@ -286,7 +286,12 @@ impl LogReplayScanner {
             if has_protocol_update {
                 table_configuration
                     .ensure_operation_supported(Operation::Cdf)
-                    .map_err(|e| mode.protocol_support_error(e, commit_file.version))?;
+                    .map_err(|e| match e {
+                        crate::Error::Kernel(e) => {
+                            mode.protocol_support_error(e, commit_file.version).into()
+                        }
+                        other => other,
+                    })?;
             }
         }
         // We resolve the remove deletion vector map after visiting the entire commit.

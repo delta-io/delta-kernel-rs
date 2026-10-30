@@ -591,7 +591,7 @@ impl ScanBuilder {
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
     #[tracing::instrument(name = "scan_builder.build", skip_all, fields(enable_call_frame), err)]
-    pub fn build(self) -> KernelResult<Scan> {
+    pub fn build(self) -> crate::Result<Scan> {
         // Predicates may reference columns outside self.logical_read_schema, so resolve against the
         // full table schema
         let table_schema = self.snapshot.schema();
@@ -600,10 +600,10 @@ impl ScanBuilder {
         // counts downstream and panics in the arrow layer. Users must populate the
         // schema with ALTER TABLE ADD COLUMN before scanning.
         if table_schema.num_fields() == 0 {
-            return Err(KernelError::generic(
+            return Err(crate::Error::Kernel(KernelError::generic(
                 "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
                  to add at least one column before scanning",
-            ));
+            )));
         }
 
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)

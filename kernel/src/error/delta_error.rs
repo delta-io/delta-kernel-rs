@@ -50,7 +50,6 @@ impl DeltaError {
         )
     }
 
-
     /// Reports a declared partition `column` absent from the logical `schema`.
     pub(crate) fn partition_column_not_found(
         column: &str,

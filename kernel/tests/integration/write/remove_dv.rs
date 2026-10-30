@@ -144,9 +144,9 @@ async fn append_only_enforces_data_change_for_file_actions(
             } else {
                 vec![false; data.len()]
             };
-            FilteredEngineData::try_new(data, selection_vector)
+            Ok(FilteredEngineData::try_new(data, selection_vector)?)
         })
-        .collect::<KernelResult<Vec<_>>>()?;
+        .collect::<delta_kernel::Result<Vec<_>>>()?;
     let mut txn = begin_transaction_with(
         snapshot,
         engine.as_ref(),
@@ -230,14 +230,16 @@ async fn append_only_enforces_data_change_for_file_actions(
 fn selected_scan_file_batch(
     snapshot: Arc<Snapshot>,
     engine: &dyn Engine,
-) -> KernelResult<FilteredEngineData> {
+) -> delta_kernel::Result<FilteredEngineData> {
     for scan_files in get_scan_files(snapshot, engine)? {
         let data = scan_files.apply_selection_vector()?;
         if !data.is_empty() {
             return Ok(FilteredEngineData::with_all_rows_selected(data));
         }
     }
-    Err(KernelError::generic("expected at least one scan file"))
+    Err(delta_kernel::Error::Kernel(KernelError::generic(
+        "expected at least one scan file",
+    )))
 }
 
 #[rstest]

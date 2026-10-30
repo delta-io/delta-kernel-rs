@@ -39,7 +39,7 @@ fn test_cross_product_read_write(
     feature_set: FeatureSet,
     layout_config: (DataLayoutConfig, TableConfig),
     version_target: VersionTarget,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let (data_layout, table_config) = layout_config;
     let table = test_table(log_state.clone(), feature_set, data_layout, table_config);
     let engine: Arc<dyn Engine> =
@@ -94,7 +94,7 @@ fn write_and_assert_checksum(
     log_state: &LogState,
     version: u64,
     engine: &dyn Engine,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let expected_result = if log_state.crcs_at().contains(&version) {
         ChecksumWriteResult::AlreadyExists
     } else {

@@ -1118,7 +1118,7 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
     // The failure is the propagated ICT read error, not a laundered `ChecksumWriteUnsupported`.
     assert!(matches!(
         fresh.write_checksum(engine.as_ref()),
-        Err(e) if !matches!(e, delta_kernel::KernelError::ChecksumWriteUnsupported(_))
+        Err(e) if !matches!(e, delta_kernel::Error::Kernel(delta_kernel::KernelError::ChecksumWriteUnsupported(_)))
     ));
 
     Ok(())
@@ -1158,7 +1158,9 @@ async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupporte
     assert!(fresh.crc_at_version().is_none());
     assert!(matches!(
         fresh.write_checksum(engine.as_ref()),
-        Err(delta_kernel::KernelError::ChecksumWriteUnsupported(_))
+        Err(delta_kernel::Error::Kernel(
+            delta_kernel::KernelError::ChecksumWriteUnsupported(_)
+        ))
     ));
 
     Ok(())
@@ -2621,7 +2623,9 @@ async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate(
     assert_eq!(fresh.get_file_stats_if_present(), None);
     assert!(matches!(
         fresh.write_checksum(engine.as_ref()),
-        Err(delta_kernel::KernelError::ChecksumWriteUnsupported(_))
+        Err(delta_kernel::Error::Kernel(
+            delta_kernel::KernelError::ChecksumWriteUnsupported(_)
+        ))
     ));
 
     Ok(())

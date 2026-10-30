@@ -523,7 +523,7 @@ impl Snapshot {
         existing: &Arc<Snapshot>,
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
-    ) -> KernelResult<Arc<Snapshot>> {
+    ) -> crate::Result<Arc<Snapshot>> {
         let built_as_latest = existing.built_as_latest || built_as_latest;
         if existing.built_as_latest == built_as_latest
             && existing.skipped_new_checkpoints == skipped_new_checkpoints

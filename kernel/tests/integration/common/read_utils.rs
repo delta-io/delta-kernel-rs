@@ -15,7 +15,7 @@ pub fn read_row_tracking_scan(
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn Engine>,
     metadata_columns: impl IntoIterator<Item = MetadataColumnSpec>,
-) -> KernelResult<Vec<RecordBatch>> {
+) -> delta_kernel::Result<Vec<RecordBatch>> {
     let scan_schema = metadata_columns.into_iter().try_fold(
         snapshot.schema().as_ref().clone(),
         |schema, metadata_column| {
@@ -26,7 +26,7 @@ pub fn read_row_tracking_scan(
         .scan_builder()
         .with_schema(Arc::new(scan_schema))
         .build()?;
-    read_scan(&scan, engine)
+    Ok(read_scan(&scan, engine)?)
 }
 
 pub fn read_parquet_file(path: &std::path::Path) -> RecordBatch {

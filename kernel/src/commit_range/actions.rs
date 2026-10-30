@@ -204,10 +204,10 @@ impl CommitAction {
 
     /// Validate that the kernel can read this commit, given the prebuilt effective `table_config`
     /// (present iff both protocol and metadata are known at this commit).
-    fn protocol_validation(&self, table_config: &Option<TableConfiguration>) -> KernelResult<()> {
+    fn protocol_validation(&self, table_config: &Option<TableConfiguration>) -> crate::Result<()> {
         match (table_config, &self.protocol) {
             (Some(table_config), _) => table_config.ensure_operation_supported(Operation::Scan),
-            (None, Some(protocol)) => ensure_table_can_be_read(protocol),
+            (None, Some(protocol)) => Ok(ensure_table_can_be_read(protocol)?),
             (None, None) => Ok(()),
         }
     }

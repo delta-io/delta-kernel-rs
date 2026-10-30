@@ -689,7 +689,7 @@ fn declarative_json_only_disables_metadata_pruning(
             .with_partition_values(partitions.clone())
             .with_predicate(predicate)
             .build()?;
-        declarative_metadata(&scan, &engine)
+        Ok::<_, crate::Error>(declarative_metadata(&scan, &engine)?)
     };
     let baseline = metadata(StatsOptions::json_only(), None)?;
     assert_eq!(metadata_row_count(&baseline), 4);

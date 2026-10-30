@@ -176,7 +176,7 @@ pub unsafe extern "C" fn incremental_scan_builder_build(
 
 fn incremental_scan_builder_build_impl(
     builder: FfiIncrementalScanBuilder,
-) -> KernelResult<OptionalValue<Handle<SharedIncrementalScanStream>>> {
+) -> delta_kernel::Result<OptionalValue<Handle<SharedIncrementalScanStream>>> {
     let engine = builder.engine.engine();
     let maybe_stream = builder
         .target_snapshot

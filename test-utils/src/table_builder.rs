@@ -1428,7 +1428,7 @@ impl TestTableBuilder {
 /// Write a CRC file via kernel's checksum writer. Builder invariant: the snapshot
 /// comes from a post-commit handoff on a fresh in-memory table, so the CRC for
 /// that version cannot already exist on disk.
-fn write_crc(snapshot: &Arc<Snapshot>, engine: &dyn Engine) -> KernelResult<()> {
+fn write_crc(snapshot: &Arc<Snapshot>, engine: &dyn Engine) -> delta_kernel::Result<()> {
     let (result, _) = snapshot.write_checksum(engine)?;
     assert_eq!(
         result,

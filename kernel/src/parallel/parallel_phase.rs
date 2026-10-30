@@ -384,7 +384,7 @@ mod tests {
         engine: &dyn crate::Engine,
         snapshot: &SnapshotRef,
         predicate: Option<PredicateRef>,
-    ) -> KernelResult<Vec<String>> {
+    ) -> crate::Result<Vec<String>> {
         let scan = snapshot
             .clone()
             .scan_builder()

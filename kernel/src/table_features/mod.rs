@@ -282,7 +282,7 @@ pub(crate) enum FeatureRequirement {
     /// Feature must NOT be enabled (may be supported but property must not activate it)
     NotEnabled(TableFeature),
     /// Custom validation logic run against the protocol and table properties.
-    Custom(fn(&Protocol, &TableProperties) -> KernelResult<()>),
+    Custom(fn(&Protocol, &TableProperties) -> crate::Result<()>),
 }
 
 /// Minimum protocol versions for legacy (pre-feature-list) inference.
@@ -712,7 +712,10 @@ static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
         FeatureRequirement::Custom(|_protocol, properties| {
-            if let Some(mode) = properties.column_mapping_mode.filter(|mode| *mode != ColumnMappingMode::Id) {
+            if let Some(mode) = properties
+                .column_mapping_mode
+                .filter(|mode| *mode != ColumnMappingMode::Id)
+            {
                 let mode = match mode {
                     ColumnMappingMode::None => "none",
                     ColumnMappingMode::Name => "name",
@@ -721,15 +724,17 @@ static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
                 return Err(crate::DeltaError::adaptive_metadata_mapping_mode(
                     mode,
                     KernelError::invalid_protocol(
-                        "Feature 'adaptiveMetadata-preview' requires column mapping in 'id' mode"
+                        "Feature 'adaptiveMetadata-preview' requires column mapping in 'id' mode",
                     ),
-                ).into());
+                )
+                .into());
             }
             require!(
                 properties.column_mapping_mode == Some(ColumnMappingMode::Id),
                 KernelError::invalid_protocol(
                     "Feature 'adaptiveMetadata-preview' requires column mapping in 'id' mode"
                 )
+                .into()
             );
             Ok(())
         }),

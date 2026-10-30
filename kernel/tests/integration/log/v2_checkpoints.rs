@@ -33,7 +33,7 @@ use crate::common::write_utils::{
     simple_id_batch,
 };
 
-fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> KernelResult<Vec<RecordBatch>> {
+fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> delta_kernel::Result<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
     let test_path = test_dir.path().join(test_name.as_ref());
 
@@ -50,7 +50,7 @@ fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> KernelResult<Vec<Reco
 fn test_v2_checkpoint_with_table(
     table_name: &str,
     mut expected_table: Vec<String>,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let batches = read_v2_checkpoint_table(table_name)?;
 
     sort_lines!(expected_table);
@@ -192,7 +192,7 @@ fn get_without_sidecars_table() -> Vec<String> {
 /// - `last checkpoint contains correct schema for v1/v2 Checkpoints` ->
 ///   `v2_checkpoints_parquet_with_last_checkpoint`
 #[test]
-fn v2_checkpoints_json_with_sidecars() -> KernelResult<()> {
+fn v2_checkpoints_json_with_sidecars() -> delta_kernel::Result<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-json-with-sidecars",
         generate_sidecar_expected_data(),
@@ -200,7 +200,7 @@ fn v2_checkpoints_json_with_sidecars() -> KernelResult<()> {
 }
 
 #[test]
-fn v2_checkpoints_parquet_with_sidecars() -> KernelResult<()> {
+fn v2_checkpoints_parquet_with_sidecars() -> delta_kernel::Result<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-parquet-with-sidecars",
         generate_sidecar_expected_data(),
@@ -208,7 +208,7 @@ fn v2_checkpoints_parquet_with_sidecars() -> KernelResult<()> {
 }
 
 #[test]
-fn v2_checkpoints_json_without_sidecars() -> KernelResult<()> {
+fn v2_checkpoints_json_without_sidecars() -> delta_kernel::Result<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-json-without-sidecars",
         get_without_sidecars_table(),
@@ -216,7 +216,7 @@ fn v2_checkpoints_json_without_sidecars() -> KernelResult<()> {
 }
 
 #[test]
-fn v2_checkpoints_parquet_without_sidecars() -> KernelResult<()> {
+fn v2_checkpoints_parquet_without_sidecars() -> delta_kernel::Result<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-parquet-without-sidecars",
         get_without_sidecars_table(),
@@ -224,12 +224,12 @@ fn v2_checkpoints_parquet_without_sidecars() -> KernelResult<()> {
 }
 
 #[test]
-fn v2_classic_checkpoint_json() -> KernelResult<()> {
+fn v2_classic_checkpoint_json() -> delta_kernel::Result<()> {
     test_v2_checkpoint_with_table("v2-classic-checkpoint-json", get_classic_checkpoint_table())
 }
 
 #[test]
-fn v2_classic_checkpoint_parquet() -> KernelResult<()> {
+fn v2_classic_checkpoint_parquet() -> delta_kernel::Result<()> {
     test_v2_checkpoint_with_table(
         "v2-classic-checkpoint-parquet",
         get_classic_checkpoint_table(),
@@ -237,7 +237,7 @@ fn v2_classic_checkpoint_parquet() -> KernelResult<()> {
 }
 
 #[test]
-fn v2_checkpoints_json_with_last_checkpoint() -> KernelResult<()> {
+fn v2_checkpoints_json_with_last_checkpoint() -> delta_kernel::Result<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-json-with-last-checkpoint",
         get_simple_id_table(),
@@ -245,7 +245,7 @@ fn v2_checkpoints_json_with_last_checkpoint() -> KernelResult<()> {
 }
 
 #[test]
-fn v2_checkpoints_parquet_with_last_checkpoint() -> KernelResult<()> {
+fn v2_checkpoints_parquet_with_last_checkpoint() -> delta_kernel::Result<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-parquet-with-last-checkpoint",
         get_simple_id_table(),
