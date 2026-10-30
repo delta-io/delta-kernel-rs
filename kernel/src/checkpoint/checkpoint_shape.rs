@@ -321,7 +321,10 @@ mod tests {
     };
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
-    use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
+    use crate::last_checkpoint_hint::{
+        HintAction, LastCheckpointHint, LastCheckpointV2,
+        LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD,
+    };
     use crate::log_segment_files::LogSegmentFiles;
     use crate::plans::ir::nodes::Operator;
     use crate::plans::{IoOperation, PlanResult};
@@ -696,11 +699,22 @@ mod tests {
         );
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum ManifestMetadataSource {
+        Actions,
+        Independent,
+        Trimmed,
+    }
+
     /// Builds a segment whose applicable hint lists one sidecar and carries a `checkpointMetadata`
     /// action with a synthetic `sidecarFileSchema` tag, exercising the footer-read short-circuit.
     /// When `compatible`, the tagged schema's `add.stats_parsed` matches [`probe_stats_schema`];
     /// otherwise `add` has no `stats_parsed` field at all, so the compatibility check fails.
-    fn segment_with_manifest_hint(extension: &str, compatible: bool, source: &str) -> LogSegment {
+    fn segment_with_manifest_hint(
+        extension: &str,
+        compatible: bool,
+        source: ManifestMetadataSource,
+    ) -> LogSegment {
         let columns = || schema! { nullable "id": LONG, nullable "value": STRING };
         let stats_parsed = schema! {
             nullable NUM_RECORDS: LONG,
@@ -729,13 +743,13 @@ mod tests {
             version: 1,
             tags: Some(tags),
         };
-        let independent = !matches!(source, "actions" | "trimmed");
+        let independent = matches!(source, ManifestMetadataSource::Independent);
         let actions = (!independent).then(|| {
             let mut actions = vec![HintAction::CheckpointMetadata(metadata.clone())];
-            if source == "trimmed" {
+            if matches!(source, ManifestMetadataSource::Trimmed) {
                 actions.extend(vec![
                     HintAction::Protocol(crate::actions::Protocol::default());
-                    30
+                    LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD
                 ]);
             }
             actions
@@ -790,7 +804,12 @@ mod tests {
         #[case] extension: &str,
         #[case] compatible: bool,
         #[case] expect_parsed: bool,
-        #[values("actions", "independent", "trimmed")] source: &str,
+        #[values(
+            ManifestMetadataSource::Actions,
+            ManifestMetadataSource::Independent,
+            ManifestMetadataSource::Trimmed
+        )]
+        source: ManifestMetadataSource,
     ) {
         let segment = segment_with_manifest_hint(extension, compatible, source);
         let root = &segment.listed.checkpoint_parts[0].location;
@@ -825,9 +844,62 @@ mod tests {
     }
 
     #[rstest]
-    fn unusable_independent_checkpoint_metadata_reads_footer(
-        #[values("malformed", "mismatched")] source: &str,
+    #[case::no_tags(None, 1)]
+    #[case::missing_schema_tag(Some(std::collections::HashMap::new()), 1)]
+    #[case::malformed_schema(Some(std::collections::HashMap::from([
+        (SIDECAR_FILE_SCHEMA_TAG.to_string(), "invalid schema".to_string()),
+    ])), 1)]
+    #[case::mismatched_version(None, 2)]
+    fn unusable_independent_metadata_falls_back_to_action_schema(
+        #[case] tags: Option<std::collections::HashMap<String, String>>,
+        #[case] version: i64,
     ) {
+        let mut segment =
+            segment_with_manifest_hint("parquet", true, ManifestMetadataSource::Actions);
+        let expected = segment.checkpoint_hint_sidecar_file_schema().unwrap();
+        let v2 = segment
+            .last_checkpoint_metadata
+            .as_mut()
+            .unwrap()
+            .v2_checkpoint
+            .as_mut()
+            .unwrap();
+        v2.checkpoint_metadata = Some(CheckpointMetadata::new(version, tags));
+        assert_eq!(
+            segment.checkpoint_hint_sidecar_file_schema(),
+            Some(expected)
+        );
+        let exec = CountingExecutor::new();
+        let root = &segment.listed.checkpoint_parts[0].location;
+        CheckpointShape::from_v2_checkpoint_hint(&exec, &segment, root, FileType::Parquet, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exec.footer_reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn mismatched_action_metadata_does_not_supply_sidecar_schema() {
+        let mut segment =
+            segment_with_manifest_hint("parquet", true, ManifestMetadataSource::Actions);
+        let v2 = segment
+            .last_checkpoint_metadata
+            .as_mut()
+            .unwrap()
+            .v2_checkpoint
+            .as_mut()
+            .unwrap();
+        let actions = v2.non_file_actions.as_mut().unwrap();
+        let HintAction::CheckpointMetadata(metadata) = &mut actions[0] else {
+            panic!("expected checkpoint metadata");
+        };
+        metadata.version += 1;
+        assert!(segment.checkpoint_hint_sidecar_file_schema().is_none());
+    }
+
+    #[rstest]
+    #[case::malformed(false)]
+    #[case::mismatched(true)]
+    fn unusable_independent_checkpoint_metadata_reads_footer(#[case] mismatched: bool) {
         let (_engine, snapshot, _tempdir) =
             load_test_table("v2-parquet-sidecars-struct-stats-only").unwrap();
         let mut segment = snapshot.log_segment().clone();
@@ -848,7 +920,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        if source == "malformed" {
+        if !mismatched {
             metadata.tags.as_mut().unwrap().insert(
                 SIDECAR_FILE_SCHEMA_TAG.to_string(),
                 "invalid schema".to_string(),
@@ -885,7 +957,7 @@ mod tests {
                 .unwrap();
             actions.extend(vec![
                 HintAction::Protocol(crate::actions::Protocol::default());
-                31
+                LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD + 1
             ]);
             *hint = LastCheckpointHint::from_parts(
                 hint.version,

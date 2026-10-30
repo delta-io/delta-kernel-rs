@@ -478,30 +478,31 @@ impl LogSegment {
     /// The sidecar files' schema from the applicable `_last_checkpoint` hint's
     /// `checkpointMetadata.tags["sidecarFileSchema"]`.
     ///
-    /// `None` when the hint is absent/mismatched, carried no `checkpointMetadata`
-    /// either independently or in `nonFileActions`, lacked the tag, or the value failed to parse.
+    /// Prefer independently retained metadata, then search `nonFileActions`. Both sources must
+    /// match the checkpoint version. Missing or malformed schema tags are skipped so a later
+    /// candidate can supply the schema. Return `None` when no candidate has a usable schema.
     #[allow(unused)] // consumed by the scan-shape checkpoint classifier
     pub(crate) fn checkpoint_hint_sidecar_file_schema(&self) -> Option<StructType> {
         let hint = self.checkpoint_hint()?;
         let v2 = hint.v2_checkpoint.as_ref()?;
-        let metadata = v2
-            .checkpoint_metadata
-            .as_ref()
-            .filter(|metadata| u64::try_from(metadata.version()).ok() == Some(hint.version))
-            .or_else(|| {
+        v2.checkpoint_metadata
+            .iter()
+            .chain(
                 v2.non_file_actions
-                    .as_ref()?
                     .iter()
-                    .find_map(|action| match action {
+                    .flatten()
+                    .filter_map(|action| match action {
                         HintAction::CheckpointMetadata(metadata) => Some(metadata),
                         _ => None,
-                    })
-            })?;
-        let tags = metadata.tags.as_ref()?;
-        let raw = tags.get(SIDECAR_FILE_SCHEMA_TAG)?;
-        serde_json::from_str::<StructType>(raw)
-            .inspect_err(|e| warn!("Unparseable sidecarFileSchema tag, ignoring: {e}"))
-            .ok()
+                    }),
+            )
+            .filter(|metadata| u64::try_from(metadata.version()).ok() == Some(hint.version))
+            .filter_map(|metadata| metadata.tags.as_ref()?.get(SIDECAR_FILE_SCHEMA_TAG))
+            .find_map(|raw| {
+                serde_json::from_str::<StructType>(raw)
+                    .inspect_err(|e| warn!("Unparseable sidecarFileSchema tag, ignoring: {e}"))
+                    .ok()
+            })
     }
 
     /// Succinct summary string for logging purposes.

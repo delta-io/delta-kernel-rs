@@ -28,7 +28,7 @@ const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 /// drop the whole field by count when it exceeds the cap:
 /// <https://github.com/delta-io/delta/blob/83002ef0bfdae90914edbcb0cae23dae5a9b9af5/spark/src/main/scala/org/apache/spark/sql/delta/sources/DeltaSQLConf.scala#L1431-L1461>
 const LAST_CHECKPOINT_SIDECARS_THRESHOLD: usize = 30;
-const LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD: usize = 30;
+pub(crate) const LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD: usize = 30;
 
 // Note: Schema can not be derived because the checkpoint schema is only known at runtime.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -192,7 +192,8 @@ pub(crate) struct LastCheckpointV2 {
 
     /// The checkpoint's non-file actions (see [`HintAction`]), letting a reader obtain them
     /// without reading the checkpoint file. Dropped to `None` by
-    /// [`LastCheckpointHint::drop_oversized_fields`] when the count exceeds the threshold.
+    /// [`LastCheckpointHint::drop_oversized_fields`] when the count exceeds the threshold, after
+    /// retaining any checkpoint metadata independently.
     pub(crate) non_file_actions: Option<Vec<HintAction>>,
 
     /// Checkpoint metadata retained independently of the optional non-file action collection.
@@ -398,7 +399,9 @@ impl LastCheckpointHint {
     }
 
     /// Drops `sidecarFiles` / `nonFileActions` over the threshold. Drops the whole field, never
-    /// truncates. Absent means info missing, so this only loses an optimization.
+    /// truncates. Preserve checkpoint metadata independently before dropping non-file actions,
+    /// without overwriting metadata already retained. Absent means info missing, so dropping a
+    /// collection only loses an optimization.
     fn drop_oversized_fields(mut self) -> Self {
         if let Some(v2) = &mut self.v2_checkpoint {
             let version = self.version;
@@ -1203,8 +1206,11 @@ mod tests {
     }
 
     #[rstest]
-    #[case::at_threshold(30, Some(30))]
-    #[case::above_threshold(31, None)]
+    #[case::at_threshold(
+        LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD,
+        Some(LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD)
+    )]
+    #[case::above_threshold(LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD + 1, None)]
     fn reconstructed_hint_bounds_embedded_fields(
         #[case] count: usize,
         #[case] expected_count: Option<usize>,
@@ -1249,6 +1255,40 @@ mod tests {
         );
         assert_eq!(v2.sidecar_files.as_ref().map(Vec::len), expected_count);
         assert_eq!(v2.non_file_actions.as_ref().map(Vec::len), expected_count);
+    }
+
+    #[rstest]
+    fn trimming_preserves_existing_independent_checkpoint_metadata(
+        #[values(false, true)] has_embedded_metadata: bool,
+    ) {
+        let retained = CheckpointMetadata::new(
+            1,
+            Some(HashMap::from([(
+                "retained".to_string(),
+                "value".to_string(),
+            )])),
+        );
+        let mut actions = vec![
+            HintAction::Protocol(Protocol::new_unchecked(1, 2, None, None));
+            LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD + 1
+        ];
+        if has_embedded_metadata {
+            actions[0] = HintAction::CheckpointMetadata(CheckpointMetadata::new(1, None));
+        }
+        let hint = LastCheckpointHint {
+            version: 1,
+            v2_checkpoint: Some(LastCheckpointV2 {
+                path: "checkpoint.parquet".to_string(),
+                non_file_actions: Some(actions),
+                checkpoint_metadata: Some(retained.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .drop_oversized_fields();
+        let v2 = hint.v2_checkpoint.unwrap();
+        assert!(v2.non_file_actions.is_none());
+        assert_eq!(v2.checkpoint_metadata, Some(retained));
     }
 
     #[test]
