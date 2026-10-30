@@ -5,10 +5,12 @@ use std::sync::Arc;
 
 use rstest::rstest;
 use test_utils::{add_commit, assert_result_error_with_message, delta_path_for_version};
+use url::Url;
 
 use super::tests::add_checkpoint_to_store;
 use super::LogSegment;
-use crate::actions::LastManifestCommit;
+use crate::actions::{CheckpointAction, CommitInfo, ContentRoot, LastManifestCommit, Protocol};
+use crate::arrow::array::StringArray;
 use crate::committer::FileSystemCommitter;
 use crate::crc::{Crc, FileStats, FileStatsState};
 use crate::engine::sync::SyncEngine;
@@ -19,6 +21,7 @@ use crate::object_store::ObjectStoreExt as _;
 use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
+use crate::unit_test_utils::adaptive_metadata_fixtures::last_manifest_commit_info;
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, parse_json_batch, test_schema_flat_with_column_mapping,
 };
@@ -30,17 +33,32 @@ fn one_column_schema() -> SchemaRef {
         .unwrap()
 }
 
-// Builds a commit line with a `checkpoint` action that carries protocol and metadata at
-// `version`. The commit has no top-level protocol/metaData, so P&M comes only from that action.
+// Builds a manifest commit at `version`: a `commitInfo.lastManifestCommit` pointing at itself and a
+// `checkpoint` action carrying protocol and metadata at `version`. The commit has no top-level
+// protocol/metaData, so P&M comes only from that action.
 fn checkpoint_commit(version: i64, extra_features: &[TableFeature], schema: SchemaRef) -> String {
+    format!(
+        "{}\n{}",
+        commit_info(Some((version, version))),
+        checkpoint_action(version, extra_features, schema)
+    )
+}
+
+// Builds a `checkpoint` action line carrying protocol and metadata at `version`, with no
+// `lastManifestCommit` pointer.
+fn checkpoint_action(version: i64, extra_features: &[TableFeature], schema: SchemaRef) -> String {
     let config = adaptive_metadata_table_configuration(schema, extra_features);
-    serde_json::json!({ "checkpoint": [
-        { "checkpointMetadata": { "version": version } },
-        { "contentRoot": { "path": "metadata/root.parquet", "sizeInBytes": 1, "version": version } },
-        { "protocol": config.protocol() },
-        { "metaData": config.metadata() },
-    ] })
-    .to_string()
+    let checkpoint = CheckpointAction {
+        version,
+        content_root: ContentRoot::new("metadata/root.parquet".to_string(), 1, version),
+        protocol: config.protocol().clone(),
+        metadata: config.metadata().clone(),
+        transactions: vec![],
+        domain_metadata: vec![],
+        txn_sidecars: vec![],
+        domain_metadata_sidecars: vec![],
+    };
+    serde_json::json!({ "checkpoint": checkpoint }).to_string()
 }
 
 // Builds a top-level `metaData` commit line with the given schema (no protocol).
@@ -60,24 +78,66 @@ fn standalone_pm_commit(schema: SchemaRef) -> String {
     )
 }
 
-// Builds a `commitInfo` line with an In-Commit Timestamp and, when given, a `lastManifestCommit`
-// `(version, contentRootVersion)`, as an AMT writer records on every commit.
-fn commit_info_line(pointer: Option<(i64, i64)>) -> String {
-    let mut commit_info = serde_json::json!({ "timestamp": 1, "inCommitTimestamp": 1 });
-    if let Some((version, content_root_version)) = pointer {
-        commit_info["lastManifestCommit"] =
-            serde_json::json!({ "version": version, "contentRootVersion": content_root_version });
-    }
-    serde_json::json!({ "commitInfo": commit_info }).to_string()
+// Builds a top-level `protocol` commit line with the given reader/writer versions (no features).
+fn protocol_commit(min_reader_version: i32, min_writer_version: i32) -> String {
+    let protocol = Protocol::try_new_legacy(min_reader_version, min_writer_version).unwrap();
+    serde_json::json!({ "protocol": protocol }).to_string()
 }
 
-// Builds a top-level `protocol` commit line with the given reader/writer versions (no features).
-fn protocol_commit(min_reader_version: i64, min_writer_version: i64) -> String {
-    serde_json::json!({ "protocol": {
-        "minReaderVersion": min_reader_version,
-        "minWriterVersion": min_writer_version,
-    } })
+// Prepends to `commit` a `commitInfo` carrying `last_manifest_commit` forward, as a writer does on
+// every commit after a manifest commit.
+fn carrying_pointer(last_manifest_commit: (i64, i64), commit: String) -> String {
+    format!("{}\n{commit}", commit_info(Some(last_manifest_commit)))
+}
+
+// Builds a `commitInfo` line, carrying `lastManifestCommit` when given.
+fn commit_info(last_manifest_commit: Option<(i64, i64)>) -> String {
+    match last_manifest_commit {
+        Some((version, content_root_version)) => {
+            last_manifest_commit_info(version, content_root_version)
+        }
+        None => serde_json::json!({ "commitInfo": CommitInfo {
+            operation: Some("WRITE".to_string()),
+            in_commit_timestamp: Some(1),
+            ..Default::default()
+        } }),
+    }
     .to_string()
+}
+
+// Commits a root manifest commit at v0 (pointing at itself) followed by `later_commits`, and
+// returns the store and table root.
+async fn manifest_commit_table(later_commits: &[String]) -> (Arc<InMemory>, url::Url) {
+    let manifest_commit = checkpoint_commit(0, &[], one_column_schema());
+    let commits: Vec<String> = std::iter::once(manifest_commit)
+        .chain(later_commits.iter().cloned())
+        .collect();
+    commit_table(&commits).await
+}
+
+// Commits `commits` as versions 0, 1, ... of an in-memory table, and returns the store and table
+// root.
+async fn commit_table(commits: &[String]) -> (Arc<InMemory>, url::Url) {
+    let store = Arc::new(InMemory::new());
+    let table_root = url::Url::parse("memory:///").unwrap();
+    for (version, commit) in commits.iter().enumerate() {
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            version as u64,
+            commit.clone(),
+        )
+        .await
+        .unwrap();
+    }
+    (store, table_root)
+}
+
+// Lists the log segment for the latest version of the table at `table_root`.
+fn latest_log_segment(table_root: &Url, engine: &impl Engine) -> LogSegment {
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let storage = engine.storage_handler();
+    LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap()
 }
 
 // Removes SyncEngine's plan executor so replay uses the non-plan path even when
@@ -99,16 +159,7 @@ async fn test_load_resolves_pm_from_manifest_commit_checkpoint_action() {
 // A single commit whose only P&M is a checkpoint action. The build succeeds only if P&M came from
 // that action, and the `id` column confirms it used the embedded metaData.
 async fn check_manifest_commit_checkpoint<E: Engine>(make_engine: impl FnOnce(Arc<InMemory>) -> E) {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
-    add_commit(
-        table_root.as_str(),
-        store.as_ref(),
-        0,
-        checkpoint_commit(0, &[], one_column_schema()),
-    )
-    .await
-    .unwrap();
+    let (store, table_root) = manifest_commit_table(&[]).await;
 
     let engine = make_engine(store);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
@@ -137,7 +188,7 @@ async fn check_manifest_commit_checkpoint<E: Engine>(make_engine: impl FnOnce(Ar
 // A newer top-level metaData beats the older checkpoint action's metaData.
 #[case::newer_metadata_beats_older_checkpoint(
     checkpoint_commit(0, &[], one_column_schema()),
-    metadata_commit(test_schema_flat_with_column_mapping()),
+    carrying_pointer((0, 0), metadata_commit(test_schema_flat_with_column_mapping())),
     2,
     3
 )]
@@ -194,14 +245,7 @@ async fn build_and_check_pm<E: Engine>(
     expected_reader_features: usize,
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
 ) {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
-    add_commit(table_root.as_str(), store.as_ref(), 0, v0.to_string())
-        .await
-        .unwrap();
-    add_commit(table_root.as_str(), store.as_ref(), 1, v1.to_string())
-        .await
-        .unwrap();
+    let (store, table_root) = commit_table(&[v0.to_string(), v1.to_string()]).await;
 
     let engine = make_engine(store);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
@@ -235,32 +279,15 @@ async fn test_lagging_checkpoint_ranks_by_checkpoint_version() {
 async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
 ) {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
-    add_commit(
-        table_root.as_str(),
-        store.as_ref(),
-        0,
-        checkpoint_commit(0, &[], one_column_schema()),
-    )
-    .await
-    .unwrap();
-    add_commit(
-        table_root.as_str(),
-        store.as_ref(),
-        1,
-        metadata_commit(test_schema_flat_with_column_mapping()),
-    )
-    .await
-    .unwrap();
-    add_commit(
-        table_root.as_str(),
-        store.as_ref(),
-        2,
-        checkpoint_commit(0, &[], one_column_schema()),
-    )
-    .await
-    .unwrap();
+    let (store, table_root) = manifest_commit_table(&[
+        carrying_pointer(
+            (0, 0),
+            metadata_commit(test_schema_flat_with_column_mapping()),
+        ),
+        // A manifest commit at v2 whose checkpoint action lags at v0.
+        carrying_pointer((2, 0), checkpoint_action(0, &[], one_column_schema())),
+    ])
+    .await;
 
     let engine = make_engine(store);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
@@ -271,71 +298,40 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
     assert_eq!(schema.num_fields(), 2);
 }
 
-// A fresh (no-CRC) load runs a full replay that captures the checkpoint action onto the snapshot:
-// `Snapshot::latest_checkpoint_action` returns `Some` with the action's version when a commit
-// carries one, and `None` when P&M come from standalone actions (a replay miss leaves the action
-// uncaptured, so the accessor follows the commit's `lastManifestCommit`, which records none).
-#[rstest]
-#[case::commit_carries_checkpoint_action(checkpoint_commit(0, &[], one_column_schema()), Some(0))]
-#[case::standalone_pm_has_no_checkpoint_action(
-    format!("{}\n{}", commit_info_line(None), standalone_pm_commit(one_column_schema())),
-    None
-)]
+// A fresh (no-CRC) load runs a full replay that captures the checkpoint action onto the snapshot.
+// The commit is deleted before `Snapshot::latest_checkpoint_action` runs, so following the
+// commit's `lastManifestCommit` would fail and only the captured action can answer.
 #[tokio::test]
-async fn replay_captures_latest_checkpoint_action(
-    #[case] commit: String,
-    #[case] expected_version: Option<i64>,
-) {
-    assert_latest_checkpoint_action(&commit, expected_version, non_plan_engine).await;
+async fn replay_captures_latest_checkpoint_action() {
+    assert_replay_captures_checkpoint_action(non_plan_engine).await;
     #[cfg(feature = "declarative-plans")]
-    assert_latest_checkpoint_action(&commit, expected_version, |store| {
-        SyncEngine::new_with_store(store)
-    })
-    .await;
+    assert_replay_captures_checkpoint_action(|store| SyncEngine::new_with_store(store)).await;
 }
 
-async fn assert_latest_checkpoint_action<E: Engine>(
-    commit: &str,
-    expected_version: Option<i64>,
+async fn assert_replay_captures_checkpoint_action<E: Engine>(
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
 ) {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
-    add_commit(table_root.as_str(), store.as_ref(), 0, commit.to_string())
+    let (store, table_root) = commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
+
+    let engine = make_engine(store.clone());
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    store
+        .delete(&delta_path_for_version(0, "json"))
         .await
         .unwrap();
 
-    let engine = make_engine(store);
-    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
-
     let action = snapshot.latest_checkpoint_action(&engine).unwrap();
-    assert_eq!(action.map(|action| action.version), expected_version);
+    assert_eq!(action.map(|action| action.version), Some(0));
 }
 
 // A snapshot built without P&M replay (`Snapshot::new`) captures no checkpoint action, so
 // `latest_checkpoint_action` follows the commit's `lastManifestCommit` to it.
 #[tokio::test]
 async fn latest_checkpoint_action_without_replay_follows_commit_info_pointer() {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
-    add_commit(
-        table_root.as_str(),
-        store.as_ref(),
-        0,
-        format!(
-            "{}\n{}",
-            commit_info_line(Some((0, 0))),
-            checkpoint_commit(0, &[], one_column_schema())
-        ),
-    )
-    .await
-    .unwrap();
+    let (store, table_root) = commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
 
     let engine = non_plan_engine(store);
-    let storage = engine.storage_handler();
-    let log_root = table_root.join("_delta_log/").unwrap();
-    let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
+    let log_segment = latest_log_segment(&table_root, &engine);
     let table_configuration = adaptive_metadata_table_configuration(one_column_schema(), &[]);
     let snapshot = Snapshot::new(log_segment, table_configuration).unwrap();
 
@@ -362,7 +358,7 @@ async fn latest_checkpoint_action_without_replay_follows_commit_info_pointer() {
 #[case::checkpoint_action_in_non_first_batch(
     vec![
         checkpoint_commit(0, &[], one_column_schema()),
-        metadata_commit(test_schema_flat_with_column_mapping()),
+        carrying_pointer((0, 0), metadata_commit(test_schema_flat_with_column_mapping())),
     ],
     Some(0)
 )]
@@ -388,32 +384,26 @@ async fn assert_replay_resolution<E: Engine>(
     expected_version: Option<i64>,
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
 ) {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
-    for (version, commit) in commits.iter().enumerate() {
-        add_commit(
-            table_root.as_str(),
-            store.as_ref(),
-            version as u64,
-            commit.clone(),
-        )
+    let version = replay_checkpoint_action(commits, make_engine)
         .await
-        .unwrap();
-    }
-
-    let engine = make_engine(store);
-    let storage = engine.storage_handler();
-    let log_root = table_root.join("_delta_log/").unwrap();
-    let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
-
-    let resolution = log_segment
-        .read_protocol_metadata_opt(&engine, None)
-        .unwrap();
-    let version = resolution
-        .captured_checkpoint_action
         .map(|action| action.version);
     assert_eq!(version, expected_version);
+}
+
+// Writes `commits` as versions 0.. and replays P&M at the latest version.
+async fn replay_checkpoint_action<E: Engine>(
+    commits: &[String],
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) -> Option<Arc<CheckpointAction>> {
+    let (store, table_root) = commit_table(commits).await;
+
+    let engine = make_engine(store);
+    let log_segment = latest_log_segment(&table_root, &engine);
+
+    log_segment
+        .read_protocol_metadata_opt(&engine, None)
+        .unwrap()
+        .captured_checkpoint_action
 }
 
 // An incremental update resolves the latest checkpoint action for the updated snapshot: a new
@@ -423,7 +413,7 @@ async fn assert_replay_resolution<E: Engine>(
 #[rstest]
 #[case::new_commit_carries_a_newer_action(checkpoint_commit(1, &[], one_column_schema()), 1)]
 #[case::new_commit_carries_no_action(
-    format!("{}\n{}", commit_info_line(Some((0, 0))), metadata_commit(one_column_schema())),
+    format!("{}\n{}", commit_info(Some((0, 0))), metadata_commit(one_column_schema())),
     0
 )]
 #[tokio::test]
@@ -431,16 +421,7 @@ async fn incremental_update_resolves_latest_checkpoint_action(
     #[case] new_commit: String,
     #[case] expected_version: i64,
 ) {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
-    add_commit(
-        table_root.as_str(),
-        store.as_ref(),
-        0,
-        checkpoint_commit(0, &[], one_column_schema()),
-    )
-    .await
-    .unwrap();
+    let (store, table_root) = manifest_commit_table(&[]).await;
 
     let engine = non_plan_engine(store.clone());
     let base = Snapshot::builder_for(table_root.clone())
@@ -473,6 +454,7 @@ async fn incremental_update_resolves_latest_checkpoint_action(
 // only the commit it points at, failing when that commit does not carry the expected action. Each
 // case has checkpoint commits at v0 and v2, the given v1, and a CRC at v2 holding the pointer. A
 // scan would find v2's action first, so any other expected version proves the pointer was followed.
+// A pointer naming v1 deliberately disagrees with v2's own action for that reason.
 #[rstest]
 #[case::pointer_names_latest_manifest_commit(
     checkpoint_commit(1, &[], one_column_schema()),
@@ -487,7 +469,7 @@ async fn incremental_update_resolves_latest_checkpoint_action(
     Ok(1)
 )]
 #[case::pointer_names_commit_checkpointing_older_version(
-    checkpoint_commit(0, &[], one_column_schema()),
+    carrying_pointer((1, 0), checkpoint_action(0, &[], one_column_schema())),
     1,
     0,
     Ok(0)
@@ -499,7 +481,7 @@ async fn incremental_update_resolves_latest_checkpoint_action(
     Err("that commit carries no checkpoint action")
 )]
 #[case::manifest_commit_with_other_content_root_version_fails(
-    checkpoint_commit(0, &[], one_column_schema()),
+    carrying_pointer((1, 0), checkpoint_action(0, &[], one_column_schema())),
     1,
     1,
     Err("that commit's checkpoint action has content root version 0")
@@ -511,18 +493,12 @@ async fn latest_checkpoint_action_reads_commit_named_by_crc_pointer(
     #[case] pointer_content_root_version: i64,
     #[case] expected: Result<i64, &str>,
 ) {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
     let commits = [
         checkpoint_commit(0, &[], one_column_schema()),
         v1,
         checkpoint_commit(2, &[], one_column_schema()),
     ];
-    for (version, commit) in commits.into_iter().enumerate() {
-        add_commit(table_root.as_str(), store.as_ref(), version as u64, commit)
-            .await
-            .unwrap();
-    }
+    let (store, table_root) = commit_table(&commits).await;
     let pointer = LastManifestCommit::new(pointer_version, pointer_content_root_version).unwrap();
     put_crc_with_pointer(&store, 2, pointer).await;
 
@@ -541,24 +517,8 @@ async fn latest_checkpoint_action_reads_commit_named_by_crc_pointer(
 // action. Such a log needs a classic checkpoint, which adaptiveMetadata forbids.
 #[tokio::test]
 async fn latest_checkpoint_action_fails_without_commit_or_crc_at_checkpoint_version() {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
-    let commit = format!(
-        "{}\n{}",
-        commit_info_line(Some((0, 0))),
-        checkpoint_commit(0, &[], one_column_schema())
-    );
-    add_commit(table_root.as_str(), store.as_ref(), 0, commit)
-        .await
-        .unwrap();
-    let pm = standalone_pm_commit(one_column_schema());
-    add_checkpoint_to_store(
-        &store,
-        parse_json_batch(pm.lines().collect::<Vec<_>>().into()),
-        "00000000000000000001.checkpoint.parquet",
-    )
-    .await
-    .unwrap();
+    let (store, table_root) = commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
+    put_pm_checkpoint(&store, 1).await;
 
     let engine = non_plan_engine(store);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
@@ -583,30 +543,16 @@ async fn latest_checkpoint_action_follows_commit_info_pointer(
     #[case] pointer: Option<(i64, i64)>,
     #[case] expected_version: Option<i64>,
 ) {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
     let commits = [
+        checkpoint_commit(0, &[], one_column_schema()),
+        checkpoint_commit(1, &[], one_column_schema()),
         format!(
             "{}\n{}",
-            commit_info_line(Some((0, 0))),
-            checkpoint_commit(0, &[], one_column_schema())
-        ),
-        format!(
-            "{}\n{}",
-            commit_info_line(Some((1, 1))),
-            checkpoint_commit(1, &[], one_column_schema())
-        ),
-        format!(
-            "{}\n{}",
-            commit_info_line(pointer),
+            commit_info(pointer),
             standalone_pm_commit(one_column_schema())
         ),
     ];
-    for (version, commit) in commits.into_iter().enumerate() {
-        add_commit(table_root.as_str(), store.as_ref(), version as u64, commit)
-            .await
-            .unwrap();
-    }
+    let (store, table_root) = commit_table(&commits).await;
 
     let engine = non_plan_engine(store);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
@@ -616,31 +562,20 @@ async fn latest_checkpoint_action_follows_commit_info_pointer(
 }
 
 // The pointer alone decides the lookup: one naming a commit the segment does not list, below or
-// above it, is inconsistent. The segment keeps only v1, whose checkpoint action a scan would find.
+// above it, is inconsistent. The table has commits v0 and v1, and the segment keeps only v1, whose
+// checkpoint action a scan would find. So v0 is below the segment, and v5 is past the table's end.
 #[rstest]
+#[case::below_segment_start(0)]
+#[case::past_table_end(5)]
 #[tokio::test]
 async fn read_last_checkpoint_action_from_pointer_rejects_commit_outside_segment(
-    #[values(0, 5)] pointer_version: i64,
+    #[case] pointer_version: i64,
 ) {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
-    for version in 0..2 {
-        add_commit(
-            table_root.as_str(),
-            store.as_ref(),
-            version,
-            checkpoint_commit(version as i64, &[], one_column_schema()),
-        )
-        .await
-        .unwrap();
-    }
+    let (store, table_root) =
+        manifest_commit_table(&[checkpoint_commit(1, &[], one_column_schema())]).await;
 
     let engine = non_plan_engine(store);
-    let storage = engine.storage_handler();
-    let log_root = table_root.join("_delta_log/").unwrap();
-    let log_segment = LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None)
-        .unwrap()
-        .segment_after_version(0);
+    let log_segment = latest_log_segment(&table_root, &engine).segment_after_version(0);
 
     let pointer = LastManifestCommit::new(pointer_version, pointer_version).unwrap();
     let result = log_segment.read_last_checkpoint_action_from_pointer(&engine, &pointer);
@@ -655,20 +590,7 @@ async fn post_commit_snapshot_resolves_latest_checkpoint_action(
     #[case] write_root_manifest: bool,
     #[case] expected_version: i64,
 ) {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
-    add_commit(
-        table_root.as_str(),
-        store.as_ref(),
-        0,
-        format!(
-            "{}\n{}",
-            serde_json::json!({ "commitInfo": { "timestamp": 1, "inCommitTimestamp": 1 } }),
-            checkpoint_commit(0, &[], one_column_schema()),
-        ),
-    )
-    .await
-    .unwrap();
+    let (store, table_root) = commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
     let engine = non_plan_engine(store.clone());
     let snapshot = Snapshot::builder_for(table_root.clone())
         .build(&engine)
@@ -710,20 +632,7 @@ async fn post_commit_snapshot_resolves_latest_checkpoint_action(
 // deleted, only that pointer can name the manifest commit.
 #[tokio::test]
 async fn post_commit_snapshot_follows_transaction_last_manifest_commit() {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
-    add_commit(
-        table_root.as_str(),
-        store.as_ref(),
-        0,
-        format!(
-            "{}\n{}",
-            commit_info_line(Some((0, 0))),
-            checkpoint_commit(0, &[], one_column_schema())
-        ),
-    )
-    .await
-    .unwrap();
+    let (store, table_root) = commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
     put_crc_with_pointer(&store, 0, LastManifestCommit::new(0, 0).unwrap()).await;
     let engine = non_plan_engine(store.clone());
     let snapshot = Snapshot::builder_for(table_root.clone())
@@ -759,21 +668,7 @@ async fn post_commit_snapshot_follows_transaction_last_manifest_commit() {
 async fn snapshot_with_crc_at_version_serves_last_manifest_commit_from_crc(
     #[case] crc_pointer: Option<(i64, i64)>,
 ) {
-    let store = Arc::new(InMemory::new());
-    let table_root = url::Url::parse("memory:///").unwrap();
-    let commits = [
-        checkpoint_commit(0, &[], one_column_schema()),
-        serde_json::json!({ "commitInfo": {
-            "inCommitTimestamp": 1,
-            "lastManifestCommit": { "version": 0, "contentRootVersion": 0 },
-        } })
-        .to_string(),
-    ];
-    for (version, commit) in commits.into_iter().enumerate() {
-        add_commit(table_root.as_str(), store.as_ref(), version as u64, commit)
-            .await
-            .unwrap();
-    }
+    let (store, table_root) = manifest_commit_table(&[commit_info(Some((0, 0)))]).await;
     let engine = non_plan_engine(store.clone());
     let loaded = Snapshot::builder_for(table_root).build(&engine).unwrap();
     let expected = crc_pointer.map(|(v, c)| LastManifestCommit::new(v, c).unwrap());
@@ -796,6 +691,19 @@ async fn snapshot_with_crc_at_version_serves_last_manifest_commit_from_crc(
         .await
         .unwrap();
     assert_eq!(snapshot.last_manifest_commit(&engine).unwrap(), expected);
+}
+
+// Writes a parquet checkpoint at `version` holding only top-level protocol and metaData. Kernel
+// refuses to write a classic checkpoint on an adaptiveMetadata table, so it is written by hand.
+async fn put_pm_checkpoint(store: &Arc<InMemory>, version: u64) {
+    let rows = standalone_pm_commit(one_column_schema());
+    add_checkpoint_to_store(
+        store,
+        parse_json_batch(StringArray::from(rows.lines().collect::<Vec<_>>())),
+        &format!("{version:020}.checkpoint.parquet"),
+    )
+    .await
+    .unwrap();
 }
 
 // Writes a CRC at `version` carrying `pointer` as its `lastManifestCommit`.
