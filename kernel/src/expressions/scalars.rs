@@ -413,8 +413,9 @@ pub enum Scalar {
     Timestamp(i64),
     /// Microsecond precision timestamp, with no timezone.
     TimestampNtz(i64),
-    /// Year-month interval, stored as a signed month count and an ANSI qualifier.
-    /// `YEAR` values must contain whole years.
+    /// Year-month interval, stored as a signed month count aligned to its ANSI qualifier.
+    ///
+    /// `YEAR` values must be multiples of 12 months; other qualifiers accept any `i32`.
     #[from]
     IntervalYearMonth(IntervalYearMonthData),
     /// Day-time interval, stored as a signed 64bit count of microseconds (matches Spark Catalyst).
@@ -1187,7 +1188,10 @@ fn checked_day_time_micros(
         .checked_add(micros)
 }
 
-/// Parses a year-month interval literal into a scalar with the target qualifier.
+/// Parses `raw` as a year-month interval literal aligned to the `target` qualifier.
+///
+/// Returns a scalar only when the literal's qualifier matches `target` and its month count fits
+/// in `i32`. `YEAR` values are whole multiples of 12 months; parsing never rounds or truncates.
 fn parse_year_month_interval(raw: &str, target: IntervalYearToMonthType) -> KernelResult<Scalar> {
     use IntervalField::*;
     use IntervalYearToMonthType::*;
