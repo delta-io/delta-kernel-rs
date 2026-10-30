@@ -12,6 +12,8 @@ use super::ConditionMetadata;
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DeltaErrorCondition {
+    /// `DELTA_LOG_FILE_NOT_FOUND` (SQLSTATE `42K03`).
+    DeltaLogFileNotFound,
     /// `DELTA_PATH_DOES_NOT_EXIST` (SQLSTATE `42K03`).
     DeltaPathDoesNotExist,
     /// `DELTA_VERSIONS_NOT_CONTIGUOUS` (SQLSTATE `KD00C`).
@@ -23,6 +25,12 @@ pub enum DeltaErrorCondition {
 impl DeltaErrorCondition {
     pub(super) const fn metadata(self) -> ConditionMetadata {
         match self {
+            Self::DeltaLogFileNotFound => ConditionMetadata {
+                name: "DELTA_LOG_FILE_NOT_FOUND",
+                sql_state: Some("42K03"),
+                parameter_names: &["version", "checkpointVersion", "logPath"],
+                message_template: "Unable to retrieve the delta log files to construct table version <version> starting from checkpoint version <checkpointVersion> at <logPath>.",
+            },
             Self::DeltaPathDoesNotExist => ConditionMetadata {
                 name: "DELTA_PATH_DOES_NOT_EXIST",
                 sql_state: Some("42K03"),
