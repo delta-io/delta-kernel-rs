@@ -109,10 +109,8 @@ pub(crate) enum TableFeature {
     CheckConstraints,
     /// Protects checkpoints and version history across table feature removal.
     ///
-    /// Support is gated by the `checkpoint-protection` Cargo feature. Enable it only if the
-    /// connector satisfies all writer requirements in the checkpoint protection specification:
-    ///
-    /// <https://github.com/delta-io/delta/blob/master/protocol_rfcs/checkpoint-protection.md>
+    /// Transactions require
+    /// [`ack_checkpoint_protection_requirements`](crate::transaction::Transaction::ack_checkpoint_protection_requirements).
     CheckpointProtection,
     /// CDF on a table
     ChangeDataFeed,
@@ -365,10 +363,7 @@ static CHECKPOINT_PROTECTION_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
     feature_requirements: &[],
-    #[cfg(feature = "checkpoint-protection")]
     kernel_support: KernelSupport::Supported,
-    #[cfg(not(feature = "checkpoint-protection"))]
-    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 

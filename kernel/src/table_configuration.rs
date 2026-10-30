@@ -2393,7 +2393,7 @@ mod test {
     }
 
     #[rstest]
-    fn checkpoint_protection_gates_writes_but_allows_reads(
+    fn checkpoint_protection_supports_reads_and_writes(
         #[values(1, 3)] reader_version: i32,
         #[values(
             Operation::SnapshotLoad,
@@ -2412,15 +2412,7 @@ mod test {
             )
             .build();
 
-        let result = config.ensure_operation_supported(operation);
-        if operation == Operation::Write && !cfg!(feature = "checkpoint-protection") {
-            assert_result_error_with_message(
-                result,
-                "Feature 'checkpointProtection' is not supported",
-            );
-        } else {
-            result.unwrap();
-        }
+        config.ensure_operation_supported(operation).unwrap();
     }
 
     #[cfg(not(feature = "geo-type-in-dev"))]
