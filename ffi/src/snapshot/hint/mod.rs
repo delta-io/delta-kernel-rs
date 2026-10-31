@@ -3,16 +3,14 @@
 use delta_kernel::snapshot::{SnapshotHint, SnapshotHintError, SnapshotHintFreshness};
 use delta_kernel::{KernelError, KernelResult, Version};
 
+use super::builder::{ExclusiveSnapshotBuilder, FfiSnapshotBuilder, FfiSnapshotBuilderSource};
 use crate::delta_types::{
     FfiCrc, FfiLastCheckpoint, FfiMetadata, FfiProtocol, FfiPublicationWatermark,
 };
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
-use crate::{
-    ExclusiveSnapshotBuilder, FfiSnapshotBuilder, FfiSnapshotBuilderSource, NullableCvoid,
-    SharedExternEngine, SharedSnapshot,
-};
+use crate::{NullableCvoid, SharedExternEngine, SharedSnapshot};
 
 mod export;
 
