@@ -59,15 +59,45 @@ env:
 # are installed via taiki-e/install-action, which fetches prebuilt binaries.
 
 jobs:
+  action-versions:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Install lockfile parser
+        run: python3 -m pip install --no-deps PyYAML==6.0.3
+      - name: Test action version validation
+        run: python3 -m unittest discover --start-directory .github/scripts --pattern 'test_*.py'
+      - name: Install workflow lockfile verifier
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh extension install github/gh-actions-lock --pin v0.3.0
+      - name: Verify locked dependencies and one version per action
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_ACTIONS_LOCK_REPO_ROOT: ${{ github.workspace }}
+        run: |
+          if ! gh actions-lock --verify --json=valid,findings,workflows,dependencies > "$RUNNER_TEMP/action-dependencies.json"; then
+            cat "$RUNNER_TEMP/action-dependencies.json"
+            exit 1
+          fi
+          python3 .github/scripts/check_action_versions.py "$RUNNER_TEMP/action-dependencies.json"
+
   benchmark-scripts:
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      - uses: actions/setup-python@v6.2.0
         with:
           python-version: "3.12"
       - name: Test benchmark scripts
@@ -76,10 +106,10 @@ jobs:
   release-tooling:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
-      - uses: taiki-e/install-action@7bc99eee1f1b8902a125006cf790a1f4c8461e63 # v2.69.8
+      - uses: taiki-e/install-action@v2.85.8
         with:
           tool: git-cliff
       - name: Test release tooling
@@ -91,8 +121,8 @@ jobs:
   ai-review-config:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v6.2.0
         with:
           python-version: "3.12"
       - name: Install AI reviewer config test dependencies
@@ -106,9 +136,9 @@ jobs:
   format:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@v7.0.1
       - name: Install nightly with rustfmt
-        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
         with:
           cache: false
           toolchain: nightly
@@ -123,16 +153,16 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@v7.0.1
       - name: Install minimal stable and cargo msrv
-        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@7bc99eee1f1b8902a125006cf790a1f4c8461e63 # v2.69.8
+      - uses: taiki-e/install-action@v2.85.8
         with:
           tool: cargo-msrv
       - name: verify-msrv
@@ -144,24 +174,26 @@ jobs:
   msrv-run-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@v7.0.1
       - name: Install minimal stable and cargo msrv
-        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@7bc99eee1f1b8902a125006cf790a1f4c8461e63 # v2.69.8
+      - uses: taiki-e/install-action@v2.85.8
         with:
           tool: cargo-msrv
-      - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
+      - uses: taiki-e/install-action@v2.85.8
+        with:
+          tool: nextest
       - name: Get rust-version from Cargo.toml
         id: rust-version
         run: echo "RUST_VERSION=$(cargo msrv show --path kernel/ --output-format minimal)" >> $GITHUB_ENV
       - name: Install specified rust version
-        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
         with:
           cache: false
           toolchain: ${{ env.RUST_VERSION }}
@@ -176,12 +208,12 @@ jobs:
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@v7.0.1
       - name: Install minimal stable
-        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -218,13 +250,13 @@ jobs:
           - ubuntu-latest
           - windows-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@v7.0.1
       - name: Install minimal stable with clippy
-        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
         with:
           cache: false
           components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -270,8 +302,8 @@ jobs:
           - all-features
           - no-declarative-plans
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+      - uses: actions/checkout@v7.0.1
+      - uses: dorny/paths-filter@v3.0.2
         id: filter
         with:
           filters: |
@@ -279,15 +311,17 @@ jobs:
               - 'ffi/src/handle.rs'
               - 'ffi-proc-macros/**'
       - name: Install minimal stable with clippy and rustfmt
-        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-bin: false
           key: ${{ matrix.config }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
+      - uses: taiki-e/install-action@v2.85.8
+        with:
+          tool: nextest
       - name: all-features tests
         if: matrix.config == 'all-features'
         shell: bash
@@ -314,12 +348,12 @@ jobs:
     if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@v7.0.1
       - name: Install minimal stable
-        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -341,9 +375,9 @@ jobs:
           - ubuntu-24.04-arm
           - ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@v7.0.1
       - name: Setup cmake
-        uses: jwlawson/actions-setup-cmake@0d6a7d60b009d01c9e7523be22153ff8f19460d3 # v2.2.0
+        uses: jwlawson/actions-setup-cmake@v2.2.0
         with:
           cmake-version: "3.30.x"
       - name: Install arrow-glib-linux
@@ -364,14 +398,14 @@ jobs:
       #               fresh `brew install`. See the issue for root cause and fix options.
       - name: Install arrow-glib-macOS
         if: runner.os == 'macOS'
-        uses: ./.github/actions/use-homebrew-tools
+        uses: tecolicom/actions-use-homebrew-tools@v1.3
         with:
           tools: "apache-arrow apache-arrow-glib"
       - name: Install minimal stable
-        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -458,17 +492,19 @@ jobs:
       matrix:
         partition: [1, 2, 3]
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@v7.0.1
       - name: Install Miri
         run: |
           rustup toolchain install nightly --component miri
           rustup override set nightly
           cargo miri setup
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
+      - uses: taiki-e/install-action@v2.85.8
+        with:
+          tool: nextest
       - name: Test with Miri
         # -Zmiri-provenance-gc=1000000 runs Miri's pointer-provenance garbage collector every 1M
         # basic blocks instead of the default 10k, reducing GC pauses. It only changes GC
@@ -482,21 +518,23 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@v7.0.1
       - name: Install rust
-        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@2d15d02e710b40b6332201aba6af30d595b5cd96 # cargo-llvm-cov
+        uses: taiki-e/install-action@v2.85.8
+        with:
+          tool: cargo-llvm-cov
       - name: Generate code coverage
         run: cargo llvm-cov --locked --all-features --workspace --codecov --output-path codecov.json -- --skip read_table_version_hdfs --skip handle::tests::invalid_handle_code
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        uses: codecov/codecov-action@v7.0.0
         with:
           files: codecov.json
           fail_ci_if_error: true
@@ -507,18 +545,20 @@ jobs:
   datafusion-executor:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@v7.0.1
       - name: Install minimal stable with clippy
-        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
         with:
           cache: false
           components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: datafusion-executor
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
+      - uses: taiki-e/install-action@v2.85.8
+        with:
+          tool: nextest
       - name: build and lint with clippy
         working-directory: datafusion-executor
         run: cargo clippy --locked --benches --tests --all-features -- -D warnings
