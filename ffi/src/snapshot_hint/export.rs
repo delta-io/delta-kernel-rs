@@ -35,7 +35,7 @@ pub(super) fn visit_v2(
             context,
             &FfiSnapshotHintV2 {
                 base,
-                checkpoint_kind: checkpoint_kind.into(),
+                checkpoint_kind,
                 crc_provenance: crc_provenance.into(),
                 base_crc,
             },

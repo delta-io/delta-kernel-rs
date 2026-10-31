@@ -11,7 +11,7 @@ use delta_kernel::crc::Crc;
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::path::ParsedLogPath;
-use delta_kernel::snapshot::{IncrementalReplay, PublicationWatermark, Snapshot};
+use delta_kernel::snapshot::{CrcSource, IncrementalReplay, PublicationWatermark, Snapshot};
 use delta_kernel::{
     Engine, EvaluationHandler, FileMeta, JsonHandler, ParquetHandler, StorageHandler,
 };
@@ -656,14 +656,52 @@ extern "C" fn install_visited_hint_v2(context: NullableCvoid, hint: *const FfiSn
 }
 
 #[rstest::rstest]
-#[case::at_version(crate::snapshot_provenance::FfiCrcSource::AtVersion, Some(2), Some(2))]
-#[case::reconstructed(crate::snapshot_provenance::FfiCrcSource::Reconstructed { num_commits: 2 }, Some(0), Some(2))]
-#[case::stale(crate::snapshot_provenance::FfiCrcSource::Stale, Some(0), Some(1))]
-#[case::missing(crate::snapshot_provenance::FfiCrcSource::Missing, None, None)]
-#[case::unusable(crate::snapshot_provenance::FfiCrcSource::Unusable, None, None)]
-#[case::unknown(crate::snapshot_provenance::FfiCrcSource::Unknown, None, Some(2))]
+#[case::crc_before_checkpoint(0, SelectedCheckpointKind::Unknown, CrcSource::Stale, 0)]
+#[case::checkpoint_claim(1, SelectedCheckpointKind::None, CrcSource::AtVersion, 1)]
+#[case::crc_claim(1, SelectedCheckpointKind::Unknown, CrcSource::Reconstructed { num_commits: 2 }, 0)]
+fn versioned_hint_provenance_failures_are_invalid_snapshot_hints(
+    #[case] crc_version: u64,
+    #[case] checkpoint_kind: SelectedCheckpointKind,
+    #[case] source: CrcSource,
+    #[case] base_version: u64,
+) {
+    let engine = test_engine();
+    let paths = [FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000001.checkpoint.parquet"),
+        0,
+        1,
+    )];
+    let mut crc = empty_crc();
+    crc.version = crc_version;
+    let hint = FfiSnapshotHintV2 {
+        base: test_snapshot_hint(&paths, 1, FfiSnapshotHintFreshness::Latest),
+        checkpoint_kind,
+        crc_provenance: FfiCrcProvenance {
+            source,
+            base_version: OptionalValue::Some(base_version),
+        },
+        base_crc: &crc,
+    };
+    let builder = unsafe {
+        ok_or_panic(snapshot_builder_with_snapshot_hint_v2(
+            test_builder(&engine),
+            &hint,
+        ))
+    };
+    let result = unsafe { snapshot_builder_build(builder) };
+    assert_extern_result_error_with_message(result, FFIKernelError::InvalidSnapshotHint, None);
+    unsafe { free_engine(engine) };
+}
+
+#[rstest::rstest]
+#[case::at_version(CrcSource::AtVersion, Some(2), Some(2))]
+#[case::reconstructed(CrcSource::Reconstructed { num_commits: 2 }, Some(0), Some(2))]
+#[case::stale(CrcSource::Stale, Some(0), Some(1))]
+#[case::missing(CrcSource::Missing, None, None)]
+#[case::unusable(CrcSource::Unusable, None, None)]
+#[case::unknown(CrcSource::Unknown, None, Some(2))]
 fn versioned_hint_preserves_provenance_without_io(
-    #[case] source: crate::snapshot_provenance::FfiCrcSource,
+    #[case] source: CrcSource,
     #[case] base_version: Option<u64>,
     #[case] crc_version: Option<u64>,
 ) {
@@ -690,7 +728,7 @@ fn versioned_hint_preserves_provenance_without_io(
     crc.version = crc_version.unwrap_or(0);
     let hint = FfiSnapshotHintV2 {
         base: test_snapshot_hint(&paths, 2, FfiSnapshotHintFreshness::Latest),
-        checkpoint_kind: FfiSelectedCheckpointKind::None,
+        checkpoint_kind: SelectedCheckpointKind::None,
         crc_provenance: FfiCrcProvenance {
             source,
             base_version: base_version.into(),

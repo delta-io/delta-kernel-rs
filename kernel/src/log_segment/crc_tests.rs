@@ -1491,6 +1491,41 @@ async fn pick_latest_base_crc_preserves_cancellation_with_in_memory_base(
     }
 }
 
+#[rstest]
+#[case::no_disk_crc(None)]
+#[case::same_version_disk_crc(Some(false))]
+#[case::corrupt_newer_disk_crc(Some(true))]
+#[tokio::test]
+async fn pick_latest_base_crc_preserves_in_memory_identity(#[case] disk_crc: Option<bool>) {
+    let mut test = CrcReadTest::new()
+        .commit(0, create_table_actions())
+        .commit(1, [commit_info(DEFAULT_OPERATION, None)]);
+    test = match disk_crc {
+        None => test,
+        Some(false) => test.crc(0, protocol_a(), metadata_a(), None),
+        Some(true) => test.corrupt_crc(1),
+    };
+    let built = test.build().await;
+    let base = Arc::new(Crc {
+        version: 0,
+        ..Default::default()
+    });
+    let storage = built.engine.storage_handler();
+    let segment = LogSegment::for_snapshot_impl(
+        storage.as_ref(),
+        built.url.join("_delta_log/").unwrap(),
+        vec![],
+        None,
+        None,
+    )
+    .unwrap();
+    let selected = segment
+        .pick_latest_base_crc(&built.engine, Some(&base))
+        .unwrap()
+        .unwrap();
+    assert!(Arc::ptr_eq(&base, &selected));
+}
+
 // A base exactly at the checkpoint version is kept (its tail is (ckpt, end]); a base below it is
 // dropped. Guards the `>=` vs `>` seam in `pick_latest_base_crc`.
 #[tokio::test]

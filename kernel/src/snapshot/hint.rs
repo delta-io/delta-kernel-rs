@@ -243,8 +243,8 @@ impl SnapshotHint {
 
     /// Returns the retained CRC state, if present.
     ///
-    /// Hints exported by [`Snapshot::to_snapshot_hint`] retain only CRC state at the snapshot
-    /// version. Connector-provided inputs are checked when the snapshot is built.
+    /// Returns `None` for a stale checksum; [`Self::base_crc`] includes the retained stale
+    /// baseline. Connector-provided inputs are checked when the snapshot is built.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn crc(&self) -> Option<&Crc> {
@@ -404,6 +404,16 @@ impl SnapshotHint {
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, table_url, version)?;
         if let Some(crc) = crc.as_ref() {
+            if let Some(checkpoint) = log_segment.checkpoint_version {
+                require!(
+                    crc.version >= checkpoint,
+                    SnapshotHintError::CrcBeforeCheckpoint {
+                        crc: crc.version,
+                        checkpoint
+                    }
+                    .into()
+                );
+            }
             require!(
                 crc.version == version || (provenance.is_some() && crc.version < version),
                 SnapshotHintError::CrcVersion {
@@ -1402,6 +1412,32 @@ mod tests {
             "CRC metadata does not match",
         );
 
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn snapshot_hint_rejects_crc_before_checkpoint_with_typed_error(
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
+        let (engine, table_root, _, mut hint) =
+            snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
+        let checkpoint = hint.version;
+        hint.log_segment_files.checkpoint_parts = vec![create_log_path(&format!(
+            "{table_root}_delta_log/{checkpoint:020}.checkpoint.parquet"
+        ))];
+        hint.log_segment_files.ascending_commit_files.clear();
+        let crc_version = checkpoint - 1;
+        Arc::make_mut(hint.crc.as_mut().unwrap()).version = crc_version;
+        hint.provenance = Some((
+            SelectedCheckpointKind::Unknown,
+            CrcProvenance::new(crate::snapshot::CrcSource::Stale, Some(crc_version)),
+        ));
+        let error = SnapshotBuilder::new_for(table_root)
+            .with_snapshot_hint(hint)
+            .build(engine.as_ref())
+            .unwrap_err();
+        assert!(matches!(error, KernelError::SnapshotHint(error)
+            if matches!(*error, SnapshotHintError::CrcBeforeCheckpoint { crc, checkpoint: selected }
+                if crc == crc_version && selected == checkpoint)));
         Ok(())
     }
 

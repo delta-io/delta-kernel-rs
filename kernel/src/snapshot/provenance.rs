@@ -6,7 +6,13 @@ use crate::Version;
 ///
 /// This describes the selected checkpoint, independently of the table's checkpoint policy.
 /// A classic checkpoint filename alone does not distinguish V1 from V2.
+/// Classic-named V2 checkpoints without sidecars can remain unknown when ordinary reads do not
+/// inspect their checkpoint metadata action.
+///
+/// cbindgen:prefix-with-name=true
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+#[repr(C)]
 pub enum SelectedCheckpointKind {
     /// No checkpoint was selected.
     None,
@@ -20,7 +26,11 @@ pub enum SelectedCheckpointKind {
 }
 
 /// How the retained checksum relates to an observed checksum file and the snapshot version.
+///
+/// cbindgen:prefix-with-name=true
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+#[repr(C)]
 pub enum CrcSource {
     /// A usable checksum file was resolved at the snapshot version.
     AtVersion,
@@ -34,6 +44,7 @@ pub enum CrcSource {
     /// Normal loading found no applicable checksum file.
     Missing,
     /// An observed checksum candidate was unusable and no usable baseline was resolved.
+    /// This includes read failures as well as invalid checksum contents.
     Unusable,
     /// The checksum's disk provenance was not established.
     #[default]
@@ -46,11 +57,23 @@ pub enum CrcSource {
 /// storage. In particular, an in-memory checksum at the snapshot version does not by itself
 /// establish that a checksum file exists at that version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct CrcProvenance {
     /// How the checksum was resolved.
     pub source: CrcSource,
     /// Version of the original usable checksum file, when known.
     pub base_version: Option<Version>,
+}
+
+impl CrcProvenance {
+    /// Describes `source` and its original usable checksum file's `base_version`, if known.
+    /// Snapshot-hint construction validates the claim against the retained checksum.
+    pub fn new(source: CrcSource, base_version: Option<Version>) -> Self {
+        Self {
+            source,
+            base_version,
+        }
+    }
 }
 
 #[cfg(test)]

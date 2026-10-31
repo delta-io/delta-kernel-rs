@@ -604,7 +604,8 @@ impl Snapshot {
     /// Captures retained snapshot state as an owned hint without engine I/O.
     ///
     /// The hint preserves whether this snapshot was built as latest, not whether it is still
-    /// latest. Missing checkpoint hints and CRCs at this snapshot's version remain absent.
+    /// latest. It retains checkpoint and checksum provenance, including any stale checksum
+    /// baseline through [`SnapshotHint::base_crc`]. Missing state is not loaded or reconstructed.
     /// Rebuild it with [`SnapshotBuilder::with_snapshot_hint`] for the same table root.
     ///
     /// # Errors
@@ -1681,7 +1682,7 @@ impl Snapshot {
             SelectedCheckpointKind::V1
         });
         // Carry only an at-version CRC forward: the checkpoint drops the commits below it, so a
-        // stale base could no longer be advanced over them.
+        // stale base could no longer be advanced over them. Dropping it leaves unknown CRC origin.
         Ok((
             CheckpointWriteResult::Written,
             Arc::new(

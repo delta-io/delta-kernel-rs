@@ -202,6 +202,20 @@ pub enum SnapshotHintError {
         /// The version described by the snapshot hint.
         hint: Version,
     },
+    /// The supplied CRC predates the selected checkpoint and cannot seed its replay history.
+    #[error("Invalid snapshot hint: CRC version {crc} is below checkpoint version {checkpoint}")]
+    CrcBeforeCheckpoint {
+        /// The version described by the CRC.
+        crc: Version,
+        /// The selected checkpoint version.
+        checkpoint: Version,
+    },
+    /// The claimed checkpoint kind conflicts with the selected checkpoint.
+    #[error("Invalid snapshot hint: checkpoint provenance conflicts with selected checkpoint")]
+    CheckpointProvenance,
+    /// The claimed checksum origin conflicts with the retained checksum.
+    #[error("Invalid snapshot hint: checksum provenance conflicts with retained checksum")]
+    CrcProvenance,
     /// The supplied CRC protocol differs from the hint protocol.
     #[error("Invalid snapshot hint: CRC protocol does not match snapshot hint protocol")]
     CrcProtocol,
