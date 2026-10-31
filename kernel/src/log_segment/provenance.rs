@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 use super::LogSegment;
 use crate::actions::CHECKPOINT_METADATA_NAME;
 use crate::engine_data::{GetData, TypedGetData as _};
+use crate::error::SnapshotHintError;
 use crate::path::LogPathFileType;
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType, StructType};
 use crate::snapshot::SelectedCheckpointKind;
@@ -10,21 +11,26 @@ use crate::{KernelError, KernelResult, RowVisitor};
 
 impl LogSegment {
     pub(crate) fn selected_checkpoint_kind(&self) -> SelectedCheckpointKind {
-        use SelectedCheckpointKind::*;
         match self
             .listed
             .checkpoint_parts
             .first()
             .map(|part| &part.file_type)
         {
-            Option::None => None,
-            Some(LogPathFileType::MultiPartCheckpoint { .. }) => V1,
-            Some(LogPathFileType::UuidCheckpoint) => V2,
+            Option::None => SelectedCheckpointKind::None,
+            Some(LogPathFileType::MultiPartCheckpoint { .. }) => SelectedCheckpointKind::V1,
+            Some(LogPathFileType::UuidCheckpoint) => SelectedCheckpointKind::V2,
             _ => {
-                if let Some(schema) = self.checkpoint_hint_schema() {
-                    self.observe_checkpoint_schema(&schema);
+                if let Some(kind) = self.checkpoint_kind.get() {
+                    return *kind;
                 }
-                self.checkpoint_kind.get().copied().unwrap_or(Unknown)
+                if self
+                    .checkpoint_hint_schema()
+                    .is_some_and(|schema| !schema.contains(CHECKPOINT_METADATA_NAME))
+                {
+                    return SelectedCheckpointKind::V1;
+                }
+                self.checkpoint_kind_hint
             }
         }
     }
@@ -59,25 +65,26 @@ impl LogSegment {
                 .map(|part| &part.location.location))
         {
             self.checkpoint_kind = previous.checkpoint_kind.clone();
+            self.checkpoint_kind_hint = previous.checkpoint_kind_hint;
         }
     }
 
-    pub(crate) fn with_checkpoint_kind(self, kind: SelectedCheckpointKind) -> KernelResult<Self> {
+    pub(crate) fn with_checkpoint_kind(
+        mut self,
+        kind: SelectedCheckpointKind,
+    ) -> KernelResult<Self> {
         let established = self.selected_checkpoint_kind();
         if kind != SelectedCheckpointKind::Unknown
             && established != SelectedCheckpointKind::Unknown
             && kind != established
         {
-            return Err(KernelError::generic(
-                "Checkpoint provenance conflicts with selected checkpoint",
-            ));
+            return Err(SnapshotHintError::CheckpointProvenance.into());
         }
         if kind == SelectedCheckpointKind::None && self.checkpoint_version.is_some() {
-            return Err(KernelError::generic(
-                "Checkpoint provenance omits selected checkpoint",
-            ));
+            return Err(SnapshotHintError::CheckpointProvenance.into());
         }
-        self.observe_checkpoint_kind(kind);
+        // Keep connector claims separate so ordinary reads can establish the actual kind.
+        self.checkpoint_kind_hint = kind;
         Ok(self)
     }
 }
@@ -171,6 +178,28 @@ mod tests {
         #[case] expected: SelectedCheckpointKind,
     ) {
         assert_eq!(segment(filename).selected_checkpoint_kind(), expected);
+    }
+
+    #[test]
+    fn checkpoint_reads_override_hint_claims() {
+        let segment = segment("00000000000000000000.checkpoint.parquet")
+            .with_checkpoint_kind(SelectedCheckpointKind::V1)
+            .unwrap();
+        assert_eq!(
+            segment.selected_checkpoint_kind(),
+            SelectedCheckpointKind::V1
+        );
+        segment.observe_checkpoint_kind(SelectedCheckpointKind::V2);
+        assert_eq!(
+            segment.selected_checkpoint_kind(),
+            SelectedCheckpointKind::V2
+        );
+        let mut inherited = segment.clone();
+        inherited.inherit_checkpoint_observation(&segment);
+        assert_eq!(
+            inherited.selected_checkpoint_kind(),
+            SelectedCheckpointKind::V2
+        );
     }
 
     #[test]

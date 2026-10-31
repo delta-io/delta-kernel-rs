@@ -157,7 +157,9 @@ pub(crate) struct LogSegment {
     /// [`Self::checkpoint_hint_sidecars`] accessors built on it). Read this field directly only
     /// when the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
     pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
+    /// Kind established by ordinary reads or checkpoint writes, shared by the same checkpoint.
     pub(crate) checkpoint_kind: Arc<OnceLock<crate::snapshot::SelectedCheckpointKind>>,
+    pub(crate) checkpoint_kind_hint: crate::snapshot::SelectedCheckpointKind,
 }
 
 // Observations can be refined by readers without changing the selected log segment.
@@ -399,6 +401,7 @@ impl LogSegment {
             log_root,
             last_checkpoint_metadata: None,
             checkpoint_kind: Default::default(),
+            checkpoint_kind_hint: Default::default(),
             listed: LogSegmentFiles {
                 max_published_version: Some(commit_file.version),
                 latest_commit_file: Some(commit_file.clone()),
@@ -453,6 +456,7 @@ impl LogSegment {
             log_root,
             last_checkpoint_metadata,
             checkpoint_kind: Default::default(),
+            checkpoint_kind_hint: Default::default(),
             listed: listed_files,
         };
 
@@ -843,6 +847,7 @@ impl LogSegment {
         // whether stats_parsed or sidecar columns exist).
         new_log_segment.last_checkpoint_metadata = None;
         new_log_segment.checkpoint_kind = Default::default();
+        new_log_segment.checkpoint_kind_hint = Default::default();
         Ok(new_log_segment)
     }
 
@@ -1436,10 +1441,10 @@ impl LogSegment {
         checkpoint: &ParsedLogPath<FileMeta>,
         hint_schema: Option<&SchemaRef>,
     ) -> KernelResult<SchemaRef> {
-        let schema = match hint_schema {
-            Some(schema) => Ok(schema.clone()),
-            None => Self::read_footer_schema(engine, &checkpoint.location),
-        }?;
+        if let Some(schema) = hint_schema {
+            return Ok(schema.clone());
+        }
+        let schema = Self::read_footer_schema(engine, &checkpoint.location)?;
         self.observe_checkpoint_schema(&schema);
         Ok(schema)
     }
@@ -1680,6 +1685,7 @@ impl LogSegment {
             log_root: self.log_root.clone(),
             last_checkpoint_metadata: None,
             checkpoint_kind: Default::default(),
+            checkpoint_kind_hint: Default::default(),
             listed: LogSegmentFiles {
                 ascending_commit_files: commits,
                 ascending_compaction_files: compactions,
