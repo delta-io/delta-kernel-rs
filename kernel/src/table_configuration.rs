@@ -1088,7 +1088,7 @@ impl TableConfiguration {
     }
 
     /// Internal helper for write operations
-    fn ensure_write_supported(&self) -> KernelResult<()> {
+    pub(crate) fn ensure_write_supported(&self) -> KernelResult<()> {
         // Version check: kernel supports writer versions
         // MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
         require!(
