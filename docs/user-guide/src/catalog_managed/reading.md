@@ -80,7 +80,7 @@ let snapshot = Snapshot::builder_for(table_url)
     .build(&engine)?;
 ```
 
-The log tail must be a **contiguous sequence** `M..=N`: ascending by version, no gaps,
+When nonempty, the log tail must be a **contiguous sequence** `M..=N`: ascending by version, no gaps,
 no duplicates. The first version `M` can be any value `>= 0` (typical catalog clients
 return a suffix of recent commits, not the full history). The last version `N` depends
 on whether you are time-traveling:
@@ -95,12 +95,31 @@ readers to prefer the catalog-supplied commit when the catalog provides one.
 
 Call `.with_max_catalog_version(N)` to tell Kernel the highest version the catalog has
 ratified. This prevents Kernel from loading filesystem commits beyond what the catalog
-knows about.
+knows about. Supply this bound even when the catalog returns an empty tail.
 
-> [!NOTE]
-> To time-travel to a specific version within a catalog-managed table, call both
-> `.at_version(v)` and `.with_max_catalog_version(N)` on the builder. Call order does
-> not matter. The requested version must not exceed `N`.
+## Time travel and management changes
+
+When using catalog discovery, pass its bound together with `.at_version(v)` for time
+travel. The requested version must not exceed the bound, regardless of the protocol at
+that version. Without an explicit target, Kernel rejects a Snapshot whose protocol is
+catalog-managed unless you supply a bound.
+
+For an explicit target, Kernel doesn't require a bound solely because that historical
+version was catalog-managed. For example, after a published downgrade, you can read an
+earlier catalog-managed version from published history without a bound. Your connector
+must still perform catalog discovery when required by the table's current management
+state. Kernel doesn't load newer protocol state to validate this obligation.
+
+Fresh staged tails require a catalog bound. Retained staged paths in an existing
+Snapshot or complete snapshot hint don't themselves require a new bound: their
+ratification is already part of the Snapshot or hint's contract. Any supplied bound
+still applies to an explicit target.
+
+A catalog-ratified downgrade produces a non-catalog-managed Snapshot. You can read it
+with the catalog bound whether its commit is staged, published, or absent from the
+catalog tail. To discover later filesystem commits, refresh without the old bound.
+Reading the downgrade Snapshot doesn't establish that publication has completed for a
+subsequent filesystem write.
 
 For a complete Unity Catalog example, see
 [Reading Unity Catalog tables](../unity_catalog/reading.md).
