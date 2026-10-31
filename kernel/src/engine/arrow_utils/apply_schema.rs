@@ -279,12 +279,12 @@ fn apply_schema_to_file(array: &ArrayRef) -> KernelResult<StructArray> {
     // Every `file` has the canonical sub-fields, so the canonical type is the kernel schema.
     static KERNEL_FILE_TYPE: LazyLock<DataType> = LazyLock::new(DataType::file_type);
     ensure_data_types(&KERNEL_FILE_TYPE, array.data_type(), ValidationMode::Full)?;
-    let Some(sa) = array.as_struct_opt() else {
+    let Some(struct_array) = array.as_struct_opt() else {
         return Err(make_arrow_error(
             "Arrow claimed to be a struct but isn't a StructArray",
         ));
     };
-    let index_by_name: HashMap<&str, usize> = sa
+    let index_by_name: HashMap<&str, usize> = struct_array
         .fields()
         .iter()
         .enumerate()
@@ -301,10 +301,13 @@ fn apply_schema_to_file(array: &ArrayRef) -> KernelResult<StructArray> {
                         kernel_field.name()
                     ))
                 })?;
-            Ok::<_, KernelError>((sa.fields()[index].clone(), sa.column(index).clone()))
+            Ok::<_, KernelError>((
+                struct_array.fields()[index].clone(),
+                struct_array.column(index).clone(),
+            ))
         })
         .process_results(|iter| iter.unzip())?;
-    let ordered = StructArray::try_new(fields.into(), columns, sa.nulls().cloned())?;
+    let ordered = StructArray::try_new(fields.into(), columns, struct_array.nulls().cloned())?;
     apply_schema_to_struct(&ordered, &FILE_FIELDS)
 }
 

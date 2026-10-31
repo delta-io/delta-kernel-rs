@@ -3,7 +3,7 @@
 use std::ops::Range;
 
 use crate::arrow::array::cast::AsArray;
-use crate::arrow::array::{Array, OffsetSizeTrait, StructArray};
+use crate::arrow::array::{Array, ArrayRef, OffsetSizeTrait, StructArray};
 use crate::arrow::datatypes::{DataType as ArrowDataType, Int64Type};
 use crate::engine::arrow_utils::make_arrow_error;
 use crate::expressions::ColumnName;
@@ -23,11 +23,11 @@ pub(crate) fn validate_file_values(
     data: &StructArray,
     kernel_schema: &StructType,
 ) -> KernelResult<()> {
-    let Some(file_paths) = FilePaths::of_struct(kernel_schema)? else {
+    let Some(file_paths) = FilePaths::from_schema(kernel_schema)? else {
         return Ok(());
     };
-    // The top-level rows are all present; `validate` combines this with `data`'s own validity.
-    validate(data, &file_paths, &vec![true; data.len()], &mut Vec::new())
+    // The top-level rows are all present; `validate_at_file_paths` combines this with `data`'s own validity.
+    validate_at_file_paths(data, &file_paths, &vec![true; data.len()], &mut Vec::new())
 }
 
 /// The parts of a schema that lead to `file` values: each `file`, and the structs, arrays and maps
@@ -45,31 +45,30 @@ enum FilePaths {
 impl FilePaths {
     /// Returns the paths to the `file` values in `schema`, or `None` if it has none. Each field is
     /// visited once. Fails if a map key contains a `file`.
-    fn of_struct(schema: &StructType) -> KernelResult<Option<Self>> {
+    fn from_schema(schema: &StructType) -> KernelResult<Option<Self>> {
         let mut fields = Vec::new();
         for field in schema.fields() {
-            if let Some(paths) = Self::of(field.data_type())? {
+            if let Some(paths) = Self::from_data_type(field.data_type())? {
                 fields.push((field.name().clone(), paths));
             }
         }
         Ok((!fields.is_empty()).then_some(Self::Struct(fields)))
     }
 
-    fn of(data_type: &DataType) -> KernelResult<Option<Self>> {
+    fn from_data_type(data_type: &DataType) -> KernelResult<Option<Self>> {
         Ok(match data_type {
             DataType::File(_) => Some(Self::File),
-            DataType::Struct(schema) => Self::of_struct(schema)?,
-            DataType::Array(array_type) => {
-                Self::of(array_type.element_type())?.map(|element| Self::Array(Box::new(element)))
-            }
+            DataType::Struct(schema) => Self::from_schema(schema)?,
+            DataType::Array(array_type) => Self::from_data_type(array_type.element_type())?
+                .map(|element| Self::Array(Box::new(element))),
             DataType::Map(map_type) => {
                 // Table schemas with a `file` in a map key are rejected when they are loaded.
-                if Self::of(map_type.key_type())?.is_some() {
+                if Self::from_data_type(map_type.key_type())?.is_some() {
                     return Err(KernelError::internal_error(
                         "A map key type must not contain a `file`",
                     ));
                 }
-                Self::of(map_type.value_type())?.map(|value| Self::Map(Box::new(value)))
+                Self::from_data_type(map_type.value_type())?.map(|value| Self::Map(Box::new(value)))
             }
             _ => None,
         })
@@ -84,33 +83,62 @@ fn rows_present(array: &dyn Array, parent_present: &[bool]) -> Vec<bool> {
         .collect()
 }
 
-/// Returns, for each of the `len` child values of a list or map, whether a present row uses it.
-/// `range_of` gives the range of child values under a row; it is only called for present rows, and
-/// ranges are clamped to `len`.
+/// Returns the span of a list's or map's `len` child values that present rows use, and for each
+/// value in that span whether a present row uses it. `range_of` gives the range of child values
+/// under a row; it is only called for present rows, and ranges are clamped to `len`. For example:
+///
+/// ```text
+/// Parent rows:     [A, B], NULL, [D]
+/// Child values:    [A, B, C, D]
+/// Parent ranges:   0..2,   2..3, 3..4
+/// Span:            0..4
+/// Child presence:  true, true, false, true
+/// ```
+///
+/// `C` is still stored but belongs only to a null parent, so it is not validated. Child values
+/// outside the span, such as those a sliced list no longer shows, are not scanned at all.
 fn entries_present(
     rows_present: &[bool],
     len: usize,
     range_of: impl Fn(usize) -> Range<usize>,
-) -> Vec<bool> {
+) -> (Range<usize>, Vec<bool>) {
+    let ranges: Vec<_> = (0..rows_present.len())
+        .filter(|&row| rows_present[row])
+        .map(|row| {
+            let range = range_of(row);
+            range.start.min(len)..range.end.min(len)
+        })
+        .filter(|range| range.start < range.end)
+        .collect();
+    let span_start = ranges.iter().map(|range| range.start).min().unwrap_or(0);
+    let span_end = ranges.iter().map(|range| range.end).max().unwrap_or(0);
     // Mark where each present row's range starts and ends; a running count above zero means a value
     // is used. This stays linear even when list-view ranges overlap.
-    let mut starts_minus_ends = vec![0i64; len + 1];
-    for row in (0..rows_present.len()).filter(|&row| rows_present[row]) {
-        let range = range_of(row);
-        let (start, end) = (range.start.min(len), range.end.min(len));
-        if start < end {
-            starts_minus_ends[start] += 1;
-            starts_minus_ends[end] -= 1;
-        }
+    let mut starts_minus_ends = vec![0i64; span_end - span_start + 1];
+    for range in &ranges {
+        starts_minus_ends[range.start - span_start] += 1;
+        starts_minus_ends[range.end - span_start] -= 1;
     }
     let mut count = 0;
-    starts_minus_ends[..len]
+    let present = starts_minus_ends[..span_end - span_start]
         .iter()
         .map(|delta| {
             count += delta;
             count > 0
         })
-        .collect()
+        .collect();
+    (span_start..span_end, present)
+}
+
+/// Returns the span of `values` that present rows use, and which of its values they use; see
+/// [`entries_present`].
+fn used_values(
+    values: &ArrayRef,
+    rows_present: &[bool],
+    range_of: impl Fn(usize) -> Range<usize>,
+) -> (ArrayRef, Vec<bool>) {
+    let (span, present) = entries_present(rows_present, values.len(), range_of);
+    (values.slice(span.start, span.len()), present)
 }
 
 /// The child values row `row` of a list or map uses, from its offsets.
@@ -124,47 +152,36 @@ fn view_range<O: OffsetSizeTrait>(offsets: &[O], sizes: &[O], row: usize) -> Ran
     start..start + sizes[row].as_usize()
 }
 
-/// Returns the child values of the list-like `array` and which of them a present row uses.
-fn list_entries<'a>(
-    array: &'a dyn Array,
-    present: &[bool],
-) -> KernelResult<(&'a dyn Array, Vec<bool>)> {
+/// Returns the child values of the list-like `array` that present rows use, and which of them they
+/// use; see [`used_values`].
+fn list_entries(array: &dyn Array, present: &[bool]) -> KernelResult<(ArrayRef, Vec<bool>)> {
     let list = match array.data_type() {
         ArrowDataType::List(_) => array.as_list_opt::<i32>().map(|list| {
             let offsets = list.value_offsets();
-            let entries = entries_present(present, list.values().len(), |row| {
-                offset_range(offsets, row)
-            });
-            (list.values().as_ref(), entries)
+            used_values(list.values(), present, |row| offset_range(offsets, row))
         }),
         ArrowDataType::LargeList(_) => array.as_list_opt::<i64>().map(|list| {
             let offsets = list.value_offsets();
-            let entries = entries_present(present, list.values().len(), |row| {
-                offset_range(offsets, row)
-            });
-            (list.values().as_ref(), entries)
+            used_values(list.values(), present, |row| offset_range(offsets, row))
         }),
         ArrowDataType::ListView(_) => array.as_list_view_opt::<i32>().map(|list| {
             let (offsets, sizes) = (list.value_offsets(), list.value_sizes());
-            let entries = entries_present(present, list.values().len(), |row| {
+            used_values(list.values(), present, |row| {
                 view_range(offsets, sizes, row)
-            });
-            (list.values().as_ref(), entries)
+            })
         }),
         ArrowDataType::LargeListView(_) => array.as_list_view_opt::<i64>().map(|list| {
             let (offsets, sizes) = (list.value_offsets(), list.value_sizes());
-            let entries = entries_present(present, list.values().len(), |row| {
+            used_values(list.values(), present, |row| {
                 view_range(offsets, sizes, row)
-            });
-            (list.values().as_ref(), entries)
+            })
         }),
         ArrowDataType::FixedSizeList(..) => array.as_fixed_size_list_opt().map(|list| {
             let length = list.value_length() as usize;
-            let entries = entries_present(present, list.values().len(), |row| {
+            used_values(list.values(), present, |row| {
                 let start = list.value_offset(row) as usize;
                 start..start + length
-            });
-            (list.values().as_ref(), entries)
+            })
         }),
         _ => None,
     };
@@ -178,7 +195,7 @@ fn list_entries<'a>(
 
 /// Validates the `file` values at `file_paths` in `array`, whose rows are present in its parent
 /// per `parent_present`.
-fn validate(
+fn validate_at_file_paths(
     array: &dyn Array,
     file_paths: &FilePaths,
     parent_present: &[bool],
@@ -197,7 +214,7 @@ fn validate(
                         ColumnName::new(current_column_path.iter().cloned())
                     ))
                 })?;
-                validate(
+                validate_at_file_paths(
                     column.as_ref(),
                     inner,
                     &current_present,
@@ -209,17 +226,17 @@ fn validate(
         }
         FilePaths::Array(element) => {
             let (values, entries) = list_entries(array, &current_present)?;
-            validate(values, element, &entries, current_column_path)
+            validate_at_file_paths(values.as_ref(), element, &entries, current_column_path)
         }
         FilePaths::Map(value) => {
             let map = array.as_map_opt().ok_or_else(|| {
                 make_arrow_error("Arrow claimed to be a map but isn't a MapArray")
             })?;
             let offsets = map.value_offsets();
-            let entries = entries_present(&current_present, map.entries().len(), |row| {
+            let (values, entries) = used_values(map.values(), &current_present, |row| {
                 offset_range(offsets, row)
             });
-            validate(map.values().as_ref(), value, &entries, current_column_path)
+            validate_at_file_paths(values.as_ref(), value, &entries, current_column_path)
         }
     }
 }
@@ -462,15 +479,7 @@ mod tests {
             Arc::new(file),
             nulls,
         );
-        let data = StructArray::from(vec![(
-            Arc::new(Field::new("a", list.data_type().clone(), true)),
-            Arc::new(list) as ArrayRef,
-        )]);
-        let schema = StructType::new_unchecked([StructField::nullable(
-            "a",
-            ArrayType::new(DataType::file_type(), true),
-        )]);
-        (data, schema)
+        array_column(Arc::new(list))
     }
 
     /// An invalid value is not checked where no present row uses it: in the range of a null list
@@ -597,15 +606,7 @@ mod tests {
                 Arc::new(file),
                 nulls,
             );
-            let data = StructArray::from(vec![(
-                Arc::new(Field::new("a", list.data_type().clone(), true)),
-                Arc::new(list) as ArrayRef,
-            )]);
-            let schema = StructType::new_unchecked([StructField::nullable(
-                "a",
-                ArrayType::new(DataType::file_type(), true),
-            )]);
-            (data, schema)
+            array_column(Arc::new(list))
         };
         let (data, schema) = large_list(Some(NullBuffer::from(vec![true, false])));
         validate_file_values(&data, &schema).unwrap();
@@ -713,5 +714,22 @@ mod tests {
             }
             other => panic!("expected a missing `file` column error, got {other:?}"),
         }
+    }
+
+    /// Only the span of child values that present rows use is marked, so a slice or a null row
+    /// at either end does not make validation scan the rest of the child values.
+    #[test]
+    fn entries_present_covers_only_the_used_span() {
+        let ranges = [0..2, 2..5, 5..6, 6..9];
+        let range_of = |row: usize| ranges[row].clone();
+        // Rows 1 and 2 are present.
+        let (span, present) = entries_present(&[false, true, true, false], 8, range_of);
+        assert_eq!((span, present), (2..6, vec![true; 4]));
+        // Only row 3 is present; its range is clamped to the 8 child values.
+        let (span, present) = entries_present(&[false, false, false, true], 8, range_of);
+        assert_eq!((span, present), (6..8, vec![true; 2]));
+        // No row is present.
+        let (span, present) = entries_present(&[false; 4], 8, range_of);
+        assert_eq!((span, present), (0..0, vec![]));
     }
 }
