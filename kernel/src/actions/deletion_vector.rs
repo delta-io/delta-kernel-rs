@@ -824,6 +824,15 @@ fn normalized_absolute_marker_and_path(
     }
 }
 
+impl crate::snapshot::memory::HeapSize for DeletionVectorDescriptor {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.path_or_inline_dv.heap_size(context)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

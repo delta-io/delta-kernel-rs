@@ -25,8 +25,10 @@ pub(crate) use crate::schema::file_utils::validate_file_type_feature_support;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
-    schema_has_invariants, validate_column_defaults_metadata, SchemaRef, StructField, StructType,
+    build_and_measure_schema, measure_schema, schema_has_invariants, SchemaRef, StructField,
+    StructType,
 };
+use crate::snapshot::memory::Memory;
 #[cfg(feature = "geo-type-in-dev")]
 use crate::table_features::validate_geospatial_feature_support;
 use crate::table_features::{
@@ -301,6 +303,8 @@ pub(crate) struct TableConfiguration {
     protocol: Protocol,
     /// Logical schema: field names are the user-facing (logical) column names.
     logical_schema: SchemaRef,
+    /// Creation-time summaries of the four immutable schema roots; nested nodes store no counters.
+    schema_memory: [Memory; 4],
     /// Whether any field in the logical schema declares a column default.
     has_column_with_default: bool,
     /// The subset of the logical schema that remains after excluding partition columns.
@@ -373,12 +377,13 @@ impl TableConfiguration {
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
         let physical_schema = Arc::new(logical_schema.make_physical(column_mapping_mode)?);
+        let (_, physical_memory) = measure_schema(&physical_schema, false)?;
         let partition_columns: HashSet<&str> = metadata
             .partition_columns()
             .iter()
             .map(|s| s.as_str())
             .collect();
-        let physical_data_schema_without_partition_columns = {
+        let (physical_data_schema_without_partition_columns, physical_data_memory) = {
             let fields = logical_schema
                 .fields()
                 .zip(physical_schema.fields())
@@ -387,19 +392,27 @@ impl TableConfiguration {
                 })
                 .map(|(_, physical_field)| physical_field.clone());
             // Safety: subset of an already-valid schema.
-            Arc::new(StructType::new_unchecked(fields))
+            let (schema, memory) = build_and_measure_schema(fields)?;
+            (Arc::new(schema), memory)
         };
-        let logical_schema_without_partition_columns = {
+        let (logical_schema_without_partition_columns, logical_data_memory) = {
             let fields = logical_schema
                 .fields()
                 .filter(|field| !partition_columns.contains(field.name().as_str()))
                 .cloned();
             // Safety: subset of an already-valid schema.
-            Arc::new(StructType::new_unchecked(fields))
+            let (schema, memory) = build_and_measure_schema(fields)?;
+            (Arc::new(schema), memory)
         };
 
         let mut table_config = Self {
             logical_schema,
+            schema_memory: [
+                Memory::ZERO,
+                physical_memory,
+                logical_data_memory,
+                physical_data_memory,
+            ],
             has_column_with_default: false,
             logical_schema_without_partition_columns,
             physical_schema,
@@ -433,8 +446,10 @@ impl TableConfiguration {
         // Reject corrupt column-default metadata (a non-string `CURRENT_DEFAULT`, or a non-`NULL`
         // default on a Variant column) and retain whether the validated schema declares any column
         // defaults.
-        table_config.has_column_with_default =
-            validate_column_defaults_metadata(&table_config.logical_schema)?;
+        (
+            table_config.has_column_with_default,
+            table_config.schema_memory[0],
+        ) = measure_schema(&table_config.logical_schema, true)?;
         // Reject tables with geo-typed columns that don't declare the `geospatial` feature.
         #[cfg(feature = "geo-type-in-dev")]
         validate_geospatial_feature_support(&table_config)?;
@@ -1283,6 +1298,28 @@ impl TableConfiguration {
             ));
         }
         Ok(())
+    }
+}
+
+impl crate::snapshot::memory::HeapSize for TableConfiguration {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.metadata.heap_size(context)
+            + self.protocol.heap_size(context)
+            + context.include_arc(&self.logical_schema, self.schema_memory[0])
+            + context.include_arc(&self.physical_schema, self.schema_memory[1])
+            + context.include_arc(
+                &self.logical_schema_without_partition_columns,
+                self.schema_memory[2],
+            )
+            + context.include_arc(
+                &self.physical_data_schema_without_partition_columns,
+                self.schema_memory[3],
+            )
+            + self.table_properties.heap_size(context)
+            + self.table_root.heap_size(context)
     }
 }
 

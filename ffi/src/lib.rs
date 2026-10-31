@@ -1696,6 +1696,31 @@ pub unsafe extern "C" fn version(snapshot: Handle<SharedSnapshot>) -> u64 {
     snapshot.version()
 }
 
+/// Returns the cached estimate of retained requested allocation bytes at Snapshot construction.
+///
+/// This O(1) accessor borrows the handle and performs no I/O or allocation. The count includes
+/// schema, configuration, log, CRC, and captured checkpoint state. It excludes construction and
+/// scan temporaries, later lazy state, engine storage, allocator overhead, and RSS. Shared storage
+/// is counted once within a snapshot, but can be counted again by a different snapshot's estimate.
+/// Container layouts and log-path sampling are estimates, not hard upper bounds.
+/// `None` indicates an accounting invariant that could not be satisfied;
+/// it must not be interpreted as zero bytes.
+///
+/// # Safety
+///
+/// The caller must provide a valid snapshot handle and keep it alive for this call.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_retained_memory_at_creation(
+    snapshot: Handle<SharedSnapshot>,
+) -> OptionalValue<u64> {
+    unsafe { snapshot.as_ref() }
+        .retained_memory_at_creation()
+        .total_bytes()
+        .ok()
+        .map(|bytes| bytes as u64)
+        .into()
+}
+
 /// Get the timestamp of the specified snapshot in milliseconds since the Unix epoch.
 ///
 /// When In-Commit Timestamp (ICT) is enabled, returns the ICT value from the commit's

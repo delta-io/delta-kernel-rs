@@ -725,6 +725,31 @@ impl DeletedRecordCountsHistogram {
     }
 }
 
+impl crate::snapshot::memory::HeapSize for Crc {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.metadata.heap_size(context)
+            + self.protocol.heap_size(context)
+            + self.file_stats_state.heap_size(context)
+            + self.set_transaction_state.heap_size(context)
+            + self.domain_metadata_state.heap_size(context)
+            + self.all_files.heap_size(context)
+            + self.txn_id.heap_size(context)
+            + self.deleted_record_counts_histogram_opt.heap_size(context)
+    }
+}
+
+impl crate::snapshot::memory::HeapSize for DeletedRecordCountsHistogram {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.deleted_record_counts.heap_size(context)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

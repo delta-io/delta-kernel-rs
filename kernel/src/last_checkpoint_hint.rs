@@ -556,6 +556,38 @@ impl LastCheckpointV2 {
     }
 }
 
+impl crate::snapshot::memory::HeapSize for LastCheckpointHint {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        let memory = self.checkpoint_schema.heap_size(context)
+            + self.checksum.heap_size(context)
+            + self.tags.heap_size(context)
+            + self.v2_checkpoint.heap_size(context);
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let memory = memory
+            + self
+                .amt_checkpoint
+                .as_ref()
+                .map_or(crate::snapshot::memory::Memory::ZERO, |amt| {
+                    amt.checkpoint.heap_size(context) + amt.leaves.heap_size(context)
+                });
+        memory
+    }
+}
+
+impl crate::snapshot::memory::HeapSize for LastCheckpointV2 {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.path.heap_size(context)
+            + self.sidecar_files.heap_size(context)
+            + self.non_file_actions.heap_size(context)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]

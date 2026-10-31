@@ -525,6 +525,15 @@ macro_rules! joined_column_expr {
 }
 use serde::{Deserialize, Serialize};
 
+impl crate::snapshot::memory::HeapSize for ColumnName {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.path.heap_size(context)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

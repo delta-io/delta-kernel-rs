@@ -283,6 +283,15 @@ impl RowVisitor for FileStatsVisitor<'_, '_> {
     }
 }
 
+impl crate::snapshot::memory::HeapSize for FileStats {
+    fn heap_size(
+        &self,
+        context: &mut crate::snapshot::memory::SizeContext,
+    ) -> crate::snapshot::memory::Memory {
+        self.file_size_histogram.heap_size(context)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;

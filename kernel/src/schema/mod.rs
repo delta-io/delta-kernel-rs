@@ -29,11 +29,17 @@ use crate::utils::{require, CollectInto};
 use crate::{KernelError, KernelResult};
 
 pub(crate) mod column_default;
+pub(crate) use column_default::try_collect_column_defaults;
+#[cfg(test)]
+pub(crate) use column_default::validate_column_defaults_metadata;
 pub use column_default::ColumnDefault;
-pub(crate) use column_default::{try_collect_column_defaults, validate_column_defaults_metadata};
 pub(crate) mod compare;
+mod memory;
+pub(crate) use memory::{build_and_measure_schema, measure_schema};
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
+#[cfg(test)]
+mod memory_tests;
 
 pub(crate) mod collation_utils;
 #[cfg(feature = "internal-api")]
