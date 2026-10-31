@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{schema_ref, DataType, StructField};
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
-use delta_kernel::transaction::{Transaction, UpdateTableOperation};
+use delta_kernel::transaction::{Transaction, UpdateTableOperation, UpdateTableTransactionBuilder};
 use delta_kernel::{Engine, FileMeta, KernelError, KernelResult};
 use rstest::rstest;
 use serde_json::{json, Value};
@@ -384,5 +384,76 @@ async fn test_commit_info_omits_adaptive_metadata_fields_without_the_feature(
     let commit_info = commit_info_at(&table_url, 1)?;
     assert!(commit_info.get("dataChange").is_none());
     assert!(commit_info.get("lastManifestCommit").is_none());
+    Ok(())
+}
+
+/// Configures one transaction's builder.
+type Configure = fn(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder;
+
+/// Commits transactions configured by `before`, `manifest`, then `after`, the `manifest` one as a
+/// manifest commit of a root manifest that is never read, and returns a freshly loaded snapshot.
+fn commit_around_root_manifest(
+    engine: &dyn Engine,
+    table_url: &Url,
+    snapshot: SnapshotRef,
+    before: Configure,
+    manifest: Configure,
+    after: Configure,
+) -> Result<SnapshotRef, Box<dyn std::error::Error>> {
+    let commit = |snapshot, configure, root_manifest: Option<FileMeta>| {
+        let mut txn = begin_transaction_with(
+            snapshot,
+            engine,
+            UpdateTableOperation::Write,
+            "test-engine",
+            true,
+            configure,
+        )?;
+        if let Some(file) = root_manifest {
+            txn = txn.with_root_manifest_file(file)?;
+        }
+        Ok::<_, Box<dyn std::error::Error>>(txn.commit(engine)?.unwrap_post_commit_snapshot())
+    };
+    let root_manifest = FileMeta {
+        location: table_url.join("metadata/root-v2.parquet")?,
+        last_modified: 0,
+        size: 1024,
+    };
+    let snapshot = commit(snapshot, before, None)?;
+    let snapshot = commit(snapshot, manifest, Some(root_manifest))?;
+    commit(snapshot, after, None)?;
+    Ok(Snapshot::builder_for(table_url.clone()).build(engine)?)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_app_id_versions_read_across_a_root_manifest_commit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (engine, _temp_dir, table_url, snapshot) =
+        setup_adaptive_metadata_table("root_manifest_file_app_id_versions").await?;
+
+    // End-to-end consistency with the real writer, which also writes each `txn` to its commit: the
+    // manifest commit's checkpoint action holds `app-1` and `app-2`, and the commit after it
+    // overrides `app-1`.
+    let snapshot = commit_around_root_manifest(
+        &engine,
+        &table_url,
+        snapshot,
+        |builder| builder.with_transaction_id("app-1", 5),
+        |builder| builder.with_transaction_id("app-2", 7),
+        |builder| builder.with_transaction_id("app-1", 6),
+    )?;
+
+    assert_eq!(
+        snapshot.reader().get_app_id_version("app-1", &engine)?,
+        Some(6)
+    );
+    assert_eq!(
+        snapshot.reader().get_app_id_version("app-2", &engine)?,
+        Some(7)
+    );
+    assert_eq!(
+        snapshot.reader().get_app_id_version("app-3", &engine)?,
+        None
+    );
     Ok(())
 }

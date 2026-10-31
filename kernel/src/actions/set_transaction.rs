@@ -3,7 +3,7 @@ use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{SetTransaction, LOG_TXN_SCHEMA};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
-use crate::{Engine, KernelResult, KernelResultIterator, RowVisitor as _, Version};
+use crate::{Engine, KernelResult, KernelResultIterator, RowVisitor as _, Snapshot, Version};
 
 /// Resolves the latest `txn` action per application id via log replay, where the newest action in
 /// log order wins.
@@ -19,11 +19,11 @@ impl SetTransactionScanner {
     /// Note that each call to this function repeats log replay. Thus, if callers are interested
     /// in multiple app ids, use `get_all` (once) instead and probe the map returned.
     pub(crate) fn get_one(
-        log_segment: &LogSegment,
+        snapshot: &Snapshot,
         application_id: &str,
         engine: &dyn Engine,
     ) -> KernelResult<Option<SetTransaction>> {
-        let actions = replay_for_app_ids(log_segment, engine)?;
+        let actions = replay_for_app_ids(snapshot, engine)?;
         let mut transactions = scan_application_transactions(actions, Some(application_id))?;
         Ok(transactions.remove(application_id))
     }
@@ -31,10 +31,10 @@ impl SetTransactionScanner {
     /// Scan the Delta Log for the latest `txn` action of every application id.
     #[allow(unused)]
     pub(crate) fn get_all(
-        log_segment: &LogSegment,
+        snapshot: &Snapshot,
         engine: &dyn Engine,
     ) -> KernelResult<SetTransactionMap> {
-        let actions = replay_for_app_ids(log_segment, engine)?;
+        let actions = replay_for_app_ids(snapshot, engine)?;
         scan_application_transactions(actions, None)
     }
 
@@ -87,10 +87,10 @@ fn scan_application_transactions(
 
 // The full-log `txn` read that `get_one` and `get_all` fold; factored out to facilitate testing.
 fn replay_for_app_ids(
-    log_segment: &LogSegment,
+    snapshot: &Snapshot,
     engine: &dyn Engine,
 ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
-    log_segment.read_actions(engine, LOG_TXN_SCHEMA.clone())
+    snapshot.read_log_actions(engine, LOG_TXN_SCHEMA.clone())
 }
 
 #[cfg(test)]
@@ -103,7 +103,6 @@ mod tests {
     use crate::arrow::array::StringArray;
     use crate::engine::sync::SyncEngine;
     use crate::unit_test_utils::parse_json_batch;
-    use crate::Snapshot;
 
     fn get_latest_transactions(
         path: &str,
@@ -114,11 +113,10 @@ mod tests {
         let engine = SyncEngine::new();
 
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-        let log_segment = snapshot.log_segment();
 
         (
-            SetTransactionScanner::get_all(log_segment, &engine).unwrap(),
-            SetTransactionScanner::get_one(log_segment, app_id, &engine).unwrap(),
+            SetTransactionScanner::get_all(&snapshot, &engine).unwrap(),
+            SetTransactionScanner::get_one(&snapshot, app_id, &engine).unwrap(),
         )
     }
 
@@ -164,10 +162,9 @@ mod tests {
         let engine = SyncEngine::new();
 
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-        let log_segment = snapshot.log_segment();
 
         // The checkpoint has five parts, each containing one action. There are two app ids.
-        let data: Vec<_> = replay_for_app_ids(log_segment, &engine)
+        let data: Vec<_> = replay_for_app_ids(&snapshot, &engine)
             .unwrap()
             .try_collect()
             .unwrap();
@@ -181,10 +178,9 @@ mod tests {
         let engine = SyncEngine::new();
 
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-        let log_segment = snapshot.log_segment();
 
         // The scanner returns every app_id regardless of `lastUpdated`; callers apply retention.
-        let all_txns = SetTransactionScanner::get_all(log_segment, &engine).unwrap();
+        let all_txns = SetTransactionScanner::get_all(&snapshot, &engine).unwrap();
         assert_eq!(all_txns.len(), 4);
     }
 
