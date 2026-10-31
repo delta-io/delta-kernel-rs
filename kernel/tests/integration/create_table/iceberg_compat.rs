@@ -122,7 +122,7 @@ fn v3_create_table_rejects_interval_column(
     Ok(())
 }
 
-/// TODO: Stricter than the spec, which only requires column mapping to be supported when
+/// TODO(#3769): Stricter than the spec, which only requires column mapping to be supported when
 /// IcebergCompatV3 is supported. CREATE runs the write path checks, which require the
 /// requirements of every listed writer feature to hold.
 #[test]
