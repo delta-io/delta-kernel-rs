@@ -8,8 +8,8 @@ use crate::expressions::{
     VariadicExpression,
 };
 use crate::transforms::{
-    carrier_into_inner_opt, map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else,
-    transform_output_type, Carrier,
+    carrier_into_inner_opt, carrier_try_none, map_owned_children_or_else, map_owned_or_else,
+    map_owned_pair_or_else, transform_output_type, Carrier,
 };
 use crate::{DeltaResult, Error};
 
@@ -42,6 +42,9 @@ use crate::{DeltaResult, Error};
 /// * Variadic (0+ children) - If no children remain (all filtered out), filter out the parent.
 ///   Otherwise, if at least one child changed or was filtered out, build a new parent around the
 ///   children. Otherwise, return the parent unchanged.
+///
+/// * CASE WHEN - If any condition, result, or existing ELSE was filtered out, filter out the
+///   parent. Otherwise, rebuild only if a child changed. An originally absent ELSE stays absent.
 ///
 /// Implementations can call these as needed but will generally not need to override them.
 ///
@@ -410,8 +413,8 @@ pub trait ExpressionTransform<'a> {
         map_owned_children_or_else(v, children, |exprs| VariadicExpression::new(v.op, exprs))
     }
 
-    /// Recursively transforms CASE WHEN branches and the optional ELSE. Filtering a condition or
-    /// result drops its pair; filtering ELSE removes the fallback. An empty CASE returns NULL.
+    /// Recursively transforms CASE WHEN branches and the optional ELSE. Filtering any existing
+    /// child filters out the entire CASE.
     fn recurse_into_expr_case_when(
         &mut self,
         c: &'a CaseWhenExpression,
@@ -424,8 +427,6 @@ pub trait ExpressionTransform<'a> {
             if let (Some(condition), Some(result)) = (condition, result) {
                 changed |= matches!(condition, Cow::Owned(_)) || matches!(result, Cow::Owned(_));
                 branches.push((condition, result));
-            } else {
-                changed = true;
             }
         }
         let else_expr = if let Some(else_expr) = &c.else_expr {
@@ -435,6 +436,10 @@ pub trait ExpressionTransform<'a> {
         } else {
             None
         };
+        // Visit all children before propagating filtering: visitor carriers also produce None.
+        if branches.len() != c.branches.len() || (c.else_expr.is_some() && else_expr.is_none()) {
+            carrier_try_none!();
+        }
         Carrier::from_inner(if changed {
             Cow::Owned(CaseWhenExpression::new(
                 branches
@@ -689,14 +694,23 @@ mod tests {
         }
     }
 
-    fn case_when_columns(names: [&str; 5]) -> Expr {
+    struct ColumnRemover<'a>(&'a str);
+    impl<'a> ExpressionTransform<'a> for ColumnRemover<'_> {
+        transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
+        fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+            (name != &ColumnName::new([self.0])).then_some(Cow::Borrowed(name))
+        }
+    }
+
+    fn case_when_columns(names: [&str; 5], with_else: bool) -> Expr {
         let [c1, r1, c2, r2, fallback] = names.map(|name| Expr::column([name]));
         Expr::case_when(
             [
                 (Pred::BooleanExpression(c1), r1),
                 (Pred::BooleanExpression(c2), r2),
             ],
-            Some(fallback),
+            with_else.then_some(fallback),
         )
     }
 
@@ -710,59 +724,42 @@ mod tests {
     #[case::no_match(&[])]
     fn test_transform_expr_case_when_recursion(#[case] changed: &[usize]) {
         let names = std::array::from_fn(|i| if changed.contains(&i) { "old_col" } else { "x" });
-        let input = case_when_columns(names);
-        let expected =
-            case_when_columns(names.map(|name| if name == "old_col" { "new_col" } else { name }));
+        let input = case_when_columns(names, true);
+        let expected = case_when_columns(
+            names.map(|name| if name == "old_col" { "new_col" } else { name }),
+            true,
+        );
         let result = ColumnReplacer.transform_expr(&input);
         assert_eq!(matches!(result, Cow::Borrowed(_)), changed.is_empty());
         assert_eq!(result.into_owned(), expected);
     }
 
-    #[test]
-    fn test_transform_empty_case_when_returns_borrowed() {
-        let expr = Expr::case_when([], None);
+    #[rstest::rstest]
+    fn test_transform_case_when_without_branches_filters_only_existing_else(
+        #[values(None, Some(column_expr!("fallback")))] else_expr: Option<Expr>,
+        #[values("missing", "fallback")] dropped: &str,
+    ) {
+        let filtered = else_expr.is_some() && dropped == "fallback";
+        let expr = Expr::case_when([], else_expr);
         assert!(matches!(
             ColumnReplacer.transform_expr(&expr),
             Cow::Borrowed(_)
         ));
+        let result = ColumnRemover(dropped).transform_expr(&expr);
+        assert_eq!(result.as_deref(), (!filtered).then_some(&expr));
+        assert_eq!(matches!(result, Some(Cow::Borrowed(_))), !filtered);
     }
 
     #[rstest::rstest]
-    #[case::condition_drops_pair(&["c1"], &[1], true)]
-    #[case::result_drops_pair(&["r1"], &[1], true)]
-    #[case::else_becomes_implicit_null(&["fallback"], &[0, 1], false)]
-    #[case::all_pairs_dropped_keep_else(&["c1", "c2"], &[], true)]
-    #[case::all_children_dropped_becomes_null(&["c1", "r1", "c2", "r2", "fallback"], &[], false)]
-    fn test_transform_expr_case_when_filters_children(
-        #[case] dropped: &[&str],
-        #[case] retained: &[usize],
-        #[case] keep_else: bool,
+    fn test_transform_expr_case_when_filters_entire_expression(
+        #[values("c1", "r1", "c2", "r2", "fallback", "missing")] dropped: &str,
+        #[values(false, true)] with_else: bool,
     ) {
-        struct ColumnRemover<'a>(&'a [&'a str]);
-        impl<'a> ExpressionTransform<'a> for ColumnRemover<'_> {
-            transform_output_type!(|'a, T| Option<Cow<'a, T>>);
-            fn transform_expr_column(
-                &mut self,
-                name: &'a ColumnName,
-            ) -> Option<Cow<'a, ColumnName>> {
-                (!self
-                    .0
-                    .iter()
-                    .any(|dropped| name == &ColumnName::new([*dropped])))
-                .then_some(Cow::Borrowed(name))
-            }
-        }
-        let input = case_when_columns(["c1", "r1", "c2", "r2", "fallback"]);
-        let Expr::CaseWhen(case_when) = &input else {
-            panic!("expected CASE WHEN")
-        };
-        let expected = Expr::case_when(
-            retained.iter().map(|&i| case_when.branches[i].clone()),
-            keep_else.then(|| column_expr!("fallback")),
-        );
-        let result = ColumnRemover(dropped).transform_expr(&input).unwrap();
-        assert!(matches!(result, Cow::Owned(_)));
-        assert_eq!(result.into_owned(), expected);
+        let input = case_when_columns(["c1", "r1", "c2", "r2", "fallback"], with_else);
+        let result = ColumnRemover(dropped).transform_expr(&input);
+        let unchanged = dropped == "missing" || (!with_else && dropped == "fallback");
+        assert_eq!(result.as_deref(), unchanged.then_some(&input));
+        assert_eq!(matches!(result, Some(Cow::Borrowed(_))), unchanged);
     }
 
     #[test]
@@ -775,7 +772,7 @@ mod tests {
             }
         }
         let names = ["c1", "r1", "c2", "r2", "fallback"];
-        let expr = case_when_columns(names);
+        let expr = case_when_columns(names, true);
         let mut collector = ColumnCollector(Vec::new());
         collector.transform_expr(&expr);
         assert_eq!(collector.0, names.map(|name| ColumnName::new([name])));
