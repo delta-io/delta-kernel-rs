@@ -493,10 +493,10 @@ mod tests {
     use crate::log_segment::LogSegment;
     use crate::scan::state::DvInfo;
     use crate::schema::schema_ref;
-    use crate::table_changes::log_replay::{
-        table_changes_action_iter, table_changes_action_iter_with_mode,
+    use crate::table_changes::test_utils::{
+        replay_unmapped_unpartitioned_table_changes, row_tracking_table_config,
+        test_deletion_vector,
     };
-    use crate::table_changes::test_utils::{row_tracking_table_config, test_deletion_vector};
     use crate::table_changes::CdfMode;
     use crate::table_features::ColumnMappingMode;
     use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
@@ -558,7 +558,7 @@ mod tests {
             nullable "value": STRING,
         };
         let table_config = row_tracking_table_config(table_root, table_schema.clone());
-        let scan_metadata = table_changes_action_iter_with_mode(
+        let scan_metadata = replay_unmapped_unpartitioned_table_changes(
             engine,
             &table_config,
             log_segment.listed.ascending_commit_files,
@@ -666,12 +666,13 @@ mod tests {
             .with_table_root(&table_root)
             .build();
 
-        let scan_metadata = table_changes_action_iter(
+        let scan_metadata = replay_unmapped_unpartitioned_table_changes(
             Arc::new(engine),
             &table_config,
             log_segment.listed.ascending_commit_files.clone(),
             table_schema,
             None,
+            CdfMode::ChangeDataFeed,
         )
         .unwrap();
         let scan_files: Vec<_> = scan_metadata_to_scan_file(scan_metadata)

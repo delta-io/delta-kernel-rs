@@ -622,11 +622,12 @@ impl KernelError {
     pub(crate) fn row_tracking_change_feed_unsupported(version: impl Into<Version>) -> Self {
         Self::RowTrackingChangeFeedUnsupported(version.into())
     }
-    pub(crate) fn change_data_feed_incompatible_schema(
-        expected: &StructType,
-        actual: &StructType,
+    /// Creates an incompatible-schema error describing the expected and actual partition layouts.
+    pub(crate) fn change_data_feed_incompatible_partition_layout(
+        expected: String,
+        actual: String,
     ) -> Self {
-        Self::ChangeDataFeedIncompatibleSchema(expected.to_string(), actual.to_string())
+        Self::ChangeDataFeedIncompatibleSchema(expected, actual)
     }
 
     /// Creates an incompatible-schema error that identifies the version of `actual`.
