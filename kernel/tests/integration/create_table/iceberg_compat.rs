@@ -10,7 +10,7 @@ use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::transaction::create_table::create_table;
 use rstest::rstest;
 use serde_json::json;
-use test_utils::test_table_setup;
+use test_utils::{assert_result_error_with_message, test_table_setup};
 
 /// V3 create-table negative paths: enabling V3 alongside an incompatible property must fail at
 /// `.build(...)` with a clear error.
@@ -132,14 +132,11 @@ fn v3_supported_but_not_enabled_requires_column_mapping() -> KernelResult<()> {
         nullable "data": { INTEGER => nullable [nullable INTEGER] },
     };
 
-    let err = create_table(&table_path, schema, "Test/1.0", true)
-        .with_table_properties([("delta.feature.icebergCompatV3", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("Feature 'icebergCompatV3' requires 'columnMapping' to be enabled"),
-        "unexpected error: {err}",
+    assert_result_error_with_message(
+        create_table(&table_path, schema, "Test/1.0", true)
+            .with_table_properties([("delta.feature.icebergCompatV3", "supported")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new())),
+        "Feature 'icebergCompatV3' requires 'columnMapping' to be enabled",
     );
     Ok(())
 }

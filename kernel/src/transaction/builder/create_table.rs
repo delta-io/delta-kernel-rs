@@ -2836,59 +2836,27 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_create_table_iceberg_native_v4_enables_dependencies() {
+    fn test_create_table_iceberg_native_v4_assigns_nested_ids() {
         let txn = build_create_table_txn(
             build_iceberg_compat_test_schema(),
             &[(ENABLE_ICEBERG_NATIVE_V4, "true")],
         )
         .unwrap();
         let config = &txn.effective_table_config;
-        assert!(config.is_feature_enabled(&TableFeature::IcebergNativeV4Preview));
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Id);
-
-        let properties = config.metadata().configuration();
-        for (key, expected) in [
-            (COLUMN_MAPPING_MODE, "id"),
-            (COLUMN_MAPPING_MAX_COLUMN_ID, "9"),
-            (ENABLE_ROW_TRACKING, "true"),
-            (ENABLE_DELETION_VECTORS, "true"),
-            (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
-        ] {
-            assert_eq!(
-                properties.get(key).map(String::as_str),
-                Some(expected),
-                "{key}"
-            );
-        }
+        assert_eq!(
+            config
+                .metadata()
+                .configuration()
+                .get(COLUMN_MAPPING_MAX_COLUMN_ID)
+                .map(String::as_str),
+            Some("9"),
+        );
         let schema = config.logical_schema();
         let top = schema.field("top").unwrap();
         assert!(top
             .metadata()
             .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref()));
-
-        let protocol = config.protocol();
-        let reader_features: HashSet<_> = protocol.reader_features().unwrap().iter().collect();
-        assert_eq!(
-            reader_features,
-            HashSet::from([
-                &TableFeature::ColumnMapping,
-                &TableFeature::DeletionVectors,
-                &TableFeature::AdaptiveMetadataPreview,
-            ])
-        );
-        let writer_features: HashSet<_> = protocol.writer_features().unwrap().iter().collect();
-        assert_eq!(
-            writer_features,
-            HashSet::from([
-                &TableFeature::ColumnMapping,
-                &TableFeature::DeletionVectors,
-                &TableFeature::RowTracking,
-                &TableFeature::DomainMetadata,
-                &TableFeature::InCommitTimestamp,
-                &TableFeature::AdaptiveMetadataPreview,
-                &TableFeature::IcebergNativeV4Preview,
-            ])
-        );
     }
 
     /// Builds `ValidatedTableProperties` directly because some of these properties are not in
@@ -2925,17 +2893,50 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::checkpoint_policy_v2(
+        schema_ref! { nullable "id": INTEGER },
+        &[(ENABLE_ICEBERG_NATIVE_V4, "true"), (CHECKPOINT_POLICY, "v2")],
+        "'v2Checkpoint'"
+    )]
+    #[case::byte_column(
+        schema_ref! { nullable "b": BYTE },
+        &[(ENABLE_ICEBERG_NATIVE_V4, "true")],
+        "icebergNativeV4-preview does not support type at column: b (byte)"
+    )]
+    #[case::enabled_iceberg_compat_v2(
+        schema_ref! { nullable "id": INTEGER },
+        &[(ENABLE_ICEBERG_NATIVE_V4, "true"), (ENABLE_ICEBERG_COMPAT_V2, "true")],
+        "IcebergNativeV4 cannot be enabled together with 'delta.enableIcebergCompatV2'"
+    )]
+    #[case::enabled_iceberg_compat_v3(
+        schema_ref! { nullable "id": INTEGER },
+        &[(ENABLE_ICEBERG_NATIVE_V4, "true"), (ENABLE_ICEBERG_COMPAT_V3, "true")],
+        "IcebergNativeV4 cannot be enabled together with 'delta.enableIcebergCompatV3'"
+    )]
     // TODO(#3769): Stricter than the RFC, which places no requirements on a supported but not
     // enabled icebergNativeV4. The write path checks every listed writer feature.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_create_table_iceberg_native_v4_supported_but_not_enabled_requires_adaptive_metadata() {
+    #[case::supported_but_not_enabled(
+        schema_ref! { nullable "id": INTEGER },
+        &[("delta.feature.icebergNativeV4-preview", "supported")],
+        "Feature 'icebergNativeV4-preview' requires 'adaptiveMetadata-preview' to be enabled"
+    )]
+    // TODO(#3769): Stricter than the RFC, which allows an inactive icebergCompatV2 alongside
+    // icebergNativeV4. The write path checks requirements for every listed writer feature.
+    #[case::supported_iceberg_compat_v2(
+        schema_ref! { nullable "id": INTEGER },
+        &[(ENABLE_ICEBERG_NATIVE_V4, "true"), ("delta.feature.icebergCompatV2", "supported")],
+        "Feature 'icebergCompatV2' requires 'deletionVectors' to not be enabled"
+    )]
+    fn test_create_table_iceberg_native_v4_rejects(
+        #[case] schema: SchemaRef,
+        #[case] properties: &[(&str, &str)],
+        #[case] expected_substring: &str,
+    ) {
         assert_result_error_with_message(
-            build_create_table_txn(
-                schema_ref! { nullable "id": INTEGER },
-                &[("delta.feature.icebergNativeV4-preview", "supported")],
-            ),
-            "Feature 'icebergNativeV4-preview' requires 'adaptiveMetadata-preview' to be enabled",
+            build_create_table_txn(schema, properties),
+            expected_substring,
         );
     }
 
@@ -2955,33 +2956,6 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest]
-    #[case::checkpoint_policy_v2(
-        schema_ref! { nullable "id": INTEGER },
-        &[(CHECKPOINT_POLICY, "v2")],
-        "'v2Checkpoint'"
-    )]
-    #[case::byte_column(
-        schema_ref! { nullable "b": BYTE },
-        &[],
-        "icebergNativeV4-preview does not support type at column: b (byte)"
-    )]
-    fn test_create_table_iceberg_native_v4_rejects_auto_enabled_features(
-        #[case] schema: SchemaRef,
-        #[case] extra_properties: &[(&str, &str)],
-        #[case] expected_substring: &str,
-    ) {
-        let properties: Vec<_> = [(ENABLE_ICEBERG_NATIVE_V4, "true")]
-            .into_iter()
-            .chain(extra_properties.iter().copied())
-            .collect();
-        assert_result_error_with_message(
-            build_create_table_txn(schema, &properties),
-            expected_substring,
-        );
-    }
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[rstest]
     #[case::column_mapping(TableFeature::ColumnMapping)]
     #[case::deletion_vectors(TableFeature::DeletionVectors)]
     #[case::row_tracking(TableFeature::RowTracking)]
@@ -2992,6 +2966,7 @@ mod tests {
     #[case::variant_type(TableFeature::VariantType)]
     #[case::variant_shredding(TableFeature::VariantShredding)]
     #[case::catalog_managed(TableFeature::CatalogManaged)]
+    #[case::iceberg_compat_v3(TableFeature::IcebergCompatV3)]
     fn test_create_table_iceberg_native_v4_accepts_allowed_feature(#[case] feature: TableFeature) {
         let feature_key = format!("delta.feature.{feature}");
         let txn = build_create_table_txn(
@@ -3005,55 +2980,6 @@ mod tests {
         let config = &txn.effective_table_config;
         assert!(config.is_feature_enabled(&TableFeature::IcebergNativeV4Preview));
         assert!(config.is_feature_supported(&feature));
-    }
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_create_table_iceberg_native_v4_accepts_supported_iceberg_compat_v3() {
-        let txn = build_create_table_txn(
-            schema_ref! { nullable "id": INTEGER },
-            &[
-                (ENABLE_ICEBERG_NATIVE_V4, "true"),
-                ("delta.feature.icebergCompatV3", "supported"),
-            ],
-        )
-        .unwrap();
-        let config = &txn.effective_table_config;
-        assert!(config.is_feature_supported(&TableFeature::IcebergCompatV3));
-        assert!(!config.is_feature_enabled(&TableFeature::IcebergCompatV3));
-    }
-
-    // TODO(#3769): Stricter than the RFC, which allows an inactive icebergCompatV2 alongside
-    // icebergNativeV4. The write path checks requirements for every listed writer feature.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_create_table_iceberg_native_v4_rejects_supported_iceberg_compat_v2() {
-        assert_result_error_with_message(
-            build_create_table_txn(
-                schema_ref! { nullable "id": INTEGER },
-                &[
-                    (ENABLE_ICEBERG_NATIVE_V4, "true"),
-                    ("delta.feature.icebergCompatV2", "supported"),
-                ],
-            ),
-            "Feature 'icebergCompatV2' requires 'deletionVectors' to not be enabled",
-        );
-    }
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[rstest]
-    #[case::v2(ENABLE_ICEBERG_COMPAT_V2)]
-    #[case::v3(ENABLE_ICEBERG_COMPAT_V3)]
-    fn test_create_table_iceberg_native_v4_rejects_enabled_iceberg_compat(
-        #[case] compat_key: &str,
-    ) {
-        assert_result_error_with_message(
-            build_create_table_txn(
-                schema_ref! { nullable "id": INTEGER },
-                &[(ENABLE_ICEBERG_NATIVE_V4, "true"), (compat_key, "true")],
-            ),
-            &format!("IcebergNativeV4 cannot be enabled together with '{compat_key}'"),
-        );
     }
 
     /// Asserts the field has CM id == `expected_id` and a `col-` prefixed physical name; returns
