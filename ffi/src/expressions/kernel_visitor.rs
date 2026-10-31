@@ -389,13 +389,15 @@ pub extern "C" fn visit_expression_literal_timestamp_ntz(
     wrap_expression(state, lit(Scalar::TimestampNtz(value)))
 }
 
-/// Visit an interval year-month literal (signed month count).
+/// Registers a `YEAR TO MONTH` literal containing `value` total months in `state`.
+///
+/// Returns its expression ID. Every `i32` month count is valid.
 #[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_literal_interval_year_month(
     state: &mut KernelExpressionVisitorState,
     value: i32,
 ) -> usize {
-    wrap_expression(state, lit(Scalar::IntervalYearMonth(value)))
+    wrap_expression(state, lit(Scalar::IntervalYearMonth(value.into())))
 }
 
 /// Visit an interval day-time literal (signed microsecond count).
@@ -554,7 +556,7 @@ impl NullTypeTag {
                 PrimitiveType::Date => (Self::Date, 0, 0),
                 PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
                 PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
-                PrimitiveType::IntervalYearMonth => (Self::IntervalYearMonth, 0, 0),
+                PrimitiveType::IntervalYearMonth(_) => (Self::IntervalYearMonth, 0, 0),
                 PrimitiveType::IntervalDayTime => (Self::IntervalDayTime, 0, 0),
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
                 // Void has no dedicated FFI tag. The current predicate-construction path is
@@ -879,7 +881,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use delta_kernel::expressions::{col, lit, MapToStructOptions, Scalar};
-    use delta_kernel::schema::{schema, ArrayType, DataType, MapType};
+    use delta_kernel::schema::{schema, ArrayType, DataType, IntervalYearToMonthType, MapType};
     use rstest::rstest;
 
     use super::*;
@@ -1020,6 +1022,14 @@ mod tests {
     }
 
     #[test]
+    fn interval_year_month_null_tag_reconstructs_full_range() {
+        assert_eq!(
+            NullTypeTag::IntervalYearMonth.to_data_type(0, 0).unwrap(),
+            DataType::INTERVAL_YEAR_MONTH
+        );
+    }
+
+    #[test]
     fn to_data_type_decimal() {
         let dt = NullTypeTag::Decimal.to_data_type(10, 2).unwrap();
         assert_eq!(dt, DataType::decimal(10, 2).unwrap());
@@ -1145,19 +1155,19 @@ mod tests {
     }
 
     #[rstest]
-    #[case(Scalar::IntervalYearMonth(17))]
+    #[case(Scalar::interval_year_month(17, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
     #[case(Scalar::IntervalDayTime(1_234_567))]
-    #[case(Scalar::IntervalYearMonth(-13))]
-    #[case(Scalar::IntervalYearMonth(i32::MIN))]
-    #[case(Scalar::IntervalYearMonth(i32::MAX))]
+    #[case(Scalar::interval_year_month(-13, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
+    #[case(Scalar::interval_year_month(i32::MIN, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
+    #[case(Scalar::interval_year_month(i32::MAX, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
     #[case(Scalar::IntervalDayTime(-86_400_000_000))]
     #[case(Scalar::IntervalDayTime(i64::MIN))]
     #[case(Scalar::IntervalDayTime(i64::MAX))]
     fn interval_literal_visitors_build_interval_scalars(#[case] expected: Scalar) {
         let mut state = KernelExpressionVisitorState::default();
         let id = match expected {
-            Scalar::IntervalYearMonth(value) => {
-                visit_expression_literal_interval_year_month(&mut state, value)
+            Scalar::IntervalYearMonth(ref value) => {
+                visit_expression_literal_interval_year_month(&mut state, value.months())
             }
             Scalar::IntervalDayTime(value) => {
                 visit_expression_literal_interval_day_time(&mut state, value)

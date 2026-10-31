@@ -264,7 +264,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::Scalar;
-    use crate::schema::{schema, ArrayType, DataType, MapType};
+    use crate::schema::{schema, ArrayType, DataType, IntervalYearToMonthType, MapType};
 
     fn assert_type_ok(data_type: DataType, value: Scalar) {
         let schema = schema! { not_null "p": (data_type) };
@@ -555,6 +555,37 @@ mod tests {
     ) {
         let err = assert_type_err(data_type, value);
         assert!(err.contains("p"), "{err}");
+    }
+
+    #[rstest]
+    fn test_validate_types_year_month_qualifier_matches_schema(
+        #[values(
+            IntervalYearToMonthType::IntervalYear,
+            IntervalYearToMonthType::IntervalMonth,
+            IntervalYearToMonthType::IntervalYearToMonth
+        )]
+        schema_qualifier: IntervalYearToMonthType,
+        #[values(
+            IntervalYearToMonthType::IntervalYear,
+            IntervalYearToMonthType::IntervalMonth,
+            IntervalYearToMonthType::IntervalYearToMonth
+        )]
+        value_qualifier: IntervalYearToMonthType,
+    ) {
+        let schema = schema! {
+            not_null "p": (DataType::interval_year_month(schema_qualifier))
+        };
+        let value = Scalar::interval_year_month(24, value_qualifier).unwrap();
+        let values = HashMap::from([("p".to_string(), value)]);
+        let result = validate_types(&schema, &values);
+        if schema_qualifier == value_qualifier {
+            result.unwrap();
+        } else {
+            assert!(matches!(
+                result,
+                Err(KernelError::InvalidPartitionValues(_))
+            ));
+        }
     }
 
     /// Complex types (struct, array, map) are rejected as partition column types.
