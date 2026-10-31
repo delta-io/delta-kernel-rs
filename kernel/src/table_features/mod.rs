@@ -540,8 +540,8 @@ static ICEBERG_NATIVE_V4_PREVIEW_INFO: FeatureInfo = FeatureInfo {
 };
 
 /// Writer features an `icebergNativeV4-preview` table may list.
-// TODO: The RFC does not cover geospatial and type widening yet. Update their entries once it
-// does.
+// TODO(#3769): The RFC does not cover fileType, geospatial, and type widening yet. Update their
+// entries once it does.
 const ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURES: &[TableFeature] = &[
     TableFeature::IcebergNativeV4Preview,
     TableFeature::AdaptiveMetadataPreview,

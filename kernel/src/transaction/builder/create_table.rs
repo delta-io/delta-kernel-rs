@@ -660,13 +660,14 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
 
 /// Adds IcebergNativeV4 dependencies when `delta.enableIcebergNativeV4=true`.
 ///
-/// - Sets required props (`columnMapping.mode=id`, row tracking, DVs, ICT). CM *feature*
-///   is added later in `maybe_apply_column_mapping_for_table_create` when mode is name/id.
+/// - Sets required props (`columnMapping.mode=id`, row tracking, DVs, ICT). CM *feature* is added
+///   later in `maybe_apply_column_mapping_for_table_create` when mode is name/id.
 /// - Adds AMT, V4, and domainMetadata features here (V4 depends on AMT directly).
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn maybe_enable_iceberg_native_v4_dependencies(
     validated: &mut ValidatedTableProperties,
 ) -> KernelResult<()> {
+    // TODO(#3769): Replace per-feature dependency wiring with a general CREATE dependency resolver.
     if !validated.is_property_true(ENABLE_ICEBERG_NATIVE_V4) {
         return Ok(());
     }
@@ -2837,8 +2838,8 @@ mod tests {
         );
     }
 
-    // TODO: Stricter than the RFC, which places no requirements on a supported but not enabled
-    // icebergNativeV4. The write path checks requirements for every listed writer feature.
+    // TODO(#3769): Stricter than the RFC, which places no requirements on a supported but not
+    // enabled icebergNativeV4. The write path checks every listed writer feature.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn test_create_table_iceberg_native_v4_supported_but_not_enabled_requires_adaptive_metadata() {
@@ -2935,7 +2936,7 @@ mod tests {
         assert!(!config.is_feature_enabled(&TableFeature::IcebergCompatV3));
     }
 
-    // TODO: Stricter than the RFC, which allows an inactive icebergCompatV2 alongside
+    // TODO(#3769): Stricter than the RFC, which allows an inactive icebergCompatV2 alongside
     // icebergNativeV4. The write path checks requirements for every listed writer feature.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]

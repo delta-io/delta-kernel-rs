@@ -1107,6 +1107,8 @@ impl TableConfiguration {
         }
 
         // Check all enabled writer features have kernel support
+        // TODO(#3769): This validates requirements of supported-but-not-enabled features too,
+        // which is stricter than the protocol.
         for feature in self.get_enabled_writer_features() {
             self.check_feature_support(&feature, Operation::Write)?;
         }
