@@ -136,6 +136,10 @@ pub(crate) struct DeletionVectorInfo {
     pub(crate) key_metadata: Option<Bytes>,
 }
 
+/// The `deletionVector.*` leaf columns of a content entry, in [`DeletionVectorInfo`] field order.
+pub(crate) static DV_INFO_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| DeletionVectorInfo::to_schema().leaves(DV_INFO));
+
 /// Sub-struct of ContentTreeNodeEntry that tracks details
 /// of the history of a file in the AMT (its current state,
 /// a sequence number for when it was added, etc).

@@ -5,7 +5,7 @@
 
 use url::{ParseError, Url};
 
-use crate::path_encoding::uri_encode_path;
+use crate::path_encoding::{uri_decode_path, uri_encode_path};
 use crate::utils::{require, to_file_size};
 use crate::{FileMeta, KernelError, KernelResult};
 
@@ -23,18 +23,44 @@ use crate::{FileMeta, KernelError, KernelResult};
 ///
 /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
 pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult<Url> {
-    match scheme_len(path) {
-        Some(scheme_len) => {
-            reject_dot_segments(path)?;
-            let (prefix, raw_path) = split_authority(path, scheme_len);
-            uri_with_encoded_path(prefix, raw_path).map_err(|e| {
-                KernelError::generic(format!(
-                    "Failed to parse absolute AMT location {path:?}: {e}"
-                ))
-            })
-        }
+    match parse_absolute_amt_location(path)? {
+        Some(url) => Ok(url),
         None => encode_and_join(path, table_root),
     }
+}
+
+/// Parses an absolute AMT `path` into a [`Url`] with its path component percent-encoded, as
+/// [`resolve_amt_location`] does, or returns `None` if `path` is relative (has no URI scheme).
+pub(crate) fn parse_absolute_amt_location(path: &str) -> KernelResult<Option<Url>> {
+    let Some(scheme_len) = scheme_len(path) else {
+        return Ok(None);
+    };
+    reject_dot_segments(path)?;
+    let (prefix, raw_path) = split_authority(path, scheme_len);
+    let url = uri_with_encoded_path(prefix, raw_path).map_err(|e| {
+        KernelError::generic(format!(
+            "Failed to parse absolute AMT location {path:?}: {e}"
+        ))
+    })?;
+    Ok(Some(url))
+}
+
+/// Converts an absolute, percent-encoded `uri` (such as a Delta `p` deletion vector path) into the
+/// raw form AMT locations are stored in: the inverse of [`resolve_amt_location`] for an absolute
+/// path. The `scheme:[//authority]` prefix is kept verbatim and the path component is
+/// percent-decoded.
+pub(crate) fn raw_amt_location_from_uri(uri: &str) -> KernelResult<String> {
+    let invalid =
+        |reason: &str| KernelError::generic(format!("Invalid absolute URI {uri:?}: {reason}"));
+    let scheme_len = scheme_len(uri).ok_or_else(|| invalid("no URI scheme"))?;
+    let url = Url::parse(uri).map_err(|e| invalid(&e.to_string()))?;
+    require!(
+        url.query().is_none() && url.fragment().is_none(),
+        invalid("a query or fragment cannot be stored as an AMT location")
+    );
+    let (prefix, encoded_path) = split_authority(uri, scheme_len);
+    let path = uri_decode_path(encoded_path).ok_or_else(|| invalid("path is not valid UTF-8"))?;
+    Ok(format!("{prefix}{path}"))
 }
 
 /// Builds the [`FileMeta`] of an AMT manifest file referenced by `path` (absolute, or relative to
@@ -173,7 +199,7 @@ fn uri_with_encoded_path(prefix: &str, raw_path: &str) -> Result<Url, ParseError
 
 /// Rejects a `path` containing a `.` or `..` segment: the Iceberg V4 path spec does not support
 /// relative navigation, and URL parsing would otherwise silently collapse such segments.
-fn reject_dot_segments(path: &str) -> KernelResult<()> {
+pub(crate) fn reject_dot_segments(path: &str) -> KernelResult<()> {
     require!(
         !path
             .split('/')
@@ -300,6 +326,37 @@ mod tests {
         let table_root = Url::parse(table_root).unwrap();
         let location = resolve_amt_location(path, &table_root).unwrap();
         assert_eq!(location.as_str(), expected_location);
+    }
+
+    #[rstest]
+    #[case::encoded_space("s3://bucket/data/dv%20file.bin", "s3://bucket/data/dv file.bin")]
+    #[case::unencoded("s3://bucket/data/dv.bin", "s3://bucket/data/dv.bin")]
+    #[case::encoded_reserved_chars(
+        "s3://bucket/data/a%23b%3Fc%25d.bin",
+        "s3://bucket/data/a#b?c%d.bin"
+    )]
+    #[case::userinfo_authority_kept(
+        "abfss://c1@acct.dfs.core.windows.net/t/a%20b.bin",
+        "abfss://c1@acct.dfs.core.windows.net/t/a b.bin"
+    )]
+    fn test_raw_amt_location_from_uri_round_trips(#[case] uri: &str, #[case] expected_raw: &str) {
+        let raw = raw_amt_location_from_uri(uri).unwrap();
+        assert_eq!(raw, expected_raw);
+        let table_root = Url::parse("memory:///table/").unwrap();
+        assert_eq!(
+            resolve_amt_location(&raw, &table_root).unwrap().as_str(),
+            uri
+        );
+    }
+
+    #[rstest]
+    #[case::relative("data/dv.bin", "no URI scheme")]
+    #[case::not_a_url("s3://bucket:port/dv.bin", "Invalid absolute URI")]
+    #[case::query("s3://bucket/dv.bin?x=1", "query or fragment")]
+    #[case::fragment("s3://bucket/dv.bin#x", "query or fragment")]
+    #[case::invalid_utf8("s3://bucket/%FF.bin", "not valid UTF-8")]
+    fn test_raw_amt_location_from_uri_errors(#[case] uri: &str, #[case] message: &str) {
+        assert_result_error_with_message(raw_amt_location_from_uri(uri), message);
     }
 
     #[rstest]

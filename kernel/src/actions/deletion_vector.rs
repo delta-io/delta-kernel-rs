@@ -1585,6 +1585,13 @@ mod tests {
         "s3://mytable/",
         "ps3://other/a%20b/dv.bin"
     )]
+    #[case::uuid_relative_absent_offset(
+        DeletionVectorStorageType::PersistedRelative,
+        "ab^-aqEH.-t@S}K{vb[*k^",
+        None,
+        "s3://mytable/",
+        "rab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
+    )]
     #[case::inline(
         DeletionVectorStorageType::Inline,
         "ABC",
