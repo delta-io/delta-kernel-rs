@@ -11,6 +11,7 @@
 //! `modificationTime` and `dataChange` have no AMT source and are supplied by the caller via
 //! [`ReadContext`].
 
+use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, LazyLock};
 use std::{iter, slice};
@@ -19,7 +20,7 @@ use bytes::Bytes;
 use url::Url;
 
 use crate::actions::{CheckpointAction, ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA};
-use crate::amt_path_util::amt_manifest_filemeta;
+use crate::amt_path_util::{amt_location_to_add_path, amt_manifest_filemeta};
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::mumbling::MumblingBitmap;
 use crate::content_tree::{
@@ -285,9 +286,25 @@ static FIRST_ROW_ID_HELPER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
+/// Column appended to an entry batch holding each selected entry's `location` encoded into the
+/// RFC 2396 form `Add.path` uses, or null when encoding leaves it unchanged.
+const ENCODED_PATH_HELPER: &str = "_encodedPath";
+
+/// Schema of the appended [`ENCODED_PATH_HELPER`] column.
+static ENCODED_PATH_HELPER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new_unchecked([StructField::nullable(
+        ENCODED_PATH_HELPER,
+        DataType::STRING,
+    )]))
+});
+
 /// Leaf converter input schema: the entry schema plus [`FIRST_ROW_ID_HELPER`].
-static LEAF_INPUT_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| entry_schema_with(&FIRST_ROW_ID_HELPER_SCHEMA));
+static LEAF_INPUT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    schema_with_helpers(
+        &ContentTreeNodeEntry::to_schema(),
+        &FIRST_ROW_ID_HELPER_SCHEMA,
+    )
+});
 
 /// Converts content-tree entry batches into `Add`-action batches. The entry->`Add` evaluator is
 /// built once, so one converter can be reused across every batch of a manifest.
@@ -320,7 +337,8 @@ impl EntryConverter {
     /// Returns an error if an entry carries an unknown content-type or tracking-status value, if a
     /// delete manifest entry is live, if a selected (live `Data`) entry is not Parquet, has a
     /// non-zero partition spec id, or carries a deletion vector, column files, or a
-    /// `modifiedSnapshotId` (none yet supported by the read path), if the evaluator fails to
+    /// `modifiedSnapshotId` (none yet supported by the read path), if a selected entry's
+    /// `location` has a `.` or `..` segment, if the evaluator fails to
     /// evaluate, or if the selection vector length exceeds the batch.
     fn convert(
         &self,
@@ -330,9 +348,16 @@ impl EntryConverter {
         let mut selector = AddSelectionVisitor {
             removed,
             selection: Vec::new(),
+            encoded_paths: Vec::new(),
         };
         selector.visit_rows_of(entries)?;
-        let actions = self.evaluator.evaluate(entries)?;
+        let augmented = append_helper_column(
+            entries,
+            &ENCODED_PATH_HELPER_SCHEMA,
+            DataType::STRING,
+            selector.encoded_paths,
+        )?;
+        let actions = self.evaluator.evaluate(augmented.as_ref())?;
         FilteredEngineData::try_new(actions, selector.selection)
     }
 }
@@ -436,10 +461,12 @@ impl LeafReadContext {
         let (first_row_ids, next_first_row_id) =
             validate_and_assign_first_row_ids(entries, self.next_first_row_id, removed)?;
 
-        let helper_column =
-            ArrayData::try_new(ArrayType::new(DataType::LONG, true), first_row_ids)?;
-        let augmented =
-            entries.append_columns(FIRST_ROW_ID_HELPER_SCHEMA.clone(), vec![helper_column])?;
+        let augmented = append_helper_column(
+            entries,
+            &FIRST_ROW_ID_HELPER_SCHEMA,
+            DataType::LONG,
+            first_row_ids,
+        )?;
 
         let filtered = self.converter.convert(augmented.as_ref(), removed)?;
         self.next_first_row_id = next_first_row_id;
@@ -473,14 +500,23 @@ impl LeafReadContext {
 
 // === Helpers ===
 
-/// [`ContentTreeNodeEntry::to_schema`] followed by the fields of `helpers`.
-fn entry_schema_with(helpers: &StructType) -> SchemaRef {
+/// `schema` followed by the fields of `helpers`.
+fn schema_with_helpers(schema: &StructType, helpers: &StructType) -> SchemaRef {
     Arc::new(StructType::new_unchecked(
-        ContentTreeNodeEntry::to_schema()
-            .fields()
-            .chain(helpers.fields())
-            .cloned(),
+        schema.fields().chain(helpers.fields()).cloned(),
     ))
+}
+
+/// Appends the nullable `data_type` column `values`, named by the single field of `schema`, to
+/// `entries`.
+fn append_helper_column(
+    entries: &dyn EngineData,
+    schema: &SchemaRef,
+    data_type: DataType,
+    values: Vec<Scalar>,
+) -> KernelResult<Box<dyn EngineData>> {
+    let column = ArrayData::try_new(ArrayType::new(data_type, true), values)?;
+    entries.append_columns(schema.clone(), vec![column])
 }
 
 /// Index of the first of the [`TRACKING_COLUMNS`] getters that end `getters`.
@@ -657,8 +693,9 @@ impl RowVisitor for FilePathVisitor {
 /// Shared constructor for [`EntryConverter`]: builds the entry->`Add` transform (with the caller's
 /// [`AddFieldSources`]) and its evaluator.
 ///
-/// `input_schema` is the schema the transform evaluates against -- the entry schema for a root
-/// batch, or an augmented schema when a caller appends helper columns.
+/// `input_schema` is the schema of the batches passed to [`EntryConverter::convert`] -- the entry
+/// schema for a root batch, or an augmented schema when a caller appends helper columns. The
+/// converter appends [`ENCODED_PATH_HELPER`] itself.
 fn make_entry_converter(
     engine: &dyn Engine,
     ctx: &ReadContext,
@@ -668,7 +705,7 @@ fn make_entry_converter(
     let output_type = DataType::from(LOG_ADD_SCHEMA.as_ref().clone());
     let expr = build_entry_to_add_expression(ctx, sources)?;
     let evaluator = engine.evaluation_handler().new_expression_evaluator(
-        input_schema,
+        schema_with_helpers(&input_schema, &ENCODED_PATH_HELPER_SCHEMA),
         Arc::new(expr),
         output_type,
     )?;
@@ -718,11 +755,10 @@ fn build_entry_to_add_expression(
     // deletion-vector info across from the entry.
     let add = struct_expr_from_schema(&ADD_SCHEMA, |name| {
         Some(match name {
-            // TODO(#3319): `location` is the raw path stored in the AMT root; resolving it to a
-            // table-relative `Add.path` (percent-decoding, and relativizing against a manifest
-            // location for non-root entries) is not yet done -- it flows through verbatim, which
-            // round-trips only the minimal-root case that stored the raw path.
-            n if n == PATH_NAME => Expression::column([LOCATION]),
+            n if n == PATH_NAME => Expression::coalesce([
+                Expression::column([ENCODED_PATH_HELPER]),
+                Expression::column([LOCATION]),
+            ]),
             // TODO(#3320): read partition values from the entry's `partition` tuple once the read
             // path carries a partition spec.
             n if n == PARTITION_VALUES_NAME => empty_partition_values.clone(),
@@ -769,9 +805,13 @@ fn partition_values_map_type() -> KernelResult<MapType> {
 /// - a selected entry that carries a deletion vector: the read path does not yet populate
 ///   `Add.deletionVector`, so a DV-less `Add` would read its logically deleted rows back as live;
 /// - a selected entry that carries column files, whose updated values a plain `Add` would drop.
+///
+/// Alongside, it encodes each selected entry's raw `location` (see [`amt_location_to_add_path`])
+/// into [`ENCODED_PATH_HELPER`] values: the encoded path when encoding changes it, else null.
 struct AddSelectionVisitor<'r> {
     removed: RemovedEntries<'r>,
     selection: Vec<bool>,
+    encoded_paths: Vec<Scalar>,
 }
 
 impl RowVisitor for AddSelectionVisitor<'_> {
@@ -808,10 +848,12 @@ impl RowVisitor for AddSelectionVisitor<'_> {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         self.selection.reserve(row_count);
+        self.encoded_paths.reserve(row_count);
         for row in 0..row_count {
             // `selection` holds one flag per row visited so far, so its length is this row's index.
             if self.removed.contains(self.selection.len()) {
                 self.selection.push(false);
+                self.encoded_paths.push(Scalar::Null(DataType::STRING));
                 continue;
             }
             let content_type = DataContentType::try_from_repr(getters[0].get(row, CONTENT_TYPE)?)?;
@@ -830,10 +872,17 @@ impl RowVisitor for AddSelectionVisitor<'_> {
                     false
                 }
             };
-            if selected {
+            let encoded_path = if selected {
                 check_selected_entry(row, location, getters)?;
-            }
+                match amt_location_to_add_path(location)? {
+                    Cow::Owned(path) => Some(path),
+                    Cow::Borrowed(_) => None,
+                }
+            } else {
+                None
+            };
             self.selection.push(selected);
+            self.encoded_paths.push(encoded_path.into());
         }
         Ok(())
     }
@@ -1123,8 +1172,8 @@ mod tests {
     use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::Int64Type;
     use crate::content_tree::test_utils::{
-        added_data_entry, data_manifest_entry, entry_batch, mumbling_bitmap, struct_batch,
-        with_field, write_manifest,
+        action_paths, added_data_entry, data_manifest_entry, entry_batch, mumbling_bitmap,
+        struct_batch, with_field, write_manifest,
     };
     use crate::content_tree::{DeletionVectorInfo, ManifestInfo};
     use crate::engine::arrow_conversion::TryFromArrow as _;
@@ -1976,6 +2025,50 @@ mod tests {
         assert_result_error_with_message(
             read_tree(&engine, &checkpoint),
             "references leaf manifest 'memory:///table/metadata/leaf.parquet' more than once",
+        );
+    }
+
+    /// Root and leaf entry locations are encoded into `add.path`; a deleted entry's location is
+    /// neither encoded nor validated, since it does not become an `Add`.
+    #[test]
+    fn read_add_actions_from_amt_encodes_root_and_leaf_paths() {
+        let engine = memory_engine();
+        let leaf = write_leaf(
+            &engine,
+            "metadata/leaf.parquet",
+            &[leaf_entry("c d.parquet", 100, 10, None, None, None)],
+            5,
+            100,
+        );
+        let deleted = with_status(
+            added_data_entry("../gone x.parquet", 1, 1, 0, 0),
+            TrackingStatus::Deleted,
+        );
+        let checkpoint = write_root(
+            &engine,
+            &[
+                added_data_entry("a b.parquet", 100, 10, 0, 5),
+                deleted,
+                leaf,
+            ],
+        );
+
+        let paths: Vec<_> = read_tree(&engine, &checkpoint)
+            .unwrap()
+            .iter()
+            .flat_map(|batch| action_paths(batch, ADD_NAME))
+            .collect();
+
+        assert_eq!(paths, ["a%20b.parquet", "c%20d.parquet"]);
+    }
+
+    #[test]
+    fn read_add_actions_from_amt_rejects_dot_segment_in_live_location() {
+        let engine = memory_engine();
+        let checkpoint = write_root(&engine, &[added_data_entry("../a.parquet", 1, 1, 0, 0)]);
+        assert_result_error_with_message(
+            read_tree(&engine, &checkpoint),
+            "contains a '.' or '..' segment",
         );
     }
 

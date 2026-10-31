@@ -1,6 +1,6 @@
 //! Domain metadata replay logic for [`LogSegment`].
 //!
-//! Two entry points: [`LogSegment::scan_domain_metadatas`] replays the whole log for the latest
+//! Two entry points: [`scan_domain_metadata_actions`] folds a whole-log replay into the latest
 //! domain metadata, and [`LogSegment::scan_domain_metadatas_rooted_in_crc`] scans only the commits
 //! after an authoritative stale CRC and reconciles them against its active-domain map.
 
@@ -19,6 +19,7 @@ pub(crate) type DomainMetadataMap = HashMap<String, DomainMetadata>;
 
 impl LogSegment {
     /// [`scan_domain_metadata_actions`] over this segment's whole log.
+    #[cfg(test)]
     pub(crate) fn scan_domain_metadatas(
         &self,
         domains: Option<&HashSet<&str>>,
@@ -107,7 +108,7 @@ impl LogSegment {
 /// Returns the latest domain metadata for each domain, accounting for tombstones
 /// (`removed=true`) — removed domain metadatas will _never_ be present in the returned map.
 #[instrument(name = "domain_metadata.scan", skip_all, fields(domains = ?domains.map(|d| d.iter().collect::<Vec<_>>())), err)]
-fn scan_domain_metadata_actions(
+pub(crate) fn scan_domain_metadata_actions(
     actions: impl Iterator<Item = KernelResult<ActionsBatch>>,
     domains: Option<&HashSet<&str>>,
 ) -> KernelResult<DomainMetadataMap> {
