@@ -137,7 +137,8 @@ connector reads or writes a UC-managed table.
  │  3. snapshot_builder_from_load_table(&resp)?.build(..)    │
  │  4. snapshot.update_table(                                │
  │       UpdateTableOperation::Write, engine_info, true)     │
- │       .build(&engine, Box::new(UCCommitter::new(...)))?   │
+ │       .build_with_committer(                              │
+ │           &engine, Box::new(UCCommitter::new(...)))?      │
  │       .commit(&engine)?                                   │
  └──────┬─────────────────────────┬──────────────────────────┘
         │                         │

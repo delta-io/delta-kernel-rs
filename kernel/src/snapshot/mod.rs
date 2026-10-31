@@ -1258,7 +1258,7 @@ impl Snapshot {
     /// nullable column with `ALTER TABLE`, or compaction that rewrites files without changing any
     /// records. Kernel preserves this value even when no files are staged; it does not compare
     /// file contents to verify it. Invalid names and incompatible intent are rejected by
-    /// [`UpdateTableTransactionBuilder::build`].
+    /// [`UpdateTableTransactionBuilder::build_with_committer`].
     ///
     /// Operation, engine info, and data-change intent are required:
     ///
@@ -1764,7 +1764,6 @@ mod tests {
     use crate::actions::{DomainMetadata, Protocol};
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
-    use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -2585,7 +2584,7 @@ mod tests {
         }
 
         let _ = create_table_builder
-            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .build_with_filesystem_committer(&engine)?
             .commit(&engine)?;
 
         let snapshot = Snapshot::builder_for(&table_path).build(&engine)?;
@@ -2926,10 +2925,7 @@ mod tests {
             .fold_with(column_mapping_mode, |builder, mode| {
                 builder.with_table_properties([("delta.columnMapping.mode", mode)])
             })
-            .build(
-                &engine,
-                Box::new(crate::committer::FileSystemCommitter::new()),
-            )
+            .build_with_filesystem_committer(&engine)
             .unwrap()
             .commit(&engine)
             .unwrap();
@@ -3046,7 +3042,7 @@ mod tests {
             let store = Arc::new(InMemory::new());
             let engine = SyncEngine::new_with_store(store);
             create_table("memory:///", schema, "test", true)
-                .build(&engine, Box::new(FileSystemCommitter::new()))
+                .build_with_filesystem_committer(&engine)
                 .unwrap()
                 .commit(&engine)
                 .unwrap()

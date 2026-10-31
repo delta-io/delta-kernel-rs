@@ -475,7 +475,7 @@ async fn crc_at_prior_version_roots_replay_at_crc_for_both_modes(
 
     // commit 0: create table, then write its CRC (write_checksum needs the post-commit CRC).
     let create_committed = create_table(&table_path, simple_schema(), "Test/1.0", true)
-        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(setup_engine.as_ref())?
         .commit(setup_engine.as_ref())?
         .unwrap_committed();
     create_committed
@@ -631,7 +631,7 @@ async fn setup_table_with_dms_and_set_txns(
     let snap_v0 = create_table(&table_path, simple_schema(), "Test/1.0", true)
         .with_table_properties(properties)
         .with_data_layout(DataLayout::clustered(["id"]))
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 
@@ -639,7 +639,7 @@ async fn setup_table_with_dms_and_set_txns(
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_domain_metadata("myapp.config".to_string(), "v1".to_string())
         .with_transaction_id("my-app", 1)
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 

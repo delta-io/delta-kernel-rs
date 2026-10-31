@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Int32Array, MapArray, RecordBatch, StringArray, StructArray};
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{col, lit, Predicate as Pred, PredicateRef, Scalar};
 use delta_kernel::incremental_scan::{
@@ -1261,7 +1260,7 @@ async fn partitioned_snapshot(
         } else {
             DataLayout::partitioned(partition_columns)
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
         .unwrap_committed();
     add_commit(
@@ -1576,7 +1575,7 @@ async fn incremental_scan_from_cached_snapshot_matches_full_scan_with_timezone(
         true, /* data_change */
     )
     .with_data_layout(DataLayout::partitioned(["ts"]))
-    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(engine.as_ref())?
     .commit(engine.as_ref())?
     .unwrap_committed();
 

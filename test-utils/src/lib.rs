@@ -1300,7 +1300,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
     if is_blind_append {
         builder = builder.with_blind_append();
     }
-    let mut txn = builder.build(engine.as_ref(), committer)?;
+    let mut txn = builder.build_with_committer(engine.as_ref(), committer)?;
     txn.ack_column_defaults();
 
     let write_state = txn.write_state()?;
@@ -1342,7 +1342,7 @@ pub fn begin_transaction_with(
     configure: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
 ) -> KernelResult<Transaction> {
     configure(snapshot.update_table(operation, engine_info, data_change))
-        .build(engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(engine)
 }
 
 /// A catalog [`Committer`] for tests: writes every commit directly to the published Delta log
@@ -1783,7 +1783,7 @@ pub async fn write_batch_to_table(
     let mut txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "DefaultEngine", true)
-        .build(engine, Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine)?;
     txn.ack_column_defaults();
     let write_state = txn.write_state()?;
     let write_context = if txn.logical_partition_columns().is_empty() {
@@ -2089,12 +2089,11 @@ pub fn create_table_and_load_snapshot(
     engine: &dyn Engine,
     properties: &[(&str, &str)],
 ) -> KernelResult<Arc<Snapshot>> {
-    use delta_kernel::committer::FileSystemCommitter;
     use delta_kernel::transaction::create_table::create_table;
 
     let _ = create_table(table_path, schema, "Test/1.0", true)
         .with_table_properties(properties.to_vec())
-        .build(engine, Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine)?
         .commit(engine)?;
 
     let table_url = delta_kernel::try_parse_uri(table_path)?;
@@ -2264,7 +2263,7 @@ pub fn remove_all_and_get_remove_actions(
     let mut txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "DefaultEngine", true)
-        .build(engine, Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine)?;
     for sm in all_scan_metadata {
         txn.remove_files(sm.scan_files);
     }

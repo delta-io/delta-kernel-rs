@@ -93,7 +93,7 @@ async fn try_main() -> KernelResult<()> {
             "default_engine/write-table-example",
             /* data_change */ true,
         )
-        .build(&engine, committer)?;
+        .build_with_committer(&engine, committer)?;
 
     // This example assumes the table is unpartitioned.
     let write_context = txn.write_state()?.write_context_builder().build()?;
@@ -206,7 +206,7 @@ async fn create_table(
         "write-table-example/1.0",
         /* data_change */ true,
     )
-    .build(engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(engine)?
     .commit(engine)?;
 
     println!("✓ Created Delta table with schema: {schema:#?}");

@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{schema_ref, DataType, StructField};
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use delta_kernel::transaction::{Transaction, UpdateTableOperation};
@@ -129,7 +128,7 @@ async fn alter_table_commit_rejects_root_manifest() -> Result<(), Box<dyn std::e
         .clone()
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(StructField::nullable("fresh_column", DataType::INTEGER))
-        .build(&engine, Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(&engine)?
         .with_root_manifest_file(file)?;
 
     let error = txn.commit(&engine).unwrap_err();

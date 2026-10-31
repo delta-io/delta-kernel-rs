@@ -149,7 +149,6 @@ mod tests {
     use url::Url;
 
     use crate::actions::visitors::DomainMetadataVisitor;
-    use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
@@ -180,7 +179,7 @@ mod tests {
         )
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
         .with_domain_metadata("domainC", "cfgC")
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap()
         .commit(&engine)
         .unwrap();
@@ -191,7 +190,7 @@ mod tests {
             .update_table(UpdateTableOperation::Write, "test-engine", true)
             .with_domain_metadata("domainA", "cfgA")
             .with_domain_metadata("domainB", "cfgB")
-            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .build_with_filesystem_committer(&engine)
             .unwrap()
             .commit(&engine)
             .unwrap();
@@ -333,7 +332,7 @@ mod tests {
         let _ = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
             .with_domain_metadata_removed("domainA")
-            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .build_with_filesystem_committer(&engine)
             .unwrap()
             .commit(&engine)
             .unwrap();

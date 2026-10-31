@@ -191,7 +191,7 @@ pub(super) fn create_simple_table(
         builder
     };
     builder
-        .build(engine, make_committer(catalog_managed))?
+        .build_with_committer(engine, make_committer(catalog_managed))?
         .commit(engine)?
         .unwrap_committed();
     Ok(())

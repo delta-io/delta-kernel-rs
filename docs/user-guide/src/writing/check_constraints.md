@@ -93,7 +93,6 @@ row. Kernel doesn't provide a SQL evaluator for constraints.
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use delta_kernel::arrow::array::{BooleanArray, RecordBatch};
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 # use delta_kernel::{KernelError, KernelResult, SnapshotRef};
@@ -109,7 +108,7 @@ async fn append_with_check_constraints(
     // 1. Start the transaction.
     let mut txn = snapshot
         .update_table(UpdateTableOperation::Write, "my-app/1.0", /* data_change */ true)
-        .build(engine, Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine)?;
 
     // 2. Discover the constraints and compile each one before writing anything.
     let mut checks = Vec::new();

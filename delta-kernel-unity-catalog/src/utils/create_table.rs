@@ -16,7 +16,7 @@
 //! let disk_props = get_required_properties_for_disk(&staging_info.table_id);
 //! let create_table_txn = kernel::create_table(path, schema, "MyApp/1.0", /* data_change */ true)
 //!     .with_table_properties(disk_props)
-//!     .build(engine, committer);
+//!     .build_with_committer(engine, committer);
 //! create_table_txn.commit(engine)?;
 //!
 //! // Step 3: Finalize table in UC
@@ -219,7 +219,7 @@ mod tests {
         create_table(table_path, schema, "Test/1.0", true)
             .with_table_properties(disk_props)
             .with_data_layout(data_layout)
-            .build(engine, Box::new(TestCatalogCommitter))
+            .build_with_committer(engine, Box::new(TestCatalogCommitter))
             .unwrap()
             .commit(engine)
             .unwrap()
@@ -347,7 +347,7 @@ mod tests {
         create_table(table_path, schema, "Test/1.0", true)
             .with_table_properties(disk_props)
             .with_domain_metadata("myApp.retention", r#"{"days":30}"#)
-            .build(&engine, Box::new(TestCatalogCommitter))
+            .build_with_committer(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
             .commit(&engine)
             .unwrap()
@@ -420,7 +420,7 @@ mod tests {
         let disk_props = get_required_properties_for_disk("test-table-id");
         let _ = create_table(table_path, schema, "Test/1.0", true)
             .with_table_properties(disk_props)
-            .build(&engine, Box::new(TestCatalogCommitter))
+            .build_with_committer(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
             .commit(&engine)
             .unwrap();
@@ -430,7 +430,7 @@ mod tests {
             .unwrap();
         let result = v0_snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, Box::new(TestCatalogCommitter))
+            .build_with_committer(&engine, Box::new(TestCatalogCommitter))
             .unwrap()
             .commit(&engine)
             .unwrap();

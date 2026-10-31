@@ -43,7 +43,6 @@ impl Transaction<UpdateTable, Imperative> {
     /// # use std::sync::Arc;
     /// # use delta_kernel::Engine;
     /// # use delta_kernel::snapshot::Snapshot;
-    /// # use delta_kernel::committer::FileSystemCommitter;
     /// # fn example(
     /// #     engine: Arc<dyn Engine>,
     /// #     table_url: url::Url,
@@ -57,7 +56,7 @@ impl Transaction<UpdateTable, Imperative> {
     ///         "my-app/1.0",
     ///         /* data_change */ true,
     ///     )
-    ///     .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    ///     .build_with_filesystem_committer(engine.as_ref())?;
     ///
     /// // Get file metadata from a scan
     /// let scan = snapshot.scan_builder().build()?;
@@ -147,7 +146,7 @@ impl Transaction<UpdateTable, Imperative> {
     /// let mut txn = snapshot
     ///     .clone()
     ///     .update_table(UpdateTableOperation::Update, "my-app/1.0", /* data_change */ true)
-    ///     .build(engine, Box::new(FileSystemCommitter::new()))?;
+    ///     .build_with_filesystem_committer(engine)?;
     ///
     /// let scan = snapshot.scan_builder().build()?;
     /// let files: Vec<FilteredEngineData> = scan.scan_metadata(engine)?

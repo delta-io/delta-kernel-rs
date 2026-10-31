@@ -24,7 +24,6 @@ use crate::checkpoint::{
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
-use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::sync::SyncEngine;
 use crate::log_replay::HasSelectionVector;
@@ -898,7 +897,7 @@ async fn test_checkpoint_preserves_domain_metadata() -> KernelResult<()> {
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
             .with_domain_metadata(domain, value)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(&engine)?;
         let result = txn.commit(&engine)?;
         assert!(result.is_committed());
         Ok(())
@@ -975,7 +974,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> KernelResult<(
     let txn = snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_domain_metadata("foo", "bar")
-        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(&engine)?;
     let result = txn.commit(&engine)?;
     assert!(result.is_committed());
 
@@ -991,7 +990,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> KernelResult<(
     let result = snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_domain_metadata_removed("foo")
-        .build(&engine, Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(&engine)?
         .commit(&engine)?;
     assert!(result.is_committed());
 
@@ -1024,7 +1023,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         "test",
         true,
     )
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 
     // Version 1

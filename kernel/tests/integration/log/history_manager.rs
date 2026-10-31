@@ -4,7 +4,6 @@ use std::fs::OpenOptions;
 use std::ops::RangeInclusive;
 use std::time::{Duration, SystemTime};
 
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::history_manager::{get_earliest_commit, latest_version_as_of, HistoryCommitType};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{ObjectStore, ObjectStoreExt as _};
@@ -72,7 +71,7 @@ fn test_at_timestamp_resolves_to_intermediate_version() -> KernelResult<()> {
     // v0: CreateTable
     let schema = get_simple_int_schema();
     let mut snap = create_table(&table_path, schema, "AtTimestampTest/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 

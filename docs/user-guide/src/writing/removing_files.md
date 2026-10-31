@@ -133,7 +133,6 @@ This example removes the first file from a filesystem-backed table:
 # extern crate delta_kernel_default_engine;
 # extern crate tokio;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::engine_data::FilteredEngineData;
@@ -150,7 +149,7 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let mut txn = snapshot
     .clone()
     .update_table(UpdateTableOperation::Delete, "my-app/1.0", /* data_change */ true)
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build_with_filesystem_committer(&engine)?;
 
 // 3. Build a scan and get file metadata
 let scan = snapshot.scan_builder().build()?;

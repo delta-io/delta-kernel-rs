@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::Snapshot;
@@ -149,7 +148,7 @@ async fn test_create_table_with_data_uses_relative_paths() -> Result<(), Box<dyn
     let table_url = Url::from_directory_path(&table_path).unwrap();
 
     let mut txn = create_table_txn(table_url.as_str(), schema.clone(), "test/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine.as_ref())?;
     let write_context = txn.write_state()?.write_context_builder().build()?;
     let add_meta = engine
         .write_parquet(

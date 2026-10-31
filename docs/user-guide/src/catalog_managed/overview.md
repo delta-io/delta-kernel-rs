@@ -128,7 +128,7 @@ IDs, catalog APIs, or catalog servers. Instead:
 |      .build(&engine)                                      |
 |    snapshot.update_table(                                 |
 |      UpdateTableOperation::Write, engine_info, true)      |
-|      .build(&engine, committer)                           |
+|      .build_with_committer(&engine, committer)            |
 +---------------------------+-------------------------------+
                             | calls Kernel APIs
                             v

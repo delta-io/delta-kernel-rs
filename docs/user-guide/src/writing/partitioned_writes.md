@@ -32,7 +32,6 @@ The pattern for partitioned writes is: **group your data by partition values, cr
 # extern crate tokio;
 # use std::collections::HashMap;
 # use delta_kernel::arrow::array::RecordBatch;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel::transaction::UpdateTableOperation;
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel_default_engine::DefaultEngine;
@@ -50,7 +49,7 @@ let mut txn = snapshot
         "my-app/1.0",
         /* data_change */ true,
     )
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build_with_filesystem_committer(&engine)?;
 
 // Build the write state before iterating over partitions.
 let write_state = txn.write_state()?;

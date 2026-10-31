@@ -13,7 +13,6 @@ The `create_table` function returns a builder that you configure and then commit
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
@@ -29,7 +28,7 @@ let schema = Arc::new(StructType::try_new([
 ])?);
 
 create_table(url.as_str(), schema, "my-app/1.0", /* data_change */ true)
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 # Ok(())
 # }
@@ -100,7 +99,6 @@ You can set custom application properties on the table:
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
@@ -117,7 +115,7 @@ create_table(url.as_str(), schema, "my-app/1.0", /* data_change */ true)
         ("myapp.version", "2.0"),
         ("myapp.owner", "data-team"),
     ])
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 # Ok(())
 # }
@@ -136,7 +134,6 @@ layout for queries that filter on the clustering columns:
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
@@ -154,7 +151,7 @@ let schema = Arc::new(StructType::try_new([
 
 create_table(url.as_str(), schema, "my-app/1.0", /* data_change */ true)
     .with_data_layout(DataLayout::clustered(["region", "timestamp"]))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 # Ok(())
 # }
@@ -192,7 +189,6 @@ entire directories when filtering on those columns.
 # extern crate delta_kernel;
 # extern crate delta_kernel_default_engine;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
@@ -211,7 +207,7 @@ let schema = Arc::new(StructType::try_new([
 
 create_table(url.as_str(), schema, "my-app/1.0", /* data_change */ true)
     .with_data_layout(DataLayout::partitioned(["year", "month"]))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 # Ok(())
 # }
@@ -246,16 +242,13 @@ features may additionally materialize them into the data files; see
 
 ## The Committer
 
-The `build()` method takes a `Box<dyn Committer>` that controls how the commit is
-persisted:
+`build_with_filesystem_committer()` uses a `FileSystemCommitter` for standalone
+filesystem-based tables. It writes commit files directly to `_delta_log/` using
+atomic put-if-absent.
 
-- **`FileSystemCommitter`**: For standalone filesystem-based tables. Writes commit files
-  directly to `_delta_log/` using atomic put-if-absent. This is the default for most use
-  cases.
-
-- **Custom `Committer`**: For catalog-managed tables (e.g. Unity Catalog), you implement
-  the `Committer` trait to route commits through the catalog. See
-  [Catalog-Managed Tables](../catalog_managed/overview.md).
+`build_with_committer()` takes a `Box<dyn Committer>` when you supply your own,
+including for catalog-managed tables (e.g. Unity Catalog). See
+[Catalog-Managed Tables](../catalog_managed/overview.md).
 
 ## Handling the result
 

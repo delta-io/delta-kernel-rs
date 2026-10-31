@@ -111,7 +111,6 @@ pub struct ImperativeCommit;
 /// Builder entry points default to imperative transactions without an explicit mode selection.
 ///
 /// ```no_run
-/// use delta_kernel::committer::FileSystemCommitter;
 /// use delta_kernel::schema::SchemaRef;
 /// use delta_kernel::snapshot::SnapshotRef;
 /// use delta_kernel::transaction::create_table::create_table;
@@ -127,12 +126,12 @@ pub struct ImperativeCommit;
 /// ) -> KernelResult<()> {
 ///     let update = snapshot
 ///         .update_table(UpdateTableOperation::Write, "connector/1.0", true)
-///         .build(engine, Box::new(FileSystemCommitter::new()))?;
+///         .build_with_filesystem_committer(engine)?;
 ///     let _update_state = update.write_state()?;
 ///     let _: Transaction<UpdateTable, Imperative> = update;
 ///
 ///     let create = create_table("/path/to/new-table", schema, "connector/1.0", true)
-///         .build(engine, Box::new(FileSystemCommitter::new()))?;
+///         .build_with_filesystem_committer(engine)?;
 ///     let _create_state = create.write_state()?;
 ///     let _: Transaction<CreateTable, Imperative> = create;
 ///     Ok(())
@@ -156,7 +155,6 @@ pub struct ModeSelectionRequiresDeclarativePlans;
 /// Declarative transactions stage relation handles and expose a separate commit entry point.
 ///
 /// ```no_run
-/// use delta_kernel::committer::FileSystemCommitter;
 /// use delta_kernel::plans::{RelationRef, ScopedPlanExecutor};
 /// use delta_kernel::snapshot::SnapshotRef;
 /// use delta_kernel::transaction::{CommitResult, Declarative, UpdateTable, UpdateTableOperation};
@@ -173,7 +171,7 @@ pub struct ModeSelectionRequiresDeclarativePlans;
 ///         .update_table(UpdateTableOperation::Write, "connector/1.0", true)
 ///         .with_execution_mode::<Declarative>()
 ///         .with_transaction_id("app", 1)
-///         .build(engine, Box::new(FileSystemCommitter::new()))?;
+///         .build_with_filesystem_committer(engine)?;
 ///     txn.add_files_ref(adds);
 ///     txn.remove_files_ref(removes);
 ///     txn.commit_declarative(executor)
@@ -185,7 +183,6 @@ pub struct DeclarativeCommit;
 /// Create-table builders support declarative mode and retain their table-specific setters.
 ///
 /// ```no_run
-/// use delta_kernel::committer::FileSystemCommitter;
 /// use delta_kernel::plans::{RelationRef, ScopedPlanExecutor};
 /// use delta_kernel::schema::SchemaRef;
 /// use delta_kernel::transaction::create_table::create_table;
@@ -201,7 +198,7 @@ pub struct DeclarativeCommit;
 ///     let mut txn = create_table("/path/to/new-table", schema, "connector/1.0", true)
 ///         .with_execution_mode::<Declarative>()
 ///         .with_table_properties([("app.version", "1")])
-///         .build(engine, Box::new(FileSystemCommitter::new()))?;
+///         .build_with_filesystem_committer(engine)?;
 ///     txn.add_files_ref(adds);
 ///     txn.commit_declarative(executor)
 /// }

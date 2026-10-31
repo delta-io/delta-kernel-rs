@@ -565,7 +565,7 @@ fn create_table_txn_builder_build_impl(
     extern_engine: &dyn ExternEngine,
 ) -> KernelResult<Handle<ExclusiveCreateTableTransaction>> {
     let engine = extern_engine.engine();
-    let create_txn = builder.build(engine.as_ref(), committer)?;
+    let create_txn = builder.build_with_committer(engine.as_ref(), committer)?;
     Ok(Box::new(create_txn).into())
 }
 

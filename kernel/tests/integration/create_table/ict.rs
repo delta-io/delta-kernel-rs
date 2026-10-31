@@ -6,7 +6,6 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
     TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -83,7 +82,7 @@ fn test_create_table_ict(
 
     let committed = create_table(&table_path, super::simple_schema()?, "Test/1.0", true)
         .with_table_properties(properties.iter().copied())
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 

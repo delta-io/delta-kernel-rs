@@ -171,7 +171,6 @@ mod tests {
 
     use super::*;
     use crate::actions::{Sidecar, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA};
-    use crate::committer::FileSystemCommitter;
     use crate::crc::{Crc, DomainMetadataState, SetTransactionState};
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
@@ -381,7 +380,7 @@ mod tests {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///t/", schema, "test", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .build_with_filesystem_committer(&engine)?
             .commit(&engine)?;
         let snapshot = Snapshot::builder_for("memory:///t/").build(&engine)?;
 

@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use delta_kernel::actions::MIN_VALUES;
 use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{column_name, ColumnName};
 use delta_kernel::object_store::local::LocalFileSystem;
@@ -221,7 +220,7 @@ async fn run_ctas_test(
             builder = builder.with_data_layout(DataLayout::clustered(["row_number"]));
         }
         let result = builder
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .build_with_filesystem_committer(engine.as_ref())?
             .commit(engine.as_ref())?;
         match result {
             CommitResult::Committed(c) => c
@@ -259,7 +258,7 @@ async fn run_ctas_test(
     if tgt_clustered {
         tgt_builder = tgt_builder.with_data_layout(DataLayout::clustered(["row_number"]));
     }
-    let mut tgt_txn = tgt_builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let mut tgt_txn = tgt_builder.build_with_filesystem_committer(engine.as_ref())?;
 
     let write_context = tgt_txn.write_state()?.write_context_builder().build()?;
     let add_meta = engine

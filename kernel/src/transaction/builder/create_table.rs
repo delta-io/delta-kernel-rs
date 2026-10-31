@@ -19,7 +19,7 @@ use super::state::TransactionBuilderState;
 use super::TransactionBuilder;
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
-use crate::committer::Committer;
+use crate::committer::{Committer, FileSystemCommitter};
 use crate::expressions::ColumnName;
 use crate::schema::file_utils::schema_contains_file_type;
 use crate::schema::validation::validate_schema;
@@ -877,7 +877,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
     /// # }
     /// ```
     ///
-    /// [`build()`]: CreateTableTransactionBuilder::build
+    /// [`build()`]: CreateTableTransactionBuilder::build_with_committer
     #[internal_api]
     pub(crate) fn with_table_properties<I, K, V>(mut self, properties: I) -> Self
     where
@@ -971,6 +971,20 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
     /// - Unsupported delta properties or feature flags are specified
     /// - Connector commit information does not contain exactly one row
     /// - An application transaction identifier occurs more than once
+    ///
+    /// For path-based tables that use the default filesystem committer,
+    /// [`Self::build_with_filesystem_committer`] is shorter.
+    #[internal_api]
+    pub(crate) fn build_with_committer(
+        self,
+        engine: &dyn Engine,
+        committer: Box<dyn Committer>,
+    ) -> KernelResult<CreateTableTransaction<MODE>> {
+        self.build(engine, committer)
+    }
+
+    /// Compatibility alias for [`Self::build_with_committer`].
+    #[doc(hidden)]
     #[internal_api]
     pub(crate) fn build(
         self,
@@ -1096,6 +1110,18 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
         transaction.validate_domain_metadata_operations()?;
         Ok(transaction)
     }
+
+    /// Builds a transaction with a [`FileSystemCommitter`].
+    ///
+    /// This is the usual choice for path-based tables. Catalog-managed tables require a catalog
+    /// committer via [`Self::build_with_committer`].
+    #[internal_api]
+    pub(crate) fn build_with_filesystem_committer(
+        self,
+        engine: &dyn Engine,
+    ) -> KernelResult<CreateTableTransaction<MODE>> {
+        self.build(engine, Box::new(FileSystemCommitter::new()))
+    }
 }
 
 fn try_new_create_table<MODE: ExecutionMode>(
@@ -1143,7 +1169,6 @@ mod tests {
     use crate::arrow::array::StringArray;
     use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::arrow::record_batch::RecordBatch;
-    use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
@@ -1207,7 +1232,7 @@ mod tests {
         if skip_dedup_validation {
             builder = builder.without_dedup_validation();
         }
-        let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
+        let transaction = builder.build_with_filesystem_committer(&engine)?;
 
         assert_eq!(transaction.skip_dedup_validation, skip_dedup_validation);
         assert_eq!(transaction.engine_info, "test-engine");
@@ -1263,7 +1288,7 @@ mod tests {
             true,
         )
         .with_commit_info(commit_info, commit_info_schema)
-        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&SyncEngine::new())
         .unwrap_err();
         assert!(
             error
@@ -1287,7 +1312,7 @@ mod tests {
         )
         .with_transaction_id("app", 1)
         .with_transaction_id("app", 2)
-        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&SyncEngine::new())
         .unwrap_err();
         assert!(
             error
@@ -1325,7 +1350,7 @@ mod tests {
         }
 
         assert_result_error_with_message(
-            builder.build(&SyncEngine::new(), Box::new(FileSystemCommitter::new())),
+            builder.build_with_filesystem_committer(&SyncEngine::new()),
             expected,
         );
         Ok(())
@@ -1344,7 +1369,7 @@ mod tests {
         )
         .with_data_layout(DataLayout::clustered(["id"]))
         .with_domain_metadata("delta.clustering", "{}")
-        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&SyncEngine::new())
         .unwrap_err();
 
         assert!(error.to_string().contains("system controlled"), "{error}");

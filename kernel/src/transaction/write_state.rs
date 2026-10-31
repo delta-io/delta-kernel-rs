@@ -451,7 +451,6 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::{schema_ref, MetadataValue};
@@ -498,7 +497,7 @@ mod tests {
         )
         .with_data_layout(DataLayout::partitioned(["year"]))
         .with_table_properties(properties)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(engine.as_ref())
         .unwrap();
 
         let mut write_state = txn.write_state().unwrap();
@@ -724,7 +723,7 @@ mod tests {
         let txn = create_table("memory:///case_sensitive_partitions", schema, "test", true)
             .with_data_layout(DataLayout::partitioned(["first", "second"]))
             .with_table_properties([("delta.columnMapping.mode", mode_property)])
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(engine.as_ref())?;
         let state = WriteState::decode(&txn.write_state()?.encode()?)?;
 
         let physical_context = state

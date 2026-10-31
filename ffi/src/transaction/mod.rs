@@ -4381,7 +4381,7 @@ mod tests {
             "test-engine/1.0",
             true,
         )
-        .build(&kernel_engine, Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(&kernel_engine)?
         .commit(&kernel_engine)?
         .unwrap_committed();
         let engine = engine_handle_for_store(store);
@@ -4744,7 +4744,7 @@ mod tests {
         let mut add_txn = snapshot
             .clone()
             .update_table(UpdateTableOperation::Write, "test-engine/1.0", true)
-            .build(kernel_engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(kernel_engine.as_ref())?;
         let add_files_schema = add_txn.add_files_schema();
         let add_metadata = test_utils::create_add_files_metadata(
             add_files_schema,

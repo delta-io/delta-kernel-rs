@@ -26,7 +26,6 @@ may differ.
 # extern crate tokio;
 # use std::sync::Arc;
 # use delta_kernel::arrow::array::{Int32Array, RecordBatch, StringArray};
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel_default_engine::DefaultEngine;
@@ -43,7 +42,7 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 // 2. Create a transaction
 let mut txn = snapshot
     .update_table(UpdateTableOperation::Write, "my-app/1.0", /* data_change */ true)
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build_with_filesystem_committer(&engine)?;
 
 // 3. Create write state and bind a write context
 let write_state = txn.write_state()?;
@@ -91,7 +90,7 @@ writing against:
 ```rust,ignore
 let mut txn = snapshot
     .update_table(UpdateTableOperation::Write, "my-app/1.0", /* data_change */ true)
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build_with_filesystem_committer(&engine)?;
 ```
 
 Pass the operation, connector name/version, and `data_change` to
@@ -251,7 +250,7 @@ let txn = snapshot
         /* data_change */ true,
     )
     .with_blind_append()
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build_with_filesystem_committer(&engine)?;
 ```
 
 Kernel records `isBlindAppend: true` in the commit's `commitInfo` action. This flag
@@ -288,7 +287,7 @@ let txn = snapshot
     )
     .with_operation_parameters([("mode", Some("Append")), ("predicate", None)])
     .with_operation_metrics([("numFiles", Some("1"))])
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .with_commit_info(engine_commit_info, commit_info_schema);
 ```
 

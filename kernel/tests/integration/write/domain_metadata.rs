@@ -1,6 +1,5 @@
 //! Integration tests for domain metadata set/remove flows.
 
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::transaction::UpdateTableOperation;
@@ -295,7 +294,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_domain_metadata("app.config", "v1")
         .with_domain_metadata_removed("app.config")
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap_err();
     assert!(err
         .to_string()
@@ -307,7 +306,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_domain_metadata_removed("test.domain")
         .with_domain_metadata("test.domain", "v1")
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap_err();
     assert!(err
         .to_string()
@@ -319,7 +318,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_domain_metadata_removed("another.domain")
         .with_domain_metadata_removed("another.domain")
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(&engine)
         .unwrap_err();
     assert!(err.to_string().contains("removed more than once"));
 

@@ -17,7 +17,6 @@ use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use delta_kernel::arrow::error::ArrowError;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
@@ -103,7 +102,7 @@ async fn append_only_enforces_data_change_for_file_actions(
             ("delta.appendOnly", "true"),
             ("delta.enableDeletionVectors", "true"),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
     let mut txn = begin_transaction_with(
@@ -786,7 +785,7 @@ async fn test_remove_files_adds_expected_entries() -> KernelResult<()> {
     let mut txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "test engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine.as_ref())?;
 
     let scan = snapshot.scan_builder().build()?;
     let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
@@ -1081,7 +1080,7 @@ async fn test_update_deletion_vectors_adds_expected_entries() -> KernelResult<()
     let mut txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Update, "test engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine.as_ref())?;
 
     // Build scan and collect all scan metadata
     let scan = snapshot.clone().scan_builder().build()?;
@@ -1626,7 +1625,7 @@ async fn test_update_deletion_vectors_multiple_files(
     let mut txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Update, "test engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine.as_ref())?;
 
     let mut scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
 
@@ -1782,7 +1781,7 @@ async fn test_update_deletion_vectors_respects_selection_vector(
     let mut txn = snapshot
         .clone()
         .update_table(UpdateTableOperation::Update, "test engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine.as_ref())?;
 
     let dv_map: HashMap<String, DeletionVectorDescriptor> = targeted
         .iter()
@@ -2087,7 +2086,7 @@ async fn test_remove_files_with_modified_selection_vector() -> KernelResult<()> 
         let mut txn = snapshot
             .clone()
             .update_table(UpdateTableOperation::Delete, "selective remove test", true)
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(engine.as_ref())?;
 
         // First batch: Remove only the first file
         let scan2 = snapshot.clone().scan_builder().build()?;

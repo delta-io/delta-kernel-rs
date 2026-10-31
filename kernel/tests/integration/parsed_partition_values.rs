@@ -9,7 +9,6 @@ use delta_kernel::arrow::array::{
     TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::compute::filter_record_batch;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{col, lit, ColumnName, Predicate, Scalar};
@@ -908,7 +907,7 @@ fn create_timestamp_partition_table_with_parsed_partition(
                 },
             ),
         ])
-        .build(engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(engine)
         .unwrap()
         .commit(engine)
         .unwrap()

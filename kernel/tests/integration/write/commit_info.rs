@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, MapBuilder, RecordBatch, StringArray, StringBuilder};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
@@ -45,7 +44,7 @@ async fn test_commit_info_defaults_to_empty_parameters_and_omitted_metrics(
         let txn = Snapshot::builder_for(table_url.clone())
             .build(&engine)?
             .update_table(operation.clone(), engine_info, true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(&engine)?;
 
         // commit!
         let _ = txn.commit(&engine)?;
@@ -100,7 +99,7 @@ async fn transaction_builder_writes_operation_parameters_and_metrics(
             .update_table(UpdateTableOperation::Write, "test-engine", true)
             .with_operation_parameters([("mode", Some("Append"))])
             .with_operation_metrics([("numFiles", Some("3"))])
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(&engine)?;
 
         transaction.commit(&engine)?.unwrap_committed();
 
@@ -136,7 +135,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
         let txn = Snapshot::builder_for(table_url.clone())
             .build(&engine)?
             .update_table(UpdateTableOperation::Write, "default engine", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(&engine)?;
 
         let _ = txn.commit(&engine)?;
 

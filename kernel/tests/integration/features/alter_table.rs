@@ -67,7 +67,7 @@ async fn schema_evolution_while_writing_round_trips_new_column(
         .clone()
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .add_column(StructField::nullable("country", DataType::STRING))
-        .build(engine.as_ref(), committer())?;
+        .build_with_committer(engine.as_ref(), committer())?;
 
     let write_context = transaction.write_state()?.write_context_builder().build()?;
     assert!(write_context.logical_data_schema().contains("country"));
@@ -192,7 +192,7 @@ async fn alter_table_rejects_data_change_true_at_build(
         .clone()
         .update_table(UpdateTableOperation::AlterTable, "test-engine", true)
         .add_column(StructField::nullable("country", DataType::STRING))
-        .build(engine.as_ref(), committer());
+        .build_with_committer(engine.as_ref(), committer());
 
     assert_result_error_with_message(result, "ALTER TABLE requires data_change to be false");
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -231,7 +231,7 @@ async fn alter_table_commit_rejects_staged_files(
         .clone()
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(StructField::nullable("country", DataType::STRING))
-        .build(engine.as_ref(), committer())?;
+        .build_with_committer(engine.as_ref(), committer())?;
     let write_context = transaction.write_state()?.write_context_builder().build()?;
     let batch = RecordBatch::try_new(
         Arc::new(
@@ -299,7 +299,7 @@ async fn schema_evolution_during_data_preserving_rewrite(
         .clone()
         .update_table(UpdateTableOperation::Optimize, "test-engine", false)
         .add_column(StructField::nullable("country", DataType::STRING))
-        .build(engine.as_ref(), committer())?;
+        .build_with_committer(engine.as_ref(), committer())?;
     let write_context = transaction.write_state()?.write_context_builder().build()?;
     let mut columns = old_batch.columns().to_vec();
     columns.push(new_null_array(&ArrowDataType::Utf8, old_batch.num_rows()));
@@ -390,7 +390,7 @@ async fn add_column_validates_cdf_column_names(
     let result = snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(StructField::nullable(column_name, DataType::STRING))
-        .build(engine.as_ref(), committer());
+        .build_with_committer(engine.as_ref(), committer());
 
     if let Some(expected_error) = expected_error {
         assert_result_error_with_message(result, expected_error);
@@ -438,7 +438,7 @@ async fn add_column_validates_cdf_physical_column_names(
                 "_change_type",
             )]),
         )
-        .build(engine.as_ref(), committer());
+        .build_with_committer(engine.as_ref(), committer());
 
     if let Some(expected_error) = expected_error {
         assert_result_error_with_message(result, expected_error);
@@ -476,7 +476,7 @@ async fn alter_table_commit_info_includes_operation_maps() -> KernelResult<()> {
         .add_column(StructField::nullable("added", DataType::STRING))
         .with_operation_parameters([("columns", Some(r#"["added"]"#))])
         .with_operation_metrics([("numAddedColumns", Some("1"))])
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -531,7 +531,7 @@ async fn add_columns_lifecycle(
         let committed = current
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
             .add_column(StructField::nullable(name, DataType::STRING))
-            .build(engine.as_ref(), committer())?
+            .build_with_committer(engine.as_ref(), committer())?
             .commit(engine.as_ref())?
             .unwrap_committed();
         let post = committed
@@ -714,7 +714,7 @@ async fn add_complex_type_column(
     snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(field)
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -771,7 +771,7 @@ async fn add_column_failures(
     let err = snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(field)
-        .build(engine.as_ref(), committer());
+        .build_with_committer(engine.as_ref(), committer());
     assert!(err.is_err());
     assert!(err.unwrap_err().to_string().contains(error_contains));
 
@@ -795,7 +795,7 @@ async fn back_to_back_alters_with_checkpoint() -> KernelResult<()> {
     let v1 = snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(StructField::nullable("a", DataType::STRING))
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
     let v1_snap = v1
@@ -809,7 +809,7 @@ async fn back_to_back_alters_with_checkpoint() -> KernelResult<()> {
     let v2 = v1_ckpt
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(StructField::nullable("b", DataType::INTEGER))
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
     let v2_snap = v2
@@ -894,7 +894,7 @@ async fn add_column_at_round_trip(
             column_name!("parent"),
             StructField::nullable("added", DataType::STRING),
         )
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -949,7 +949,7 @@ async fn add_column_at_nested_struct_with_column_mapping(
             column_name!("address"),
             StructField::nullable("zip", DataType::STRING),
         )
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -1017,7 +1017,7 @@ async fn add_column_at_containers_round_trip(
             column_name!("by_value.value"),
             StructField::nullable("added", DataType::STRING),
         )
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -1080,7 +1080,7 @@ async fn add_column_at_struct_fields_named_like_container_segments() -> KernelRe
             column_name!("address.value"),
             StructField::nullable("added", DataType::STRING),
         )
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -1124,7 +1124,7 @@ async fn add_column_at_rejects_duplicate_field_in_same_builder() -> KernelResult
             column_name!("address"),
             StructField::nullable("dup", DataType::STRING),
         )
-        .build(engine.as_ref(), committer());
+        .build_with_committer(engine.as_ref(), committer());
     assert_result_error_with_message(result, "already exists");
 
     Ok(())
@@ -1142,7 +1142,7 @@ async fn add_column_at_rejects_non_struct_parent() -> KernelResult<()> {
             column_name!("id"),
             StructField::nullable("added", DataType::STRING),
         )
-        .build(engine.as_ref(), committer());
+        .build_with_committer(engine.as_ref(), committer());
     assert_result_error_with_message(result, "path target is not a struct");
 
     Ok(())
@@ -1186,7 +1186,7 @@ async fn empty_create_then_add_column(
     let write_state_err = v0
         .clone()
         .update_table(UpdateTableOperation::Write, "EmptySchemaApp/0.1.0", true)
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .write_state()
         .expect_err("write_state() must reject empty-schema snapshots");
     assert!(
@@ -1197,7 +1197,7 @@ async fn empty_create_then_add_column(
 
     v0.update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(StructField::nullable("id", DataType::INTEGER))
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -1298,7 +1298,7 @@ async fn set_nullable_succeeds(
     snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .set_nullable(column.clone())
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -1344,7 +1344,7 @@ async fn set_nullable_on_layout_column_with_checkpoint(
     create_table(&table_path, schema.clone(), "Test/1.0", true)
         .with_data_layout(layout)
         .with_table_properties(properties)
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
     let v0 = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1387,7 +1387,7 @@ async fn set_nullable_on_layout_column_with_checkpoint(
     let v2 = v1
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .set_nullable(ColumnName::new([col_name]))
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
     let v2_snap = v2
@@ -1426,7 +1426,7 @@ async fn set_nullable_nonexistent_column_fails() -> KernelResult<()> {
     let err = snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .set_nullable(column_name!("nonexistent"))
-        .build(engine.as_ref(), committer());
+        .build_with_committer(engine.as_ref(), committer());
     assert!(err.is_err());
     assert!(err.unwrap_err().to_string().contains("does not exist"));
 
@@ -1474,7 +1474,7 @@ async fn chain_add_column_and_set_nullable(
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(StructField::nullable("email", DataType::STRING))
         .set_nullable(column_name!("id"))
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
     let v1_snap = v1
@@ -1485,7 +1485,7 @@ async fn chain_add_column_and_set_nullable(
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(StructField::nullable("age", DataType::INTEGER))
         .set_nullable(column_name!("name"))
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
     let v2_snap = v2
@@ -1571,7 +1571,7 @@ async fn add_column_with_stray_cm_metadata_on_non_cm_table_is_stripped(
     snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(field)
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -1613,7 +1613,7 @@ async fn add_column_strip_is_none_mode_only(
     snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(field)
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -1656,7 +1656,7 @@ async fn schema_changes_blocked_when_iceberg_compat_enabled(
             operation != UpdateTableOperation::AlterTable,
         )
         .add_column(StructField::nullable("new_col", DataType::STRING))
-        .build(engine.as_ref(), committer())
+        .build_with_committer(engine.as_ref(), committer())
         .unwrap_err()
         .to_string();
     assert!(
@@ -1682,7 +1682,7 @@ async fn add_column_with_orphan_default_metadata_succeeds() -> KernelResult<()> 
     snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(field)
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -1697,7 +1697,7 @@ async fn add_column_with_orphan_default_metadata_succeeds() -> KernelResult<()> 
 
     let txn = reloaded
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(engine.as_ref(), committer())?;
+        .build_with_committer(engine.as_ref(), committer())?;
     assert!(
         txn.top_level_column_defaults()?.is_empty(),
         "default metadata must remain inert without allowColumnDefaults",
@@ -1734,7 +1734,7 @@ async fn schema_changes_blocked_when_allow_column_defaults_enabled(
             operation != UpdateTableOperation::AlterTable,
         )
         .add_column(StructField::nullable("new_col", DataType::STRING))
-        .build(&engine, committer())
+        .build_with_committer(&engine, committer())
         .unwrap_err()
         .to_string();
     assert!(
@@ -1795,7 +1795,7 @@ async fn add_column_preserves_complete_cm_metadata(
     snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(field)
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -1834,7 +1834,7 @@ async fn add_column_with_only_physical_name_allocates_id(
     snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(field)
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -1872,7 +1872,7 @@ async fn add_column_with_only_id_fills_physical_name(
     snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(field)
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -1922,7 +1922,7 @@ async fn add_column_with_id_below_max_column_id_succeeds() -> KernelResult<()> {
     snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(field)
-        .build(engine.as_ref(), committer())?
+        .build_with_committer(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -1965,7 +1965,7 @@ async fn add_column_with_id_colliding_existing_field_is_rejected() -> KernelResu
     let err = snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(field)
-        .build(engine.as_ref(), committer())
+        .build_with_committer(engine.as_ref(), committer())
         .unwrap_err()
         .to_string();
     assert!(
@@ -2019,7 +2019,7 @@ async fn add_column_on_stale_table_leaves_schema_untouched(
     snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(added_field)
-        .build(&engine, committer())?
+        .build_with_committer(&engine, committer())?
         .commit(&engine)?
         .unwrap_committed();
 

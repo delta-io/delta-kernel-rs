@@ -12,7 +12,6 @@ use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::expressions::{ColumnName, Scalar};
 use delta_kernel::object_store::local::LocalFileSystem;
@@ -226,7 +225,7 @@ async fn v3_invalid_type_change_blocks_writes_but_not_snapshot_loading() {
         .unwrap();
     let err = snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(engine.as_ref())
         .unwrap_err()
         .to_string();
     assert!(
@@ -292,7 +291,7 @@ async fn v2_and_deletion_vectors_active_blocks_writes() {
         .unwrap();
     let err = snapshot
         .update_table(UpdateTableOperation::Write, "test-engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(engine.as_ref())
         .unwrap_err()
         .to_string();
     assert!(
@@ -311,7 +310,7 @@ async fn iceberg_compat_commit_validates_num_records(
 
     let _ = create_table(TABLE_ROOT, simple_schema(), "Test/1.0", true)
         .with_table_properties([(feature_property, "true")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(engine.as_ref())
         .unwrap()
         .commit(engine.as_ref())
         .unwrap();
@@ -321,7 +320,7 @@ async fn iceberg_compat_commit_validates_num_records(
 
     let mut txn = snapshot
         .update_table(UpdateTableOperation::Write, "Test/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(engine.as_ref())
         .unwrap();
     let add_files = create_add_files_metadata(
         txn.add_files_schema(),
@@ -362,7 +361,7 @@ async fn v2_partitioned_write_materializes_partition_and_nested_field_ids() {
     let snapshot = create_table(&table_path, schema, "Test/1.0", true)
         .with_table_properties([("delta.enableIcebergCompatV2", "true")])
         .with_data_layout(DataLayout::partitioned(["region"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(engine.as_ref())
         .unwrap()
         .commit(engine.as_ref())
         .unwrap()
@@ -480,7 +479,7 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
     let _ = create_table(&table_path, schema.clone(), "Test/1.0", true)
         .with_table_properties(props)
         .with_data_layout(DataLayout::partitioned(["region"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(engine.as_ref())
         .unwrap()
         .commit(engine.as_ref())
         .unwrap();

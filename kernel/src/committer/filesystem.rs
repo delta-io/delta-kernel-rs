@@ -201,7 +201,7 @@ mod tests {
         let committer = Box::new(FileSystemCommitter::new());
         let err = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(&engine, committer)
+            .build_with_committer(&engine, committer)
             .unwrap()
             .commit(&engine)
             .unwrap_err();

@@ -34,7 +34,6 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Int32Array, RecordBatch, StringArray};
 use delta_kernel::arrow::util::pretty::print_batches;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use delta_kernel_default_engine::storage::store_from_url;
@@ -61,7 +60,7 @@ async fn main() -> KernelResult<()> {
     ])?);
 
     create_table(url.as_str(), schema.clone(), "quick-start/1.0", /* data_change */ true)
-        .build(&engine, Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(&engine)?
         .commit(&engine)?;
     println!("Created table at {url}");
 
@@ -74,7 +73,7 @@ async fn main() -> KernelResult<()> {
             "quick-start/1.0",
             /* data_change */ true,
         )
-        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(&engine)?;
 
     // Build an Arrow RecordBatch
     let arrow_schema: delta_kernel::arrow::datatypes::Schema =
@@ -135,7 +134,7 @@ let schema = Arc::new(StructType::try_new(vec![
 ])?);
 
 create_table(url.as_str(), schema.clone(), "quick-start/1.0", /* data_change */ true)
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build_with_filesystem_committer(&engine)?
     .commit(&engine)?;
 ```
 
@@ -144,8 +143,8 @@ create_table(url.as_str(), schema.clone(), "quick-start/1.0", /* data_change */ 
 - A schema (using kernel's `StructType`)
 - An engine info string (identifies your application)
 
-`.build()` takes the engine and a `Committer`. For local filesystem tables, use
-`FileSystemCommitter`. For catalog-managed tables, you provide your own committer.
+`.build_with_filesystem_committer()` is enough for local filesystem tables.
+Catalog-managed tables need `.build_with_committer()` and your own committer.
 [Catalog-Managed Tables](../catalog_managed/overview.md) covers that topic.
 
 `.commit()` writes version 0 of the table (the initial Protocol and Metadata actions).
@@ -162,7 +161,7 @@ let mut txn = snapshot
         "quick-start/1.0",
         /* data_change */ true,
     )
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build_with_filesystem_committer(&engine)?;
 ```
 
 **Build your data as an Arrow RecordBatch and wrap it:**

@@ -1,6 +1,5 @@
 //! Integration tests for transaction-identifier write paths.
 
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::transaction::UpdateTableOperation;
@@ -34,7 +33,7 @@ async fn test_write_txn_actions(
             snapshot.clone().update_table(UpdateTableOperation::Write, "test-engine", true)
                 .with_transaction_id("app_id1".to_string(), 0)
                 .with_transaction_id("app_id1".to_string(), 1)
-                .build(&engine, Box::new(FileSystemCommitter::new())),
+                .build_with_filesystem_committer(&engine),
             Err(KernelError::InvalidTransactionState(msg)) if msg.contains("app_id app_id1")
         ));
 
@@ -43,7 +42,7 @@ async fn test_write_txn_actions(
                 .clone()
                 .update_table(UpdateTableOperation::Write, "test-engine", true)
                 .with_transaction_id("app_id1".to_string(), 0)
-                .build(&engine, Box::new(FileSystemCommitter::new()))?
+                .build_with_filesystem_committer(&engine)?
                 .with_transaction_id("app_id1".to_string(), 1);
             assert_result_error_with_message(txn.commit(&engine), "app_id app_id1");
         }
@@ -51,14 +50,14 @@ async fn test_write_txn_actions(
         let builder = snapshot.update_table(UpdateTableOperation::Write, "default engine", true);
         let txn = if after_build {
             builder
-                .build(&engine, Box::new(FileSystemCommitter::new()))?
+                .build_with_filesystem_committer(&engine)?
                 .with_transaction_id("app_id1".to_string(), 1)
                 .with_transaction_id("app_id2".to_string(), 2)
         } else {
             builder
                 .with_transaction_id("app_id1".to_string(), 1)
                 .with_transaction_id("app_id2".to_string(), 2)
-                .build(&engine, Box::new(FileSystemCommitter::new()))?
+                .build_with_filesystem_committer(&engine)?
         };
 
         // commit!

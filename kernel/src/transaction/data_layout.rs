@@ -55,7 +55,7 @@ impl DataLayout {
     ///
     /// This method constructs the layout without validation. Full validation
     /// (duplicates, schema compatibility, data types) is performed during
-    /// `CreateTableTransactionBuilder::build()` via `validate_clustering_columns()`.
+    /// `CreateTableTransactionBuilder::build_with_committer()` via `validate_clustering_columns()`.
     ///
     /// # Examples
     ///
@@ -93,7 +93,7 @@ impl DataLayout {
     ///
     /// This method constructs the layout without validation. Full validation
     /// (duplicates, schema compatibility, data types) is performed during
-    /// `CreateTableTransactionBuilder::build()` via `validate_partition_columns()`.
+    /// `CreateTableTransactionBuilder::build_with_committer()` via `validate_partition_columns()`.
     ///
     /// # Example
     ///

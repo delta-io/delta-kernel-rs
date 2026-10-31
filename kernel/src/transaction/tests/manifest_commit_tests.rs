@@ -4,7 +4,6 @@
 use super::super::{ManifestCommitState, ManifestWrite, Transaction, UpdateTableOperation};
 use super::{add_dummy_file, create_existing_table_txn};
 use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
-use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::schema::{DataType, StructField};
 use crate::snapshot::Snapshot;
@@ -222,7 +221,7 @@ fn manifest_commit_after_schema_change_uses_evolved_schema(
     let mut txn = snapshot
         .update_table(operation, "test-engine", !is_alter)
         .add_column(StructField::nullable("fresh_column", DataType::INTEGER))
-        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(&engine)?;
     let expected = txn.effective_table_config.physical_schema();
     assert_ne!(expected, initial_schema);
     let writer = txn

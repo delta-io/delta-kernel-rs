@@ -1,7 +1,6 @@
 //! Integration tests for the `checkConstraints` writer feature: constraint discovery on `Snapshot`
 //! and `Transaction`, and the `ack_check_constraints` gate on commits and `write_state`.
 
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{schema_ref, DataType, StructField};
 use delta_kernel::table_properties::CheckConstraint;
@@ -31,7 +30,7 @@ fn build_write_txn(snapshot: &SnapshotRef, engine: &dyn Engine) -> KernelResult<
     snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "Test/1.0", true)
-        .build(engine, Box::new(FileSystemCommitter::new()))
+        .build_with_filesystem_committer(engine)
 }
 
 fn stage_one_file(txn: &mut Transaction) -> KernelResult<()> {
@@ -235,7 +234,7 @@ async fn alter_table_commit_succeeds_only_with_ack_and_keeps_constraints(
     let mut txn = snapshot
         .update_table(UpdateTableOperation::AlterTable, "Test/1.0", false)
         .add_column(StructField::nullable("note", DataType::STRING))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine.as_ref())?;
     if !acknowledge {
         assert_gate_error(txn.commit(engine.as_ref()));
         return Ok(());

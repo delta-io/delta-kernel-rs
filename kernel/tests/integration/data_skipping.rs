@@ -18,7 +18,6 @@ use delta_kernel::arrow::array::{Array, BooleanArray, Int64Array, RecordBatch, S
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{
     col, column_name, lit, Expression as Expr, Predicate as Pred, PredicateRef, Scalar,
@@ -956,7 +955,7 @@ async fn scan_with_replace_table_schema_change(
     create_table(&table_path, old_schema, "Test/1.0", true)
         .with_data_layout(DataLayout::partitioned(["part"]))
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 
@@ -1222,7 +1221,7 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
     };
     create_table(&table_path, schema, "Test/1.0", true)
         .with_data_layout(DataLayout::partitioned(["ts"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -1299,7 +1298,7 @@ async fn interval_partition_values_do_not_prune_files(
     };
     let mut snapshot = create_table(&table_path, schema, "Test/1.0", true)
         .with_data_layout(DataLayout::partitioned(["period"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
     let data_schema = schema! { nullable "v": LONG };

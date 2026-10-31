@@ -7,7 +7,6 @@ use delta_kernel::actions::{MAX_VALUES, MIN_VALUES};
 use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
 use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{column_name, ArrayData, ColumnName, MapData, Scalar};
 use delta_kernel::object_store::local::LocalFileSystem;
@@ -130,7 +129,7 @@ fn setup_clustered_table(
         .with_data_layout(DataLayout::Clustered {
             columns: clustering_cols,
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let snapshot = set_table_properties(
@@ -381,13 +380,13 @@ async fn write_new_files_to_clustered_table(
         .with_data_layout(DataLayout::Clustered {
             columns: vec![column_name!("id")],
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 
     let txn = snapshot
         .update_table(UpdateTableOperation::Write, "Test/1.0", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine.as_ref())?;
     let write_state = txn.write_state()?;
     let write_context = write_state.write_context_builder().build()?;
     let mut file_metadata = Vec::new();
@@ -593,7 +592,7 @@ fn test_add_file_clustering_provider_on_unclustered_table(
     };
     let mut create = create_table_txn(table_url.as_str(), get_simple_schema(), "Test/1.0", true)
         .with_table_properties(properties)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine.as_ref())?;
     let mut metadata = create_add_files_metadata(
         create.add_files_schema(),
         vec![
@@ -634,7 +633,7 @@ fn test_add_file_clustering_provider_on_unclustered_table(
             .unwrap_post_commit_snapshot();
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, "Test/1.0", true)
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(engine.as_ref())?;
         txn.add_files(metadata);
         txn.commit(engine.as_ref())
             .map(|result| result.unwrap_committed().commit_version())

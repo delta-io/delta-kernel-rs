@@ -11,7 +11,6 @@ use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -265,7 +264,7 @@ async fn test_v2_checkpoint_parquet_write() -> KernelResult<()> {
     let schema = schema_ref! { nullable "value": INTEGER };
     let _ = create_table(&table_path, schema.clone(), "Test/1.0", true)
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     // Commit an add action via the transaction API so the checkpoint has action batches
@@ -782,7 +781,7 @@ async fn test_checkpoint_spec_rejected(
         builder = builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")]);
     }
     let _ = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -810,7 +809,7 @@ async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> KernelResult<()> {
     // v2 table, no data commits -> only protocol + metadata at version 0.
     let _ = create_table(&table_path, schema, "Test/1.0", true)
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -902,7 +901,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
             ("delta.feature.v2Checkpoint", "supported"),
             ("delta.feature.domainMetadata", "supported"),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     // Insert 8 files (one per commit) -> ids 1..=8
@@ -1166,7 +1165,7 @@ async fn create_partitioned_stats_table<E: TaskExecutor>(
             ("delta.checkpoint.writeStatsAsStruct", "true"),
         ])
         .with_data_layout(DataLayout::partitioned(["part_key"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let data_schema = schema! {
@@ -1451,7 +1450,7 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add() -> KernelResult<
             ("delta.enableDeletionVectors", "true"),
             ("delta.enableRowTracking", "true"),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     // === Step 2: Append one batch. ===
@@ -1551,7 +1550,7 @@ async fn test_v2_sidecar_default_hint_splits_at_50k() -> KernelResult<()> {
     // === Step 1: Create v2Checkpoint table. ===
     let _ = create_table(&table_path, get_simple_schema(), "Test/1.0", true)
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     // === Step 2: Run 60 commits of 1_000 synthetic adds each (60_000 total). ===
@@ -1665,7 +1664,7 @@ async fn build_v2_table_with_feature<E: TaskExecutor>(
         builder = builder.with_data_layout(layout);
     }
     let _ = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     // For partitioned tables, the data batches must NOT include the partition column --
@@ -1719,7 +1718,7 @@ async fn snapshot_selects_uuid_checkpoint_over_classic_at_one_version() -> Kerne
     let schema = schema_ref! { nullable "value": INTEGER };
     let _ = create_table(&table_path, schema, "Test/1.0", true)
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build_with_filesystem_committer(engine.as_ref())?
         .commit(engine.as_ref())?;
 
     let snapshot0 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;

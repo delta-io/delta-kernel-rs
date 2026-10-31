@@ -192,10 +192,7 @@ async fn test_write_deletion_vectors_end_to_end() -> KernelResult<()> {
     let mut txn = Snapshot::builder_for(table_url.clone())
         .build(engine.as_ref())?
         .update_table(UpdateTableOperation::Write, "test engine", true)
-        .build(
-            engine.as_ref(),
-            Box::new(delta_kernel::committer::FileSystemCommitter::new()),
-        )?;
+        .build_with_filesystem_committer(engine.as_ref())?;
 
     // Create add file metadata for both files
     let add_files_schema = txn.add_files_schema();

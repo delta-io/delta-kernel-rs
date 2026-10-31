@@ -4,8 +4,8 @@
 <!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-client-api, unity-catalog-delta-rest-client -->
 
 To write to a Unity Catalog-managed Delta table, you create a `UCCommitter`, pass it to
-`UpdateTableTransactionBuilder::build()`, and then publish the staged commit to make it visible in
-`_delta_log/`.
+`UpdateTableTransactionBuilder::build_with_committer()`, and then publish the staged commit to make
+it visible in `_delta_log/`.
 
 Before reading this page, make sure you understand the generic
 [catalog-managed write lifecycle](../catalog_managed/writing.md) and the
@@ -85,7 +85,7 @@ let mut txn = snapshot.clone()
         "my-app/1.0",
         /* data_change */ true,
     )
-    .build(&engine, committer)?;
+    .build_with_committer(&engine, committer)?;
 ```
 
 `UCCommitter` requires a multi-threaded tokio runtime. The default Kernel
@@ -297,7 +297,7 @@ let mut txn = snapshot.clone()
         "my-app/1.0",
         /* data_change */ true,
     )
-    .build(&engine, committer)?;
+    .build_with_committer(&engine, committer)?;
 
 // 6. Write data
 let write_state = txn.write_state()?;

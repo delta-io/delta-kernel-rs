@@ -23,7 +23,6 @@ while writing to a built transaction before committing it.
 # extern crate delta_kernel_default_engine;
 # extern crate tokio;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::transaction::UpdateTableOperation;
@@ -43,7 +42,7 @@ let txn = snapshot
         "myConnector.settings".to_string(),
         r#"{"version": 1, "compress": true}"#.to_string(),
     )
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build_with_filesystem_committer(&engine)?;
 
 txn.commit(&engine)?;
 # Ok(())
@@ -84,7 +83,6 @@ that does not exist yet.
 # extern crate delta_kernel_default_engine;
 # extern crate tokio;
 # use std::sync::Arc;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::transaction::UpdateTableOperation;
@@ -101,7 +99,7 @@ let txn = snapshot
         /* data_change */ false,
     )
     .with_domain_metadata_removed("myConnector.settings")
-    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    .build_with_filesystem_committer(&engine)?;
 
 txn.commit(&engine)?;
 # Ok(())
@@ -123,7 +121,6 @@ an operation; without it, reads retain your engine's normal cancellation and tim
 > A missing domain in incomplete CRC state can still require replay, even for a current CRC.
 > Connectors that heavily rely on `get_domain_metadata()` should ensure checksum CRC files are
 > written with each commit.
-
 
 ```rust,no_run
 # extern crate delta_kernel;

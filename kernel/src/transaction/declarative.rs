@@ -79,7 +79,6 @@ mod tests {
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
-    use crate::committer::FileSystemCommitter;
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::scan::scan_row_schema;
     use crate::schema::{schema_ref, ToSchema};
@@ -97,7 +96,7 @@ mod tests {
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
             .with_execution_mode::<Declarative>()
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(engine.as_ref())?;
         if add_files {
             txn.add_files_ref(RelationRef::new("adds", txn.add_files_schema().clone()));
         }
@@ -130,7 +129,7 @@ mod tests {
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
             .with_execution_mode::<Declarative>()
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build_with_filesystem_committer(engine.as_ref())?;
         let executor = SyncPlanExecutor::default().get_scoped();
         let error = txn.commit_declarative(&executor).unwrap_err();
         assert!(matches!(&error, KernelError::Unsupported(_)));

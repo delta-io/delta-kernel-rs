@@ -104,7 +104,6 @@ and per-row `DEFAULT` requests need separate handling.
 # use std::sync::Arc;
 # use delta_kernel::arrow::array::RecordBatch;
 # use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-# use delta_kernel::committer::FileSystemCommitter;
 # use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 # use delta_kernel::engine::arrow_data::ArrowEngineData;
 # use delta_kernel::expressions::Scalar;
@@ -128,7 +127,7 @@ async fn append_with_defaults(
     let table_schema = snapshot.schema();
     let mut txn = snapshot
         .update_table(UpdateTableOperation::Write, "my-app/1.0", /* data_change */ true)
-        .build(engine, Box::new(FileSystemCommitter::new()))?;
+        .build_with_filesystem_committer(engine)?;
 
     // 2. Build one reusable mapping from input columns or parsed defaults.
     let defaults = txn.top_level_column_defaults()?;

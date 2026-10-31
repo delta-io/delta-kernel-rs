@@ -66,7 +66,7 @@ let mut txn = snapshot
         "my-app/1.0",
         /* data_change */ true,
     )
-    .build(&engine, committer)?;
+    .build_with_committer(&engine, committer)?;
 
 // Drive your Parquet writer from the write context, then hand the resulting
 // add-file metadata batch to the transaction. See the
