@@ -335,6 +335,9 @@ struct CrcReplayAccumulator {
     /// [`is_incremental_safe_operation`] safelist. If false at commit end and the commit
     /// had file actions, we can't trust the file-stats delta and mark it unsafe.
     current_commit_saw_safe_op: bool,
+
+    /// Operation name retained for diagnostics at the commit boundary.
+    current_commit_operation: Option<String>,
 }
 
 impl CrcReplayAccumulator {
@@ -352,6 +355,7 @@ impl CrcReplayAccumulator {
             current_file_url: None,
             current_commit_saw_file_action: false,
             current_commit_saw_safe_op: false,
+            current_commit_operation: None,
         }
     }
 
@@ -376,6 +380,7 @@ impl CrcReplayAccumulator {
         // Covers both "no commitInfo at all" and "commitInfo with no `operation` field".
         if self.current_commit_saw_file_action && !self.current_commit_saw_safe_op {
             warn!(
+                operation = ?self.current_commit_operation,
                 "CRC reverse-replay: commit at {} carried file actions but no safe-classified \
                  operation; defaulting to non-incremental-safe",
                 self.current_file_url.as_deref().unwrap_or("?")
@@ -384,6 +389,7 @@ impl CrcReplayAccumulator {
         }
         self.current_commit_saw_file_action = false;
         self.current_commit_saw_safe_op = false;
+        self.current_commit_operation = None;
     }
 
     // ===== Row-level updates (also the seams used by `on_*` unit tests) =====
@@ -399,13 +405,9 @@ impl CrcReplayAccumulator {
             LastManifestCommit,
         >,
     ) {
-        if let Some(op) = operation {
-            if is_incremental_safe_operation(op) {
-                self.current_commit_saw_safe_op = true;
-            } else {
-                warn!("CRC reverse-replay: non-incremental op {op}");
-                self.delta.is_incremental_safe = false;
-            }
+        self.current_commit_operation = operation.map(str::to_owned);
+        if operation.is_some_and(is_incremental_safe_operation) {
+            self.current_commit_saw_safe_op = true;
         }
         if self.is_first_commit {
             self.delta.in_commit_timestamp = ict;
@@ -743,7 +745,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use test_utils::{add_commit, assert_result_error_with_message};
+    use test_utils::{add_commit, assert_result_error_with_message, LoggingTest};
 
     use super::*;
     use crate::crc::{DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
@@ -768,14 +770,61 @@ mod tests {
     // ===== commitInfo =====
 
     #[rstest::rstest]
-    #[case::safe("WRITE", true)]
-    #[case::streaming_update("STREAMING UPDATE", true)]
-    #[case::unsafe_op("ANALYZE STATS", false)]
-    fn on_commit_info_classifies_operation(#[case] op: &str, #[case] is_safe: bool) {
+    #[case::safe(Some("WRITE"), true)]
+    #[case::streaming_update(Some("STREAMING UPDATE"), true)]
+    #[case::unsafe_op(Some("ANALYZE STATS"), false)]
+    #[case::vacuum_start(Some("VACUUM START"), false)]
+    #[case::vacuum_end(Some("VACUUM END"), false)]
+    #[case::set_properties(Some("SET TBLPROPERTIES"), false)]
+    #[case::missing_operation(None, false)]
+    fn commit_safety_depends_on_operation_only_with_file_actions(
+        #[case] op: Option<&str>,
+        #[case] is_safe: bool,
+        #[values(false, true)] has_file_action: bool,
+        #[values(false, true)] commit_info_first: bool,
+    ) {
         let mut acc = CrcReplayAccumulator::new(None);
-        acc.on_commit_info_without_lmc(Some(op), None);
+        acc.process_batch_start("v1.json");
+        if commit_info_first {
+            acc.on_commit_info_without_lmc(op, None);
+        }
+        if has_file_action {
+            acc.on_add(0).unwrap();
+            acc.on_remove("a", Some(0)).unwrap();
+        }
+        if !commit_info_first {
+            acc.on_commit_info_without_lmc(op, None);
+        }
         assert_eq!(acc.current_commit_saw_safe_op, is_safe);
-        assert_eq!(acc.delta.is_incremental_safe, is_safe);
+        acc.process_commit_file_end();
+        assert_eq!(acc.delta.is_incremental_safe, !has_file_action || is_safe);
+    }
+
+    #[rstest::rstest]
+    #[case::unknown_operation(Some("ANALYZE STATS"), "operation=Some(\"ANALYZE STATS\")")]
+    #[case::missing_operation(None, "operation=None")]
+    fn unsafe_commit_warning_includes_operation_only_after_file_actions(
+        #[case] operation: Option<&str>,
+        #[case] expected_operation: &str,
+    ) {
+        let logging = LoggingTest::new();
+        let mut acc = CrcReplayAccumulator::new(None);
+        acc.process_batch_start("v2.json");
+        acc.on_commit_info_without_lmc(Some("VACUUM END"), None);
+        acc.process_batch_start("v1.json");
+        if let Some(operation) = operation {
+            acc.on_commit_info_without_lmc(Some(operation), None);
+        }
+        assert!(logging.logs().is_empty());
+
+        acc.on_add(0).unwrap();
+        assert!(logging.logs().is_empty());
+        acc.process_commit_file_end();
+
+        let logs = logging.logs();
+        assert!(logs.contains("commit at v1.json"), "{logs}");
+        assert!(logs.contains(expected_operation), "{logs}");
+        assert!(!logs.contains("VACUUM END"), "{logs}");
     }
 
     #[test]
