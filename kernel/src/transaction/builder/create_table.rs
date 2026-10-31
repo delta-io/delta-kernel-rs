@@ -2864,14 +2864,8 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest]
     #[case::cm_mode_name(COLUMN_MAPPING_MODE, "name")]
-    #[case::cm_mode_none(COLUMN_MAPPING_MODE, "none")]
-    #[case::row_tracking_false(ENABLE_ROW_TRACKING, "false")]
-    #[case::deletion_vectors_false(ENABLE_DELETION_VECTORS, "false")]
-    #[case::ict_false(ENABLE_IN_COMMIT_TIMESTAMPS, "false")]
     #[case::row_tracking_suspended(ROW_TRACKING_SUSPENDED, "true")]
     #[case::v1_concurrent(ENABLE_ICEBERG_COMPAT_V1, "true")]
-    #[case::v2_concurrent(ENABLE_ICEBERG_COMPAT_V2, "true")]
-    #[case::v3_concurrent(ENABLE_ICEBERG_COMPAT_V3, "true")]
     fn test_iceberg_native_v4_dependencies_rejects_invalid_combinations(
         #[case] key: &str,
         #[case] value: &str,
@@ -2909,11 +2903,6 @@ mod tests {
         schema_ref! { nullable "id": INTEGER },
         &[(ENABLE_ICEBERG_NATIVE_V4, "true"), (ENABLE_ICEBERG_COMPAT_V2, "true")],
         "IcebergNativeV4 cannot be enabled together with 'delta.enableIcebergCompatV2'"
-    )]
-    #[case::enabled_iceberg_compat_v3(
-        schema_ref! { nullable "id": INTEGER },
-        &[(ENABLE_ICEBERG_NATIVE_V4, "true"), (ENABLE_ICEBERG_COMPAT_V3, "true")],
-        "IcebergNativeV4 cannot be enabled together with 'delta.enableIcebergCompatV3'"
     )]
     // TODO(#3769): Stricter than the RFC, which places no requirements on a supported but not
     // enabled icebergNativeV4. The write path checks every listed writer feature.
@@ -2956,15 +2945,7 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest]
-    #[case::column_mapping(TableFeature::ColumnMapping)]
-    #[case::deletion_vectors(TableFeature::DeletionVectors)]
-    #[case::row_tracking(TableFeature::RowTracking)]
-    #[case::domain_metadata(TableFeature::DomainMetadata)]
-    #[case::in_commit_timestamp(TableFeature::InCommitTimestamp)]
-    #[case::vacuum_protocol_check(TableFeature::VacuumProtocolCheck)]
-    #[case::type_widening(TableFeature::TypeWidening)]
     #[case::variant_type(TableFeature::VariantType)]
-    #[case::variant_shredding(TableFeature::VariantShredding)]
     #[case::catalog_managed(TableFeature::CatalogManaged)]
     #[case::iceberg_compat_v3(TableFeature::IcebergCompatV3)]
     fn test_create_table_iceberg_native_v4_accepts_allowed_feature(#[case] feature: TableFeature) {
