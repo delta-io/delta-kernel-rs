@@ -8,10 +8,7 @@ use delta_kernel::snapshot::{SnapshotHint, SnapshotHintFreshness};
 use delta_kernel::KernelError;
 use delta_kernel::KernelResult;
 
-use super::{
-    FfiSnapshotHint, FfiSnapshotHintFreshness, FfiSnapshotHintV2, SnapshotHintVisitor,
-    SnapshotHintVisitorV2,
-};
+use super::{FfiSnapshotHint, FfiSnapshotHintFreshness, SnapshotHintVisitor};
 use crate::delta_types::{CheckpointBacking, CrcBacking, MetadataBacking, ProtocolBacking};
 use crate::log_path::FfiLogPath;
 use crate::{kernel_string_slice, optional_pointer, FfiSlice, NullableCvoid};
@@ -21,38 +18,7 @@ pub(super) fn visit(
     context: NullableCvoid,
     visitor: SnapshotHintVisitor,
 ) -> KernelResult<()> {
-    visit_impl(hint, false, |value, _| visitor(context, &value))
-}
-
-pub(super) fn visit_v2(
-    hint: &SnapshotHint,
-    context: NullableCvoid,
-    visitor: SnapshotHintVisitorV2,
-) -> KernelResult<()> {
-    visit_impl(hint, true, |base, base_crc| {
-        let (checkpoint_kind, crc_provenance) = hint.provenance().unwrap_or_default();
-        visitor(
-            context,
-            &FfiSnapshotHintV2 {
-                base,
-                checkpoint_kind,
-                crc_provenance: crc_provenance.into(),
-                base_crc,
-            },
-        );
-    })
-}
-
-fn visit_impl(
-    hint: &SnapshotHint,
-    include_stale_crc: bool,
-    visitor: impl FnOnce(FfiSnapshotHint, *const crate::delta_types::FfiCrc),
-) -> KernelResult<()> {
-    let retained_crc = if include_stale_crc {
-        hint.base_crc()
-    } else {
-        hint.crc()
-    };
+    let retained_crc = hint.base_crc();
     #[cfg(feature = "adaptive-metadata-in-dev")]
     if retained_crc.is_some_and(|crc| {
         crc.last_manifest_commit().is_some()
@@ -96,6 +62,7 @@ fn visit_impl(
     let crc = retained_crc.map(CrcBacking::new);
     let checkpoint_view = checkpoint.as_ref().map(CheckpointBacking::as_ffi);
     let crc_view = crc.as_ref().map(CrcBacking::as_ffi);
+    let (checkpoint_kind, crc_provenance) = hint.provenance().unwrap_or_default();
     let value = FfiSnapshotHint {
         version: hint.version(),
         freshness: match hint.freshness() {
@@ -106,9 +73,11 @@ fn visit_impl(
         protocol: protocol.as_ffi(),
         metadata: metadata.as_ffi(),
         last_checkpoint: optional_pointer(checkpoint_view.as_ref()),
-        crc: optional_pointer(crc_view.as_ref().filter(|_| hint.crc().is_some())),
+        crc: optional_pointer(crc_view.as_ref()),
         publication_watermark: hint.publication_watermark().into(),
+        checkpoint_kind,
+        crc_provenance: crc_provenance.into(),
     };
-    visitor(value, optional_pointer(crc_view.as_ref()));
+    visitor(context, &value);
     Ok(())
 }

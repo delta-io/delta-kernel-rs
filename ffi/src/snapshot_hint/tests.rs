@@ -253,6 +253,11 @@ fn test_snapshot_hint(
         last_checkpoint: std::ptr::null(),
         crc: std::ptr::null(),
         publication_watermark: FfiPublicationWatermark::InferFromLogPaths,
+        checkpoint_kind: SelectedCheckpointKind::Unknown,
+        crc_provenance: FfiCrcProvenance {
+            source: CrcSource::Unknown,
+            base_version: OptionalValue::None,
+        },
     }
 }
 
@@ -491,6 +496,9 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
     let table_root = source.table_root().as_str().to_owned();
     let expected_segment = source.log_segment().clone();
     let expected_crc = source.crc_at_version().cloned();
+    let expected_base_crc = source.to_snapshot_hint().unwrap().base_crc().cloned();
+    let expected_provenance = source.crc_provenance();
+    let expected_checkpoint_kind = source.selected_checkpoint_kind();
     let expected_latest = source.is_built_as_latest();
     let files = &expected_segment.listed;
     let expected_files: BTreeMap<_, _> = files
@@ -531,7 +539,7 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
     );
     assert_eq!(
         state.crc_version,
-        expected_crc.as_ref().map(|crc| crc.version)
+        expected_base_crc.as_ref().map(|crc| crc.version)
     );
 
     let builder = unsafe {
@@ -546,6 +554,15 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
     let rebuilt_ref = unsafe { rebuilt.as_ref() };
     assert_eq!(rebuilt_ref.log_segment(), &expected_segment);
     assert_eq!(rebuilt_ref.crc_at_version(), expected_crc.as_ref());
+    assert_eq!(
+        rebuilt_ref.to_snapshot_hint().unwrap().base_crc(),
+        expected_base_crc.as_ref()
+    );
+    assert_eq!(rebuilt_ref.crc_provenance(), expected_provenance);
+    assert_eq!(
+        rebuilt_ref.selected_checkpoint_kind(),
+        expected_checkpoint_kind
+    );
     assert_eq!(rebuilt_ref.is_built_as_latest(), expected_latest);
     unsafe {
         free_snapshot(rebuilt);
@@ -601,7 +618,7 @@ fn exported_hint_sorts_and_deduplicates_supplied_paths(#[case] checkpoint_versio
     ignore = "checkpoint setup is costly; shared FFI coverage is kept in \
               exported_hint_sorts_and_deduplicates_supplied_paths"
 )]
-fn exported_storage_snapshot_preserves_paths_and_omits_stale_crc(
+fn exported_storage_snapshot_preserves_paths_and_retained_crc(
     #[case] checkpoint_version: Version,
     #[case] expected_crc_path: Option<Version>,
 ) {
@@ -647,19 +664,11 @@ struct VisitedHint {
     visits: usize,
 }
 
-extern "C" fn install_visited_hint_v2(context: NullableCvoid, hint: *const FfiSnapshotHintV2) {
-    let state = unsafe { &mut *context.unwrap().as_ptr().cast::<VisitedHint>() };
-    state.visits += 1;
-    state.result = Some(unsafe {
-        snapshot_builder_with_snapshot_hint_v2(state.builder.take().unwrap(), &*hint)
-    });
-}
-
 #[rstest::rstest]
 #[case::crc_before_checkpoint(0, SelectedCheckpointKind::Unknown, CrcSource::Stale, 0)]
 #[case::checkpoint_claim(1, SelectedCheckpointKind::None, CrcSource::AtVersion, 1)]
 #[case::crc_claim(1, SelectedCheckpointKind::Unknown, CrcSource::Reconstructed { num_commits: 2 }, 0)]
-fn versioned_hint_provenance_failures_are_invalid_snapshot_hints(
+fn hint_provenance_failures_are_invalid_snapshot_hints(
     #[case] crc_version: u64,
     #[case] checkpoint_kind: SelectedCheckpointKind,
     #[case] source: CrcSource,
@@ -673,17 +682,17 @@ fn versioned_hint_provenance_failures_are_invalid_snapshot_hints(
     )];
     let mut crc = empty_crc();
     crc.version = crc_version;
-    let hint = FfiSnapshotHintV2 {
-        base: test_snapshot_hint(&paths, 1, FfiSnapshotHintFreshness::Latest),
+    let hint = FfiSnapshotHint {
         checkpoint_kind,
         crc_provenance: FfiCrcProvenance {
             source,
             base_version: OptionalValue::Some(base_version),
         },
-        base_crc: &crc,
+        crc: &crc,
+        ..test_snapshot_hint(&paths, 1, FfiSnapshotHintFreshness::Latest)
     };
     let builder = unsafe {
-        ok_or_panic(snapshot_builder_with_snapshot_hint_v2(
+        ok_or_panic(snapshot_builder_with_snapshot_hint(
             test_builder(&engine),
             &hint,
         ))
@@ -700,7 +709,9 @@ fn versioned_hint_provenance_failures_are_invalid_snapshot_hints(
 #[case::missing(CrcSource::Missing, None, None)]
 #[case::unusable(CrcSource::Unusable, None, None)]
 #[case::unknown(CrcSource::Unknown, None, Some(2))]
-fn versioned_hint_preserves_provenance_without_io(
+#[case::unknown_stale(CrcSource::Unknown, None, Some(1))]
+#[case::unknown_absent(CrcSource::Unknown, None, None)]
+fn hint_preserves_provenance_without_io(
     #[case] source: CrcSource,
     #[case] base_version: Option<u64>,
     #[case] crc_version: Option<u64>,
@@ -726,21 +737,21 @@ fn versioned_hint_preserves_provenance_without_io(
     ];
     let mut crc = empty_crc();
     crc.version = crc_version.unwrap_or(0);
-    let hint = FfiSnapshotHintV2 {
-        base: test_snapshot_hint(&paths, 2, FfiSnapshotHintFreshness::Latest),
+    let hint = FfiSnapshotHint {
         checkpoint_kind: SelectedCheckpointKind::None,
         crc_provenance: FfiCrcProvenance {
             source,
             base_version: base_version.into(),
         },
-        base_crc: if crc_version.is_some() {
+        crc: if crc_version.is_some() {
             &crc
         } else {
             std::ptr::null()
         },
+        ..test_snapshot_hint(&paths, 2, FfiSnapshotHintFreshness::Latest)
     };
     let builder = unsafe {
-        ok_or_panic(snapshot_builder_with_snapshot_hint_v2(
+        ok_or_panic(snapshot_builder_with_snapshot_hint(
             test_builder(&engine),
             &hint,
         ))
@@ -760,20 +771,30 @@ fn versioned_hint_preserves_provenance_without_io(
         visits: 0,
     };
     assert!(unsafe {
-        ok_or_panic(snapshot_to_snapshot_hint_v2(
+        ok_or_panic(snapshot_to_snapshot_hint(
             snapshot.shallow_copy(),
             engine.shallow_copy(),
             Some(NonNull::from(&mut state).cast()),
-            install_visited_hint_v2,
+            install_visited_hint,
         ))
     });
     assert_eq!(state.visits, 1);
     unsafe { free_snapshot(snapshot) };
     let rebuilt =
         unsafe { ok_or_panic(snapshot_builder_build(ok_or_panic(state.result.unwrap()))) };
+    let rebuilt_ref = unsafe { rebuilt.as_ref() };
     assert_eq!(
-        unsafe { rebuilt.as_ref() }.crc_provenance(),
+        rebuilt_ref.crc_provenance(),
         hint.crc_provenance.to_kernel()
+    );
+    assert_eq!(rebuilt_ref.selected_checkpoint_kind(), hint.checkpoint_kind);
+    assert_eq!(
+        rebuilt_ref
+            .to_snapshot_hint()
+            .unwrap()
+            .base_crc()
+            .map(|crc| crc.version),
+        crc_version
     );
     unsafe {
         free_snapshot(rebuilt);
@@ -1554,17 +1575,11 @@ fn aggregate_with_rejects_null_nonempty_log_path_array() {
     let engine = test_engine();
     let builder = test_builder(&engine);
     let hint = FfiSnapshotHint {
-        version: 0,
-        freshness: FfiSnapshotHintFreshness::Unverified,
         log_paths: LogPathArray {
             ptr: std::ptr::null(),
             len: 1,
         },
-        protocol: test_protocol(),
-        metadata: test_metadata(),
-        last_checkpoint: std::ptr::null(),
-        crc: std::ptr::null(),
-        publication_watermark: FfiPublicationWatermark::InferFromLogPaths,
+        ..test_snapshot_hint(&[], 0, FfiSnapshotHintFreshness::Unverified)
     };
     let result = unsafe { snapshot_builder_with_snapshot_hint(builder, &hint) };
     assert_extern_result_error_contains(
