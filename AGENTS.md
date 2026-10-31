@@ -366,9 +366,7 @@ Keep this list updated when new protocol features are added to kernel.
 
 ## Code Style
 
-- Prefer mirroring the `kernel/src/` module hierarchy in `ffi/src/` for corresponding APIs.
-  Keep FFI-specific ownership, conversion, and engine support code where it fits the boundary.
-
+- For FFI module organization, follow the [source layout guidance](ffi/AGENTS.md#source-layout).
 - Line width is 100 characters. Wrap comments and string literals at 100, not 80.
 - Place `use` imports at the top of the file (for non-test code) or at the top of the
   `mod tests` block (for test code): never inside function bodies.

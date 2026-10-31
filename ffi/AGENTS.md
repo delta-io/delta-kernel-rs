@@ -785,9 +785,9 @@ The setter consumes the builder on both success and error, returning its replace
 ## Source layout
 
 Prefer mirroring the `kernel/src/` module hierarchy in `ffi/src/` for corresponding APIs.
-For example, snapshot hints belong under `src/snapshot/hint/`, alongside the kernel
-`kernel/src/snapshot/hint.rs` implementation. Keep related snapshot APIs under `src/snapshot/`
-as well. FFI-specific support code can use its own modules.
+Snapshot hints live under `src/snapshot/hint/`, matching `kernel/src/snapshot/hint.rs`.
+Snapshot builders and accessors live in `src/lib.rs`. FFI-specific ownership, conversion, and
+engine support code can use its own modules.
 
 ## Key Files
 

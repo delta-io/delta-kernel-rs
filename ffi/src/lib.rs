@@ -84,6 +84,8 @@ pub mod scan;
 pub mod schema;
 pub mod schema_visitor;
 pub mod snapshot;
+/// Preserves the `snapshot_hint` import path for Rust callers.
+#[doc(hidden)]
 pub use snapshot::hint as snapshot_hint;
 
 #[cfg(test)]
