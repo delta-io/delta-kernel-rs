@@ -17,6 +17,8 @@ pub(crate) struct DelegatingEngine {
     parquet: Option<Arc<dyn ParquetHandler>>,
     #[cfg(feature = "declarative-plans")]
     plan_executor: PlanExecutorOverride,
+    #[cfg(feature = "declarative-plans")]
+    declarative_protocol_metadata: bool,
 }
 
 /// How [`DelegatingEngine`] resolves `plan_executor`. Unlike the other handlers, `None` is
@@ -32,13 +34,15 @@ enum PlanExecutorOverride {
 impl DelegatingEngine {
     pub(crate) fn new(inner: Arc<dyn Engine>) -> Self {
         Self {
-            inner,
+            inner: inner.clone(),
             evaluation: None,
             storage: None,
             json: None,
             parquet: None,
             #[cfg(feature = "declarative-plans")]
             plan_executor: PlanExecutorOverride::Inherit,
+            #[cfg(feature = "declarative-plans")]
+            declarative_protocol_metadata: inner.use_declarative_protocol_metadata(),
         }
     }
 
@@ -65,6 +69,12 @@ impl DelegatingEngine {
     #[cfg(feature = "declarative-plans")]
     pub(crate) fn with_plan_executor(mut self, executor: Arc<dyn PlanExecutor>) -> Self {
         self.plan_executor = PlanExecutorOverride::Some(executor);
+        self
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn with_declarative_protocol_metadata(mut self, enabled: bool) -> Self {
+        self.declarative_protocol_metadata = enabled;
         self
     }
 
@@ -98,6 +108,11 @@ impl Engine for DelegatingEngine {
         self.parquet
             .clone()
             .unwrap_or_else(|| self.inner.parquet_handler())
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn use_declarative_protocol_metadata(&self) -> bool {
+        self.declarative_protocol_metadata
     }
 
     #[cfg(feature = "declarative-plans")]

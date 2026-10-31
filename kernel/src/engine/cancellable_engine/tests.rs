@@ -747,7 +747,8 @@ fn json_iterator_stops_after_mid_stream_cancellation(#[values(false, true)] canc
 #[cfg(feature = "declarative-plans")]
 #[test]
 fn declarative_replay_does_not_use_handler_cancellation() {
-    let engine = SyncEngine::new();
+    let engine =
+        DelegatingEngine::new(Arc::new(SyncEngine::new())).with_declarative_protocol_metadata(true);
     let snapshot = Snapshot::builder_for("tests/data/table-without-dv-small")
         .build(&engine)
         .unwrap();

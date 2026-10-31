@@ -49,6 +49,8 @@ pub(crate) struct CancellableEngine {
     /// Original declarative executor, when available.
     #[cfg(feature = "declarative-plans")]
     plan_executor: Option<Arc<dyn PlanExecutor>>,
+    #[cfg(feature = "declarative-plans")]
+    declarative_protocol_metadata: bool,
 }
 
 impl CancellableEngine {
@@ -70,6 +72,8 @@ impl CancellableEngine {
             )),
             #[cfg(feature = "declarative-plans")]
             plan_executor: engine.plan_executor(),
+            #[cfg(feature = "declarative-plans")]
+            declarative_protocol_metadata: engine.use_declarative_protocol_metadata(),
         }
     }
 }
@@ -99,6 +103,11 @@ impl Engine for CancellableEngine {
     #[cfg(feature = "declarative-plans")]
     fn plan_executor(&self) -> Option<Arc<dyn PlanExecutor>> {
         self.plan_executor.clone()
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn use_declarative_protocol_metadata(&self) -> bool {
+        self.declarative_protocol_metadata
     }
 }
 
