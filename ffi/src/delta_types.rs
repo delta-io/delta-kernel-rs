@@ -403,6 +403,9 @@ pub struct FfiLastCheckpointV2 {
     pub sidecar_files: OptionalValue<FfiSidecarArray>,
     /// Optional non-file actions. `Some` may contain an empty array.
     pub non_file_actions: OptionalValue<FfiCheckpointNonFileActionArray>,
+    /// Independently retained checkpoint metadata. NULL means absent. The record and its tags
+    /// are borrowed for the enclosing hint call or export callback, like the other hint fields.
+    pub checkpoint_metadata: *const FfiCheckpointMetadata,
 }
 
 struct CheckpointV2Backing<'a> {
@@ -412,6 +415,8 @@ struct CheckpointV2Backing<'a> {
     _action_backing: Option<Vec<CheckpointActionBacking<'a>>>,
     _action_records: Option<Vec<CheckpointActionRecord>>,
     actions: Option<Vec<FfiCheckpointNonFileAction>>,
+    _checkpoint_metadata_tags: Option<Vec<FfiStringMapEntry>>,
+    checkpoint_metadata: Vec<FfiCheckpointMetadata>,
 }
 
 impl<'a> CheckpointV2Backing<'a> {
@@ -459,8 +464,26 @@ impl<'a> CheckpointV2Backing<'a> {
         let actions: Option<Vec<_>> = action_records
             .as_ref()
             .map(|values| values.iter().map(CheckpointActionRecord::as_ffi).collect());
+        let checkpoint_metadata_tags = source.checkpoint_metadata().and_then(|metadata| {
+            metadata
+                .tags()
+                .map(|tags| unsafe { FfiStringMapEntry::from_map_unsafe(tags) })
+        });
+        let checkpoint_metadata = source
+            .checkpoint_metadata()
+            .into_iter()
+            .map(|metadata| FfiCheckpointMetadata {
+                version: metadata.version(),
+                tags: checkpoint_metadata_tags
+                    .as_deref()
+                    .map(|tags| unsafe { FfiSlice::new_unsafe(tags) })
+                    .into(),
+            })
+            .collect();
         Self {
             source,
+            _checkpoint_metadata_tags: checkpoint_metadata_tags,
+            checkpoint_metadata,
             _sidecar_tags: sidecar_tags,
             sidecars,
             _action_backing: action_backing,
@@ -472,6 +495,10 @@ impl<'a> CheckpointV2Backing<'a> {
     fn as_ffi(&self) -> FfiLastCheckpointV2 {
         let path = self.source.path();
         FfiLastCheckpointV2 {
+            checkpoint_metadata: self
+                .checkpoint_metadata
+                .first()
+                .map_or(std::ptr::null(), std::ptr::from_ref),
             path: kernel_string_slice!(path),
             size_in_bytes: self.source.size_in_bytes().into(),
             modification_time: self.source.modification_time().into(),
@@ -533,7 +560,7 @@ impl<'a> CheckpointBacking<'a> {
             .tags()
             .map(|values| unsafe { FfiStringMapEntry::from_map_unsafe(values) });
         let v2_backing = source.v2_checkpoint().map(CheckpointV2Backing::new);
-        // The V2 record points into vector buffers, which remain stable when their owners move.
+        // The V2 record points into heap allocations, which remain stable when their owners move.
         let v2 = v2_backing.as_ref().map(CheckpointV2Backing::as_ffi);
         Ok(Self {
             source,
@@ -1216,12 +1243,16 @@ impl FfiLastCheckpointV2 {
             Option::<&FfiCheckpointNonFileActionArray>::from(&self.non_file_actions)
                 .map(|value| unsafe { value.try_to_kernel() })
                 .transpose()?;
+        let checkpoint_metadata = unsafe { self.checkpoint_metadata.as_ref() }
+            .map(|metadata| unsafe { metadata.try_to_kernel() })
+            .transpose()?;
         Ok(LastCheckpointV2::from_parts(
             unsafe { self.path.try_to_string() }?,
             Option::<&i64>::from(&self.size_in_bytes).copied(),
             Option::<&i64>::from(&self.modification_time).copied(),
             sidecar_files,
             non_file_actions,
+            checkpoint_metadata,
         ))
     }
 }
