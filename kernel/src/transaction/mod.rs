@@ -23,7 +23,7 @@ use crate::schema::void_utils::validate_schema_for_write;
 use crate::schema::{
     lazy_schema_ref, ColumnDefault, MapType, SchemaRef, SchemaStructPatchBuilder, StructField,
 };
-use crate::snapshot::{Snapshot, SnapshotRef};
+use crate::snapshot::{CrcOrigin, Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 #[cfg(feature = "check-constraints-in-dev")]
@@ -1313,6 +1313,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
                     log_segment,
                     self.effective_table_config,
                     Some(Arc::new(crc)),
+                    CrcOrigin::Unknown,
                     true,  /* built_as_latest */
                     false, /* skipped_new_checkpoints */
                 )?;

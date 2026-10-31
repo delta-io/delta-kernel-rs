@@ -227,13 +227,8 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         last_checkpoint_hint,
         crc,
         freshness,
+        provenance.map(|hint| (hint.checkpoint_kind, hint.crc_provenance.to_kernel())),
     )?;
-    let snapshot_hint = match provenance {
-        Some(hint) => {
-            snapshot_hint.with_provenance(hint.checkpoint_kind, hint.crc_provenance.to_kernel())
-        }
-        None => snapshot_hint,
-    };
     builder.snapshot_hint = Some(Box::new(snapshot_hint));
     Ok(())
 }

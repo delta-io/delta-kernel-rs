@@ -78,10 +78,10 @@ impl LogSegment {
             && established != SelectedCheckpointKind::Unknown
             && kind != established
         {
-            return Err(SnapshotHintError::CheckpointProvenance.into());
+            return Err(SnapshotHintError::CheckpointProvenanceConflict.into());
         }
         if kind == SelectedCheckpointKind::None && self.checkpoint_version.is_some() {
-            return Err(SnapshotHintError::CheckpointProvenance.into());
+            return Err(SnapshotHintError::CheckpointProvenanceConflict.into());
         }
         // Keep connector claims separate so ordinary reads can establish the actual kind.
         self.checkpoint_kind_hint = kind;

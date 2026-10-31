@@ -1228,6 +1228,7 @@ fn typed_export_rejects_adaptive_crc_without_visiting_or_consuming_snapshot(
         None,
         Some(Arc::new(expected_crc.clone())),
         SnapshotHintFreshness::Unverified,
+        None,
     )
     .unwrap();
     let kernel_engine = unsafe { engine.as_ref() }.engine();

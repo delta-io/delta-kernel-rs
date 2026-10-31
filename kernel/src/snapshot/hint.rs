@@ -12,7 +12,9 @@ use crate::log_path::LogPath;
 use crate::log_segment::{validate_catalog_managed_versions, LogSegment};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::path::{LogPathFileType, ParsedLogPath, DELTA_LOG_DIR_WITH_SLASH};
-use crate::snapshot::{CrcProvenance, IncrementalReplay, SelectedCheckpointKind, SnapshotRef};
+use crate::snapshot::{
+    CrcOrigin, CrcProvenance, IncrementalReplay, SelectedCheckpointKind, SnapshotRef,
+};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
 use crate::{KernelError, KernelResult, Snapshot, Version};
@@ -103,6 +105,11 @@ impl SnapshotHint {
     /// `publication_watermark` selects path-based inference or an explicit observation that may
     /// no longer be represented by a retained path.
     ///
+    /// `provenance` supplies retained checkpoint and checksum observations. When present, `crc`
+    /// may be stale; `None` preserves legacy hint behavior and requires any CRC to be at-version.
+    /// Structural consistency is validated when the hint is built; Kernel does not read storage
+    /// to verify these claims.
+    ///
     /// # Errors
     ///
     /// Returns an error if `table_root` is invalid,
@@ -123,6 +130,7 @@ impl SnapshotHint {
         last_checkpoint_hint: Option<LastCheckpointHint>,
         crc: Option<Arc<Crc>>,
         freshness: SnapshotHintFreshness,
+        provenance: Option<(SelectedCheckpointKind, CrcProvenance)>,
     ) -> KernelResult<Self> {
         let log_root = try_parse_uri(table_root)?.join(DELTA_LOG_DIR_WITH_SLASH)?;
         let mut parsed_paths: Vec<ParsedLogPath> = log_paths.into_iter().map(Into::into).collect();
@@ -160,23 +168,8 @@ impl SnapshotHint {
             last_checkpoint_hint,
             crc,
             freshness,
-            provenance: None,
+            provenance,
         })
-    }
-
-    /// Attaches retained checkpoint and checksum observations to this hint.
-    ///
-    /// With provenance attached, the supplied CRC may be stale. Structural consistency is
-    /// validated when the hint is built; Kernel does not read storage to verify these claims.
-    #[internal_api]
-    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn with_provenance(
-        mut self,
-        checkpoint_kind: SelectedCheckpointKind,
-        crc_provenance: CrcProvenance,
-    ) -> Self {
-        self.provenance = Some((checkpoint_kind, crc_provenance));
-        self
     }
 
     /// Returns retained observations, if supplied or captured from a snapshot.
@@ -439,6 +432,7 @@ impl SnapshotHint {
             },
             table_configuration,
             crc,
+            CrcOrigin::Unknown,
             freshness == SnapshotHintFreshness::Latest,
             false, /* skipped_new_checkpoints */
         )?;
@@ -592,6 +586,7 @@ mod tests {
             )?,
             snapshot.table_configuration().clone(),
             snapshot.crc_at_version().cloned(),
+            CrcOrigin::Unknown,
             false,
             false,
         )?;
@@ -625,6 +620,7 @@ mod tests {
             )?,
             snapshot.table_configuration().clone(),
             None,
+            CrcOrigin::Unknown,
             false,
             false,
         )?;
@@ -662,6 +658,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
 
@@ -697,6 +694,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
 
@@ -730,6 +728,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         );
         assert_result_error_with_message(result, expected_error);
     }
@@ -782,6 +781,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .and_then(|hint| {
             SnapshotBuilder::new_for(TABLE_ROOT)
@@ -849,6 +849,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
         let first_retained_path = hint
@@ -895,6 +896,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
         let (engine, _store, _table_root) = setup_test();

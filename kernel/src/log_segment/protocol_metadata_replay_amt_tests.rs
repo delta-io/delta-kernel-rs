@@ -17,6 +17,7 @@ use crate::engine::test_delegating::DelegatingEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
 use crate::schema::SchemaRef;
+use crate::snapshot::CrcOrigin;
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
 use crate::unit_test_utils::{
@@ -786,6 +787,7 @@ async fn snapshot_with_crc_at_version_serves_last_manifest_commit_from_crc(
         loaded.log_segment().clone(),
         loaded.table_configuration().clone(),
         Some(Arc::new(crc)),
+        CrcOrigin::Unknown,
         false, /* built_as_latest */
         false, /* skipped_new_checkpoints */
     )
