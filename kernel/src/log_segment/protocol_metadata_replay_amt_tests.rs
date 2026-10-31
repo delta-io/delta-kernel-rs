@@ -19,6 +19,9 @@ use crate::object_store::ObjectStoreExt as _;
 use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
+use crate::unit_test_utils::adaptive_metadata_fixtures::{
+    commit_info_line, protocol_and_metadata_lines,
+};
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, parse_json_batch, test_schema_flat_with_column_mapping,
 };
@@ -47,28 +50,6 @@ fn checkpoint_commit(version: i64, extra_features: &[TableFeature], schema: Sche
 fn metadata_commit(schema: SchemaRef) -> String {
     let config = adaptive_metadata_table_configuration(schema, &[]);
     serde_json::json!({ "metaData": config.metadata() }).to_string()
-}
-
-// Builds a commit line with top-level `protocol` and `metaData` from an AMT config, and no
-// checkpoint action, so P&M come from standalone actions.
-fn standalone_pm_commit(schema: SchemaRef) -> String {
-    let config = adaptive_metadata_table_configuration(schema, &[]);
-    format!(
-        "{}\n{}",
-        serde_json::json!({ "protocol": config.protocol() }),
-        serde_json::json!({ "metaData": config.metadata() }),
-    )
-}
-
-// Builds a `commitInfo` line with an In-Commit Timestamp and, when given, a `lastManifestCommit`
-// `(version, contentRootVersion)`, as an AMT writer records on every commit.
-fn commit_info_line(pointer: Option<(i64, i64)>) -> String {
-    let mut commit_info = serde_json::json!({ "timestamp": 1, "inCommitTimestamp": 1 });
-    if let Some((version, content_root_version)) = pointer {
-        commit_info["lastManifestCommit"] =
-            serde_json::json!({ "version": version, "contentRootVersion": content_root_version });
-    }
-    serde_json::json!({ "commitInfo": commit_info }).to_string()
 }
 
 // Builds a top-level `protocol` commit line with the given reader/writer versions (no features).
@@ -278,7 +259,11 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
 #[rstest]
 #[case::commit_carries_checkpoint_action(checkpoint_commit(0, &[], one_column_schema()), Some(0))]
 #[case::standalone_pm_has_no_checkpoint_action(
-    format!("{}\n{}", commit_info_line(None), standalone_pm_commit(one_column_schema())),
+    format!(
+        "{}\n{}",
+        commit_info_line(1, None),
+        protocol_and_metadata_lines(one_column_schema(), &[])
+    ),
     None
 )]
 #[tokio::test]
@@ -324,7 +309,7 @@ async fn latest_checkpoint_action_without_replay_follows_commit_info_pointer() {
         0,
         format!(
             "{}\n{}",
-            commit_info_line(Some((0, 0))),
+            commit_info_line(1, Some((0, 0))),
             checkpoint_commit(0, &[], one_column_schema())
         ),
     )
@@ -335,8 +320,7 @@ async fn latest_checkpoint_action_without_replay_follows_commit_info_pointer() {
     let storage = engine.storage_handler();
     let log_root = table_root.join("_delta_log/").unwrap();
     let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
-            .unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
     let table_configuration = adaptive_metadata_table_configuration(one_column_schema(), &[]);
     let snapshot = Snapshot::new(log_segment, table_configuration).unwrap();
 
@@ -368,7 +352,7 @@ async fn latest_checkpoint_action_without_replay_follows_commit_info_pointer() {
     Some(0)
 )]
 #[case::standalone_pm_has_no_checkpoint_action(
-    vec![standalone_pm_commit(one_column_schema())],
+    vec![protocol_and_metadata_lines(one_column_schema(), &[])],
     None
 )]
 #[tokio::test]
@@ -406,8 +390,7 @@ async fn assert_replay_resolution<E: Engine>(
     let storage = engine.storage_handler();
     let log_root = table_root.join("_delta_log/").unwrap();
     let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
-            .unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
 
     let resolution = log_segment
         .read_protocol_metadata_opt(&engine, None)
@@ -425,7 +408,7 @@ async fn assert_replay_resolution<E: Engine>(
 #[rstest]
 #[case::new_commit_carries_a_newer_action(checkpoint_commit(1, &[], one_column_schema()), 1)]
 #[case::new_commit_carries_no_action(
-    format!("{}\n{}", commit_info_line(Some((0, 0))), metadata_commit(one_column_schema())),
+    format!("{}\n{}", commit_info_line(1, Some((0, 0))), metadata_commit(one_column_schema())),
     0
 )]
 #[tokio::test]
@@ -547,13 +530,13 @@ async fn latest_checkpoint_action_fails_without_commit_or_crc_at_checkpoint_vers
     let table_root = url::Url::parse("memory:///").unwrap();
     let commit = format!(
         "{}\n{}",
-        commit_info_line(Some((0, 0))),
+        commit_info_line(1, Some((0, 0))),
         checkpoint_commit(0, &[], one_column_schema())
     );
     add_commit(table_root.as_str(), store.as_ref(), 0, commit)
         .await
         .unwrap();
-    let pm = standalone_pm_commit(one_column_schema());
+    let pm = protocol_and_metadata_lines(one_column_schema(), &[]);
     add_checkpoint_to_store(
         &store,
         parse_json_batch(pm.lines().collect::<Vec<_>>().into()),
@@ -590,18 +573,18 @@ async fn latest_checkpoint_action_follows_commit_info_pointer(
     let commits = [
         format!(
             "{}\n{}",
-            commit_info_line(Some((0, 0))),
+            commit_info_line(1, Some((0, 0))),
             checkpoint_commit(0, &[], one_column_schema())
         ),
         format!(
             "{}\n{}",
-            commit_info_line(Some((1, 1))),
+            commit_info_line(1, Some((1, 1))),
             checkpoint_commit(1, &[], one_column_schema())
         ),
         format!(
             "{}\n{}",
-            commit_info_line(pointer),
-            standalone_pm_commit(one_column_schema())
+            commit_info_line(1, pointer),
+            protocol_and_metadata_lines(one_column_schema(), &[])
         ),
     ];
     for (version, commit) in commits.into_iter().enumerate() {
@@ -640,10 +623,9 @@ async fn read_last_checkpoint_action_from_pointer_rejects_commit_outside_segment
     let engine = non_plan_engine(store);
     let storage = engine.storage_handler();
     let log_root = table_root.join("_delta_log/").unwrap();
-    let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
-            .unwrap()
-            .segment_after_version(0);
+    let log_segment = LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None)
+        .unwrap()
+        .segment_after_version(0);
 
     let pointer = LastManifestCommit::new(pointer_version, pointer_version).unwrap();
     let result = log_segment.read_last_checkpoint_action_from_pointer(&engine, &pointer);
@@ -721,7 +703,7 @@ async fn post_commit_snapshot_follows_transaction_last_manifest_commit() {
         0,
         format!(
             "{}\n{}",
-            commit_info_line(Some((0, 0))),
+            commit_info_line(1, Some((0, 0))),
             checkpoint_commit(0, &[], one_column_schema())
         ),
     )

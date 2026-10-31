@@ -158,7 +158,7 @@ mod private {
         ///
         /// * No mutable references can overlap with the returned reference.
         pub unsafe fn as_ref(&self) -> &H::Target {
-            H::as_ref(self.ptr.cast().as_ptr())
+            unsafe { H::as_ref(self.ptr.cast().as_ptr()) }
         }
 
         /// Consumes this handle and returns the resource it was originally created `From`: A
@@ -168,7 +168,7 @@ mod private {
         ///
         /// Caller asserts that the handle is [valid][Handle#Validity].
         pub unsafe fn into_inner(self) -> H::From {
-            H::into_inner(self.ptr.cast().as_ptr())
+            unsafe { H::into_inner(self.ptr.cast().as_ptr()) }
         }
         /// Drops this handle. Dropping a mutable handle always drops the underlying object as well;
         /// dropping a shared handle only drops the underlying object if the handle was the last
@@ -178,14 +178,19 @@ mod private {
         ///
         /// Caller asserts that the handle is [valid][Handle#Validity].
         pub unsafe fn drop_handle(self) {
-            drop(self.into_inner())
+            drop(unsafe { self.into_inner() })
         }
 
         /// In testing code we want to simulate what c code can do where a pointer can be used
         /// without consuming it. This creates a "new" handle just by copying the underlying pointer
-        /// without increasing the arc refcount. This is dangerous! Do not use outside testing code!
+        /// without increasing the arc refcount.
+        ///
+        /// # Safety
+        ///
+        /// This is dangerous! Do not use outside testing code! Caller must ensure a valid handle
+        /// outlives this new fake one, or it will dangle.
         #[cfg(test)]
-        pub fn shallow_copy(&self) -> Self {
+        pub unsafe fn shallow_copy(&self) -> Self {
             Handle { ptr: self.ptr }
         }
     }
@@ -212,7 +217,7 @@ mod private {
         ///   reference. In particular, this means the caller must ensure no other thread can access
         ///   this handle while the returned reference is still alive.
         pub unsafe fn as_mut(&mut self) -> &mut T {
-            H::as_mut(self.ptr.cast().as_ptr())
+            unsafe { H::as_mut(self.ptr.cast().as_ptr()) }
         }
     }
 
@@ -233,7 +238,7 @@ mod private {
         ///
         /// Caller asserts that the handle is [valid][Handle#Validity].
         pub unsafe fn clone_handle(&self) -> Self {
-            self.clone_as_arc().into()
+            unsafe { self.clone_as_arc() }.into()
         }
 
         /// Clones a new `Arc<T>` out of this handle, increasing the underlying object's refcount by
@@ -243,7 +248,7 @@ mod private {
         ///
         /// Caller asserts that the handle is [valid][Handle#Validity].
         pub unsafe fn clone_as_arc(&self) -> Arc<T> {
-            H::clone_arc(self.ptr.cast().as_ptr())
+            unsafe { H::clone_arc(self.ptr.cast().as_ptr()) }
         }
     }
 
@@ -362,10 +367,10 @@ mod private {
             BoxExt::into_non_null(val)
         }
         unsafe fn as_ref<'a>(ptr: *const T) -> &'a T {
-            &*ptr
+            unsafe { &*ptr }
         }
         unsafe fn into_inner(ptr: *mut T) -> Box<T> {
-            Box::from_raw(ptr)
+            unsafe { Box::from_raw(ptr) }
         }
     }
 
@@ -374,7 +379,7 @@ mod private {
         H: HandleDescriptor<Target = T, Mutable = True, Sized = True>,
     {
         unsafe fn as_mut<'a>(ptr: *mut T) -> &'a mut T {
-            &mut *ptr
+            unsafe { &mut *ptr }
         }
     }
 
@@ -393,10 +398,10 @@ mod private {
             unsafe { NonNull::new_unchecked(ptr) } // into_raw guarantees non-null
         }
         unsafe fn as_ref<'a>(ptr: *const T) -> &'a T {
-            &*ptr
+            unsafe { &*ptr }
         }
         unsafe fn into_inner(ptr: *mut T) -> Arc<T> {
-            Arc::from_raw(ptr)
+            unsafe { Arc::from_raw(ptr) }
         }
     }
 
@@ -406,8 +411,10 @@ mod private {
         H: HandleDescriptor<Target = T, Mutable = False, Sized = True>,
     {
         unsafe fn clone_arc(ptr: *const T) -> Arc<T> {
-            Arc::increment_strong_count(ptr);
-            Arc::from_raw(ptr)
+            unsafe {
+                Arc::increment_strong_count(ptr);
+                Arc::from_raw(ptr)
+            }
         }
     }
 
@@ -429,7 +436,7 @@ mod private {
             boxed.as_ref()
         }
         unsafe fn into_inner(ptr: *mut Box<T>) -> Box<T> {
-            *Box::from_raw(ptr)
+            unsafe { *Box::from_raw(ptr) }
         }
     }
 
@@ -462,7 +469,7 @@ mod private {
             arc.as_ref()
         }
         unsafe fn into_inner(ptr: *mut Arc<T>) -> Arc<T> {
-            *Box::from_raw(ptr)
+            unsafe { *Box::from_raw(ptr) }
         }
     }
 

@@ -33,7 +33,7 @@ pub(crate) struct EngineErrorWithMessage {
     pub(crate) message: String,
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) extern "C" fn allocate_err(
     etype: FFIKernelError,
     message: KernelStringSlice,
@@ -44,7 +44,7 @@ pub(crate) extern "C" fn allocate_err(
     Box::into_raw(boxed) as *mut EngineError
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) extern "C" fn allocate_str(kernel_str: KernelStringSlice) -> NullableCvoid {
     let s = unsafe { String::try_from_slice(&kernel_str) };
     let ptr = Box::into_raw(Box::new(s.unwrap())).cast(); // never null
@@ -52,7 +52,7 @@ pub(crate) extern "C" fn allocate_str(kernel_str: KernelStringSlice) -> Nullable
     Some(ptr)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) extern "C" fn allocate_bytes(bytes: KernelBytesSlice) -> NullableCvoid {
     let bytes = unsafe { bytes.try_as_slice() }.unwrap().to_vec();
     NonNull::new(Box::into_raw(Box::new(bytes)).cast())
@@ -60,7 +60,7 @@ pub(crate) extern "C" fn allocate_bytes(bytes: KernelBytesSlice) -> NullableCvoi
 
 /// Recover an error from 'allocate_err'
 pub(crate) unsafe fn recover_error(ptr: *mut EngineError) -> EngineErrorWithMessage {
-    *Box::from_raw(ptr as *mut EngineErrorWithMessage)
+    unsafe { *Box::from_raw(ptr as *mut EngineErrorWithMessage) }
 }
 
 /// Recover a string from `allocate_str`
@@ -77,13 +77,13 @@ pub(crate) fn recover_bytes(ptr: NonNull<c_void>) -> Vec<u8> {
 pub(crate) fn ok_or_panic<T>(result: ExternResult<T>) -> T {
     match result {
         ExternResult::Ok(t) => t,
-        ExternResult::Err(e) => unsafe {
-            let error = recover_error(e);
+        ExternResult::Err(e) => {
+            let error = unsafe { recover_error(e) };
             panic!(
                 "Got engine error with type {:?} message: {}",
                 error.etype, error.message
             );
-        },
+        }
     }
 }
 
@@ -115,8 +115,8 @@ pub(crate) unsafe fn build_snapshot(
     path: KernelStringSlice,
     engine: crate::handle::Handle<SharedExternEngine>,
 ) -> crate::handle::Handle<SharedSnapshot> {
-    let builder = ok_or_panic(get_snapshot_builder(path, engine));
-    ok_or_panic(snapshot_builder_build(builder))
+    let builder = ok_or_panic(unsafe { get_snapshot_builder(path, engine) });
+    ok_or_panic(unsafe { snapshot_builder_build(builder) })
 }
 
 /// Build a `WRITE` transaction through the FFI snapshot and transaction-builder APIs.
@@ -133,15 +133,15 @@ pub(crate) unsafe fn build_update_table_txn(
 ) -> ExternResult<crate::handle::Handle<ExclusiveUpdateTableTransaction>> {
     let snapshot = unsafe { build_snapshot(path, engine.shallow_copy()) };
     let engine_info = "test-engine/1.0";
-    let builder = unsafe {
-        ok_or_panic(new_update_table_txn_builder(
+    let builder = ok_or_panic(unsafe {
+        new_update_table_txn_builder(
             snapshot.shallow_copy(),
             KernelUpdateTableOperation::Write,
             kernel_string_slice!(engine_info),
             true,
             engine.shallow_copy(),
-        ))
-    };
+        )
+    });
     unsafe { free_snapshot(snapshot) };
     unsafe { update_table_txn_builder_build(builder, engine) }
 }

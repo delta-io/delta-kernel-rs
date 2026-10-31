@@ -19,8 +19,8 @@ use crate::expressions::{
     VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
-    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, RelationRef, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
+    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, RelationRef,
+    ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
@@ -153,6 +153,7 @@ impl From<&Operator> for proto_plan::Operator {
             Operator::Filter(n) => Op::Filter(n.into()),
             Operator::DynamicScan(n) => Op::DynamicScan(n.into()),
             Operator::Aggregate(n) => Op::Aggregate(n.into()),
+            Operator::PrefixSum(n) => Op::PrefixSum(n.into()),
             Operator::WriteJson(n) => Op::WriteJson(n.into()),
             Operator::SemiJoin(n) => Op::SemiJoin(n.into()),
             Operator::UnionAll(_) => Op::UnionAll(proto_plan::UnionAllNode {}),
@@ -309,6 +310,16 @@ impl From<&SemiJoin> for proto_plan::SemiJoinNode {
             inverted: node.inverted,
             probe_keys: convert_vec(&node.probe_keys),
             build_keys: convert_vec(&node.build_keys),
+        }
+    }
+}
+
+impl From<&PrefixSum> for proto_plan::PrefixSumNode {
+    fn from(node: &PrefixSum) -> Self {
+        proto_plan::PrefixSumNode {
+            input: Some((&node.input).into()),
+            output: node.output.clone(),
+            schema: Some(node.schema.as_ref().into()),
         }
     }
 }
@@ -668,6 +679,9 @@ impl From<&DataType> for proto_schema::DataType {
                         .collect(),
                 }))
             }
+            // The proto `FileType` is empty: a `file` has a fixed, canonical set of sub-fields, so
+            // the type identity alone is enough to reconstruct it.
+            DataType::File(_) => DataTypeKind::File(proto_schema::FileType {}),
         };
         proto_schema::DataType { kind: Some(kind) }
     }
@@ -874,6 +888,7 @@ impl TryFrom<proto_schema::DataType> for DataType {
                     return Err(KernelError::unsupported("UDT requires udt-in-dev"));
                 }
             }
+            DataTypeKind::File(_) => DataType::file_type(),
         };
         Ok(data_type)
     }
@@ -1061,8 +1076,8 @@ mod tests {
         IndirectDataSkippingPredicateEvaluator,
     };
     use crate::plans::ir::nodes::{
-        Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, RelationRef, ScanFile,
-        ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
+        Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, RelationRef,
+        ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
     use crate::plans::proto::{
@@ -1405,6 +1420,14 @@ mod tests {
         Operator::SemiJoin(SemiJoin { inverted: false, probe_keys: vec![], build_keys: vec![] }),
         "semi_join"
     )]
+    #[case(
+        Operator::PrefixSum(PrefixSum {
+            input: ColumnName::new(["n"]),
+            output: "offset".to_string(),
+            schema: sample_schema(),
+        }),
+        "prefix_sum"
+    )]
     #[case(Operator::UnionAll(UnionAll), "union_all")]
     #[case(Operator::WriteJson(WriteJson {
         file_path: Url::parse("memory:///out.json").unwrap(), overwrite: false,
@@ -1422,6 +1445,7 @@ mod tests {
             Op::DynamicScan(_) => "dynamic_scan",
             Op::Aggregate(_) => "aggregate",
             Op::SemiJoin(_) => "semi_join",
+            Op::PrefixSum(_) => "prefix_sum",
             Op::UnionAll(_) => "union_all",
             Op::WriteJson(_) => "write_json",
         };
@@ -1619,6 +1643,19 @@ mod tests {
         assert_eq!(proto.group_by.len(), 1);
         assert_eq!(proto.aggs.len(), 1);
         assert!(proto.aggs[0].func.is_some());
+        assert!(proto.schema.is_some());
+    }
+
+    #[test]
+    fn from_prefix_sum() {
+        let node = PrefixSum {
+            input: ColumnName::new(["n"]),
+            output: "offset".to_string(),
+            schema: sample_schema(),
+        };
+        let proto = proto_plan::PrefixSumNode::from(&node);
+        assert_eq!(proto.input.expect("input").path, ["n"]);
+        assert_eq!(proto.output, "offset");
         assert!(proto.schema.is_some());
     }
 
@@ -2241,6 +2278,7 @@ mod tests {
     #[case(DataType::from(schema! { nullable "a": INTEGER }), "struct")]
     #[case(MapType::new(DataType::STRING, DataType::INTEGER, true).into(), "map")]
     #[case(DataType::unshredded_variant(), "variant")]
+    #[case(DataType::file_type(), "file")]
     fn from_data_type(#[case] value: DataType, #[case] expected: &str) {
         use proto_schema::data_type::Kind;
         let kind = match proto_schema::DataType::from(&value).kind.unwrap() {
@@ -2250,6 +2288,7 @@ mod tests {
             Kind::Map(_) => "map",
             Kind::Variant(_) => "variant",
             Kind::UserDefined(_) => "udt",
+            Kind::File(_) => "file",
         };
         assert_eq!(kind, expected);
     }
@@ -2532,6 +2571,22 @@ mod tests {
             decoded.expect("decode succeeds"),
             DataType::unshredded_variant()
         );
+    }
+
+    /// A `file` keeps its logical type on the wire: it must decode back to a `file`, not to the
+    /// plain struct it is physically stored as. Covers a top-level column and nested positions.
+    #[test]
+    fn file_round_trips() {
+        use crate::schema::StructField;
+        let schema = StructType::new_unchecked([
+            StructField::nullable("f", DataType::file_type()),
+            StructField::nullable("arr", ArrayType::new(DataType::file_type(), true)),
+            StructField::nullable(
+                "m",
+                MapType::new(DataType::STRING, DataType::file_type(), true),
+            ),
+        ]);
+        assert_schema_round_trips(schema);
     }
 
     // Builds a proto `DataType::Primitive` with the given (possibly malformed) primitive kind.

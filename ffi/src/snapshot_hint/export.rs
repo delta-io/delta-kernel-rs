@@ -11,7 +11,7 @@ use delta_kernel::KernelResult;
 use super::{FfiSnapshotHint, FfiSnapshotHintFreshness, SnapshotHintVisitor};
 use crate::delta_types::{CheckpointBacking, CrcBacking, MetadataBacking, ProtocolBacking};
 use crate::log_path::FfiLogPath;
-use crate::{kernel_string_slice, optional_pointer, FfiSlice, NullableCvoid};
+use crate::{optional_pointer, FfiSlice, NullableCvoid};
 
 pub(super) fn visit(
     hint: &SnapshotHint,
@@ -41,17 +41,7 @@ pub(super) fn visit(
     // Deduplication only removes adjacent entries; sorting groups copies of the same retained path.
     paths.sort_unstable_by_key(|path| path.location.location.as_str());
     paths.dedup_by_key(|path| path.location.location.as_str());
-    let paths: Vec<_> = paths
-        .into_iter()
-        .map(|path| {
-            let location = path.location.location.as_str();
-            FfiLogPath::new(
-                kernel_string_slice!(location),
-                path.location.last_modified,
-                path.location.size,
-            )
-        })
-        .collect();
+    let paths: Vec<_> = paths.into_iter().map(FfiLogPath::from_parsed).collect();
     let protocol = ProtocolBacking::new(hint.protocol());
     let metadata = MetadataBacking::new(hint.metadata());
     let checkpoint = hint

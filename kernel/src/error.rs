@@ -13,11 +13,21 @@ use crate::schema::{DataType, StructType};
 use crate::table_properties::ParseIntervalError;
 use crate::Version;
 
+mod delta_error;
+mod delta_error_condition;
+
+pub use delta_error::{DeltaError, DeltaErrorParameter};
+pub use delta_error_condition::DeltaErrorCondition;
+
 /// An error returned by a Delta Kernel operation.
 #[derive(Debug, thiserror::Error)]
-// TODO(#2630): Remove non_exhaustive once Delta and Engine variants are introduced.
+// TODO(#2630): Remove non_exhaustive once the Engine variant is introduced.
 #[non_exhaustive]
 pub enum Error {
+    /// A stable, user-facing Delta failure.
+    #[error(transparent)]
+    Delta(#[from] DeltaError),
+
     /// A failure represented by a kernel implementation error.
     #[error(transparent)]
     Kernel(KernelError),
@@ -252,6 +262,10 @@ pub enum KernelError {
     /// A generic error with a message
     #[error("Generic delta kernel error: {0}")]
     Generic(String),
+
+    /// Commit range configuration or construction failed.
+    #[error("Commit range error: {0}")]
+    CommitRange(String),
 
     /// A generic error wrapping another error
     #[error("Generic error: {source}")]

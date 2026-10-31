@@ -42,6 +42,8 @@ use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{physical_to_logical_column_name_and_type, Operation, TableFeature};
+#[cfg(feature = "check-constraints-in-dev")]
+use crate::table_properties::CheckConstraint;
 use crate::table_properties::TableProperties;
 use crate::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
 use crate::utils::require;
@@ -52,6 +54,7 @@ mod builder;
 mod cancellation_tests;
 mod hint;
 mod incremental;
+mod reader;
 mod snapshot_crc;
 #[cfg(test)]
 mod tracing_tests;
@@ -61,6 +64,7 @@ pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder
 #[allow(unused_imports)]
 #[internal_api]
 pub(crate) use hint::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
+pub use reader::SnapshotReader;
 use snapshot_crc::SnapshotCrc;
 
 pub use crate::error::SnapshotHintError;
@@ -184,6 +188,15 @@ impl Snapshot {
     /// to a more recent version.
     pub fn builder_from(existing_snapshot: SnapshotRef) -> IncrementalSnapshotBuilder {
         SnapshotBuilder::new_from(existing_snapshot)
+    }
+
+    /// Creates a reader for metadata getters that may access storage.
+    ///
+    /// Getters run synchronously and may block on I/O. The reader uses the supplied engine's
+    /// normal behavior unless configured with a cancellation token; it does not inherit the
+    /// snapshot builder's token. Creating the reader does not issue I/O.
+    pub fn reader(&self) -> SnapshotReader<'_> {
+        SnapshotReader::new(self)
     }
 
     // ============================================================================
@@ -600,7 +613,8 @@ impl Snapshot {
 
     /// The held CRC regardless of version, for reuse that does not require an at-version CRC
     /// (e.g. checksum writes). Prefer [`Self::crc_at_version`] for authoritative queries.
-    fn base_crc(&self) -> Option<&Arc<Crc>> {
+    /// Replaying `allFiles` from this CRC requires applying commits newer than its version.
+    pub(crate) fn base_crc(&self) -> Option<&Arc<Crc>> {
         self.crc.base()
     }
 
@@ -668,6 +682,17 @@ impl Snapshot {
     /// Get the [`TableProperties`] for this [`Snapshot`].
     pub fn table_properties(&self) -> &TableProperties {
         self.table_configuration().table_properties()
+    }
+
+    /// The table's CHECK constraints at this snapshot's version, sorted by name and then SQL.
+    /// Empty when the table declares none.
+    ///
+    /// A connector writing to the table discovers them from
+    /// [`Transaction::check_constraints`](crate::transaction::Transaction::check_constraints)
+    /// instead.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn check_constraints(&self) -> &[CheckConstraint] {
+        &self.table_properties().check_constraints
     }
 
     /// Returns the protocol-derived table properties as a map of key-value pairs.
@@ -739,7 +764,7 @@ impl Snapshot {
         err,
         fields(report, from_cache, found)
     )]
-    pub fn get_app_id_version(
+    fn get_app_id_version(
         &self,
         application_id: &str,
         engine: &dyn Engine,
@@ -824,7 +849,7 @@ impl Snapshot {
     /// configuration for the domain, or None if the domain does not exist.
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
-    pub fn get_domain_metadata(
+    fn get_domain_metadata(
         &self,
         domain: &str,
         engine: &dyn Engine,
@@ -846,10 +871,7 @@ impl Snapshot {
     ///
     /// Reads domain metadata, potentially replaying the log, and returns an error if the metadata
     /// cannot be read or its JSON configuration is malformed.
-    pub fn get_row_tracking_high_water_mark(
-        &self,
-        engine: &dyn Engine,
-    ) -> KernelResult<Option<i64>> {
+    fn get_row_tracking_high_water_mark(&self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
         self.get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine)?
             .map(|config| parse_row_tracking_high_water_mark(&config))
             .transpose()
@@ -873,8 +895,7 @@ impl Snapshot {
     /// Returns an error if the clustering domain metadata is malformed, or if a physical
     /// column name cannot be resolved to a logical name in the schema.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    #[internal_api]
-    pub(crate) fn get_clustering_column_infos(
+    fn get_clustering_column_infos(
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Vec<ClusteringColumnInfo>>> {
@@ -910,8 +931,7 @@ impl Snapshot {
     ///
     /// The columns are returned as physical column names, respecting the column mapping mode.
     /// Note that this method performs log replay (fetches and processes metadata from storage).
-    #[internal_api]
-    pub(crate) fn get_physical_clustering_columns(
+    fn get_physical_clustering_columns(
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Vec<ColumnName>>> {
@@ -926,10 +946,7 @@ impl Snapshot {
     /// Returns `Ok(None)` when the `ClusteredTable` feature is absent on the protocol, or when
     /// the domain has no current entry. The JSON has the shape
     /// `{"clusteringColumns":[["col1"],["addr","city"], ...]}` with physical column names.
-    pub(crate) fn get_clustering_domain_metadata(
-        &self,
-        engine: &dyn Engine,
-    ) -> KernelResult<Option<String>> {
+    fn get_clustering_domain_metadata(&self, engine: &dyn Engine) -> KernelResult<Option<String>> {
         if !self
             .table_configuration
             .protocol()
@@ -953,8 +970,7 @@ impl Snapshot {
         err,
         fields(report, from_cache, num_domains_returned)
     )]
-    #[internal_api]
-    pub(crate) fn get_domain_metadatas_internal(
+    fn get_domain_metadatas_internal(
         &self,
         engine: &dyn Engine,
         domains: Option<&HashSet<&str>>,
@@ -1040,8 +1056,7 @@ impl Snapshot {
     /// (or was removed). Unlike [`Snapshot::get_domain_metadata`], this does not reject `delta.*`
     /// domains.
     #[allow(unused)]
-    #[internal_api]
-    pub(crate) fn get_domain_metadata_internal(
+    fn get_domain_metadata_internal(
         &self,
         domain: &str,
         engine: &dyn Engine,
@@ -1054,11 +1069,7 @@ impl Snapshot {
     ///
     /// Internal (`delta.*`) domains are filtered out.
     #[allow(unused)]
-    #[internal_api]
-    pub(crate) fn get_all_domain_metadata(
-        &self,
-        engine: &dyn Engine,
-    ) -> KernelResult<Vec<DomainMetadata>> {
+    fn get_all_domain_metadata(&self, engine: &dyn Engine) -> KernelResult<Vec<DomainMetadata>> {
         let all_metadata = self.get_domain_metadatas_internal(engine, None)?;
         Ok(all_metadata
             .into_values()
@@ -1084,8 +1095,7 @@ impl Snapshot {
     /// - `Ok(None)` - ICT is not enabled
     /// - `Err(...)` - ICT is enabled but cannot be read, or enablement version is invalid
     #[instrument(parent = &self.span, name = "snap.get_ict", skip_all, err)]
-    #[internal_api]
-    pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
+    fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
         // Get ICT enablement info and check if we should read ICT for this version
         let enablement = self
             .table_configuration()
@@ -1192,9 +1202,8 @@ impl Snapshot {
     /// See also [`get_in_commit_timestamp`] for ICT-only semantics.
     ///
     /// [`get_in_commit_timestamp`]: Self::get_in_commit_timestamp
-    #[allow(unused)]
     #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
-    pub fn get_timestamp(&self, engine: &dyn Engine) -> KernelResult<i64> {
+    fn get_timestamp(&self, engine: &dyn Engine) -> KernelResult<i64> {
         match self
             .table_configuration()
             .in_commit_timestamp_enablement()?
@@ -1630,7 +1639,7 @@ impl Snapshot {
 
         writer.finalize(engine, &info.last_checkpoint_stats)?;
 
-        let checkpoint_log_path = ParsedLogPath::try_from(info.file_meta)?.ok_or_else(|| {
+        let checkpoint_log_path = ParsedLogPath::new(info.file_meta).ok_or_else(|| {
             KernelError::internal_error("Checkpoint path could not be parsed as a log path")
         })?;
         let new_log_segment = self
@@ -1865,11 +1874,11 @@ mod tests {
     ) -> KernelResult<Snapshot> {
         // Create a log segment with only checkpoint and no commit file (simulating scenario
         // where a checkpoint exists but the commit file has been cleaned up)
-        let checkpoint_parts = vec![ParsedLogPath::try_from(crate::FileMeta {
+        let checkpoint_parts = vec![ParsedLogPath::new(crate::FileMeta {
             location: url.join("_delta_log/00000000000000000000.checkpoint.parquet")?,
             last_modified: 0,
             size: 100,
-        })?
+        })
         .unwrap()];
 
         let listed_files = LogSegmentFiles {
@@ -1937,7 +1946,7 @@ mod tests {
 
         let engine = SyncEngine::new();
         let storage = engine.storage_handler();
-        let cp = LastCheckpointHint::try_read(storage.as_ref(), &url, None).unwrap();
+        let cp = LastCheckpointHint::try_read(storage.as_ref(), &url).unwrap();
         assert!(cp.is_none());
     }
 
@@ -1991,8 +2000,8 @@ mod tests {
         let engine = SyncEngine::new_with_store(store);
         let storage = engine.storage_handler();
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = LastCheckpointHint::try_read(storage.as_ref(), &url, None)
-            .expect("read last checkpoint");
+        let invalid =
+            LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
@@ -2026,8 +2035,8 @@ mod tests {
         // valid, invalid and valid with tags.
         for (path_prefix, _, expected_result) in test_cases {
             let url = Url::parse(&format!("memory:///{path_prefix}/")).expect("valid url");
-            let result = LastCheckpointHint::try_read(storage.as_ref(), &url, None)
-                .expect("read last checkpoint");
+            let result =
+                LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
             assert_eq!(result, expected_result);
         }
     }
@@ -2044,24 +2053,22 @@ mod tests {
 
         assert_eq!(snapshot.log_segment.listed.checkpoint_parts.len(), 1);
         assert_eq!(
-            ParsedLogPath::try_from(
+            ParsedLogPath::new(
                 snapshot.log_segment.listed.checkpoint_parts[0]
                     .location
                     .clone()
             )
-            .unwrap()
             .unwrap()
             .version,
             2,
         );
         assert_eq!(snapshot.log_segment.listed.ascending_commit_files.len(), 1);
         assert_eq!(
-            ParsedLogPath::try_from(
+            ParsedLogPath::new(
                 snapshot.log_segment.listed.ascending_commit_files[0]
                     .location
                     .clone()
             )
-            .unwrap()
             .unwrap()
             .version,
             3,
@@ -2989,12 +2996,11 @@ mod tests {
                     let filename =
                         format!("00000000000000000099.checkpoint.{i:010}.0000000100.parquet");
                     let location = log_root.join(&filename).unwrap();
-                    let part = ParsedLogPath::try_from(crate::FileMeta {
+                    let part = ParsedLogPath::new(crate::FileMeta {
                         location,
                         last_modified: 0,
                         size: 100,
                     })
-                    .unwrap()
                     .unwrap();
                     listed.checkpoint_parts.push(part);
                 }
@@ -3015,12 +3021,11 @@ mod tests {
                     let end = start + 5;
                     let filename = format!("{start:020}.{end:020}.compacted.json");
                     let location = log_root.join(&filename).unwrap();
-                    let comp = ParsedLogPath::try_from(crate::FileMeta {
+                    let comp = ParsedLogPath::new(crate::FileMeta {
                         location,
                         last_modified: 0,
                         size: 100,
                     })
-                    .unwrap()
                     .unwrap();
                     listed.ascending_compaction_files.push(comp);
                 }

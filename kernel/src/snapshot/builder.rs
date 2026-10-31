@@ -274,6 +274,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     ///
     /// This token applies only to the build and is not retained by the snapshot. Builds run
     /// synchronously and may block on I/O, including when a cancellation token is supplied.
+    /// Configure [`Snapshot::reader`] with a token for subsequent metadata reads.
     ///
     /// [`CancellationToken`]: crate::CancellationToken
     /// [`KernelError::Cancelled`]: crate::KernelError::Cancelled
@@ -406,7 +407,6 @@ impl<Mode> SnapshotBuilder<Mode> {
                     log_tail,
                     effective_version,
                     metric_context.clone(),
-                    None,
                 )?;
                 Snapshot::try_new_from_log_segment(
                     table_url,
@@ -1141,6 +1141,32 @@ pub(super) mod tests {
                 result,
                 Err(KernelError::LogTailVersionsNotContiguous { .. })
             ));
+
+            Ok(())
+        }
+
+        #[rstest::rstest]
+        #[case::crc("crc")]
+        #[case::classic_checkpoint("checkpoint.parquet")]
+        #[case::uuid_checkpoint("checkpoint.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json")]
+        #[case::multipart_checkpoint("checkpoint.0000000001.0000000002.parquet")]
+        #[case::compaction("00000000000000000002.compacted.json")]
+        #[test_log::test(tokio::test)]
+        async fn test_non_commit_log_tail_errors(
+            #[case] suffix: &str,
+        ) -> KernelResult<(), Box<dyn std::error::Error>> {
+            let (engine, _store, table_root) = setup_catalog_managed_test().await;
+            let log_tail = vec![create_log_path(
+                &table_root,
+                test_utils::delta_path_for_version(1, suffix),
+            )];
+
+            let result = SnapshotBuilder::new_for(table_root)
+                .with_log_tail(log_tail)
+                .with_max_catalog_version(1)
+                .build(engine.as_ref());
+
+            assert!(matches!(result, Err(KernelError::InvalidLogPath(_))));
 
             Ok(())
         }

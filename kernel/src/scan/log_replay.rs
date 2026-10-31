@@ -10,12 +10,12 @@ use url::Url;
 use super::data_skipping::DataSkippingFilter;
 use super::metrics::ScanMetrics;
 use super::state_info::{ResolvedPhysicalStatsSchemas, StateInfo};
-use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
+use super::{map_to_struct_options, PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
-    col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionRef,
-    MapToStructOptions, Predicate, PredicateRef, UnaryExpressionOp,
+    col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionRef, Predicate,
+    PredicateRef, UnaryExpressionOp,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
@@ -812,14 +812,14 @@ pub(crate) static FILE_CONSTANT_VALUES_NAME: &str = "fileConstantValues";
 pub(crate) static PATH_NAME: &str = "path";
 pub(crate) static BASE_ROW_ID_NAME: &str = "baseRowId";
 pub(crate) static DEFAULT_ROW_COMMIT_VERSION_NAME: &str = "defaultRowCommitVersion";
-pub(crate) static CLUSTERING_PROVIDER_NAME: &str = "clusteringProvider";
+pub const CLUSTERING_PROVIDER_NAME: &str = "clusteringProvider";
 pub(crate) static PARTITION_VALUES_NAME: &str = "partitionValues";
 pub(crate) static SIZE_NAME: &str = "size";
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) static MODIFICATION_TIME_NAME: &str = "modificationTime";
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) static DATA_CHANGE_NAME: &str = "dataChange";
-pub(crate) static TAGS_NAME: &str = "tags";
+pub const TAGS_NAME: &str = "tags";
 pub(crate) static STATS_NAME: &str = "stats";
 pub(crate) static STATS_PARSED_NAME: &str = "stats_parsed";
 #[internal_api]
@@ -994,24 +994,15 @@ fn get_add_transform_expr(
             col!("add.partitionValues_parsed")
         } else {
             // No native column (JSON commit): reconstruct from the string map.
-            parsed_partition_values_expr(col!("add.partitionValues"), timestamp_timezone)
+            Expression::map_to_struct(
+                col!("add.partitionValues"),
+                map_to_struct_options(timestamp_timezone),
+            )
         };
         fields.push(Arc::new(pv_parsed_expr));
     }
 
     Arc::new(Expression::struct_from(fields))
-}
-
-/// Build typed partition values from the string map.
-fn parsed_partition_values_expr(
-    raw_partition_values: Expression,
-    timestamp_timezone: Option<&str>,
-) -> Expression {
-    let options = MapToStructOptions::default().fold_with(
-        timestamp_timezone,
-        MapToStructOptions::with_timestamp_timezone,
-    );
-    Expression::map_to_struct(raw_partition_values, options)
 }
 
 // TODO: Move this to transaction/mod.rs once `scan_metadata_from` is pub, as this is used for

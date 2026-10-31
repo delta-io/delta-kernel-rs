@@ -18,7 +18,7 @@ static GLOBAL_ALLOC: PeakAlloc = PeakAlloc;
 /// Whether this library was built with allocation tracking.
 ///
 /// The `*_native_bytes` getters return zero when this is false.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn alloc_tracking_enabled() -> bool {
     cfg!(feature = "alloc-tracking")
 }
@@ -27,7 +27,7 @@ pub extern "C" fn alloc_tracking_enabled() -> bool {
 ///
 /// The value is process-wide, not per-operation, and counts requested Rust allocation sizes only.
 /// Returns zero when built without `alloc-tracking`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn peak_native_bytes() -> u64 {
     #[cfg(feature = "alloc-tracking")]
     {
@@ -43,7 +43,7 @@ pub extern "C" fn peak_native_bytes() -> u64 {
 ///
 /// The value is process-wide and counts requested Rust allocation sizes only. Returns zero when
 /// built without `alloc-tracking`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn current_native_bytes() -> u64 {
     #[cfg(feature = "alloc-tracking")]
     {
@@ -61,7 +61,7 @@ pub extern "C" fn current_native_bytes() -> u64 {
 /// `peak_alloc` samples and resets separately, so concurrent allocation can cause the returned
 /// value to understate the cleared peak and leave the reported peak lower than the current total.
 /// Returns zero when built without `alloc-tracking`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn reset_peak_native_bytes() -> u64 {
     #[cfg(feature = "alloc-tracking")]
     {

@@ -30,7 +30,7 @@ pub(crate) use timestamp_ntz::{
 use crate::actions::Protocol;
 use crate::expressions::Scalar;
 use crate::schema::derive_macro_utils::ToDataType;
-use crate::schema::DataType;
+use crate::schema::{schema_has_invariants, DataType, Schema};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
@@ -180,6 +180,12 @@ pub(crate) enum TableFeature {
     #[strum(serialize = "variantShredding-preview")]
     #[serde(rename = "variantShredding-preview")]
     VariantShreddingPreview,
+    /// This feature enables support for the file data type, which stores a reference to a range of
+    /// bytes located inline or in an external file.
+    FileType,
+    #[strum(serialize = "fileType-preview")]
+    #[serde(rename = "fileType-preview")]
+    FileTypePreview,
     /// Iceberg V4 adaptive metadata tree as the table's native content metadata format.
     ///
     /// TODO(#2866): gated by the `adaptive-metadata-in-dev` cargo feature until fully supported.
@@ -233,6 +239,9 @@ pub(crate) enum EnablementCheck {
     /// Feature is enabled if supported AND the provided function returns true when checking table
     /// properties
     EnabledIf(fn(&TableProperties) -> bool),
+    /// Feature is enabled if supported AND the provided function returns true when checking the
+    /// logical table schema
+    EnabledIfSchema(fn(&Schema) -> bool),
 }
 
 /// Represents the type of operation being performed on a table
@@ -323,19 +332,24 @@ static APPEND_ONLY_INFO: FeatureInfo = FeatureInfo {
 // Although kernel marks invariants as "Supported", invariants must NOT actually be present in the
 // table schema. Kernel will fail to write to any table that actually uses invariants (see check in
 // TableConfiguration::ensure_write_supported). This is to allow legacy tables with the Invariants
-// feature enabled but not in use.
+// feature supported but not in use. It is enabled only if the schema has invariant metadata, since
+// it has no table property.
 static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 2)),
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
-    enablement_check: EnablementCheck::AlwaysIfSupported,
+    enablement_check: EnablementCheck::EnabledIfSchema(schema_has_invariants),
 };
 
+// Enabled whenever the writer protocol supports it, even if the table declares no constraint.
 static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 3)),
     feature_requirements: &[],
+    #[cfg(feature = "check-constraints-in-dev")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "check-constraints-in-dev"))]
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -520,7 +534,6 @@ static ICEBERG_NATIVE_V4_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-// TODO(#3553): Support writing clusteringProvider to AddFile actions.
 static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
@@ -673,6 +686,22 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+static FILE_TYPE_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+static FILE_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 // Dependencies and mutual exclusions per the adaptiveMetadata RFC (delta-io/delta#6978) "Table
 // Feature Enablement" section. Enforcement is covered by
 // `test_adaptive_metadata_feature_requirements`.
@@ -756,6 +785,8 @@ impl TableFeature {
             | TableFeature::VariantTypePreview
             | TableFeature::VariantShredding
             | TableFeature::VariantShreddingPreview
+            | TableFeature::FileType
+            | TableFeature::FileTypePreview
             | TableFeature::AdaptiveMetadataPreview
             | TableFeature::GeospatialType => FeatureType::ReaderWriter,
             TableFeature::AppendOnly
@@ -826,6 +857,8 @@ impl TableFeature {
             TableFeature::VariantTypePreview => &VARIANT_TYPE_PREVIEW_INFO,
             TableFeature::VariantShredding => &VARIANT_SHREDDING_INFO,
             TableFeature::VariantShreddingPreview => &VARIANT_SHREDDING_PREVIEW_INFO,
+            TableFeature::FileType => &FILE_TYPE_INFO,
+            TableFeature::FileTypePreview => &FILE_TYPE_PREVIEW_INFO,
             TableFeature::AdaptiveMetadataPreview => &ADAPTIVE_METADATA_PREVIEW_INFO,
             TableFeature::GeospatialType => &GEOSPATIAL_TYPE_INFO,
 
@@ -1196,6 +1229,8 @@ mod tests {
                 TableFeature::VariantTypePreview => "variantType-preview",
                 TableFeature::VariantShredding => "variantShredding",
                 TableFeature::VariantShreddingPreview => "variantShredding-preview",
+                TableFeature::FileType => "fileType",
+                TableFeature::FileTypePreview => "fileType-preview",
                 TableFeature::AdaptiveMetadataPreview => "adaptiveMetadata-preview",
                 TableFeature::AllowColumnDefaults => "allowColumnDefaults",
                 TableFeature::GeospatialType => "geospatial",

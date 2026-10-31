@@ -47,6 +47,13 @@ cargo check-no-default-kernel
 cargo check-no-default-engine
 cargo clippy-no-default-kernel-leaves
 
+# Download the latest upstream catalog and record its commit and hash.
+cargo xtask update-delta-error-catalog
+
+# Generate DeltaErrorCondition from the local catalog and selected-conditions.json.
+# --check fails if stale, writing nothing.
+cargo xtask generate-delta-error-conditions [--check]
+
 # Quick pre-push check (mimics CI)
 cargo +nightly fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
@@ -73,6 +80,7 @@ cargo +nightly fmt \
 | `delta-kernel-unity-catalog`         | `delta-kernel-unity-catalog/`         | Unity Catalog integration (UCCommitter, snapshot + create-table helpers) |
 | `unity-catalog-delta-client-api`     | `unity-catalog-delta-client-api/`     | Transport-agnostic UC client traits + wire models                        |
 | `unity-catalog-delta-rest-client`    | `unity-catalog-delta-rest-client/`    | REST/HTTP client for the Unity Catalog Delta Tables API                  |
+| `xtask`                              | `xtask/`                              | Dev tasks (regenerates checked-in code from pinned inputs)               |
 
 Packages under `kernel/examples/` are also workspace members. Use the package name from the
 example's `Cargo.toml` with `-p`.
@@ -89,8 +97,14 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
 - `arrow-conversion`, `arrow-expression`: Arrow interop (auto-enabled by `default-engine-base`)
 - `prettyprint`: enables Arrow pretty-print helpers (primarily test/example oriented)
 - `schema-diff`: experimental schema diffing
-- `check-constraints-in-dev`: enables the internal SQL tokenizer and single-comparison parser for
-  check-constraint development
+- `check-constraints-in-dev`: CHECK constraints support (experimental, in development). Gates
+  `KernelSupport::Supported` for the `checkConstraints` writer feature (without it, writes to
+  tables that support the feature, including legacy writer version 3 and above, are blocked). With
+  it, kernel discovers constraints and exposes their raw SQL through `check_constraints()` on
+  `Snapshot` and `Transaction`, and on a constrained table `write_state` and every commit require
+  `Transaction::ack_check_constraints`. Kernel does not evaluate constraint SQL, so enforcement is
+  the connector's responsibility. CREATE TABLE rejects `delta.constraints.*` properties in every
+  build. Also gates the internal SQL tokenizer and parser.
 - `adaptive-metadata-in-dev`: adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature. Without it, reads and writes to tables listing
@@ -112,14 +126,26 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
 **Snapshot** is the primary entry point for existing-table operations: an immutable view of a
 table at a specific version. From it you build a `Scan` (reads) or `Transaction` (writes).
 
+**Snapshot metadata:** `snapshot.reader()` creates a `SnapshotReader` for metadata getters that may
+read storage. Its optional token scopes synchronous, blocking reads without changing the shared
+snapshot or the connector's engine. In-memory getters remain on `Snapshot`.
+
 **Read path:** `Snapshot` -> `ScanBuilder` -> `Scan` -> data. Execution paths:
 `execute()` (simple), `scan_metadata()` (advanced/distributed),
 `parallel_scan_metadata()` (two-phase distributed log replay).
 
 
 **Write path:** `Snapshot` -> `UpdateTableTransactionBuilder` -> `Transaction` -> `commit()`.
-`UpdateTableTransactionBuilder` aliases `TransactionBuilder<UpdateTable>`; the create-table
-builder aliases `TransactionBuilder<CreateTable>`. Common setters have one generic implementation.
+`UpdateTableTransactionBuilder<MODE>` aliases `TransactionBuilder<UpdateTable, MODE>`; the
+create-table builder aliases `TransactionBuilder<CreateTable, MODE>`. The mode defaults to
+`Imperative`. Both entry points return imperative builders; with `declarative-plans`,
+`with_execution_mode::<MODE>()` selects the mode returned by `build()`. Common setters have one
+generic implementation.
+`transaction::imperative` contains EngineData staging, staged-data validation, action encoding,
+and committer response handling. The feature-gated `transaction::declarative` contains relation
+staging and a commit entry point that currently returns an unsupported error. Transaction
+configuration, mode-independent validation, CRC construction, and post-commit snapshot logic
+remain shared.
 The sealed `TransactionType` trait selects opaque type-specific state; specialized implementations
 provide constructors, custom setters, and build validation.
 `Snapshot::update_table(operation, engine_info, data_change)` requires all three values at
@@ -147,6 +173,10 @@ directly: ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` acce
 - **Unit tests** test internal APIs and module internals. It is fine to use public APIs
   like `create_table` in a unit test as setup (e.g. to create a table for testing reads,
   writes, or state loading).
+- **Test module layout:** keep short unit-test modules inline in the implementation file.
+  When tests grow large enough to warrant a separate file, use `module/mod.rs` for the
+  implementation and `module/tests.rs` for the tests. Avoid `module.rs` alongside a
+  `module/` directory containing only `tests.rs`.
 - **Integration tests** exercise only public APIs end-to-end. See `kernel/tests/README.md`
   for a catalog of available test tables (schema, protocol, features, and which tests use
   them). Consult it before creating new test data to avoid duplication.
@@ -303,8 +333,8 @@ is the source of truth. Key concepts:
   `icebergCompatV3`, `identityColumns`, `inCommitTimestamp`, `invariants`,
   `materializePartitionColumns`, `rowTracking`
 - Reader + writer: `adaptiveMetadata-preview`, `catalogManaged`, `catalogOwned-preview`,
-  `columnMapping`, `deletionVectors`, `geospatial`, `timestampNtz`,
-  `typeWidening`, `typeWidening-preview`, `v2Checkpoint`, `vacuumProtocolCheck`,
+  `columnMapping`, `deletionVectors`, `fileType`, `fileType-preview`, `geospatial`,
+  `timestampNtz`, `typeWidening`, `typeWidening-preview`, `v2Checkpoint`, `vacuumProtocolCheck`,
   `variantShredding`, `variantShredding-preview`, `variantType`, `variantType-preview`
 
 Keep this list updated when new protocol features are added to kernel.
@@ -331,6 +361,8 @@ Keep this list updated when new protocol features are added to kernel.
   parallel threads in one test binary, while nextest normally runs each test in a separate
   process. Tests for global tracing subscribers and callbacks must not share capture buffers with
   thread-local dispatch tests or assume no other thread can emit an event.
+- **Generated code:** files starting with ``//! Generated by `cargo xtask ...` `` are never edited by
+  hand. Change the generator in `xtask/` or its inputs and rerun the command.
 
 ## Code Style
 
@@ -394,7 +426,7 @@ Keep this list updated when new protocol features are added to kernel.
 ## Comment & Doc Style
 
 - MUST include doc comments for all public functions, structs, enums, and methods.
-- MUST document function parameters, return values, and errors.
+- MUST document function parameters and return values.
 - Doc comments focus on "what" (contract with caller) more than "how" (implementation),
   unless the "how" meaningfully impacts the "what".
 - Code comments state intent and explain "why": don't restate what the code self-documents.

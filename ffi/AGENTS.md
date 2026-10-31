@@ -847,12 +847,24 @@ publication watermark.
 When built with `adaptive-metadata-in-dev`, typed export rejects CRCs containing experimental
 adaptive-metadata `lastManifestCommit` or Add `backReference` state.
 
-Snapshot accessors (`ffi/src/lib.rs`) read a built `SharedSnapshot` without I/O -- e.g. `version`,
-`snapshot_timestamp`, and `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
+`snapshot_log_segment(snapshot, context, visitor)` exposes the existing retained segment without
+I/O through one borrowed `FfiLogSegment` callback. It includes commit, compaction, and top-level
+checkpoint files, optional latest commit/CRC metadata, checkpoint version, and the known publication
+watermark. It preserves staged paths independently of that watermark. The snapshot is borrowed;
+copy all retained values before the callback returns. It does not implement snapshot equivalence
+or establish freshness.
+
+Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
+`snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
 `num_files` / `table_size_bytes` from the CRC; `None` when the snapshot has no CRC, or its CRC lacks
 complete file stats). `visit_file_size_histogram` exposes the optional variable-length histogram in
 the same file stats: it invokes one callback with borrowed `i64` slices for bin boundaries, file
 counts, and total bytes; callers must copy values they retain after the callback.
+
+`snapshot_timestamp` uses a synchronous `SnapshotReader` and may read commit JSON when the
+In-Commit Timestamp is unavailable from retained CRC state. Domain-metadata and transaction-version
+FFI reads also use an unscoped reader, preserving the engine's cancellation and timeout behavior.
+The C API signatures do not expose reader state or a cancellation token.
 
 Domain-metadata reads live in `ffi/src/domain_metadata.rs`: `get_domain_metadata` /
 `visit_domain_metadata` for user domains, and `visit_clustering_columns`, which reports one
@@ -908,7 +920,9 @@ reuses `ScanMetadataArrowResult` with null `transforms`.
 ## Write Flow
 
 Rust builders are aliases for `TransactionBuilder<CreateTable>` and
-`TransactionBuilder<UpdateTable>`. Keep their concrete opaque FFI descriptors and explicit
+`TransactionBuilder<UpdateTable>`, both using the default `Imperative` execution mode. Rust callers
+can select another mode on the builder; the FFI descriptors expose imperative transactions.
+Keep their concrete opaque FFI descriptors and explicit
 `create_table_txn_builder_*` / `update_table_txn_builder_*` exports. Shared Rust setters do not imply
 a universal C handle; custom setters are exposed only for their applicable builder descriptor.
 Rust-only builder aliases carry `cbindgen:ignore` so header generation uses the descriptors rather

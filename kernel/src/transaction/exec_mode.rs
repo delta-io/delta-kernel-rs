@@ -1,6 +1,8 @@
 #[cfg(doc)]
 use super::Transaction;
 use crate::engine_data::FilteredEngineData;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::RelationRef;
 use crate::EngineData;
 
 /// Execution mode for a [`Transaction`].
@@ -21,7 +23,7 @@ pub(crate) trait StagedDataChanges {
     fn has_removes(&self) -> bool;
     /// Whether any DV-update inputs are staged, including batches with no matched rows.
     fn has_dv_inputs(&self) -> bool;
-    /// Whether any files have matched DV updates that require validation.
+    /// Whether any DV updates may affect files and require validation.
     fn has_dv_updates(&self) -> bool;
 }
 
@@ -38,7 +40,19 @@ pub struct Imperative {
     pub(super) num_dv_updates: usize,
 }
 
+/// Declarative execution mode which stages data-file changes as relation handles.
+#[cfg(feature = "declarative-plans")]
+#[derive(Debug, Default)]
+pub struct Declarative {
+    pub(super) add_files: Vec<RelationRef>,
+    pub(super) remove_files: Vec<RelationRef>,
+    // Each pair holds the new DV descriptors and the existing scan files to match against.
+    pub(super) dv_updates: Vec<(RelationRef, RelationRef)>,
+}
+
 impl ExecutionMode for Imperative {}
+#[cfg(feature = "declarative-plans")]
+impl ExecutionMode for Declarative {}
 
 impl StagedDataChanges for Imperative {
     fn has_adds(&self) -> bool {
@@ -58,6 +72,26 @@ impl StagedDataChanges for Imperative {
     }
 }
 
+#[cfg(feature = "declarative-plans")]
+impl StagedDataChanges for Declarative {
+    fn has_adds(&self) -> bool {
+        !self.add_files.is_empty()
+    }
+
+    fn has_removes(&self) -> bool {
+        !self.remove_files.is_empty()
+    }
+
+    fn has_dv_inputs(&self) -> bool {
+        !self.dv_updates.is_empty()
+    }
+
+    fn has_dv_updates(&self) -> bool {
+        // Relation match counts are unknown until execution.
+        self.has_dv_inputs()
+    }
+}
+
 impl std::fmt::Debug for Imperative {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Imperative")
@@ -74,4 +108,6 @@ mod sealed {
 
     pub trait Sealed {}
     impl Sealed for Imperative {}
+    #[cfg(feature = "declarative-plans")]
+    impl Sealed for super::Declarative {}
 }

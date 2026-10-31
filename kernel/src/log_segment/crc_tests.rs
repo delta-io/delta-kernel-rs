@@ -416,7 +416,7 @@ impl BuiltCrcTest {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
-            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)?;
+            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None)?;
         log_segment.build_crc_from_base(&self.engine, base)
     }
 
@@ -429,7 +429,7 @@ impl BuiltCrcTest {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
-            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)?;
+            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None)?;
         Ok(log_segment
             .pick_latest_base_crc(engine, in_memory_base)?
             .map(|c| c.version))
@@ -511,7 +511,10 @@ impl BuiltCrcTest {
 
     fn assert_ict(&self, version: impl Into<Option<u64>>, expected_ict: Option<i64>) {
         let (snapshot, label) = self.snapshot_at(version.into());
-        let ict = snapshot.get_in_commit_timestamp(&self.engine).unwrap();
+        let ict = snapshot
+            .reader()
+            .get_in_commit_timestamp(&self.engine)
+            .unwrap();
         assert_eq!(ict, expected_ict, "ICT mismatch at {label}");
     }
 
@@ -522,8 +525,7 @@ impl BuiltCrcTest {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
-            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None, None)
-                .unwrap();
+            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
         let crc = log_segment.read_latest_crc(&self.engine).unwrap();
         log_segment
             .read_protocol_metadata_opt(&self.engine, crc.as_ref())
