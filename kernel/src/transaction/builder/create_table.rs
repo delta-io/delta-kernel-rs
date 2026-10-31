@@ -102,7 +102,12 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // Dependent features (ColumnMapping, RowTracking, DomainMetadata) are auto-added during
     // create table.
     TableFeature::IcebergCompatV3,
+    TableFeature::TimestampWithoutTimezone,
+    TableFeature::AdaptiveMetadataPreview,
+    TableFeature::IcebergNativeV4Preview,
 ];
+
+const UNIVERSAL_FORMAT_ENABLED_FORMATS: &str = "delta.universalFormat.enabledFormats";
 
 /// The single allow-list of `delta.*` properties accepted during CREATE TABLE. Any `delta.*`
 /// key not present here is rejected.
@@ -133,6 +138,7 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     // IcebergCompatV3 enablement: triggers auto-enablement of ColumnMapping,
     // RowTracking, DomainMetadata.
     ENABLE_ICEBERG_COMPAT_V3,
+    UNIVERSAL_FORMAT_ENABLED_FORMATS,
     // Log/checkpoint maintenance configs: stored verbatim, consumed by log cleanup / checkpoint
     // scheduling.
     LOG_RETENTION_DURATION,
@@ -1105,6 +1111,9 @@ fn try_new_create_table<MODE: ExecutionMode>(
     clustering_columns: Option<Vec<ColumnName>>,
     common_state: TransactionBuilderState,
 ) -> KernelResult<Transaction<CreateTable, MODE>> {
+    if effective_table_config.is_feature_enabled(&TableFeature::IcebergNativeV4Preview) {
+        effective_table_config.ensure_read_write_supported()?;
+    }
     validate_iceberg_compat_if_needed(
         &effective_table_config,
         &V2_VALIDATOR,
