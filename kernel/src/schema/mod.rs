@@ -2412,6 +2412,18 @@ impl<'de> serde::Deserialize<'de> for DataType {
 }
 
 /// cbindgen:ignore
+/// The sub-fields of a [`DataType::File`], in the canonical order; see [`DataType::file_type`].
+pub(crate) static FILE_FIELDS: LazyLock<StructType> = LazyLock::new(|| {
+    StructType::new_unchecked([
+        StructField::nullable("uri", DataType::STRING),
+        StructField::nullable("offset", DataType::LONG),
+        StructField::nullable("size", DataType::LONG),
+        StructField::nullable("content_type", DataType::STRING),
+        StructField::nullable("checksum", DataType::STRING),
+        StructField::nullable("inline", DataType::BINARY),
+    ])
+});
+
 impl DataType {
     pub const STRING: Self = DataType::Primitive(PrimitiveType::String);
     pub const LONG: Self = DataType::Primitive(PrimitiveType::Long);
@@ -2532,14 +2544,7 @@ impl DataType {
     /// `checksum`: STRING, `inline`: BINARY. Like Variant, the type identity is carried in the
     /// Delta schema; physically a `file` is this struct.
     pub fn file_type() -> Self {
-        DataType::File(Box::new(StructType::new_unchecked([
-            StructField::nullable("uri", DataType::STRING),
-            StructField::nullable("offset", DataType::LONG),
-            StructField::nullable("size", DataType::LONG),
-            StructField::nullable("content_type", DataType::STRING),
-            StructField::nullable("checksum", DataType::STRING),
-            StructField::nullable("inline", DataType::BINARY),
-        ])))
+        DataType::File(Box::new(FILE_FIELDS.clone()))
     }
 
     /// Create a new [`DataType::Variant`] from the provided fields. For unshredded variants, you
