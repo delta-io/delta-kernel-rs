@@ -107,6 +107,8 @@ pub(crate) enum TableFeature {
     Invariants,
     /// Check constraints on columns
     CheckConstraints,
+    /// Protects checkpoints and JSON logs.
+    CheckpointProtection,
     /// CDF on a table
     ChangeDataFeed,
     /// Columns with generated values
@@ -350,6 +352,20 @@ static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     #[cfg(feature = "check-constraints-in-dev")]
     kernel_support: KernelSupport::Supported,
     #[cfg(not(feature = "check-constraints-in-dev"))]
+    kernel_support: KernelSupport::NotSupported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+// checkpointProtection restricts metadata cleanup, which Kernel does not support.
+// Any future metadata cleanup implementation must follow the feature's writer requirements:
+// https://github.com/delta-io/delta/blob/master/protocol_rfcs/checkpoint-protection.md
+static CHECKPOINT_PROTECTION_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    #[cfg(feature = "checkpoint-protection")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "checkpoint-protection"))]
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -794,6 +810,7 @@ impl TableFeature {
             | TableFeature::Invariants
             | TableFeature::RowTracking
             | TableFeature::CheckConstraints
+            | TableFeature::CheckpointProtection
             | TableFeature::ChangeDataFeed
             | TableFeature::GeneratedColumns
             | TableFeature::IdentityColumns
@@ -829,6 +846,7 @@ impl TableFeature {
             TableFeature::AppendOnly => &APPEND_ONLY_INFO,
             TableFeature::Invariants => &INVARIANTS_INFO,
             TableFeature::CheckConstraints => &CHECK_CONSTRAINTS_INFO,
+            TableFeature::CheckpointProtection => &CHECKPOINT_PROTECTION_INFO,
             TableFeature::ChangeDataFeed => &CHANGE_DATA_FEED_INFO,
             TableFeature::GeneratedColumns => &GENERATED_COLUMNS_INFO,
             TableFeature::IdentityColumns => &IDENTITY_COLUMNS_INFO,
@@ -1204,6 +1222,7 @@ mod tests {
                 TableFeature::AppendOnly => "appendOnly",
                 TableFeature::Invariants => "invariants",
                 TableFeature::CheckConstraints => "checkConstraints",
+                TableFeature::CheckpointProtection => "checkpointProtection",
                 TableFeature::ChangeDataFeed => "changeDataFeed",
                 TableFeature::GeneratedColumns => "generatedColumns",
                 TableFeature::IdentityColumns => "identityColumns",

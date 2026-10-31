@@ -2392,6 +2392,37 @@ mod test {
         }
     }
 
+    #[rstest]
+    fn checkpoint_protection_gates_writes_but_allows_reads(
+        #[values(1, 2, 3)] reader_version: i32,
+        #[values(
+            Operation::SnapshotLoad,
+            Operation::Scan,
+            Operation::Cdf,
+            Operation::Write
+        )]
+        operation: Operation,
+    ) {
+        let config = MockTableConfigurationBuilder::new()
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::CheckpointProtection])
+                    .with_versions(reader_version, 7 /* writer_version */)
+                    .build(),
+            )
+            .build();
+
+        let result = config.ensure_operation_supported(operation);
+        if operation == Operation::Write && !cfg!(feature = "checkpoint-protection") {
+            assert_result_error_with_message(
+                result,
+                "Feature 'checkpointProtection' is not supported",
+            );
+        } else {
+            result.unwrap();
+        }
+    }
+
     #[cfg(not(feature = "geo-type-in-dev"))]
     #[rstest]
     fn test_geospatial_not_supported_without_cargo_feature(
