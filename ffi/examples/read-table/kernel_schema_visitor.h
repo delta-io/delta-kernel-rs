@@ -51,6 +51,23 @@ void trim_trailing_whitespace(char* s)
     s[--len] = '\0';
   }
 }
+
+// Parses a lowercase Delta protocol algorithm name. Returns false if the name is not recognized.
+bool parse_edge_interpolation_algorithm(const char* s, FfiEdgeInterpolationAlgorithm* algorithm)
+{
+  const FfiEdgeInterpolationAlgorithm algorithms[] = {
+    FfiEdgeInterpolationAlgorithmSpherical, FfiEdgeInterpolationAlgorithmVincenty,
+    FfiEdgeInterpolationAlgorithmThomas,    FfiEdgeInterpolationAlgorithmAndoyer,
+    FfiEdgeInterpolationAlgorithmKarney,
+  };
+  for (size_t i = 0; i < sizeof(algorithms) / sizeof(algorithms[0]); i++) {
+    if (strcmp(s, edge_interpolation_algorithm_name(algorithms[i])) == 0) {
+      *algorithm = algorithms[i];
+      return true;
+    }
+  }
+  return false;
+}
 #endif
 
 // This function looks at tahe type field in the schema to figure out which visitor to call. It's a
@@ -115,8 +132,12 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
     }
     trim_trailing_whitespace(crs_buf);
     trim_trailing_whitespace(algorithm_buf);
+    FfiEdgeInterpolationAlgorithm algorithm;
+    if (!parse_edge_interpolation_algorithm(algorithm_buf, &algorithm)) {
+      printf("[ERROR] Invalid geography edge interpolation algorithm: %s\n", algorithm_buf);
+      return 0;
+    }
     KernelStringSlice crs = { crs_buf, strlen(crs_buf) };
-    KernelStringSlice algorithm = { algorithm_buf, strlen(algorithm_buf) };
     visit_res = visit_field_geography(
       state, name, crs, algorithm, item->is_nullable, &metadata, allocate_error);
 #endif

@@ -1194,6 +1194,7 @@ mod scan_builder_tests {
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::{
+        schema::FfiEdgeInterpolationAlgorithm,
         schema_visitor::{visit_field_geography, visit_field_geometry},
         tests::get_default_engine,
     };
@@ -1282,13 +1283,12 @@ mod scan_builder_tests {
             ))
         };
         let geog = "geog";
-        let algorithm = "spherical";
         let geog_field_id = unsafe {
             ok_or_panic(visit_field_geography(
                 state,
                 kernel_string_slice!(geog),
                 kernel_string_slice!(crs),
-                kernel_string_slice!(algorithm),
+                FfiEdgeInterpolationAlgorithm::Spherical,
                 true,
                 std::ptr::null(),
                 allocate_err,

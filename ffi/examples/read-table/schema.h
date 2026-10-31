@@ -384,26 +384,38 @@ void visit_geometry(void* data,
   read_column_mapping_metadata(item, metadata, builder->engine);
 }
 
+// Returns the lowercase Delta protocol name of an edge interpolation algorithm.
+const char* edge_interpolation_algorithm_name(FfiEdgeInterpolationAlgorithm algorithm)
+{
+  switch (algorithm) {
+    case FfiEdgeInterpolationAlgorithmSpherical:
+      return "spherical";
+    case FfiEdgeInterpolationAlgorithmVincenty:
+      return "vincenty";
+    case FfiEdgeInterpolationAlgorithmThomas:
+      return "thomas";
+    case FfiEdgeInterpolationAlgorithmAndoyer:
+      return "andoyer";
+    case FfiEdgeInterpolationAlgorithmKarney:
+      return "karney";
+  }
+  return "unknown";
+}
+
 void visit_geography(void* data,
                      uintptr_t sibling_list_id,
                      struct KernelStringSlice name,
                      bool is_nullable,
                      const CMetadataMap * metadata,
                      struct KernelStringSlice crs,
-                     struct KernelStringSlice algorithm)
+                     FfiEdgeInterpolationAlgorithm algorithm)
 {
   SchemaBuilder* builder = data;
   char* name_ptr = allocate_string(name);
-  size_t type_size = strlen("geography(, )") + crs.len + algorithm.len + 1;
+  const char* algorithm_name = edge_interpolation_algorithm_name(algorithm);
+  size_t type_size = strlen("geography(, )") + crs.len + strlen(algorithm_name) + 1;
   char* type = malloc(type_size * sizeof(char));
-  snprintf(
-    type,
-    type_size,
-    "geography(%.*s, %.*s)",
-    (int)crs.len,
-    crs.ptr,
-    (int)algorithm.len,
-    algorithm.ptr);
+  snprintf(type, type_size, "geography(%.*s, %s)", (int)crs.len, crs.ptr, algorithm_name);
   PRINT_NO_CHILD_VISIT(type, name_ptr, sibling_list_id);
   SchemaItem* item = add_to_list(&builder->lists[sibling_list_id], name_ptr, type, is_nullable);
   read_column_mapping_metadata(item, metadata, builder->engine);
