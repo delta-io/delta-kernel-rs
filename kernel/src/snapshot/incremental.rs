@@ -293,10 +293,16 @@ impl Snapshot {
         )?;
 
         tracing::Span::current().record("version", table_configuration.version());
+        let origin = super::snapshot_crc::SnapshotCrc::resolved_origin(
+            base_crc.as_ref(),
+            Some(&existing_snapshot.crc),
+            combined_log_segment.listed.latest_crc_file.is_some(),
+        );
         let crc = Self::validate_configuration_and_crc(
             combined_log_segment,
             &table_configuration,
             crc_at_version.map(|(crc, _)| crc).or(base_crc),
+            origin,
         )?;
         let log_segment = current_segment
             .take()
@@ -488,7 +494,7 @@ impl Snapshot {
                 existing_log_segment.last_checkpoint_metadata.clone(),
             )
         };
-        let combined_log_segment = LogSegment::try_new(
+        let mut combined_log_segment = LogSegment::try_new(
             LogSegmentFiles {
                 ascending_commit_files,
                 ascending_compaction_files,
@@ -507,6 +513,7 @@ impl Snapshot {
             requested_version,
             new_checkpoint_hint,
         )?;
+        combined_log_segment.inherit_checkpoint_observation(existing_log_segment);
 
         Ok(NewSegment::Combined(combined_log_segment))
     }
@@ -528,6 +535,7 @@ impl Snapshot {
             existing.log_segment.clone(),
             existing.table_configuration.clone(),
             existing.base_crc().cloned(),
+            existing.crc.crc_origin,
             built_as_latest,
             skipped_new_checkpoints,
         )?))
@@ -1658,6 +1666,116 @@ mod tests {
     // Tests: stale-CRC resolution on the incremental path
     // ============================================================================
 
+    #[rstest]
+    #[case::missing(
+        None,
+        false,
+        IncrementalReplay::Unlimited,
+        crate::snapshot::CrcSource::Missing
+    )]
+    #[case::unusable(
+        Some(3),
+        true,
+        IncrementalReplay::Unlimited,
+        crate::snapshot::CrcSource::Unusable
+    )]
+    #[case::at_version(
+        Some(3),
+        false,
+        IncrementalReplay::Disabled,
+        crate::snapshot::CrcSource::AtVersion
+    )]
+    #[case::stale(
+        Some(1),
+        false,
+        IncrementalReplay::Disabled,
+        crate::snapshot::CrcSource::Stale
+    )]
+    #[case::over_budget(
+        Some(1),
+        false,
+        IncrementalReplay::UpToCommits(1),
+        crate::snapshot::CrcSource::Stale
+    )]
+    #[case::reconstructed(Some(1), false, IncrementalReplay::Unlimited, crate::snapshot::CrcSource::Reconstructed { num_commits: 2 })]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn crc_provenance_survives_hint_round_trip(
+        #[case] disk_version: Option<u64>,
+        #[case] corrupt: bool,
+        #[case] replay: IncrementalReplay,
+        #[case] source: crate::snapshot::CrcSource,
+    ) -> KernelResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
+        if let Some(version) = disk_version {
+            let content = if corrupt {
+                "invalid".to_owned()
+            } else {
+                make_test_crc_json(200, 2).to_string()
+            };
+            ctx.store
+                .put(&delta_path_for_version(version, "crc"), content.into())
+                .await?;
+        }
+        let snapshot = Snapshot::builder_for(ctx.url.as_str())
+            .with_incremental_crc_replay(replay)
+            .build(ctx.engine.as_ref())?;
+        let expected = crate::snapshot::CrcProvenance {
+            source,
+            base_version: disk_version.filter(|_| !corrupt),
+        };
+        assert_eq!(snapshot.crc_provenance(), expected);
+        let rebuilt = Snapshot::builder_for(ctx.url.as_str())
+            .with_snapshot_hint(snapshot.to_snapshot_hint()?)
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(rebuilt.crc_provenance(), expected);
+        assert_eq!(rebuilt.base_crc(), snapshot.base_crc());
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::usable_newer(false)]
+    #[case::failed_newer_falls_back(true)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn crc_provenance_new_disk_baseline_or_fallback(
+        #[case] corrupt: bool,
+    ) -> KernelResult<()> {
+        use crate::snapshot::{CrcProvenance, CrcSource};
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 5).await?;
+        ctx.store
+            .put(
+                &delta_path_for_version(1, "crc"),
+                make_test_crc_json(200, 2).to_string().into(),
+            )
+            .await?;
+        let snapshot = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(2)
+            .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+            .build(ctx.engine.as_ref())?;
+        let content = if corrupt {
+            "invalid".to_owned()
+        } else {
+            make_test_crc_json(300, 3).to_string()
+        };
+        ctx.store
+            .put(&delta_path_for_version(3, "crc"), content.into())
+            .await?;
+        let updated = Snapshot::builder_from(snapshot)
+            .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(
+            updated.crc_provenance(),
+            CrcProvenance {
+                source: CrcSource::Reconstructed {
+                    num_commits: if corrupt { 3 } else { 1 }
+                },
+                base_version: Some(if corrupt { 1 } else { 3 }),
+            }
+        );
+        Ok(())
+    }
+
     // `resolve_crc_file` when the new listing discovers a checkpoint *at or below* the existing
     // snapshot version must correctly decide which CRC file the combined segment carries on disk.
     // Each case below sets up commits 0-3, writes an existing CRC, builds snapshot_v3, writes
@@ -1779,6 +1897,10 @@ mod tests {
             .with_incremental_crc_replay(IncrementalReplay::Unlimited)
             .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_a.crc_at_version().map(|c| c.version), Some(3));
+        assert_eq!(
+            snapshot_a.crc_provenance().source,
+            crate::snapshot::CrcSource::Reconstructed { num_commits: 2 }
+        );
 
         // Advance with each CRC budget under both checkpoint-listing policies.
         let builder = Snapshot::builder_from(snapshot_a).with_incremental_crc_replay(mode);
@@ -1792,6 +1914,15 @@ mod tests {
         // Checkpoint retention must not change whether the configured CRC budget can advance.
         assert_eq!(updated.version(), 5);
         assert_eq!(updated.crc_at_version().map(|c| c.version), expected_crc_v);
+        assert_eq!(updated.crc_provenance().base_version, Some(1));
+        assert_eq!(
+            updated.crc_provenance().source,
+            if expected_crc_v.is_some() {
+                crate::snapshot::CrcSource::Reconstructed { num_commits: 4 }
+            } else {
+                crate::snapshot::CrcSource::Stale
+            }
+        );
         assert_eq!(
             updated
                 .log_segment

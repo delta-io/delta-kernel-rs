@@ -1,7 +1,7 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
 use std::num::NonZero;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -49,6 +49,7 @@ use crate::{
 mod crc_replay;
 mod domain_metadata_replay;
 mod protocol_metadata_replay;
+mod provenance;
 
 pub(crate) use domain_metadata_replay::DomainMetadataMap;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -135,7 +136,7 @@ pub(crate) struct ActionsWithCheckpointInfo<A: KernelResultIterator<ActionsBatch
 /// in `TableChanges` when built with [`LogSegment::for_table_changes`].
 ///
 /// [`Snapshot`]: crate::snapshot::Snapshot
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 #[internal_api]
 pub(crate) struct LogSegment {
     pub end_version: Version,
@@ -150,7 +151,23 @@ pub(crate) struct LogSegment {
     /// [`Self::checkpoint_hint_sidecars`] accessors built on it). Read this field directly only
     /// when the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
     pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
+    /// Kind established by ordinary reads or checkpoint writes, shared by the same checkpoint.
+    pub(crate) checkpoint_kind: Arc<OnceLock<crate::snapshot::SelectedCheckpointKind>>,
+    pub(crate) checkpoint_kind_hint: crate::snapshot::SelectedCheckpointKind,
 }
+
+// Observations can be refined by readers without changing the selected log segment.
+impl PartialEq for LogSegment {
+    fn eq(&self, other: &Self) -> bool {
+        self.end_version == other.end_version
+            && self.checkpoint_version == other.checkpoint_version
+            && self.log_root == other.log_root
+            && self.listed == other.listed
+            && self.last_checkpoint_metadata == other.last_checkpoint_metadata
+    }
+}
+
+impl Eq for LogSegment {}
 
 /// Validate the invariants shared by catalog-managed snapshot and commit-range log tails.
 pub(crate) fn validate_catalog_managed_log_tail(
@@ -378,6 +395,8 @@ impl LogSegment {
             checkpoint_version: None,
             log_root,
             last_checkpoint_metadata: None,
+            checkpoint_kind: Default::default(),
+            checkpoint_kind_hint: Default::default(),
             listed: LogSegmentFiles {
                 max_published_version: Some(commit_file.version),
                 latest_commit_file: Some(commit_file.clone()),
@@ -431,6 +450,8 @@ impl LogSegment {
             checkpoint_version,
             log_root,
             last_checkpoint_metadata,
+            checkpoint_kind: Default::default(),
+            checkpoint_kind_hint: Default::default(),
             listed: listed_files,
         };
 
@@ -818,6 +839,8 @@ impl LogSegment {
         // scan will read the checkpoint parquet footer to determine the schema (e.g.
         // whether stats_parsed or sidecar columns exist).
         new_log_segment.last_checkpoint_metadata = None;
+        new_log_segment.checkpoint_kind = Default::default();
+        new_log_segment.checkpoint_kind_hint = Default::default();
         Ok(new_log_segment)
     }
 
@@ -1205,7 +1228,7 @@ impl LogSegment {
             MultiPartCheckpoint { .. } => {
                 // Multi-part checkpoints are always V1 and never have sidecars.
                 let schema =
-                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
+                    self.read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
                 Ok((Some(schema), vec![]))
             }
             UuidCheckpoint if checkpoint.extension.as_str() == "json" => {
@@ -1217,7 +1240,7 @@ impl LogSegment {
                 // Parquet checkpoint (classic-named or UUID-named): either can be V1 or V2.
                 // Check for sidecar column to distinguish.
                 let checkpoint_schema =
-                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
+                    self.read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
                 if checkpoint_schema.field(SIDECAR_NAME).is_some() {
                     self.read_sidecar_schema_and_files(engine, checkpoint, Some(&checkpoint_schema))
                 } else {
@@ -1236,14 +1259,17 @@ impl LogSegment {
     /// Returns the checkpoint's parquet schema, using the hint from `_last_checkpoint` if
     /// available or reading the parquet footer otherwise.
     fn read_checkpoint_schema(
+        &self,
         engine: &dyn Engine,
         checkpoint: &ParsedLogPath<FileMeta>,
         hint_schema: Option<&SchemaRef>,
     ) -> KernelResult<SchemaRef> {
-        match hint_schema {
-            Some(schema) => Ok(schema.clone()),
-            None => Self::read_footer_schema(engine, &checkpoint.location),
+        if let Some(schema) = hint_schema {
+            return Ok(schema.clone());
         }
+        let schema = Self::read_footer_schema(engine, &checkpoint.location)?;
+        self.observe_checkpoint_schema(&schema);
+        Ok(schema)
     }
 
     /// Extracts sidecar file references and reads the file actions schema from the first
@@ -1419,16 +1445,22 @@ impl LogSegment {
         engine: &dyn Engine,
         checkpoint: &ParsedLogPath,
     ) -> KernelResult<Vec<FileMeta>> {
-        // Read checkpoint with just the sidecar column
+        // Observe checkpointMetadata alongside the sidecar references in the same read.
+        let read_schema = Arc::new(StructType::new_unchecked(
+            Self::sidecar_read_schema()
+                .fields()
+                .cloned()
+                .chain([crate::actions::CHECKPOINT_METADATA_FIELD.clone()]),
+        ));
         let batches = match checkpoint.extension.as_str() {
             "json" => engine.json_handler().read_json_files(
                 std::slice::from_ref(&checkpoint.location),
-                Self::sidecar_read_schema(),
+                read_schema.clone(),
                 None,
             )?,
             "parquet" => engine.parquet_handler().read_parquet_files(
                 std::slice::from_ref(&checkpoint.location),
-                Self::sidecar_read_schema(),
+                read_schema,
                 None,
             )?,
             _ => return Ok(vec![]),
@@ -1436,9 +1468,15 @@ impl LogSegment {
 
         // Extract sidecar file references
         let mut visitor = SidecarVisitor::default();
+        let mut metadata = provenance::CheckpointMetadataVisitor::default();
         for batch_result in batches {
             let batch = batch_result?;
             visitor.visit_rows_of(batch.as_ref())?;
+            metadata.visit_rows_of(batch.as_ref())?;
+        }
+
+        if metadata.found || !visitor.sidecars.is_empty() {
+            self.observe_checkpoint_kind(crate::snapshot::SelectedCheckpointKind::V2);
         }
 
         // Convert to FileMeta
@@ -1468,6 +1506,8 @@ impl LogSegment {
             checkpoint_version: None,
             log_root: self.log_root.clone(),
             last_checkpoint_metadata: None,
+            checkpoint_kind: Default::default(),
+            checkpoint_kind_hint: Default::default(),
             listed: LogSegmentFiles {
                 ascending_commit_files: commits,
                 ascending_compaction_files: compactions,

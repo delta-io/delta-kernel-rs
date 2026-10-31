@@ -4,9 +4,21 @@
 
 use std::sync::Arc;
 
+use super::{CrcProvenance, CrcSource};
 use crate::crc::Crc;
+use crate::error::SnapshotHintError;
 use crate::utils::require;
 use crate::{KernelError, KernelResult, Version};
+
+/// The original disk observation survives advancing a CRC in memory.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) enum CrcOrigin {
+    Disk(Version),
+    Missing,
+    Unusable,
+    #[default]
+    Unknown,
+}
 
 /// The newest [`Crc`] a snapshot resolved, at or before the snapshot's version. It is one CRC,
 /// read from disk (or computed) at most once; keeping it lets later queries and CRC writes reuse
@@ -19,15 +31,18 @@ use crate::{KernelError, KernelResult, Version};
 pub(super) struct SnapshotCrc {
     crc: Option<Arc<Crc>>,
     snapshot_version: Version,
+    pub(super) crc_origin: CrcOrigin,
 }
 
 impl SnapshotCrc {
     /// Wrap the CRC a snapshot at `snapshot_version` resolved. A `Some(crc)` must sit in
-    /// `[checkpoint_version, snapshot_version]`.
+    /// `[checkpoint_version, snapshot_version]`. `crc_origin` records the caller's observation of
+    /// the original disk checksum, independently of the retained CRC's version.
     pub(super) fn try_new(
         crc: Option<Arc<Crc>>,
         snapshot_version: Version,
         checkpoint_version: Option<Version>,
+        crc_origin: CrcOrigin,
     ) -> KernelResult<Self> {
         if let Some(crc) = crc.as_ref() {
             require!(
@@ -48,7 +63,65 @@ impl SnapshotCrc {
         Ok(Self {
             crc,
             snapshot_version,
+            crc_origin,
         })
+    }
+
+    pub(super) fn set_provenance(&mut self, provenance: CrcProvenance) -> KernelResult<()> {
+        self.crc_origin = match (provenance.source, provenance.base_version) {
+            (CrcSource::Unknown, None) => CrcOrigin::Unknown,
+            (CrcSource::Missing, None) => CrcOrigin::Missing,
+            (CrcSource::Unusable, None) => CrcOrigin::Unusable,
+            (_, Some(version)) if self.base().is_some_and(|crc| version <= crc.version) => {
+                CrcOrigin::Disk(version)
+            }
+            _ => return Err(SnapshotHintError::CrcProvenanceConflict.into()),
+        };
+        require!(
+            self.provenance() == provenance,
+            SnapshotHintError::CrcProvenanceConflict.into()
+        );
+        Ok(())
+    }
+
+    pub(super) fn provenance(&self) -> CrcProvenance {
+        let (source, base_version) = match (self.crc_origin, self.base()) {
+            (CrcOrigin::Disk(version), Some(crc)) => {
+                let source = if crc.version < self.snapshot_version {
+                    CrcSource::Stale
+                } else if version == self.snapshot_version {
+                    CrcSource::AtVersion
+                } else {
+                    CrcSource::Reconstructed {
+                        num_commits: self.snapshot_version - version,
+                    }
+                };
+                (source, Some(version))
+            }
+            (CrcOrigin::Missing, None) => (CrcSource::Missing, None),
+            (CrcOrigin::Unusable, None) => (CrcSource::Unusable, None),
+            _ => (CrcSource::Unknown, None),
+        };
+        CrcProvenance {
+            source,
+            base_version,
+        }
+    }
+
+    /// Preserve the origin of a reused baseline; a different baseline was read from disk.
+    /// `LogSegment::pick_latest_base_crc` preserves the in-memory Arc's identity when it wins.
+    pub(super) fn resolved_origin(
+        base: Option<&Arc<Crc>>,
+        previous: Option<&Self>,
+        candidate_present: bool,
+    ) -> CrcOrigin {
+        match base {
+            Some(base) => previous
+                .filter(|old| old.base().is_some_and(|crc| Arc::ptr_eq(crc, base)))
+                .map_or(CrcOrigin::Disk(base.version), |old| old.crc_origin),
+            None if candidate_present => CrcOrigin::Unusable,
+            None => CrcOrigin::Missing,
+        }
     }
 
     /// The CRC iff it sits exactly at the snapshot version, so its cached values are authoritative
@@ -88,7 +161,7 @@ mod tests {
     #[test]
     fn new_rejects_crc_ahead_of_snapshot() {
         assert_result_error_with_message(
-            SnapshotCrc::try_new(Some(crc_at(6)), 5, None),
+            SnapshotCrc::try_new(Some(crc_at(6)), 5, None, CrcOrigin::Unknown),
             "is ahead of snapshot version",
         );
     }
@@ -96,35 +169,61 @@ mod tests {
     #[test]
     fn new_rejects_crc_below_checkpoint() {
         assert_result_error_with_message(
-            SnapshotCrc::try_new(Some(crc_at(2)), 5, Some(3)),
+            SnapshotCrc::try_new(Some(crc_at(2)), 5, Some(3), CrcOrigin::Unknown),
             "is below checkpoint version",
         );
     }
 
     #[test]
     fn new_accepts_crc_at_checkpoint() {
-        let holder = SnapshotCrc::try_new(Some(crc_at(3)), 5, Some(3)).unwrap();
+        let holder = SnapshotCrc::try_new(Some(crc_at(3)), 5, Some(3), CrcOrigin::Unknown).unwrap();
         assert_eq!(holder.base().map(|c| c.version), Some(3));
     }
 
     #[test]
     fn at_version_serves_crc_matching_snapshot_version() {
-        let holder = SnapshotCrc::try_new(Some(crc_at(5)), 5, None).unwrap();
+        let holder = SnapshotCrc::try_new(Some(crc_at(5)), 5, None, CrcOrigin::Unknown).unwrap();
         assert_eq!(holder.at_version().map(|c| c.version), Some(5));
         assert_eq!(holder.base().map(|c| c.version), Some(5));
     }
 
     #[test]
     fn stale_crc_is_base_but_not_at_version() {
-        let holder = SnapshotCrc::try_new(Some(crc_at(3)), 5, None).unwrap();
+        let holder = SnapshotCrc::try_new(Some(crc_at(3)), 5, None, CrcOrigin::Unknown).unwrap();
         assert!(holder.at_version().is_none());
         assert_eq!(holder.base().map(|c| c.version), Some(3));
     }
 
     #[test]
     fn none_holder_serves_nothing() {
-        let holder = SnapshotCrc::try_new(None, 5, None).unwrap();
+        let holder = SnapshotCrc::try_new(None, 5, None, CrcOrigin::Unknown).unwrap();
         assert!(holder.at_version().is_none());
         assert!(holder.base().is_none());
+    }
+
+    #[rstest::rstest]
+    #[case::wrong_count(Some(5), CrcSource::Reconstructed { num_commits: 1 }, Some(3))]
+    #[case::zero_count(Some(5), CrcSource::Reconstructed { num_commits: 0 }, Some(5))]
+    #[case::missing_with_crc(Some(5), CrcSource::Missing, None)]
+    #[case::unusable_with_crc(Some(3), CrcSource::Unusable, None)]
+    #[case::at_version_without_crc(None, CrcSource::AtVersion, Some(5))]
+    #[case::future_base(Some(5), CrcSource::AtVersion, Some(6))]
+    #[case::stale_without_base(Some(3), CrcSource::Stale, None)]
+    #[case::unknown_with_base(Some(5), CrcSource::Unknown, Some(3))]
+    fn rejects_inconsistent_provenance(
+        #[case] crc_version: Option<Version>,
+        #[case] source: CrcSource,
+        #[case] base_version: Option<Version>,
+    ) {
+        let mut holder =
+            SnapshotCrc::try_new(crc_version.map(crc_at), 5, None, CrcOrigin::Unknown).unwrap();
+        let error = holder
+            .set_provenance(CrcProvenance {
+                source,
+                base_version,
+            })
+            .unwrap_err();
+        assert!(matches!(error, KernelError::SnapshotHint(error)
+            if matches!(*error, SnapshotHintError::CrcProvenanceConflict)));
     }
 }

@@ -73,6 +73,7 @@ fn external_snapshot_hint_api_builds_without_storage_io() -> KernelResult<()> {
         snapshot.log_segment().checkpoint_hint().cloned(),
         snapshot.crc_at_version().cloned(),
         SnapshotHintFreshness::Latest,
+        None,
     )?;
     reporter.reset();
 
@@ -200,6 +201,7 @@ fn external_snapshot_hint_accepts_parsed_advanced_crc() -> KernelResult<()> {
         snapshot.log_segment().checkpoint_hint().cloned(),
         Some(parsed_crc),
         SnapshotHintFreshness::Latest,
+        None,
     )?;
     reporter.reset();
 

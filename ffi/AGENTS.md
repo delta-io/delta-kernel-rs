@@ -770,6 +770,8 @@ pub struct FfiSnapshotHint {
     pub last_checkpoint: *const FfiLastCheckpoint,
     pub crc: *const FfiCrc,
     pub publication_watermark: FfiPublicationWatermark,
+    pub checkpoint_kind: SelectedCheckpointKind,
+    pub crc_provenance: FfiCrcProvenance,
 }
 
 pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint(
@@ -833,8 +835,9 @@ engine I/O through one callback with a complete borrowed `FfiSnapshotHint`. Both
 borrowed. The callback runs once on success and is not invoked on error. All nested pointers expire
 when the callback returns; copy retained values during the callback. No hint handle is returned.
 Supply the copied values through `snapshot_builder_with_snapshot_hint` when rebuilding a snapshot.
-The hint preserves build-time freshness, not current freshness, and includes only a matching
-checkpoint hint and an at-version CRC. Compaction files are unsupported.
+The hint preserves build-time freshness, a matching checkpoint hint, retained CRC state (including
+stale baselines), and checkpoint and CRC provenance. `crc` is null only when no checksum is retained.
+Callers supply `Unknown` for observations they have not established. Compaction files are unsupported.
 
 Export includes an explicit publication watermark,
 preserving absence even when published commits are not represented by the retained paths.

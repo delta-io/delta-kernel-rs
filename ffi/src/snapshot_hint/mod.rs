@@ -1,6 +1,8 @@
 //! Construction and export of snapshot hints.
 
-use delta_kernel::snapshot::{SnapshotHint, SnapshotHintError, SnapshotHintFreshness};
+use delta_kernel::snapshot::{
+    SelectedCheckpointKind, SnapshotHint, SnapshotHintError, SnapshotHintFreshness,
+};
 use delta_kernel::{KernelError, KernelResult, Version};
 
 use crate::delta_types::{
@@ -9,6 +11,7 @@ use crate::delta_types::{
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
+use crate::snapshot_provenance::FfiCrcProvenance;
 use crate::{
     ExclusiveSnapshotBuilder, FfiSnapshotBuilder, FfiSnapshotBuilderSource, NullableCvoid,
     SharedExternEngine, SharedSnapshot,
@@ -88,12 +91,17 @@ pub struct FfiSnapshotHint {
     pub metadata: FfiMetadata,
     /// Optional `_last_checkpoint` state. Null means absent.
     pub last_checkpoint: *const FfiLastCheckpoint,
-    /// Optional CRC state. Null means absent.
+    /// Optional retained CRC state at or before `version`. Null means absent.
+    /// A stale CRC remains a baseline for later reconstruction.
     pub crc: *const FfiCrc,
     /// Whether to infer publication from paths or preserve an explicit observation.
     ///
     /// Export always uses an explicit variant, never `InferFromLogPaths`.
     pub publication_watermark: FfiPublicationWatermark,
+    /// Selected checkpoint specification. Use `Unknown` when it has not been established.
+    pub checkpoint_kind: SelectedCheckpointKind,
+    /// Retained checksum observation. Use `Unknown` with no base version when it is not known.
+    pub crc_provenance: FfiCrcProvenance,
 }
 
 fn invalid_with_source(message: impl Into<String>, source: KernelError) -> KernelError {
@@ -160,6 +168,7 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         last_checkpoint_hint,
         crc,
         freshness,
+        Some((value.checkpoint_kind, value.crc_provenance.to_kernel())),
     )?;
     builder.snapshot_hint = Some(Box::new(snapshot_hint));
     Ok(())
@@ -172,8 +181,8 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
 /// supplied log location must be beneath the builder's table log root, including paths discarded by
 /// checkpoint selection. Kernel preserves the locations; the connector must canonicalize them into
 /// the same URL form as the table root. Build performs the remaining structural and
-/// table-configuration validation. `Latest` makes `is_built_as_latest()` true, and kernel trusts
-/// that caller claim. `Unverified` makes it false.
+/// table-configuration and provenance validation. `Latest` makes `is_built_as_latest()` true, and
+/// kernel trusts that caller claim. `Unverified` makes it false.
 ///
 /// # Errors
 ///

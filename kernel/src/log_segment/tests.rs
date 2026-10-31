@@ -12,8 +12,8 @@ use super::*;
 use crate::actions::visitors::{AddVisitor, SidecarVisitor};
 use crate::actions::{
     get_all_actions_schema, get_commit_schema, Add, CheckpointMetadata, Remove, Sidecar, ADD_NAME,
-    COMMIT_INFO_NAME, LOG_METADATA_SCHEMA, MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS,
-    REMOVE_NAME, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
+    CHECKPOINT_METADATA_NAME, COMMIT_INFO_NAME, LOG_METADATA_SCHEMA, MAX_VALUES, METADATA_NAME,
+    MIN_VALUES, NUM_RECORDS, REMOVE_NAME, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
 };
 use crate::arrow::array::{StringArray, StructArray};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
@@ -44,6 +44,7 @@ use crate::scan::{
 use crate::schema::{
     schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
 };
+use crate::snapshot::SelectedCheckpointKind;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table, write_commit,
@@ -349,6 +350,8 @@ fn log_segment_stats_counts_only_replay_commits(
         checkpoint_version: checkpoint_only.then_some(0),
         log_root: Url::parse("memory:///_delta_log/").unwrap(),
         last_checkpoint_metadata: None,
+        checkpoint_kind: Default::default(),
+        checkpoint_kind_hint: Default::default(),
         listed: LogSegmentFiles {
             ascending_commit_files: commits,
             checkpoint_parts: if checkpoint_only {
@@ -421,6 +424,8 @@ fn log_segment_stats_uses_selected_compactions(
         checkpoint_version: None,
         log_root: Url::parse("memory:///_delta_log/").unwrap(),
         last_checkpoint_metadata: None,
+        checkpoint_kind: Default::default(),
+        checkpoint_kind_hint: Default::default(),
         listed: LogSegmentFiles {
             ascending_commit_files: commit_sizes
                 .iter()
@@ -1616,6 +1621,67 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
     assert_batch_matches(first_batch, add_batch_simple(v2_checkpoint_read_schema));
     assert!(iter.next().is_none());
 
+    Ok(())
+}
+
+#[rstest]
+#[case::no_sidecar_column(false, SelectedCheckpointKind::Unknown)]
+#[case::nullable_sidecar_column(true, SelectedCheckpointKind::V2)]
+#[tokio::test]
+async fn classic_v2_checkpoint_kind_follows_observed_actions(
+    #[case] sidecar_column: bool,
+    #[case] expected: SelectedCheckpointKind,
+) -> KernelResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    let mut fields = vec![ADD_NAME, CHECKPOINT_METADATA_NAME];
+    if sidecar_column {
+        fields.push(SIDECAR_NAME);
+    }
+    let schema = get_all_actions_schema().project(&fields)?;
+    let json = StringArray::from(vec![
+        r#"{"checkpointMetadata":{"version":1}}"#,
+        r#"{"add":{"path":"data.parquet","partitionValues":{},"size":1,"modificationTime":0,"dataChange":false}}"#,
+    ]);
+    let batch = SyncJsonHandler::new(None).parse_json(string_array_to_engine_data(json), schema)?;
+    let filename = "00000000000000000001.checkpoint.parquet";
+    add_checkpoint_to_store(&store, batch, filename).await?;
+    let size = get_file_size(&store, &format!("_delta_log/{filename}")).await;
+    let segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(
+                log_root.join(filename)?.as_str(),
+                size,
+            )],
+            latest_commit_file: Some(create_log_path(
+                log_root.join("00000000000000000001.json")?.as_str(),
+            )),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )?;
+    // A normal V2 action read must override a contradictory connector claim.
+    let claim = if sidecar_column {
+        SelectedCheckpointKind::V1
+    } else {
+        SelectedCheckpointKind::Unknown
+    };
+    let segment = segment.with_checkpoint_kind(claim)?;
+    let batches = segment.create_checkpoint_stream(
+        &engine,
+        get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
+        None,
+        None,
+        None,
+    )?;
+    let mut adds = AddVisitor::default();
+    for batch in batches.actions {
+        adds.visit_rows_of(batch?.actions.as_ref())?;
+    }
+    assert_eq!(adds.adds.len(), 1);
+    assert_eq!(segment.selected_checkpoint_kind(), expected);
     Ok(())
 }
 

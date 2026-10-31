@@ -106,7 +106,8 @@ impl LogSegment {
     /// Pick the latest CRC to use as an advance base: this segment's on-disk CRC or
     /// `in_memory_base`, whichever is newer, falling back to `in_memory_base` on a failed on-disk
     /// read, except cancellation. Drops a base below the checkpoint; returns None when no candidate
-    /// remains.
+    /// remains. When the in-memory base wins, preserves its Arc identity so snapshot provenance
+    /// can distinguish reuse from reading a checksum file.
     pub(crate) fn pick_latest_base_crc(
         &self,
         engine: &dyn Engine,
