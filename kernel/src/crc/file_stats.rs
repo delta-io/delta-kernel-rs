@@ -120,9 +120,8 @@ const INCREMENTAL_SAFE_OPS: &[&str] = &[
 /// Returns `true` if the given operation can be safely tracked by incremental file stats.
 ///
 /// Incremental-safe operations produce add/remove actions whose net counts give correct file
-/// stats. Unknown or missing operations are treated as unsafe. For example, ANALYZE STATS
-/// re-adds existing files with updated statistics; naively counting those adds would
-/// double-count file stats.
+/// stats. Unknown operations return `false`. For example, ANALYZE STATS re-adds existing files
+/// with updated statistics; naively counting those adds would double-count file stats.
 pub(crate) fn is_incremental_safe_operation(operation: &str) -> bool {
     INCREMENTAL_SAFE_OPS.contains(&operation)
 }

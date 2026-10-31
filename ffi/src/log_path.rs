@@ -1,9 +1,10 @@
 //! FFI interface for LogPath.
 
+use delta_kernel::path::ParsedLogPath;
 use delta_kernel::{FileMeta, KernelResult, LogPath};
 use url::Url;
 
-use crate::{FfiSlice, KernelStringSlice, TryFromStringSlice};
+use crate::{kernel_string_slice, FfiSlice, KernelStringSlice, TryFromStringSlice};
 
 /// Borrowed array of FFI-safe log paths.
 pub type LogPathArray = FfiSlice<FfiLogPath>;
@@ -58,12 +59,23 @@ impl FfiLogPath {
         self.size
     }
 
+    /// Borrows file metadata from a parsed path. The returned location string remains valid
+    /// only while `path` is alive and its location is unchanged.
+    pub(crate) fn from_parsed(path: &ParsedLogPath) -> Self {
+        let location = path.location.location.as_str();
+        Self::new(
+            kernel_string_slice!(location),
+            path.location.last_modified,
+            path.location.size,
+        )
+    }
+
     /// Convert this FFI log path into a kernel LogPath
     ///
     /// # Safety
     ///
     /// The `self.location` string slice must be valid UTF-8 and represent a valid URL.
-    unsafe fn log_path(&self) -> KernelResult<LogPath> {
+    pub(crate) unsafe fn log_path(&self) -> KernelResult<LogPath> {
         let location_str = unsafe { TryFromStringSlice::try_from_slice(&self.location) }?;
         let url = Url::parse(location_str)?;
         let file_meta = FileMeta {

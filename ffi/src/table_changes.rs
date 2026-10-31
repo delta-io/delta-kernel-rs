@@ -35,7 +35,7 @@ pub struct ExclusiveTableChanges;
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles and path pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_from_version(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
@@ -43,7 +43,8 @@ pub unsafe extern "C" fn table_changes_from_version(
 ) -> ExternResult<Handle<ExclusiveTableChanges>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    table_changes_impl(url, engine, start_version, None).into_extern_result(&engine)
+    let result = table_changes_impl(url, engine, start_version, None);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Get the table changes from the specified table between two versions
@@ -56,7 +57,7 @@ pub unsafe extern "C" fn table_changes_from_version(
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles and path pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_between_versions(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
@@ -65,7 +66,8 @@ pub unsafe extern "C" fn table_changes_between_versions(
 ) -> ExternResult<Handle<ExclusiveTableChanges>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    table_changes_impl(url, engine, start_version, end_version.into()).into_extern_result(&engine)
+    let result = table_changes_impl(url, engine, start_version, end_version.into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn table_changes_impl(
@@ -87,9 +89,9 @@ fn table_changes_impl(
 ///
 /// # Safety
 /// Caller is responsible for passing a valid table changes handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_table_changes(table_changes: Handle<ExclusiveTableChanges>) {
-    table_changes.drop_handle();
+    unsafe { table_changes.drop_handle() }
 }
 
 /// Get schema from the specified TableChanges.
@@ -97,7 +99,7 @@ pub unsafe extern "C" fn free_table_changes(table_changes: Handle<ExclusiveTable
 /// # Safety
 ///
 /// Caller is responsible for passing a valid table changes handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_schema(
     table_changes: Handle<ExclusiveTableChanges>,
 ) -> Handle<SharedSchema> {
@@ -110,7 +112,7 @@ pub unsafe extern "C" fn table_changes_schema(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid table changes handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_table_root(
     table_changes: Handle<ExclusiveTableChanges>,
     allocate_fn: AllocateStringFn,
@@ -125,7 +127,7 @@ pub unsafe extern "C" fn table_changes_table_root(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid table changes handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_start_version(
     table_changes: Handle<ExclusiveTableChanges>,
 ) -> u64 {
@@ -138,7 +140,7 @@ pub unsafe extern "C" fn table_changes_start_version(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid table changes handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_end_version(
     table_changes: Handle<ExclusiveTableChanges>,
 ) -> u64 {
@@ -156,14 +158,15 @@ pub struct SharedTableChangesScan;
 /// # Safety
 ///
 /// Caller is responsible for passing a valid table changes pointer, and engine pointer
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_scan(
     table_changes: Handle<ExclusiveTableChanges>,
     engine: Handle<SharedExternEngine>,
     predicate: Option<&mut EnginePredicate>,
 ) -> ExternResult<Handle<SharedTableChangesScan>> {
     let table_changes = unsafe { table_changes.into_inner() };
-    table_changes_scan_impl(*table_changes, predicate).into_extern_result(&engine.as_ref())
+    let result = table_changes_scan_impl(*table_changes, predicate);
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 fn table_changes_scan_impl(
@@ -185,11 +188,11 @@ fn table_changes_scan_impl(
 ///
 /// # Safety
 /// Caller is responsible for passing a valid scan handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_table_changes_scan(
     table_changes_scan: Handle<SharedTableChangesScan>,
 ) {
-    table_changes_scan.drop_handle();
+    unsafe { table_changes_scan.drop_handle() }
 }
 
 /// Get the table root of a table changes scan.
@@ -197,7 +200,7 @@ pub unsafe extern "C" fn free_table_changes_scan(
 /// # Safety
 /// Engine is responsible for providing a valid scan pointer and allocate_fn (for allocating the
 /// string)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_scan_table_root(
     table_changes_scan: Handle<SharedTableChangesScan>,
     allocate_fn: AllocateStringFn,
@@ -212,7 +215,7 @@ pub unsafe extern "C" fn table_changes_scan_table_root(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_scan_logical_schema(
     table_changes_scan: Handle<SharedTableChangesScan>,
 ) -> Handle<SharedSchema> {
@@ -225,7 +228,7 @@ pub unsafe extern "C" fn table_changes_scan_logical_schema(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_scan_physical_schema(
     table_changes_scan: Handle<SharedTableChangesScan>,
 ) -> Handle<SharedSchema> {
@@ -256,15 +259,15 @@ impl Drop for ScanTableChangesIterator {
 /// # Safety
 ///
 /// Engine is responsible for passing a valid [`SharedExternEngine`] and [`SharedTableChangesScan`]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_scan_execute(
     table_changes_scan: Handle<SharedTableChangesScan>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedScanTableChangesIterator>> {
     let table_changes_scan = unsafe { table_changes_scan.as_ref() };
     let engine = unsafe { engine.clone_as_arc() };
-    table_changes_scan_execute_impl(table_changes_scan, engine.clone())
-        .into_extern_result(&engine.as_ref())
+    let result = table_changes_scan_execute_impl(table_changes_scan, engine.clone());
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 fn table_changes_scan_execute_impl(
@@ -284,11 +287,11 @@ fn table_changes_scan_execute_impl(
 /// Drops table changes iterator.
 /// Caller is responsible for (at most once) passing a valid pointer returned by a call to
 /// [`table_changes_scan_execute`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_scan_table_changes_iter(
     data: Handle<SharedScanTableChangesIterator>,
 ) {
-    data.drop_handle();
+    unsafe { data.drop_handle() }
 }
 
 /// Get next batch of data from the table changes iterator.
@@ -301,12 +304,13 @@ pub unsafe extern "C" fn free_scan_table_changes_iter(
 ///
 /// The iterator must be valid (returned by [`table_changes_scan_execute`]) and not yet freed
 /// by [`free_scan_table_changes_iter`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_table_changes_next(
     data: Handle<SharedScanTableChangesIterator>,
 ) -> ExternResult<*mut ArrowFFIData> {
     let data = unsafe { data.as_ref() };
-    scan_table_changes_next_impl(data).into_extern_result(&data.engine.as_ref())
+    let result = scan_table_changes_next_impl(data);
+    unsafe { result.into_extern_result(&data.engine.as_ref()) }
 }
 
 fn scan_table_changes_next_impl(

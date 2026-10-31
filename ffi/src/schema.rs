@@ -301,7 +301,7 @@ pub struct EngineSchemaVisitor {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid schema handle and schema visitor.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_schema(
     schema: Handle<SharedSchema>,
     visitor: &mut EngineSchemaVisitor,

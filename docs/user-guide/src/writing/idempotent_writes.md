@@ -43,7 +43,7 @@ let app_id = "my-streaming-job";
 let batch_version: i64 = 42;
 
 // Check if this batch was already committed
-if let Some(committed_version) = snapshot.get_app_id_version(app_id, &engine)? {
+if let Some(committed_version) = snapshot.reader().get_app_id_version(app_id, &engine)? {
     if committed_version >= batch_version {
         println!("batch {batch_version} already committed (table has {committed_version})");
         return Ok(());
@@ -70,11 +70,11 @@ the next run, `get_app_id_version()` will find it and the duplicate write is ski
 
 ## Reading the latest transaction version
 
-`Snapshot::get_app_id_version()` scans the log for the latest `SetTransaction` with the
+`SnapshotReader::get_app_id_version()` scans the log for the latest `SetTransaction` with the
 given `app_id`:
 
 ```rust,ignore
-let latest: Option<i64> = snapshot.get_app_id_version("my-app", &engine)?;
+let latest: Option<i64> = snapshot.reader().get_app_id_version("my-app", &engine)?;
 ```
 
 Returns `None` if no transaction with that `app_id` has been committed.

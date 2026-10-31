@@ -274,6 +274,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     ///
     /// This token applies only to the build and is not retained by the snapshot. Builds run
     /// synchronously and may block on I/O, including when a cancellation token is supplied.
+    /// Configure [`Snapshot::reader`] with a token for subsequent metadata reads.
     ///
     /// [`CancellationToken`]: crate::CancellationToken
     /// [`KernelError::Cancelled`]: crate::KernelError::Cancelled

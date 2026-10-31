@@ -126,6 +126,10 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
 **Snapshot** is the primary entry point for existing-table operations: an immutable view of a
 table at a specific version. From it you build a `Scan` (reads) or `Transaction` (writes).
 
+**Snapshot metadata:** `snapshot.reader()` creates a `SnapshotReader` for metadata getters that may
+read storage. Its optional token scopes synchronous, blocking reads without changing the shared
+snapshot or the connector's engine. In-memory getters remain on `Snapshot`.
+
 **Read path:** `Snapshot` -> `ScanBuilder` -> `Scan` -> data. Execution paths:
 `execute()` (simple), `scan_metadata()` (advanced/distributed),
 `parallel_scan_metadata()` (two-phase distributed log replay).
@@ -169,6 +173,10 @@ directly: ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` acce
 - **Unit tests** test internal APIs and module internals. It is fine to use public APIs
   like `create_table` in a unit test as setup (e.g. to create a table for testing reads,
   writes, or state loading).
+- **Test module layout:** keep short unit-test modules inline in the implementation file.
+  When tests grow large enough to warrant a separate file, use `module/mod.rs` for the
+  implementation and `module/tests.rs` for the tests. Avoid `module.rs` alongside a
+  `module/` directory containing only `tests.rs`.
 - **Integration tests** exercise only public APIs end-to-end. See `kernel/tests/README.md`
   for a catalog of available test tables (schema, protocol, features, and which tests use
   them). Consult it before creating new test data to avoid duplication.

@@ -1186,6 +1186,7 @@ mod tests {
     #[rstest]
     fn common_builder_state_preserves_data_change_through_empty_commit(
         #[values(false, true)] expected_data_change: bool,
+        #[values(false, true)] skip_dedup_validation: bool,
     ) -> KernelResult<()> {
         let tempdir = tempfile::tempdir()?;
         let table_path = tempdir.path().join("table");
@@ -1194,7 +1195,7 @@ mod tests {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
-        let builder = CreateTableTransactionBuilder::new(
+        let mut builder = CreateTableTransactionBuilder::new(
             table_path.to_string_lossy(),
             test_schema(),
             "test-engine",
@@ -1203,8 +1204,12 @@ mod tests {
         .with_correlation_id("test-correlation")
         .with_operation_parameters([("mode", Some("Create"))])
         .with_transaction_id("app", 7);
+        if skip_dedup_validation {
+            builder = builder.without_dedup_validation();
+        }
         let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
 
+        assert_eq!(transaction.skip_dedup_validation, skip_dedup_validation);
         assert_eq!(transaction.engine_info, "test-engine");
         assert_eq!(
             transaction.correlation_id.as_deref(),

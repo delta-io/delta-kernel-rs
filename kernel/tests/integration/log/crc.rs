@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::crc::{Crc, DomainMetadataState, SetTransactionState};
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
@@ -22,15 +23,15 @@ use delta_kernel::transaction::{UpdateTableOperation, UpdateTableTransactionBuil
 use delta_kernel::LogPath;
 use delta_kernel::{
     Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, FileSize,
-    FileStats, JsonHandler, KernelResult, KernelResultIterator, ParquetFooter, ParquetHandler,
-    PredicateRef, StorageHandler, Version,
+    FileStats, JsonHandler, KernelError, KernelResult, KernelResultIterator, ParquetFooter,
+    ParquetHandler, PredicateRef, StorageHandler, Version,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
-    add_commit, begin_transaction_with, copy_directory, insert_data, test_table_setup,
-    test_table_setup_mt,
+    add_commit, begin_transaction_with, copy_directory, insert_data, insert_data_with,
+    test_table_setup, test_table_setup_mt,
 };
 use url::Url;
 
@@ -647,9 +648,11 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> KernelResult<(
     Ok(())
 }
 
+#[rstest]
 #[tokio::test]
-async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate() -> KernelResult<()>
-{
+async fn test_post_commit_crc_metadata_only_custom_op_makes_file_stats_indeterminate(
+    #[values("ANALYZE STATS", "VACUUM END", "SET TBLPROPERTIES")] operation: &str,
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // ===== GIVEN: Create table (v0) and insert data (v1) =====
@@ -662,11 +665,11 @@ async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate(
         .unwrap_committed();
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
 
-    // ===== WHEN: Commit a non-incremental operation (ANALYZE STATS) =====
+    // ===== WHEN: Commit a custom operation without file actions =====
     let committed = begin_transaction_with(
         snapshot_v1.clone(),
         engine.as_ref(),
-        delta_kernel::transaction::UpdateTableOperation::Custom("ANALYZE STATS".to_string()),
+        UpdateTableOperation::Custom(operation.to_string()),
         "test-engine",
         true,
         |builder| builder,
@@ -679,6 +682,16 @@ async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate(
     let snapshot_v2 = committed.post_commit_snapshot().unwrap();
     let crc_v2 = snapshot_v2.crc_at_version().unwrap();
     assert!(crc_v2.file_stats_state().is_indeterminate());
+    assert!(matches!(
+        snapshot_v2.write_checksum(engine.as_ref()),
+        Err(KernelError::ChecksumWriteUnsupported(_))
+    ));
+
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        fresh.write_checksum(engine.as_ref())?.0,
+        ChecksumWriteResult::Written
+    );
 
     Ok(())
 }
@@ -727,6 +740,113 @@ async fn test_write_checksum_double_write_returns_already_exists(
     };
     assert_eq!(second, ChecksumWriteResult::AlreadyExists);
 
+    Ok(())
+}
+
+#[rstest]
+#[case::version_zero(WriteRoot::VersionZero, None)]
+#[case::stale_crc_incremental(WriteRoot::StaleCrcIncrementalBuild, None)]
+#[case::stale_crc_non_incremental(WriteRoot::StaleCrcNonIncrementalBuild, None)]
+#[case::checkpoint_v1(WriteRoot::CheckpointWithTail, Some(CheckpointSpec::V1))]
+#[case::checkpoint_v2(
+    WriteRoot::CheckpointWithTail,
+    Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
+)]
+#[case::checkpoint_v2_sidecars(
+    WriteRoot::CheckpointWithTail,
+    Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+        file_actions_per_sidecar_hint: Some(1),
+    }))
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_write_checksum_preserves_stats_across_metadata_only_commits(
+    #[case] root: WriteRoot,
+    #[case] checkpoint: Option<CheckpointSpec>,
+    #[values("VACUUM START", "VACUUM END", "SET TBLPROPERTIES", "ANALYZE STATS")] operation: &str,
+) -> KernelResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let mut builder = create_table(
+        &table_path,
+        schema_ref! { nullable "id": INTEGER },
+        "test_engine",
+        true,
+    )
+    .with_table_properties([("delta.feature.domainMetadata", "supported")]);
+    if matches!(&checkpoint, Some(CheckpointSpec::V2(_))) {
+        builder = builder.with_table_properties([("delta.checkpointPolicy", "v2")]);
+    }
+    let snap = builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let mut snap = insert_data(snap, &engine, vec![Arc::new(Int32Array::from(vec![1]))])
+        .await?
+        .unwrap_post_commit_snapshot();
+    match root {
+        WriteRoot::CheckpointWithTail => {
+            snap = snap.checkpoint(engine.as_ref(), checkpoint.as_ref())?.1;
+        }
+        WriteRoot::StaleCrcIncrementalBuild | WriteRoot::StaleCrcNonIncrementalBuild => {
+            snap.write_checksum(engine.as_ref())?;
+        }
+        WriteRoot::VersionZero => {}
+        WriteRoot::CheckpointNoTail => unreachable!("metadata-only commits require a tail"),
+    }
+
+    for version in 2..=4 {
+        snap = if version == 3 {
+            insert_data(snap, &engine, vec![Arc::new(Int32Array::from(vec![2]))])
+                .await?
+                .unwrap_post_commit_snapshot()
+        } else {
+            snap.update_table(
+                UpdateTableOperation::Custom(operation.to_string()),
+                "test_engine",
+                false,
+            )
+            .with_domain_metadata("metadata_only", format!("v{version}"))
+            .with_transaction_id("metadata_only", version)
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot()
+        };
+    }
+
+    let incremental_build = root == WriteRoot::StaleCrcIncrementalBuild;
+    let replay = if incremental_build {
+        IncrementalReplay::Unlimited
+    } else {
+        IncrementalReplay::Disabled
+    };
+    let fresh = Snapshot::builder_for(&table_path)
+        .with_incremental_crc_replay(replay)
+        .build(engine.as_ref())?;
+    assert_eq!(fresh.version(), 4);
+    assert_eq!(fresh.crc_at_version().is_some(), incremental_build);
+    assert_eq!(
+        fresh.log_segment().checkpoint_version,
+        checkpoint.as_ref().map(|_| 1)
+    );
+    assert_eq!(
+        fresh.write_checksum(engine.as_ref())?.0,
+        ChecksumWriteResult::Written
+    );
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let crc = reloaded.crc_at_version().unwrap();
+    let sizes = parquet_file_sizes_on_disk(&table_path);
+    assert_eq!(sizes.len(), 2);
+    let stats = crc.file_stats().unwrap();
+    assert_eq!(stats.num_files(), 2);
+    assert_eq!(stats.table_size_bytes(), sizes.iter().sum::<i64>());
+    assert_histogram_totals(stats, 2, sizes.iter().sum());
+    assert_eq!(
+        crc.domain_metadata_state.expect_complete()["metadata_only"].configuration(),
+        "v4"
+    );
+    assert_eq!(
+        crc.set_transaction_state.expect_complete()["metadata_only"].version(),
+        4
+    );
     Ok(())
 }
 
@@ -1121,38 +1241,52 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupported(
+#[rstest]
+#[case::checkpoint(true)]
+#[case::stale_crc(false)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
+    #[case] with_checkpoint: bool,
 ) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-
-    let schema = schema_ref! { nullable "id": INTEGER };
-    let snap = create_table(&table_path, schema, "test_engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
-        .unwrap_post_commit_snapshot();
-    let snap = insert_data(
+    let snap = create_table_and_commit(&table_path, engine.as_ref())?
+        .post_commit_snapshot()
+        .unwrap()
+        .clone();
+    if !with_checkpoint {
+        snap.write_checksum(engine.as_ref())?;
+    }
+    let mut snap = insert_data(
         snap,
         &engine,
         vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
     )
     .await?
     .unwrap_post_commit_snapshot();
-    let (_, snap) = snap.checkpoint(engine.as_ref(), None)?;
-    // Non-incremental operation in the tail dooms file stats regardless of the checkpoint.
-    begin_transaction_with(
+    if with_checkpoint {
+        snap = snap.checkpoint(engine.as_ref(), None)?.1;
+    }
+    insert_data_with(
         snap,
-        engine.as_ref(),
-        delta_kernel::transaction::UpdateTableOperation::Custom("ANALYZE STATS".to_string()),
-        "test-engine",
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+        Box::new(FileSystemCommitter::new()),
+        "ANALYZE STATS",
         true,
-        |builder| builder,
-    )?
-    .commit(engine.as_ref())?
+        false,
+    )
+    .await?
     .unwrap_committed();
 
-    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    assert!(fresh.crc_at_version().is_none());
+    let fresh = Snapshot::builder_for(&table_path)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(engine.as_ref())?;
+    assert_eq!(fresh.version(), 2);
+    assert_eq!(fresh.crc_at_version().is_some(), !with_checkpoint);
+    assert_eq!(fresh.get_file_stats_if_present(), None);
+    if let Some(crc) = fresh.crc_at_version() {
+        assert!(crc.file_stats_state().is_indeterminate());
+    }
     assert!(matches!(
         fresh.write_checksum(engine.as_ref()),
         Err(delta_kernel::KernelError::ChecksumWriteUnsupported(_))
@@ -1330,6 +1464,7 @@ async fn test_write_checksum_with_no_dms_writes_empty_list(
 
     let snapshot = committed.post_commit_snapshot().unwrap();
     assert!(snapshot
+        .reader()
         .get_all_domain_metadata(engine.as_ref())?
         .is_empty());
     let crc = write_and_verify_crc(snapshot, &table_path, engine.as_ref());
@@ -1391,24 +1526,35 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> KernelResult<()
     // Asserts domain metadata on any snapshot, regardless of how it was loaded.
     let assert_domain_metadata = |snapshot: &Snapshot, engine: &dyn delta_kernel::Engine| {
         assert_eq!(
-            snapshot.get_domain_metadata("zip", engine).unwrap(),
+            snapshot
+                .reader()
+                .get_domain_metadata("zip", engine)
+                .unwrap(),
             Some("zap1".to_string())
         );
         assert_eq!(
-            snapshot.get_domain_metadata("foo", engine).unwrap(),
+            snapshot
+                .reader()
+                .get_domain_metadata("foo", engine)
+                .unwrap(),
             Some("bar".to_string())
         );
         // Miss on a Complete cache: served as authoritative None without log replay.
         assert_eq!(
-            snapshot.get_domain_metadata("nonexistent", engine).unwrap(),
+            snapshot
+                .reader()
+                .get_domain_metadata("nonexistent", engine)
+                .unwrap(),
             None
         );
         assert!(snapshot
+            .reader()
             .get_domain_metadata_internal("delta.clustering", engine)
             .unwrap()
             .is_some());
         assert_eq!(
             snapshot
+                .reader()
                 .get_domain_metadatas_internal(engine, None)
                 .unwrap()
                 .len(),
@@ -1498,37 +1644,50 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> KernelRes
 
     // Hit: "foo" is in the Partial cache, so served without log replay.
     assert_eq!(
-        snapshot_v1.get_domain_metadata("foo", &FailingEngine)?,
+        snapshot_v1
+            .reader()
+            .get_domain_metadata("foo", &FailingEngine)?,
         Some("bar".to_string())
     );
 
     // Miss: "zip" is not in this Partial cache; FailingEngine panics, real engine finds it.
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        snapshot_v1.get_domain_metadata("zip", &FailingEngine).ok()
+        snapshot_v1
+            .reader()
+            .get_domain_metadata("zip", &FailingEngine)
+            .ok()
     }))
     .is_err());
     assert_eq!(
-        snapshot_v1.get_domain_metadata("zip", engine.as_ref())?,
+        snapshot_v1
+            .reader()
+            .get_domain_metadata("zip", engine.as_ref())?,
         Some("zap0".to_string())
     );
 
     // Miss on a nonexistent domain falls through and returns None.
     assert_eq!(
-        snapshot_v1.get_domain_metadata("nonexistent", engine.as_ref())?,
+        snapshot_v1
+            .reader()
+            .get_domain_metadata("nonexistent", engine.as_ref())?,
         None
     );
 
     // Multi-key filter with a mixed hit ("foo") and miss ("zip"): the first miss
     // short-circuits the cache lookup and the full result comes from log replay.
     let filter = HashSet::from(["foo", "zip"]);
-    let map = snapshot_v1.get_domain_metadatas_internal(engine.as_ref(), Some(&filter))?;
+    let map = snapshot_v1
+        .reader()
+        .get_domain_metadatas_internal(engine.as_ref(), Some(&filter))?;
     assert_eq!(map.len(), 2);
     assert_eq!(map["foo"].configuration(), "bar");
     assert_eq!(map["zip"].configuration(), "zap0");
 
     // "All" queries against Partial always fall through. The replay-derived set must
     // include BOTH entries.
-    let mut all = snapshot_v1.get_all_domain_metadata(engine.as_ref())?;
+    let mut all = snapshot_v1
+        .reader()
+        .get_all_domain_metadata(engine.as_ref())?;
     all.sort_by(|a, b| a.domain().cmp(b.domain()));
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].domain(), "foo");
@@ -1564,6 +1723,7 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> KernelResult<()> {
     assert!(fresh_v0.crc_at_version().is_some());
     assert_eq!(
         fresh_v0
+            .reader()
             .get_app_id_version("my-app", &FailingEngine)
             .unwrap(),
         None
@@ -1582,12 +1742,14 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> KernelResult<()> {
     // Post-commit CRC tracks my-app=1, queryable via fast path
     assert_eq!(
         snapshot_v1
+            .reader()
             .get_app_id_version("my-app", &FailingEngine)
             .unwrap(),
         Some(1)
     );
     assert_eq!(
         snapshot_v1
+            .reader()
             .get_app_id_version("nonexistent", &FailingEngine)
             .unwrap(),
         None
@@ -1603,12 +1765,14 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> KernelResult<()> {
     assert!(fresh_v1.crc_at_version().is_some());
     assert_eq!(
         fresh_v1
+            .reader()
             .get_app_id_version("my-app", &FailingEngine)
             .unwrap(),
         Some(1)
     );
     assert_eq!(
         fresh_v1
+            .reader()
             .get_app_id_version("nonexistent", &FailingEngine)
             .unwrap(),
         None
@@ -1628,12 +1792,14 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> KernelResult<()> {
     // Post-commit CRC tracks updated versions, queryable via fast path
     assert_eq!(
         snapshot_v2
+            .reader()
             .get_app_id_version("my-app", &FailingEngine)
             .unwrap(),
         Some(2)
     );
     assert_eq!(
         snapshot_v2
+            .reader()
             .get_app_id_version("other-app", &FailingEngine)
             .unwrap(),
         Some(1)
@@ -1648,12 +1814,14 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> KernelResult<()> {
     assert!(fresh_v2.crc_at_version().is_some());
     assert_eq!(
         fresh_v2
+            .reader()
             .get_app_id_version("my-app", &FailingEngine)
             .unwrap(),
         Some(2)
     );
     assert_eq!(
         fresh_v2
+            .reader()
             .get_app_id_version("other-app", &FailingEngine)
             .unwrap(),
         Some(1)
@@ -1711,25 +1879,32 @@ async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> Kern
 
     // Hit: "my-app" is in the Partial cache -- served without log replay.
     assert_eq!(
-        snapshot_v2.get_app_id_version("my-app", &FailingEngine)?,
+        snapshot_v2
+            .reader()
+            .get_app_id_version("my-app", &FailingEngine)?,
         Some(1)
     );
 
     // Miss: "v1-app" is NOT in the Partial cache; FailingEngine panics, real engine finds it.
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         snapshot_v2
+            .reader()
             .get_app_id_version("v1-app", &FailingEngine)
             .ok()
     }))
     .is_err());
     assert_eq!(
-        snapshot_v2.get_app_id_version("v1-app", engine.as_ref())?,
+        snapshot_v2
+            .reader()
+            .get_app_id_version("v1-app", engine.as_ref())?,
         Some(1)
     );
 
     // Miss: completely absent app_id falls through and returns None.
     assert_eq!(
-        snapshot_v2.get_app_id_version("nonexistent", engine.as_ref())?,
+        snapshot_v2
+            .reader()
+            .get_app_id_version("nonexistent", engine.as_ref())?,
         None
     );
 
@@ -1792,6 +1967,7 @@ async fn test_set_txn_expiration_via_crc_fast_path(
     // FailingEngine proves the CRC fast path is used (no log replay)
     assert_eq!(
         snapshot
+            .reader()
             .get_app_id_version("my-app", &FailingEngine)
             .unwrap(),
         expected
@@ -1853,7 +2029,9 @@ async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> Kernel
 
     // FailingEngine proves the Partial fast path is used; the expiration filter drops the txn.
     assert_eq!(
-        snapshot_v2.get_app_id_version("my-app", &FailingEngine)?,
+        snapshot_v2
+            .reader()
+            .get_app_id_version("my-app", &FailingEngine)?,
         None
     );
 
@@ -1894,7 +2072,9 @@ async fn test_set_txn_null_last_updated_never_expires_via_log_replay() -> Kernel
 
     // Despite aggressive retention, null last_updated means the txn never expires
     assert_eq!(
-        fresh.get_app_id_version("null-app", engine.as_ref())?,
+        fresh
+            .reader()
+            .get_app_id_version("null-app", engine.as_ref())?,
         Some(42)
     );
 
@@ -1936,7 +2116,10 @@ async fn test_set_txn_expired_newest_returns_none_not_older_via_log_replay() -> 
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(fresh.version(), 2);
     assert!(fresh.crc_at_version().is_none());
-    assert_eq!(fresh.get_app_id_version("app", engine.as_ref())?, None);
+    assert_eq!(
+        fresh.reader().get_app_id_version("app", engine.as_ref())?,
+        None
+    );
 
     Ok(())
 }
@@ -2468,6 +2651,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     // - If no CRC, then we must re-read the latest commit -> need real engine.
     // - Else, we did CRC replay and cached the result -> use fake engine.
     assert!(fresh
+        .reader()
         .get_in_commit_timestamp(real_engine_iff_crc_missing)?
         .is_some());
 
@@ -2482,6 +2666,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     // === Check: domain metadata written *before* the CRC ===
     for domain in ["domain_at_create", "delta.clustering"] {
         assert!(fresh
+            .reader()
             .get_domain_metadata_internal(
                 domain,
                 real_engine_iff_crc_missing_or_crc_missing_opt_fields
@@ -2492,13 +2677,14 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     // === Check: domain metadata written *after* the CRC ===
     for domain in ["domain", "delta.rowTracking"] {
         assert!(fresh
+            .reader()
             .get_domain_metadata_internal(domain, real_engine_iff_crc_missing)?
             .is_some());
     }
 
     // === Check: set transactions written *before* the CRC ===
     assert_eq!(
-        fresh.get_app_id_version(
+        fresh.reader().get_app_id_version(
             "app_before_crc",
             real_engine_iff_crc_missing_or_crc_missing_opt_fields
         )?,
@@ -2507,59 +2693,11 @@ async fn test_stale_crc_fresh_build_advance_matrix(
 
     // === Check: set transactions written *after* the CRC ===
     assert_eq!(
-        fresh.get_app_id_version("app", real_engine_iff_crc_missing)?,
+        fresh
+            .reader()
+            .get_app_id_version("app", real_engine_iff_crc_missing)?,
         Some(LATEST_VERSION)
     );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate() -> KernelResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-
-    // ===== GIVEN: a CRC at v0 (made stale by an insert at v1) =====
-    let snap = create_table_and_commit(&table_path, engine.as_ref())?
-        .post_commit_snapshot()
-        .unwrap()
-        .clone();
-    snap.write_checksum(engine.as_ref())?;
-    let snap = insert_data(
-        snap,
-        &engine,
-        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-    )
-    .await?
-    .unwrap_post_commit_snapshot();
-
-    // ===== WHEN: a non-incremental operation (ANALYZE STATS) commits at v2 =====
-    begin_transaction_with(
-        snap,
-        engine.as_ref(),
-        delta_kernel::transaction::UpdateTableOperation::Custom("ANALYZE STATS".to_string()),
-        "test-engine",
-        true,
-        |builder| builder,
-    )?
-    .commit(engine.as_ref())?
-    .unwrap_committed();
-
-    // ===== THEN: advancing the stale CRC trips file stats to Indeterminate, so they are not
-    // served and write_checksum is rejected =====
-    let fresh = Snapshot::builder_for(&table_path)
-        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
-        .build(engine.as_ref())?;
-    assert_eq!(fresh.version(), 2);
-    assert!(fresh
-        .crc_at_version()
-        .unwrap()
-        .file_stats_state()
-        .is_indeterminate());
-    assert_eq!(fresh.get_file_stats_if_present(), None);
-    assert!(matches!(
-        fresh.write_checksum(engine.as_ref()),
-        Err(delta_kernel::KernelError::ChecksumWriteUnsupported(_))
-    ));
 
     Ok(())
 }
@@ -2744,12 +2882,13 @@ async fn test_dm_query_rooted_in_stale_complete_crc(#[case] query: Query) -> Ker
     };
     match query {
         Query::One(domain, expected) => assert_eq!(
-            fresh.get_domain_metadata(domain, &engine)?,
+            fresh.reader().get_domain_metadata(domain, &engine)?,
             expected.map(str::to_string)
         ),
         Query::Filter(keys) => {
             let filter = keys.iter().copied().collect();
             let got: HashMap<String, String> = fresh
+                .reader()
                 .get_domain_metadatas_internal(&engine, Some(&filter))?
                 .into_iter()
                 .map(|(domain, dm)| (domain, dm.configuration().to_string()))
@@ -2758,6 +2897,7 @@ async fn test_dm_query_rooted_in_stale_complete_crc(#[case] query: Query) -> Ker
         }
         Query::All => {
             let all: HashMap<String, String> = fresh
+                .reader()
                 .get_all_domain_metadata(&engine)?
                 .into_iter()
                 .map(|dm| (dm.domain().to_string(), dm.configuration().to_string()))
@@ -2783,11 +2923,15 @@ async fn test_dm_query_stale_partial_crc_falls_through_to_full_scan() -> KernelR
 
     // Results are still correct via the full scan (with the real engine).
     assert_eq!(
-        fresh.get_domain_metadata("dom_before", engine.as_ref())?,
+        fresh
+            .reader()
+            .get_domain_metadata("dom_before", engine.as_ref())?,
         Some("cfg_before".to_string())
     );
     assert_eq!(
-        fresh.get_domain_metadata("dom_removed", engine.as_ref())?,
+        fresh
+            .reader()
+            .get_domain_metadata("dom_removed", engine.as_ref())?,
         None
     );
 
@@ -2797,7 +2941,10 @@ async fn test_dm_query_stale_partial_crc_falls_through_to_full_scan() -> KernelR
         inner: engine.clone(),
     };
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        fresh.get_domain_metadata("dom_before", &no_parquet).ok()
+        fresh
+            .reader()
+            .get_domain_metadata("dom_before", &no_parquet)
+            .ok()
     }))
     .is_err());
 
@@ -2869,7 +3016,10 @@ async fn test_txn_query_rooted_in_stale_complete_crc(
     let engine = NoParquetReadsEngine {
         inner: engine.clone(),
     };
-    assert_eq!(fresh.get_app_id_version(app_id, &engine)?, expected);
+    assert_eq!(
+        fresh.reader().get_app_id_version(app_id, &engine)?,
+        expected
+    );
     Ok(())
 }
 
@@ -2888,11 +3038,15 @@ async fn test_txn_query_stale_partial_crc_falls_through_to_full_scan() -> Kernel
 
     // Results are still correct via the full scan (with the real engine).
     assert_eq!(
-        fresh.get_app_id_version("app_before", engine.as_ref())?,
+        fresh
+            .reader()
+            .get_app_id_version("app_before", engine.as_ref())?,
         Some(5)
     );
     assert_eq!(
-        fresh.get_app_id_version("app_updated", engine.as_ref())?,
+        fresh
+            .reader()
+            .get_app_id_version("app_updated", engine.as_ref())?,
         Some(16)
     );
 
@@ -2902,7 +3056,10 @@ async fn test_txn_query_stale_partial_crc_falls_through_to_full_scan() -> Kernel
         inner: engine.clone(),
     };
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        fresh.get_app_id_version("app_before", &no_parquet).ok()
+        fresh
+            .reader()
+            .get_app_id_version("app_before", &no_parquet)
+            .ok()
     }))
     .is_err());
 
