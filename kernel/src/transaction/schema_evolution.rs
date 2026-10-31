@@ -122,7 +122,8 @@ pub(crate) struct SchemaEvolutionResult {
 /// # Errors
 ///
 /// Returns an error if any operation fails validation. The error message identifies which
-/// operation failed and why.
+/// operation failed and why. When column mapping is enabled, also returns an invalid-protocol
+/// error if `current_max_column_id` is smaller than the largest column id in `schema`.
 pub(crate) fn apply_schema_operations(
     mut schema: StructType,
     operations: Vec<SchemaOperation>,
@@ -145,13 +146,22 @@ pub(crate) fn apply_schema_operations(
         })?;
     }
 
-    // When column mapping is enabled and the property is set, defensively take the max with
-    // the schema's actual max in case a non-conforming writer left the property stale.
-    let mut max_id = if cm_enabled {
-        current_max_column_id.map(|cfg| cfg.max(find_max_column_id_in_schema(&schema).unwrap_or(0)))
-    } else {
-        current_max_column_id
-    };
+    // A persisted maximum below an id still present in the schema is inconsistent metadata.
+    // Raising it to the schema maximum cannot recover ids of dropped columns, so a later add
+    // could reuse a historical id. Reject the gap instead of advancing the property.
+    let mut max_id = current_max_column_id;
+    if cm_enabled {
+        if let (Some(persisted), Some(schema_max)) =
+            (current_max_column_id, find_max_column_id_in_schema(&schema))
+        {
+            if persisted < schema_max {
+                return Err(KernelError::invalid_protocol(format!(
+                    "Table property `{COLUMN_MAPPING_MAX_COLUMN_ID}` ({persisted}) is less than \
+                     the maximum column id in the current schema ({schema_max})"
+                )));
+            }
+        }
+    }
 
     for op in operations {
         let mut root = DataType::from(schema);
@@ -1073,37 +1083,47 @@ mod tests {
         );
     }
 
-    /// If the persisted `maxColumnId` is stale (smaller than the actual max ID present in
-    /// the schema), the defensive seed rebases on the schema's max so a newly added column
-    /// cannot collide with an existing field's ID. Matches delta-spark's `findMaxColumnId`.
-    #[test]
-    fn stale_max_column_id_is_self_healed_by_schema_walk() {
-        let mut existing = StructField::nullable("existing", DataType::STRING);
-        existing.metadata.insert(
-            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
-            MetadataValue::Number(42),
-        );
+    /// Persisted `delta.columnMapping.maxColumnId` must be at least the largest id in the
+    /// current schema. A smaller value is rejected: the schema walk cannot recover ids of
+    /// dropped columns, so raising the property could reuse a historical id. A persisted
+    /// value equal to or above the schema maximum is consistent and still allocates from it.
+    #[rstest]
+    #[case::stale_is_rejected(5, true)]
+    #[case::equal_is_accepted(42, false)]
+    #[case::ahead_of_schema_is_accepted(50, false)]
+    fn persisted_max_column_id_relative_to_schema(
+        #[case] persisted: i64,
+        #[case] expect_reject: bool,
+    ) {
         let schema = schema! {
-            (existing),
+            (field_with_id_only("existing", DataType::STRING, 42)),
         };
         let ops = vec![SchemaOperation::add_column(
             None,
             StructField::nullable("new", DataType::STRING),
         )];
-        // Persisted maxColumnId is stale at 5, but the schema actually contains id=42.
         let result = apply_schema_operations(
             schema,
             ops,
             ColumnMappingMode::Name,
-            Some(5),
+            Some(persisted),
             false, /* cdf_enabled */
-        )
-        .unwrap();
-        let new_id = get_cm_id(result.schema.field("new").unwrap());
-        assert_eq!(
-            new_id, 43,
-            "new id must follow schema max (42), not stale property (5)"
         );
-        assert_eq!(result.new_max_column_id, Some(43));
+
+        if expect_reject {
+            let err = result.unwrap_err();
+            assert!(matches!(err, KernelError::InvalidProtocol(_)));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&persisted.to_string()) && msg.contains("42"),
+                "error should report both the persisted max and the schema max, got: {msg}"
+            );
+        } else {
+            let result = result.unwrap();
+            let new_id = persisted + 1;
+            assert_eq!(get_cm_id(result.schema.field("existing").unwrap()), 42);
+            assert_eq!(get_cm_id(result.schema.field("new").unwrap()), new_id);
+            assert_eq!(result.new_max_column_id, Some(new_id));
+        }
     }
 }
