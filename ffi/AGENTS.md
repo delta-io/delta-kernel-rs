@@ -786,14 +786,15 @@ The setter consumes the builder on both success and error, returning its replace
 
 Prefer mirroring the `kernel/src/` module hierarchy in `ffi/src/` for corresponding APIs.
 Snapshot hints live under `src/snapshot/hint/`, matching `kernel/src/snapshot/hint.rs`.
-Snapshot builders and accessors live in `src/lib.rs`. FFI-specific ownership, conversion, and
-engine support code can use its own modules.
+Snapshot builders live in `src/snapshot/builder.rs`; snapshot accessors live in `src/lib.rs`.
+FFI-specific ownership, conversion, and engine support code can use its own modules.
 
 ## Key Files
 
 - `src/lib.rs` -- main FFI entry points and type definitions
 - `src/delta_types.rs` -- reusable borrowed C representations of Delta state and actions,
   with their backing storage and conversions colocated
+- `src/snapshot/builder.rs` -- snapshot builders and their configuration
 - `src/snapshot/hint/` -- typed snapshot-hint input and callback export
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
@@ -811,7 +812,7 @@ engine support code can use its own modules.
 get_default_engine() -> get_snapshot_builder() -> snapshot_builder_build() -> scan() -> scan_metadata() -> read + transform
 ```
 
-Snapshot builder API (`ffi/src/lib.rs` and `ffi/src/snapshot/hint/mod.rs`):
+Snapshot builder API (`ffi/src/snapshot/builder.rs` and `ffi/src/snapshot/hint/mod.rs`):
 - `get_snapshot_builder(path, engine)` -- fresh snapshot from a table path
 - `get_snapshot_builder_from(old_snapshot, engine)` -- incremental update reusing an existing snapshot (avoids re-reading the log)
 - `snapshot_builder_with_version(builder, version)` -- optional: pin to a specific version

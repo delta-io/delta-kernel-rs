@@ -4,9 +4,10 @@ This crate provides a C foreign function interface (ffi) for delta-kernel-rs.
 
 ## Source layout
 
-Snapshot hints live in [`src/snapshot/hint/`](src/snapshot/hint/); snapshot builders and accessors
-live in [`src/lib.rs`](src/lib.rs). See the [source layout guidance](AGENTS.md#source-layout) for
-module organization conventions.
+Snapshot builders live in [`src/snapshot/builder.rs`](src/snapshot/builder.rs), with typed hint bindings
+in [`src/snapshot/hint/`](src/snapshot/hint/). Snapshot accessors live in
+[`src/lib.rs`](src/lib.rs). See the [source layout guidance](AGENTS.md#source-layout) for module
+organization conventions.
 
 ## Selecting scan statistics
 
