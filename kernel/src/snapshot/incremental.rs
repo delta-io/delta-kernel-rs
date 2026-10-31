@@ -321,8 +321,8 @@ impl Snapshot {
             combined_log_segment,
             &table_configuration,
             crc_at_version.map(|(crc, _)| crc).or(base_crc),
-        )?
-        .with_origin(origin);
+            origin,
+        )?;
         let log_segment = current_segment
             .take()
             .ok_or_else(|| KernelError::internal_error("Missing prepared log segment"))?;

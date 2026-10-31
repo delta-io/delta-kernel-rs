@@ -32,11 +32,12 @@ pub enum SelectedCheckpointKind {
 #[non_exhaustive]
 #[repr(C)]
 pub enum CrcSource {
-    /// A usable checksum file was resolved at the snapshot version.
+    /// A usable on-disk checksum file was resolved at the snapshot version.
     AtVersion,
-    /// An older checksum file was advanced to the snapshot version using committed actions.
+    /// An older on-disk checksum was advanced in memory to the snapshot version using committed
+    /// actions.
     Reconstructed {
-        /// Total commits incorporated since the original checksum file, across all updates.
+        /// Total commits incorporated since the on-disk baseline version, across all updates.
         num_commits: u64,
     },
     /// A usable checksum is retained behind the snapshot version.
@@ -61,12 +62,13 @@ pub enum CrcSource {
 pub struct CrcProvenance {
     /// How the checksum was resolved.
     pub source: CrcSource,
-    /// Version of the original usable checksum file, when known.
+    /// Version of the on-disk checksum file used as the original baseline, when known.
+    /// This stays at the disk file's version when the checksum is advanced in memory.
     pub base_version: Option<Version>,
 }
 
 impl CrcProvenance {
-    /// Describes `source` and its original usable checksum file's `base_version`, if known.
+    /// Describes `source` and the on-disk baseline's `base_version`, if known.
     /// Snapshot-hint construction validates the claim against the retained checksum.
     pub fn new(source: CrcSource, base_version: Option<Version>) -> Self {
         Self {

@@ -73,6 +73,7 @@ fn external_snapshot_hint_api_builds_without_storage_io() -> delta_kernel::Resul
         snapshot.log_segment().checkpoint_hint().cloned(),
         snapshot.crc_at_version().cloned(),
         SnapshotHintFreshness::Latest,
+        None,
     )?;
     reporter.reset();
 
@@ -201,6 +202,7 @@ fn external_snapshot_hint_accepts_parsed_advanced_crc() -> delta_kernel::Result<
         snapshot.log_segment().checkpoint_hint().cloned(),
         Some(parsed_crc),
         SnapshotHintFreshness::Latest,
+        None,
     )?;
     reporter.reset();
 

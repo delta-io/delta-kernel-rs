@@ -80,7 +80,8 @@ pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder
 pub(crate) use hint::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
 pub use provenance::{CrcProvenance, CrcSource, SelectedCheckpointKind};
 pub use reader::SnapshotReader;
-use snapshot_crc::{CrcOrigin, SnapshotCrc};
+pub(crate) use snapshot_crc::CrcOrigin;
+use snapshot_crc::SnapshotCrc;
 
 pub use crate::error::SnapshotHintError;
 pub use crate::log_segment::LogSegmentStats;
@@ -232,13 +233,15 @@ impl Snapshot {
         Self::new_with_crc(
             log_segment,
             table_configuration,
-            None,  /* crc */
+            None, /* crc */
+            CrcOrigin::Unknown,
             false, /* built_as_latest */
             false, /* skipped_new_checkpoints */
         )
     }
 
-    /// Internal constructor that accepts an explicit pre-resolved CRC.
+    /// Internal constructor that accepts an explicit pre-resolved CRC and its origin.
+    /// `CrcOrigin::Unknown` means the caller has not established its disk provenance.
     ///
     /// `built_as_latest` records whether the build confirmed this is the latest version
     /// (best-effort). See [`Snapshot::built_as_latest`]. `skipped_new_checkpoints` records the last
@@ -247,10 +250,16 @@ impl Snapshot {
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
         crc: Option<Arc<Crc>>,
+        crc_origin: CrcOrigin,
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
     ) -> KernelResult<Self> {
-        let crc = Self::validate_configuration_and_crc(&log_segment, &table_configuration, crc)?;
+        let crc = Self::validate_configuration_and_crc(
+            &log_segment,
+            &table_configuration,
+            crc,
+            crc_origin,
+        )?;
         Ok(Self::new_with_validated_crc(
             log_segment,
             table_configuration,
@@ -270,18 +279,15 @@ impl Snapshot {
         log_segment: &LogSegment,
         table_configuration: &TableConfiguration,
         crc: Option<Arc<Crc>>,
+        crc_origin: CrcOrigin,
     ) -> KernelResult<SnapshotCrc> {
         table_configuration.ensure_operation_supported(Operation::SnapshotLoad)?;
         SnapshotCrc::try_new(
             crc,
             table_configuration.version(),
             log_segment.checkpoint_version,
+            crc_origin,
         )
-    }
-
-    fn with_crc_origin(mut self, origin: CrcOrigin) -> Self {
-        self.crc.origin = origin;
-        self
     }
 
     /// `captured_checkpoint_action` is the latest checkpoint action when the build already has it
@@ -520,8 +526,8 @@ impl Snapshot {
             log_segment.listed.latest_crc_file.is_some(),
         );
         let crc = crc_at_version.map(|(crc, _)| crc).or(base_crc);
-        let crc = Self::validate_configuration_and_crc(log_segment, &table_configuration, crc)?
-            .with_origin(origin);
+        let crc =
+            Self::validate_configuration_and_crc(log_segment, &table_configuration, crc, origin)?;
         Ok(PreparedSnapshot {
             table_configuration,
             crc,
@@ -598,8 +604,8 @@ impl Snapshot {
             &new_log_segment,
             &new_table_configuration,
             new_crc,
-        )?
-        .with_origin(self.crc.origin);
+            self.crc.crc_origin,
+        )?;
         // A successful commit means the post-commit snapshot is the latest version.
         Ok(Self::new_with_validated_crc(
             new_log_segment,
@@ -1531,16 +1537,14 @@ impl Snapshot {
             Ok(bytes_written) => {
                 info!("Wrote CRC file at {}", crc_path.location);
                 let new_log_segment = self.log_segment.try_new_with_crc_file(crc_path)?;
-                let new_snapshot = Arc::new(
-                    Snapshot::new_with_crc(
-                        new_log_segment,
-                        self.table_configuration().clone(),
-                        Some(crc),
-                        self.built_as_latest,
-                        self.skipped_new_checkpoints,
-                    )?
-                    .with_crc_origin(CrcOrigin::Disk(self.version())),
-                );
+                let new_snapshot = Arc::new(Snapshot::new_with_crc(
+                    new_log_segment,
+                    self.table_configuration().clone(),
+                    Some(crc),
+                    CrcOrigin::Disk(self.version()),
+                    self.built_as_latest,
+                    self.skipped_new_checkpoints,
+                )?);
                 tracing::Span::current().record("bytes_written", bytes_written);
                 Ok((ChecksumWriteResult::Written, new_snapshot))
             }
@@ -1824,9 +1828,10 @@ impl Snapshot {
             new_log_segment,
             self.table_configuration().clone(),
             self.crc_at_version().cloned(),
+            self.crc.crc_origin,
             self.built_as_latest,
             false, /* skipped_new_checkpoints */
-        )?.with_crc_origin(self.crc.origin));
+        )?);
         span.record(
             "bytes_written",
             info.last_checkpoint_stats.size_in_bytes as u64,
@@ -1926,9 +1931,10 @@ impl Snapshot {
             log_segment,
             self.table_configuration().clone(),
             self.base_crc().cloned(),
+            self.crc.crc_origin,
             self.built_as_latest,
             self.skipped_new_checkpoints,
-        )?.with_crc_origin(self.crc.origin)))
+        )?))
     }
 }
 
@@ -2535,7 +2541,8 @@ mod tests {
         Snapshot::new_with_crc(
             log_segment,
             table_cfg,
-            None,  /* crc */
+            None, /* crc */
+            CrcOrigin::Unknown,
             false, /* built_as_latest */
             false, /* skipped_new_checkpoints */
         )
@@ -3329,6 +3336,7 @@ mod tests {
             loaded_snapshot.log_segment().clone(),
             loaded_snapshot.table_configuration().clone(),
             None,
+            CrcOrigin::Unknown,
             false,
             false, /* skipped_new_checkpoints */
         )?;
@@ -3438,6 +3446,7 @@ mod tests {
             built.log_segment().clone(),
             built.table_configuration().clone(),
             Some(stale_crc),
+            CrcOrigin::Unknown,
             false, /* built_as_latest */
             false, /* skipped_new_checkpoints */
         )

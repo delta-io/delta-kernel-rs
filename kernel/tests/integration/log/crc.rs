@@ -250,6 +250,7 @@ fn test_get_all_files_preserved_via_snapshot_hint() -> delta_kernel::Result<()> 
         snapshot.log_segment().checkpoint_hint().cloned(),
         snapshot.crc_at_version().cloned(),
         SnapshotHintFreshness::Latest,
+        None,
     )?;
 
     // Hint path (not a from-scratch load): the hinted CRC keeps its allFiles.
