@@ -83,7 +83,8 @@ pub mod plans;
 pub mod scan;
 pub mod schema;
 pub mod schema_visitor;
-pub mod snapshot_hint;
+pub mod snapshot;
+pub use snapshot::hint as snapshot_hint;
 
 #[cfg(test)]
 mod ffi_test_utils;
@@ -1293,7 +1294,7 @@ pub struct SharedProtocol;
 /// [`snapshot_builder_with_incremental_crc_replay`], [`snapshot_builder_with_log_tail`], and
 /// [`snapshot_builder_with_max_catalog_version`] (for catalog-managed tables). Builders returned
 /// by [`get_snapshot_builder`] may instead receive a complete typed snapshot hint with
-/// [`snapshot_hint::snapshot_builder_with_snapshot_hint`].
+/// [`snapshot::hint::snapshot_builder_with_snapshot_hint`].
 /// Finally, call [`snapshot_builder_build`] to consume the builder and obtain the snapshot. If you
 /// need to discard the builder without building, call [`free_snapshot_builder`].
 pub struct FfiSnapshotBuilder {
@@ -1596,7 +1597,7 @@ fn snapshot_builder_build_impl(
             |_, _| {
                 // The public API rejects this combination; retain the invariant here for
                 // internal construction paths.
-                Err(snapshot_hint::invalid(
+                Err(snapshot::hint::invalid(
                     "A snapshot hint cannot be used with Snapshot::builder_from",
                 ))
             },

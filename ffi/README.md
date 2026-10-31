@@ -2,6 +2,13 @@
 
 This crate provides a C foreign function interface (ffi) for delta-kernel-rs.
 
+## Source layout
+
+The FFI source mirrors the `kernel/src/` module hierarchy where practical, so corresponding APIs
+are easy to find. Snapshot hints live in [`src/snapshot/hint/`](src/snapshot/hint/), matching
+[`kernel/src/snapshot/hint.rs`](../kernel/src/snapshot/hint.rs). Related snapshot APIs belong under
+`src/snapshot/`. FFI-specific support code has its own modules.
+
 ## Selecting scan statistics
 
 Pass `FfiStatsOptions` to `scan_builder_with_stats` to choose JSON output, indexed structured
