@@ -16,7 +16,7 @@ use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::visitors::SetTransactionMap;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{CheckpointAction, LastManifestCommit};
-use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
+use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::checkpoint::{
     ensure_standalone_checkpoint_supported, CheckpointSpec, CheckpointWriter, V2CheckpointConfig,
     DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
@@ -29,9 +29,12 @@ use crate::crc::{
 };
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
+use crate::log_replay::ActionsBatch;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::log_segment::LastManifestCommitResolution;
-use crate::log_segment::{DomainMetadataMap, LogSegment, PmResolution};
+use crate::log_segment::{
+    scan_domain_metadata_actions, DomainMetadataMap, LogSegment, PmResolution,
+};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::{
     emit_protocol_metadata_load, emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
@@ -47,8 +50,12 @@ use crate::table_properties::CheckConstraint;
 use crate::table_properties::TableProperties;
 use crate::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult, LogCompactionWriter, Version};
+use crate::{
+    Engine, KernelError, KernelResult, KernelResultIterator, LogCompactionWriter, Version,
+};
 
+#[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
+mod adaptive_metadata_tests;
 mod builder;
 #[cfg(test)]
 mod cancellation_tests;
@@ -338,6 +345,29 @@ impl Snapshot {
         Ok(found)
     }
 
+    /// Reads this snapshot's log with `schema`, newest first, for log replay. For a table with an
+    /// AMT `checkpoint` action (see [`Self::latest_checkpoint_action`]), that action stands in for
+    /// the checkpoint and the commits at or below its version.
+    pub(crate) fn read_log_actions(
+        &self,
+        engine: &dyn Engine,
+        schema: SchemaRef,
+    ) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(checkpoint) = self.latest_checkpoint_action(engine)? {
+            let result = self.log_segment.read_actions_with_checkpoint_action(
+                engine,
+                &checkpoint,
+                self.table_root(),
+                schema.clone(),
+                schema,
+                None,
+            )?;
+            return Ok(result.actions);
+        }
+        Ok(Box::new(self.log_segment.read_actions(engine, schema)?))
+    }
+
     /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`]. Takes Protocol and Metadata
     /// from the latest on-disk CRC, advanced to the segment's end version when `incremental_replay`
     /// permits, or used to root Protocol and Metadata log replay otherwise. Falls back to full log
@@ -618,6 +648,24 @@ impl Snapshot {
         self.crc.base()
     }
 
+    /// The stale CRC a tail-only replay can start from: [`Self::base_crc`], unless an AMT
+    /// `checkpoint` action is newer. That action stands in for the commits at or below its
+    /// version, which may no longer be listed, so replay must read it instead.
+    fn tail_replay_base_crc(&self, engine: &dyn Engine) -> KernelResult<Option<&Arc<Crc>>> {
+        let Some(base) = self.base_crc() else {
+            return Ok(None);
+        };
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(checkpoint) = self.latest_checkpoint_action(engine)? {
+            if !Version::try_from(checkpoint.version()).is_ok_and(|v| v <= base.version) {
+                return Ok(None);
+            }
+        }
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        let _ = engine;
+        Ok(Some(base))
+    }
+
     pub fn table_root(&self) -> &Url {
         self.table_configuration.table_root()
     }
@@ -804,7 +852,7 @@ impl Snapshot {
         // it, skipping the checkpoint. A stale `Partial` CRC (one whose file lacked the
         // `setTransactions` field) has no authoritative transaction set, so it cannot root the
         // scan and falls through to the full replay below.
-        if let Some(base) = self.base_crc() {
+        if let Some(base) = self.tail_replay_base_crc(engine)? {
             if let SetTransactionState::Complete(base_active) = &base.set_transaction_state {
                 let txn = SetTransactionScanner::get_one_rooted_in_crc(
                     self.log_segment(),
@@ -825,7 +873,7 @@ impl Snapshot {
 
         // Fallback: full log replay. Scan for the newest txn and apply expiration to it, like the
         // CRC paths above.
-        let txn = SetTransactionScanner::get_one(self.log_segment(), application_id, engine)?;
+        let txn = SetTransactionScanner::get_one(self, application_id, engine)?;
         let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
         record_metric(false, version.is_some());
         Ok(version)
@@ -842,7 +890,7 @@ impl Snapshot {
                 return Ok(map.clone());
             }
         }
-        SetTransactionScanner::get_all(self.log_segment(), engine)
+        SetTransactionScanner::get_all(self, engine)
     }
 
     /// Fetch the domainMetadata for a specific domain in this snapshot. This returns the latest
@@ -959,8 +1007,8 @@ impl Snapshot {
 
     /// Load domain metadata: if Complete in the CRC, answer from the cache; else if every
     /// requested domain is in a Partial cache, also answer from the cache; else if a stale Complete
-    /// CRC is held, scan only the commits after it and reconcile against its map; else full log
-    /// replay. `domains == None` means load all.
+    /// CRC no older than an AMT checkpoint action is held, scan only the commits after it and
+    /// reconcile against its map; else full log replay. `domains == None` means load all.
     ///
     /// Reports metrics: `DomainMetadataLoadSuccess` or `DomainMetadataLoadFailure`.
     #[instrument(
@@ -1022,7 +1070,7 @@ impl Snapshot {
         // it, skipping the checkpoint. A stale `Partial` CRC (one whose file lacked the
         // `domainMetadata` field) has no authoritative active-domain set, so it cannot root the
         // scan and falls through to the full replay below.
-        if let Some(base) = self.base_crc() {
+        if let Some(base) = self.tail_replay_base_crc(engine)? {
             if let DomainMetadataState::Complete(base_active) = &base.domain_metadata_state {
                 let rooted = self.log_segment().scan_domain_metadatas_rooted_in_crc(
                     base.version,
@@ -1044,7 +1092,10 @@ impl Snapshot {
         //       miss search could skip that range and only scan the older commits, then
         //       union those results with the Partial cache's entries to produce the final
         //       answer.
-        let replayed = self.log_segment().scan_domain_metadatas(domains, engine)?;
+        let replayed = scan_domain_metadata_actions(
+            self.read_log_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())?,
+            domains,
+        )?;
         record_metric(false, replayed.len());
         Ok(replayed)
     }
@@ -1458,6 +1509,10 @@ impl Snapshot {
 
         let end = self.version();
         let log_segment = &self.log_segment;
+
+        // TODO(#2866): the replays below read only commits, so a CRC over an AMT checkpoint action
+        // misses any `txn` or `domainMetadata` entry (inline or in a sidecar) that only the action
+        // carries. The CRC must inline those entries or omit the fields.
 
         // Case 2: a stale base CRC, older than this version. Advance the retained base over the
         // tail commits (a held base is always at or above the checkpoint, so a tail exists).
