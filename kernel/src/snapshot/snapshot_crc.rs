@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use super::{CrcProvenance, CrcSource};
 use crate::crc::Crc;
+use crate::error::SnapshotHintError;
 use crate::utils::require;
 use crate::{KernelError, KernelResult, Version};
 
@@ -77,11 +78,11 @@ impl SnapshotCrc {
             (_, Some(version)) if self.base().is_some_and(|crc| version <= crc.version) => {
                 CrcOrigin::Disk(version)
             }
-            _ => return Err(KernelError::generic("Inconsistent checksum provenance")),
+            _ => return Err(SnapshotHintError::CrcProvenance.into()),
         };
         require!(
             self.provenance() == provenance,
-            KernelError::generic("Checksum provenance conflicts with retained checksum")
+            SnapshotHintError::CrcProvenance.into()
         );
         Ok(())
     }
@@ -111,6 +112,7 @@ impl SnapshotCrc {
     }
 
     /// Preserve the origin of a reused baseline; a different baseline was read from disk.
+    /// `LogSegment::pick_latest_base_crc` preserves the in-memory Arc's identity when it wins.
     pub(super) fn resolved_origin(
         base: Option<&Arc<Crc>>,
         previous: Option<&Self>,
@@ -217,11 +219,13 @@ mod tests {
         #[case] base_version: Option<Version>,
     ) {
         let mut holder = SnapshotCrc::try_new(crc_version.map(crc_at), 5, None).unwrap();
-        assert!(holder
+        let error = holder
             .set_provenance(CrcProvenance {
                 source,
-                base_version
+                base_version,
             })
-            .is_err());
+            .unwrap_err();
+        assert!(matches!(error, KernelError::SnapshotHint(error)
+            if matches!(*error, SnapshotHintError::CrcProvenance)));
     }
 }
