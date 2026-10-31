@@ -26,7 +26,8 @@ pub(crate) fn validate_file_values(
     let Some(file_paths) = FilePaths::from_schema(kernel_schema)? else {
         return Ok(());
     };
-    // The top-level rows are all present; `validate_at_file_paths` combines this with `data`'s own validity.
+    // The top-level rows are all present; `validate_at_file_paths` combines this with `data`'s own
+    // validity.
     validate_at_file_paths(data, &file_paths, &vec![true; data.len()], &mut Vec::new())
 }
 
