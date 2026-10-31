@@ -32,7 +32,7 @@ use crate::{kernel_string_slice, KernelStringSlice, NullableCvoid, SharedExternE
 ///
 /// `txn` must be a valid handle. This call mutably borrows it. The caller must eventually commit
 /// or free it.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_ack_column_defaults(
     mut txn: Handle<ExclusiveUpdateTableTransaction>,
 ) {
@@ -67,7 +67,7 @@ pub type ColumnDefaultVisitor = extern "C" fn(
 /// Caller is responsible for passing valid transaction and engine handles, a valid
 /// `engine_context` pointer passed through to each `visitor` invocation, and a valid `visitor`
 /// function pointer. This call borrows `txn` and `engine`. The caller retains ownership.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_visit_top_level_column_defaults(
     txn: Handle<ExclusiveUpdateTableTransaction>,
     engine: Handle<SharedExternEngine>,
@@ -76,7 +76,8 @@ pub unsafe extern "C" fn update_table_txn_visit_top_level_column_defaults(
 ) -> ExternResult<usize> {
     let engine = unsafe { engine.as_ref() };
     let txn = unsafe { txn.as_ref() };
-    visit_top_level_column_defaults_impl(txn, engine_context, visitor).into_extern_result(&engine)
+    let result = visit_top_level_column_defaults_impl(txn, engine_context, visitor);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn visit_top_level_column_defaults_impl(
@@ -139,19 +140,16 @@ mod tests {
     fn visit_defaults_of(table_path: &str) -> (usize, Vec<VisitedDefault>) {
         let table_root = delta_kernel::try_parse_uri(table_path).unwrap().to_string();
         let engine = get_default_engine(&table_root);
-        let txn = unsafe {
-            ok_or_panic(build_update_table_txn(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
+        let table_root = kernel_string_slice!(table_root);
+        let txn = unsafe { ok_or_panic(build_update_table_txn(table_root, engine.shallow_copy())) };
 
         let mut collected: Vec<VisitedDefault> = Vec::new();
+        let engine_context = NonNull::new((&mut collected as *mut Vec<VisitedDefault>).cast());
         let count = unsafe {
             ok_or_panic(update_table_txn_visit_top_level_column_defaults(
                 txn.shallow_copy(),
                 engine.shallow_copy(),
-                NonNull::new((&mut collected as *mut Vec<VisitedDefault>).cast()),
+                engine_context,
                 collect_default,
             ))
         };

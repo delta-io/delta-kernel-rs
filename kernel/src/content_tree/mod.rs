@@ -4,7 +4,9 @@
 #![allow(dead_code)]
 #![allow(unreachable_pub)]
 
+mod action_projector;
 mod builder;
+mod checkpoint_sidecar;
 mod dv_conversion;
 mod mumbling;
 mod reader;

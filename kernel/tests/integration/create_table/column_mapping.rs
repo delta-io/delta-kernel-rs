@@ -379,7 +379,9 @@ fn test_create_clustered_table_with_column_mapping(
     assert!(table_config.is_feature_supported(&TableFeature::DomainMetadata));
 
     // Verify clustering domain metadata exists and uses physical column names
-    let clustering_columns = snapshot.get_physical_clustering_columns(engine.as_ref())?;
+    let clustering_columns = snapshot
+        .reader()
+        .get_physical_clustering_columns(engine.as_ref())?;
     let columns = clustering_columns.expect("Clustering columns should be present");
     assert_eq!(
         columns.len(),
@@ -570,7 +572,9 @@ fn test_create_clustered_table_nested_with_column_mapping(
     };
     assert_column_mapping_config(&snapshot, expected_cm_mode);
 
-    let clustering_columns = snapshot.get_physical_clustering_columns(engine.as_ref())?;
+    let clustering_columns = snapshot
+        .reader()
+        .get_physical_clustering_columns(engine.as_ref())?;
     let columns = clustering_columns.expect("Clustering columns should be present");
     assert_eq!(columns.len(), expected_cols.len());
 
@@ -644,7 +648,9 @@ fn test_partitioned_table_stores_logical_column_names_with_column_mapping(
         );
     }
 
-    let clustering = snapshot.get_physical_clustering_columns(engine.as_ref())?;
+    let clustering = snapshot
+        .reader()
+        .get_physical_clustering_columns(engine.as_ref())?;
     assert!(
         clustering.is_none(),
         "Partitioned table should not have clustering columns"

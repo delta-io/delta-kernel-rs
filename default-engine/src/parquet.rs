@@ -73,8 +73,8 @@ impl DataFileMetadata {
         &self.file_meta.location
     }
 
-    /// Converts this `DataFileMetadata` into an [`EngineData`] record batch matching the schema
-    /// returned by [`Transaction::add_files_schema`].
+    /// Converts this `DataFileMetadata` into an [`EngineData`] record batch matching the base
+    /// schema returned by [`Transaction::add_files_schema`].
     ///
     /// The `partition_values` map uses physical column names as keys and protocol-serialized
     /// strings as values. `None` represents a null partition value. The serialization layer

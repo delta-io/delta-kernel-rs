@@ -114,11 +114,13 @@ handles this gracefully during commit.
 ## Reading domain metadata
 
 To read domain metadata from a table, call `get_domain_metadata()` on a
-`Snapshot`. 
+`SnapshotReader`, obtained with `snapshot.reader()`. These reads are synchronous and may block
+on storage I/O. Use `.with_cancellation_token(token)` on the reader to scope related reads to
+an operation; without it, reads retain your engine's normal cancellation and timeout behavior.
 
 > [!TIP]
-> Reading domain data from a snapshot is efficient if a CRC file was present when loading
-> the snapshot. Otherwise determining domain metadata requires performing a log replay.
+> Reading domain data avoids log replay when the snapshot's CRC state can answer the query.
+> A missing domain in incomplete CRC state can still require replay, even for a current CRC.
 > Connectors that heavily rely on `get_domain_metadata()` should ensure checksum CRC files are
 > written with each commit.
 
@@ -138,7 +140,7 @@ To read domain metadata from a table, call `get_domain_metadata()` on a
 let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
 // Returns Ok(Some(config)) if the domain exists, Ok(None) if it does not
-let config: Option<String> = snapshot.get_domain_metadata("myConnector.settings", &engine)?;
+let config: Option<String> = snapshot.reader().get_domain_metadata("myConnector.settings", &engine)?;
 
 match config {
     Some(value) => println!("Domain config: {value}"),
