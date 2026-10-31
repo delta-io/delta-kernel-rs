@@ -849,7 +849,7 @@ impl TryFrom<proto_schema::StructField> for StructField {
             name: proto.name,
             data_type: DataType::try_from(data_type)?,
             nullable: proto.nullable,
-            metadata,
+            metadata: metadata.into(),
         })
     }
 }
