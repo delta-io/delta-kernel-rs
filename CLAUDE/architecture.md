@@ -68,9 +68,9 @@ hint's table membership against the builder's root and validates structural cons
 connector owns protocol/metadata provenance, publication state, and freshness.
 `Snapshot::to_snapshot_hint()` exports retained state without engine I/O, preserving build-time
 freshness, the selected log files and publication watermark, a matching checkpoint hint, and the
-retained CRC baseline and provenance. It rejects log compactions. The V2 FFI hint preserves this
-state, including stale baselines; the original FFI hint exports only an at-version CRC. Both export
-one complete borrowed typed hint through a callback; connectors must copy any state retained after
+retained CRC baseline and provenance. It rejects log compactions. `FfiSnapshotHint` preserves this
+state, including stale CRC baselines. Export delivers one complete borrowed typed hint through a
+callback; connectors must copy any state retained after
 the callback returns. `Snapshot::selected_checkpoint_kind()` and `Snapshot::crc_provenance()` expose
 retained observations without engine I/O. Ordinary checkpoint reads can refine an unknown kind;
 CRC reconstruction keeps the original disk baseline across incremental updates.
