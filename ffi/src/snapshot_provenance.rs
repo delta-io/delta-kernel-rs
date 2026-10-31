@@ -10,7 +10,7 @@ use crate::{Handle, OptionalValue, SharedSnapshot};
 pub struct FfiCrcProvenance {
     /// How the checksum was resolved.
     pub source: CrcSource,
-    /// Version of the original usable checksum file, if known.
+    /// Version of the on-disk checksum file used as the original baseline, if known.
     pub base_version: OptionalValue<u64>,
 }
 

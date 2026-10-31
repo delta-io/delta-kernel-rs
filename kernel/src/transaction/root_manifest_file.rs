@@ -176,7 +176,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
-    use crate::snapshot::Snapshot;
+    use crate::snapshot::{CrcOrigin, Snapshot};
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
         adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table,
@@ -701,6 +701,7 @@ mod tests {
             built.log_segment().clone(),
             built.table_configuration().clone(),
             Some(crc),
+            CrcOrigin::Unknown,
             true,
             false,
         )?;

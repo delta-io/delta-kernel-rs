@@ -302,8 +302,8 @@ impl Snapshot {
             combined_log_segment,
             &table_configuration,
             crc_at_version.map(|(crc, _)| crc).or(base_crc),
-        )?
-        .with_origin(origin);
+            origin,
+        )?;
         let log_segment = current_segment
             .take()
             .ok_or_else(|| KernelError::internal_error("Missing prepared log segment"))?;
@@ -531,16 +531,14 @@ impl Snapshot {
         {
             return Ok(existing.clone());
         }
-        Ok(Arc::new(
-            Snapshot::new_with_crc(
-                existing.log_segment.clone(),
-                existing.table_configuration.clone(),
-                existing.base_crc().cloned(),
-                built_as_latest,
-                skipped_new_checkpoints,
-            )?
-            .with_crc_origin(existing.crc.origin),
-        ))
+        Ok(Arc::new(Snapshot::new_with_crc(
+            existing.log_segment.clone(),
+            existing.table_configuration.clone(),
+            existing.base_crc().cloned(),
+            existing.crc.crc_origin,
+            built_as_latest,
+            skipped_new_checkpoints,
+        )?))
     }
 
     /// Determine the on-disk CRC file the combined segment should carry.
