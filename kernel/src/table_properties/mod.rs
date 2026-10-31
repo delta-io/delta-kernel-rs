@@ -44,6 +44,7 @@ pub(crate) const ENABLE_TYPE_WIDENING: &str = "delta.enableTypeWidening";
 pub(crate) const ENABLE_ICEBERG_COMPAT_V1: &str = "delta.enableIcebergCompatV1";
 pub(crate) const ENABLE_ICEBERG_COMPAT_V2: &str = "delta.enableIcebergCompatV2";
 pub(crate) const ENABLE_ICEBERG_COMPAT_V3: &str = "delta.enableIcebergCompatV3";
+pub(crate) const ENABLE_ICEBERG_NATIVE_V4: &str = "delta.enableIcebergNativeV4";
 pub(crate) const ISOLATION_LEVEL: &str = "delta.isolationLevel";
 pub(crate) const LOG_RETENTION_DURATION: &str = "delta.logRetentionDuration";
 pub(crate) const ENABLE_EXPIRED_LOG_CLEANUP: &str = "delta.enableExpiredLogCleanup";
@@ -155,6 +156,9 @@ pub struct TableProperties {
     /// Whether Iceberg compatibility V3 is enabled for this table. When enabled, Delta Lake
     /// ensures compatibility with Apache Iceberg V3 table format.
     pub enable_iceberg_compat_v3: Option<bool>,
+
+    /// When enabled, table content metadata is kept in the Adaptive Metadata Tree (AMT).
+    pub enable_iceberg_native_v4: Option<bool>,
 
     /// The degree to which a transaction must be isolated from modifications made by concurrent
     /// transactions.
@@ -472,6 +476,7 @@ mod tests {
         assert_eq!(ENABLE_ICEBERG_COMPAT_V1, "delta.enableIcebergCompatV1");
         assert_eq!(ENABLE_ICEBERG_COMPAT_V2, "delta.enableIcebergCompatV2");
         assert_eq!(ENABLE_ICEBERG_COMPAT_V3, "delta.enableIcebergCompatV3");
+        assert_eq!(ENABLE_ICEBERG_NATIVE_V4, "delta.enableIcebergNativeV4");
         assert_eq!(ISOLATION_LEVEL, "delta.isolationLevel");
         assert_eq!(LOG_RETENTION_DURATION, "delta.logRetentionDuration");
         assert_eq!(ENABLE_EXPIRED_LOG_CLEANUP, "delta.enableExpiredLogCleanup");
@@ -642,6 +647,7 @@ mod tests {
             (ENABLE_ICEBERG_COMPAT_V1, "true"),
             (ENABLE_ICEBERG_COMPAT_V2, "true"),
             (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ICEBERG_NATIVE_V4, "true"),
             (ISOLATION_LEVEL, "snapshotIsolation"),
             (LOG_RETENTION_DURATION, "interval 2 seconds"),
             (ENABLE_EXPIRED_LOG_CLEANUP, "true"),
@@ -683,6 +689,7 @@ mod tests {
             enable_iceberg_compat_v1: Some(true),
             enable_iceberg_compat_v2: Some(true),
             enable_iceberg_compat_v3: Some(true),
+            enable_iceberg_native_v4: Some(true),
             isolation_level: Some(IsolationLevel::SnapshotIsolation),
             log_retention_duration: Some(Duration::new(2, 0)),
             enable_expired_log_cleanup: Some(true),

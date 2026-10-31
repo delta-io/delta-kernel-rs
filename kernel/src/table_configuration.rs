@@ -29,6 +29,8 @@ use crate::schema::{
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::table_features::validate_geospatial_feature_support;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::table_features::V4_VALIDATOR;
 use crate::table_features::{
     check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
     get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
@@ -446,6 +448,12 @@ impl TableConfiguration {
         validate_iceberg_compat_if_needed(
             &table_config,
             &V3_VALIDATOR,
+            IcebergCompatValidationContext::TableConfiguration,
+        )?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        validate_iceberg_compat_if_needed(
+            &table_config,
+            &V4_VALIDATOR,
             IcebergCompatValidationContext::TableConfiguration,
         )?;
 
@@ -1080,7 +1088,7 @@ impl TableConfiguration {
     }
 
     /// Internal helper for write operations
-    fn ensure_write_supported(&self) -> KernelResult<()> {
+    pub(crate) fn ensure_write_supported(&self) -> KernelResult<()> {
         // Version check: kernel supports writer versions
         // MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
         require!(
@@ -1099,6 +1107,8 @@ impl TableConfiguration {
         }
 
         // Check all enabled writer features have kernel support
+        // TODO(#3769): This validates requirements of supported-but-not-enabled features too,
+        // which is stricter than the protocol.
         for feature in self.get_enabled_writer_features() {
             self.check_feature_support(&feature, Operation::Write)?;
         }
@@ -1302,6 +1312,8 @@ mod test {
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
         TABLE_FEATURES_MIN_WRITER_VERSION,
     };
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::table_properties::ENABLE_ICEBERG_NATIVE_V4;
     use crate::table_properties::{
         TableProperties, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1,
         ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
@@ -3410,6 +3422,14 @@ mod test {
         vec![TableFeature::IcebergNativeV4Preview],
         Some("requires 'adaptiveMetadata-preview' to be enabled")
     )]
+    #[case::non_allow_listed_writer_feature(
+        vec![
+            TableFeature::AdaptiveMetadataPreview,
+            TableFeature::IcebergNativeV4Preview,
+            TableFeature::AllowColumnDefaults,
+        ],
+        Some("requires 'allowColumnDefaults' to not be supported")
+    )]
     fn test_iceberg_native_v4_feature_requirements(
         #[case] features: Vec<TableFeature>,
         #[case] expected_error_substring: Option<&str>,
@@ -3467,6 +3487,33 @@ mod test {
             .build();
         let result = config.validate_feature_requirements(&TableFeature::IcebergNativeV4Preview);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::unset(None, false)]
+    #[case::true_(Some("true"), true)]
+    #[case::false_(Some("false"), false)]
+    fn test_iceberg_native_v4_enablement_follows_table_property(
+        #[case] property_value: Option<&str>,
+        #[case] expected_enabled: bool,
+    ) {
+        let properties = property_value
+            .map(|v| vec![(ENABLE_ICEBERG_NATIVE_V4, v)])
+            .unwrap_or_default();
+        let config = MockTableConfigurationBuilder::new()
+            .with_properties(&properties)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::IcebergNativeV4Preview])
+                    .build(),
+            )
+            .build();
+        assert!(config.is_feature_supported(&TableFeature::IcebergNativeV4Preview));
+        assert_eq!(
+            config.is_feature_enabled(&TableFeature::IcebergNativeV4Preview),
+            expected_enabled,
+        );
     }
 
     // IcebergCompatV1/V2/V3 are pairwise mutually exclusive.
