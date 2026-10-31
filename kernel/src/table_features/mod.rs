@@ -356,6 +356,9 @@ static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+// checkpointProtection restricts metadata cleanup, which Kernel does not support.
+// Any future metadata cleanup implementation must follow the feature's writer requirements:
+// https://github.com/delta-io/delta/blob/master/protocol_rfcs/checkpoint-protection.md
 static CHECKPOINT_PROTECTION_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,

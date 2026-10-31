@@ -75,7 +75,6 @@ async fn checkpoint_protection_without_feature_blocks_writes() -> KernelResult<(
 }
 
 async fn create_checkpoint_protection_table(table_url: &Url) -> KernelResult<()> {
-    // The create-table builder cannot enable checkpointProtection.
     create_table(
         Arc::new(LocalFileSystem::new()),
         table_url.clone(),

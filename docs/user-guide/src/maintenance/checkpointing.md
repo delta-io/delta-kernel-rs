@@ -170,11 +170,6 @@ if stats.commits_since_checkpoint >= interval {
 See [Version Checksums](./version_checksums.md) for the recommended full
 post-commit pattern that includes writing a CRC file before checkpointing.
 
-## Checkpoint protection
-
-For support on tables with `checkpointProtection`, see
-[Checkpoint protection](../writing/checkpoint_protection.md).
-
 ## Log compaction
 
 **Log compaction** aggregates multiple commit JSON files into a single compacted file,
