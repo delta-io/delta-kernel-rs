@@ -77,3 +77,6 @@ pub(crate) mod ensure_data_types;
 pub mod parquet_row_group_skipping;
 #[cfg(all(test, feature = "default-engine-base"))]
 pub(crate) mod test_utils;
+
+#[cfg(all(feature = "arrow-expression", feature = "default-engine-base"))]
+pub mod storage;
