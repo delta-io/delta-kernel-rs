@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::sync::LazyLock;
+
 #[internal_api]
 pub(crate) use column_mapping::get_any_level_column_physical_name;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
@@ -574,6 +577,14 @@ const ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURES: &[TableFeature] = &[
     TableFeature::IcebergCompatV3,
 ];
 
+static ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURE_SET: LazyLock<HashSet<TableFeature>> =
+    LazyLock::new(|| {
+        ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURES
+            .iter()
+            .cloned()
+            .collect()
+    });
+
 static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
@@ -1082,7 +1093,7 @@ fn check_iceberg_native_v4_allowed_writer_features(
     let writer_features = protocol.writer_features().unwrap_or_default();
     if let Some(feature) = writer_features
         .iter()
-        .find(|f| !ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURES.contains(*f))
+        .find(|f| !ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURE_SET.contains(*f))
     {
         return Err(KernelError::invalid_protocol(format!(
             "Feature 'icebergNativeV4-preview' requires '{feature}' to not be supported"
