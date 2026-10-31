@@ -19,6 +19,8 @@ use crate::checkpoint::collation_stats::{
     build_collation_stats_read_transform, source_collation_stats,
 };
 use crate::committer::CatalogCommit;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::content_tree::read_checkpoint_action;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
@@ -28,6 +30,8 @@ use crate::metrics::{
     emit_log_segment_load, emit_log_segment_load_failure, SnapshotLoadMetricContext,
 };
 use crate::path::LogPathFileType::*;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::path::LogRoot;
 use crate::path::{LogPathFileType, ParsedLogPath};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::{FileType, ScanFile};
@@ -60,7 +64,7 @@ mod crc_tests;
 #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
 mod protocol_metadata_replay_amt_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Statistics for the commit files selected to replay a snapshot's log segment.
 ///
@@ -939,6 +943,82 @@ impl LogSegment {
         Ok(ActionsWithCheckpointInfo {
             actions: commit_stream.chain(checkpoint_result.actions),
             checkpoint_info: checkpoint_result.checkpoint_info,
+        })
+    }
+
+    /// Same as [`Self::read_actions_with_projected_checkpoint_actions`], but reads the AMT
+    /// `checkpoint` action as the segment's checkpoint: the commits after its version are followed
+    /// by the actions it carries, and the commits and checkpoint files at or below that version are
+    /// not read.
+    ///
+    /// `table_root` resolves the action's manifest locations.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn read_actions_with_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+        checkpoint: &CheckpointAction,
+        table_root: &Url,
+        commit_read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
+        stats_schema: Option<&StructType>,
+    ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
+        let version = Version::try_from(checkpoint.version())
+            .ok()
+            .filter(|v| *v <= self.end_version)
+            .ok_or_else(|| {
+                KernelError::invalid_checkpoint(format!(
+                    "checkpoint action version {} is outside the log segment's versions 0..={}",
+                    checkpoint.version(),
+                    self.end_version
+                ))
+            })?;
+        // A manifest commit's checkpoint action covers its version with the tree alone; an older
+        // root needs the inline file actions only a standalone checkpoint carries.
+        require!(
+            checkpoint.content_root_version() == checkpoint.version(),
+            KernelError::unsupported(format!(
+                "reading a checkpoint action whose content root version {} is older than its \
+                 version {version} is not yet supported",
+                checkpoint.content_root_version()
+            ))
+        );
+        // Writers stop producing checkpoint files once adaptiveMetadata is enabled, so a file at or
+        // after the action's version is a standalone checkpoint.
+        if let Some(checkpoint_file_version) = self.checkpoint_version.filter(|v| *v >= version) {
+            return Err(KernelError::unsupported(format!(
+                "reading the adaptiveMetadata standalone checkpoint at version \
+                 {checkpoint_file_version} is not yet supported"
+            )));
+        }
+
+        let commits = Self::read_commit_files(
+            engine,
+            &self.find_commit_cover_after(Some(version)),
+            commit_read_schema,
+        )?;
+        let stats_fallback =
+            needs_json_stats_fallback(&checkpoint_read_schema, stats_schema, false)
+                .then(|| StructField::nullable("stats", DataType::STRING));
+        let checkpoint_read_schema = augment_checkpoint_read_schema(
+            &checkpoint_read_schema,
+            stats_fallback.into_iter().collect(),
+            false,
+        )?;
+        let checkpoint_actions = read_checkpoint_action(
+            engine,
+            checkpoint,
+            &LogRoot::new(table_root.clone())?,
+            checkpoint_read_schema.clone(),
+        )?;
+        Ok(ActionsWithCheckpointInfo {
+            actions: Box::new(commits.chain(checkpoint_actions)),
+            checkpoint_info: CheckpointReadInfo {
+                has_stats_parsed: false,
+                has_partition_values_parsed: false,
+                checkpoint_read_schema,
+            },
         })
     }
 
