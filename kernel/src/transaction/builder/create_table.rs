@@ -658,7 +658,11 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
     Ok(())
 }
 
-/// Adds the IcebergNativeV4 dependencies when `delta.enableIcebergNativeV4=true`.
+/// Adds IcebergNativeV4 dependencies when `delta.enableIcebergNativeV4=true`.
+///
+/// - Sets required props (`columnMapping.mode=id`, row tracking, DVs, ICT). CM *feature*
+///   is added later in `maybe_apply_column_mapping_for_table_create` when mode is name/id.
+/// - Adds AMT, V4, and domainMetadata features here (V4 depends on AMT directly).
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn maybe_enable_iceberg_native_v4_dependencies(
     validated: &mut ValidatedTableProperties,
@@ -667,6 +671,7 @@ fn maybe_enable_iceberg_native_v4_dependencies(
         return Ok(());
     }
 
+    // Incompatible properties
     if validated.is_property_true(ROW_TRACKING_SUSPENDED) {
         return Err(KernelError::generic(format!(
             "IcebergNativeV4 cannot be enabled while '{ROW_TRACKING_SUSPENDED}' is 'true'"
@@ -685,6 +690,7 @@ fn maybe_enable_iceberg_native_v4_dependencies(
         }
     }
 
+    // Required table properties
     for (key, required) in [
         (COLUMN_MAPPING_MODE, "id"),
         (ENABLE_ROW_TRACKING, "true"),
@@ -702,6 +708,7 @@ fn maybe_enable_iceberg_native_v4_dependencies(
         }
     }
 
+    // Required table features
     for feature in [
         TableFeature::AdaptiveMetadataPreview,
         TableFeature::IcebergNativeV4Preview,
