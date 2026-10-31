@@ -1,0 +1,61 @@
+# Build semver dependencies on main so PRs and merge queues can reuse them.
+# semver-checks.yml only runs for PRs and merge groups, which cannot save under our main-only
+# cache policy. Without this producer, no run populates the cache and every check starts cold.
+# PR and merge-queue checks reuse dependencies but regenerate API docs and compare both revisions.
+# A separate workflow keeps cache warming out of semver's label/title callback chain.
+name: semver-cache
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Let the running producer finish saving its cache even when another commit lands.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+# These inputs must match semver-checks.yml; rust-cache hashes the Cargo/Rust environment.
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  SEMVER_CHECKS_VERSION: "0.50.0"
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target/semver-cache
+
+jobs:
+  warm-semver-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust for semver checks
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          cache: false
+          # rustdoc's JSON format is unstable; cargo-semver-checks must support this compiler.
+          # Validate the pair when updating either version.
+          toolchain: "1.99.0"
+      # See build.yml for the main-only write policy and the reason cache-bin is disabled.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        id: cache
+        with:
+          workspaces: ". -> target/semver-cache"
+          shared-key: semver-checks-${{ env.SEMVER_CHECKS_VERSION }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Install cargo-semver-checks
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        with:
+          tool: cargo-semver-checks@${{ env.SEMVER_CHECKS_VERSION }}
+      # Comparing HEAD to itself builds dependencies without needing another revision.
+      # Skip this work on an exact cache hit; PR and merge-queue checks always run.
+      - name: Populate semver dependency cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cargo-semver-checks -p delta_kernel -p delta_kernel_ffi --all-features \
+            --baseline-rev HEAD
