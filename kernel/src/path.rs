@@ -268,7 +268,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             ["json"] if in_delta_log_dir => LogPathFileType::Commit,
             [uuid, "json"] if in_staged_commits_dir => {
                 // staged commits like _delta_log/_staged_commits/00000000000000000000.{uuid}.json
-                match parse_path_part::<String>(uuid, UUID_PART_LEN) {
+                match parse_path_part::<Uuid>(uuid, UUID_PART_LEN) {
                     Some(_uuid) => LogPathFileType::StagedCommit,
                     None => LogPathFileType::Unknown,
                 }
@@ -276,7 +276,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             ["crc"] if in_delta_log_dir => LogPathFileType::Crc,
             ["checkpoint", "parquet"] if in_delta_log_dir => LogPathFileType::ClassicCheckpoint,
             ["checkpoint", uuid, "json" | "parquet"] if in_delta_log_dir => {
-                parse_path_part::<String>(uuid, UUID_PART_LEN)?;
+                parse_path_part::<Uuid>(uuid, UUID_PART_LEN)?;
                 LogPathFileType::UuidCheckpoint
             }
             [hi, "compacted", "json"] if in_delta_log_dir => {
@@ -728,6 +728,9 @@ pub(crate) mod tests {
     #[case::short_uuid_checkpoint(
         "00000000000000000010.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e.parquet"
     )]
+    #[case::malformed_uuid_checkpoint(
+        "00000000000000000010.checkpoint.00000000-0000-0000-0000-00000000000g.parquet"
+    )]
     #[case::zero_checkpoint_part("00000000000000000008.checkpoint.0000000000.0000000002.parquet")]
     #[case::checkpoint_part_exceeds_total(
         "00000000000000000008.checkpoint.0000000003.0000000002.parquet"
@@ -774,6 +777,10 @@ pub(crate) mod tests {
         "00000000000000000010.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
         UuidCheckpoint
     )]
+    #[case::uuid_checkpoint_uppercase(
+        "00000000000000000010.checkpoint.3A0D65CD-4056-49B8-937B-95F9E3EE90E5.parquet",
+        UuidCheckpoint
+    )]
     #[case::uuid_checkpoint_wrong_extension(
         "00000000000000000010.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.foo",
         Unknown
@@ -805,6 +812,10 @@ pub(crate) mod tests {
     )]
     #[case::staged_commit_invalid_uuid(
         "_staged_commits/00000000000000000010.not-a-uuid.json",
+        Unknown
+    )]
+    #[case::staged_commit_malformed_uuid(
+        "_staged_commits/00000000000000000010.00000000-0000-0000-0000-00000000000g.json",
         Unknown
     )]
     #[case::uuid_name_outside_staged_commits_dir(
