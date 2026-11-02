@@ -33,6 +33,26 @@ pub enum Error {
     Kernel(KernelError),
 }
 
+impl Error {
+    /// Passes this error to `kernel` or `delta`, according to its variant, and returns the result.
+    ///
+    /// An underlying cause does not change which callback is called. Keeping the match inside
+    /// Kernel lets boundary crates handle this non-exhaustive enum without discarding unknown
+    /// variants in a fallback arm.
+    #[cfg(feature = "internal-api")]
+    #[delta_kernel_derive::internal_api]
+    pub(crate) fn dispatch<T>(
+        self,
+        kernel: impl FnOnce(KernelError) -> T,
+        delta: impl FnOnce(DeltaError) -> T,
+    ) -> T {
+        match self {
+            Self::Kernel(error) => kernel(error),
+            Self::Delta(error) => delta(error),
+        }
+    }
+}
+
 /// Details of a failed conversion from a scalar into a Rust value.
 ///
 /// Conversion code adds path elements as an error unwinds, producing a path from the outermost
