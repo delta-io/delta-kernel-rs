@@ -798,6 +798,7 @@ FFI-specific ownership, conversion, and engine support code can use its own modu
   with their backing storage and conversions colocated
 - `src/snapshot/builder.rs` -- snapshot builders and their configuration
 - `src/snapshot/hint/` -- typed snapshot-hint input and callback export
+- `src/snapshot/provenance.rs` -- retained checkpoint and checksum provenance getters
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface

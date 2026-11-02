@@ -12,7 +12,7 @@ use crate::delta_types::{
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
-use crate::snapshot_provenance::FfiCrcProvenance;
+use crate::snapshot::provenance::FfiCrcProvenance;
 use crate::{NullableCvoid, SharedExternEngine, SharedSnapshot};
 
 mod export;

@@ -91,7 +91,6 @@ pub use snapshot::{
     snapshot_builder_with_incremental_crc_replay, snapshot_builder_with_log_tail,
     snapshot_builder_with_max_catalog_version, snapshot_builder_with_version,
 };
-pub mod snapshot_provenance;
 
 #[cfg(test)]
 mod ffi_test_utils;
