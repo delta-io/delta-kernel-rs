@@ -60,6 +60,7 @@ add_test(NAME read_arrow_metadata_basic COMMAND ${TestRunner} ${DatPath}/basic_p
 # prints per field.
 add_test(NAME read_column_mapping_metadata COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ExpectedPath}/column-mapping-arrow-metadata.expected -a)
 add_test(NAME read_projected_column_mapping COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ExpectedPath}/column-mapping-projected.expected -cletter,new_int)
+add_test(NAME snapshot_visit_metadata COMMAND ${TestRunner} ${KernelTestPath}/partition_cm/none/ ${ExpectedPath}/snapshot-metadata.expected -m)
 add_test(NAME commit_range_commit_files_basic_partitioned
   COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/run_commit_range_commit_files_test.sh"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../../acceptance/tests/dat/out/reader_tests/generated/basic_partitioned/delta/"

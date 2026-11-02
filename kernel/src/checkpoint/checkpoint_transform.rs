@@ -16,7 +16,9 @@
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::{ADD_NAME, STATS_PARSED as STATS_PARSED_FIELD};
-use crate::expressions::{col, Expression, ExpressionRef, MapToStructOptions, UnaryExpressionOp};
+use crate::expressions::{
+    col, column_name, Expression, ExpressionRef, MapToStructOptions, UnaryExpressionOp,
+};
 use crate::schema::{DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_properties::TableProperties;
@@ -50,6 +52,8 @@ impl StatsTransformConfig {
 /// - When `writeStatsAsJson=false`: drop `stats` field
 /// - When `writeStatsAsStruct=true`: `stats_parsed = COALESCE(stats_parsed, ParseJson(stats))`
 /// - When `writeStatsAsStruct=false`: drop `stats_parsed` field
+///
+/// When the parsed input and output schemas differ, rebuilds parsed stats from JSON.
 ///
 /// For partitioned tables when `writeStatsAsStruct=true`, it also populates:
 /// - `partitionValues_parsed = COALESCE(partitionValues_parsed, MAP_TO_STRUCT(partitionValues))`
@@ -100,12 +104,22 @@ pub(crate) fn build_checkpoint_transform(
 
     // Handle stats_parsed field
     // Note: stats_parsed was added to read schema (via build_checkpoint_read_schema),
-    // so we always need to either replace it (with COALESCE) or drop it.
+    // so we always need to either replace it or drop it.
     if config.write_stats_as_struct {
-        // Populate stats_parsed from JSON stats (for commits that only have JSON stats)
-        let stats_parsed_expr = build_stats_parsed_expr(stats_schema);
-        patch_builder =
-            patch_builder.replace_expr_at([ADD_NAME], STATS_PARSED_FIELD, stats_parsed_expr);
+        let stats_field = StructField::nullable(STATS_PARSED_FIELD, stats_schema.as_ref().clone());
+        let input_field = read_schema.field_at(&column_name!(ADD_NAME, STATS_PARSED_FIELD))?;
+        let stats_parsed_expr = if input_field.data_type() == stats_field.data_type() {
+            build_stats_parsed_expr(stats_schema)
+        } else {
+            // Sampled collation fields are absent from the read projection; full JSON retains them.
+            Expression::parse_json(STATS_JSON_EXPR.as_ref().clone(), stats_schema.clone()).into()
+        };
+        patch_builder = patch_builder.replace_at(
+            [ADD_NAME],
+            STATS_PARSED_FIELD,
+            stats_field,
+            stats_parsed_expr,
+        );
     } else {
         // Drop stats_parsed field when not writing as struct
         patch_builder = patch_builder.drop_at([ADD_NAME], STATS_PARSED_FIELD);

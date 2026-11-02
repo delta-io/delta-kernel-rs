@@ -314,7 +314,9 @@ fn try_new_update_table<MODE: ExecutionMode>(
     // collide with physical data columns.
 
     // Read clustering columns from snapshot (returns None if clustering not enabled)
-    let clustering_columns = read_snapshot.get_physical_clustering_columns(engine)?;
+    let clustering_columns = read_snapshot
+        .reader()
+        .get_physical_clustering_columns(engine)?;
 
     let commit_timestamp = current_time_ms()?;
 

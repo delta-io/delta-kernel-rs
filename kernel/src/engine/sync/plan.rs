@@ -17,6 +17,7 @@ use itertools::Itertools;
 use super::aggs::eval_aggregate;
 use super::json::try_create_from_json;
 use super::parquet::{parquet_footer, try_create_from_parquet};
+use super::prefix_sum::eval_prefix_sum;
 use super::storage::SyncStorageHandler;
 use super::{put_bytes, read_files_arrow};
 use crate::arrow::array::{
@@ -253,6 +254,7 @@ impl SyncPlanExecutor {
                 self.eval_dynamic_scan(dynamic_scan, &results[inputs[0]])
             }
             Operator::Aggregate(aggregate) => eval_aggregate(&aggregate, &results[inputs[0]]),
+            Operator::PrefixSum(prefix_sum) => eval_prefix_sum(&prefix_sum, &results[inputs[0]]),
             Operator::WriteJson(write) => {
                 self.eval_write_json(&write, inputs.iter().flat_map(|&i| results[i].iter()))
             }

@@ -176,6 +176,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             .collect();
         let existing_domains = self
             .read_snapshot()?
+            .reader()
             .get_domain_metadatas_internal(engine, Some(&domains))?;
 
         // Create removal tombstones with pre-image configurations
@@ -215,6 +216,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
                     Some(metadata) => metadata.high_water_mark(),
                     None => self
                         .read_snapshot()?
+                        .reader()
                         .get_row_tracking_high_water_mark(engine)?
                         .unwrap_or(ROW_TRACKING_INITIAL_HIGH_WATER_MARK),
                 };

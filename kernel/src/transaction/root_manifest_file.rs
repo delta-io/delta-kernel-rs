@@ -144,7 +144,9 @@ impl RootManifestFile {
                 );
                 domain_metadata
             }
-            _ => snapshot.get_domain_metadatas_internal(engine, None)?,
+            _ => snapshot
+                .reader()
+                .get_domain_metadatas_internal(engine, None)?,
         };
         let transactions = match &checkpoint_action {
             Some(checkpoint) if !transactions_complete_in_crc => checkpoint

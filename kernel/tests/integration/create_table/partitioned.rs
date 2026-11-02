@@ -32,7 +32,9 @@ fn test_create_table_partitioned_basic(#[case] partition_col: &str) -> KernelRes
     let partition_cols = snapshot.table_configuration().logical_partition_columns();
     assert_eq!(partition_cols, &["date"]);
 
-    let clustering = snapshot.get_physical_clustering_columns(engine.as_ref())?;
+    let clustering = snapshot
+        .reader()
+        .get_physical_clustering_columns(engine.as_ref())?;
     assert!(
         clustering.is_none(),
         "Partitioned table should not have clustering columns"

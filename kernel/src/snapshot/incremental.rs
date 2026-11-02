@@ -817,7 +817,7 @@ mod tests {
             last_modified: 1234567890,
             size: 100,
         };
-        let parsed_path = ParsedLogPath::try_from(file_meta)?
+        let parsed_path = ParsedLogPath::new(file_meta)
             .ok_or_else(|| KernelError::Generic("Failed to parse log path".to_string()))?;
         let log_tail = vec![parsed_path];
 

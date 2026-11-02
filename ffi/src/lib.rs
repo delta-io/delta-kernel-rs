@@ -12,7 +12,7 @@ use std::os::raw::{c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use delta_kernel::actions::{Metadata, Protocol};
+use delta_kernel::actions::Protocol;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::history_manager::{
     first_version_after as kernel_first_version_after,
@@ -77,6 +77,7 @@ pub mod ffi_metrics;
 pub mod ffi_tracing;
 pub mod incremental_scan;
 pub mod log_path;
+pub mod log_segment;
 #[cfg(feature = "declarative-plans")]
 pub mod plans;
 pub mod scan;
@@ -474,12 +475,13 @@ pub struct ExclusiveRustString;
 /// # Safety
 ///
 /// Caller is responsible for passing a valid KernelStringSlice
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn allocate_kernel_string(
     kernel_str: KernelStringSlice,
     error_fn: AllocateErrorFn,
 ) -> ExternResult<Handle<ExclusiveRustString>> {
-    allocate_kernel_string_impl(kernel_str).into_extern_result(&error_fn)
+    let result = allocate_kernel_string_impl(kernel_str);
+    unsafe { result.into_extern_result(&error_fn) }
 }
 
 fn allocate_kernel_string_impl(
@@ -504,7 +506,7 @@ pub struct ExclusiveRustBytes;
 /// Caller is responsible for passing a valid [`KernelBytesSlice`] whose pointer references at least
 /// `len` readable bytes. The slice only needs to remain valid until after this call returns.
 #[cfg(feature = "declarative-plans")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn allocate_kernel_bytes(
     bytes: KernelBytesSlice,
 ) -> Handle<ExclusiveRustBytes> {
@@ -629,7 +631,7 @@ mod private {
             if self.len == 0 {
                 Default::default()
             } else {
-                Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len)
+                unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len) }
             }
         }
     }
@@ -672,7 +674,7 @@ mod private {
         /// The slice must have been originally created `From<Vec<u64>>`, and must not have
         /// already been consumed by a previous call to this method.
         pub unsafe fn into_vec(self) -> Vec<u64> {
-            Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len)
+            unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len) }
         }
 
         /// Creates an empty slice.
@@ -698,7 +700,7 @@ pub use private::{KernelBoolSlice, KernelRowIndexArray};
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_bool_slice(slice: KernelBoolSlice) {
     let vec = unsafe { slice.into_vec() };
     debug!("Dropping bool slice. It is {vec:#?}");
@@ -707,9 +709,9 @@ pub unsafe extern "C" fn free_bool_slice(slice: KernelBoolSlice) {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
-    let _ = slice.into_vec();
+    let _ = unsafe { slice.into_vec() };
 }
 
 /// Free a [`KernelOwnedBytes`] buffer obtained from kernel.
@@ -718,7 +720,7 @@ pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
 ///
 /// Caller is responsible for passing a valid buffer, and must not use it again afterwards.
 #[cfg(feature = "declarative-plans")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_kernel_bytes(bytes: KernelOwnedBytes) {
     let _ = unsafe { bytes.into_vec() };
 }
@@ -739,9 +741,9 @@ pub struct ExclusiveEngineData;
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle as engine_data
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_engine_data(engine_data: Handle<ExclusiveEngineData>) {
-    engine_data.drop_handle();
+    unsafe { engine_data.drop_handle() }
 }
 
 // A wrapper for Engine which defines additional FFI-specific methods.
@@ -874,13 +876,14 @@ pub struct ExclusiveEngineBuilder;
 /// # Safety
 /// Caller is responsible for passing a valid path pointer.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_engine_builder(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    get_engine_builder_impl(url, allocate_error).into_extern_result(&allocate_error)
+    let result = get_engine_builder_impl(url, allocate_error);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -906,9 +909,9 @@ fn get_engine_builder_impl(
 /// `builder` must be a valid handle returned by [`get_engine_builder`]. It is consumed and must not
 /// be used or freed again after this call.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_engine_builder(builder: Handle<ExclusiveEngineBuilder>) {
-    unsafe { builder.drop_handle() };
+    unsafe { builder.drop_handle() }
 }
 
 /// Set an option on the builder and return the updated builder handle on success.
@@ -923,7 +926,7 @@ pub unsafe extern "C" fn free_engine_builder(builder: Handle<ExclusiveEngineBuil
 /// is consumed unconditionally and must not be used or freed after this call. On error, the
 /// builder is dropped.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn builder_with_option(
     builder: Handle<ExclusiveEngineBuilder>,
     key: KernelStringSlice,
@@ -931,9 +934,8 @@ pub unsafe extern "C" fn builder_with_option(
 ) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
     let mut builder = unsafe { builder.into_inner() };
     let allocate_fn = builder.allocate_fn;
-    builder_with_option_impl(&mut builder, key, value)
-        .map(|_| builder.into())
-        .into_extern_result(&allocate_fn)
+    let result = builder_with_option_impl(&mut builder, key, value).map(|_| builder.into());
+    unsafe { result.into_extern_result(&allocate_fn) }
 }
 #[cfg(feature = "default-engine-base")]
 fn builder_with_option_impl(
@@ -960,7 +962,7 @@ fn builder_with_option_impl(
 /// Caller must pass a valid engine builder handle. The input handle is consumed; the returned
 /// handle owns the builder with the executor configuration applied.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn builder_with_multithreaded_executor(
     builder: Handle<ExclusiveEngineBuilder>,
     worker_threads: usize,
@@ -995,7 +997,7 @@ pub unsafe extern "C" fn builder_with_multithreaded_executor(
 /// Caller must pass a valid engine builder handle. The input handle is consumed; the returned
 /// handle owns the builder with the I/O configuration applied.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn builder_with_io_concurrency(
     builder: Handle<ExclusiveEngineBuilder>,
     buffer_size: usize,
@@ -1025,7 +1027,7 @@ pub unsafe extern "C" fn builder_with_io_concurrency(
 /// the callback must be safe to invoke from any thread concurrently (see
 /// [`rest_engine::CAuthHeaderCallback`]).
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn builder_with_rest_object_store(
     builder: Handle<ExclusiveEngineBuilder>,
     endpoint_config: *const rest_engine::CRestEndpointConfig,
@@ -1034,9 +1036,10 @@ pub unsafe extern "C" fn builder_with_rest_object_store(
 ) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
     let mut builder = unsafe { builder.into_inner() };
     let allocate_fn = builder.allocate_fn;
-    builder_with_rest_object_store_impl(&mut builder, endpoint_config, callback, context)
-        .map(|_| builder.into())
-        .into_extern_result(&allocate_fn)
+    let result =
+        builder_with_rest_object_store_impl(&mut builder, endpoint_config, callback, context)
+            .map(|_| builder.into());
+    unsafe { result.into_extern_result(&allocate_fn) }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -1068,33 +1071,34 @@ fn builder_with_rest_object_store_impl(
 /// Caller must pass a valid engine builder handle. The handle is consumed before any fallible work
 /// and must not be used or freed after this call, regardless of the result.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn builder_build(
     builder: Handle<ExclusiveEngineBuilder>,
 ) -> ExternResult<Handle<SharedExternEngine>> {
     let builder_box = unsafe { builder.into_inner() };
-    get_default_engine_impl(
+    let result = get_default_engine_impl(
         builder_box.url,
         builder_box.options,
         builder_box.object_store_backend,
         builder_box.multithreaded_executor_config,
         builder_box.io_config,
         builder_box.allocate_fn,
-    )
-    .into_extern_result(&builder_box.allocate_fn)
+    );
+    unsafe { result.into_extern_result(&builder_box.allocate_fn) }
 }
 
 /// # Safety
 ///
 /// Caller is responsible for passing a valid path pointer.
 #[cfg(feature = "default-engine-base")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_default_engine(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<Handle<SharedExternEngine>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    get_default_default_engine_impl(url, allocate_error).into_extern_result(&allocate_error)
+    let result = get_default_default_engine_impl(url, allocate_error);
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 // get the default version of the default engine :)
@@ -1197,10 +1201,10 @@ pub(crate) fn build_engine_from_store(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_engine(engine: Handle<SharedExternEngine>) {
     debug!("engine released engine");
-    engine.drop_handle();
+    unsafe { engine.drop_handle() }
 }
 
 #[handle_descriptor(target=Schema, mutable=false, sized=true)]
@@ -1281,9 +1285,6 @@ impl FfiCheckpointSpec {
 
 #[handle_descriptor(target=Protocol, mutable=false, sized=true)]
 pub struct SharedProtocol;
-
-#[handle_descriptor(target=Metadata, mutable=false, sized=true)]
-pub struct SharedMetadata;
 
 /// Opaque builder for constructing a [`SharedSnapshot`].
 ///
@@ -1367,7 +1368,7 @@ fn make_snapshot_builder(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid path and engine handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_snapshot_builder(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
@@ -1377,9 +1378,13 @@ pub unsafe extern "C" fn get_snapshot_builder(
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let source = match url {
         Ok(url) => FfiSnapshotBuilderSource::TableRoot(url),
-        Err(e) => return KernelResult::Err(e).into_extern_result(&engine_ref),
+        Err(e) => {
+            let result: KernelResult<Handle<ExclusiveSnapshotBuilder>> = Err(e);
+            return unsafe { result.into_extern_result(&engine_ref) };
+        }
     };
-    make_snapshot_builder(source, engine_arc).into_extern_result(&engine_ref)
+    let result = make_snapshot_builder(source, engine_arc);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Get a builder for incrementally updating an existing snapshot.
@@ -1392,7 +1397,7 @@ pub unsafe extern "C" fn get_snapshot_builder(
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_snapshot_builder_from(
     prev_snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
@@ -1400,11 +1405,11 @@ pub unsafe extern "C" fn get_snapshot_builder_from(
     let engine_ref = unsafe { engine.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
     let snapshot_arc = unsafe { prev_snapshot.clone_as_arc() };
-    make_snapshot_builder(
+    let result = make_snapshot_builder(
         FfiSnapshotBuilderSource::ExistingSnapshot(snapshot_arc),
         engine_arc,
-    )
-    .into_extern_result(&engine_ref)
+    );
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Sets an explicit target version on a snapshot builder. When omitted, a hinted build uses the
@@ -1416,7 +1421,7 @@ pub unsafe extern "C" fn get_snapshot_builder_from(
 ///
 /// Caller must pass a valid builder handle. The input handle is consumed; the returned handle owns
 /// the builder with the target version applied.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_builder_with_version(
     builder: Handle<ExclusiveSnapshotBuilder>,
     version: Version,
@@ -1437,7 +1442,7 @@ pub unsafe extern "C" fn snapshot_builder_with_version(
 ///
 /// Caller must pass a valid builder handle and mode tag. The input handle is consumed; the
 /// returned handle owns the builder with the replay mode applied.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_builder_with_incremental_crc_replay(
     builder: Handle<ExclusiveSnapshotBuilder>,
     mode: FfiIncrementalReplay,
@@ -1459,7 +1464,7 @@ pub unsafe extern "C" fn snapshot_builder_with_incremental_crc_replay(
 /// Caller must pass a valid builder handle. The builder is consumed unconditionally and must not
 /// be used or freed after this call. On error, the builder is dropped. The `log_tail` array and its
 /// contents must follow the [`FfiSlice`] contract and remain valid for the duration of this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_builder_with_log_tail(
     builder: Handle<ExclusiveSnapshotBuilder>,
     log_tail: log_path::LogPathArray,
@@ -1467,9 +1472,9 @@ pub unsafe extern "C" fn snapshot_builder_with_log_tail(
     let mut builder = unsafe { builder.into_inner() };
     let engine_arc = builder.engine.clone();
     let engine_ref = engine_arc.as_ref();
-    snapshot_builder_with_log_tail_impl(&mut builder, log_tail)
-        .map(|_| builder.into())
-        .into_extern_result(&engine_ref)
+    let result = unsafe { snapshot_builder_with_log_tail_impl(&mut builder, log_tail) }
+        .map(|_| builder.into());
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 unsafe fn snapshot_builder_with_log_tail_impl(
@@ -1487,7 +1492,7 @@ unsafe fn snapshot_builder_with_log_tail_impl(
 ///
 /// Caller must pass a valid builder handle. The input handle is consumed; the returned handle owns
 /// the builder with the maximum catalog version applied.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_builder_with_max_catalog_version(
     builder: Handle<ExclusiveSnapshotBuilder>,
     max_catalog_version: Version,
@@ -1503,7 +1508,7 @@ pub unsafe extern "C" fn snapshot_builder_with_max_catalog_version(
 /// # Safety
 ///
 /// Caller must pass a valid builder pointer and must not use it again after this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_builder_build(
     mut builder: Handle<ExclusiveSnapshotBuilder>,
 ) -> ExternResult<Handle<SharedSnapshot>> {
@@ -1511,7 +1516,8 @@ pub unsafe extern "C" fn snapshot_builder_build(
     let engine_arc = unsafe { builder.as_mut() }.engine.clone();
     let engine_ref = engine_arc.as_ref();
     let builder_box = unsafe { builder.into_inner() };
-    snapshot_builder_build_impl(*builder_box).into_extern_result(&engine_ref)
+    let result = snapshot_builder_build_impl(*builder_box);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 fn snapshot_builder_build_impl(
@@ -1604,18 +1610,18 @@ fn snapshot_builder_build_impl(
 /// # Safety
 ///
 /// Caller must pass a valid builder pointer and must not use it again after this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_snapshot_builder(builder: Handle<ExclusiveSnapshotBuilder>) {
-    builder.drop_handle();
+    unsafe { builder.drop_handle() }
 }
 
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
     debug!("engine released snapshot");
-    snapshot.drop_handle();
+    unsafe { snapshot.drop_handle() }
 }
 
 /// Perform a checkpoint write on the given snapshot. Mirrors the kernel's
@@ -1634,7 +1640,7 @@ pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
 ///
 /// Caller is responsible for passing valid handles. The `spec` pointer, if non-null, must point
 /// to a valid `FfiCheckpointSpec` for the duration of the call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn checkpoint_snapshot(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
@@ -1643,10 +1649,10 @@ pub unsafe extern "C" fn checkpoint_snapshot(
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
     let kernel_spec = spec.map(|s| s.to_kernel());
-    snapshot_ref
+    let result = snapshot_ref
         .checkpoint(engine_ref.engine().as_ref(), kernel_spec.as_ref())
-        .map(|(result, updated)| FfiCheckpointWriteResult::from_kernel(result, updated))
-        .into_extern_result(&engine_ref)
+        .map(|(result, updated)| FfiCheckpointWriteResult::from_kernel(result, updated));
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Publish unpublished catalog commits on a catalog-managed snapshot.
@@ -1664,7 +1670,7 @@ pub unsafe extern "C" fn checkpoint_snapshot(
 ///
 /// All handles must be valid. This call borrows `snapshot` and `engine` and unconditionally
 /// consumes `committer`, including on error. Do not use or free `committer` afterward.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_publish_with_committer(
     snapshot: Handle<SharedSnapshot>,
     committer: Handle<MutableCommitter>,
@@ -1673,10 +1679,10 @@ pub unsafe extern "C" fn snapshot_publish_with_committer(
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
     let committer = unsafe { committer.into_inner() };
-    snapshot_ref
+    let result = snapshot_ref
         .publish(engine_ref.engine().as_ref(), committer.as_ref())
-        .map(|updated| updated.into())
-        .into_extern_result(&engine_ref)
+        .map(|updated| updated.into());
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Get the version of the specified snapshot
@@ -1684,7 +1690,7 @@ pub unsafe extern "C" fn snapshot_publish_with_committer(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn version(snapshot: Handle<SharedSnapshot>) -> u64 {
     let snapshot = unsafe { snapshot.as_ref() };
     snapshot.version()
@@ -1702,16 +1708,17 @@ pub unsafe extern "C" fn version(snapshot: Handle<SharedSnapshot>) -> u64 {
 /// # Safety
 ///
 /// Caller is responsible for passing valid snapshot handle and engine handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_timestamp(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<i64> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    snapshot
-        .get_timestamp(engine_ref.engine().as_ref())
-        .into_extern_result(&engine_ref)
+    let result = snapshot
+        .reader()
+        .get_timestamp(engine_ref.engine().as_ref());
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Statistics for the commit files selected to replay a snapshot's log segment.
@@ -1748,17 +1755,15 @@ impl From<LogSegmentStats> for FfiLogSegmentStats {
 /// # Safety
 ///
 /// Caller must pass valid snapshot and engine handles, and retain ownership of both handles.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_log_segment_stats(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<FfiLogSegmentStats> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    snapshot
-        .log_segment_stats()
-        .map(FfiLogSegmentStats::from)
-        .into_extern_result(&engine_ref)
+    let result = snapshot.log_segment_stats().map(FfiLogSegmentStats::from);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// File-level statistics for a snapshot, sourced from the snapshot's CRC.
@@ -1792,7 +1797,7 @@ impl From<FileStats> for FfiFileStats {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_file_stats(
     snapshot: Handle<SharedSnapshot>,
 ) -> OptionalValue<FfiFileStats> {
@@ -1829,7 +1834,7 @@ pub type FileSizeHistogramVisitor = extern "C" fn(
 /// Caller is responsible for passing a valid snapshot handle, an `engine_context` value suitable
 /// for the visitor (which may be null), and a valid `visitor` function pointer. The visitor must
 /// not retain the passed slices.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_file_size_histogram(
     snapshot: Handle<SharedSnapshot>,
     engine_context: NullableCvoid,
@@ -1890,7 +1895,7 @@ impl From<FfiHistoryCommitType> for HistoryCommitType {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid `log_root` string slice and a valid engine handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_earliest_commit(
     engine: Handle<SharedExternEngine>,
     log_root: KernelStringSlice,
@@ -1899,13 +1904,13 @@ pub unsafe extern "C" fn get_earliest_commit(
 ) -> ExternResult<Version> {
     let engine_ref = unsafe { engine.as_ref() };
     let log_root = unsafe { unwrap_and_parse_path_as_url(log_root) };
-    get_earliest_commit_impl(
+    let result = get_earliest_commit_impl(
         engine_ref,
         log_root,
         earliest_ratified_commit_version,
         commit_type,
-    )
-    .into_extern_result(&engine_ref)
+    );
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 fn get_earliest_commit_impl(
@@ -1954,7 +1959,7 @@ impl From<CommitAt> for FfiCommitAt {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot handle and a valid engine handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn latest_version_as_of(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
@@ -1963,14 +1968,14 @@ pub unsafe extern "C" fn latest_version_as_of(
 ) -> ExternResult<FfiCommitAt> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    kernel_latest_version_as_of(
+    let result = kernel_latest_version_as_of(
         snapshot,
         engine_ref.engine().as_ref(),
         timestamp,
         commit_type.into(),
     )
-    .map(FfiCommitAt::from)
-    .into_extern_result(&engine_ref)
+    .map(FfiCommitAt::from);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Get the first commit (version and timestamp) within `snapshot`'s version range with a
@@ -1984,7 +1989,7 @@ pub unsafe extern "C" fn latest_version_as_of(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot handle and a valid engine handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn first_version_after(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
@@ -1993,14 +1998,14 @@ pub unsafe extern "C" fn first_version_after(
 ) -> ExternResult<FfiCommitAt> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    kernel_first_version_after(
+    let result = kernel_first_version_after(
         snapshot,
         engine_ref.engine().as_ref(),
         timestamp,
         commit_type.into(),
     )
-    .map(FfiCommitAt::from)
-    .into_extern_result(&engine_ref)
+    .map(FfiCommitAt::from);
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Get the logical schema of the specified snapshot
@@ -2008,7 +2013,7 @@ pub unsafe extern "C" fn first_version_after(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn logical_schema(snapshot: Handle<SharedSnapshot>) -> Handle<SharedSchema> {
     let snapshot = unsafe { snapshot.as_ref() };
     snapshot.schema().into()
@@ -2021,7 +2026,7 @@ pub unsafe extern "C" fn logical_schema(snapshot: Handle<SharedSnapshot>) -> Han
 ///
 /// # Safety
 /// The snapshot handle is borrowed and must be valid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_physical_schema(
     snapshot: Handle<SharedSnapshot>,
 ) -> Handle<SharedSchema> {
@@ -2033,9 +2038,9 @@ pub unsafe extern "C" fn snapshot_physical_schema(
 ///
 /// # Safety
 /// Engine is responsible for providing a valid schema handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_schema(schema: Handle<SharedSchema>) {
-    schema.drop_handle();
+    unsafe { schema.drop_handle() }
 }
 
 /// Get the resolved root of the table. This should be used in any future calls that require
@@ -2044,7 +2049,7 @@ pub unsafe extern "C" fn free_schema(schema: Handle<SharedSchema>) {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_table_root(
     snapshot: Handle<SharedSnapshot>,
     allocate_fn: AllocateStringFn,
@@ -2058,7 +2063,7 @@ pub unsafe extern "C" fn snapshot_table_root(
 ///
 /// # Safety
 /// Caller is responsible for passing a valid snapshot handle
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_partition_column_count(snapshot: Handle<SharedSnapshot>) -> usize {
     let snapshot = unsafe { snapshot.as_ref() };
     snapshot
@@ -2071,7 +2076,7 @@ pub unsafe extern "C" fn get_partition_column_count(snapshot: Handle<SharedSnaps
 ///
 /// # Safety
 /// Caller is responsible for passing a valid snapshot handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_partition_columns(
     snapshot: Handle<SharedSnapshot>,
 ) -> Handle<StringSliceIterator> {
@@ -2085,44 +2090,13 @@ pub unsafe extern "C" fn get_partition_columns(
     iter.into()
 }
 
-/// Visit each metadata configuration (key/value pair) for the specified snapshot by invoking the
-/// provided `visitor` callback once per entry.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid snapshot handle, a valid `engine_context` as an
-/// opaque pointer passed to each `visitor` invocation, and a valid `visitor` function pointer.
-#[no_mangle]
-pub unsafe extern "C" fn visit_metadata_configuration(
-    snapshot: Handle<SharedSnapshot>,
-    engine_context: NullableCvoid,
-    visitor: extern "C" fn(
-        engine_context: NullableCvoid,
-        key: KernelStringSlice,
-        value: KernelStringSlice,
-    ),
-) {
-    let snapshot = unsafe { snapshot.as_ref() };
-    snapshot
-        .table_configuration()
-        .metadata()
-        .configuration()
-        .iter()
-        .for_each(|(key, value)| {
-            visitor(
-                engine_context,
-                kernel_string_slice!(key),
-                kernel_string_slice!(value),
-            );
-        });
-}
 // === Protocol handle FFI ===
 
 /// Get the protocol for this snapshot. The returned handle must be freed with [`free_protocol`].
 ///
 /// # Safety
 /// Caller is responsible for providing a valid snapshot handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_get_protocol(
     snapshot: Handle<SharedSnapshot>,
 ) -> Handle<SharedProtocol> {
@@ -2134,9 +2108,9 @@ pub unsafe extern "C" fn snapshot_get_protocol(
 ///
 /// # Safety
 /// Caller is responsible for providing a valid, non-freed protocol handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_protocol(protocol: Handle<SharedProtocol>) {
-    protocol.drop_handle();
+    unsafe { protocol.drop_handle() }
 }
 
 /// Visit all fields of the protocol in a single FFI call. The caller provides:
@@ -2148,7 +2122,7 @@ pub unsafe extern "C" fn free_protocol(protocol: Handle<SharedProtocol>) {
 /// # Safety
 /// Caller is responsible for providing a valid protocol handle, a valid `context` pointer, and
 /// valid function pointers for `visit_versions` and `visit_feature`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_protocol(
     protocol: Handle<SharedProtocol>,
     context: NullableCvoid,
@@ -2179,109 +2153,27 @@ pub unsafe extern "C" fn visit_protocol(
     }
 }
 
-// === Metadata handle FFI ===
+// === Metadata FFI ===
 
-/// Get the metadata for this snapshot. The returned handle must be freed with [`free_metadata`].
+/// Visits the snapshot's complete metadata action without engine I/O.
+///
+/// Borrows `snapshot` and invokes `visitor` once with `context` and a borrowed metadata view.
+/// The view and all nested pointers are valid only until the callback returns. Callers must copy
+/// any values they retain. The original schema JSON is preserved without reserialization.
 ///
 /// # Safety
-/// Caller is responsible for providing a valid snapshot handle.
-#[no_mangle]
-pub unsafe extern "C" fn snapshot_get_metadata(
+///
+/// `snapshot` must be a valid, live handle for the duration of the call. `visitor` must not unwind
+/// or invalidate the snapshot. Any non-null `context` must satisfy the visitor's requirements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_visit_metadata(
     snapshot: Handle<SharedSnapshot>,
-) -> Handle<SharedMetadata> {
-    let snapshot = unsafe { snapshot.as_ref() };
-    Arc::new(snapshot.table_configuration().metadata().clone()).into()
-}
-
-/// Free a metadata handle obtained from [`snapshot_get_metadata`].
-///
-/// # Safety
-/// Caller is responsible for providing a valid, non-freed metadata handle.
-#[no_mangle]
-pub unsafe extern "C" fn free_metadata(metadata: Handle<SharedMetadata>) {
-    metadata.drop_handle();
-}
-
-/// Visit all fields of the metadata in a single FFI call. String fields borrow from the metadata
-/// handle and are only valid for the duration of the callback.
-///
-/// The visitor receives:
-/// - `id`: always present
-/// - `name`: `OptionalValue::None` if not set
-/// - `description`: `OptionalValue::None` if not set
-/// - `format_provider`: always present
-/// - `has_created_time`: whether `created_time_ms` is meaningful
-/// - `created_time_ms`: milliseconds since epoch (only valid when `has_created_time` is true)
-///
-/// # Safety
-/// Caller is responsible for providing a valid metadata handle, a valid `context` pointer, and
-/// a valid `visit_metadata_fields` function pointer. String slices must not be retained past the
-/// callback return.
-#[no_mangle]
-pub unsafe extern "C" fn visit_metadata(
-    metadata: Handle<SharedMetadata>,
     context: NullableCvoid,
-    visit_metadata_fields: extern "C" fn(
-        context: NullableCvoid,
-        id: KernelStringSlice,
-        name: OptionalValue<KernelStringSlice>,
-        description: OptionalValue<KernelStringSlice>,
-        format_provider: KernelStringSlice,
-        has_created_time: bool,
-        created_time_ms: i64,
-    ),
+    visitor: extern "C" fn(NullableCvoid, *const delta_types::FfiMetadata),
 ) {
-    let metadata = unsafe { metadata.as_ref() };
-    let id_str = metadata.id();
-    let id = kernel_string_slice!(id_str);
-    let name = metadata.name().map(|s| kernel_string_slice!(s)).into();
-    let description = metadata
-        .description()
-        .map(|s| kernel_string_slice!(s))
-        .into();
-    let fp_str = metadata.format_provider();
-    let format_provider = kernel_string_slice!(fp_str);
-    let (has_created_time, created_time_ms) = match metadata.created_time() {
-        Some(t) => (true, t),
-        None => (false, 0),
-    };
-    visit_metadata_fields(
-        context,
-        id,
-        name,
-        description,
-        format_provider,
-        has_created_time,
-        created_time_ms,
-    );
-}
-
-/// Visit each format option in the metadata by invoking `visitor` once per key/value pair.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid metadata handle, a valid `engine_context` as an
-/// opaque pointer passed to each `visitor` invocation, and a valid `visitor` function pointer.
-/// This function borrows the metadata handle, so the caller remains responsible for releasing it
-/// with [`free_metadata`]. String slices must not be retained past the callback return.
-#[no_mangle]
-pub unsafe extern "C" fn visit_metadata_format_options(
-    metadata: Handle<SharedMetadata>,
-    engine_context: NullableCvoid,
-    visitor: extern "C" fn(
-        engine_context: NullableCvoid,
-        key: KernelStringSlice,
-        value: KernelStringSlice,
-    ),
-) {
-    let metadata = unsafe { metadata.as_ref() };
-    metadata.format_options().iter().for_each(|(key, value)| {
-        visitor(
-            engine_context,
-            kernel_string_slice!(key),
-            kernel_string_slice!(value),
-        );
-    });
+    let snapshot = unsafe { snapshot.as_ref() };
+    let backing = delta_types::MetadataBacking::new(snapshot.table_configuration().metadata());
+    visitor(context, &backing.as_ffi());
 }
 
 // === Snapshot-level computed property FFI ===
@@ -2298,7 +2190,7 @@ pub struct StringSliceIterator;
 ///
 /// [`scan_metadata_iter_init`]: crate::scan::scan_metadata_iter_init
 /// [`free_scan_metadata_iter`]: crate::scan::free_scan_metadata_iter
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn string_slice_next(
     data: Handle<StringSliceIterator>,
     engine_context: NullableCvoid,
@@ -2324,9 +2216,9 @@ fn string_slice_next_impl(
 /// # Safety
 ///
 /// Caller is responsible for (at most once) passing a valid pointer to a [`StringSliceIterator`]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_string_slice_data(data: Handle<StringSliceIterator>) {
-    data.drop_handle();
+    unsafe { data.drop_handle() }
 }
 
 /// A set that can identify its contents by address
@@ -2385,6 +2277,7 @@ mod tests {
     use std::collections::HashMap;
     use std::ptr::NonNull;
 
+    use delta_kernel::actions::Metadata;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
@@ -2410,7 +2303,7 @@ mod tests {
         setup_snapshot,
     };
 
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     extern "C" fn allocate_null_err(_: FFIKernelError, _: KernelStringSlice) -> *mut EngineError {
         std::ptr::null_mut()
     }
@@ -2600,15 +2493,17 @@ mod tests {
         log_tail: log_path::LogPathArray,
         max_catalog_version: Option<Version>,
     ) -> ExternResult<Handle<SharedSnapshot>> {
-        let ptr = ok_or_panic(get_snapshot_builder(path, engine));
-        let ptr = snapshot_builder_with_version(ptr, version);
-        let ptr = ok_or_panic(snapshot_builder_with_log_tail(ptr, log_tail));
-        let ptr = if let Some(mcv) = max_catalog_version {
-            snapshot_builder_with_max_catalog_version(ptr, mcv)
-        } else {
-            ptr
-        };
-        snapshot_builder_build(ptr)
+        unsafe {
+            let ptr = ok_or_panic(get_snapshot_builder(path, engine));
+            let ptr = snapshot_builder_with_version(ptr, version);
+            let ptr = ok_or_panic(snapshot_builder_with_log_tail(ptr, log_tail));
+            let ptr = if let Some(mcv) = max_catalog_version {
+                snapshot_builder_with_max_catalog_version(ptr, mcv)
+            } else {
+                ptr
+            };
+            snapshot_builder_build(ptr)
+        }
     }
 
     pub(crate) fn get_default_engine(path: &str) -> Handle<SharedExternEngine> {
@@ -3197,82 +3092,6 @@ mod tests {
         Ok(())
     }
 
-    #[rstest]
-    #[case(
-        METADATA_WITH_TABLE_PROPERTIES,
-        HashMap::from([
-            (String::from("delta.appendOnly"), String::from("true")),
-            (String::from("custom.key"), String::from("custom_value")),
-        ])
-    )]
-    #[case(METADATA, HashMap::new())]
-    #[tokio::test]
-    async fn test_visit_metadata_configuration(
-        #[case] metadata: &str,
-        #[case] expected: HashMap<String, String>,
-    ) -> KernelResult<()> {
-        let table_root = "memory:///";
-        let storage = Arc::new(InMemory::new());
-        add_commit(
-            table_root,
-            storage.as_ref(),
-            0,
-            actions_to_string_with_metadata(vec![TestAction::Metadata], metadata),
-        )
-        .await?;
-
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
-
-        let snap =
-            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
-
-        extern "C" fn collect_property(
-            engine_context: NullableCvoid,
-            key: KernelStringSlice,
-            value: KernelStringSlice,
-        ) {
-            let map =
-                unsafe { &mut *(engine_context.unwrap().as_ptr() as *mut HashMap<String, String>) };
-            let k = unsafe { String::try_from_slice(&key) }.unwrap();
-            let v = unsafe { String::try_from_slice(&value) }.unwrap();
-            map.insert(k, v);
-        }
-
-        let mut collected: HashMap<String, String> = HashMap::new();
-        let ctx = NonNull::new(&mut collected as *mut _ as *mut c_void);
-        unsafe { visit_metadata_configuration(snap.shallow_copy(), ctx, collect_property) };
-
-        assert_eq!(collected, expected);
-
-        unsafe { free_snapshot(snap) }
-        unsafe { free_engine(engine) }
-        Ok(())
-    }
-
-    #[rstest]
-    #[case(
-        METADATA_WITH_FORMAT_OPTIONS,
-        HashMap::from([
-            (String::from("compression"), String::from("zstd")),
-            (String::from("custom.option"), String::from("arbitrary value")),
-        ])
-    )]
-    #[case(METADATA, HashMap::new())]
-    #[tokio::test]
-    async fn test_visit_metadata_format_options(
-        #[case] metadata: &str,
-        #[case] expected: HashMap<String, String>,
-    ) -> KernelResult<()> {
-        let (engine, snap) = setup_snapshot(metadata.to_string()).await?;
-
-        assert_eq!(collect_metadata_format_options(&snap), expected);
-
-        unsafe { free_snapshot(snap) };
-        unsafe { free_engine(engine) };
-        Ok(())
-    }
-
     // V2 protocol + metadata declaring the `v2Checkpoint` reader+writer feature.
     //
     // Two columns (id INT, val STRING), no partitions, no extra table properties. Used by every
@@ -3786,7 +3605,7 @@ mod tests {
 
         let partition_iter = unsafe { get_partition_columns(snapshot.shallow_copy()) };
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         extern "C" fn visit_partition(_context: NullableCvoid, slice: KernelStringSlice) {
             let s = unsafe { String::try_from_slice(&slice) }.unwrap();
             assert_eq!(s.as_str(), "val", "Partition col should be 'val'");
@@ -4268,89 +4087,6 @@ mod tests {
         state
     }
 
-    struct MetadataVisitState {
-        id: Option<String>,
-        name: Option<String>,
-        description: Option<String>,
-        format_provider: Option<String>,
-        has_created_time: bool,
-        created_time_ms: i64,
-    }
-
-    impl MetadataVisitState {
-        fn new() -> Self {
-            Self {
-                id: None,
-                name: None,
-                description: None,
-                format_provider: None,
-                has_created_time: false,
-                created_time_ms: 0,
-            }
-        }
-    }
-
-    /// Convert a [`KernelStringSlice`] to a [`String`] (test-only helper).
-    fn slice_to_string(slice: KernelStringSlice) -> String {
-        unsafe { String::try_from_slice(&slice) }.unwrap()
-    }
-
-    extern "C" fn metadata_visit_cb(
-        ctx: NullableCvoid,
-        id: KernelStringSlice,
-        name: OptionalValue<KernelStringSlice>,
-        description: OptionalValue<KernelStringSlice>,
-        format_provider: KernelStringSlice,
-        has_created_time: bool,
-        created_time_ms: i64,
-    ) {
-        let state = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut MetadataVisitState) };
-        state.id = Some(slice_to_string(id));
-        state.name = match name {
-            OptionalValue::Some(s) => Some(slice_to_string(s)),
-            OptionalValue::None => None,
-        };
-        state.description = match description {
-            OptionalValue::Some(s) => Some(slice_to_string(s)),
-            OptionalValue::None => None,
-        };
-        state.format_provider = Some(slice_to_string(format_provider));
-        state.has_created_time = has_created_time;
-        state.created_time_ms = created_time_ms;
-    }
-
-    extern "C" fn metadata_format_option_cb(
-        ctx: NullableCvoid,
-        key: KernelStringSlice,
-        value: KernelStringSlice,
-    ) {
-        let options = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut HashMap<String, String>) };
-        options.insert(slice_to_string(key), slice_to_string(value));
-    }
-
-    /// Visit metadata on a snapshot and return the collected state.
-    fn collect_metadata_state(snap: &handle::Handle<SharedSnapshot>) -> MetadataVisitState {
-        let meta = unsafe { snapshot_get_metadata(snap.shallow_copy()) };
-        let mut state = MetadataVisitState::new();
-        let ctx = NonNull::new(&mut state as *mut MetadataVisitState as *mut c_void);
-        unsafe { visit_metadata(meta.shallow_copy(), ctx, metadata_visit_cb) };
-        unsafe { free_metadata(meta) };
-        state
-    }
-
-    fn collect_metadata_format_options(
-        snap: &handle::Handle<SharedSnapshot>,
-    ) -> HashMap<String, String> {
-        let meta = unsafe { snapshot_get_metadata(snap.shallow_copy()) };
-        let mut options = HashMap::new();
-        let ctx = NonNull::new(&mut options as *mut HashMap<String, String> as *mut c_void);
-        unsafe {
-            visit_metadata_format_options(meta.shallow_copy(), ctx, metadata_format_option_cb)
-        };
-        unsafe { free_metadata(meta) };
-        options
-    }
-
     // === visit_protocol tests ===
 
     #[tokio::test]
@@ -4431,85 +4167,99 @@ mod tests {
         Ok(())
     }
 
+    const METADATA_WITHOUT_CREATED_TIME: &str = concat!(
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{},"isBlindAppend":true}}"#,
+        "\n",
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+        "\n",
+        r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{}}}"#,
+    );
+
+    #[rstest]
+    #[case::default(
+        METADATA,
+        "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+        None,
+        None,
+        Some(1587968585495),
+        &[],
+        &[]
+    )]
+    #[case::with_name_and_configuration(
+        METADATA_WITH_FEATURES,
+        "deadbeef-1234-5678-abcd-000000000000",
+        Some("test_table"),
+        None,
+        Some(1234567890000),
+        &[],
+        &[
+            ("delta.columnMapping.mode", "name"),
+            ("delta.rowTracking.enabled", "true"),
+            ("delta.rowTracking.materializedRowIdColumnName", "_row_id"),
+            ("delta.rowTracking.materializedRowCommitVersionColumnName", "_row_commit_version"),
+        ]
+    )]
+    #[case::with_description_and_format_options(
+        METADATA_WITH_FORMAT_OPTIONS,
+        "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+        Some("my_table"),
+        Some("A test table"),
+        Some(1587968585495),
+        &[("compression", "zstd"), ("custom.option", "arbitrary value")],
+        &[]
+    )]
+    #[case::with_table_properties(
+        METADATA_WITH_TABLE_PROPERTIES,
+        "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+        None,
+        None,
+        Some(1587968585495),
+        &[],
+        &[("delta.appendOnly", "true"), ("custom.key", "custom_value")]
+    )]
+    #[case::without_created_time(
+        METADATA_WITHOUT_CREATED_TIME,
+        "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+        None,
+        None,
+        None,
+        &[],
+        &[]
+    )]
     #[tokio::test]
-    async fn test_visit_metadata_default() -> KernelResult<()> {
-        let (engine, snap) = setup_snapshot(METADATA.to_string()).await?;
-        let state = collect_metadata_state(&snap);
+    async fn test_visit_metadata(
+        #[case] metadata: &str,
+        #[case] id: &str,
+        #[case] name: Option<&str>,
+        #[case] description: Option<&str>,
+        #[case] created_time: Option<i64>,
+        #[case] format_options: &[(&str, &str)],
+        #[case] configuration: &[(&str, &str)],
+    ) -> KernelResult<()> {
+        fn to_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
+            entries
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        }
+        // Copies the borrowed view into an owned `Metadata` before the callback returns.
+        extern "C" fn collect(ctx: NullableCvoid, metadata: *const delta_types::FfiMetadata) {
+            let result = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut Option<Metadata>) };
+            *result = Some(unsafe { (*metadata).try_to_kernel() }.unwrap());
+        }
+        let (engine, snap) = setup_snapshot(metadata.to_string()).await?;
 
-        assert_eq!(
-            state.id.as_deref(),
-            Some("5fba94ed-9794-4965-ba6e-6ee3c0d22af9")
-        );
-        assert!(
-            state.name.is_none(),
-            "name should be None for default metadata"
-        );
-        assert!(
-            state.description.is_none(),
-            "description should be None for default metadata"
-        );
-        assert_eq!(state.format_provider.as_deref(), Some("parquet"));
-        assert!(state.has_created_time);
-        assert_eq!(state.created_time_ms, 1587968585495);
-
-        unsafe { free_snapshot(snap) };
-        unsafe { free_engine(engine) };
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_visit_metadata_with_name() -> KernelResult<()> {
-        let (engine, snap) = setup_snapshot(METADATA_WITH_FEATURES.to_string()).await?;
-        let state = collect_metadata_state(&snap);
-
-        assert_eq!(
-            state.id.as_deref(),
-            Some("deadbeef-1234-5678-abcd-000000000000")
-        );
-        assert_eq!(state.name.as_deref(), Some("test_table"));
-        assert!(state.description.is_none(), "description should be None");
-        assert_eq!(state.format_provider.as_deref(), Some("parquet"));
-        assert!(state.has_created_time);
-        assert_eq!(state.created_time_ms, 1234567890000);
-
-        unsafe { free_snapshot(snap) };
-        unsafe { free_engine(engine) };
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_visit_metadata_with_description() -> KernelResult<()> {
-        let (engine, snap) = setup_snapshot(METADATA_WITH_FORMAT_OPTIONS.to_string()).await?;
-        let state = collect_metadata_state(&snap);
-
-        assert_eq!(state.name.as_deref(), Some("my_table"));
-        assert_eq!(state.description.as_deref(), Some("A test table"));
-        assert_eq!(state.format_provider.as_deref(), Some("parquet"));
-        assert!(state.has_created_time);
-
-        unsafe { free_snapshot(snap) };
-        unsafe { free_engine(engine) };
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_visit_metadata_without_created_time() -> KernelResult<()> {
-        let metadata_no_time = concat!(
-            r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{},"isBlindAppend":true}}"#,
-            "\n",
-            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
-            "\n",
-            r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{}}}"#,
-        );
-        let (engine, snap) = setup_snapshot(metadata_no_time.to_string()).await?;
-        let state = collect_metadata_state(&snap);
-
-        assert_eq!(
-            state.id.as_deref(),
-            Some("5fba94ed-9794-4965-ba6e-6ee3c0d22af9")
-        );
-        assert!(!state.has_created_time);
-        assert_eq!(state.created_time_ms, 0);
+        let mut visited: Option<Metadata> = None;
+        let ctx = Some(NonNull::from(&mut visited).cast());
+        unsafe { snapshot_visit_metadata(snap.shallow_copy(), ctx, collect) };
+        let visited = visited.expect("visitor was not invoked");
+        assert_eq!(visited.id(), id);
+        assert_eq!(visited.name(), name);
+        assert_eq!(visited.description(), description);
+        assert_eq!(visited.format_provider(), "parquet");
+        assert_eq!(visited.format_options(), &to_map(format_options));
+        assert_eq!(visited.created_time(), created_time);
+        assert_eq!(visited.configuration(), &to_map(configuration));
 
         unsafe { free_snapshot(snap) };
         unsafe { free_engine(engine) };

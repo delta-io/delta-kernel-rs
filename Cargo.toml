@@ -15,6 +15,7 @@ members = [
     "unity-catalog-delta-rest-client", # WIP: this is an experimental UC client for catalog-managed table work
     "delta-kernel-unity-catalog", # WIP: this is an experimental UC catalog implementation
     "unity-catalog-delta-client-api", # WIP: transport-agnostic UC client API traits
+    "xtask",
 ]
 # note that in addition to the members above, the workspace includes examples:
 # - inspect-table

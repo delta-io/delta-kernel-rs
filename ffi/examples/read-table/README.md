@@ -82,4 +82,20 @@ annotation keys and values as C strings, with a null value pointer representing 
 Embedded NUL bytes in annotation strings are rejected. The tests check that rejection and the
 schema round trip, including annotation lifetimes after the source Rust schemas are released.
 
+## Snapshot metadata tests
+
+`read_table -m path/to/table` prints all the information from the table's metadata, then exits
+without scanning.
+`-m` can't be combined with `-a`, `-c`, or `-s`. Because no data files are read, the test doesn't
+need Arrow GLib. Run these commands from the repository root:
+
+```sh
+cargo build -p delta_kernel_ffi --features tracing
+mkdir -p ffi/examples/read-table/build
+cd ffi/examples/read-table/build
+cmake .. -DPRINT_DATA=OFF
+cmake --build . --target read_table
+ctest -R '^snapshot_visit_metadata$' --output-on-failure
+```
+
 [cmake]: https://cmake.org/

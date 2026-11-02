@@ -122,7 +122,9 @@ async fn test_create_table_with_row_tracking(
     let disk_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let expected_high_water_mark: i64 = if with_data { 4 } else { -1 };
     assert_eq!(
-        disk_snapshot.get_row_tracking_high_water_mark(engine.as_ref())?,
+        disk_snapshot
+            .reader()
+            .get_row_tracking_high_water_mark(engine.as_ref())?,
         Some(expected_high_water_mark),
     );
 
@@ -252,7 +254,9 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> KernelResul
     // HWM should be 7 (IDs 0-2 from file 1, IDs 3-7 from file 2)
     let disk_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(
-        disk_snapshot.get_row_tracking_high_water_mark(engine.as_ref())?,
+        disk_snapshot
+            .reader()
+            .get_row_tracking_high_water_mark(engine.as_ref())?,
         Some(7),
         "HWM should be 7 for 8 total rows (3 + 5) starting from -1"
     );
@@ -388,7 +392,9 @@ async fn test_create_table_with_row_tracking_and_clustering_and_data() -> Kernel
     // High water mark should reflect the 5 written rows
     let disk_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(
-        disk_snapshot.get_row_tracking_high_water_mark(engine.as_ref())?,
+        disk_snapshot
+            .reader()
+            .get_row_tracking_high_water_mark(engine.as_ref())?,
         Some(4),
         "5 rows -> high water mark = 4"
     );
@@ -417,7 +423,9 @@ async fn test_feature_signal_create_then_append_assigns_correct_base_row_id() ->
         .at_version(0)
         .build(engine.as_ref())?;
     assert_eq!(
-        v0_snapshot.get_row_tracking_high_water_mark(engine.as_ref())?,
+        v0_snapshot
+            .reader()
+            .get_row_tracking_high_water_mark(engine.as_ref())?,
         Some(-1),
         "Initial high water mark should be -1"
     );
@@ -447,7 +455,9 @@ async fn test_feature_signal_create_then_append_assigns_correct_base_row_id() ->
     // High water mark after append: 3 rows starting from 0 -> high water mark = 2
     let v1_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(
-        v1_snapshot.get_row_tracking_high_water_mark(engine.as_ref())?,
+        v1_snapshot
+            .reader()
+            .get_row_tracking_high_water_mark(engine.as_ref())?,
         Some(2),
         "3 rows starting from 0 -> high water mark = 2"
     );

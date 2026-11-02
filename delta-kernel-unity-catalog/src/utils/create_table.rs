@@ -143,8 +143,9 @@ pub fn build_uc_create_table_request(
     // UC only recognizes the `delta.clustering` and `delta.rowTracking` domain metadatas.
     let uc_recognized_domains = HashSet::from([CLUSTERING_DOMAIN_NAME, ROW_TRACKING_DOMAIN_NAME]);
     let mut domain_metadata: HashMap<String, serde_json::Value> = HashMap::new();
-    for (domain, dm) in
-        snapshot.get_domain_metadatas_internal(engine, Some(&uc_recognized_domains))?
+    for (domain, dm) in snapshot
+        .reader()
+        .get_domain_metadatas_internal(engine, Some(&uc_recognized_domains))?
     {
         let value = serde_json::from_str(dm.configuration()).map_err(|e| {
             KernelError::generic(format!("malformed {domain} domain metadata: {e}"))
@@ -152,7 +153,7 @@ pub fn build_uc_create_table_request(
         domain_metadata.insert(domain, value);
     }
 
-    let in_commit_timestamp_ms = snapshot.get_timestamp(engine)?;
+    let in_commit_timestamp_ms = snapshot.reader().get_timestamp(engine)?;
 
     Ok(CreateTableRequest {
         name: table_name.into(),
