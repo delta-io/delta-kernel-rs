@@ -557,7 +557,9 @@ async fn collation_domain_hints_survive_append_alter_checkpoint_and_crc(
             .at_version(snapshot.version())
             .build(engine.as_ref())?;
         assert_eq!(
-            reloaded.get_domain_metadata("collations", engine.as_ref())?,
+            reloaded
+                .reader()
+                .get_domain_metadata("collations", engine.as_ref())?,
             Some(configuration.clone())
         );
     }
@@ -572,7 +574,9 @@ async fn collation_domain_hints_survive_append_alter_checkpoint_and_crc(
     );
     assert!(checkpointed.log_segment().listed.latest_crc_file.is_none());
     assert_eq!(
-        checkpointed.get_domain_metadata("collations", engine.as_ref())?,
+        checkpointed
+            .reader()
+            .get_domain_metadata("collations", engine.as_ref())?,
         Some(configuration.clone())
     );
     assert_eq!(
@@ -587,7 +591,9 @@ async fn collation_domain_hints_survive_append_alter_checkpoint_and_crc(
         configuration
     );
     assert_eq!(
-        reloaded.get_domain_metadata("collations", engine.as_ref())?,
+        reloaded
+            .reader()
+            .get_domain_metadata("collations", engine.as_ref())?,
         Some(configuration)
     );
     Ok(())
