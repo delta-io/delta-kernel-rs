@@ -1085,7 +1085,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
         // Build TableConfiguration directly for the new table
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
         if table_configuration.has_generation_expressions() {
-            return Err(KernelError::generic(
+            return Err(KernelError::unsupported(
                 "Setting `delta.generationExpression` column metadata is not supported during \
                  CREATE TABLE",
             ));
@@ -1427,6 +1427,8 @@ mod tests {
         )
         .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()));
 
+        let is_unsupported = matches!(&result, Err(KernelError::Unsupported(_)));
+        assert!(is_unsupported);
         assert_result_error_with_message(result, "delta.generationExpression");
         Ok(())
     }
