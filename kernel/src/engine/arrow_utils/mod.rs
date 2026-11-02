@@ -236,11 +236,12 @@ impl RowIndexBuilder {
 /// `DataTypeCompat::NeedsCast` into an actual `arrow::compute::cast`, so post-reorder leaf types
 /// are `Identical` to the kernel target.
 ///
-/// **File values.** A non-null `file` value that resolves to no referent (neither `uri` nor
-/// `inline` set, or `offset` set without `uri`) fails the read, as the File type requires.
+/// **File values.** A non-null `file` value that the File type requires readers to reject fails
+/// the read; `validate_file_values` in `file_values.rs` lists the rules.
 ///
-/// **Cost.** O(F) per batch where F is the total number of fields (including nested). Row data
-/// (Arrow buffers, offsets, null buffers) is shared via `Arc` and never copied.
+/// **Cost.** O(F) per batch where F is the total number of fields (including nested), plus O(R)
+/// per `file` column for R rows. Row data (Arrow buffers, offsets, null buffers) is shared via
+/// `Arc` and never copied.
 #[internal_api]
 pub(crate) fn fixup_parquet_read(
     batch: RecordBatch,
