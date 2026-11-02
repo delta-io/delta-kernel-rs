@@ -2474,6 +2474,7 @@ mod tests {
     #[case::one_row_group(vec![vec![1i64, 2, 3]], Some(3), Some((1, 3)))]
     #[case::two_row_groups(vec![vec![1i64], vec![2i64]], Some(2), Some((1, 2)))]
     #[case::only_zero_row_group(vec![vec![]], Some(0), None)]
+    #[case::zero_row_group_first(vec![vec![], vec![1i64, 2]], Some(2), Some((1, 2)))]
     #[case::zero_row_group_between(vec![vec![1i64], vec![], vec![2i64]], Some(2), Some((1, 2)))]
     fn test_file_stats_accumulator_finish_counts_and_bounds(
         #[case] row_groups: Vec<Vec<i64>>,
@@ -2554,9 +2555,13 @@ mod tests {
 
         let mut acc = FileStatsAccumulator::new(&[column_name!("t")], &physical_schema);
         for _ in 0..repetitions {
-            acc.merge(&first).unwrap();
-            acc.merge(&empty).unwrap();
-            acc.merge(&second).unwrap();
+            for batch in [&first, &empty, &second] {
+                acc.merge(batch).unwrap();
+                let AccumulatorState::Open(Some(total)) = &acc.state else {
+                    panic!("successful merge must retain statistics");
+                };
+                assert_eq!(total.len(), 1);
+            }
         }
         let merged = acc.finish().unwrap().unwrap();
 
@@ -2783,8 +2788,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_file_stats_accumulator_rejects_differing_stats_shape() {
+    #[rstest::rstest]
+    fn test_file_stats_accumulator_rejects_differing_stats_shape(
+        #[values(1, 2, 4)] matching_merges: usize,
+    ) {
         let declared = nested_batch(["x", "y"], [1, 2]);
         // `with_match_field_names(false)` is the only way to get a schema-equal batch whose nested
         // field names differ.
@@ -2801,7 +2808,9 @@ mod tests {
             &[column_name!("s", "x"), column_name!("s", "y")],
             &physical_schema,
         );
-        acc.merge(&declared).expect("first merge must succeed");
+        for _ in 0..matching_merges {
+            acc.merge(&declared).expect("matching merge must succeed");
+        }
         let err = acc
             .merge(&renamed)
             .expect_err("a batch deriving a different stats shape must be rejected");
