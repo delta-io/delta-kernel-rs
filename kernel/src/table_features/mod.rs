@@ -411,10 +411,7 @@ static GENERATED_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 4)),
     feature_requirements: &[],
-    #[cfg(feature = "generated-columns-in-dev")]
     kernel_support: KernelSupport::Supported,
-    #[cfg(not(feature = "generated-columns-in-dev"))]
-    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 

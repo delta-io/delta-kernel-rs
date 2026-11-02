@@ -23,12 +23,11 @@ use crate::scan::data_skipping::stats_schema::{
 };
 use crate::schema::collation_utils::validate_collations_feature_support;
 pub(crate) use crate::schema::file_utils::validate_file_type_feature_support;
+use crate::schema::generated_column::collect_generated_columns;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
-#[cfg(feature = "generated-columns-in-dev")]
-use crate::schema::{generated_column::collect_generated_columns, GeneratedColumn};
 use crate::schema::{
-    ColumnMetadataKey, SchemaRef, StructField, StructType, schema_has_invariants,
+    ColumnMetadataKey, GeneratedColumn, SchemaRef, StructField, StructType, schema_has_invariants,
     validate_column_defaults_metadata,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -871,7 +870,6 @@ impl TableConfiguration {
     ///
     /// Returns a schema error if a generated column's `delta.generationExpression` metadata is not
     /// a string.
-    #[cfg(feature = "generated-columns-in-dev")]
     pub(crate) fn generated_columns(&self) -> KernelResult<Vec<GeneratedColumn>> {
         if !self.is_feature_supported(&TableFeature::GeneratedColumns) {
             return Ok(Vec::new());
@@ -1159,7 +1157,6 @@ impl TableConfiguration {
         // Run discovery to assert that every generated column's expression is a string, because
         // connectors receive it as SQL text. A non-string expression fails discovery with a schema
         // error and blocks the write.
-        #[cfg(feature = "generated-columns-in-dev")]
         self.generated_columns()?;
 
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
@@ -1607,30 +1604,11 @@ mod test {
         }
     }
 
-    /// The write support of a table that lists the `generatedColumns` writer feature.
-    const WITH_GENERATED_COLUMNS_FEATURE_WRITE_SUPPORT: WriteSupport =
-        if cfg!(feature = "generated-columns-in-dev") {
+    /// The write support of a legacy writer version 4 table. Writer version 4 also implies
+    /// `checkConstraints`, which kernel writes only with `check-constraints-in-dev`.
+    const LEGACY_WRITER_V4_WRITE_SUPPORT: WriteSupport =
+        if cfg!(feature = "check-constraints-in-dev") {
             WriteSupport::Supported
-        } else {
-            WriteSupport::Unsupported
-        };
-
-    /// The write support of a legacy writer version 4 table, which implies `checkConstraints` and
-    /// `generatedColumns`.
-    const LEGACY_WRITER_V4_WRITE_SUPPORT: WriteSupport = if cfg!(all(
-        feature = "check-constraints-in-dev",
-        feature = "generated-columns-in-dev"
-    )) {
-        WriteSupport::Supported
-    } else {
-        WriteSupport::Unsupported
-    };
-
-    /// The write support of a table that lists the `generatedColumns` writer feature and has a
-    /// non-string generation expression.
-    const NON_STRING_EXPRESSION_WITH_GENERATED_COLUMNS_FEATURE_WRITE_SUPPORT: WriteSupport =
-        if cfg!(feature = "generated-columns-in-dev") {
-            WriteSupport::InvalidSchema
         } else {
             WriteSupport::Unsupported
         };
@@ -1648,14 +1626,14 @@ mod test {
         MockProtocolBuilder::new().with_versions(1, 2).build(),
         WriteSupport::Supported
     )]
-    // Kernel writes tables that support `generatedColumns` only with `generated-columns-in-dev`.
-    // The feature is listed in the protocol, or implied by writer version 4.
+    // Tables that support `generatedColumns`. The feature is listed in the protocol, or implied by
+    // writer version 4.
     #[case::with_feature(
         generated_event_year_schema(),
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        WITH_GENERATED_COLUMNS_FEATURE_WRITE_SUPPORT
+        WriteSupport::Supported
     )]
     #[case::legacy_writer_at_min_version(
         generated_event_year_schema(),
@@ -1668,7 +1646,7 @@ mod test {
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        WITH_GENERATED_COLUMNS_FEATURE_WRITE_SUPPORT
+        WriteSupport::Supported
     )]
     #[case::empty_expression_without_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, "")) },
@@ -1682,7 +1660,7 @@ mod test {
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        NON_STRING_EXPRESSION_WITH_GENERATED_COLUMNS_FEATURE_WRITE_SUPPORT
+        WriteSupport::InvalidSchema
     )]
     #[case::non_string_expression_without_feature(
         schema_ref! { (field_with_generation_expression("event_year", DataType::INTEGER, 7_i64)) },
@@ -1696,7 +1674,7 @@ mod test {
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
-        WITH_GENERATED_COLUMNS_FEATURE_WRITE_SUPPORT
+        WriteSupport::Supported
     )]
     #[case::no_generation_expression(
         schema_ref! { nullable "event_time": TIMESTAMP },
@@ -1826,7 +1804,6 @@ mod test {
         assert_eq!(has_generation_expressions, expected);
     }
 
-    #[cfg(feature = "generated-columns-in-dev")]
     #[rstest]
     // Protocols that support `generatedColumns`.
     #[case::with_feature(

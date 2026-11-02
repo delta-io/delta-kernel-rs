@@ -20,10 +20,9 @@ use crate::path::{LogRoot, ParsedLogPath};
 use crate::scan::log_replay::STATS_NAME;
 pub use crate::scan::log_replay::{CLUSTERING_PROVIDER_NAME, TAGS_NAME};
 use crate::schema::void_utils::validate_schema_for_write;
-#[cfg(feature = "generated-columns-in-dev")]
-use crate::schema::GeneratedColumn;
 use crate::schema::{
-    ColumnDefault, MapType, SchemaRef, SchemaStructPatchBuilder, StructField, lazy_schema_ref,
+    ColumnDefault, GeneratedColumn, MapType, SchemaRef, SchemaStructPatchBuilder, StructField,
+    lazy_schema_ref,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
@@ -336,7 +335,6 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     check_constraints_acknowledged: bool,
     // Whether the connector acknowledged responsibility for enforcing this table's generated
     // columns.
-    #[cfg(feature = "generated-columns-in-dev")]
     generated_columns_acknowledged: bool,
     // Whether the connector acknowledged responsibility for preserving Row IDs and Row Commit
     // Versions.
@@ -430,7 +428,6 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     ///
     /// Returns a schema error if a generated column's `delta.generationExpression` metadata is not
     /// a string.
-    #[cfg(feature = "generated-columns-in-dev")]
     pub fn generated_columns(&self) -> KernelResult<Vec<GeneratedColumn>> {
         self.effective_table_config.generated_columns()
     }
@@ -451,7 +448,6 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// The acknowledgement covers whatever this transaction commits. Without it,
     /// [`write_state`](Transaction::write_state) and [`commit`](Self::commit) fail whenever this
     /// transaction has effective generated columns.
-    #[cfg(feature = "generated-columns-in-dev")]
     pub fn ack_generated_columns(&mut self) {
         self.generated_columns_acknowledged = true;
     }
@@ -671,7 +667,6 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         self.ensure_column_defaults_acknowledged()?;
         #[cfg(feature = "check-constraints-in-dev")]
         self.ensure_check_constraints_acknowledged()?;
-        #[cfg(feature = "generated-columns-in-dev")]
         self.ensure_generated_columns_acknowledged()?;
         self.validate_for_data_write()?;
         // The effective table configuration can change while building a transaction, so this
@@ -748,7 +743,6 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             column_defaults_acknowledged: false,
             #[cfg(feature = "check-constraints-in-dev")]
             check_constraints_acknowledged: false,
-            #[cfg(feature = "generated-columns-in-dev")]
             generated_columns_acknowledged: false,
             row_tracking_preservation_acknowledged: false,
             is_blind_append: false,
@@ -1051,7 +1045,6 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
 
     /// Fails `write_state` and `commit` when this transaction has effective generated columns that
     /// the connector hasn't acknowledged.
-    #[cfg(feature = "generated-columns-in-dev")]
     fn ensure_generated_columns_acknowledged(&self) -> KernelResult<()> {
         require!(
             self.generated_columns_acknowledged
@@ -1206,7 +1199,6 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
 
         #[cfg(feature = "check-constraints-in-dev")]
         self.ensure_check_constraints_acknowledged()?;
-        #[cfg(feature = "generated-columns-in-dev")]
         self.ensure_generated_columns_acknowledged()?;
 
         // TODO(zach): we currently do this in two passes - can we do it in one and still keep refs
@@ -1706,7 +1698,6 @@ mod tests {
             column_defaults_acknowledged,
             #[cfg(feature = "check-constraints-in-dev")]
             check_constraints_acknowledged,
-            #[cfg(feature = "generated-columns-in-dev")]
             generated_columns_acknowledged,
             row_tracking_preservation_acknowledged,
             is_blind_append,
@@ -1742,7 +1733,6 @@ mod tests {
         assert!(!column_defaults_acknowledged);
         #[cfg(feature = "check-constraints-in-dev")]
         assert!(!check_constraints_acknowledged);
-        #[cfg(feature = "generated-columns-in-dev")]
         assert!(!generated_columns_acknowledged);
         assert!(!row_tracking_preservation_acknowledged);
         assert!(!is_blind_append);

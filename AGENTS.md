@@ -9,9 +9,10 @@ internals. Kernel never does I/O directly: it defines _what_ to do via its APIs
 
 Current capabilities include table reads with predicates, data skipping, deletion vectors,
 change data feed, incremental scans (`incremental_scan_builder`) and commit ranges, checkpoints
-(V1 & V2), version checksums, blind appends, file removals, table creation (including clustered
-tables), limited schema alteration, and catalog-managed tables. Log compaction remains disabled
-(#2337).
+(V1 & V2), version checksums, blind appends, file removals, writes to tables with generated
+columns (the connector computes and verifies the values after `Transaction::ack_generated_columns`),
+table creation (including clustered tables), limited schema alteration, and catalog-managed tables.
+Log compaction remains disabled (#2337).
 
 ## Build & Test Commands
 
@@ -107,15 +108,6 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   the connector's responsibility. CREATE TABLE rejects `delta.constraints.*` properties in every
   build. Also gates the internal SQL tokenizer and parser.
 - `checkpoint-protection`: support for the `checkpointProtection` writer feature.
-- `generated-columns-in-dev`: generated columns support (experimental, in development). Gates
-  `KernelSupport::Supported` for the `generatedColumns` writer feature (without it, writes to
-  tables that support the feature, including legacy writer version 4 and above, are blocked).
-  With it, kernel discovers generated columns and exposes their raw generation expression SQL
-  through `generated_columns()` on `Snapshot` and `Transaction`, and on a table with generated
-  columns `write_state` and every commit require `Transaction::ack_generated_columns`. The
-  connector computes and verifies generated values. CREATE TABLE rejects top-level
-  `delta.generationExpression` metadata in every build, and schema changes are rejected on tables
-  with generated columns.
 - `adaptive-metadata-in-dev`: adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature. Without it, reads and writes to tables listing

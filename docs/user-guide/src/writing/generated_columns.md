@@ -7,12 +7,6 @@ and commit.
 
 Before reading this page, make sure you understand [Appending data](./append.md).
 
-> [!NOTE]
-> Generated column support is experimental and requires the `generated-columns-in-dev` Cargo
-> feature on `delta_kernel`. Without it, the APIs on this page don't exist and Kernel rejects
-> writes to any table that supports the `generatedColumns` table feature. See
-> [Feature flags](../concepts/feature_flags.md).
-
 ## Generated columns example
 
 Suppose the `people` table has columns `name` (STRING), `age` (INTEGER), `city` (STRING), and

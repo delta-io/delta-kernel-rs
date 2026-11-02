@@ -39,9 +39,7 @@ use crate::metrics::{
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{ROW_TRACKING_DOMAIN_NAME, parse_row_tracking_high_water_mark};
 use crate::scan::ScanBuilder;
-#[cfg(feature = "generated-columns-in-dev")]
-use crate::schema::GeneratedColumn;
-use crate::schema::SchemaRef;
+use crate::schema::{GeneratedColumn, SchemaRef};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{Operation, TableFeature, physical_to_logical_column_name_and_type};
 #[cfg(feature = "check-constraints-in-dev")]
@@ -709,7 +707,6 @@ impl Snapshot {
     ///
     /// Returns a schema error if a generated column's `delta.generationExpression` metadata is not
     /// a string.
-    #[cfg(feature = "generated-columns-in-dev")]
     pub fn generated_columns(&self) -> KernelResult<Vec<GeneratedColumn>> {
         self.table_configuration().generated_columns()
     }

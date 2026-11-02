@@ -12,7 +12,6 @@ mod commit_info;
 mod domain_metadata;
 #[cfg(feature = "arrow-60")]
 mod file;
-#[cfg(feature = "generated-columns-in-dev")]
 mod generated_columns;
 mod ict;
 mod interval;
