@@ -505,11 +505,10 @@ pub fn collect_stats(
     physical_schema: &StructType,
 ) -> KernelResult<StructArray> {
     let null_count_only_columns = interval_column_names(physical_schema, stats_columns);
-    reduce_stats(&collect_stats_raw(
-        batch,
-        stats_columns,
-        &null_count_only_columns,
-    )?)
+    reduce_stats(
+        &collect_stats_raw(batch, stats_columns, &null_count_only_columns)?,
+        /* truncate_strings */ true,
+    )
 }
 
 #[cfg(test)]
@@ -517,7 +516,10 @@ pub(crate) fn collect_stats_for_test(
     batch: &RecordBatch,
     stats_columns: &[ColumnName],
 ) -> KernelResult<StructArray> {
-    reduce_stats(&collect_stats_raw(batch, stats_columns, &[])?)
+    reduce_stats(
+        &collect_stats_raw(batch, stats_columns, &[])?,
+        /* truncate_strings */ true,
+    )
 }
 
 /// Collect one batch's raw (untruncated) statistics as a single-row struct. [`reduce_stats`] turns
@@ -717,7 +719,9 @@ impl FileStatsAccumulator {
         let AccumulatorState::Open(total) = self.state else {
             return Err(KernelError::stats_validation(FAILED));
         };
-        total.as_ref().map(reduce_stats).transpose()
+        total
+            .map(|stats| reduce_stats(&stats, /* truncate_strings */ true))
+            .transpose()
     }
 }
 
@@ -738,23 +742,21 @@ fn merge_raw_stats(left: &StructArray, right: &StructArray) -> KernelResult<Stru
     let combined = combined
         .as_struct_opt()
         .ok_or_else(|| KernelError::internal_error("concatenated stats are not a struct"))?;
-    reduce_stats_with(combined, reduce_raw_minmax_leaf)
+    reduce_stats(combined, /* truncate_strings */ false)
 }
 
-/// Reduce a raw statistics struct of one row per row group into the single publishable row for the
-/// file: `numRecords` and `nullCount` summed, `minValues`/`maxValues` aggregated element-wise and
-/// truncated per Delta's string rules, `tightBounds` AND-ed.
+/// Reduce raw statistics rows into one: sum `numRecords` and `nullCount`, combine min/max bounds,
+/// and AND `tightBounds`. When `truncate_strings` is true, truncate string bounds for publication.
 ///
 /// Returns `Err` if `stats` is not shaped like the output of `collect_stats_raw`.
-fn reduce_stats(stats: &StructArray) -> KernelResult<StructArray> {
-    reduce_stats_with(stats, reduce_minmax_leaf)
-}
-
-/// Reduce counts and tightness, using `reduce_minmax` for each min/max leaf.
-fn reduce_stats_with(
-    stats: &StructArray,
-    reduce_minmax: fn(&ArrayRef, Agg) -> KernelResult<ArrayRef>,
-) -> KernelResult<StructArray> {
+fn reduce_stats(stats: &StructArray, truncate_strings: bool) -> KernelResult<StructArray> {
+    let reduce_minmax = |col: &ArrayRef, agg| -> KernelResult<ArrayRef> {
+        let bound = match compute_leaf_agg(col, agg)? {
+            Some(bound) if truncate_strings => truncate_stats_bound(&bound, agg)?,
+            bound => bound,
+        };
+        Ok(bound.unwrap_or_else(|| new_null_array(col.data_type(), 1)))
+    };
     let fields = stats.fields().clone();
     let mut cols: Vec<ArrayRef> = Vec::with_capacity(stats.num_columns());
     for (field, col) in fields.iter().zip(stats.columns()) {
@@ -831,24 +833,6 @@ fn reduce_bool_and_leaf(array: &ArrayRef) -> KernelResult<ArrayRef> {
     }
     let all = bool_and(arr).unwrap_or(true);
     Ok(Arc::new(BooleanArray::from(vec![all])))
-}
-
-/// Reduce a min/max leaf without truncating strings, preserving raw bounds for later merges.
-fn reduce_raw_minmax_leaf(array: &ArrayRef, agg: Agg) -> KernelResult<ArrayRef> {
-    Ok(compute_leaf_agg(array, agg)?.unwrap_or_else(|| new_null_array(array.data_type(), 1)))
-}
-
-/// Reduce a min (or max) leaf to the one bound published for the file, null if none is
-/// representable.
-///
-/// Reusing `compute_leaf_agg` gives the bound the same ordering a single-pass collection uses (NaN,
-/// decimal precision/scale, timestamp timezone, string byte order).
-fn reduce_minmax_leaf(array: &ArrayRef, agg: Agg) -> KernelResult<ArrayRef> {
-    let bound = match compute_leaf_agg(array, agg)? {
-        Some(bound) => truncate_stats_bound(&bound, agg)?,
-        None => None,
-    };
-    Ok(bound.unwrap_or_else(|| new_null_array(array.data_type(), 1)))
 }
 
 /// Truncate a single-row min/max bound per Delta's string rules, passing non-string bounds through.
@@ -2666,7 +2650,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_internal_error(reduce_stats(&stats), "unknown stats section");
+        assert_internal_error(
+            reduce_stats(&stats, /* truncate_strings */ true),
+            "unknown stats section",
+        );
     }
 
     #[test]
