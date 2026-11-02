@@ -12,7 +12,9 @@ use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{col, lit};
 use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::ObjectStore;
 use delta_kernel::path::ParsedLogPath;
+use delta_kernel::scan::Scan;
 use delta_kernel::schema::{schema_ref, SchemaRef};
 use delta_kernel::snapshot::{ChecksumWriteResult, IncrementalReplay, Snapshot, SnapshotRef};
 #[cfg(feature = "internal-api")]
@@ -774,69 +776,9 @@ async fn test_write_checksum_after_reorg_matches_active_files(
     #[values(false, true)] incremental_load: bool,
 ) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let store: Arc<dyn delta_kernel::object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
-    let schema = schema_ref! { nullable "id": INTEGER, nullable "data": STRING };
-    let mut builder = create_table(&table_path, schema, "test-engine", true)
-        .with_table_properties([("delta.enableDeletionVectors", "true")]);
-    if v2_checkpoint {
-        builder = builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")]);
-    }
-    let mut snapshot = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
-        .unwrap_post_commit_snapshot();
-
-    // Two files to reorganize span histogram bins; a third file remains untouched.
-    let small_ids = vec![1, 2, 3];
-    let large_ids: Vec<_> = (100..100 + LARGE_FILE_ROW_COUNT).collect();
-    for ids in [&small_ids, &large_ids, &vec![-1]] {
-        let strings: Vec<_> = ids.iter().map(|id| format!("{id:0>100}")).collect();
-        snapshot = insert_data(
-            snapshot,
-            &engine,
-            vec![
-                Arc::new(Int32Array::from(ids.clone())),
-                Arc::new(StringArray::from(strings)),
-            ],
-        )
-        .await?
-        .unwrap_post_commit_snapshot();
-    }
-    let selected_scan = |snapshot: SnapshotRef| {
-        snapshot
-            .scan_builder()
-            .with_predicate(Arc::new(Predicate::gt(col!("id"), lit(0))))
-            .build()
-    };
-
-    // PURGE can remove files without replacements when their DVs delete every row.
-    // The rewrite case starts with one deleted row in each input file instead.
-    let mut txn = snapshot
-        .clone()
-        .update_table(UpdateTableOperation::Delete, "test-engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-    let mut descriptors = HashMap::new();
-    let mut scan_files = Vec::new();
-    let context = txn.write_state()?.write_context_builder().build()?;
-    for metadata in selected_scan(snapshot.clone())?.scan_metadata(engine.as_ref())? {
-        let metadata = metadata?;
-        let files = metadata.visit_scan_files(Vec::new(), |files, file| files.push(file))?;
-        for file in files {
-            let num_deleted = if reorg_files == ReorgFiles::RemoveOnly {
-                file.stats.unwrap().num_records
-            } else {
-                1
-            };
-            let mut dv = KernelDeletionVector::new();
-            dv.add_deleted_row_indexes(0..num_deleted);
-            let descriptor = write_deletion_vector_to_store(&store, &context, dv, "").await?;
-            descriptors.insert(file.path, descriptor);
-        }
-        scan_files.push(metadata.scan_files);
-    }
-    assert_eq!(descriptors.len(), 2);
-    txn.update_deletion_vectors(descriptors, scan_files.into_iter().map(Ok))?;
-    snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let (snapshot, replacement_ids) =
+        create_reorg_inputs(&table_path, &engine, &store, reorg_files, v2_checkpoint).await?;
     let base_version = snapshot.version();
     match root {
         WriteRoot::CheckpointWithTail => {
@@ -857,53 +799,7 @@ async fn test_write_checksum_after_reorg_matches_active_files(
         2
     );
 
-    let mut txn = base
-        .clone()
-        .update_table(
-            UpdateTableOperation::Custom("REORG".to_string()),
-            "test-engine",
-            false,
-        )
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-    let context = txn.write_state()?.write_context_builder().build()?;
-    for metadata in selected_scan(base.clone())?.scan_metadata(engine.as_ref())? {
-        let metadata = metadata?;
-        if reorg_files == ReorgFiles::ReplaceDeletionVectors {
-            let files = metadata.visit_scan_files(Vec::new(), |files, file| files.push(file))?;
-            let mut descriptors = HashMap::new();
-            for file in files {
-                let mut dv = KernelDeletionVector::new();
-                dv.add_deleted_row_indexes([0]);
-                let descriptor = write_deletion_vector_to_store(&store, &context, dv, "").await?;
-                descriptors.insert(file.path, descriptor);
-            }
-            txn.update_deletion_vectors(descriptors, std::iter::once(Ok(metadata.scan_files)))?;
-        } else {
-            txn.remove_files(metadata.scan_files);
-        }
-    }
-    if reorg_files == ReorgFiles::Rewrite {
-        let ids: Vec<_> = small_ids
-            .into_iter()
-            .skip(1)
-            .chain(large_ids.into_iter().skip(1))
-            .collect();
-        let strings: Vec<_> = ids.iter().map(|id| format!("{id:0>100}")).collect();
-        let batch = RecordBatch::try_new(
-            Arc::new(TryFromKernel::try_from_kernel(base.schema().as_ref())?),
-            vec![
-                Arc::new(Int32Array::from(ids)),
-                Arc::new(StringArray::from(strings)),
-            ],
-        )?;
-        txn.add_files(
-            engine
-                .write_parquet(&ArrowEngineData::new(batch), &context)
-                .await?,
-        );
-    }
-    // Exercise log replay: custom transactions deliberately do not derive a safe in-memory CRC.
-    txn.commit(engine.as_ref())?.unwrap_committed();
+    commit_reorg(base.clone(), &engine, &store, reorg_files, replacement_ids).await?;
     let replay = if root == WriteRoot::StaleCrcIncrementalBuild {
         IncrementalReplay::Unlimited
     } else {
@@ -975,16 +871,159 @@ async fn test_write_checksum_after_reorg_matches_active_files(
     assert_eq!(reloaded.version(), base_version + 2);
     assert_crc_matches_active_files(&reloaded, engine.as_ref(), expected_count + 1)?;
 
+    assert_stats_readd_rejects_checksum(&reloaded, engine.as_ref(), store.as_ref()).await?;
+    Ok(())
+}
+
+async fn create_reorg_inputs<E: TaskExecutor>(
+    table_path: &str,
+    engine: &Arc<DefaultEngine<E>>,
+    store: &Arc<dyn ObjectStore>,
+    reorg_files: ReorgFiles,
+    v2_checkpoint: bool,
+) -> KernelResult<(SnapshotRef, Vec<i32>)> {
+    let schema = schema_ref! { nullable "id": INTEGER, nullable "data": STRING };
+    let mut builder = create_table(table_path, schema, "test-engine", true)
+        .with_table_properties([("delta.enableDeletionVectors", "true")]);
+    if v2_checkpoint {
+        builder = builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")]);
+    }
+    let mut snapshot = builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+
+    // Two files to reorganize span histogram bins; a third file remains untouched.
+    let small_ids = vec![1, 2, 3];
+    let large_ids: Vec<_> = (100..100 + LARGE_FILE_ROW_COUNT).collect();
+    for ids in [&small_ids, &large_ids, &vec![-1]] {
+        let strings: Vec<_> = ids.iter().map(|id| format!("{id:0>100}")).collect();
+        snapshot = insert_data(
+            snapshot,
+            engine,
+            vec![
+                Arc::new(Int32Array::from(ids.clone())),
+                Arc::new(StringArray::from(strings)),
+            ],
+        )
+        .await?
+        .unwrap_post_commit_snapshot();
+    }
+
+    // PURGE can remove files without replacements when their DVs delete every row.
+    // The rewrite case starts with one deleted row in each input file instead.
+    let mut txn = snapshot
+        .clone()
+        .update_table(UpdateTableOperation::Delete, "test-engine", true)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let mut descriptors = HashMap::new();
+    let mut scan_files = Vec::new();
+    let context = txn.write_state()?.write_context_builder().build()?;
+    for metadata in reorg_input_scan(snapshot.clone())?.scan_metadata(engine.as_ref())? {
+        let metadata = metadata?;
+        let files = metadata.visit_scan_files(Vec::new(), |files, file| files.push(file))?;
+        for file in files {
+            let num_deleted = if reorg_files == ReorgFiles::RemoveOnly {
+                file.stats.unwrap().num_records
+            } else {
+                1
+            };
+            let mut dv = KernelDeletionVector::new();
+            dv.add_deleted_row_indexes(0..num_deleted);
+            let descriptor = write_deletion_vector_to_store(store, &context, dv, "").await?;
+            descriptors.insert(file.path, descriptor);
+        }
+        scan_files.push(metadata.scan_files);
+    }
+    assert_eq!(descriptors.len(), 2);
+    txn.update_deletion_vectors(descriptors, scan_files.into_iter().map(Ok))?;
+    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let replacement_ids = small_ids
+        .into_iter()
+        .skip(1)
+        .chain(large_ids.into_iter().skip(1))
+        .collect();
+    Ok((snapshot, replacement_ids))
+}
+
+async fn commit_reorg<E: TaskExecutor>(
+    snapshot: SnapshotRef,
+    engine: &Arc<DefaultEngine<E>>,
+    store: &Arc<dyn ObjectStore>,
+    reorg_files: ReorgFiles,
+    replacement_ids: Vec<i32>,
+) -> KernelResult<()> {
+    let mut txn = snapshot
+        .clone()
+        .update_table(
+            UpdateTableOperation::Custom("REORG".to_string()),
+            "test-engine",
+            false,
+        )
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let context = txn.write_state()?.write_context_builder().build()?;
+    for metadata in reorg_input_scan(snapshot.clone())?.scan_metadata(engine.as_ref())? {
+        let metadata = metadata?;
+        if reorg_files == ReorgFiles::ReplaceDeletionVectors {
+            let files = metadata.visit_scan_files(Vec::new(), |files, file| files.push(file))?;
+            let mut descriptors = HashMap::new();
+            for file in files {
+                let mut dv = KernelDeletionVector::new();
+                dv.add_deleted_row_indexes([0]);
+                let descriptor = write_deletion_vector_to_store(store, &context, dv, "").await?;
+                descriptors.insert(file.path, descriptor);
+            }
+            txn.update_deletion_vectors(descriptors, std::iter::once(Ok(metadata.scan_files)))?;
+        } else {
+            txn.remove_files(metadata.scan_files);
+        }
+    }
+    if reorg_files == ReorgFiles::Rewrite {
+        let strings: Vec<_> = replacement_ids
+            .iter()
+            .map(|id| format!("{id:0>100}"))
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?),
+            vec![
+                Arc::new(Int32Array::from(replacement_ids)),
+                Arc::new(StringArray::from(strings)),
+            ],
+        )?;
+        txn.add_files(
+            engine
+                .write_parquet(&ArrowEngineData::new(batch), &context)
+                .await?,
+        );
+    }
+    // Exercise log replay: custom transactions deliberately do not derive a safe in-memory CRC.
+    txn.commit(engine.as_ref())?.unwrap_committed();
+    Ok(())
+}
+
+fn reorg_input_scan(snapshot: SnapshotRef) -> KernelResult<Scan> {
+    snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(Predicate::gt(col!("id"), lit(0))))
+        .build()
+}
+
+async fn assert_stats_readd_rejects_checksum(
+    snapshot: &SnapshotRef,
+    engine: &dyn Engine,
+    store: &dyn ObjectStore,
+) -> KernelResult<()> {
     // A later metadata-only file re-add must still invalidate incremental statistics.
-    std::fs::remove_file(crc_file_path(&table_path, reloaded.version()))?;
-    let mut add = read_actions_from_commit(reloaded.table_root(), reloaded.version(), "add")?
+    let crc = ParsedLogPath::new_crc(snapshot.table_root(), snapshot.version())?;
+    std::fs::remove_file(crc.location.to_file_path().unwrap())?;
+    let mut add = read_actions_from_commit(snapshot.table_root(), snapshot.version(), "add")?
         .pop()
         .unwrap();
     add["dataChange"] = serde_json::json!(false);
     add_commit(
-        reloaded.table_root().as_str(),
-        store.as_ref(),
-        reloaded.version() + 1,
+        snapshot.table_root().as_str(),
+        store,
+        snapshot.version() + 1,
         format!(
             "{}\n{}",
             serde_json::json!({"commitInfo": {"operation": "ANALYZE STATS"}}),
@@ -992,11 +1031,11 @@ async fn test_write_checksum_after_reorg_matches_active_files(
         ),
     )
     .await?;
-    let unsafe_snapshot = Snapshot::builder_for(&table_path)
+    let unsafe_snapshot = Snapshot::builder_for(snapshot.table_root().as_str())
         .with_incremental_crc_replay(IncrementalReplay::Unlimited)
-        .build(engine.as_ref())?;
+        .build(engine)?;
     assert!(matches!(
-        unsafe_snapshot.write_checksum(engine.as_ref()),
+        unsafe_snapshot.write_checksum(engine),
         Err(delta_kernel::KernelError::ChecksumWriteUnsupported(_))
     ));
     Ok(())
