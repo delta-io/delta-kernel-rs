@@ -463,6 +463,7 @@ impl<Mode> SnapshotBuilder<Mode> {
                     log_tail,
                     engine,
                     effective_version,
+                    max_catalog_version,
                     metric_context,
                     incremental_replay,
                     checkpoint_handling,

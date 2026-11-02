@@ -23,7 +23,7 @@ use crate::{Engine, KernelError, KernelResult, Version};
 ///
 /// See [`Snapshot::try_new_from`] for the case taxonomy these outcomes map onto.
 enum NewSegment {
-    /// No new segment to build; the caller returns the existing snapshot unchanged.
+    /// No new segment to build. The caller reuses the snapshot with updated build flags.
     Unchanged,
     /// A checkpoint ahead of the existing snapshot requires a full rebuild from it.
     Rebuild(LogSegment),
@@ -76,7 +76,8 @@ impl Snapshot {
     /// only commits in `(S1, S2]` are replayed for newer P+M on top of it. A base CRC newer than
     /// `S1`, when present, serves as the baseline instead.
     ///
-    /// - **A.** `T == S1`: return the existing snapshot unchanged.
+    /// - **A.** `T == S1`: reuse the existing snapshot, clearing its latest claim if the catalog
+    ///   bound is newer than `S1`.
     /// - **B.** `T < S1`: error. The incremental path only moves forward.
     /// - Otherwise (`T` unset or `T > S1`), list the log from `C1+1` (or from version 1 if there is
     ///   no existing checkpoint), and one of the following applies:
@@ -110,6 +111,7 @@ impl Snapshot {
         log_tail: Vec<ParsedLogPath>,
         engine: &dyn Engine,
         target_version: impl Into<Option<Version>>,
+        max_catalog_version: Option<Version>,
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         checkpoint_handling: CheckpointHandling,
@@ -122,6 +124,7 @@ impl Snapshot {
             log_tail,
             engine,
             requested_version,
+            max_catalog_version,
             &metric_context,
             incremental_replay,
             checkpoint_handling,
@@ -148,6 +151,7 @@ impl Snapshot {
         log_tail: Vec<ParsedLogPath>,
         engine: &dyn Engine,
         requested_version: Option<Version>,
+        max_catalog_version: Option<Version>,
         metric_context: &SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
         checkpoint_handling: CheckpointHandling,
@@ -159,9 +163,15 @@ impl Snapshot {
             tracing::Span::current().record("version", requested_version);
             // Case A: re-requesting the same version.
             if requested_version == existing_snapshot_version {
-                // TODO(#3833): Reconcile cached freshness with the new request before reuse.
+                // TODO(#3833): Promote cached freshness for latest requests.
                 // TODO(#3845): Preserve publication evidence from the supplied tail before reuse.
-                return Ok(existing_snapshot.clone());
+                let built_as_latest = existing_snapshot.built_as_latest
+                    && max_catalog_version.is_none_or(|max| max <= existing_snapshot_version);
+                return Ok(Self::reuse_with_build_metadata(
+                    &existing_snapshot,
+                    built_as_latest,
+                    existing_snapshot.skipped_new_checkpoints,
+                ));
             }
             // Case B: incremental path only moves forward.
             if requested_version < existing_snapshot_version {
@@ -191,11 +201,12 @@ impl Snapshot {
         .inspect_err(|_| emit_log_segment_load_failure(metric_context))?
         {
             NewSegment::Unchanged => {
-                return Self::reuse_with_build_metadata(
+                let built_as_latest = existing_snapshot.built_as_latest || built_as_latest;
+                return Ok(Self::reuse_with_build_metadata(
                     &existing_snapshot,
                     built_as_latest,
                     skipped_new_checkpoints,
-                );
+                ));
             }
             NewSegment::Rebuild(new_log_segment) => {
                 emit_log_segment_load(
@@ -521,26 +532,32 @@ impl Snapshot {
         Ok(NewSegment::Combined(combined_log_segment))
     }
 
-    /// Reuse `existing`, promoting its `built_as_latest` flag to `true` if this build confirmed
-    /// latest (and updating the checkpoint-retention flag).
+    /// Reuses the snapshot when its build flags match, otherwise copies its retained state.
+    ///
+    /// The source is unchanged. Populated caches are preserved, and uninitialized cache cells
+    /// resolve independently.
     fn reuse_with_build_metadata(
         existing: &Arc<Snapshot>,
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
-    ) -> KernelResult<Arc<Snapshot>> {
-        let built_as_latest = existing.built_as_latest || built_as_latest;
+    ) -> Arc<Snapshot> {
         if existing.built_as_latest == built_as_latest
             && existing.skipped_new_checkpoints == skipped_new_checkpoints
         {
-            return Ok(existing.clone());
+            return existing.clone();
         }
-        Ok(Arc::new(Snapshot::new_with_crc(
-            existing.log_segment.clone(),
-            existing.table_configuration.clone(),
-            existing.base_crc().cloned(),
+        Arc::new(Self {
+            span: existing.span.clone(),
+            log_segment: existing.log_segment.clone(),
+            table_configuration: existing.table_configuration.clone(),
+            crc: existing.crc.clone(),
             built_as_latest,
             skipped_new_checkpoints,
-        )?))
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_action: existing.checkpoint_action.clone(),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit: existing.last_manifest_commit.clone(),
+        })
     }
 
     /// Determine the on-disk CRC file the combined segment should carry.
@@ -756,6 +773,7 @@ mod tests {
             vec![],
             &engine,
             None,
+            None,
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
             CheckpointHandling::Adopt,
@@ -841,6 +859,7 @@ mod tests {
             log_tail,
             &engine,
             Some(2),
+            None,
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
             CheckpointHandling::Adopt,
@@ -901,6 +920,7 @@ mod tests {
             vec![],
             &engine,
             Some(1),
+            None,
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
             CheckpointHandling::Adopt,
@@ -914,6 +934,7 @@ mod tests {
             vec![],
             &engine,
             Some(0),
+            None,
             SnapshotLoadMetricContext::for_test(),
             IncrementalReplay::Disabled,
             CheckpointHandling::Adopt,
