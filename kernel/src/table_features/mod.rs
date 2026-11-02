@@ -356,8 +356,20 @@ static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-// checkpointProtection restricts metadata cleanup, which Kernel does not support.
-// Any future metadata cleanup implementation must follow the feature's writer requirements:
+// checkpointProtection uses delta.requireCheckpointProtectionBeforeVersion as a protection
+// boundary:
+// - Metadata cleanup must preserve checkpoints before the boundary.
+// - Creating a checkpoint before the boundary requires support for all features in that version's
+//   protocol.
+// - History cleanup requires support for every removed version's protocol, unless a single cleanup
+//   operation removes all history before the boundary.
+// - Cleanup must remove commits before their associated checkpoints.
+//
+// The checkpoint write requirement is satisfied when creating a `CheckpointWriter`: Kernel
+// validates read and write support for the snapshot being checkpointed.
+// The metadata cleanup requirements are trivially satisfied because Kernel does not perform
+// metadata cleanup. Any future metadata cleanup implementation must follow the above writer
+// requirements. Reference:
 // https://github.com/delta-io/delta/blob/master/protocol_rfcs/checkpoint-protection.md
 static CHECKPOINT_PROTECTION_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
