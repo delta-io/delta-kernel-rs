@@ -13,6 +13,41 @@ change data feed, incremental scans (`incremental_scan_builder`) and commit rang
 tables), limited schema alteration, and catalog-managed tables. Log compaction remains disabled
 (#2337).
 
+## Documentation Ownership
+
+Choose where to document something by the reader's task and the scope of the explanation:
+
+- **Rustdoc** is authoritative for public API behavior and usage. Crate and module docs explain
+  how APIs work together and how to choose between them. Type and trait docs explain purpose,
+  lifecycle, and usage; function and method docs explain the caller's contract. Keep enough
+  context for readers to use the API without first reading the guide. Follow the
+  [comment and documentation style](#comment--doc-style), including its guidance on errors and
+  doctests.
+- **The user guide** provides introductions, longer examples, and broader connector workflows
+  that would make everyday API navigation harder if included in rustdoc. Keep enough context to
+  follow each page, and link to rustdoc for API details. Follow the
+  [guide maintenance policy](docs/user-guide/README.md#maintenance).
+- **Source comments** explain implementation invariants, pitfalls, and low-level design decisions
+  next to the code they concern.
+- **Agent docs** explain repository workflows, test helpers, code conventions, source navigation,
+  and design considerations spanning modules. Link to source comments for implementation details.
+
+Give each contract, inventory, or dependency setup example one authoritative location. Summarize
+what readers need for their task and link to that location instead of maintaining another copy.
+Use crate manifests for package and feature inventories, and the Delta protocol spec for protocol
+rules. An explanation involving several APIs can still belong in module or type rustdoc; neither
+the number of APIs nor the length alone determines its home.
+
+For example, document how to use `Snapshot::checkpoint` and its caller requirements in the method's
+rustdoc. Explain how the checkpoint APIs work together in module docs. Use the guide for a
+connector's maintenance workflow, including scheduling and operational choices, with links to the
+API details.
+
+- **Good:** Explain when to choose `Scan::execute` or `Scan::scan_metadata` in the scan module's
+  rustdoc. Use the guide to develop a distributed connector workflow using those APIs.
+- **Bad:** Replace the module explanation with "See the user guide" because it discusses multiple
+  APIs.
+
 ## Build & Test Commands
 
 > **`datafusion-executor` and `integration-tests` are separate workspaces.** Root `--workspace`
@@ -429,7 +464,7 @@ Keep this list updated when new protocol features are added to kernel.
 
 ### Doc comments
 
-- MUST include doc comments for all public functions, structs, enums, and methods;
+- MUST include doc comments for all public modules, types, traits, macros, functions, and methods;
   see below for what to put in them.
 - Start with one concise sentence describing the caller-facing behavior. Add semantics and usage
   details that help callers use the API correctly: preconditions, side effects, ownership, or edge
@@ -451,6 +486,8 @@ Keep this list updated when new protocol features are added to kernel.
   Scale their number and size to the API's complexity and importance; prefer focused examples over
   a monolithic one. An invariant tested by a doctest need not have a duplicate unit test. Don't add
   examples just to have them.
+- Use meaningful assertions in runnable doctests to check the behavior they teach. Use `no_run`
+  when execution requires external resources and `compile_fail` to demonstrate invalid usage.
 
 For example, this summary from `ColumnName::parent` explains when the result is absent:
 
@@ -510,8 +547,6 @@ Read these when relevant to the task at hand:
 - Always cross-check protocol behavior against the
   [Delta protocol spec](https://raw.githubusercontent.com/delta-io/delta/master/PROTOCOL.md)
 
-**Keeping docs current:** If you notice renamed structs, traits, functions, modules, crates, APIs,
-stale data flows, or wrong file paths in these docs,
-inform the user so they can be updated. After major changes, update this file,
-`CLAUDE/architecture.md`, `ffi/AGENTS.md`, `.github/CLAUDE.md`, and any relevant
-`<crate>/CLAUDE.md` files.
+**Keeping docs current:** Update the authoritative documentation for a changed fact, along with
+affected examples and cross-references. Use [Documentation Ownership](#documentation-ownership)
+to choose where the explanation belongs. Do not mirror a change across every agent file.
