@@ -737,7 +737,7 @@ fn hint_preserves_provenance_without_io(
     #[case] base_version: Option<u64>,
     #[case] crc_version: Option<u64>,
 ) {
-    use crate::snapshot_provenance::{snapshot_crc_provenance, snapshot_selected_checkpoint_kind};
+    use crate::snapshot::provenance::{snapshot_crc_provenance, snapshot_selected_checkpoint_kind};
     let engine = test_engine();
     let paths = [
         FfiLogPath::new(
