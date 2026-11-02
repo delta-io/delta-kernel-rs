@@ -698,7 +698,8 @@ impl Snapshot {
     }
 
     /// The table's [`GeneratedColumn`]s at this snapshot's version, in schema order. Empty when
-    /// the table has none.
+    /// the table has none, or when its protocol doesn't support the `generatedColumns` writer
+    /// feature.
     ///
     /// A connector writing to the table discovers them from
     /// [`Transaction::generated_columns`](crate::transaction::Transaction::generated_columns)

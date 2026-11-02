@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn collects_top_level_generated_columns_in_schema_order() -> KernelResult<()> {
-        // Kernel ignores the expression on the nested field `details.nested`, like Delta Spark.
+        // Kernel ignores the expression on the nested field `details.nested`.
         let schema = schema! {
             (field_with_generation_expression("event_year", DataType::INTEGER, "YEAR(event_time)")),
             nullable "event_time": TIMESTAMP,

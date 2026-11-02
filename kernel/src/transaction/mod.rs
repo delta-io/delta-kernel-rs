@@ -420,7 +420,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     }
 
     /// The effective [`GeneratedColumn`]s of this transaction, in schema order. Empty when the
-    /// table has none.
+    /// table has none, or when its protocol doesn't support the `generatedColumns` writer feature.
     ///
     /// Each generated column's value is defined by a SQL expression over the row's other columns.
     /// See [`Self::ack_generated_columns`] for what a connector must do before writing to a table
