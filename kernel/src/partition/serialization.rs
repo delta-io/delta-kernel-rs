@@ -137,11 +137,7 @@ macro_rules! format_java_float {
         let abs = v.abs();
         if (1e-3..1e7).contains(&abs) {
             let s = v.to_string();
-            if s.contains('.') {
-                s
-            } else {
-                format!("{s}.0")
-            }
+            if s.contains('.') { s } else { format!("{s}.0") }
         } else {
             let s = format!("{v:e}").replace('e', "E");
             if s.contains('.') {

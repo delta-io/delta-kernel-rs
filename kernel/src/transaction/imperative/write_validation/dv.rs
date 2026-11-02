@@ -4,9 +4,9 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use super::utils::{
+    DELETION_VECTOR_NAME, OFFSET_NAME, PATH_OR_INLINE_DV_NAME, STORAGE_TYPE_NAME,
     columns_and_types_from_schema, dv_id_at, validate_partition_keys,
-    validate_required_field_exist, DELETION_VECTOR_NAME, OFFSET_NAME, PATH_OR_INLINE_DV_NAME,
-    STORAGE_TYPE_NAME,
+    validate_required_field_exist,
 };
 use super::{FileActionUniquenessValidator, StagedDataValidator, Validation};
 use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
@@ -16,7 +16,7 @@ use crate::scan::log_replay::{
 };
 use crate::schema::ColumnNamesAndTypes;
 use crate::transaction::imperative::update_table::{
-    intermediate_dv_schema, NEW_DELETION_VECTOR_NAME,
+    NEW_DELETION_VECTOR_NAME, intermediate_dv_schema,
 };
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
@@ -161,7 +161,7 @@ mod tests {
     use test_utils::{deletion_vector_array, replace_column};
 
     use super::*;
-    use crate::arrow::array::{new_null_array, Array as _, ArrayRef, Int64Array, StructArray};
+    use crate::arrow::array::{Array as _, ArrayRef, Int64Array, StructArray, new_null_array};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };

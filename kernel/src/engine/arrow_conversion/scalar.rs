@@ -12,12 +12,12 @@
 
 // TODO: add `extract_scalar` that handles complex types (Struct, Array, Map) via recursive
 // extraction into StructData/ArrayData/MapData when there is a concrete use case.
+use crate::arrow::array::Array;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{
-    Date32Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
-    Int8Type, TimestampMicrosecondType,
+    Date32Type, Decimal128Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type,
+    Int64Type, TimestampMicrosecondType,
 };
-use crate::arrow::array::Array;
 use crate::arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
 use crate::expressions::Scalar;
 use crate::schema::DataType;
@@ -170,9 +170,9 @@ mod tests {
 
     use super::*;
     use crate::arrow::array::{
-        new_null_array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
-        Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-        LargeBinaryArray, LargeStringArray, StringArray, StructArray, TimestampMicrosecondArray,
+        ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+        Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+        LargeStringArray, StringArray, StructArray, TimestampMicrosecondArray, new_null_array,
     };
     use crate::arrow::datatypes::{Field, Fields};
     use crate::engine::arrow_conversion::TryFromArrow as _;

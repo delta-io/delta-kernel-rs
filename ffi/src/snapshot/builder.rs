@@ -11,8 +11,8 @@ use super::hint;
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::{
-    log_path, unwrap_and_parse_path_as_url, ExternEngine, KernelStringSlice, SharedExternEngine,
-    SharedSnapshot,
+    ExternEngine, KernelStringSlice, SharedExternEngine, SharedSnapshot, log_path,
+    unwrap_and_parse_path_as_url,
 };
 
 /// Opaque builder for constructing a [`SharedSnapshot`].

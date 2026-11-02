@@ -1,8 +1,8 @@
-use super::{should_compact, LogCompactionWriter, COMPACTION_ACTIONS_SCHEMA};
+use super::{COMPACTION_ACTIONS_SCHEMA, LogCompactionWriter, should_compact};
+use crate::SnapshotRef;
 use crate::action_reconciliation::RetentionCalculator;
 use crate::engine::sync::SyncEngine;
 use crate::snapshot::Snapshot;
-use crate::SnapshotRef;
 
 fn create_mock_snapshot() -> SnapshotRef {
     let path = std::fs::canonicalize(std::path::PathBuf::from(
@@ -46,10 +46,12 @@ fn test_invalid_version_range() {
     let result = LogCompactionWriter::try_new(create_mock_snapshot(), start_version, end_version);
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Invalid version range"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid version range")
+    );
 }
 
 #[test]
@@ -61,10 +63,12 @@ fn test_equal_version_range_invalid() {
     let result = LogCompactionWriter::try_new(create_mock_snapshot(), start_version, end_version);
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Invalid version range"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid version range")
+    );
 }
 
 #[test]
@@ -137,10 +141,12 @@ fn test_end_version_exceeds_snapshot_version() {
 
     let result = writer.compaction_data(&engine);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("exceeds snapshot version"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds snapshot version")
+    );
 }
 
 #[test]
@@ -248,9 +254,9 @@ async fn test_no_compaction_staged_commits() {
 
     use crate::actions::Add;
     use crate::engine::sync::SyncEngine;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStoreExt as _;
     use crate::table_features::TableFeature;
 
     // Set up in-memory store

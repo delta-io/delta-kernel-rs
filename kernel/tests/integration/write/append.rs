@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{new_null_array, Int32Array, StringArray};
+use delta_kernel::arrow::array::{Int32Array, StringArray, new_null_array};
 use delta_kernel::arrow::datatypes::{Field as ArrowField, Schema as ArrowSchema};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
@@ -12,8 +12,8 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
-use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::object_store::path::Path;
 use delta_kernel::schema::{schema, schema_ref};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
@@ -22,16 +22,16 @@ use delta_kernel::transaction::{UpdateTableOperation, WriteState};
 use delta_kernel::{KernelError, KernelResult, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
-use serde_json::{json, Deserializer};
+use serde_json::{Deserializer, json};
 use test_utils::{
-    assert_result_error_with_message, into_record_batch, load_and_begin_transaction_with,
-    modify_add_file_partition_keys, set_json_value, setup_test_tables, test_read,
-    AddFilePartitionKeyModify,
+    AddFilePartitionKeyModify, assert_result_error_with_message, into_record_batch,
+    load_and_begin_transaction_with, modify_add_file_partition_keys, set_json_value,
+    setup_test_tables, test_read,
 };
 
 use crate::common::write_utils::{
-    check_action_timestamps, get_and_check_all_parquet_sizes, get_simple_int_schema,
-    validate_txn_id, write_data_and_check_result_and_stats, ZERO_UUID,
+    ZERO_UUID, check_action_timestamps, get_and_check_all_parquet_sizes, get_simple_int_schema,
+    validate_txn_id, write_data_and_check_result_and_stats,
 };
 
 #[tokio::test]

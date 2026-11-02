@@ -55,7 +55,7 @@ mod tests {
     use crate::arrow::array::{ArrayRef, StringArray, StructArray};
     use crate::arrow::util::pretty::pretty_format_batches;
     use crate::expressions::column_name;
-    use crate::schema::{schema, schema_ref, DataType, StructField};
+    use crate::schema::{DataType, StructField, schema, schema_ref};
 
     /// Asserts `batches` pretty-print equal to `expected` (row order must match).
     fn assert_batches_eq(batches: &[RecordBatch], expected: &str) {

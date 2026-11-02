@@ -5,8 +5,8 @@ use delta_kernel::log_segment::LogSegment;
 use crate::handle::Handle;
 use crate::log_path::{FfiLogPath, LogPathArray};
 use crate::{
-    kernel_string_slice, optional_pointer, FfiSlice, KernelStringSlice, NullableCvoid,
-    OptionalValue, SharedSnapshot,
+    FfiSlice, KernelStringSlice, NullableCvoid, OptionalValue, SharedSnapshot, kernel_string_slice,
+    optional_pointer,
 };
 
 /// The files and publication state retained by a snapshot's log segment.
@@ -112,7 +112,7 @@ mod tests {
     use test_utils::{compacted_log_path_for_versions, create_log_path};
 
     use super::*;
-    use crate::{free_snapshot, TryFromStringSlice};
+    use crate::{TryFromStringSlice, free_snapshot};
 
     #[derive(Default)]
     struct CapturedLogSegment {

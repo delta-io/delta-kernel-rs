@@ -7,16 +7,16 @@
 
 use std::sync::Arc;
 
+use delta_kernel::KernelResult;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
-    schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
-    StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+    schema_ref,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::KernelResult;
 use test_utils::{
     column_mapping_fixtures as fixtures, create_table_and_load_snapshot, test_table_setup,
 };
@@ -270,10 +270,12 @@ fn test_column_mapping_invalid_mode_rejected() {
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Invalid column mapping mode"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid column mapping mode")
+    );
 }
 
 /// CREATE TABLE with column mapping disabled strips every column-mapping annotation the input

@@ -230,10 +230,12 @@ mod tests {
 
     #[test]
     fn empty_custom_operation_is_rejected() {
-        assert!(UpdateTableOperation::Custom(String::new())
-            .validate()
-            .unwrap_err()
-            .contains("cannot be empty"));
+        assert!(
+            UpdateTableOperation::Custom(String::new())
+                .validate()
+                .unwrap_err()
+                .contains("cannot be empty")
+        );
     }
 
     #[test]

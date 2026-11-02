@@ -1,10 +1,10 @@
 //! Integration tests for domain metadata set/remove flows.
 
-use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::Snapshot;
+use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::transaction::UpdateTableOperation;
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::Deserializer;
@@ -144,8 +144,8 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
 }
 
 #[tokio::test]
-async fn test_set_domain_metadata_unsupported_writer_feature(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_set_domain_metadata_unsupported_writer_feature()
+-> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = get_simple_int_schema();
@@ -170,14 +170,17 @@ async fn test_set_domain_metadata_unsupported_writer_feature(
         .with_domain_metadata("app.config".to_string(), "test_config".to_string())
         .commit(&engine);
 
-    assert_result_error_with_message(res, "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature");
+    assert_result_error_with_message(
+        res,
+        "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature",
+    );
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_remove_domain_metadata_unsupported_writer_feature(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_remove_domain_metadata_unsupported_writer_feature()
+-> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = get_simple_int_schema();
@@ -207,7 +210,10 @@ async fn test_remove_domain_metadata_unsupported_writer_feature(
         |builder| builder.with_domain_metadata_removed("app.config"),
     );
 
-    assert_result_error_with_message(res, "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature");
+    assert_result_error_with_message(
+        res,
+        "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature",
+    );
 
     Ok(())
 }
@@ -297,9 +303,10 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         .with_domain_metadata_removed("app.config")
         .build(&engine, Box::new(FileSystemCommitter::new()))
         .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("cannot be added and removed in one transaction"));
+    assert!(
+        err.to_string()
+            .contains("cannot be added and removed in one transaction")
+    );
 
     // remove then set same domain
     let err = snapshot
@@ -309,9 +316,10 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         .with_domain_metadata("test.domain", "v1")
         .build(&engine, Box::new(FileSystemCommitter::new()))
         .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("cannot be added and removed in one transaction"));
+    assert!(
+        err.to_string()
+            .contains("cannot be added and removed in one transaction")
+    );
 
     // remove same domain twice
     let err = snapshot
@@ -333,9 +341,11 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         |builder| builder.with_domain_metadata_removed("delta.system"),
     )
     .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("Cannot modify domains that start with 'delta.' as those are system controlled"));
+    assert!(
+        err.to_string().contains(
+            "Cannot modify domains that start with 'delta.' as those are system controlled"
+        )
+    );
 
     Ok(())
 }

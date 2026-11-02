@@ -4,13 +4,13 @@ use std::sync::LazyLock;
 use url::Url;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
-use crate::actions::{Metadata, Protocol, COMMIT_INFO_FIELD, METADATA_FIELD, PROTOCOL_FIELD};
+use crate::actions::{COMMIT_INFO_FIELD, METADATA_FIELD, Metadata, PROTOCOL_FIELD, Protocol};
 use crate::commit_range::with_version_context;
 use crate::engine_data::RowVisitor as _;
 use crate::path::ParsedLogPath;
-use crate::schema::{lazy_schema_ref, SchemaRef};
+use crate::schema::{SchemaRef, lazy_schema_ref};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
-use crate::table_features::{ensure_table_can_be_read, Operation};
+use crate::table_features::{Operation, ensure_table_can_be_read};
 use crate::{Engine, FileDataReadResultIterator, KernelError, KernelResult, Version};
 
 /// A Delta log action kind.

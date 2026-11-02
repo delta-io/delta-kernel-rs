@@ -1,23 +1,23 @@
 //! EngineData related ffi code
 use std::ffi::c_void;
 
+use delta_kernel::EngineData;
+#[cfg(feature = "default-engine-base")]
+use delta_kernel::KernelResult;
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::arrow;
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::arrow::array::{
-    ffi::{FFI_ArrowArray, FFI_ArrowSchema},
     ArrayData, RecordBatch, StructArray,
+    ffi::{FFI_ArrowArray, FFI_ArrowSchema},
 };
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
-use delta_kernel::EngineData;
-#[cfg(feature = "default-engine-base")]
-use delta_kernel::KernelResult;
 
 use super::handle::Handle;
+use crate::ExclusiveEngineData;
 #[cfg(feature = "default-engine-base")]
 use crate::error::AllocateErrorFn;
-use crate::ExclusiveEngineData;
 #[cfg(feature = "default-engine-base")]
 use crate::{ExternResult, IntoExternResult, SharedExternEngine};
 

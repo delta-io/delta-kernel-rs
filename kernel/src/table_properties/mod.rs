@@ -589,9 +589,11 @@ mod tests {
                 parsed.column_mapping_max_column_id, None,
                 "input: {invalid}"
             );
-            assert!(parsed
-                .unknown_properties
-                .contains_key(COLUMN_MAPPING_MAX_COLUMN_ID));
+            assert!(
+                parsed
+                    .unknown_properties
+                    .contains_key(COLUMN_MAPPING_MAX_COLUMN_ID)
+            );
         }
     }
 

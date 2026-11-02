@@ -64,7 +64,7 @@ fn emit(expr: &Expr, kernel: &Path) -> syn::Result<TokenStream> {
                     return Err(Error::new_spanned(
                         binary.op,
                         "supported operators are ==, !=, <, <=, >, >=",
-                    ))
+                    ));
                 }
             };
             let method = Ident::new(method, binary.op.span());
@@ -106,7 +106,7 @@ fn emit_call(call: &ExprCall, kernel: &Path) -> syn::Result<TokenStream> {
                     call,
                     "col() requires one string literal; \
                      use path() for explicit or computed column segments",
-                ))
+                ));
             }
         };
         return Ok(quote! { #kernel::expressions::col!(#path) });
@@ -119,7 +119,7 @@ fn emit_call(call: &ExprCall, kernel: &Path) -> syn::Result<TokenStream> {
             return Err(Error::new_spanned(
                 method,
                 format!("unsupported expression call: {name}"),
-            ))
+            ));
         }
     };
     if let Some(arity) = arity {
