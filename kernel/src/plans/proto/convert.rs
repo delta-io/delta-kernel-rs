@@ -360,6 +360,19 @@ impl From<&Expression> for proto_expr::Expression {
             Expression::MapToStruct(map_to_struct) => {
                 Kind::MapToStruct(Box::new(map_to_struct.into()))
             }
+            Expression::CaseWhen(case_when) => {
+                Kind::CaseWhen(Box::new(proto_expr::CaseWhenExpression {
+                    branches: case_when
+                        .branches
+                        .iter()
+                        .map(|(condition, result)| proto_expr::CaseWhenBranch {
+                            condition: Some(condition.into()),
+                            result: Some(result.into()),
+                        })
+                        .collect(),
+                    else_expr: Some(Box::new(case_when.else_expr.as_ref().into())),
+                }))
+            }
             // No proto cast node yet; serialize as an opaque unknown.
             Expression::Cast(cast) => Kind::Unknown(format!("cast_to_{}", cast.target)),
         };
@@ -1734,6 +1747,7 @@ mod tests {
         "map_to_struct"
     )]
     #[case(Expression::unknown("x"), "unknown")]
+    #[case(Expression::case_when([(Predicate::TRUE, lit(1))], lit(2)), "case_when")]
     fn from_expression(#[case] expr: Expression, #[case] expected: &str) {
         use proto_expr::expression::Kind;
         let kind = match proto_expr::Expression::from(&expr).kind.unwrap() {
@@ -1745,7 +1759,7 @@ mod tests {
             Kind::Unary(_) => "unary",
             Kind::Binary(_) => "binary",
             Kind::Variadic(_) => "variadic",
-            Kind::IfExpr(_) => "if_expr",
+            Kind::CaseWhen(_) => "case_when",
             Kind::Opaque(_) => "opaque",
             Kind::ParseJson(_) => "parse_json",
             Kind::MapToStruct(_) => "map_to_struct",

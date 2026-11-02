@@ -8,8 +8,8 @@ use std::cmp::Ordering;
 use tracing::{debug, warn};
 
 use crate::expressions::{
-    BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, ColumnName,
-    Expression as Expr, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
+    BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, CaseWhenExpression,
+    ColumnName, Expression as Expr, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
     OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, Predicate as Pred, Scalar,
     UnaryPredicate, UnaryPredicateOp,
 };
@@ -80,6 +80,7 @@ pub type IndirectDataSkippingPredicateEvaluator<'a> =
 /// stats-based skipping is well-defined. If an arbitrary data skipping predicate evaluates to
 /// NULL, there is no way to tell whether the original predicate really evaluated to NULL (safe to
 /// use), or the data skipping version evaluated to NULL due to missing stats (very unsafe to use).
+/// CASE WHEN inputs are first resolved to their selected result before applying this restriction.
 ///
 /// NOTE: The error-handling semantics of this trait's scalar-based predicate evaluation may differ
 /// from those of the engine's predicate evaluation, because kernel predicates don't include the
@@ -172,6 +173,15 @@ pub trait KernelPredicateEvaluator {
 
     // ==================== PROVIDED METHODS ====================
 
+    /// Selects a CASE WHEN result, or its ELSE expression if no condition is TRUE.
+    ///
+    /// Returns `None` if a condition cannot be resolved. By default, only constant conditions
+    /// are evaluated: a stats-based match does not establish which branch every row selects.
+    fn select_case_when_branch<'a>(&self, case_when: &'a CaseWhenExpression) -> Option<&'a Expr> {
+        DefaultKernelPredicateEvaluator::from(EmptyColumnResolver)
+            .select_case_when_branch(case_when)
+    }
+
     /// A (possibly inverted) boolean column access, e.g. `[NOT] <col>`.
     fn eval_pred_column(&self, col: &ColumnName, inverted: bool) -> Option<Self::Output> {
         // The expression <col> is equivalent to <col> != FALSE, and the expression NOT <col> is
@@ -186,14 +196,17 @@ pub trait KernelPredicateEvaluator {
 
     /// Dispatches a (possibly inverted) boolean expression used as a predicate
     fn eval_pred_expr(&self, expr: &Expr, inverted: bool) -> Option<Self::Output> {
-        // Directly evaluate literals and and predicates used as expressions. Evaluate columns as
-        // `<col> == TRUE`. All other expressions unsupported.
+        // Directly evaluate literals and predicates used as expressions. Evaluate columns as
+        // `<col> == TRUE`, and CASE WHEN by selecting its result expression.
         match expr {
             Expr::Literal(val) => self.eval_pred_scalar(val, inverted),
             Expr::Column(col) => self.eval_pred_column(col, inverted),
             Expr::Predicate(pred) => self.eval_pred(pred, inverted),
             Expr::Opaque(OpaqueExpression { op, exprs }) => {
                 self.eval_pred_expr_opaque(op, exprs, inverted)
+            }
+            Expr::CaseWhen(case_when) => {
+                self.eval_pred_expr(self.select_case_when_branch(case_when)?, inverted)
             }
             Expr::Struct(..)
             | Expr::StructPatch(_)
@@ -217,13 +230,14 @@ pub trait KernelPredicateEvaluator {
     ) -> Option<Self::Output> {
         match op {
             UnaryPredicateOp::IsNull => match expr {
-                // WARNING: Only literals and columns can be safely null-checked. Attempting to
-                // null-check an expressions such as `a < 10` could wrongly produce FALSE in case
-                // `a` is just plain missing (rather than known to be NULL. A missing-value can
-                // arise e.g. if data skipping encounters a column with missing stats, or if
-                // partition pruning encounters a non-partition column.
+                // Only literals and columns can be safely null-checked. Resolve CASE WHEN first.
+                // NULL from an arbitrary expression could mean missing stats or an unresolved
+                // non-partition column, rather than a known SQL NULL.
                 Expr::Literal(val) => self.eval_pred_scalar_is_null(val, inverted),
                 Expr::Column(col) => self.eval_pred_is_null(col, inverted),
+                Expr::CaseWhen(case_when) => {
+                    self.eval_pred_unary(op, self.select_case_when_branch(case_when)?, inverted)
+                }
                 Expr::Predicate(_)
                 | Expr::Struct(..)
                 | Expr::StructPatch(_)
@@ -292,6 +306,15 @@ pub trait KernelPredicateEvaluator {
         use Expr::{Cast, Column, Literal};
 
         match (left, right) {
+            (Expr::CaseWhen(case_when), right) => self.eval_pred_binary(
+                op,
+                self.select_case_when_branch(case_when)?,
+                right,
+                inverted,
+            ),
+            (left, Expr::CaseWhen(case_when)) => {
+                self.eval_pred_binary(op, left, self.select_case_when_branch(case_when)?, inverted)
+            }
             (Column(a), Column(b)) => self.eval_pred_binary_columns(op, a, b, inverted),
             (Literal(a), Literal(b)) => self.eval_pred_binary_scalars(op, a, b, inverted),
             (Column(col), Literal(val)) => match op {
@@ -659,6 +682,35 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
         self.resolver.resolve_column(col)
     }
 
+    // CASE conditions use SQL WHERE semantics: only TRUE selects a branch. Handle known NULL
+    // boolean inputs here without changing the unknown NULL sentinels used by pruning callers.
+    fn eval_case_when_condition(&self, pred: &Pred, inverted: bool) -> Option<bool> {
+        match pred {
+            Pred::Not(pred) => self.eval_case_when_condition(pred, !inverted),
+            Pred::Junction(JunctionPredicate { op, preds }) => {
+                let mut preds = preds
+                    .iter()
+                    .map(|pred| self.eval_case_when_condition(pred, inverted));
+                self.finish_eval_pred_junction(*op, &mut preds, inverted)
+            }
+            Pred::BooleanExpression(expr) => {
+                let mut expr = expr;
+                while let Expr::CaseWhen(case_when) = expr {
+                    expr = self.select_case_when_branch(case_when)?;
+                }
+                match expr {
+                    Expr::Predicate(pred) => self.eval_case_when_condition(pred, inverted),
+                    _ => match self.eval_expr(expr)? {
+                        Scalar::Boolean(value) => Some(value != inverted),
+                        Scalar::Null(DataType::BOOLEAN) => Some(false),
+                        _ => None,
+                    },
+                }
+            }
+            _ => self.eval_pred_sql_where(pred, inverted),
+        }
+    }
+
     pub(crate) fn eval_expr(&self, expr: &Expr) -> Option<Scalar> {
         match expr {
             Expr::Literal(value) => Some(value.clone()),
@@ -674,6 +726,7 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                 };
                 op_fn(&self.eval_expr(left)?, &self.eval_expr(right)?)
             }
+            Expr::CaseWhen(case_when) => self.eval_expr(self.select_case_when_branch(case_when)?),
             Expr::Variadic(_) => None, // TODO
             Expr::Opaque(OpaqueExpression { op, exprs }) => op
                 .eval_expr_scalar(&|expr| self.eval_expr(expr), exprs)
@@ -724,6 +777,15 @@ impl<R: ResolveColumnAsScalar + 'static> From<R> for DefaultKernelPredicateEvalu
 /// produce a boolean output.
 impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredicateEvaluator<R> {
     type Output = bool;
+
+    fn select_case_when_branch<'a>(&self, case_when: &'a CaseWhenExpression) -> Option<&'a Expr> {
+        for (condition, result) in &case_when.branches {
+            if self.eval_case_when_condition(condition, false)? {
+                return Some(result);
+            }
+        }
+        Some(&case_when.else_expr)
+    }
 
     fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<bool> {
         KernelPredicateEvaluatorDefaults::eval_pred_scalar(val, inverted)

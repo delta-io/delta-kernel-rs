@@ -139,10 +139,15 @@ message VariadicExpression {
   repeated Expression exprs = 2;
 }
 
-message IfExpression {
+message CaseWhenBranch {
   Predicate condition = 1;
-  Expression then_expr = 2;
-  Expression else_expr = 3;
+  Expression result = 2;
+}
+
+// Ordered branches and a required ELSE. All results must have the same logical type.
+message CaseWhenExpression {
+  repeated CaseWhenBranch branches = 1;
+  Expression else_expr = 2;
 }
 
 message ParseJsonExpression {
@@ -232,6 +237,9 @@ message Predicate {
 // ============================================================================
 
 message Expression {
+  reserved 9;
+  reserved "if_expr";
+
   oneof kind {
     Scalar literal = 1;
     ColumnName column = 2;
@@ -241,11 +249,10 @@ message Expression {
     UnaryExpression unary = 6;
     BinaryExpression binary = 7;
     VariadicExpression variadic = 8;
-    // TODO: IfExpression is not yet available in Kernel but will be needed in the future.
-    IfExpression if_expr = 9;
     OpaqueExpression opaque = 10;
     ParseJsonExpression parse_json = 11;
     MapToStructExpression map_to_struct = 12;
     string unknown = 13;
+    CaseWhenExpression case_when = 14;
   }
 }

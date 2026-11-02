@@ -363,6 +363,26 @@ pub struct VariadicExpression {
     pub exprs: Vec<Expression>,
 }
 
+/// A searched SQL `CASE WHEN` expression.
+///
+/// Conditions are checked in order. The first TRUE condition selects its result expression;
+/// FALSE and NULL conditions fall through to the next branch. Only the selected result is
+/// evaluated for each row. If no condition is TRUE, `else_expr` is evaluated.
+/// An empty branch list evaluates to `else_expr`.
+/// Every THEN result and `else_expr` must have the same logical data type, including typed NULLs.
+/// For example, integer results require an integer ELSE or a NULL typed as [`DataType::INTEGER`].
+/// No implicit casts or numeric widening are applied. Compatible engine representations of the
+/// same logical type, such as Arrow string and string-view arrays, are allowed.
+/// Runtime type validation checks evaluated results; unused branches are not evaluated to check
+/// their types.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CaseWhenExpression {
+    /// Ordered condition/result pairs.
+    pub branches: Vec<(Predicate, Expression)>,
+    /// The fallback expression when no condition is TRUE.
+    pub else_expr: Box<Expression>,
+}
+
 /// An expression that parses a JSON string column into a struct column of `output_schema`, the
 /// inverse of [`UnaryExpressionOp::ToJson`] except for the sub-millisecond timestamp precision
 /// that operator discards.
@@ -534,6 +554,8 @@ pub enum Expression {
     Binary(BinaryExpression),
     /// An expression that takes a variable number of expressions as input.
     Variadic(VariadicExpression),
+    /// A conditional expression with ordered WHEN branches and a required ELSE.
+    CaseWhen(CaseWhenExpression),
     /// An expression that the engine defines and implements. Kernel interacts with the expression
     /// only through methods provided by the [`OpaqueExpressionOp`] trait.
     #[serde(serialize_with = "fail_serialize_opaque_expression")]
@@ -669,6 +691,18 @@ impl VariadicExpression {
     ) -> Self {
         let exprs = exprs.into_iter().map(Into::into).collect();
         Self { op, exprs }
+    }
+}
+
+impl CaseWhenExpression {
+    pub(crate) fn new(
+        branches: impl IntoIterator<Item = (Predicate, Expression)>,
+        else_expr: Expression,
+    ) -> Self {
+        Self {
+            branches: branches.into_iter().collect(),
+            else_expr: Box::new(else_expr),
+        }
     }
 }
 
@@ -966,6 +1000,22 @@ impl Expression {
     /// Creates a new Array constructor expression. See [`VariadicExpressionOp::Array`].
     pub fn array(exprs: impl IntoIterator<Item = impl Into<Expression>>) -> Self {
         Self::variadic(VariadicExpressionOp::Array, exprs)
+    }
+
+    /// Creates a searched CASE expression from ordered condition/result `branches` and an
+    /// `else_expr` fallback. Empty `branches` return `else_expr` directly.
+    /// All branch results and `else_expr` must have the same logical type, including typed NULLs;
+    /// no implicit type coercion is performed.
+    /// See [`CaseWhenExpression`] for evaluation semantics.
+    pub fn case_when(
+        branches: impl IntoIterator<Item = (Predicate, Expression)>,
+        else_expr: Expression,
+    ) -> Self {
+        let branches = branches.into_iter().collect::<Vec<_>>();
+        match branches.is_empty() {
+            true => else_expr,
+            false => Self::CaseWhen(CaseWhenExpression::new(branches, else_expr)),
+        }
     }
 
     /// Creates a new opaque expression
@@ -1274,6 +1324,16 @@ impl Display for Expression {
             Variadic(VariadicExpression { op, exprs }) => {
                 write!(f, "{op}({})", format_child_list(exprs))
             }
+            CaseWhen(CaseWhenExpression {
+                branches,
+                else_expr,
+            }) => {
+                write!(f, "CASE")?;
+                for (condition, result) in branches {
+                    write!(f, " WHEN {condition} THEN {result}")?;
+                }
+                write!(f, " ELSE {else_expr} END")
+            }
             Opaque(OpaqueExpression { op, exprs }) => {
                 write!(f, "{op:?}({})", format_child_list(exprs))
             }
@@ -1424,6 +1484,20 @@ mod tests {
             (
                 Expr::cast(col!("x"), DataType::DATE),
                 "CAST(Column(x) AS date)",
+            ),
+            (
+                Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
+                "CASE WHEN Column(x) IS NULL THEN 0 ELSE Column(x) END",
+            ),
+            (
+                Expr::case_when(
+                    [
+                        (col!("x").is_null(), lit(0)),
+                        (col!("x").gt(lit(100)), lit(100)),
+                    ],
+                    col!("x"),
+                ),
+                "CASE WHEN Column(x) IS NULL THEN 0 WHEN Column(x) > 100 THEN 100 ELSE Column(x) END",
             ),
         ];
 
@@ -1666,6 +1740,27 @@ mod tests {
             lit(42i64),
         ]))]
         fn test_array_expression_roundtrip(#[case] expr: Expression) {
+            assert_roundtrip(&expr);
+        }
+
+        #[rstest::rstest]
+        fn test_case_when_expression_roundtrip(
+            #[values(0, 1, 2)] num_branches: i32,
+            #[values(Expression::literal(0), null_lit(DataType::INTEGER))] else_expr: Expression,
+        ) {
+            let branches = (0..num_branches).map(|i| {
+                (
+                    col!("a").gt(Expression::literal(i)),
+                    Expression::case_when(
+                        [(col!("flag").is_null(), Expression::literal(i))],
+                        col!("value"),
+                    ),
+                )
+            });
+            let expr = Expression::case_when(branches, else_expr.clone());
+            if num_branches == 0 {
+                assert_eq!(expr, else_expr);
+            }
             assert_roundtrip(&expr);
         }
 

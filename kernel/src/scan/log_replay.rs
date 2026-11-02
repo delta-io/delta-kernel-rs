@@ -2456,6 +2456,13 @@ mod tests {
             }
             Expression::Binary(b) => count_to_json(&b.left) + count_to_json(&b.right),
             Expression::Variadic(v) => v.exprs.iter().map(|e| count_to_json(e)).sum(),
+            Expression::CaseWhen(c) => {
+                c.branches
+                    .iter()
+                    .map(|(_, result)| count_to_json(result))
+                    .sum::<usize>()
+                    + count_to_json(&c.else_expr)
+            }
             Expression::Struct(fields, nullability) => {
                 fields.iter().map(|e| count_to_json(e)).sum::<usize>()
                     + nullability.as_ref().map_or(0, |e| count_to_json(e))
