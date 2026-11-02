@@ -770,6 +770,7 @@ mod tests {
     #[rstest::rstest]
     #[case::safe("WRITE", true)]
     #[case::streaming_update("STREAMING UPDATE", true)]
+    #[case::reorg("REORG", true)]
     #[case::unsafe_op("ANALYZE STATS", false)]
     fn on_commit_info_classifies_operation(#[case] op: &str, #[case] is_safe: bool) {
         let mut acc = CrcReplayAccumulator::new(None);
@@ -863,9 +864,11 @@ mod tests {
         assert!(acc.delta.is_incremental_safe);
     }
 
-    #[test]
-    fn on_remove_missing_size_trips_is_incremental_safe() {
+    #[rstest::rstest]
+    fn on_remove_missing_size_trips_is_incremental_safe(#[values("WRITE", "REORG")] op: &str) {
         let mut acc = CrcReplayAccumulator::new(None);
+        acc.on_commit_info_without_lmc(Some(op), None);
+        assert!(acc.delta.is_incremental_safe);
         acc.on_remove("p", None).unwrap();
         assert!(!acc.delta.is_incremental_safe);
         assert!(acc.current_commit_saw_file_action);

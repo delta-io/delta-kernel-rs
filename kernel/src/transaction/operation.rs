@@ -238,7 +238,12 @@ mod tests {
 
     #[test]
     fn custom_operations_are_never_incremental_safe() {
-        for name in ["vendor.custom/write-v2", "CREATE TABLE AS SELECT", "WRITE"] {
+        for name in [
+            "vendor.custom/write-v2",
+            "CREATE TABLE AS SELECT",
+            "WRITE",
+            "REORG",
+        ] {
             assert!(!UpdateTableOperation::Custom(name.to_string()).is_incremental_safe());
         }
     }
