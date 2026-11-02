@@ -13,9 +13,9 @@ use super::*;
 use crate::Snapshot;
 use crate::actions::visitors::{AddVisitor, SidecarVisitor};
 use crate::actions::{
-    get_all_actions_schema, get_commit_schema, Add, CheckpointMetadata, Remove, Sidecar, ADD_NAME,
-    CHECKPOINT_METADATA_NAME, COMMIT_INFO_NAME, LOG_METADATA_SCHEMA, MAX_VALUES, METADATA_NAME,
-    MIN_VALUES, NUM_RECORDS, REMOVE_NAME, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME,
+    ADD_NAME, Add, CHECKPOINT_METADATA_NAME, COMMIT_INFO_NAME, CheckpointMetadata,
+    LOG_METADATA_SCHEMA, MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS, REMOVE_NAME, Remove,
+    SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME, Sidecar, get_all_actions_schema, get_commit_schema,
 };
 use crate::arrow::array::{StringArray, StructArray};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
@@ -347,11 +347,12 @@ fn log_segment_stats_counts_only_replay_commits(
     });
     let segment = LogSegment {
         end_version: sizes.len().saturating_sub(1) as u64,
-        checkpoint_version: checkpoint_only.then_some(0),
+        checkpoint: checkpoint_only.then_some(SelectedCheckpoint {
+            version: 0,
+            checkpoint_type: CheckpointType::Unresolved,
+        }),
         log_root: Url::parse("memory:///_delta_log/").unwrap(),
         last_checkpoint_metadata: None,
-        checkpoint_type: Default::default(),
-        checkpoint_type_hint: Default::default(),
         listed: LogSegmentFiles {
             ascending_commit_files: commits,
             checkpoint_parts: if checkpoint_only {
@@ -421,11 +422,9 @@ fn log_segment_stats_uses_selected_compactions(
 ) {
     let segment = LogSegment {
         end_version: commit_sizes.len() as u64 - 1,
-        checkpoint_version: None,
+        checkpoint: None,
         log_root: Url::parse("memory:///_delta_log/").unwrap(),
         last_checkpoint_metadata: None,
-        checkpoint_type: Default::default(),
-        checkpoint_type_hint: Default::default(),
         listed: LogSegmentFiles {
             ascending_commit_files: commit_sizes
                 .iter()
@@ -836,7 +835,7 @@ async fn build_snapshot_applies_checkpoint_hint_iff_it_names_the_selected_checkp
     )
     .unwrap();
 
-    assert_eq!(log_segment.checkpoint_version, Some(5));
+    assert_eq!(log_segment.checkpoint_version(), Some(5));
     assert_eq!(log_segment.end_version, 7);
     let checkpoint_filenames = log_segment
         .listed
@@ -1628,12 +1627,11 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
 }
 
 #[rstest]
-#[case::no_sidecar_column(false, None)]
-#[case::nullable_sidecar_column(true, Some(CheckpointType::V2))]
 #[tokio::test]
-async fn classic_v2_checkpoint_type_follows_observed_actions(
-    #[case] sidecar_column: bool,
-    #[case] expected: Option<CheckpointType>,
+async fn classic_v2_checkpoint_type_is_unchanged_by_reads(
+    #[values(false, true)] sidecar_column: bool,
+    #[values(CheckpointType::Unresolved, CheckpointType::V1, CheckpointType::V2)]
+    claimed_type: CheckpointType,
 ) -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
@@ -1665,13 +1663,8 @@ async fn classic_v2_checkpoint_type_follows_observed_actions(
         None,
         None,
     )?;
-    // A normal V2 action read must override a contradictory connector claim.
-    let claim = if sidecar_column {
-        Some(CheckpointType::V1)
-    } else {
-        None
-    };
-    let segment = segment.with_checkpoint_type(claim)?;
+    let segment = segment.with_checkpoint_type(Some(claimed_type))?;
+    let before = segment.clone();
     let batches = segment.create_checkpoint_stream(
         &engine,
         get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
@@ -1684,7 +1677,8 @@ async fn classic_v2_checkpoint_type_follows_observed_actions(
         adds.visit_rows_of(batch?.actions.as_ref())?;
     }
     assert_eq!(adds.adds.len(), 1);
-    assert_eq!(segment.checkpoint_type(), expected);
+    assert_eq!(segment.checkpoint_type(), Some(claimed_type));
+    assert_eq!(segment, before);
     Ok(())
 }
 
@@ -3386,7 +3380,7 @@ async fn test_latest_commit_file_with_no_commits() {
     assert!(log_segment.listed.latest_commit_file.is_none());
 
     // The checkpoint should be at version 2
-    assert_eq!(log_segment.checkpoint_version, Some(2));
+    assert_eq!(log_segment.checkpoint_version(), Some(2));
 }
 
 #[tokio::test]
@@ -3413,13 +3407,21 @@ async fn test_latest_commit_file_with_checkpoint_at_same_version() {
     .unwrap();
 
     // The latest commit should be version 1 (saved before filtering)
-    assert_eq!(log_segment.listed.latest_commit_file.unwrap().version, 1);
+    assert_eq!(
+        log_segment
+            .listed
+            .latest_commit_file
+            .as_ref()
+            .unwrap()
+            .version,
+        1
+    );
 
     // The log segment should have no commit files (all filtered by checkpoint at version 1)
     assert_eq!(log_segment.listed.ascending_commit_files.len(), 0);
 
     // The checkpoint should be at version 1
-    assert_eq!(log_segment.checkpoint_version, Some(1));
+    assert_eq!(log_segment.checkpoint_version(), Some(1));
 }
 
 #[tokio::test]
@@ -3448,7 +3450,7 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
     assert!(log_segment.listed.latest_commit_file.is_none());
 
     // The checkpoint should be at version 1
-    assert_eq!(log_segment.checkpoint_version, Some(1));
+    assert_eq!(log_segment.checkpoint_version(), Some(1));
 
     // There should be no commits in the log segment (all filtered by checkpoint)
     assert_eq!(log_segment.listed.ascending_commit_files.len(), 0);
@@ -3678,7 +3680,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     )?;
 
     // Verify that checkpoint_schema only returns schema if it is valid
-    assert_eq!(log_segment.checkpoint_version, Some(1));
+    assert_eq!(log_segment.checkpoint_version(), Some(1));
     assert_eq!(log_segment.end_version, 2);
     if expect_hint_schema_used {
         assert_eq!(
@@ -5188,7 +5190,7 @@ async fn test_try_new_with_checkpoint_rejects_invalid_path(
         ..Default::default()
     })
     .await;
-    let result = log_segment.try_new_with_checkpoint(create_log_path(path));
+    let result = log_segment.try_new_with_checkpoint(create_log_path(path), CheckpointType::V1);
     assert_result_error_with_message(result, expected_error);
 }
 
@@ -5224,11 +5226,17 @@ async fn test_try_new_with_checkpoint(
     // TODO(#2337): restore to assert !is_empty() when log compaction is re-enabled
     assert!(log_segment.listed.ascending_compaction_files.is_empty());
 
+    let checkpoint_type = if ckpt_suffix == "checkpoint.parquet" {
+        CheckpointType::V1
+    } else {
+        CheckpointType::V2
+    };
     let result = log_segment
-        .try_new_with_checkpoint(create_log_path(&ckpt_url))
+        .try_new_with_checkpoint(create_log_path(&ckpt_url), checkpoint_type)
         .unwrap();
+    assert_eq!(result.checkpoint_type(), Some(checkpoint_type));
 
-    assert_eq!(result.checkpoint_version, Some(CHECKPOINT_VERSION));
+    assert_eq!(result.checkpoint_version(), Some(CHECKPOINT_VERSION));
     assert_eq!(result.listed.checkpoint_parts.len(), 1);
     assert_eq!(
         result.listed.checkpoint_parts[0].version,
@@ -5303,7 +5311,10 @@ async fn test_try_new_with_crc_file_sets_crc_and_preserves_other_fields() {
 
     // Everything else is preserved
     assert_eq!(result.end_version, log_segment.end_version);
-    assert_eq!(result.checkpoint_version, log_segment.checkpoint_version);
+    assert_eq!(
+        result.checkpoint_version(),
+        log_segment.checkpoint_version()
+    );
     assert_eq!(
         result.listed.ascending_commit_files.len(),
         log_segment.listed.ascending_commit_files.len()
@@ -5445,7 +5456,7 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
     let after = seg.segment_after_version(case.crc_version);
     assert_eq!(extract_commit_versions(&after), case.after_commits);
     assert_eq!(extract_compaction_ranges(&after), case.after_compactions);
-    assert!(after.checkpoint_version.is_none());
+    assert!(after.checkpoint_version().is_none());
     assert!(after.listed.checkpoint_parts.is_empty());
 }
 
@@ -5906,7 +5917,7 @@ async fn amt_last_checkpoint_hint_bounds_listing(
     match expected {
         Ok((checkpoint_version, commits)) => {
             let log_segment = log_segment.unwrap();
-            assert_eq!(log_segment.checkpoint_version, checkpoint_version);
+            assert_eq!(log_segment.checkpoint_version(), checkpoint_version);
             assert_eq!(extract_commit_versions(&log_segment), commits);
         }
         Err(message) => assert_result_error_with_message(log_segment, message),

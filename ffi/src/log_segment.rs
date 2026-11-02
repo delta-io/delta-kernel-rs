@@ -88,7 +88,7 @@ fn visit(segment: &LogSegment, context: NullableCvoid, visitor: LogSegmentVisito
     let value = FfiLogSegment {
         log_root: kernel_string_slice!(log_root),
         end_version: segment.end_version,
-        checkpoint_version: segment.checkpoint_version.into(),
+        checkpoint_version: segment.checkpoint_version().into(),
         // These arrays and their strings remain alive until the callback returns.
         commit_files: unsafe { FfiSlice::new_unsafe(&commits) },
         compaction_files: unsafe { FfiSlice::new_unsafe(&compactions) },

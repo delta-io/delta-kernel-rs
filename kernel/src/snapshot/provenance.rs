@@ -7,10 +7,13 @@ use crate::Version;
 /// A classic checkpoint filename alone does not distinguish V1 from V2.
 ///
 /// cbindgen:prefix-with-name=true
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 #[repr(C)]
 pub enum CheckpointType {
+    /// A checkpoint was selected, but its type was not established during snapshot construction.
+    #[default]
+    Unresolved,
     /// The checkpoint follows the V1 specification.
     V1,
     /// The checkpoint follows the V2 specification, with or without sidecars.
@@ -74,11 +77,10 @@ impl CrcProvenance {
 mod tests {
     use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder};
 
-    use super::*;
     use crate::Snapshot;
 
     #[rstest::rstest]
-    fn checkpoint_type_from_ordinary_scan_survives_hint(
+    fn checkpoint_provenance_is_unchanged_by_scan_and_hint_round_trip(
         #[values(false, true)] v2: bool,
         #[values(false, true)] sidecars: bool,
     ) {
@@ -101,20 +103,17 @@ mod tests {
         let snapshot = Snapshot::builder_for(table.table_root())
             .build(&engine)
             .unwrap();
+        let expected = snapshot.checkpoint_type();
+        assert!(expected.is_some());
         let scan = snapshot.clone().scan_builder().build().unwrap();
         for batch in scan.scan_metadata(&engine).unwrap() {
             batch.unwrap();
         }
-        let expected = if v2 {
-            CheckpointType::V2
-        } else {
-            CheckpointType::V1
-        };
-        assert_eq!(snapshot.checkpoint_type(), Some(expected));
+        assert_eq!(snapshot.checkpoint_type(), expected);
         let hinted = Snapshot::builder_for(table.table_root())
             .with_snapshot_hint(snapshot.to_snapshot_hint().unwrap())
             .build(&engine)
             .unwrap();
-        assert_eq!(hinted.checkpoint_type(), Some(expected));
+        assert_eq!(hinted.checkpoint_type(), expected);
     }
 }

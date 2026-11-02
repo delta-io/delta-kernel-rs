@@ -21,7 +21,7 @@ impl MetadataReplayBase {
         engine: &dyn Engine,
         planner: &MetadataPlanner<'_>,
     ) -> KernelResult<Self> {
-        let checkpoint_version = snapshot.log_segment().checkpoint_version;
+        let checkpoint_version = snapshot.log_segment().checkpoint_version();
         // Keep replay eligibility independent of SnapshotCrc's validation.
         if let Some((version, files)) = snapshot
             .base_crc()
@@ -90,7 +90,7 @@ mod tests {
             .at_version(version)
             .build(engine.as_ref())?;
         assert_eq!(
-            snapshot.log_segment().checkpoint_version,
+            snapshot.log_segment().checkpoint_version(),
             checkpoint_version
         );
         let mut crc = snapshot.crc_at_version().expect("fixture CRC").clone();

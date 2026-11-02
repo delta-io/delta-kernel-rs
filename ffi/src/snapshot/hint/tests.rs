@@ -636,7 +636,7 @@ fn exported_storage_snapshot_preserves_paths_and_retained_crc(
         .build(&table.engine())
         .unwrap();
     let segment = snapshot.log_segment();
-    assert_eq!(segment.checkpoint_version, Some(checkpoint_version));
+    assert_eq!(segment.checkpoint_version(), Some(checkpoint_version));
     assert_eq!(
         segment
             .listed
@@ -712,7 +712,9 @@ fn hint_provenance_failures_are_invalid_snapshot_hints(
 ) {
     let engine = test_engine();
     let paths = [FfiLogPath::new(
-        slice("memory:///hinted-table/_delta_log/00000000000000000001.checkpoint.550e8400-e29b-41d4-a716-446655440000.parquet"),
+        slice(
+            "memory:///hinted-table/_delta_log/00000000000000000001.checkpoint.550e8400-e29b-41d4-a716-446655440000.parquet",
+        ),
         0,
         1,
     )];
@@ -755,6 +757,12 @@ fn hint_provenance_failures_are_invalid_snapshot_hints(
 #[case::unknown(CrcSource::Unknown, None, Some(2), None)]
 #[case::unknown_stale(CrcSource::Unknown, None, Some(1), None)]
 #[case::unknown_absent(CrcSource::Unknown, None, None, None)]
+#[case::unresolved(
+    CrcSource::AtVersion,
+    Some(2),
+    Some(2),
+    Some(CheckpointType::Unresolved)
+)]
 #[case::v1(CrcSource::AtVersion, Some(2), Some(2), Some(CheckpointType::V1))]
 #[case::v2(CrcSource::AtVersion, Some(2), Some(2), Some(CheckpointType::V2))]
 fn hint_preserves_provenance_without_io(
@@ -2089,7 +2097,7 @@ fn assert_typed_checkpoint_build(
         0
     );
     let segment = snapshot_ref.log_segment();
-    assert_eq!(segment.checkpoint_version, Some(0));
+    assert_eq!(segment.checkpoint_version(), Some(0));
     assert_eq!(
         segment
             .listed

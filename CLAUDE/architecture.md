@@ -71,10 +71,11 @@ freshness, the selected log files and publication watermark, a matching checkpoi
 retained CRC baseline and provenance. It rejects log compactions. `FfiSnapshotHint` preserves this
 state, including stale CRC baselines. Export delivers one complete borrowed typed hint through a
 callback; connectors must copy any state retained after
-the callback returns. `Snapshot::checkpoint_type()` (`Option<CheckpointType>` with `V1`/`V2`) and
-`Snapshot::crc_provenance()` expose retained observations without engine I/O. Ordinary checkpoint
-reads can establish an unknown type;
-CRC reconstruction keeps the original disk baseline across incremental updates.
+the callback returns. `Snapshot::checkpoint_type()` returns `None` without a selected checkpoint,
+or `Some(Unresolved/V1/V2)` for a selected checkpoint. This observation is fixed at construction;
+scans do not refine it. `LogSegment` stores checkpoint version and type together, with no mutable
+provenance cache. `Snapshot::crc_provenance()` exposes retained checksum observations without engine
+I/O. CRC reconstruction keeps the original disk baseline across incremental updates.
 
 **Snapshot loading internals:**
 1. Ordinary builds discover commits and checkpoints through **LogSegment**

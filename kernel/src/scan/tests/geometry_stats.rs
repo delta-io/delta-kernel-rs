@@ -35,7 +35,7 @@ fn geometry_stats_are_disabled_by_default() {
 async fn geometry_bounds_reach_typed_scan_output_from_commits_and_checkpoints() {
     let (engine, table_root) = setup_geometry_stats_table().await;
     let snapshot = Snapshot::builder_for(&table_root).build(&engine).unwrap();
-    assert_eq!(snapshot.log_segment().checkpoint_version, Some(1));
+    assert_eq!(snapshot.log_segment().checkpoint_version(), Some(1));
     let builder = snapshot
         .scan_builder()
         .with_stats(StatsOptions::all_struct().with_geometry_min_max_stats(true))

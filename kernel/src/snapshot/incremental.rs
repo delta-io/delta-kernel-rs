@@ -342,7 +342,7 @@ impl Snapshot {
         let listing_base_version = match checkpoint_handling {
             CheckpointHandling::Adopt => {
                 // Start listing just after the previous segment's checkpoint, if any.
-                existing_log_segment.checkpoint_version.unwrap_or(0)
+                existing_log_segment.checkpoint_version().unwrap_or(0)
             }
             CheckpointHandling::Ignore => {
                 // TODO(#3269): If Ignore retains checkpoints, list from the existing checkpoint as
@@ -401,7 +401,7 @@ impl Snapshot {
                  older than the existing snapshot version {existing_snapshot_version}"
             )));
         }
-        if let Some(new_checkpoint_version) = new_log_segment.checkpoint_version {
+        if let Some(new_checkpoint_version) = new_log_segment.checkpoint_version() {
             if new_checkpoint_version > existing_snapshot_version {
                 // Case D.1: checkpoint ahead of existing snapshot. Commits between
                 // existing_snapshot_version+1 and new_checkpoint_version were filtered out
@@ -416,7 +416,7 @@ impl Snapshot {
 
         // Case E: no new checkpoint, version did not advance; return existing.
         if new_end_version == existing_snapshot_version
-            && new_log_segment.checkpoint_version.is_none()
+            && new_log_segment.checkpoint_version().is_none()
         {
             // We must check checkpoint_version here: if a checkpoint at or below the existing
             // snapshot version was discovered, we still need to fall through to advance the
@@ -464,7 +464,7 @@ impl Snapshot {
         // Combine existing and new log segments. When the new listing found a checkpoint at or
         // below the existing snapshot version, trim existing commits and compaction files
         // already covered by it; otherwise keep all existing files.
-        let new_checkpoint_version = new_log_segment.checkpoint_version;
+        let new_checkpoint_version = new_log_segment.checkpoint_version();
         let mut ascending_commit_files = Self::files_after_checkpoint(
             &existing_log_segment.listed.ascending_commit_files,
             new_checkpoint_version,
@@ -513,7 +513,7 @@ impl Snapshot {
             requested_version,
             new_checkpoint_hint,
         )?;
-        combined_log_segment.inherit_checkpoint_observation(existing_log_segment);
+        combined_log_segment.inherit_checkpoint_provenance(existing_log_segment);
 
         Ok(NewSegment::Combined(combined_log_segment))
     }
@@ -553,7 +553,7 @@ impl Snapshot {
     ) -> Option<ParsedLogPath> {
         let crc_satisfies_new_ckpt = |crc: &ParsedLogPath| {
             new_log_segment
-                .checkpoint_version
+                .checkpoint_version()
                 .is_none_or(|ckpt_v| crc.version >= ckpt_v)
         };
         let existing_crc_file = existing_log_segment
@@ -710,8 +710,8 @@ mod tests {
         assert_eq!(left.table_configuration, right.table_configuration);
         assert_eq!(left.log_segment.end_version, right.log_segment.end_version);
         assert_eq!(
-            left.log_segment.checkpoint_version,
-            right.log_segment.checkpoint_version
+            left.log_segment.checkpoint_version(),
+            right.log_segment.checkpoint_version()
         );
         assert_eq!(left.log_segment.log_root, right.log_segment.log_root);
         assert_eq!(left.log_segment.listed, right.log_segment.listed);
@@ -954,7 +954,7 @@ mod tests {
         let base = Snapshot::builder_for(table_root)
             .at_version(3)
             .build(ctx.engine.as_ref())?;
-        assert_eq!(base.log_segment.checkpoint_version, Some(1));
+        assert_eq!(base.log_segment.checkpoint_version(), Some(1));
 
         commit(
             table_root,
@@ -985,9 +985,9 @@ mod tests {
 
         // ===== THEN =====
         // The retained snapshot keeps the original checkpoint and every commit needed by the range.
-        assert_eq!(default_update.log_segment.checkpoint_version, Some(5));
+        assert_eq!(default_update.log_segment.checkpoint_version(), Some(5));
         assert_eq!(updated.version(), 6);
-        assert_eq!(updated.log_segment.checkpoint_version, Some(1));
+        assert_eq!(updated.log_segment.checkpoint_version(), Some(1));
         assert_eq!(
             updated.log_segment.listed.checkpoint_parts,
             base.log_segment.listed.checkpoint_parts
@@ -1248,7 +1248,7 @@ mod tests {
             .build(ctx.engine.as_ref())?;
 
         // ===== THEN =====
-        assert_eq!(default_update.log_segment.checkpoint_version, Some(4));
+        assert_eq!(default_update.log_segment.checkpoint_version(), Some(4));
 
         // ===== WHEN =====
         // Retaining commits requires the full range instead of allowing the checkpoint bridge.
@@ -1274,17 +1274,17 @@ mod tests {
         let snapshot_v1 = Snapshot::builder_for(ctx.url.as_str())
             .at_version(1)
             .build(ctx.engine.as_ref())?;
-        assert_eq!(snapshot_v1.log_segment.checkpoint_version, None);
+        assert_eq!(snapshot_v1.log_segment.checkpoint_version(), None);
 
         snapshot_v1.clone().checkpoint(ctx.engine.as_ref(), None)?;
 
         let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         assert_eq!(fresh.version(), 1);
-        assert_eq!(fresh.log_segment.checkpoint_version, Some(1));
+        assert_eq!(fresh.log_segment.checkpoint_version(), Some(1));
 
         let updated = Snapshot::builder_from(snapshot_v1).build(ctx.engine.as_ref())?;
         assert_eq!(updated.version(), 1);
-        assert_eq!(updated.log_segment.checkpoint_version, Some(1));
+        assert_eq!(updated.log_segment.checkpoint_version(), Some(1));
         compare_snapshots(&updated, &fresh);
 
         Ok(())
@@ -1305,7 +1305,7 @@ mod tests {
         let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
             .at_version(3)
             .build(ctx.engine.as_ref())?;
-        assert_eq!(snapshot_v3.log_segment.checkpoint_version, Some(1));
+        assert_eq!(snapshot_v3.log_segment.checkpoint_version(), Some(1));
 
         Snapshot::builder_for(ctx.url.as_str())
             .at_version(2)
@@ -1314,11 +1314,11 @@ mod tests {
 
         let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         assert_eq!(fresh.version(), 3);
-        assert_eq!(fresh.log_segment.checkpoint_version, Some(2));
+        assert_eq!(fresh.log_segment.checkpoint_version(), Some(2));
 
         let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
         assert_eq!(updated.version(), 3);
-        assert_eq!(updated.log_segment.checkpoint_version, Some(2));
+        assert_eq!(updated.log_segment.checkpoint_version(), Some(2));
         compare_snapshots(&updated, &fresh);
 
         Ok(())
@@ -1334,18 +1334,18 @@ mod tests {
         let snapshot_v1 = Snapshot::builder_for(ctx.url.as_str())
             .at_version(1)
             .build(ctx.engine.as_ref())?;
-        assert_eq!(snapshot_v1.log_segment.checkpoint_version, None);
+        assert_eq!(snapshot_v1.log_segment.checkpoint_version(), None);
 
         snapshot_v1.clone().checkpoint(ctx.engine.as_ref(), None)?;
 
         let refreshed = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
-        assert_eq!(refreshed.log_segment.checkpoint_version, Some(1));
+        assert_eq!(refreshed.log_segment.checkpoint_version(), Some(1));
 
         let pinned = Snapshot::builder_from(snapshot_v1.clone())
             .at_version(1)
             .build(ctx.engine.as_ref())?;
         assert!(Arc::ptr_eq(&pinned, &snapshot_v1));
-        assert_eq!(pinned.log_segment.checkpoint_version, None);
+        assert_eq!(pinned.log_segment.checkpoint_version(), None);
 
         Ok(())
     }
@@ -1394,7 +1394,7 @@ mod tests {
         let snapshot_v3 = Snapshot::builder_for(table_root)
             .at_version(3)
             .build(ctx.engine.as_ref())?;
-        assert_eq!(snapshot_v3.log_segment.checkpoint_version, Some(0));
+        assert_eq!(snapshot_v3.log_segment.checkpoint_version(), Some(0));
         assert_eq!(
             snapshot_v3
                 .table_configuration()
@@ -1424,7 +1424,7 @@ mod tests {
         // Must preserve protocol (2, 5) from commit 2, not regress to (1, 2) from checkpoint@v1.
         let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
         assert_eq!(updated.version(), 4);
-        assert_eq!(updated.log_segment.checkpoint_version, Some(1));
+        assert_eq!(updated.log_segment.checkpoint_version(), Some(1));
 
         // Critical: protocol must still be (2, 5) from commit 2, not (1, 2) from ckpt@v1.
         assert_eq!(
@@ -1858,7 +1858,7 @@ mod tests {
         let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         compare_snapshots(&updated, &fresh);
         assert_eq!(updated.version(), 3);
-        assert_eq!(updated.log_segment.checkpoint_version, Some(new_ckpt_v));
+        assert_eq!(updated.log_segment.checkpoint_version(), Some(new_ckpt_v));
         assert_eq!(
             updated
                 .log_segment
@@ -2143,7 +2143,7 @@ mod tests {
         let snapshot_v5 = Snapshot::builder_from(snapshot_v0)
             .at_version(5)
             .build(ctx.engine.as_ref())?;
-        assert_eq!(snapshot_v5.log_segment.checkpoint_version, None);
+        assert_eq!(snapshot_v5.log_segment.checkpoint_version(), None);
         assert_eq!(snapshot_v5.crc_at_version().map(|c| c.version), Some(5));
 
         // Write checkpoint at v7.
@@ -2159,7 +2159,7 @@ mod tests {
         let fresh_v10 = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         compare_snapshots(&snapshot_v10, &fresh_v10);
         assert_eq!(snapshot_v10.version(), 10);
-        assert_eq!(snapshot_v10.log_segment.checkpoint_version, Some(7));
+        assert_eq!(snapshot_v10.log_segment.checkpoint_version(), Some(7));
         assert!(snapshot_v10.crc_at_version().is_none());
 
         Ok(())
@@ -2842,7 +2842,7 @@ mod tests {
 
         let updated = Snapshot::builder_from(base).build(ctx.engine.as_ref())?;
         assert_eq!(updated.version(), 3);
-        assert_eq!(updated.log_segment.checkpoint_version, Some(3));
+        assert_eq!(updated.log_segment.checkpoint_version(), Some(3));
 
         let events = reporter.events();
         assert_eq!(

@@ -298,7 +298,7 @@ async fn test_v2_checkpoint_parquet_write() -> KernelResult<()> {
         "expected snapshot to use the written checkpoint, but checkpoint_parts is empty"
     );
     assert_eq!(
-        log_segment.checkpoint_version,
+        log_segment.checkpoint_version(),
         Some(1),
         "expected checkpoint at version 1"
     );
@@ -520,7 +520,7 @@ async fn test_v2_checkpoint_with_sidecars() -> KernelResult<()> {
         !log_segment.listed.checkpoint_parts.is_empty(),
         "fresh snapshot should load from checkpoint"
     );
-    assert_eq!(log_segment.checkpoint_version, Some(version as u64));
+    assert_eq!(log_segment.checkpoint_version(), Some(version as u64));
     assert_eq!(
         log_segment.listed.ascending_commit_files.len(),
         2,
@@ -1307,7 +1307,7 @@ async fn test_v2_sidecar_checkpoint_cross_feature(
         !log_segment.listed.checkpoint_parts.is_empty(),
         "fresh snapshot should load from the checkpoint"
     );
-    assert_eq!(log_segment.checkpoint_version, Some(version));
+    assert_eq!(log_segment.checkpoint_version(), Some(version));
     assert!(
         log_segment.listed.ascending_commit_files.is_empty(),
         "no commit files should remain after the checkpoint"
@@ -1406,7 +1406,7 @@ async fn test_v2_sidecar_consecutive_checkpoints() -> KernelResult<()> {
     let fresh = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     assert_eq!(fresh.version(), v_second);
     let log_segment = fresh.log_segment();
-    assert_eq!(log_segment.checkpoint_version, Some(v_second));
+    assert_eq!(log_segment.checkpoint_version(), Some(v_second));
     assert!(
         log_segment.listed.ascending_commit_files.is_empty(),
         "no commit files should remain after the second checkpoint"
@@ -1777,7 +1777,7 @@ async fn snapshot_selects_uuid_checkpoint_over_classic_at_one_version() -> Kerne
         vec![uuid_name.as_str()],
         "expected the uuid-named checkpoint to outrank the classic one"
     );
-    assert_eq!(log_segment.checkpoint_version, Some(version));
+    assert_eq!(log_segment.checkpoint_version(), Some(version));
 
     // The hint implies the classic checkpoint, not the selected uuid one, so its fields get
     // dropped.
