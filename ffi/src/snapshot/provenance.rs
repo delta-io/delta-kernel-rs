@@ -1,10 +1,11 @@
 //! Snapshot provenance observations, available without engine I/O.
 
-use delta_kernel::snapshot::{CrcProvenance, CrcSource, SelectedCheckpointKind};
+use delta_kernel::snapshot::{CheckpointType, CrcProvenance, CrcSource};
 
 use crate::{Handle, OptionalValue, SharedSnapshot};
 
 /// Retained checksum provenance. Contains no owned memory and needs no release.
+/// `Missing` and `Unusable` preserve observations even when no checksum is retained.
 #[derive(Debug, PartialEq)]
 #[repr(C)]
 pub struct FfiCrcProvenance {
@@ -32,15 +33,16 @@ impl FfiCrcProvenance {
     }
 }
 
-/// Returns the selected checkpoint specification without engine I/O.
+/// Returns the selected checkpoint specification, when known, without engine I/O.
+/// Returns absent if no checkpoint was selected or its specification is not yet known.
 ///
 /// # Safety
 /// `snapshot` must be valid and remain owned by the caller throughout the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapshot_selected_checkpoint_kind(
+pub unsafe extern "C" fn snapshot_checkpoint_type(
     snapshot: Handle<SharedSnapshot>,
-) -> SelectedCheckpointKind {
-    unsafe { snapshot.as_ref() }.selected_checkpoint_kind()
+) -> OptionalValue<CheckpointType> {
+    unsafe { snapshot.as_ref() }.checkpoint_type().into()
 }
 
 /// Writes the retained checksum provenance to `out` without engine I/O.

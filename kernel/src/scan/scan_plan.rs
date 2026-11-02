@@ -792,8 +792,8 @@ mod tests {
                 ..Default::default()
             },
             last_checkpoint_metadata: None,
-            checkpoint_kind: Default::default(),
-            checkpoint_kind_hint: Default::default(),
+            checkpoint_type: Default::default(),
+            checkpoint_type_hint: Default::default(),
         }
     }
 

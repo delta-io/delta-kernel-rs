@@ -65,7 +65,7 @@ pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder
 #[allow(unused_imports)]
 #[internal_api]
 pub(crate) use hint::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
-pub use provenance::{CrcProvenance, CrcSource, SelectedCheckpointKind};
+pub use provenance::{CheckpointType, CrcProvenance, CrcSource};
 pub use reader::SnapshotReader;
 pub(crate) use snapshot_crc::CrcOrigin;
 use snapshot_crc::SnapshotCrc;
@@ -599,12 +599,13 @@ impl Snapshot {
         self.crc.provenance()
     }
 
-    /// Returns the selected checkpoint specification without performing engine I/O.
+    /// Returns the selected checkpoint specification, when known, without performing engine I/O.
     ///
-    /// Ordinary checkpoint reads may refine an unknown observation. The table's configured
+    /// Returns `None` if no checkpoint was selected or its specification is not yet known.
+    /// Ordinary checkpoint reads may establish the type. The table's configured
     /// checkpoint policy does not determine this value.
-    pub fn selected_checkpoint_kind(&self) -> SelectedCheckpointKind {
-        self.log_segment.selected_checkpoint_kind()
+    pub fn checkpoint_type(&self) -> Option<CheckpointType> {
+        self.log_segment.checkpoint_type()
     }
 
     /// Captures retained snapshot state as an owned hint without engine I/O.
@@ -1680,10 +1681,10 @@ impl Snapshot {
         let new_log_segment = self
             .log_segment
             .try_new_with_checkpoint(checkpoint_log_path)?;
-        new_log_segment.observe_checkpoint_kind(if v2_supported {
-            SelectedCheckpointKind::V2
+        new_log_segment.observe_checkpoint_type(if v2_supported {
+            CheckpointType::V2
         } else {
-            SelectedCheckpointKind::V1
+            CheckpointType::V1
         });
         // Carry only an at-version CRC forward: the checkpoint drops the commits below it, so a
         // stale base could no longer be advanced over them. Dropping it leaves unknown CRC origin.

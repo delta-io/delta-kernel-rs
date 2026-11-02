@@ -25,7 +25,7 @@ use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{col, column_name};
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::last_checkpoint_hint::{AmtCheckpoint, CheckpointType};
+use crate::last_checkpoint_hint::{AmtCheckpoint, CheckpointType as LastCheckpointType};
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
@@ -46,7 +46,7 @@ use crate::scan::{
 use crate::schema::{
     DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType, schema, schema_ref,
 };
-use crate::snapshot::SelectedCheckpointKind;
+use crate::snapshot::CheckpointType;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table, write_commit,
@@ -350,8 +350,8 @@ fn log_segment_stats_counts_only_replay_commits(
         checkpoint_version: checkpoint_only.then_some(0),
         log_root: Url::parse("memory:///_delta_log/").unwrap(),
         last_checkpoint_metadata: None,
-        checkpoint_kind: Default::default(),
-        checkpoint_kind_hint: Default::default(),
+        checkpoint_type: Default::default(),
+        checkpoint_type_hint: Default::default(),
         listed: LogSegmentFiles {
             ascending_commit_files: commits,
             checkpoint_parts: if checkpoint_only {
@@ -424,8 +424,8 @@ fn log_segment_stats_uses_selected_compactions(
         checkpoint_version: None,
         log_root: Url::parse("memory:///_delta_log/").unwrap(),
         last_checkpoint_metadata: None,
-        checkpoint_kind: Default::default(),
-        checkpoint_kind_hint: Default::default(),
+        checkpoint_type: Default::default(),
+        checkpoint_type_hint: Default::default(),
         listed: LogSegmentFiles {
             ascending_commit_files: commit_sizes
                 .iter()
@@ -1628,12 +1628,12 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
 }
 
 #[rstest]
-#[case::no_sidecar_column(false, SelectedCheckpointKind::Unknown)]
-#[case::nullable_sidecar_column(true, SelectedCheckpointKind::V2)]
+#[case::no_sidecar_column(false, None)]
+#[case::nullable_sidecar_column(true, Some(CheckpointType::V2))]
 #[tokio::test]
-async fn classic_v2_checkpoint_kind_follows_observed_actions(
+async fn classic_v2_checkpoint_type_follows_observed_actions(
     #[case] sidecar_column: bool,
-    #[case] expected: SelectedCheckpointKind,
+    #[case] expected: Option<CheckpointType>,
 ) -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
@@ -1667,11 +1667,11 @@ async fn classic_v2_checkpoint_kind_follows_observed_actions(
     )?;
     // A normal V2 action read must override a contradictory connector claim.
     let claim = if sidecar_column {
-        SelectedCheckpointKind::V1
+        Some(CheckpointType::V1)
     } else {
-        SelectedCheckpointKind::Unknown
+        None
     };
-    let segment = segment.with_checkpoint_kind(claim)?;
+    let segment = segment.with_checkpoint_type(claim)?;
     let batches = segment.create_checkpoint_stream(
         &engine,
         get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
@@ -1684,7 +1684,7 @@ async fn classic_v2_checkpoint_kind_follows_observed_actions(
         adds.visit_rows_of(batch?.actions.as_ref())?;
     }
     assert_eq!(adds.adds.len(), 1);
-    assert_eq!(segment.selected_checkpoint_kind(), expected);
+    assert_eq!(segment.checkpoint_type(), expected);
     Ok(())
 }
 
@@ -5882,7 +5882,7 @@ async fn amt_last_checkpoint_hint_bounds_listing(
     let hint = LastCheckpointHint {
         version: 5,
         size: 10,
-        checkpoint_type: Some(CheckpointType::AdaptiveMetadataTree),
+        checkpoint_type: Some(LastCheckpointType::AdaptiveMetadataTree),
         amt_checkpoint: Some(AmtCheckpoint {
             manifest_commit_version,
             ..Default::default()
@@ -5931,7 +5931,7 @@ fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> KernelResul
     let hint = LastCheckpointHint {
         version: 2,
         size: 1,
-        checkpoint_type: Some(CheckpointType::AdaptiveMetadataTree),
+        checkpoint_type: Some(LastCheckpointType::AdaptiveMetadataTree),
         amt_checkpoint: Some(AmtCheckpoint {
             manifest_commit_version: 2,
             ..Default::default()

@@ -26,6 +26,7 @@ use crate::ffi_test_utils::{
     ok_or_panic,
 };
 use crate::log_path::FfiLogPath;
+use crate::snapshot::provenance::{snapshot_checkpoint_type, snapshot_crc_provenance};
 use crate::{
     FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats, KernelI64Slice, KernelStringSlice,
     OptionalValue, SharedExternEngine, engine_to_handle, free_engine, free_snapshot,
@@ -253,7 +254,7 @@ fn test_snapshot_hint(
         last_checkpoint: std::ptr::null(),
         crc: std::ptr::null(),
         publication_watermark: FfiPublicationWatermark::InferFromLogPaths,
-        checkpoint_kind: SelectedCheckpointKind::Unknown,
+        checkpoint_type: OptionalValue::None,
         crc_provenance: FfiCrcProvenance {
             source: CrcSource::Unknown,
             base_version: OptionalValue::None,
@@ -498,7 +499,7 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
     let expected_crc = source.crc_at_version().cloned();
     let expected_base_crc = source.to_snapshot_hint().unwrap().base_crc().cloned();
     let expected_provenance = source.crc_provenance();
-    let expected_checkpoint_kind = source.selected_checkpoint_kind();
+    let expected_checkpoint_type = source.checkpoint_type();
     let expected_latest = source.is_built_as_latest();
     let files = &expected_segment.listed;
     let expected_files: BTreeMap<_, _> = files
@@ -561,10 +562,7 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
         expected_base_crc.as_ref()
     );
     assert_eq!(rebuilt_ref.crc_provenance(), expected_provenance);
-    assert_eq!(
-        rebuilt_ref.selected_checkpoint_kind(),
-        expected_checkpoint_kind
-    );
+    assert_eq!(rebuilt_ref.checkpoint_type(), expected_checkpoint_type);
     assert_eq!(rebuilt_ref.is_built_as_latest(), expected_latest);
     unsafe {
         free_snapshot(rebuilt);
@@ -667,30 +665,70 @@ struct VisitedHint {
 }
 
 #[rstest::rstest]
-#[case::crc_before_checkpoint(0, SelectedCheckpointKind::Unknown, CrcSource::Stale, 0)]
-#[case::checkpoint_claim(1, SelectedCheckpointKind::None, CrcSource::AtVersion, 1)]
-#[case::crc_claim(1, SelectedCheckpointKind::Unknown, CrcSource::Reconstructed { num_commits: 2 }, 0)]
+#[case::crc_before_checkpoint(
+    Some(0),
+    None,
+    CrcSource::Stale,
+    Some(0),
+    "is below checkpoint version"
+)]
+#[case::checkpoint_claim(
+    Some(1),
+    Some(CheckpointType::V1),
+    CrcSource::AtVersion,
+    Some(1),
+    "checkpoint provenance conflicts"
+)]
+#[case::crc_claim(Some(1), None, CrcSource::Reconstructed { num_commits: 2 }, Some(0), "checksum provenance conflicts")]
+#[case::at_version_without_crc(
+    None,
+    None,
+    CrcSource::AtVersion,
+    Some(1),
+    "checksum provenance conflicts"
+)]
+#[case::reconstructed_without_crc(None, None, CrcSource::Reconstructed { num_commits: 1 }, Some(0), "checksum provenance conflicts")]
+#[case::stale_without_crc(None, None, CrcSource::Stale, Some(0), "checksum provenance conflicts")]
+#[case::missing_with_crc(
+    Some(1),
+    None,
+    CrcSource::Missing,
+    None,
+    "checksum provenance conflicts"
+)]
+#[case::unusable_with_crc(
+    Some(1),
+    None,
+    CrcSource::Unusable,
+    None,
+    "checksum provenance conflicts"
+)]
 fn hint_provenance_failures_are_invalid_snapshot_hints(
-    #[case] crc_version: u64,
-    #[case] checkpoint_kind: SelectedCheckpointKind,
+    #[case] crc_version: Option<u64>,
+    #[case] checkpoint_type: Option<CheckpointType>,
     #[case] source: CrcSource,
-    #[case] base_version: u64,
+    #[case] base_version: Option<u64>,
+    #[case] expected_message: &str,
 ) {
     let engine = test_engine();
     let paths = [FfiLogPath::new(
-        slice("memory:///hinted-table/_delta_log/00000000000000000001.checkpoint.parquet"),
+        slice("memory:///hinted-table/_delta_log/00000000000000000001.checkpoint.550e8400-e29b-41d4-a716-446655440000.parquet"),
         0,
         1,
     )];
     let mut crc = empty_crc();
-    crc.version = crc_version;
+    crc.version = crc_version.unwrap_or(0);
     let hint = FfiSnapshotHint {
-        checkpoint_kind,
+        checkpoint_type: checkpoint_type.into(),
         crc_provenance: FfiCrcProvenance {
             source,
-            base_version: OptionalValue::Some(base_version),
+            base_version: base_version.into(),
         },
-        crc: &crc,
+        crc: if crc_version.is_some() {
+            &crc
+        } else {
+            std::ptr::null()
+        },
         ..test_snapshot_hint(&paths, 1, FfiSnapshotHintFreshness::Latest)
     };
     let builder = unsafe {
@@ -700,27 +738,33 @@ fn hint_provenance_failures_are_invalid_snapshot_hints(
         ))
     };
     let result = unsafe { snapshot_builder_build(builder) };
-    assert_extern_result_error_with_message(result, FFIKernelError::InvalidSnapshotHint, None);
+    assert_extern_result_error_contains(
+        result,
+        FFIKernelError::InvalidSnapshotHint,
+        expected_message,
+    );
     unsafe { free_engine(engine) };
 }
 
 #[rstest::rstest]
-#[case::at_version(CrcSource::AtVersion, Some(2), Some(2))]
-#[case::reconstructed(CrcSource::Reconstructed { num_commits: 2 }, Some(0), Some(2))]
-#[case::stale(CrcSource::Stale, Some(0), Some(1))]
-#[case::missing(CrcSource::Missing, None, None)]
-#[case::unusable(CrcSource::Unusable, None, None)]
-#[case::unknown(CrcSource::Unknown, None, Some(2))]
-#[case::unknown_stale(CrcSource::Unknown, None, Some(1))]
-#[case::unknown_absent(CrcSource::Unknown, None, None)]
+#[case::at_version(CrcSource::AtVersion, Some(2), Some(2), None)]
+#[case::reconstructed(CrcSource::Reconstructed { num_commits: 2 }, Some(0), Some(2), None)]
+#[case::stale(CrcSource::Stale, Some(0), Some(1), None)]
+#[case::missing(CrcSource::Missing, None, None, None)]
+#[case::unusable(CrcSource::Unusable, None, None, None)]
+#[case::unknown(CrcSource::Unknown, None, Some(2), None)]
+#[case::unknown_stale(CrcSource::Unknown, None, Some(1), None)]
+#[case::unknown_absent(CrcSource::Unknown, None, None, None)]
+#[case::v1(CrcSource::AtVersion, Some(2), Some(2), Some(CheckpointType::V1))]
+#[case::v2(CrcSource::AtVersion, Some(2), Some(2), Some(CheckpointType::V2))]
 fn hint_preserves_provenance_without_io(
     #[case] source: CrcSource,
     #[case] base_version: Option<u64>,
     #[case] crc_version: Option<u64>,
+    #[case] checkpoint_type: Option<CheckpointType>,
 ) {
-    use crate::snapshot::provenance::{snapshot_crc_provenance, snapshot_selected_checkpoint_kind};
     let engine = test_engine();
-    let paths = [
+    let mut paths = vec![
         FfiLogPath::new(
             slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
             0,
@@ -737,10 +781,17 @@ fn hint_preserves_provenance_without_io(
             1,
         ),
     ];
+    if checkpoint_type.is_some() {
+        paths.push(FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000000.checkpoint.parquet"),
+            0,
+            1,
+        ));
+    }
     let mut crc = empty_crc();
     crc.version = crc_version.unwrap_or(0);
     let hint = FfiSnapshotHint {
-        checkpoint_kind: SelectedCheckpointKind::None,
+        checkpoint_type: checkpoint_type.into(),
         crc_provenance: FfiCrcProvenance {
             source,
             base_version: base_version.into(),
@@ -763,8 +814,10 @@ fn hint_preserves_provenance_without_io(
     unsafe { snapshot_crc_provenance(snapshot.shallow_copy(), observed.as_mut_ptr()) };
     assert_eq!(unsafe { observed.assume_init() }, hint.crc_provenance);
     assert_eq!(
-        unsafe { snapshot_selected_checkpoint_kind(snapshot.shallow_copy()) },
-        hint.checkpoint_kind
+        Option::<CheckpointType>::from(unsafe {
+            snapshot_checkpoint_type(snapshot.shallow_copy())
+        }),
+        Option::<&CheckpointType>::from(&hint.checkpoint_type).copied()
     );
     let mut state = VisitedHint {
         builder: Some(test_builder(&engine)),
@@ -789,7 +842,10 @@ fn hint_preserves_provenance_without_io(
         rebuilt_ref.crc_provenance(),
         hint.crc_provenance.to_kernel()
     );
-    assert_eq!(rebuilt_ref.selected_checkpoint_kind(), hint.checkpoint_kind);
+    assert_eq!(
+        rebuilt_ref.checkpoint_type(),
+        Option::<&CheckpointType>::from(&hint.checkpoint_type).copied()
+    );
     assert_eq!(
         rebuilt_ref
             .to_snapshot_hint()

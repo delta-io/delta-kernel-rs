@@ -6,31 +6,31 @@ use crate::engine_data::{GetData, TypedGetData as _};
 use crate::error::SnapshotHintError;
 use crate::path::LogPathFileType;
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType, StructType};
-use crate::snapshot::SelectedCheckpointKind;
+use crate::snapshot::CheckpointType;
 use crate::{KernelError, KernelResult, RowVisitor};
 
 impl LogSegment {
-    pub(crate) fn selected_checkpoint_kind(&self) -> SelectedCheckpointKind {
+    pub(crate) fn checkpoint_type(&self) -> Option<CheckpointType> {
         match self
             .listed
             .checkpoint_parts
             .first()
             .map(|part| &part.file_type)
         {
-            Option::None => SelectedCheckpointKind::None,
-            Some(LogPathFileType::MultiPartCheckpoint { .. }) => SelectedCheckpointKind::V1,
-            Some(LogPathFileType::UuidCheckpoint) => SelectedCheckpointKind::V2,
+            None => None,
+            Some(LogPathFileType::MultiPartCheckpoint { .. }) => Some(CheckpointType::V1),
+            Some(LogPathFileType::UuidCheckpoint) => Some(CheckpointType::V2),
             _ => {
-                if let Some(kind) = self.checkpoint_kind.get() {
-                    return *kind;
+                if let Some(checkpoint_type) = self.checkpoint_type.get() {
+                    return Some(*checkpoint_type);
                 }
                 if self
                     .checkpoint_hint_schema()
                     .is_some_and(|schema| !schema.contains(CHECKPOINT_METADATA_NAME))
                 {
-                    return SelectedCheckpointKind::V1;
+                    return Some(CheckpointType::V1);
                 }
-                self.checkpoint_kind_hint
+                self.checkpoint_type_hint
             }
         }
     }
@@ -39,17 +39,12 @@ impl LogSegment {
         // V2 requires a checkpointMetadata action. Its absence from the full schema proves V1;
         // presence of a nullable column alone does not prove a non-null action exists.
         if !schema.contains(CHECKPOINT_METADATA_NAME) {
-            self.observe_checkpoint_kind(SelectedCheckpointKind::V1);
+            self.observe_checkpoint_type(CheckpointType::V1);
         }
     }
 
-    pub(crate) fn observe_checkpoint_kind(&self, kind: SelectedCheckpointKind) {
-        if matches!(
-            kind,
-            SelectedCheckpointKind::V1 | SelectedCheckpointKind::V2
-        ) {
-            let _ = self.checkpoint_kind.set(kind);
-        }
+    pub(crate) fn observe_checkpoint_type(&self, checkpoint_type: CheckpointType) {
+        let _ = self.checkpoint_type.set(checkpoint_type);
     }
 
     pub(crate) fn inherit_checkpoint_observation(&mut self, previous: &Self) {
@@ -64,27 +59,26 @@ impl LogSegment {
                 .iter()
                 .map(|part| &part.location.location))
         {
-            self.checkpoint_kind = previous.checkpoint_kind.clone();
-            self.checkpoint_kind_hint = previous.checkpoint_kind_hint;
+            self.checkpoint_type = previous.checkpoint_type.clone();
+            self.checkpoint_type_hint = previous.checkpoint_type_hint;
         }
     }
 
-    pub(crate) fn with_checkpoint_kind(
+    pub(crate) fn with_checkpoint_type(
         mut self,
-        kind: SelectedCheckpointKind,
+        checkpoint_type: Option<CheckpointType>,
     ) -> KernelResult<Self> {
-        let established = self.selected_checkpoint_kind();
-        if kind != SelectedCheckpointKind::Unknown
-            && established != SelectedCheckpointKind::Unknown
-            && kind != established
-        {
-            return Err(SnapshotHintError::CheckpointProvenanceConflict.into());
+        if let Some(checkpoint_type) = checkpoint_type {
+            if self.checkpoint_version.is_none()
+                || self
+                    .checkpoint_type()
+                    .is_some_and(|established| checkpoint_type != established)
+            {
+                return Err(SnapshotHintError::CheckpointProvenanceConflict.into());
+            }
         }
-        if kind == SelectedCheckpointKind::None && self.checkpoint_version.is_some() {
-            return Err(SnapshotHintError::CheckpointProvenanceConflict.into());
-        }
-        // Keep connector claims separate so ordinary reads can establish the actual kind.
-        self.checkpoint_kind_hint = kind;
+        // Keep connector claims separate so ordinary reads can establish the actual type.
+        self.checkpoint_type_hint = checkpoint_type;
         Ok(self)
     }
 }
@@ -160,46 +154,55 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case("00000000000000000000.json", SelectedCheckpointKind::None)]
-    #[case(
-        "00000000000000000000.checkpoint.parquet",
-        SelectedCheckpointKind::Unknown
-    )]
+    #[case("00000000000000000000.json", None)]
+    #[case("00000000000000000000.checkpoint.parquet", None)]
     #[case(
         "00000000000000000000.checkpoint.0000000001.0000000002.parquet",
-        SelectedCheckpointKind::V1
+        Some(CheckpointType::V1)
     )]
     #[case(
         "00000000000000000000.checkpoint.550e8400-e29b-41d4-a716-446655440000.parquet",
-        SelectedCheckpointKind::V2
+        Some(CheckpointType::V2)
     )]
     fn checkpoint_filename_evidence(
         #[case] filename: &str,
-        #[case] expected: SelectedCheckpointKind,
+        #[case] expected: Option<CheckpointType>,
     ) {
-        assert_eq!(segment(filename).selected_checkpoint_kind(), expected);
+        assert_eq!(segment(filename).checkpoint_type(), expected);
+    }
+
+    #[rstest::rstest]
+    #[case("00000000000000000000.json", CheckpointType::V1)]
+    #[case("00000000000000000000.json", CheckpointType::V2)]
+    #[case(
+        "00000000000000000000.checkpoint.0000000001.0000000002.parquet",
+        CheckpointType::V2
+    )]
+    #[case(
+        "00000000000000000000.checkpoint.550e8400-e29b-41d4-a716-446655440000.parquet",
+        CheckpointType::V1
+    )]
+    fn checkpoint_type_rejects_inconsistent_claims(
+        #[case] filename: &str,
+        #[case] checkpoint_type: CheckpointType,
+    ) {
+        assert!(matches!(
+            segment(filename).with_checkpoint_type(Some(checkpoint_type)),
+            Err(KernelError::SnapshotHint(error)) if matches!(*error, SnapshotHintError::CheckpointProvenanceConflict)
+        ));
     }
 
     #[test]
     fn checkpoint_reads_override_hint_claims() {
         let segment = segment("00000000000000000000.checkpoint.parquet")
-            .with_checkpoint_kind(SelectedCheckpointKind::V1)
+            .with_checkpoint_type(Some(CheckpointType::V1))
             .unwrap();
-        assert_eq!(
-            segment.selected_checkpoint_kind(),
-            SelectedCheckpointKind::V1
-        );
-        segment.observe_checkpoint_kind(SelectedCheckpointKind::V2);
-        assert_eq!(
-            segment.selected_checkpoint_kind(),
-            SelectedCheckpointKind::V2
-        );
+        assert_eq!(segment.checkpoint_type(), Some(CheckpointType::V1));
+        segment.observe_checkpoint_type(CheckpointType::V2);
+        assert_eq!(segment.checkpoint_type(), Some(CheckpointType::V2));
         let mut inherited = segment.clone();
         inherited.inherit_checkpoint_observation(&segment);
-        assert_eq!(
-            inherited.selected_checkpoint_kind(),
-            SelectedCheckpointKind::V2
-        );
+        assert_eq!(inherited.checkpoint_type(), Some(CheckpointType::V2));
     }
 
     #[test]
@@ -215,36 +218,21 @@ mod tests {
         segment.observe_checkpoint_schema(&StructType::new_unchecked([
             CHECKPOINT_METADATA_FIELD.clone()
         ]));
-        assert_eq!(
-            segment.selected_checkpoint_kind(),
-            SelectedCheckpointKind::Unknown
-        );
-        segment.observe_checkpoint_kind(SelectedCheckpointKind::V2);
-        assert_eq!(
-            segment.selected_checkpoint_kind(),
-            SelectedCheckpointKind::V2
-        );
+        assert_eq!(segment.checkpoint_type(), None);
+        segment.observe_checkpoint_type(CheckpointType::V2);
+        assert_eq!(segment.checkpoint_type(), Some(CheckpointType::V2));
         assert_eq!(segment, independent);
-        assert_eq!(
-            independent.selected_checkpoint_kind(),
-            SelectedCheckpointKind::Unknown
-        );
+        assert_eq!(independent.checkpoint_type(), None);
         let mut inherited = independent;
         // Listing metadata can change without changing the immutable checkpoint's identity.
         inherited.listed.checkpoint_parts[0].location.last_modified += 1;
         inherited.inherit_checkpoint_observation(&segment);
-        assert_eq!(
-            inherited.selected_checkpoint_kind(),
-            SelectedCheckpointKind::V2
-        );
+        assert_eq!(inherited.checkpoint_type(), Some(CheckpointType::V2));
         inherited.listed.checkpoint_parts[0].location.location =
             url::Url::parse("memory:///other/_delta_log/00000000000000000000.checkpoint.parquet")
                 .unwrap();
-        inherited.checkpoint_kind = Default::default();
+        inherited.checkpoint_type = Default::default();
         inherited.inherit_checkpoint_observation(&segment);
-        assert_eq!(
-            inherited.selected_checkpoint_kind(),
-            SelectedCheckpointKind::Unknown
-        );
+        assert_eq!(inherited.checkpoint_type(), None);
     }
 }

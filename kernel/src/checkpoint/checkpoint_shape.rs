@@ -127,8 +127,7 @@ impl CheckpointShape {
                 // confirm whether a sidecar is actually present.
                 match collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)? {
                     Some(sidecar) => {
-                        segment
-                            .observe_checkpoint_kind(crate::snapshot::SelectedCheckpointKind::V2);
+                        segment.observe_checkpoint_type(crate::snapshot::CheckpointType::V2);
                         Self::try_new_manifest(
                             exec,
                             sidecar,

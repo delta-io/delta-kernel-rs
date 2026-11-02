@@ -12,9 +12,7 @@ use crate::log_path::LogPath;
 use crate::log_segment::{LogSegment, validate_catalog_managed_versions};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::path::{LogPathFileType, ParsedLogPath, DELTA_LOG_DIR_WITH_SLASH};
-use crate::snapshot::{
-    CrcOrigin, CrcProvenance, IncrementalReplay, SelectedCheckpointKind, SnapshotRef,
-};
+use crate::snapshot::{CheckpointType, CrcOrigin, CrcProvenance, IncrementalReplay, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
 use crate::{KernelError, KernelResult, Snapshot, Version};
@@ -86,7 +84,7 @@ pub(crate) struct SnapshotHint {
     crc: Option<Arc<Crc>>,
     /// Whether `version` was established as latest when the hint was captured.
     freshness: SnapshotHintFreshness,
-    provenance: Option<(SelectedCheckpointKind, CrcProvenance)>,
+    provenance: Option<(Option<CheckpointType>, CrcProvenance)>,
 }
 
 impl SnapshotHint {
@@ -130,7 +128,7 @@ impl SnapshotHint {
         last_checkpoint_hint: Option<LastCheckpointHint>,
         crc: Option<Arc<Crc>>,
         freshness: SnapshotHintFreshness,
-        provenance: Option<(SelectedCheckpointKind, CrcProvenance)>,
+        provenance: Option<(Option<CheckpointType>, CrcProvenance)>,
     ) -> KernelResult<Self> {
         let log_root = try_parse_uri(table_root)?.join(DELTA_LOG_DIR_WITH_SLASH)?;
         let mut parsed_paths: Vec<ParsedLogPath> = log_paths.into_iter().map(Into::into).collect();
@@ -175,7 +173,7 @@ impl SnapshotHint {
     /// Returns retained observations, if supplied or captured from a snapshot.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn provenance(&self) -> Option<(SelectedCheckpointKind, CrcProvenance)> {
+    pub(crate) fn provenance(&self) -> Option<(Option<CheckpointType>, CrcProvenance)> {
         self.provenance
     }
 
@@ -266,10 +264,7 @@ impl SnapshotHint {
             metadata: snapshot.table_configuration().metadata().clone(),
             last_checkpoint_hint: segment.checkpoint_hint().cloned(),
             crc: snapshot.base_crc().cloned(),
-            provenance: Some((
-                snapshot.selected_checkpoint_kind(),
-                snapshot.crc_provenance(),
-            )),
+            provenance: Some((snapshot.checkpoint_type(), snapshot.crc_provenance())),
             freshness: if snapshot.is_built_as_latest() {
                 SnapshotHintFreshness::Latest
             } else {
@@ -427,7 +422,7 @@ impl SnapshotHint {
 
         let mut snapshot = Snapshot::new_with_crc(
             match provenance {
-                Some((kind, _)) => log_segment.with_checkpoint_kind(kind)?,
+                Some((checkpoint_type, _)) => log_segment.with_checkpoint_type(checkpoint_type)?,
                 None => log_segment,
             },
             table_configuration,
@@ -1436,7 +1431,7 @@ mod tests {
         let crc_version = checkpoint - 1;
         Arc::make_mut(hint.crc.as_mut().unwrap()).version = crc_version;
         hint.provenance = Some((
-            SelectedCheckpointKind::Unknown,
+            None,
             CrcProvenance::new(crate::snapshot::CrcSource::Stale, Some(crc_version)),
         ));
         let error = SnapshotBuilder::new_for(table_root)
