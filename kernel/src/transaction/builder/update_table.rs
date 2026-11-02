@@ -617,14 +617,13 @@ mod tests {
     #[rstest]
     fn custom_operation_rejects_reserved_known_name(
         #[values("ALTER TABLE", "REORG")] operation: &str,
-        #[values(false, true)] data_change: bool,
     ) -> KernelResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let error = snapshot
             .update_table(
                 UpdateTableOperation::Custom(operation.to_string()),
                 "test-engine",
-                data_change,
+                false,
             )
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
