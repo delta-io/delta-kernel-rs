@@ -247,6 +247,21 @@ impl Snapshot {
         ))
     }
 
+    fn without_latest_claim(&self) -> SnapshotRef {
+        Arc::new(Self {
+            span: self.span.clone(),
+            log_segment: self.log_segment.clone(),
+            table_configuration: self.table_configuration.clone(),
+            crc: self.crc.clone(),
+            built_as_latest: false,
+            skipped_new_checkpoints: self.skipped_new_checkpoints,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_action: self.checkpoint_action.clone(),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            last_manifest_commit: self.last_manifest_commit.clone(),
+        })
+    }
+
     fn validate_configuration_and_crc(
         log_segment: &LogSegment,
         table_configuration: &TableConfiguration,
@@ -633,7 +648,7 @@ impl Snapshot {
     /// latest version, a post-commit snapshot, or a snapshot hint marked `Latest` by its connector.
     /// Kernel does not independently verify hint freshness. This is not a liveness guarantee:
     /// another writer may commit a newer version afterward, so a `true` snapshot can already be
-    /// stale.
+    /// stale. Rebuilding with a catalog bound newer than this version clears the flag.
     ///
     /// Version-preserving derivations ([`Self::checkpoint`], [`Self::write_checksum`],
     /// [`Self::publish`]) do not change this flag: they carry it over from the source snapshot.

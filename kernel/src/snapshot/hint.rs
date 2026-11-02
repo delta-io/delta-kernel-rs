@@ -20,7 +20,8 @@ use crate::{KernelError, KernelResult, Snapshot, Version};
 /// The freshness claim for the version carried by a [`SnapshotHint`].
 ///
 /// Kernel trusts this value: [`Latest`](Self::Latest) makes
-/// [`Snapshot::is_built_as_latest`] true, while [`Unverified`](Self::Unverified) makes it false.
+/// [`Snapshot::is_built_as_latest`] true unless a supplied catalog bound is newer than the hinted
+/// version, while [`Unverified`](Self::Unverified) makes it false.
 /// Connector inputs supply this claim; exports preserve the snapshot's build-time claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -57,7 +58,7 @@ pub(crate) enum PublicationWatermark {
 ///
 /// Kernel validates the log-segment shape, table configuration, and optional CRC consistency
 /// before constructing the snapshot. It does not replay the log to verify the supplied state's
-/// provenance, and records the connector-provided freshness without validating it.
+/// provenance. It trusts connector-provided freshness unless a supplied catalog bound is newer.
 #[derive(Debug, Clone)]
 #[internal_api]
 pub(crate) struct SnapshotHint {
@@ -299,16 +300,8 @@ impl SnapshotHint {
             crc,
             freshness,
         } = *self;
-        if freshness == SnapshotHintFreshness::Latest {
-            require!(
-                max_catalog_version.is_none_or(|max| max <= version),
-                SnapshotHintError::LatestVersionConflict {
-                    hint: version,
-                    max_catalog_version: max_catalog_version.unwrap_or(version),
-                }
-                .into()
-            );
-        }
+        let built_as_latest = freshness == SnapshotHintFreshness::Latest
+            && max_catalog_version.is_none_or(|max| max <= version);
         let has_staged_commits = log_segment_files
             .ascending_commit_files
             .iter()
@@ -387,7 +380,7 @@ impl SnapshotHint {
             log_segment,
             table_configuration,
             crc,
-            freshness == SnapshotHintFreshness::Latest,
+            built_as_latest,
             false, /* skipped_new_checkpoints */
         )
         .map(Into::into)
@@ -425,7 +418,7 @@ mod tests {
     use crate::Engine;
     use crate::cancellation::CancellationTokenRef;
     use crate::engine::sync::SyncEngine;
-    use crate::metrics::{MetricEvent, SnapshotLoadType};
+    use crate::metrics::{MeteredDeltaEngine, MetricEvent, SnapshotLoadType};
     use crate::schema::schema_ref;
     use crate::snapshot::builder::tests::catalog_managed_tests::{
         create_log_path as create_catalog_log_path, setup_catalog_managed_test,
@@ -1503,20 +1496,21 @@ mod tests {
 
         let mut contradictory_hint = hint_from_snapshot(&snapshot, SnapshotHintFreshness::Latest);
         contradictory_hint.crc = None;
-        assert_hint_error(
-            SnapshotBuilder::new_for("memory:///")
-                .at_version(1)
-                .with_max_catalog_version(2),
-            contradictory_hint,
-            engine.as_ref(),
-            "marked latest but max catalog version is 2",
-        );
+        let originally_latest = SnapshotBuilder::new_for("memory:///")
+            .at_version(1)
+            .with_max_catalog_version(2)
+            .with_snapshot_hint(contradictory_hint)
+            .build(engine.as_ref())?;
+        assert_eq!(originally_latest.version(), 1);
+        assert!(!originally_latest.is_built_as_latest());
         Ok(())
     }
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn snapshot_hint_accepts_staged_commit_with_catalog_version()
-    -> KernelResult<(), Box<dyn std::error::Error>> {
+    async fn snapshot_hint_accepts_staged_commit_with_catalog_version(
+        #[values(1, 2)] max_catalog_version: Version,
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_catalog_managed_test().await;
         let actions = actions_to_string(vec![TestAction::Add("file_1.parquet".to_string())]);
         let staged_path = add_staged_commit(&table_root, store.as_ref(), 1, actions).await?;
@@ -1527,14 +1521,143 @@ mod tests {
         let hint = source.to_snapshot_hint()?;
         assert_eq!(hint.log_segment_files, source.log_segment().listed);
 
-        let hinted = SnapshotBuilder::new_for(table_root)
-            .with_max_catalog_version(1)
+        let hinted = SnapshotBuilder::new_for(&table_root)
+            .at_version(1)
+            .with_max_catalog_version(max_catalog_version)
             .with_snapshot_hint(hint)
             .build(engine.as_ref())?;
 
         assert_eq!(hinted.version(), 1);
-        assert!(hinted.is_built_as_latest());
+        assert_eq!(hinted.is_built_as_latest(), max_catalog_version == 1);
         assert_eq!(hinted.log_segment().listed, source.log_segment().listed);
+        let rebuilt = SnapshotBuilder::new_for(table_root)
+            .at_version(1)
+            .with_max_catalog_version(1)
+            .with_snapshot_hint(hinted.to_snapshot_hint()?)
+            .build(engine.as_ref())?;
+        assert_eq!(rebuilt.is_built_as_latest(), hinted.is_built_as_latest());
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn snapshot_reuse_clears_latest_claim_for_newer_catalog_bound(
+        #[values(false, true)] originally_latest: bool,
+        #[values(None, Some(0), Some(1), Some(2))] bound: Option<Version>,
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
+        let (reporter, _guard) = measuring_reporter();
+        let (engine, store, table_root) = setup_test();
+        let engine = MeteredDeltaEngine::new(engine);
+        let initial = actions_to_string_catalog_managed(vec![TestAction::Metadata]);
+        add_commit(&table_root, store.as_ref(), 0, initial).await?;
+        let base = SnapshotBuilder::new_for(&table_root)
+            .with_max_catalog_version(0)
+            .build(&engine)?;
+        let base = base.checkpoint(&engine, None)?.1;
+        add_commit(
+            &table_root,
+            store.as_ref(),
+            1,
+            serde_json::json!({"commitInfo": {
+                "timestamp": 1_587_968_586_155_u64,
+                "inCommitTimestamp": 1_587_968_586_155_u64,
+                "txnId": "test-txn-1",
+                "operation": "WRITE"
+            }})
+            .to_string(),
+        )
+        .await?;
+        let mut source = SnapshotBuilder::new_from(base)
+            .at_version(1)
+            .skip_new_checkpoints();
+        source = source.with_max_catalog_version(if originally_latest { 1 } else { 2 });
+        let source = source.build(&engine)?.write_checksum(&engine)?.1;
+        assert_eq!(source.is_built_as_latest(), originally_latest);
+        assert!(source.skipped_new_checkpoints());
+        assert!(source.crc_at_version().is_some());
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            let _ = source.checkpoint_action.set(None);
+            let _ = source.last_manifest_commit.set(None);
+        }
+
+        let mut fresh = SnapshotBuilder::new_for(&table_root).at_version(1);
+        if let Some(bound) = bound {
+            fresh = fresh.with_max_catalog_version(bound);
+        }
+        let fresh = fresh.build(&engine);
+        if bound.is_none() || bound == Some(0) {
+            assert!(matches!(fresh, Err(KernelError::MaxCatalogVersion(_))));
+        } else {
+            assert_eq!(fresh?.is_built_as_latest(), bound == Some(1));
+        }
+
+        let events_before_reuse = reporter.events().len();
+        for use_hint in [false, true] {
+            let rebuilt = if use_hint {
+                let mut builder = SnapshotBuilder::new_for(&table_root)
+                    .with_snapshot_hint(source.to_snapshot_hint()?)
+                    .at_version(1);
+                if let Some(bound) = bound {
+                    builder = builder.with_max_catalog_version(bound);
+                }
+                builder.build(&engine)
+            } else {
+                let mut builder = SnapshotBuilder::new_from(source.clone()).at_version(1);
+                if let Some(bound) = bound {
+                    builder = builder.with_max_catalog_version(bound);
+                }
+                builder.build(&engine)
+            };
+            if bound.is_none() || bound == Some(0) {
+                assert!(matches!(rebuilt, Err(KernelError::MaxCatalogVersion(_))));
+                continue;
+            }
+            let rebuilt = rebuilt?;
+            let expected_latest = originally_latest && bound != Some(2);
+            assert_eq!(rebuilt.is_built_as_latest(), expected_latest);
+            assert_eq!(rebuilt.log_segment(), source.log_segment());
+            assert_eq!(rebuilt.crc_at_version(), source.crc_at_version());
+            assert_eq!(source.is_built_as_latest(), originally_latest);
+            if !use_hint {
+                assert!(rebuilt.skipped_new_checkpoints());
+                assert_eq!(
+                    Arc::ptr_eq(&rebuilt, &source),
+                    !originally_latest || bound != Some(2)
+                );
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                {
+                    assert!(rebuilt.checkpoint_action.get().is_some());
+                    assert!(rebuilt.last_manifest_commit.get().is_some());
+                }
+            }
+            let exported = rebuilt.to_snapshot_hint()?;
+            assert_eq!(
+                exported.freshness,
+                if expected_latest {
+                    SnapshotHintFreshness::Latest
+                } else {
+                    SnapshotHintFreshness::Unverified
+                }
+            );
+            let round_trip = SnapshotBuilder::new_for(&table_root)
+                .at_version(1)
+                .with_max_catalog_version(1)
+                .with_snapshot_hint(exported)
+                .build(&engine)?;
+            assert_eq!(round_trip.is_built_as_latest(), expected_latest);
+        }
+        assert!(
+            !reporter.events()[events_before_reuse..]
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    MetricEvent::StorageListCompleted(_)
+                        | MetricEvent::StorageReadCompleted(_)
+                        | MetricEvent::JsonReadCompleted(_)
+                        | MetricEvent::ParquetReadCompleted(_)
+                ))
+        );
         Ok(())
     }
 }
