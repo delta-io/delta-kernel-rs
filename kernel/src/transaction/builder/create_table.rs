@@ -1084,6 +1084,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
 
         // Build TableConfiguration directly for the new table
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
+        // TODO(#3695): Support creating tables with generated columns.
         if table_configuration.has_generation_expressions() {
             return Err(KernelError::unsupported(
                 "Setting `delta.generationExpression` column metadata is not supported during \
