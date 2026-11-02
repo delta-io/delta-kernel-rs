@@ -1321,21 +1321,27 @@ mod test {
     use crate::KernelError;
 
     #[rstest]
-    #[case::stable(TableFeature::Collations)]
-    #[case::preview(TableFeature::CollationsPreview)]
-    fn collations_require_domain_metadata_for_writes(#[case] feature: TableFeature) {
+    fn collations_feature_without_annotations_requires_only_domain_metadata_for_writes(
+        #[values(TableFeature::Collations, TableFeature::CollationsPreview)] feature: TableFeature,
+        #[values(false, true)] domain_metadata: bool,
+    ) {
+        let features =
+            std::iter::once(feature).chain(domain_metadata.then_some(TableFeature::DomainMetadata));
         let config = MockTableConfigurationBuilder::new()
+            .with_schema(schema! { nullable "value": STRING })
             .with_protocol(
                 MockProtocolBuilder::new()
-                    .with_writer_features([feature])
+                    .with_writer_features(features)
                     .build(),
             )
             .build();
-        assert_result_error_with_message(
-            config.ensure_operation_supported(Operation::Write),
-            "domainMetadata",
-        );
         config.ensure_operation_supported(Operation::Scan).unwrap();
+        let write = config.ensure_operation_supported(Operation::Write);
+        if domain_metadata {
+            write.unwrap();
+        } else {
+            assert_result_error_with_message(write, "domainMetadata");
+        }
     }
 
     #[rstest]
