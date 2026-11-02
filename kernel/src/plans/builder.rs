@@ -43,9 +43,9 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 
 use super::ir::nodes::{
-    Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, Operator, PrefixSum, Project,
-    RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
-    FILE_META_SCHEMA,
+    Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, MultiFileWrite, Operator,
+    PrefixSum, Project, RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
+    WriteJson, FILE_META_SCHEMA,
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, PredicateRef, Scalar, StructData};
@@ -327,6 +327,16 @@ impl PlanBuilder {
             },
             inputs,
         ))
+    }
+
+    /// Writes this input to files according to `write`, returning its descriptor relation.
+    /// Empty input produces an empty descriptor relation and creates no files.
+    ///
+    /// Returns an error when [`MultiFileWrite::validate_input`] rejects this input's schema or
+    /// the write contract. Shared clones retain the same write node's identity in the built DAG.
+    pub fn multi_file_write(self, write: MultiFileWrite) -> KernelResult<Self> {
+        let schema = write.output_schema(self.schema())?;
+        Ok(self.unary_op_or_absent(schema, write))
     }
 
     /// Keep rows where `predicate` holds. Output schema is unchanged. See [`Filter`].

@@ -11,6 +11,7 @@ use itertools::Itertools;
 use strum::Display;
 use url::Url;
 
+pub use super::multi_file_write::{FileNamer, MultiFileWrite};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::error::add_scalar_path_context;
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
@@ -26,7 +27,8 @@ use crate::{FileMeta, KernelError, KernelResult};
 /// documenting that operator's semantics, invariants, and output shape.
 ///
 /// An operator that reshapes its rows (a source, projection, aggregation, or file scan) carries a
-/// caller-declared `schema` field holding its output schema. File writes emit [`FILE_META_SCHEMA`].
+/// caller-declared `schema` field holding its output schema. [`WriteJson`] emits
+/// [`FILE_META_SCHEMA`]; [`MultiFileWrite`] derives its schema from named statistics.
 /// The remaining operators inherit an input's schema; each payload's docs name which input.
 #[derive(Debug, Clone, Display, From)]
 #[strum(serialize_all = "snake_case")]
@@ -44,6 +46,7 @@ pub enum Operator {
     Project(Project),
     Filter(Filter),
     DynamicScan(DynamicScan),
+    MultiFileWrite(MultiFileWrite),
     Aggregate(Aggregate),
     PrefixSum(PrefixSum),
 

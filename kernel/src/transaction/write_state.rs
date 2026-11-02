@@ -329,6 +329,17 @@ struct DecodedWriteStateWire {
 }
 
 impl WriteState {
+    /// Extracts the naming policy used by this table, without retaining write state.
+    #[cfg(feature = "declarative-plans")]
+    pub fn file_namer(&self) -> crate::plans::ir::nodes::FileNamer {
+        let randomized =
+            self.column_mapping_mode != ColumnMappingMode::None || self.randomize_file_prefixes;
+        crate::plans::ir::nodes::FileNamer::new(
+            self.logical_partition_columns.clone(),
+            randomized.then_some(self.random_prefix_length),
+        )
+    }
+
     /// Creates a builder for a write context.
     ///
     /// For an unpartitioned table, call [`BoundWriteContextBuilder::build`] directly. For a

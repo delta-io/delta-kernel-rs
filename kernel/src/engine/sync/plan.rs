@@ -211,6 +211,15 @@ impl SyncPlanExecutor {
         plan: Plan,
         relation_store: Option<&RelationStore>,
     ) -> KernelResult<Vec<RecordBatch>> {
+        if plan
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, Operator::MultiFileWrite(_)))
+        {
+            return Err(KernelError::unsupported(
+                "MultiFileWrite is not supported by SyncPlanExecutor",
+            ));
+        }
         let mut outputs: Vec<Vec<RecordBatch>> = Vec::with_capacity(plan.nodes.len());
         for node in plan.nodes {
             let output = self.eval_node(node, &outputs, relation_store)?;
@@ -255,6 +264,9 @@ impl SyncPlanExecutor {
             }
             Operator::Aggregate(aggregate) => eval_aggregate(&aggregate, &results[inputs[0]]),
             Operator::PrefixSum(prefix_sum) => eval_prefix_sum(&prefix_sum, &results[inputs[0]]),
+            Operator::MultiFileWrite(_) => Err(KernelError::unsupported(
+                "MultiFileWrite is not supported by SyncPlanExecutor",
+            )),
             Operator::WriteJson(write) => {
                 self.eval_write_json(&write, inputs.iter().flat_map(|&i| results[i].iter()))
             }
@@ -715,6 +727,7 @@ mod tests {
     use crate::engine::sync::get_bytes;
     use crate::expressions::{col, column_name, lit, Predicate, StructData};
     use crate::object_store::memory::InMemory;
+    use crate::plans::ir::nodes::{FileNamer, MultiFileWrite};
     use crate::plans::PlanBuilder;
     use crate::schema::{schema, schema_ref, ToSchema as _};
 
@@ -764,6 +777,34 @@ mod tests {
         let scan = PlanBuilder::scan_json([meta], &[], schema)?.build()?;
         let batches = executor.eval_plan(scan, None)?;
         assert_batches_sorted_eq!(expected_rows, &batches);
+        Ok(())
+    }
+
+    #[rstest]
+    fn unsupported_multi_file_write_is_rejected_before_prior_writes() -> KernelResult<()> {
+        let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
+        let path = Url::parse("memory:///must-not-exist.json")?;
+        let schema = schema_ref! { not_null "id": LONG };
+        let input = PlanBuilder::values(schema, vec![vec![1i64.into()]])?;
+        let prior_write = PlanBuilder::write_json([input], path.clone(), false, false)?;
+        let write = MultiFileWrite::try_new(
+            &FILE_META_SCHEMA,
+            FILE_META_SCHEMA.clone(),
+            Vec::new(),
+            Url::parse("memory:///output/")?,
+            FileNamer::new(Vec::new(), None),
+            |a| a,
+        )?;
+
+        let plan = prior_write.multi_file_write(write)?.build()?;
+        let error = executor
+            .execute_op(Operation::QueryPlan(plan))
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("MultiFileWrite is not supported"));
+        assert!(executor.storage.head(&path).is_err());
         Ok(())
     }
 

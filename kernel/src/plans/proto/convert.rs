@@ -19,8 +19,8 @@ use crate::expressions::{
     VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
-    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, RelationRef,
-    ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
+    Agg, Aggregate, DynamicScan, FileType, Filter, MultiFileWrite, Operator, PrefixSum, Project,
+    RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
@@ -155,6 +155,7 @@ impl From<&Operator> for proto_plan::Operator {
             Operator::Aggregate(n) => Op::Aggregate(n.into()),
             Operator::PrefixSum(n) => Op::PrefixSum(n.into()),
             Operator::WriteJson(n) => Op::WriteJson(n.into()),
+            Operator::MultiFileWrite(n) => Op::MultiFileWrite(n.into()),
             Operator::SemiJoin(n) => Op::SemiJoin(n.into()),
             Operator::UnionAll(_) => Op::UnionAll(proto_plan::UnionAllNode {}),
         };
@@ -221,6 +222,25 @@ impl From<&Project> for proto_plan::ProjectNode {
         proto_plan::ProjectNode {
             expr: Some(node.expr.as_ref().into()),
             schema: Some(node.schema.as_ref().into()),
+        }
+    }
+}
+
+impl From<&MultiFileWrite> for proto_plan::MultiFileWriteNode {
+    fn from(node: &MultiFileWrite) -> Self {
+        Self {
+            write_schema: Some(node.write_schema.as_ref().into()),
+            base_url: node.base_url.to_string(),
+            file_namer: node.file_namer.encode(),
+            stats: node
+                .stats
+                .iter()
+                .map(|(agg, name)| proto_plan::NamedAgg {
+                    aggregate: Some(agg.into()),
+                    name: name.clone(),
+                })
+                .collect(),
+            partition_columns: node.partition_columns.clone(),
         }
     }
 }
@@ -1448,6 +1468,7 @@ mod tests {
             Op::PrefixSum(_) => "prefix_sum",
             Op::UnionAll(_) => "union_all",
             Op::WriteJson(_) => "write_json",
+            Op::MultiFileWrite(_) => "multi_file_write",
         };
         assert_eq!(kind, expected);
     }

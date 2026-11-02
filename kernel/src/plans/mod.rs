@@ -37,7 +37,7 @@
 //!
 //! Every operator, expression, and predicate a plan contains must be handled; returning an error
 //! for an unsupported one is fine, and kernel surfaces it to the caller. The sync engine's
-//! `SyncPlanExecutor` is a complete reference implementation.
+//! `SyncPlanExecutor` supplies reference implementations for reads and single-file JSON writes.
 //!
 //! # Consuming terminal results
 //!

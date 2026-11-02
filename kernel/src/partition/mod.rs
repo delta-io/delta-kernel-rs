@@ -165,3 +165,25 @@
 pub(crate) mod hive;
 pub mod serialization;
 pub(crate) mod validation;
+
+/// URI-encoded relative directory used by both declarative and imperative writes.
+pub(crate) fn write_directory_prefix(
+    columns: &[(&str, Option<&str>)],
+    random_prefix_length: Option<std::num::NonZero<usize>>,
+) -> String {
+    match random_prefix_length {
+        Some(length) => format!("{}/", random_alphanumeric_prefix(length)),
+        None => {
+            crate::path_encoding::uri_encode_path(&hive::build_partition_path(columns)).into_owned()
+        }
+    }
+}
+
+pub(crate) fn random_alphanumeric_prefix(len: std::num::NonZero<usize>) -> String {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = rand::rng();
+    (0..len.get())
+        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
+        .collect()
+}

@@ -1,15 +1,12 @@
 use std::collections::HashMap;
-use std::num::NonZero;
 use std::sync::Arc;
 
-use rand::Rng;
 use url::Url;
 
 use super::WriteState;
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::expressions::{ColumnName, ExpressionRef};
-use crate::partition::hive::build_partition_path;
-use crate::path_encoding::uri_encode_path;
+use crate::partition::write_directory_prefix;
 use crate::schema::SchemaRef;
 use crate::table_features::ColumnMappingMode;
 use crate::{KernelError, KernelResult};
@@ -117,27 +114,25 @@ impl BoundWriteContext {
     // before filesystem writes and keep it encoded for `add.path`, which is unintuitive.
     pub fn write_dir(&self) -> Url {
         let mut url = self.write_state.table_root.clone();
-        // A random prefix is used when column mapping is on (to avoid leaking physical
-        // UUID column names into paths) or when `delta.randomizeFilePrefixes` is set (to
-        // avoid S3 hotspots). When a random prefix is used, the Hive-style partition path
-        // is suppressed; partition values are recorded in `add.partitionValues` instead.
         let should_prefix = self.write_state.column_mapping_mode != ColumnMappingMode::None
             || self.write_state.randomize_file_prefixes;
-        if should_prefix {
-            // The alphanumeric charset is RFC 3986 unreserved, so the prefix is URI-safe
-            // as-is and needs no further encoding.
-            let prefix = random_alphanumeric_prefix(self.write_state.random_prefix_length);
-            url.set_path(&format!("{}{}/", url.path(), prefix));
-        } else if !self.write_state.logical_partition_columns.is_empty() {
-            // CM=None, no randomization: emit a Hive-style partition path. URI-encode on
-            // top of Hive-escaping because the fn-level contract (see doc above) requires
-            // callers to URI-decode once before using the URL as a filesystem path. That
-            // decode recovers the Hive-escaped form, which is the on-disk layout
-            // Delta-Spark and kernel-java produce.
-            let hive_escaped = self.hive_partition_path_suffix();
-            let uri_encoded = uri_encode_path(&hive_escaped);
-            url.set_path(&format!("{}{}", url.path(), uri_encoded));
-        }
+        let columns: Vec<_> = self
+            .write_state
+            .logical_partition_columns
+            .iter()
+            .map(|name| {
+                let value = self
+                    .physical_partition_values
+                    .get(name)
+                    .and_then(|v| v.as_deref());
+                (name.as_str(), value)
+            })
+            .collect();
+        let prefix = write_directory_prefix(
+            &columns,
+            should_prefix.then_some(self.write_state.random_prefix_length),
+        );
+        url.set_path(&format!("{}{prefix}", url.path()));
         url
     }
 
@@ -180,31 +175,6 @@ impl BoundWriteContext {
     /// For unpartitioned tables, this is empty.
     pub fn physical_partition_values(&self) -> &HashMap<String, Option<String>> {
         &self.physical_partition_values
-    }
-
-    /// Builds the Hive-style partition path suffix (e.g., `year=2024/region=US/`).
-    /// Only called when column mapping is OFF.
-    fn hive_partition_path_suffix(&self) -> String {
-        debug_assert!(
-            self.write_state.column_mapping_mode == ColumnMappingMode::None,
-            "Hive-style paths should only be used when column mapping is OFF"
-        );
-        let columns: Vec<(&str, Option<&str>)> = self
-            .write_state
-            .logical_partition_columns
-            .iter()
-            .map(|logical_name| {
-                // CM is None, so physical == logical. Use the logical name as both the
-                // directory name (e.g. "year" in "year=2024/") and the key into
-                // physical_partition_values.
-                let value = self
-                    .physical_partition_values
-                    .get(logical_name.as_str())
-                    .and_then(|v| v.as_deref());
-                (logical_name.as_str(), value)
-            })
-            .collect();
-        build_partition_path(&columns)
     }
 
     /// Computes the relative `add.path` value for the Delta log from a file's absolute URL.
@@ -266,26 +236,17 @@ impl BoundWriteContext {
     }
 }
 
-/// Generates a random alphanumeric prefix of the given length for data file directory paths.
-/// Used to avoid S3 hotspots and to keep physical UUID column names out of paths when column
-/// mapping is enabled.
-fn random_alphanumeric_prefix(len: NonZero<usize>) -> String {
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::rng();
-    (0..len.get())
-        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::num::NonZero;
     use std::sync::Arc;
 
     use rstest::rstest;
 
     use super::*;
     use crate::expressions::lit;
+    use crate::partition::random_alphanumeric_prefix;
     use crate::schema::schema_ref;
 
     fn make_write_context(
@@ -381,6 +342,44 @@ mod tests {
                     "prefix should be alphanumeric, got: {prefix_dir}"
                 );
             }
+        }
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[rstest]
+    fn extracted_file_namer_preserves_table_layout(
+        #[values(
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id
+        )]
+        cm_mode: ColumnMappingMode,
+        #[values(false, true)] randomized: bool,
+        #[values(false, true)] partitioned: bool,
+    ) {
+        let columns = if partitioned {
+            vec!["p".into()]
+        } else {
+            vec![]
+        };
+        let values = if partitioned {
+            HashMap::from([("p".into(), Some("a/b".into()))])
+        } else {
+            HashMap::new()
+        };
+        let wc = make_write_context(cm_mode, columns, values, randomized, 4);
+        let scalars = if partitioned {
+            vec!["a/b".into()]
+        } else {
+            vec![]
+        };
+        let name = wc.write_state.file_namer().next_file_name(scalars).unwrap();
+        let directory = name.rsplit_once('/').map_or("", |(parent, _)| parent);
+        if randomized || cm_mode != ColumnMappingMode::None {
+            assert_eq!(directory.len(), 4);
+            assert!(directory.chars().all(|c| c.is_ascii_alphanumeric()));
+        } else {
+            assert_eq!(directory, if partitioned { "p=a%252Fb" } else { "" });
         }
     }
 
