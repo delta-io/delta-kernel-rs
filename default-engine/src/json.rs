@@ -280,6 +280,8 @@ async fn open_json_file(
 
 #[cfg(test)]
 mod tests {
+    //! Tests JSON parsing, storage I/O, and handler contracts.
+
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::ops::Range;
     use std::path::PathBuf;

@@ -116,11 +116,11 @@ pub(crate) fn table_changes_action_iter_with_mode(
     let json = engine.json_handler();
     let prepare_reader = CommitBatchReader::new(
         file_indices.clone(),
-        json.read_json_files(&locations, prepare_schema, None /* predicate */)?,
+        json.read_json_files(&locations, prepare_schema, None)?,
     );
     let scan_reader = CommitBatchReader::new(
         file_indices,
-        json.read_json_files(&locations, scan_schema.clone(), None /* predicate */)?,
+        json.read_json_files(&locations, scan_schema.clone(), None)?,
     );
     let mut replay = Some(TableChangesReplay {
         engine,
@@ -147,12 +147,14 @@ pub(crate) fn table_changes_action_iter_with_mode(
     }))
 }
 
+/// Adds source-file metadata so each replay pass can attribute batches to commits.
 fn replay_schema(schema: SchemaRef) -> KernelResult<SchemaRef> {
     schema
         .add_metadata_column(FILE_PATH_COLUMN_NAME, MetadataColumnSpec::FilePath)
         .map(Arc::new)
 }
 
+/// Coordinates preparation and scanning while replaying commits in order.
 struct TableChangesReplay {
     engine: Arc<dyn Engine>,
     commits: std::iter::Enumerate<std::vec::IntoIter<ParsedLogPath>>,
@@ -352,9 +354,7 @@ impl RowVisitor for FilePathVisitor {
 ///     - Otherwise, select `add` and `remove` actions. Note that only `remove` actions that do not
 ///       share a path with an `add` action are selected.
 ///
-/// The two phases iterate over each action in the commit twice. They use independent readers so
-/// preparation can release each action batch after visiting it. The add-path set and
-/// deletion-vector map still grow with the current commit.
+/// Preparation memory grows with the current commit's add paths and removal deletion vectors.
 struct LogReplayScanner {
     // True if a `cdc` action was found after running [`LogReplayScanner::try_new`]
     has_cdc_action: bool,
@@ -536,6 +536,7 @@ impl LogReplayScanner {
     }
 }
 
+/// Selects and transforms action batches using prepared commit state.
 struct CommitScanProcessor {
     has_cdc_action: bool,
     remove_dvs: Arc<HashMap<String, DvInfo>>,

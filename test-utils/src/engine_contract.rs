@@ -99,9 +99,9 @@ pub fn test_json_handler_file_path_contract(handler: &dyn JsonHandler) {
     );
 }
 
-/// Asserts that `handler` reads integer `x` fields from `files` as `expected_rows`, whose tuples
-/// contain the value and source file URL. Checks row order, exact file URLs through a
-/// [`MetadataColumnSpec::FilePath`] column, and that batches do not span files.
+/// Asserts JSON row order, source URLs, and file boundaries for `handler`.
+///
+/// Reads integer `x` fields from `files`; `expected_rows` pairs each value with its source URL.
 ///
 /// # Panics
 ///
@@ -118,6 +118,7 @@ pub fn assert_json_handler_file_path_contract(
 
     let batches = handler.read_json_files(files, schema, None).unwrap();
 
+    /// Collects values and source URLs to check row order and file boundaries.
     struct FilePathCollector {
         rows: Vec<(i32, String)>,
     }

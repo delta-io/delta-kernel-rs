@@ -1,3 +1,5 @@
+//! Exercises table reads and scan metadata through the public APIs.
+
 // Scan-metadata cancellation is a read-path concern, so its coverage lives alongside the other
 // read tests.
 mod scan_cancellation;
