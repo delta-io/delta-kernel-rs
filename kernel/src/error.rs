@@ -5,19 +5,29 @@ use std::convert::Infallible;
 use std::num::ParseIntError;
 use std::str::Utf8Error;
 
+use crate::Version;
 #[cfg(feature = "default-engine-base")]
 use crate::arrow::error::ArrowError;
 #[cfg(feature = "default-engine-base")]
 use crate::object_store;
 use crate::schema::{DataType, StructType};
 use crate::table_properties::ParseIntervalError;
-use crate::Version;
+
+mod delta_error;
+mod delta_error_condition;
+
+pub use delta_error::{DeltaError, DeltaErrorParameter};
+pub use delta_error_condition::DeltaErrorCondition;
 
 /// An error returned by a Delta Kernel operation.
 #[derive(Debug, thiserror::Error)]
-// TODO(#2630): Remove non_exhaustive once Delta and Engine variants are introduced.
+// TODO(#2630): Remove non_exhaustive once the Engine variant is introduced.
 #[non_exhaustive]
 pub enum Error {
+    /// A stable, user-facing Delta failure.
+    #[error(transparent)]
+    Delta(#[from] DeltaError),
+
     /// A failure represented by a kernel implementation error.
     #[error(transparent)]
     Kernel(KernelError),
@@ -183,9 +193,7 @@ pub enum SnapshotHintError {
     #[error("Invalid snapshot hint: snapshot history does not start at version 0")]
     MissingHistoryAnchor,
     /// The supplied CRC describes a different table version.
-    #[error(
-        "Invalid snapshot hint: CRC version {crc} does not match snapshot hint version {hint}"
-    )]
+    #[error("Invalid snapshot hint: CRC version {crc} does not match snapshot hint version {hint}")]
     CrcVersion {
         /// The version described by the CRC.
         crc: Version,
@@ -502,7 +510,9 @@ pub enum KernelError {
     LogHistory(#[from] Box<crate::history_manager::error::LogHistoryError>),
 
     #[cfg(feature = "declarative-plans")]
-    #[error("Declarative plan execution yielded the incorrect type: expected PlanResult::{expected}, got PlanResult::{actual}")]
+    #[error(
+        "Declarative plan execution yielded the incorrect type: expected PlanResult::{expected}, got PlanResult::{actual}"
+    )]
     PlanResultTypeMismatch {
         expected: &'static str,
         actual: &'static str,

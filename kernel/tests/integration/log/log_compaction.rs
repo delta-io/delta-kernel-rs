@@ -1,10 +1,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use delta_kernel::engine::to_json_bytes;
-use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::schema::schema_ref;
 use delta_kernel::Snapshot;
+use delta_kernel::engine::to_json_bytes;
+use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::schema::schema_ref;
 use test_utils::{create_table, engine_store_setup};
 use url::Url;
 

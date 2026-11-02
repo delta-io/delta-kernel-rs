@@ -25,7 +25,7 @@ use std::num::NonZero;
 
 use error::{LogHistoryError, NearestTimestamp};
 use itertools::Itertools;
-use search::{binary_search_by_key_with_bounds, Bound, SearchError};
+use search::{Bound, SearchError, binary_search_by_key_with_bounds};
 use tracing::{info, trace, warn};
 use url::Url;
 
@@ -126,7 +126,7 @@ fn get_timestamp_search_bounds(
 
     let (ict_enablement_version, ict_timestamp) = match ict_enablement {
         InCommitTimestampEnablement::NotEnabled => {
-            return Ok(TimestampSearchBounds::FileModificationSearch)
+            return Ok(TimestampSearchBounds::FileModificationSearch);
         }
         InCommitTimestampEnablement::Enabled {
             enablement: Some((v, t)),
@@ -238,9 +238,7 @@ fn linear_search_file_mod_timestamps(
         if monotonic_ts != raw_ts {
             trace!(
                 version = commit.version,
-                raw_ts,
-                monotonic_ts,
-                "Adjusted non-monotonic timestamp"
+                raw_ts, monotonic_ts, "Adjusted non-monotonic timestamp"
             );
         }
 
@@ -252,7 +250,7 @@ fn linear_search_file_mod_timestamps(
             Bound::GreatestLower => break,
             // LeastUpper: return version upon first match
             Bound::LeastUpper if monotonic_ts >= timestamp => {
-                return Ok(CommitAt::new(commit.version, monotonic_ts))
+                return Ok(CommitAt::new(commit.version, monotonic_ts));
             }
             Bound::LeastUpper => {}
         }
@@ -387,6 +385,7 @@ pub(crate) fn timestamp_to_version(
     // Short-circuit: compare against snapshot's timestamp to avoid log segment rebuild.
     // This optimization mirrors Delta Spark and Java Kernel behavior.
     let snap_ts = snapshot
+        .reader()
         .get_timestamp(engine)
         .map_err(|e| LogHistoryError::internal("failed to get snapshot timestamp", e))?;
     match (timestamp.cmp(&snap_ts), bound) {
@@ -394,7 +393,7 @@ pub(crate) fn timestamp_to_version(
         (Ordering::Equal, _) => return Ok(CommitAt::new(snapshot.version(), snap_ts)),
         // Timestamp after snapshot: for GreatestLower, snapshot is the answer
         (Ordering::Greater, Bound::GreatestLower) => {
-            return Ok(CommitAt::new(snapshot.version(), snap_ts))
+            return Ok(CommitAt::new(snapshot.version(), snap_ts));
         }
         // Timestamp after snapshot: for LeastUpper, no version exists
         (Ordering::Greater, Bound::LeastUpper) => {
@@ -719,28 +718,22 @@ fn get_earliest_published_commit_version(
 ) -> KernelResult<Version> {
     // Listing inherits any token bound to the engine's storage handler.
     // TODO(#3188): accept cancellation tokens on the history-manager entry points.
-    list_delta_log_from_storage(
-        engine.storage_handler().as_ref(),
-        log_root,
-        0,
-        Version::MAX,
-        None,
-    )?
-    .filter_ok(|f| f.file_type == LogPathFileType::Commit)
-    .next()
-    .transpose()?
-    .map(|f| f.version)
-    .ok_or_else(|| {
-        if earliest_ratified_commit_version == Some(0) {
-            return DeltaError::generic(format!(
-                "expected a published v0 commit for catalog-managed table {log_root}, \
+    list_delta_log_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?
+        .filter_ok(|f| f.file_type == LogPathFileType::Commit)
+        .next()
+        .transpose()?
+        .map(|f| f.version)
+        .ok_or_else(|| {
+            if earliest_ratified_commit_version == Some(0) {
+                return DeltaError::generic(format!(
+                    "expected a published v0 commit for catalog-managed table {log_root}, \
                        but the log listing returned no commits"
-            ));
-        }
-        DeltaError::from(LogHistoryError::NoCommitsFound {
-            log_root: log_root.clone(),
+                ));
+            }
+            DeltaError::from(LogHistoryError::NoCommitsFound {
+                log_root: log_root.clone(),
+            })
         })
-    })
 }
 
 /// Returns the earliest table version that can be fully reconstructed, and from which we can replay
@@ -777,13 +770,8 @@ fn get_earliest_recreatable_commit(
 
     // Listing inherits any token bound to the engine's storage handler.
     // TODO(#3188): accept cancellation tokens on the history-manager entry points.
-    let listing = list_delta_log_from_storage(
-        engine.storage_handler().as_ref(),
-        log_root,
-        0,
-        Version::MAX,
-        None,
-    )?;
+    let listing =
+        list_delta_log_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?;
     for parsed_result in listing {
         let parsed_log_path = parsed_result?;
         if !should_process_log_file(&parsed_log_path) {
@@ -909,10 +897,10 @@ pub fn get_earliest_commit(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::fs::{remove_file, OpenOptions};
+    use std::fs::{OpenOptions, remove_file};
     use std::ops::RangeInclusive;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::{Duration, SystemTime};
 
     use bytes::Bytes;
@@ -922,11 +910,11 @@ mod tests {
 
     use super::*;
     use crate::actions::{CommitInfo, Metadata, Protocol};
+    use crate::engine::CancellableEngine;
     use crate::engine::sync::SyncEngine;
     use crate::engine::test_delegating::DelegatingEngine;
-    use crate::engine::CancellableEngine;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{schema_ref, SchemaRef};
+    use crate::schema::{SchemaRef, schema_ref};
     use crate::snapshot::{Snapshot, SnapshotBuilder};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{Action, LocalMockTable, TestCancellationToken};
@@ -1971,7 +1959,9 @@ mod tests {
             (Ok(p), Ok(r)) => assert_eq!(p, r, "diverged at ts={timestamp} bound={bound:?}"),
             (Err(_), Err(_)) => {}
             (p, r) => {
-                panic!("Published and Recreatable diverged at ts={timestamp} bound={bound:?}: {p:?} vs {r:?}")
+                panic!(
+                    "Published and Recreatable diverged at ts={timestamp} bound={bound:?}: {p:?} vs {r:?}"
+                )
             }
         }
     }

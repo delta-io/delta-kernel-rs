@@ -181,8 +181,8 @@ projection, predicate pushdown, metadata columns, and field-ID-based column matc
 
 ## Cancellation-aware reads
 
-When a caller attaches a `CancellationToken` to a scan (see
-[Cancelling a scan](../reading/scan_metadata.md#cancelling-a-scan)), Kernel threads it down to the
+When a caller attaches a `CancellationToken` to a snapshot builder, metadata reader, or scan (see
+[Attaching a token](../concepts/engine_trait.md#attaching-a-token)), Kernel threads it down to the
 Engine through cancellation-aware variants of the relevant `StorageHandler`, `JsonHandler`, and
 `ParquetHandler` methods. Their names end in `_with_cancellation`.
 

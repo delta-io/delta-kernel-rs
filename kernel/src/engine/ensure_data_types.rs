@@ -279,7 +279,8 @@ fn check_cast_compat(
     match (source_type, &target_type) {
         (source_type, target_type) if source_type == target_type => Ok(DataTypeCompat::Identical),
         (&ArrowDataType::Timestamp(_, _), &ArrowDataType::Timestamp(_, _)) => {
-            // timestamps are able to be cast between each other
+            // Timestamp bounds returned by `timestamp_stat_as_micros` in
+            // `engine/parquet_row_group_skipping.rs` must agree with the reader's casts.
             Ok(DataTypeCompat::NeedsCast(target_type))
         }
         // Allow up-casting to a larger type if it's safe and can't cause overflow or loss of
@@ -364,7 +365,7 @@ mod tests {
     use super::*;
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
     use crate::engine::arrow_conversion::TryFromKernel as _;
-    use crate::schema::{schema, ArrayType, CheckpointFieldKind, DataType, MapType, PrimitiveType};
+    use crate::schema::{ArrayType, CheckpointFieldKind, DataType, MapType, PrimitiveType, schema};
     use crate::unit_test_utils::assert_result_error_with_message;
 
     #[test]
@@ -661,12 +662,14 @@ mod tests {
 
     #[test]
     fn ensure_decimals() {
-        assert!(ensure_data_types(
-            &DataType::decimal(5, 2).unwrap(),
-            &ArrowDataType::Decimal128(5, 2),
-            ValidationMode::TypesAndNames
-        )
-        .is_ok());
+        assert!(
+            ensure_data_types(
+                &DataType::decimal(5, 2).unwrap(),
+                &ArrowDataType::Decimal128(5, 2),
+                ValidationMode::TypesAndNames
+            )
+            .is_ok()
+        );
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::decimal(5, 2).unwrap(),
@@ -687,12 +690,14 @@ mod tests {
             false,
             false,
         );
-        assert!(ensure_data_types(
-            &DataType::from(MapType::new(DataType::LONG, DataType::STRING, true)),
-            arrow_field.data_type(),
-            ValidationMode::TypesAndNames
-        )
-        .is_ok());
+        assert!(
+            ensure_data_types(
+                &DataType::from(MapType::new(DataType::LONG, DataType::STRING, true)),
+                arrow_field.data_type(),
+                ValidationMode::TypesAndNames
+            )
+            .is_ok()
+        );
 
         assert_result_error_with_message(
             ensure_data_types(
@@ -714,18 +719,22 @@ mod tests {
 
     #[test]
     fn ensure_list() {
-        assert!(ensure_data_types(
-            &DataType::from(ArrayType::new(DataType::LONG, true)),
-            &ArrowDataType::new_list(ArrowDataType::Int64, true),
-            ValidationMode::TypesAndNames
-        )
-        .is_ok());
-        assert!(ensure_data_types(
-            &DataType::from(ArrayType::new(DataType::LONG, true)),
-            &ArrowDataType::new_large_list(ArrowDataType::Int64, true),
-            ValidationMode::TypesAndNames
-        )
-        .is_ok());
+        assert!(
+            ensure_data_types(
+                &DataType::from(ArrayType::new(DataType::LONG, true)),
+                &ArrowDataType::new_list(ArrowDataType::Int64, true),
+                ValidationMode::TypesAndNames
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_data_types(
+                &DataType::from(ArrayType::new(DataType::LONG, true)),
+                &ArrowDataType::new_large_list(ArrowDataType::Int64, true),
+                ValidationMode::TypesAndNames
+            )
+            .is_ok()
+        );
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::from(ArrayType::new(DataType::STRING, true)),
@@ -773,12 +782,14 @@ mod tests {
             ]),
             true,
         );
-        assert!(ensure_data_types(
-            &kernel_simple,
-            arrow_simple_ok.data_type(),
-            ValidationMode::Full
-        )
-        .is_ok());
+        assert!(
+            ensure_data_types(
+                &kernel_simple,
+                arrow_simple_ok.data_type(),
+                ValidationMode::Full
+            )
+            .is_ok()
+        );
 
         let arrow_missing_simple = ArrowField::new_struct(
             "arrow_struct",

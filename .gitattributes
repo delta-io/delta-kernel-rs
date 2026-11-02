@@ -1,0 +1,2 @@
+kernel/error_catalog/delta-error-classes.json text eol=lf
+xtask/tests/golden/delta_error_conditions.rs text eol=lf

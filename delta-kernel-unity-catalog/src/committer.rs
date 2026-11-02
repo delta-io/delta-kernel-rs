@@ -1,4 +1,4 @@
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 #[cfg(feature = "declarative-plans")]
@@ -506,12 +506,14 @@ mod tests {
                 panic!("expected Committed for version 0, got Conflict")
             }
         }
-        assert!(committer
-            .update_table_client
-            .requests
-            .lock()
-            .unwrap()
-            .is_empty());
+        assert!(
+            committer
+                .update_table_client
+                .requests
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[rstest]

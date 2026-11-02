@@ -11,9 +11,9 @@ use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{col, lit, ColumnName};
-use delta_kernel::schema::{schema_ref, DataType, StructType};
-use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
+use delta_kernel::expressions::{ColumnName, col, lit};
+use delta_kernel::schema::{DataType, StructType, schema_ref};
+use delta_kernel::table_features::{ColumnMappingMode, get_any_level_column_physical_name};
 use delta_kernel::{Predicate as Pred, Snapshot};
 use test_utils::{
     create_table_and_load_snapshot, read_actions_from_commit, test_table_setup,
@@ -271,8 +271,8 @@ async fn test_write_stats_for_complex_type_columns(
 /// With numIndexedCols=3, the first 3 leaf columns (id, data.name, data.tags) get stats. The
 /// 4th leaf (data.props) is excluded because the limit is reached.
 #[tokio::test]
-async fn test_write_stats_nested_complex_types_respect_column_limit(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_write_stats_nested_complex_types_respect_column_limit()
+-> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = schema_ref! {

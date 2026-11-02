@@ -3,7 +3,7 @@
 use crate::schema::{DataType, Schema, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
@@ -74,7 +74,7 @@ mod tests {
 
     use super::schema_has_file_in_map_key;
     use crate::actions::Protocol;
-    use crate::schema::{schema, ArrayType, DataType, MapType, StructField, StructType};
+    use crate::schema::{ArrayType, DataType, MapType, StructField, StructType, schema};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{
         assert_result_error_with_message, assert_schema_feature_validation,

@@ -1,9 +1,9 @@
-//! Applies snapshot-build cancellation to reads through the connector's engine handlers.
+//! Binds an operation's cancellation token to reads through the connector's engine handlers.
 //!
-//! `SnapshotBuilder::build` uses `CancellableEngine` for builds with a token and no snapshot
-//! hint. The wrappers supply that token when loading code calls an ordinary read method,
-//! or a cancellation-aware one with no token of its own, so discovery and replay share
-//! cancellation without threading a token through each helper.
+//! Snapshot building and scan metadata operations use `CancellableEngine` when configured with a
+//! token. The wrappers supply that token when loading code calls an ordinary read method, or a
+//! cancellation-aware one with no token of its own, so discovery and replay share cancellation
+//! without threading a token through each helper.
 
 use std::sync::Arc;
 
@@ -23,9 +23,8 @@ use crate::{
 /// An engine adapter that supplies a default cancellation token to storage, JSON, and
 /// Parquet reads.
 ///
-/// Snapshot builds with cancellation supply one token to [`Self::new`]. The wrapped
-/// handlers use it as the default for reads, so loading helpers inherit cancellation
-/// through the engine.
+/// Operations with cancellation supply one token to [`Self::new`]. The wrapped handlers use it as
+/// the default for reads, so loading helpers inherit cancellation through the engine.
 ///
 /// At the handler API boundary, `*_with_cancellation` methods accept an optional per-call
 /// token. `None` uses the stored default; `Some(token)` overrides it for that read and is

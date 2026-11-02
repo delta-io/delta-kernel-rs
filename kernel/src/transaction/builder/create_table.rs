@@ -15,8 +15,8 @@ use itertools::Itertools;
 use url::Url;
 use uuid::Uuid;
 
-use super::state::TransactionBuilderState;
 use super::TransactionBuilder;
+use super::state::TransactionBuilderState;
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
@@ -25,30 +25,30 @@ use crate::schema::file_utils::schema_contains_file_type;
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
-    normalize_column_names_to_schema_casing, schema_contains_non_null_fields, DataType, SchemaRef,
-    StructType,
+    DataType, SchemaRef, StructType, normalize_column_names_to_schema_casing,
+    schema_contains_non_null_fields,
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
+    ColumnMappingMode, IcebergCompatValidationContext, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
+    SET_TABLE_FEATURE_SUPPORTED_VALUE, TableFeature, V2_VALIDATOR, add_feature_to_lists,
+    assign_column_mapping_metadata, auto_enable_property_driven_features,
     ensure_domain_metadata_dependency, find_max_column_id_in_schema,
     get_any_level_column_physical_name, get_column_mapping_mode_from_properties,
     schema_contains_timestamp_ntz, strip_stray_column_mapping_metadata,
-    validate_iceberg_compat_if_needed, ColumnMappingMode, IcebergCompatValidationContext,
-    TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
-    V2_VALIDATOR,
+    validate_iceberg_compat_if_needed,
 };
 use crate::table_properties::{
-    strip_check_constraint_prefix, CheckpointPolicy, TableProperties, APPEND_ONLY,
-    CHECKPOINT_INTERVAL, CHECKPOINT_POLICY, CHECKPOINT_WRITE_STATS_AS_JSON,
+    APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY, CHECKPOINT_WRITE_STATS_AS_JSON,
     CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE,
-    DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS, DELETED_FILE_RETENTION_DURATION,
-    DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS,
-    ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
-    ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
-    ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
-    MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED,
-    SET_TRANSACTION_RETENTION_DURATION,
+    CheckpointPolicy, DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS,
+    DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED,
+    ENABLE_DELETION_VECTORS, ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1,
+    ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
+    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION,
+    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
+    PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED, SET_TRANSACTION_RETENTION_DURATION,
+    TableProperties, strip_check_constraint_prefix,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -1084,6 +1084,13 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
 
         // Build TableConfiguration directly for the new table
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
+        // TODO(#3695): Support creating tables with generated columns.
+        if table_configuration.has_generation_expressions() {
+            return Err(KernelError::unsupported(
+                "Setting `delta.generationExpression` column metadata is not supported during \
+                 CREATE TABLE",
+            ));
+        }
 
         // Create Transaction<CreateTable> with the effective table configuration
         let transaction = try_new_create_table(
@@ -1147,11 +1154,11 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{column_name, ColumnName};
+    use crate::expressions::{ColumnName, column_name};
     use crate::metrics::MetricEvent;
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
     use crate::schema::{
-        schema, schema_ref, try_schema, ColumnMetadataKey, DataType, MetadataValue, StructField,
+        ColumnMetadataKey, DataType, MetadataValue, StructField, schema, schema_ref, try_schema,
     };
     use crate::table_features::FeatureType;
     use crate::table_properties::{
@@ -1160,8 +1167,8 @@ mod tests {
     };
     use crate::transforms::SchemaTransform;
     use crate::unit_test_utils::{
-        assert_result_error_with_message, build_complex_nested_kernel_schema,
-        install_thread_local_metrics_reporter, CapturingReporter,
+        CapturingReporter, assert_result_error_with_message, build_complex_nested_kernel_schema,
+        field_with_generation_expression, install_thread_local_metrics_reporter,
     };
 
     fn test_schema() -> SchemaRef {
@@ -1186,6 +1193,7 @@ mod tests {
     #[rstest]
     fn common_builder_state_preserves_data_change_through_empty_commit(
         #[values(false, true)] expected_data_change: bool,
+        #[values(false, true)] skip_dedup_validation: bool,
     ) -> KernelResult<()> {
         let tempdir = tempfile::tempdir()?;
         let table_path = tempdir.path().join("table");
@@ -1194,7 +1202,7 @@ mod tests {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
-        let builder = CreateTableTransactionBuilder::new(
+        let mut builder = CreateTableTransactionBuilder::new(
             table_path.to_string_lossy(),
             test_schema(),
             "test-engine",
@@ -1203,8 +1211,12 @@ mod tests {
         .with_correlation_id("test-correlation")
         .with_operation_parameters([("mode", Some("Create"))])
         .with_transaction_id("app", 7);
+        if skip_dedup_validation {
+            builder = builder.without_dedup_validation();
+        }
         let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
 
+        assert_eq!(transaction.skip_dedup_validation, skip_dedup_validation);
         assert_eq!(transaction.engine_info, "test-engine");
         assert_eq!(
             transaction.correlation_id.as_deref(),
@@ -1401,6 +1413,30 @@ mod tests {
         let properties = HashMap::from([(key.to_string(), "amount > 0".to_string())]);
         let result = validate_extract_table_features_and_properties(properties);
         assert_result_error_with_message(result, "Setting CHECK constraint property");
+    }
+
+    #[test]
+    fn create_table_rejects_generation_expressions() -> KernelResult<()> {
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join("table");
+        std::fs::create_dir(&table_path)?;
+        let schema = schema_ref! {
+            nullable "event_time": TIMESTAMP,
+            (field_with_generation_expression("event_year", DataType::INTEGER, "YEAR(event_time)")),
+        };
+
+        let result = CreateTableTransactionBuilder::new(
+            table_path.to_string_lossy(),
+            schema,
+            "test-engine",
+            true,
+        )
+        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()));
+
+        let is_unsupported = matches!(&result, Err(KernelError::Unsupported(_)));
+        assert!(is_unsupported);
+        assert_result_error_with_message(result, "delta.generationExpression");
+        Ok(())
     }
 
     #[test]
@@ -1640,10 +1676,12 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not found in schema"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not found in schema")
+        );
     }
 
     #[test]
@@ -1895,18 +1933,26 @@ mod tests {
         )]);
         let validated = validate_extract_table_features_and_properties(properties).unwrap();
 
-        assert!(validated
-            .reader_features
-            .contains(&TableFeature::VariantType));
-        assert!(validated
-            .reader_features
-            .contains(&TableFeature::VariantShredding));
-        assert!(validated
-            .writer_features
-            .contains(&TableFeature::VariantType));
-        assert!(validated
-            .writer_features
-            .contains(&TableFeature::VariantShredding));
+        assert!(
+            validated
+                .reader_features
+                .contains(&TableFeature::VariantType)
+        );
+        assert!(
+            validated
+                .reader_features
+                .contains(&TableFeature::VariantShredding)
+        );
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::VariantType)
+        );
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::VariantShredding)
+        );
     }
 
     fn multi_column_schema() -> SchemaRef {
@@ -2026,10 +2072,12 @@ mod tests {
         let columns = vec![column_name!("address.city")];
         let result = validate_partition_columns(&schema, &columns);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("must be a top-level column"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must be a top-level column")
+        );
     }
 
     #[rstest::rstest]
@@ -2056,10 +2104,12 @@ mod tests {
         let columns = vec![ColumnName::new([col_name])];
         let result = validate_partition_columns(&schema, &columns);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("non-primitive type"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("non-primitive type")
+        );
     }
 
     #[rstest::rstest]
@@ -2134,9 +2184,11 @@ mod tests {
         maybe_auto_enable_property_driven_features(&mut validated);
         maybe_enable_ict_for_catalog_managed(&mut validated).unwrap();
 
-        assert!(validated
-            .writer_features
-            .contains(&TableFeature::InCommitTimestamp));
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::InCommitTimestamp)
+        );
         assert_eq!(
             validated.properties.get(ENABLE_IN_COMMIT_TIMESTAMPS),
             Some(&"true".to_string()),
@@ -2337,9 +2389,11 @@ mod tests {
 
         let region = effective_schema.field("region").expect("missing region");
         let _ = expect_field_id_and_physical_name(region, 3);
-        assert!(!region
-            .metadata
-            .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref()));
+        assert!(
+            !region
+                .metadata
+                .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref())
+        );
 
         // maxColumnId tracks the largest assigned CM id, including nested ids.
         assert_eq!(

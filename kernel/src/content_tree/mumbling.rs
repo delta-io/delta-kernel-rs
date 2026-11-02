@@ -17,9 +17,7 @@
 //! (`pos & 0xFF`). The container count limit bounds positions to 21 bits.
 //!
 //! [`MumblingBitmap`] is the owned, read-only decoded form: it answers membership queries and
-//! iterates set positions without materializing a `Vec<bool>`. [`read_bitmap`] is a convenience
-//! wrapper that decodes straight to a deletion selection vector (set positions are unselected).
-//! Encoding and mutation are out of scope.
+//! iterates set positions. Encoding and mutation are out of scope.
 
 use bytes::{Buf, Bytes};
 use itertools::Either;
@@ -123,10 +121,10 @@ impl MumblingBitmap {
 
     /// Whether position `pos` is set. Positions beyond the bitmap's containers are unset.
     pub(crate) fn contains(&self, pos: u32) -> bool {
-        let container = (pos >> 8) as usize;
+        let (container, value) = split_position(pos);
         self.containers
             .get(container)
-            .is_some_and(|c| c.contains(pos as u8))
+            .is_some_and(|c| c.contains(value))
     }
 
     /// The number of set bits.
@@ -141,56 +139,39 @@ impl MumblingBitmap {
 
     /// The set positions, in ascending order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = u32> + '_ {
-        self.containers
-            .iter()
-            .enumerate()
-            .flat_map(|(container, c)| {
-                let base = (container as u32) << 8; // container index is the high 16 bits
-                c.iter().map(move |v| base + v as u32)
-            })
+        self.iter_from(0)
     }
 
-    /// Materialize a deletion selection vector: element `p` is `false` if and only if position `p`
-    /// is set (deleted).
+    /// The set positions at or above `start`, in ascending order.
     ///
-    /// The vector ends at the highest set position, and is empty when no bit is set. Rows beyond
-    /// its end are selected, per the [`FilteredEngineData`](crate::FilteredEngineData) contract,
-    /// so callers do not need to know the row count of the data being filtered.
-    pub(crate) fn to_deletion_selection_vec(&self) -> Vec<bool> {
-        let Some(max) = self.max() else {
-            return vec![];
-        };
-        let mut out = vec![true; max as usize + 1];
-        for pos in self.iter() {
-            if let Some(slot) = out.get_mut(pos as usize) {
-                *slot = false;
-            }
-        }
-        out
-    }
-
-    /// The highest set position, or `None` if no bit is set.
-    fn max(&self) -> Option<u32> {
+    /// Containers before the one holding `start` cover only lower positions, so they are skipped
+    /// without being scanned; only the set positions below `start` in that first container are
+    /// visited and dropped. This keeps repeated calls with increasing `start` (one per leaf batch)
+    /// from rescanning the bitmap from position 0.
+    pub(crate) fn iter_from(&self, start: u32) -> impl Iterator<Item = u32> + '_ {
+        let (first_container, _) = split_position(start);
         self.containers
             .iter()
             .enumerate()
-            .rev()
-            .find_map(|(container, c)| {
-                let base = (container as u32) << 8;
-                c.iter().last().map(|v| base + v as u32)
-            })
+            .skip(first_container)
+            .flat_map(|(container, c)| c.iter().map(move |v| join_position(container, v)))
+            .skip_while(move |&pos| pos < start)
     }
-}
-
-/// Decode a Mumbling bitmap (version 1) directly into a deletion selection vector.
-///
-/// Convenience wrapper over [`MumblingBitmap::deserialize`] and
-/// [`MumblingBitmap::to_deletion_selection_vec`]; see those for the layout and errors.
-pub(crate) fn read_bitmap(bytes: Bytes) -> KernelResult<Vec<bool>> {
-    Ok(MumblingBitmap::deserialize(bytes)?.to_deletion_selection_vec())
 }
 
 // === Helpers ===
+
+/// Splits bitmap position `pos` into its container index (the bits above the low 8) and its
+/// in-container value (the low 8 bits).
+fn split_position(pos: u32) -> (usize, u8) {
+    ((pos >> 8) as usize, pos as u8)
+}
+
+/// Joins a container index and an in-container value back into a bitmap position; the inverse of
+/// [`split_position`].
+fn join_position(container: usize, value: u8) -> u32 {
+    (container as u32) << 8 | value as u32
+}
 
 impl Container {
     /// Read the container described by `descriptor` from `bytes`.
@@ -341,8 +322,29 @@ fn take(bytes: &mut Bytes, n: usize) -> KernelResult<Bytes> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+
+    /// Encodes `positions` as a Mumbling bitmap, writing every non-empty container dense, so
+    /// tests outside this module can build bitmaps from positions alone.
+    pub(crate) fn encode_positions(positions: &[u32]) -> Bytes {
+        let container_count = positions
+            .iter()
+            .max()
+            .map_or(0, |&max| split_position(max).0 + 1);
+        let mut by_container: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+        for &pos in positions {
+            let (container, value) = split_position(pos);
+            by_container.entry(container).or_default().push(value);
+        }
+        let entries: Vec<(usize, Body)> = by_container
+            .into_iter()
+            .map(|(container, values)| (container, Body::Dense(dense_bytes(&values))))
+            .collect();
+        encode_bitmap(container_count, &entries, None)
+    }
 
     /// A container body for building test buffers.
     enum Body {
@@ -410,13 +412,9 @@ mod tests {
         block
     }
 
-    /// The deleted (unselected) positions of a deletion selection vector, ascending.
-    fn deleted_positions(selection: &[bool]) -> Vec<usize> {
-        selection
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &selected)| (!selected).then_some(i))
-            .collect()
+    /// Decodes `bytes` and returns its set positions, ascending.
+    fn decode_positions(bytes: Bytes) -> KernelResult<Vec<u32>> {
+        Ok(MumblingBitmap::deserialize(bytes)?.iter().collect())
     }
 
     // === PFOR decoder: the spec's Appendix A worked examples ===
@@ -480,75 +478,74 @@ mod tests {
 
     #[test]
     fn empty_bitmap_has_no_containers() {
-        let bitmap = read_bitmap(encode_bitmap(0, &[], None)).unwrap();
-        assert!(bitmap.is_empty());
+        let positions = decode_positions(encode_bitmap(0, &[], None)).unwrap();
+        assert!(positions.is_empty());
     }
 
     #[test]
     fn sparse_container_sets_expected_positions() {
-        let bitmap = read_bitmap(encode_bitmap(
+        let positions = decode_positions(encode_bitmap(
             1,
             &[(0, Body::Sparse(vec![3, 5, 255]))],
             None,
         ))
         .unwrap();
-        assert_eq!(bitmap.len(), 256);
-        assert_eq!(deleted_positions(&bitmap), vec![3, 5, 255]);
+        assert_eq!(positions, vec![3, 5, 255]);
     }
 
     #[test]
     fn high_container_index_maps_to_position() {
         // Container 0x123 (291), value 0x45 -> position 0x12345. Exercises the u16 container index
         // (a u8 container, as in the old gist-based reader, could not address this).
-        let bitmap = read_bitmap(encode_bitmap(
+        let positions = decode_positions(encode_bitmap(
             292,
             &[(0x123, Body::Sparse(vec![0x45]))],
             None,
         ))
         .unwrap();
-        assert_eq!(bitmap.len(), 0x12345 + 1);
-        assert_eq!(deleted_positions(&bitmap), vec![0x12345]);
+        assert_eq!(positions, vec![0x12345]);
     }
 
     #[test]
     fn dense_container_respects_msb_first_bit_order() {
         let values = [0u8, 7, 8, 255];
-        let bitmap = read_bitmap(encode_bitmap(
+        let positions = decode_positions(encode_bitmap(
             1,
             &[(0, Body::Dense(dense_bytes(&values)))],
             None,
         ))
         .unwrap();
-        let expected: Vec<usize> = values.iter().map(|&v| v as usize).collect();
-        assert_eq!(deleted_positions(&bitmap), expected);
+        let expected: Vec<u32> = values.iter().map(|&v| v as u32).collect();
+        assert_eq!(positions, expected);
     }
 
     #[test]
     fn dense_byte0_msb_is_position_zero() {
         let mut block = [0u8; DENSE_BYTES];
         block[0] = 0x80; // only the most significant bit of byte 0
-        let bitmap = read_bitmap(encode_bitmap(1, &[(0, Body::Dense(block))], None)).unwrap();
-        assert_eq!(bitmap, vec![false]);
+        let positions =
+            decode_positions(encode_bitmap(1, &[(0, Body::Dense(block))], None)).unwrap();
+        assert_eq!(positions, vec![0]);
     }
 
     #[test]
     fn full_dense_container_sets_all_256_positions() {
-        let bitmap = read_bitmap(encode_bitmap(
+        let positions = decode_positions(encode_bitmap(
             1,
             &[(0, Body::Dense([0xFF; DENSE_BYTES]))],
             None,
         ))
         .unwrap();
-        assert_eq!(deleted_positions(&bitmap), (0..256).collect::<Vec<_>>());
+        assert_eq!(positions, (0..256).collect::<Vec<_>>());
     }
 
     #[test]
     fn sparse_container_at_max_length() {
         let values: Vec<u8> = (0..31).collect(); // 31 values, the largest sparse container
-        let bitmap =
-            read_bitmap(encode_bitmap(1, &[(0, Body::Sparse(values.clone()))], None)).unwrap();
-        let expected: Vec<usize> = values.iter().map(|&v| v as usize).collect();
-        assert_eq!(deleted_positions(&bitmap), expected);
+        let positions =
+            decode_positions(encode_bitmap(1, &[(0, Body::Sparse(values.clone()))], None)).unwrap();
+        let expected: Vec<u32> = values.iter().map(|&v| v as u32).collect();
+        assert_eq!(positions, expected);
     }
 
     #[test]
@@ -558,23 +555,18 @@ mod tests {
             // container 1 empty
             (2, Body::Dense(dense_bytes(&[0, 100, 255]))),
         ];
-        let bitmap = read_bitmap(encode_bitmap(3, &entries, None)).unwrap();
-        let mut expected = vec![1usize, 2];
-        expected.extend([0usize, 100, 255].iter().map(|&v| 512 + v));
-        expected.sort_unstable();
-        assert_eq!(deleted_positions(&bitmap), expected);
+        let positions = decode_positions(encode_bitmap(3, &entries, None)).unwrap();
+        assert_eq!(positions, vec![1, 2, 512, 612, 767]);
     }
 
     #[test]
     fn round_trip_across_many_containers() {
-        use std::collections::BTreeMap;
-
-        let positions = [0usize, 255, 256, 0x12345, 40000, 0x1FFFF];
-        let container_count = (positions.iter().max().unwrap() / 256) + 1;
+        let positions = [0u32, 255, 256, 0x12345, 40000, 0x1FFFF];
+        let container_count = (*positions.iter().max().unwrap() as usize / 256) + 1;
         let mut by_container: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
         for &p in &positions {
             by_container
-                .entry(p >> 8)
+                .entry(p as usize >> 8)
                 .or_default()
                 .push((p & 0xFF) as u8);
         }
@@ -586,10 +578,22 @@ mod tests {
             })
             .collect();
 
-        let bitmap = read_bitmap(encode_bitmap(container_count, &entries, None)).unwrap();
+        let decoded = decode_positions(encode_bitmap(container_count, &entries, None)).unwrap();
         let mut expected = positions.to_vec();
         expected.sort_unstable();
-        assert_eq!(deleted_positions(&bitmap), expected);
+        assert_eq!(decoded, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::empty(&[])]
+    #[case::one_container(&[0, 7, 8, 255])]
+    #[case::gap_between_containers(&[0, 600])]
+    // Container 256 needs a second 256-descriptor PFOR chunk.
+    #[case::second_descriptor_chunk(&[3, 0x10000, 0x10001])]
+    fn encode_positions_round_trips(#[case] positions: &[u32]) {
+        let bitmap = MumblingBitmap::deserialize(encode_positions(positions)).unwrap();
+        assert_eq!(bitmap.iter().collect::<Vec<_>>(), positions);
+        assert_eq!(bitmap.cardinality(), positions.len());
     }
 
     #[test]
@@ -605,12 +609,8 @@ mod tests {
         buf.push(0x20 << 2); // 6-bit value 0x20 packed MSB-first into one byte -> 0x80
         buf.extend_from_slice(&dense_bytes(&[1, 2, 3, 4, 5, 6, 7, 8])); // container 1's body
 
-        let bitmap = read_bitmap(Bytes::from(buf)).unwrap();
-        assert_eq!(bitmap.len(), 265);
-        assert_eq!(
-            deleted_positions(&bitmap),
-            vec![257, 258, 259, 260, 261, 262, 263, 264]
-        );
+        let positions = decode_positions(Bytes::from(buf)).unwrap();
+        assert_eq!(positions, (257..=264).collect::<Vec<_>>());
     }
 
     #[test]
@@ -623,9 +623,9 @@ mod tests {
     fn cardinality_mismatch_errors() {
         let entries = [(0, Body::Sparse(vec![1, 2, 3]))];
         // Correct cardinality (3) decodes.
-        assert!(read_bitmap(encode_bitmap(1, &entries, Some(3))).is_ok());
+        assert!(decode_positions(encode_bitmap(1, &entries, Some(3))).is_ok());
         // Wrong cardinality is rejected.
-        let err = read_bitmap(encode_bitmap(1, &entries, Some(99))).unwrap_err();
+        let err = decode_positions(encode_bitmap(1, &entries, Some(99))).unwrap_err();
         assert!(err.to_string().contains("cardinality"), "{err:?}");
     }
 
@@ -643,7 +643,7 @@ mod tests {
     #[case::trailing_bytes(encode_trailing_bytes(), "trailing")]
     #[case::too_many_containers(encode_container_count(MAX_CONTAINERS as u16 + 1), "exceeding")]
     fn rejects_malformed_bitmap(#[case] bytes: Bytes, #[case] needle: &str) {
-        let err = read_bitmap(bytes).unwrap_err();
+        let err = decode_positions(bytes).unwrap_err();
         assert!(err.to_string().contains(needle), "{err:?}");
     }
 
@@ -727,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn iter_yields_ascending_positions_matching_deletion_selection_vec() {
+    fn iter_yields_ascending_positions() {
         let entries = vec![
             (0, Body::Sparse(vec![3, 5, 255])),
             (2, Body::Dense(dense_bytes(&[0, 100, 255]))),
@@ -735,41 +735,30 @@ mod tests {
         ];
         let bitmap = MumblingBitmap::deserialize(encode_bitmap(292, &entries, None)).unwrap();
 
-        let from_iter: Vec<usize> = bitmap.iter().map(|p| p as usize).collect();
-        assert!(
-            from_iter.windows(2).all(|w| w[0] < w[1]),
-            "iter must be ascending"
-        );
+        let from_iter: Vec<u32> = bitmap.iter().collect();
+        assert_eq!(from_iter, vec![3, 5, 255, 512, 612, 767, 0x12345]);
         assert_eq!(from_iter.len(), bitmap.cardinality());
-        assert_eq!(
-            from_iter,
-            deleted_positions(&bitmap.to_deletion_selection_vec())
-        );
     }
 
-    #[test]
-    fn to_deletion_selection_vec_matches_read_bitmap() {
-        let bytes = encode_bitmap(
-            3,
-            &[
-                (0, Body::Sparse(vec![1, 2])),
-                (2, Body::Dense(dense_bytes(&[0, 100, 255]))),
-            ],
-            None,
-        );
-        let via_type = MumblingBitmap::deserialize(bytes.clone())
-            .unwrap()
-            .to_deletion_selection_vec();
-        assert_eq!(via_type, read_bitmap(bytes).unwrap());
-    }
-
-    #[test]
-    fn deletion_selection_vec_ends_at_highest_set_position() {
-        // Containers 1 and 2 are empty, so the vector stops after position 2 rather than 3 * 256.
-        let bitmap =
-            MumblingBitmap::deserialize(encode_bitmap(3, &[(0, Body::Sparse(vec![0, 2]))], None))
-                .unwrap();
-        assert_eq!(bitmap.to_deletion_selection_vec(), vec![false, true, false]);
+    #[rstest::rstest]
+    #[case::from_zero(0, &[3, 5, 255, 512, 612, 767, 0x12345])]
+    #[case::mid_container(5, &[5, 255, 512, 612, 767, 0x12345])]
+    #[case::skips_empty_container(256, &[512, 612, 767, 0x12345])]
+    #[case::inside_dense_container(613, &[767, 0x12345])]
+    #[case::exact_last_position(0x12345, &[0x12345])]
+    #[case::past_last_position(0x12346, &[])]
+    #[case::past_last_container(u32::MAX, &[])]
+    fn iter_from_yields_ascending_positions_at_or_above_start(
+        #[case] start: u32,
+        #[case] expected: &[u32],
+    ) {
+        let entries = vec![
+            (0, Body::Sparse(vec![3, 5, 255])),
+            (2, Body::Dense(dense_bytes(&[0, 100, 255]))),
+            (0x123, Body::Sparse(vec![0x45])),
+        ];
+        let bitmap = MumblingBitmap::deserialize(encode_bitmap(292, &entries, None)).unwrap();
+        assert_eq!(bitmap.iter_from(start).collect::<Vec<_>>(), expected);
     }
 
     #[test]

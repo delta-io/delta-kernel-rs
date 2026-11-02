@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 
+use delta_kernel::KernelError as DeltaError;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, Error, ObjectStore};
-use delta_kernel::KernelError as DeltaError;
 use url::Url;
 
 /// Alias for convenience
@@ -119,7 +119,7 @@ mod tests {
     #[cfg(feature = "arrow-60")]
     use hdfs_native_object_store_14::HdfsObjectStoreBuilder;
 
-    use super::{insert_url_handler, store_from_url_opts, URL_REGISTRY};
+    use super::{URL_REGISTRY, insert_url_handler, store_from_url_opts};
     use crate::*;
 
     /// Example funciton of doing testing of a custom [HdfsObjectStore] construction
@@ -174,7 +174,9 @@ mod tests {
             }
             Err(unexpected) => panic!("Unexpected error happened: {unexpected:?}"),
             Ok(_) => {
-                panic!("Expected to get an error when constructing an HdfsObjectStore, but something didn't work as expected! Either the parse_url_opts_hdfs_native function didn't get called, or the hdfs-native-object-store no longer errors when it cannot connect to HDFS");
+                panic!(
+                    "Expected to get an error when constructing an HdfsObjectStore, but something didn't work as expected! Either the parse_url_opts_hdfs_native function didn't get called, or the hdfs-native-object-store no longer errors when it cannot connect to HDFS"
+                );
             }
         }
     }

@@ -4,19 +4,19 @@ use std::marker::PhantomData;
 
 use delta_kernel_derive::internal_api;
 
-use super::state::TransactionBuilderState;
 use super::TransactionBuilder;
+use super::state::TransactionBuilderState;
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    validate_iceberg_compat_if_needed, IcebergCompatValidationContext, Operation, TableFeature,
-    V2_VALIDATOR, V3_VALIDATOR,
+    IcebergCompatValidationContext, Operation, TableFeature, V2_VALIDATOR, V3_VALIDATOR,
+    validate_iceberg_compat_if_needed,
 };
 use crate::transaction::domain_metadata::validate_unique_domains;
-use crate::transaction::schema_evolution::{evolve_table_config, SchemaOperation};
+use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
 use crate::transaction::{
     ExecutionMode, Imperative, Transaction, UpdateTable, UpdateTableOperation,
 };
@@ -309,12 +309,18 @@ fn try_new_update_table<MODE: ExecutionMode>(
         .table_configuration()
         .ensure_operation_supported(Operation::Write)?;
 
+    // TODO(#3223): Strip generation expressions on metadata updates when the pre-update protocol
+    // did not support generated columns, so a protocol upgrade cannot activate previously ignored
+    // formulas.
+
     // TODO(#3240): Validate that delta.enableRowTracking=true has the required protocol support
     // and materialized column-name properties. Materialized names must be distinct and must not
     // collide with physical data columns.
 
     // Read clustering columns from snapshot (returns None if clustering not enabled)
-    let clustering_columns = read_snapshot.get_physical_clustering_columns(engine)?;
+    let clustering_columns = read_snapshot
+        .reader()
+        .get_physical_clustering_columns(engine)?;
 
     let commit_timestamp = current_time_ms()?;
 
@@ -396,11 +402,11 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::column_name;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::expressions::ColumnName;
+    use crate::expressions::column_name;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{schema_ref, DataType, StructField};
+    use crate::schema::{DataType, StructField, schema_ref};
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
     use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3};
@@ -583,10 +589,12 @@ mod tests {
             UpdateTableOperation::AlterTable.into()
         );
         assert!(transaction.should_emit_metadata);
-        assert!(transaction
-            .effective_table_config
-            .logical_schema()
-            .contains("new_column"));
+        assert!(
+            transaction
+                .effective_table_config
+                .logical_schema()
+                .contains("new_column")
+        );
         Ok(())
     }
 
@@ -630,9 +638,11 @@ mod tests {
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("requires at least one schema change"));
+        assert!(
+            error
+                .to_string()
+                .contains("requires at least one schema change")
+        );
         Ok(())
     }
 
@@ -776,9 +786,11 @@ mod tests {
         );
         let result = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
         if let Some(feature) = feature.filter(|_| feature_enabled) {
-            assert!(snapshot
-                .table_configuration()
-                .is_feature_supported(&feature));
+            assert!(
+                snapshot
+                    .table_configuration()
+                    .is_feature_supported(&feature)
+            );
             assert!(snapshot.table_configuration().is_feature_enabled(&feature));
             let error = result.unwrap_err();
             let expected =

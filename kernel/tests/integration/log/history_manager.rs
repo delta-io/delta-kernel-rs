@@ -5,7 +5,7 @@ use std::ops::RangeInclusive;
 use std::time::{Duration, SystemTime};
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::history_manager::{get_earliest_commit, latest_version_as_of, HistoryCommitType};
+use delta_kernel::history_manager::{HistoryCommitType, get_earliest_commit, latest_version_as_of};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{ObjectStore, ObjectStoreExt as _};
 use delta_kernel::transaction::create_table::create_table;

@@ -4,12 +4,12 @@
 use std::collections::HashMap;
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::schema::{schema_ref, DataType, StructField};
+use delta_kernel::schema::{DataType, StructField, schema_ref};
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use delta_kernel::transaction::{Transaction, UpdateTableOperation};
 use delta_kernel::{Engine, FileMeta, KernelError, KernelResult};
 use rstest::rstest;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_utils::{
     assert_result_error_with_message, begin_transaction_with, create_table,
@@ -59,8 +59,8 @@ async fn setup_adaptive_metadata_table(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_action(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_action()
+-> Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("root_manifest_file_checkpoint").await?;
 
@@ -109,9 +109,11 @@ async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_actio
     let schema: serde_json::Value =
         serde_json::from_str(metadata["schemaString"].as_str().unwrap())?;
     let fields = schema["fields"].as_array().expect("schema fields");
-    assert!(fields
-        .iter()
-        .any(|f| f["name"] == json!("id") && f["type"] == json!("integer")));
+    assert!(
+        fields
+            .iter()
+            .any(|f| f["name"] == json!("id") && f["type"] == json!("integer"))
+    );
 
     Ok(())
 }
@@ -144,8 +146,8 @@ async fn alter_table_commit_rejects_root_manifest() -> Result<(), Box<dyn std::e
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_with_root_manifest_file_merges_domain_metadata_and_transactions(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_with_root_manifest_file_merges_domain_metadata_and_transactions()
+-> Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("root_manifest_file_merge").await?;
 
@@ -218,8 +220,8 @@ async fn test_with_root_manifest_file_merges_domain_metadata_and_transactions(
 }
 
 #[tokio::test]
-async fn test_with_root_manifest_file_requires_the_feature(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_with_root_manifest_file_requires_the_feature()
+-> Result<(), Box<dyn std::error::Error>> {
     let (store, engine, table_url) = engine_store_setup("root_manifest_file_no_feature", None);
     let schema = schema_ref! { nullable "id": INTEGER };
     create_table(store, table_url.clone(), schema, &[], true, vec![], vec![]).await?;
@@ -368,8 +370,8 @@ async fn test_commit_info_records_data_change_and_last_manifest_commit(
 }
 
 #[tokio::test]
-async fn test_commit_info_omits_adaptive_metadata_fields_without_the_feature(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_commit_info_omits_adaptive_metadata_fields_without_the_feature()
+-> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let dir_url = Url::from_directory_path(temp_dir.path()).expect("valid directory url");
     let (store, engine, table_url) =

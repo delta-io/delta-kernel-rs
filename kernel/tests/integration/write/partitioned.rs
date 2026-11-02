@@ -4,10 +4,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
+use delta_kernel::Snapshot;
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT};
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
     TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
@@ -15,12 +16,11 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
-use delta_kernel::schema::{schema, schema_ref, DataType, StructType};
+use delta_kernel::schema::{DataType, StructType, schema, schema_ref};
 use delta_kernel::table_features::ColumnMappingMode;
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::UpdateTableOperation;
-use delta_kernel::Snapshot;
 use rstest::rstest;
 use test_utils::{get_column, read_scan, test_table_setup_mt, write_batch_to_table};
 use url::Url;
@@ -983,8 +983,8 @@ fn read_single_add(
 /// `partitionValues`. Verifies that contract end-to-end through the kernel `create_table`
 /// builder.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_materialized_partition_columns_excluded_from_stats(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_materialized_partition_columns_excluded_from_stats()
+-> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let partition_col = "partition";

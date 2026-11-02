@@ -11,7 +11,7 @@ use crate::engine::sync::SyncEngine;
 use crate::metrics::{LogSegmentLoadType, MetricEvent, SnapshotLoadType};
 use crate::unit_test_utils::recording_reads::{Read, RecordingReads};
 use crate::unit_test_utils::{
-    copy_test_table, install_thread_local_metrics_reporter, CapturingReporter,
+    CapturingReporter, copy_test_table, install_thread_local_metrics_reporter,
 };
 use crate::{CancellationTokenRef, KernelError, Snapshot};
 
@@ -154,8 +154,10 @@ fn only_cancelled_crc_read_blocks_incremental_snapshot_build(
             )
         })
         .collect();
-    let [MetricEvent::ProtocolMetadataLoadFailure(pm), MetricEvent::SnapshotBuildFailure(build)] =
-        failures.as_slice()
+    let [
+        MetricEvent::ProtocolMetadataLoadFailure(pm),
+        MetricEvent::SnapshotBuildFailure(build),
+    ] = failures.as_slice()
     else {
         panic!("expected one protocol/metadata and snapshot failure: {events:?}");
     };
@@ -181,6 +183,46 @@ fn engine_reported_crc_cancellation_is_not_optional() {
     let result = Snapshot::builder_for("tests/data/crc-full").build(&reads.engine());
     assert!(matches!(result, Err(KernelError::Cancelled)));
     assert_eq!(reads.events.lock().unwrap().last(), Some(&Read::Crc));
+}
+
+#[rstest]
+#[case::tail_only("tail.metadata", Some(r#"{"tail":true}"#))]
+#[case::absent("missing", None)]
+#[case::stale_crc("myApp.metadata", Some(r#"{"key":"value"}"#))]
+fn reader_stale_crc_replay_is_cancellable(
+    #[case] domain: &str,
+    #[case] expected: Option<&str>,
+    #[values(false, true)] cancelled: bool,
+) {
+    let (url, _temp) = stale_crc_table();
+    std::fs::write(
+        url.to_file_path()
+            .unwrap()
+            .join("_delta_log/00000000000000000001.json"),
+        concat!(
+            r#"{"commitInfo":{"operation":"WRITE"}}"#,
+            "\n",
+            r#"{"domainMetadata":{"domain":"tail.metadata","configuration":"{\"tail\":true}","#,
+            r#""removed":false}}"#,
+        ),
+    )
+    .unwrap();
+    let reads = RecordingReads::new(cancelled.then_some(Read::Json));
+    let snapshot = Snapshot::builder_for(&url)
+        .with_incremental_crc_replay(IncrementalReplay::Disabled)
+        .build(reads.inner.as_ref())
+        .unwrap();
+    assert!(snapshot.crc_at_version().is_none());
+    let reader = snapshot
+        .reader()
+        .with_cancellation_token(reads.token.clone() as CancellationTokenRef);
+    let result = reader.get_domain_metadata(domain, &reads.engine());
+    if cancelled {
+        assert!(matches!(result, Err(KernelError::Cancelled)));
+    } else {
+        assert_eq!(result.unwrap().as_deref(), expected);
+    }
+    assert_eq!(*reads.events.lock().unwrap(), [Read::Json]);
 }
 
 /// Creates a table with CRC at version zero and a newer commit to replay.

@@ -32,8 +32,8 @@ use delta_kernel::table_features::TableFeature;
 use delta_kernel::{KernelError, KernelResult, Version};
 
 use crate::{
-    kernel_string_slice, optional_pointer, FfiFileStats, FfiSlice, KernelI64Slice,
-    KernelStringSlice, OptionalValue,
+    FfiFileStats, FfiSlice, KernelI64Slice, KernelStringSlice, OptionalValue, kernel_string_slice,
+    optional_pointer,
 };
 
 /// Borrowed array of UTF-8 strings.
@@ -81,7 +81,7 @@ pub type FfiNullableStringMap = FfiSlice<FfiNullableStringMapEntry>;
 ///
 /// Connectors that only supply log paths can request inference. Connectors exporting a built
 /// snapshot must preserve its observed publication state, which may not be recoverable from the
-/// retained paths. [`snapshot_to_snapshot_hint`](crate::snapshot_hint::snapshot_to_snapshot_hint)
+/// retained paths. [`snapshot_to_snapshot_hint`](crate::snapshot::hint::snapshot_to_snapshot_hint)
 /// always reports one of the two explicit variants.
 ///
 /// cbindgen:prefix-with-name=true
@@ -642,11 +642,10 @@ struct AddBacking<'a> {
 
 impl<'a> AddBacking<'a> {
     fn new(source: &'a Add) -> Self {
+        let partition_values = source.partition_values();
         Self {
             source,
-            partition_values: unsafe {
-                FfiStringMapEntry::from_map_unsafe(source.partition_values())
-            },
+            partition_values: unsafe { FfiStringMapEntry::from_map_unsafe(partition_values) },
             tags: source.tags.as_ref().map(|values| {
                 values
                     .iter()
@@ -1330,18 +1329,13 @@ impl FfiAddArray {
 impl FfiFileStatsState {
     pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<FileStatsState> {
         match self.kind {
-            FfiFileStatsStateKind::Complete => Ok(FileStatsState::Complete(unsafe {
-                let histogram = self
-                    .file_size_histogram
-                    .as_ref()
-                    .map(|value| value.try_to_kernel())
-                    .transpose()?;
-                FileStats::try_new(
-                    self.file_stats.num_files,
-                    self.file_stats.table_size_bytes,
-                    histogram,
-                )
-            }?)),
+            FfiFileStatsStateKind::Complete => Ok(FileStatsState::Complete(FileStats::try_new(
+                self.file_stats.num_files,
+                self.file_stats.table_size_bytes,
+                unsafe { self.file_size_histogram.as_ref() }
+                    .map(|value| unsafe { value.try_to_kernel() })
+                    .transpose()?,
+            )?)),
             FfiFileStatsStateKind::Indeterminate => Ok(FileStatsState::Indeterminate),
         }
     }
@@ -1349,8 +1343,7 @@ impl FfiFileStatsState {
 
 impl FfiSetTransactionArray {
     unsafe fn try_to_vec(&self) -> KernelResult<Vec<SetTransaction>> {
-        let values = unsafe { self.try_as_slice() }?;
-        values
+        unsafe { self.try_as_slice() }?
             .iter()
             .map(|value| unsafe { value.try_to_kernel() })
             .collect()

@@ -12,15 +12,15 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
-use delta_kernel::schema::{schema_ref, MetadataColumnSpec, SchemaRef, StructField};
+use delta_kernel::schema::{MetadataColumnSpec, SchemaRef, StructField, schema_ref};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{KernelError, KernelResult, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::{Deserializer, Value};
-use tempfile::{tempdir, TempDir};
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use tempfile::{TempDir, tempdir};
 use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder};
 use test_utils::{
     add_commit, assert_result_error_with_message, begin_transaction_with, collect_row_ids,
@@ -288,9 +288,11 @@ async fn test_row_tracking_append() -> KernelResult<()> {
             vec![int32_array(vec![4, 5, 6])],
         ],
     )?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data)
+            .await?
+            .is_committed()
+    );
 
     // Verify the commit was written correctly
     verify_row_tracking_in_commit(
@@ -332,9 +334,11 @@ async fn test_row_tracking_single_record_batches() -> KernelResult<()> {
             vec![int32_array(vec![3])],
         ],
     )?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data)
+            .await?
+            .is_committed()
+    );
 
     // Verify the commit was written correctly
     verify_row_tracking_in_commit(
@@ -360,9 +364,11 @@ async fn test_row_tracking_large_batch() -> KernelResult<()> {
     // Write a large batch with 1000 records
     let large_batch: Vec<i32> = (1..=1000).collect();
     let data = generate_data(schema.clone(), [vec![int32_array(large_batch.clone())]])?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data)
+            .await?
+            .is_committed()
+    );
 
     // Verify the commit was written correctly
     verify_row_tracking_in_commit(
@@ -403,9 +409,11 @@ async fn test_row_tracking_consecutive_transactions() -> KernelResult<()> {
             vec![int32_array(vec![4, 5, 6])],
         ],
     )?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data_1)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data_1)
+            .await?
+            .is_committed()
+    );
 
     // Verify first commit
     verify_row_tracking_in_commit(
@@ -421,9 +429,11 @@ async fn test_row_tracking_consecutive_transactions() -> KernelResult<()> {
     // This should read the existing row tracking domain metadata and assign base row IDs starting
     // from 6
     let data_2 = generate_data(schema.clone(), [vec![int32_array(vec![7, 8])]])?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data_2)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data_2)
+            .await?
+            .is_committed()
+    );
 
     // Verify second commit
     verify_row_tracking_in_commit(
@@ -476,9 +486,11 @@ async fn test_row_tracking_three_consecutive_transactions() -> KernelResult<()> 
             ],
         ],
     )?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data_1)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data_1)
+            .await?
+            .is_committed()
+    );
 
     verify_row_tracking_in_commit(
         &store,
@@ -497,9 +509,11 @@ async fn test_row_tracking_three_consecutive_transactions() -> KernelResult<()> 
             string_array(vec!["g".to_string(), "h".to_string()]),
         ]],
     )?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data_2)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data_2)
+            .await?
+            .is_committed()
+    );
 
     verify_row_tracking_in_commit(
         &store,
@@ -524,9 +538,11 @@ async fn test_row_tracking_three_consecutive_transactions() -> KernelResult<()> 
             ],
         ],
     )?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data_3)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data_3)
+            .await?
+            .is_committed()
+    );
 
     verify_row_tracking_in_commit(
         &store,
@@ -557,9 +573,11 @@ async fn test_row_tracking_with_regular_and_empty_adds() -> KernelResult<()> {
             vec![int32_array(vec![4, 5, 6])],
         ],
     )?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data)
+            .await?
+            .is_committed()
+    );
 
     // Verify the commit was written correctly
     verify_row_tracking_in_commit(
@@ -600,9 +618,11 @@ async fn test_row_tracking_with_empty_adds() -> KernelResult<()> {
             vec![int32_array(Vec::<i32>::new())],
         ],
     )?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data)
+            .await?
+            .is_committed()
+    );
 
     // Verify the commit was written correctly
     // NB: The expected high water mark is a bit unintuitive here, as we are appending empty
@@ -820,9 +840,11 @@ async fn test_no_row_tracking_fields_without_feature() -> KernelResult<()> {
     )?;
 
     // Write data to the table
-    assert!(write_data_to_table(&table_url, engine.clone(), data)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data)
+            .await?
+            .is_committed()
+    );
 
     // Verify that the commit does NOT contain row tracking fields
     let commit_url = table_url.join(&format!("_delta_log/{:020}.json", 1))?;
@@ -898,9 +920,11 @@ async fn test_read_row_ids_basic() -> KernelResult<()> {
         setup_number_table(&tmp_dir, "test_read_row_ids_basic").await?;
 
     let data = generate_data(schema.clone(), [vec![int32_array(vec![10, 20, 30])]])?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data)
+            .await?
+            .is_committed()
+    );
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let batches = read_row_id_scan(snapshot, engine)?;
@@ -1312,9 +1336,11 @@ async fn test_read_row_ids_multiple_files_one_commit() -> KernelResult<()> {
             vec![int32_array(vec![4, 5, 6, 7])],
         ],
     )?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data)
+            .await?
+            .is_committed()
+    );
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let batches = read_row_id_scan(snapshot, engine)?;
@@ -1355,15 +1381,19 @@ async fn test_read_row_ids_multiple_commits() -> KernelResult<()> {
 
     // Commit 1: 3 rows -> IDs 0, 1, 2.
     let data1 = generate_data(schema.clone(), [vec![int32_array(vec![1, 2, 3])]])?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data1)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data1)
+            .await?
+            .is_committed()
+    );
 
     // Commit 2: 2 rows -> IDs 3, 4.
     let data2 = generate_data(schema.clone(), [vec![int32_array(vec![4, 5])]])?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data2)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data2)
+            .await?
+            .is_committed()
+    );
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let batches = read_row_id_scan(snapshot, engine)?;
@@ -1399,9 +1429,11 @@ async fn test_read_row_tracking_values_after_checkpoint() -> KernelResult<()> {
 
     // Write 3 rows -> IDs 0, 1, 2.
     let data = generate_data(schema.clone(), [vec![int32_array(vec![1, 2, 3])]])?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data)
+            .await?
+            .is_committed()
+    );
 
     // Checkpoint at version 1. Uses TokioMultiThreadExecutor to avoid the nested block_on
     // deadlock that occurs with TokioBackgroundExecutor during checkpoint's lazy I/O.
@@ -1434,9 +1466,11 @@ async fn test_read_row_tracking_values_after_checkpoint() -> KernelResult<()> {
 
     // Write 2 more rows -> must continue from watermark, no resets or duplicates.
     let data2 = generate_data(schema.clone(), [vec![int32_array(vec![4, 5])]])?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data2)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data2)
+            .await?
+            .is_committed()
+    );
 
     let snapshot2 = Snapshot::builder_for(table_url.clone()).build(mt_engine.as_ref())?;
     let batches2 = read_row_id_scan(snapshot2, mt_engine)?;
@@ -1470,9 +1504,11 @@ async fn test_read_row_ids_coexist_with_row_index() -> KernelResult<()> {
             vec![int32_array(vec![4, 5])],
         ],
     )?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data)
+            .await?
+            .is_committed()
+    );
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let scan_schema = Arc::new(
@@ -1551,15 +1587,19 @@ async fn test_read_row_ids_after_log_compaction() -> KernelResult<()> {
 
     // Commit 1: 3 rows -> IDs 0, 1, 2.
     let data1 = generate_data(schema.clone(), [vec![int32_array(vec![1, 2, 3])]])?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data1)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data1)
+            .await?
+            .is_committed()
+    );
 
     // Commit 2: 2 rows -> IDs 3, 4.
     let data2 = generate_data(schema.clone(), [vec![int32_array(vec![4, 5])]])?;
-    assert!(write_data_to_table(&table_url, engine.clone(), data2)
-        .await?
-        .is_committed());
+    assert!(
+        write_data_to_table(&table_url, engine.clone(), data2)
+            .await?
+            .is_committed()
+    );
 
     // Create a log compaction file spanning all commits so far (versions 0..=2).
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;

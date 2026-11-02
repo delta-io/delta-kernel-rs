@@ -9,8 +9,8 @@ use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionV
 use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
 use delta_kernel::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use delta_kernel::arrow::array::{
-    new_null_array, Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray,
-    StructArray,
+    Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+    new_null_array,
 };
 use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{
@@ -22,14 +22,14 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::{
-    col, lit, null_lit, ExpressionStructPatchBuilder, MapData, Scalar,
+    ExpressionStructPatchBuilder, MapData, Scalar, col, lit, null_lit,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::log_replay::FileActionKey;
-use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::scan::{scan_row_schema, PartitionValuesOptions, StatsOptions};
-use delta_kernel::schema::{schema_ref, DataType, MapType};
+use delta_kernel::object_store::path::Path;
+use delta_kernel::scan::{PartitionValuesOptions, StatsOptions, scan_row_schema};
+use delta_kernel::schema::{DataType, MapType, schema_ref};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel::{
@@ -41,11 +41,12 @@ use rstest_reuse::{apply, template};
 use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
-    assert_result_error_with_message, begin_transaction, begin_transaction_with, copy_directory,
-    create_add_files_metadata, create_default_engine, create_default_engine_mt_executor,
-    create_table_with_column_mapping_mode, engine_store_setup, insert_data, into_record_batch,
-    load_and_begin_transaction_with, read_actions_from_commit, replace_array_row,
-    setup_test_table_p37, setup_test_tables, test_table_setup, AddActionRowTracking,
+    AddActionRowTracking, assert_result_error_with_message, begin_transaction,
+    begin_transaction_with, copy_directory, create_add_files_metadata, create_default_engine,
+    create_default_engine_mt_executor, create_table_with_column_mapping_mode,
+    deletion_vector_array, engine_store_setup, insert_data, into_record_batch,
+    load_and_begin_transaction_with, read_actions_from_commit, replace_array_row, replace_column,
+    setup_test_table_p37, setup_test_tables, test_table_setup,
 };
 use url::Url;
 
@@ -235,6 +236,338 @@ fn selected_scan_file_batch(
         }
     }
     Err(KernelError::generic("expected at least one scan file"))
+}
+
+#[rstest]
+#[case::valid(FileActionUniquenessCase::valid())]
+#[case::dedup_disabled(FileActionUniquenessCase {
+    adds: [
+        file_action("remove-0.parquet", None),
+        file_action("remove-0.parquet", None),
+    ],
+    removes: SelectedFileActions {
+        rows: [
+            file_action("remove-0.parquet", None),
+            file_action("remove-0.parquet", None),
+        ],
+        selection_vector: &[true, true],
+    },
+    dedup_validation_enabled: false,
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::dedup_disabled_empty_add_path(FileActionUniquenessCase {
+    adds: [file_action("", None), file_action("add-1.parquet", None)],
+    dedup_validation_enabled: false,
+    expected_error: Some("AddFile path must not be empty"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::dedup_disabled_empty_remove_path(FileActionUniquenessCase {
+    removes: SelectedFileActions {
+        rows: [file_action("", None), file_action("remove-1.parquet", None)],
+        selection_vector: &[true, true],
+    },
+    dedup_validation_enabled: false,
+    expected_error: Some("RemoveFile path must not be empty"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::dedup_disabled_empty_dv_path(FileActionUniquenessCase {
+    dv_updates: SelectedFileActions {
+        rows: [file_action("", None), file_action("dv-1.parquet", None)],
+        selection_vector: &[true, true],
+    },
+    dedup_validation_enabled: false,
+    expected_error: Some("AddFile path must not be empty"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::duplicate_add(FileActionUniquenessCase {
+    adds: [
+        file_action("same.parquet", None),
+        file_action("same.parquet", None),
+    ],
+    expected_error: Some("multiple AddFile actions"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::duplicate_remove(FileActionUniquenessCase {
+    removes: SelectedFileActions {
+        rows: [
+            file_action("remove-0.parquet", None),
+            file_action("remove-0.parquet", Some("different-dv")),
+        ],
+        selection_vector: &[true, true],
+    },
+    expected_error: Some("multiple RemoveFile actions"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::duplicate_remove_implicit_tail(FileActionUniquenessCase {
+    removes: SelectedFileActions {
+        rows: [
+            file_action("remove-0.parquet", None),
+            file_action("remove-0.parquet", None),
+        ],
+        selection_vector: &[true],
+    },
+    expected_error: Some("multiple RemoveFile actions"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::duplicate_remove_unselected(FileActionUniquenessCase {
+    removes: SelectedFileActions {
+        rows: [
+            file_action("remove-0.parquet", None),
+            file_action("remove-0.parquet", None),
+        ],
+        selection_vector: &[true, false],
+    },
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::add_remove_same_key(FileActionUniquenessCase {
+    adds: [
+        file_action("remove-0.parquet", None),
+        file_action("add-1.parquet", None),
+    ],
+    expected_error: Some("without a deletion vector"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::add_remove_same_path_different_dv(FileActionUniquenessCase {
+    adds: [
+        file_action("remove-0.parquet", None),
+        file_action("add-1.parquet", None),
+    ],
+    removes: SelectedFileActions {
+        rows: [
+            file_action("remove-0.parquet", Some("old-dv")),
+            file_action("remove-1.parquet", None),
+        ],
+        selection_vector: &[true, true],
+    },
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::add_collides_with_dv_update(FileActionUniquenessCase {
+    adds: [
+        file_action("dv-0.parquet", None),
+        file_action("add-1.parquet", None),
+    ],
+    dv_updates: SelectedFileActions {
+        rows: [
+            file_action("dv-0.parquet", Some("old-dv")),
+            file_action("dv-1.parquet", None),
+        ],
+        selection_vector: &[true, true],
+    },
+    expected_error: Some("multiple AddFile actions"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::add_ignores_unselected_dv_update_collision(FileActionUniquenessCase {
+    adds: [
+        file_action("dv-0.parquet", None),
+        file_action("add-1.parquet", None),
+    ],
+    dv_updates: SelectedFileActions {
+        rows: [
+            file_action("dv-0.parquet", None),
+            file_action("dv-1.parquet", None),
+        ],
+        selection_vector: &[false, true],
+    },
+    ..FileActionUniquenessCase::valid()
+})]
+#[case::remove_collides_with_dv_update(FileActionUniquenessCase {
+    removes: SelectedFileActions {
+        rows: [
+            file_action("dv-0.parquet", None),
+            file_action("remove-1.parquet", None),
+        ],
+        selection_vector: &[true, true],
+    },
+    expected_error: Some("multiple RemoveFile actions"),
+    ..FileActionUniquenessCase::valid()
+})]
+#[tokio::test]
+async fn commit_validates_file_action_uniqueness(
+    #[case] case: FileActionUniquenessCase,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // === Initialize table with files ===
+    let schema = schema_ref! { nullable "id": INTEGER };
+    let (_store, engine, table_url, _) = create_dv_table_with_files(
+        "file_action_uniqueness",
+        schema,
+        &[],
+        &[
+            "remove-0.parquet",
+            "remove-1.parquet",
+            "dv-0.parquet",
+            "dv-1.parquet",
+        ],
+    )
+    .await?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
+    let batches = scan_files
+        .into_iter()
+        .map(|scan_files| scan_files.apply_selection_vector().map(into_record_batch))
+        .collect::<KernelResult<Vec<_>>>()?;
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    let base_row = batch.slice(0, 1);
+    let mut txn = begin_transaction_with(
+        snapshot,
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "test-engine",
+        true,
+        |builder| {
+            if case.dedup_validation_enabled {
+                builder
+            } else {
+                builder.without_dedup_validation()
+            }
+        },
+    )?;
+
+    // === Stage AddFiles ===
+    txn.add_files(create_add_files_metadata(
+        txn.add_files_schema(),
+        case.adds
+            .iter()
+            .map(|file| {
+                (
+                    file.path,
+                    1, /* size */
+                    1, /* modification_time */
+                    Some(1),
+                )
+            })
+            .collect(),
+    )?);
+
+    // === Stage RemoveFiles ===
+    let removes = apply_path_dv(&base_row, &case.removes.rows)?;
+    txn.remove_files(FilteredEngineData::try_new(
+        Box::new(ArrowEngineData::new(removes)),
+        case.removes.selection_vector.to_vec(),
+    )?);
+
+    // === Stage DV updates ===
+    let scan_file = apply_path_dv(&base_row, &case.dv_updates.rows)?;
+    let descriptors = case
+        .dv_updates
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            case.dv_updates
+                .selection_vector
+                .get(*index)
+                .copied()
+                .unwrap_or(true)
+        })
+        .map(|(index, file)| {
+            let descriptor = DeletionVectorDescriptor {
+                storage_type: DeletionVectorStorageType::PersistedRelative,
+                path_or_inline_dv: format!("new-dv-{index}.bin"),
+                offset: Some(0),
+                size_in_bytes: 1,
+                cardinality: 1,
+            };
+            (file.path.to_string(), descriptor)
+        })
+        .collect();
+    txn.update_deletion_vectors(
+        descriptors,
+        std::iter::once(Ok(FilteredEngineData::try_new(
+            Box::new(ArrowEngineData::new(scan_file)),
+            case.dv_updates.selection_vector.to_vec(),
+        )?)),
+    )?;
+
+    // === Commit and assert the result ===
+    let result = txn.commit(engine.as_ref());
+    if let Some(expected_error) = case.expected_error {
+        assert_result_error_with_message(result, expected_error);
+    } else {
+        result?.unwrap_committed();
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct SelectedFileActions {
+    rows: [FileActionInput; 2],
+    selection_vector: &'static [bool],
+}
+
+#[derive(Clone)]
+struct FileActionUniquenessCase {
+    adds: [FileActionInput; 2],
+    removes: SelectedFileActions,
+    dv_updates: SelectedFileActions,
+    dedup_validation_enabled: bool,
+    expected_error: Option<&'static str>,
+}
+
+impl FileActionUniquenessCase {
+    fn valid() -> Self {
+        Self {
+            adds: [
+                file_action("add-0.parquet", None),
+                file_action("add-1.parquet", None),
+            ],
+            removes: SelectedFileActions {
+                rows: [
+                    file_action("remove-0.parquet", None),
+                    file_action("remove-1.parquet", None),
+                ],
+                selection_vector: &[true, true],
+            },
+            dv_updates: SelectedFileActions {
+                rows: [
+                    file_action("dv-0.parquet", None),
+                    file_action("dv-1.parquet", None),
+                ],
+                selection_vector: &[true, true],
+            },
+            expected_error: None,
+            dedup_validation_enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FileActionInput {
+    path: &'static str,
+    path_or_inline_dv: Option<&'static str>,
+}
+
+const fn file_action(
+    path: &'static str,
+    path_or_inline_dv: Option<&'static str>,
+) -> FileActionInput {
+    FileActionInput {
+        path,
+        path_or_inline_dv,
+    }
+}
+
+fn apply_path_dv(
+    base_row: &RecordBatch,
+    file_actions: &[FileActionInput],
+) -> Result<RecordBatch, ArrowError> {
+    let batch = concat_batches(
+        &base_row.schema(),
+        &vec![base_row.clone(); file_actions.len()],
+    )?;
+    let paths = Arc::new(StringArray::from(
+        file_actions
+            .iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>(),
+    ));
+    let batch = replace_column(&batch, "path", paths);
+
+    let paths_or_inline_dvs = file_actions
+        .iter()
+        .map(|file| file.path_or_inline_dv)
+        .collect::<Vec<_>>();
+    let deletion_vectors = Arc::new(deletion_vector_array("u", &paths_or_inline_dvs));
+    Ok(replace_column(&batch, "deletionVector", deletion_vectors))
 }
 
 #[derive(Clone, Copy)]
@@ -601,8 +934,8 @@ async fn test_remove_files_adds_expected_entries() -> KernelResult<()> {
 /// `test_remove_files_adds_expected_entries` covers the timestamped, conditionally-extended shape.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[tokio::test]
-async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_extended_metadata(
-) -> KernelResult<()> {
+async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_extended_metadata()
+-> KernelResult<()> {
     // v1: create a `number: INTEGER` adaptiveMetadata table and append a data file.
     let (_tmp_dir, table_url, engine, snapshot) =
         create_number_table(vec!["adaptiveMetadata-preview"], vec![], "id", true).await?;
@@ -2203,8 +2536,8 @@ fn setup_table_with_dv_small() -> KernelResult<DvSmallTableSetup> {
 /// remove under the id that [`DeletionVectorDescriptor::unique_id_for`] derives for the add's DV.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[tokio::test]
-async fn adaptive_metadata_remove_cancels_add_across_dv_storage_types(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn adaptive_metadata_remove_cancels_add_across_dv_storage_types()
+-> Result<(), Box<dyn std::error::Error>> {
     // v1: create an adaptiveMetadata table with one data file.
     let (_tmp_dir, table_url, engine, snapshot) =
         create_number_table(vec!["adaptiveMetadata-preview"], vec![], "id", true).await?;

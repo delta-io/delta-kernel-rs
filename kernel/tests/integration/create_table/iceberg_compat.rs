@@ -1,13 +1,13 @@
 //! IcebergCompat integration tests for the CreateTable API.
 
+use delta_kernel::KernelResult;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
-    schema, schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, schema, schema_ref,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::KernelResult;
 use rstest::rstest;
 use serde_json::json;
 use test_utils::test_table_setup;

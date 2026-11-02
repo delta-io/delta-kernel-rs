@@ -43,11 +43,12 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 
 use super::ir::nodes::{
-    Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, Operator, Project, RelationRef,
-    ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson, FILE_META_SCHEMA,
+    Aggregate, AggregateBuilder, DynamicScan, FILE_META_SCHEMA, FileType, Filter, Operator,
+    PrefixSum, Project, RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
+    WriteJson,
 };
 use super::ir::plan::{Plan, PlanNode};
-use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
+use crate::expressions::{ColumnName, Expression, ExpressionRef, PredicateRef, Scalar, StructData};
 use crate::schema::{SchemaRef, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::CollectInto;
@@ -398,7 +399,12 @@ impl PlanBuilder {
         patch: impl FnOnce(ProjectionStructPatchBuilder<'_>) -> ProjectionStructPatchBuilder<'_>,
     ) -> KernelResult<Self> {
         let (out, expr) = patch(ProjectionStructPatchBuilder::new(self.schema())).build()?;
-        self.project(expr, out)
+        match expr.as_ref() {
+            Expression::StructPatch(patch) if patch.is_empty() && patch.input_path().is_none() => {
+                Ok(self)
+            }
+            _ => self.project(expr, out),
+        }
     }
 
     /// Read data files named by `self`'s rows. Output schema is `dynamic_scan.schema`. See
@@ -510,6 +516,42 @@ impl PlanBuilder {
         self.aggregate(aggs(builder))
     }
 
+    /// Append exclusive prefixes of `input` as a new LONG column named `output`. See [`PrefixSum`].
+    ///
+    /// Over an absent input the result stays absent (with the prefix-sum output schema).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`PrefixSum::try_new`].
+    ///
+    /// # Example
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::PlanBuilder;
+    /// # use delta_kernel::expressions::column_name;
+    /// # use delta_kernel::schema::{DataType, StructField, StructType};
+    /// let schema = Arc::new(StructType::try_new([
+    ///     StructField::not_null("path", DataType::STRING),
+    ///     StructField::not_null("numRecords", DataType::LONG),
+    /// ])?);
+    /// let plan = PlanBuilder::values(
+    ///     schema,
+    ///     vec![vec!["a".into(), 10i64.into()], vec!["b".into(), 5i64.into()]],
+    /// )?
+    /// .prefix_sum(column_name!("numRecords"), "offset")?
+    /// .build()?;
+    /// # Ok::<(), delta_kernel::KernelError>(())
+    /// ```
+    pub fn prefix_sum(
+        self,
+        input: impl Into<ColumnName>,
+        output: impl Into<String>,
+    ) -> KernelResult<Self> {
+        let prefix_sum = PrefixSum::try_new(self.schema(), input, output)?;
+        let schema = Arc::clone(&prefix_sum.schema);
+        Ok(self.unary_op_or_absent(schema, prefix_sum))
+    }
+
     /// Semi join: emit the `self` (probe) rows that have a match in `build` on the join keys.
     /// Output schema mirrors `self`. Inputs are recorded as `[probe, build]`. See [`SemiJoin`].
     ///
@@ -579,7 +621,7 @@ impl PlanBuilder {
             // An absent build side matches nothing, so an anti-join forwards an unfiltered
             // probe side while a semi-join is uninhabited.
             PlanBuilderRoot::Absent(_) if inverted => {
-                return Ok(PlanBuilder(PlanBuilderRoot::Present(probe)))
+                return Ok(PlanBuilder(PlanBuilderRoot::Present(probe)));
             }
             PlanBuilderRoot::Absent(_) => return Ok(Self::absent(Arc::clone(&probe.schema))),
         };
@@ -741,16 +783,18 @@ fn check_file_constant_columns<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use test_utils::assert_result_error_with_message;
 
     use super::*;
+    use crate::FileMeta;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
-    use crate::expressions::{col, column_name, lit, Expression};
+    use crate::expressions::{Expression, col, column_name, lit};
     use crate::plans::ir::nodes::FileType;
     use crate::schema::{
-        schema, schema_ref, DataType, MetadataColumnSpec, StructField, StructType,
+        DataType, MetadataColumnSpec, StructField, StructType, schema, schema_ref,
     };
-    use crate::FileMeta;
 
     /// A single-file scan (present), no file-constant columns -- the trivial scan fixture.
     fn scan(schema: SchemaRef) -> PlanBuilder {
@@ -1055,6 +1099,7 @@ mod tests {
     })]
     #[case::grouped_aggregate(absent_src().aggregate(
         Aggregate::group_by(part_schema(), [column_name!("id")]).max(column_name!("part"))))]
+    #[case::prefix_sum(absent_over(x_schema()).prefix_sum(column_name!("x"), "offset"))]
     #[case::semi_join_absent_build(
         vals(id_schema()).semi_join(absent_src(), [column_name!("id")], [column_name!("id")]))]
     #[case::semi_join_absent_probe(
@@ -1180,6 +1225,27 @@ mod tests {
         Ok(())
     }
 
+    /// `prefix_sum` appends the exclusive-prefix column and records a unary PrefixSum node.
+    #[test]
+    fn prefix_sum_appends_output_column() -> KernelResult<()> {
+        let plan = vals(x_schema()).prefix_sum(column_name!("x"), "offset")?;
+        let schema = plan.schema();
+        assert_eq!(
+            schema
+                .fields()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            ["x", "offset"]
+        );
+        let built = assert_plan(plan, &[(&[], "values"), (&[0], "prefix_sum")]);
+        let Operator::PrefixSum(node) = &built.nodes[1].op else {
+            panic!("expected PrefixSum");
+        };
+        assert_eq!(node.input, column_name!("x"));
+        assert_eq!(node.output, "offset");
+        Ok(())
+    }
+
     /// `{ outer: { a, b }, c }` -- a nested schema for exercising `project_patch`.
     fn nested_ab_c() -> SchemaRef {
         schema_ref! {
@@ -1228,6 +1294,28 @@ mod tests {
         let a = vals(nested_ab_c()).project_patch(drop_c)?;
         let b = vals(nested_ab_c()).project_patch(drop_c)?;
         assert_eq!(a.schema(), b.schema());
+        Ok(())
+    }
+
+    #[test]
+    fn project_patch_elides_empty_projection() -> KernelResult<()> {
+        let patched = vals(nested_ab_c()).project_patch(|patch| patch)?;
+        assert_plan(patched, &[(&[], "values")]);
+        Ok(())
+    }
+
+    #[test]
+    fn project_patch_preserves_empty_nested_projection() -> KernelResult<()> {
+        // The non-const schema needs a static lifetime for project_patch's higher-ranked closure.
+        static INPUT: LazyLock<SchemaRef> = LazyLock::new(nested_ab_c);
+        let patched = vals(Arc::clone(&INPUT))
+            .project_patch(|_| ProjectionStructPatchBuilder::new_nested(&INPUT, ["outer"]))?;
+        let expected = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": STRING,
+        };
+        assert_eq!(patched.schema(), &expected);
+        assert_plan(patched, &[(&[], "values"), (&[0], "project")]);
         Ok(())
     }
 
@@ -1468,6 +1556,12 @@ mod tests {
         || vals(id_schema()).aggregate(Aggregate::group_by(id_schema(), Vec::<ColumnName>::new()).max(column_name!("nope"))))]
     #[case::aggregate_unknown_group_by("not found in schema",
         || vals(id_schema()).aggregate(Aggregate::group_by(id_schema(), [column_name!("nope")]).max(column_name!("id"))))]
+    #[case::prefix_sum_unknown_input("not found in schema",
+        || vals(x_schema()).prefix_sum(column_name!("nope"), "offset"))]
+    #[case::prefix_sum_non_long("must be LONG",
+        || vals(id_schema()).prefix_sum(column_name!("id"), "offset"))]
+    #[case::prefix_sum_duplicate_output("Duplicate field name",
+        || vals(x_schema()).prefix_sum(column_name!("x"), "x"))]
     // union
     #[case::union_schema_disagrees("differing",
         || PlanBuilder::union_all([vals(id_schema()), vals(x_schema())]))]

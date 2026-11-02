@@ -245,7 +245,6 @@ impl CommitRangeBuilder {
             log_tail,
             Some(start_version),
             configured_end_version,
-            None,
         )?
         .ascending_commit_files;
         let last_version = commit_files.last().ok_or(KernelError::EmptyLog)?.version;

@@ -122,8 +122,8 @@ mod tests {
     use url::Url;
 
     use super::SyncStorageHandler;
-    use crate::object_store::memory::InMemory;
     use crate::object_store::ObjectStoreExt as _;
+    use crate::object_store::memory::InMemory;
     use crate::utils::current_time_duration;
     use crate::{KernelError, StorageHandler};
 

@@ -13,15 +13,14 @@ use url::Url;
 use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
-    deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
+    DeletionVectorDescriptor, deletion_treemap_to_bools, split_vector,
 };
-use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
+use crate::actions::{ADD_FIELD, ADD_NAME, Add, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
-#[cfg(feature = "declarative-plans")]
-use crate::checkpoint::CheckpointShape;
+use crate::engine::CancellableEngine;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{
-    column_name, ColumnName, ExpressionRef, MapToStructOptions, Predicate, PredicateRef,
+    ColumnName, ExpressionRef, MapToStructOptions, Predicate, PredicateRef, column_name,
 };
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
@@ -35,19 +34,19 @@ use crate::parallel::sequential_phase::SequentialPhase;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{
-    ScanLogReplayProcessor, BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME,
-    DEFAULT_ROW_COMMIT_VERSION_NAME,
+    BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
+    ScanLogReplayProcessor,
 };
 use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    lazy_schema_ref, schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef,
-    StructField, StructType, ToSchema as _,
+    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
+    ToSchema as _, lazy_schema_ref, schema_ref,
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, Operation};
-use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
-use crate::utils::{require, FoldWithOption as _, IteratorExt};
+use crate::transforms::{ExpressionTransform, SchemaTransform, transform_output_type};
+use crate::utils::{FoldWithOption as _, IteratorExt, require};
 use crate::{
     Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, SnapshotRef,
     Version,
@@ -110,28 +109,31 @@ pub use crate::parallel::parallel_scan_metadata::{
 };
 
 /// Configures structured-stats output and JSON synthesis in scan metadata.
-/// Existing JSON passes through for commits and checkpoints without compatible structured stats
-/// unless stats are disabled.
+/// Imperative scans pass existing JSON through for commits and checkpoints without compatible
+/// structured stats unless stats are disabled.
+///
+/// Declarative metadata plans emit JSON stats only when JSON output is requested. JSON requests
+/// without structured output disable stats and partition pruning; statically-unsatisfiable
+/// predicates still skip the scan. The data-row predicate and imperative metadata path are
+/// unchanged.
 ///
 /// Most consumers should pick one of the named constructors:
 /// - [`Self::json_only`] (default) -- JSON stats only.
-/// - [`Self::all_struct`] -- all struct stats without JSON synthesis. Compatible checkpoints omit
-///   JSON stats; commits and checkpoints without compatible structured stats pass existing JSON
-///   through.
+/// - [`Self::all_struct`] -- all struct stats without JSON synthesis. Declarative plans omit JSON;
+///   imperative scans pass existing JSON through except on compatible checkpoints.
 /// - [`Self::struct_columns`] -- selected struct stats with the same JSON behavior.
 /// - [`Self::all`] -- both representations.
 /// - [`Self::none`] -- neither, AND disables internal data skipping. Unlike the other four
 ///   constructors, this is the only one that stops kernel from reading stats from parquet at all.
 #[derive(Clone, Debug)]
 pub struct StatsOptions {
-    /// Whether to surface JSON stats on parsed-stats checkpoints (where the
-    /// checkpoint writes stats only as a struct, not as JSON). When true, kernel
-    /// re-serializes the struct stats into JSON so engines that read JSON stats
-    /// see a populated value; when false, JSON stats are left null on such
-    /// checkpoints and the engine consumes the struct stats directly.
+    /// Whether to emit JSON stats in declarative metadata plans, synthesizing them from compatible
+    /// structured stats when the source has no JSON. When false, declarative plans omit JSON stats
+    /// from every source.
     ///
-    /// No effect on tables that write JSON stats directly, or on commit JSON --
-    /// the existing JSON is passed through regardless.
+    /// Imperative scans use this flag only for synthesis from structured checkpoint stats;
+    /// existing JSON from commits and checkpoints without compatible structured stats passes
+    /// through unless stats are disabled.
     pub(crate) synthesize_json: bool,
 
     /// Which struct stats columns to request in `stats_parsed`.
@@ -155,7 +157,7 @@ pub struct StatsOptions {
 /// stats, for example because another writer generated them.
 #[derive(Clone, Debug)]
 pub enum StructStats {
-    /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for
+    /// Don't emit `stats_parsed`. Imperative scans still read predicate-referenced stats for
     /// internal data skipping unless the caller picked [`StatsOptions::none`], which
     /// disables stats reading entirely.
     None,
@@ -196,9 +198,9 @@ impl StatsOptions {
         Self::default()
     }
 
-    /// All struct stats without JSON synthesis. Compatible checkpoints omit JSON stats and avoid
-    /// per-batch `ToJson`; commits and checkpoints without compatible structured stats pass
-    /// existing JSON through.
+    /// All struct stats without JSON synthesis. Declarative metadata plans omit JSON stats.
+    /// Imperative scans omit JSON for compatible checkpoints and otherwise pass existing JSON
+    /// through.
     pub fn all_struct() -> Self {
         Self {
             synthesize_json: false,
@@ -209,7 +211,8 @@ impl StatsOptions {
         }
     }
 
-    /// Returns struct stats for only `cols`, regardless of the table's indexed set.
+    /// Returns struct stats for only `cols`, regardless of the table's indexed set, with the JSON
+    /// behavior of [`Self::all_struct`].
     /// Predicate-only statistics may still be read for data skipping but are not returned.
     ///
     /// Names that cannot be resolved return an error. Missing per-file values read as NULL and do
@@ -222,7 +225,8 @@ impl StatsOptions {
         }
     }
 
-    /// Returns struct stats for all indexed columns and `extra_indexed`.
+    /// Returns struct stats for all indexed columns and `extra_indexed`, with the JSON behavior of
+    /// [`Self::all_struct`].
     ///
     /// Extra-indexed columns bypass the table's configured indexed set. Missing on-disk stats read
     /// as NULL and do not prune; names that cannot be resolved are ignored with a warning.
@@ -248,8 +252,8 @@ impl StatsOptions {
     /// when a predicate is set). Kernel reads no stats columns from parquet at all.
     /// Use when the engine handles its own pruning.
     ///
-    /// To get internal predicate-based skipping without `stats_parsed` output, use
-    /// [`StatsOptions::default`] (JSON only) or set `struct_stats` to `AllIndexed`/`Columns`.
+    /// To get internal predicate-based skipping, use [`Self::all_struct`]. Imperative scans also
+    /// support skipping without `stats_parsed` output via [`Self::json_only`].
     pub fn none() -> Self {
         Self {
             synthesize_json: false,
@@ -1072,6 +1076,13 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
+        self.with_cancellable_engine(engine, |engine| self.scan_metadata_with_engine(engine))
+    }
+
+    fn scan_metadata_with_engine(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
         let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
         self.scan_metadata_inner(engine, actions_with_checkpoint_info)
     }
@@ -1128,6 +1139,23 @@ impl Scan {
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn scan_metadata_from(
+        &self,
+        engine: &dyn Engine,
+        existing_version: Version,
+        existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
+        existing_predicate: Option<PredicateRef>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<ScanMetadata>>> {
+        self.with_cancellable_engine(engine, |engine| {
+            self.scan_metadata_from_with_engine(
+                engine,
+                existing_version,
+                existing_data,
+                existing_predicate,
+            )
+        })
+    }
+
+    fn scan_metadata_from_with_engine(
         &self,
         engine: &dyn Engine,
         existing_version: Version,
@@ -1205,7 +1233,7 @@ impl Scan {
         // TODO: we may be able to apply heuristics or other logic to try and fetch missing deltas
         // from the log.
         if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
-            return Ok(Box::new(self.scan_metadata(engine)?));
+            return Ok(Box::new(self.scan_metadata_with_engine(engine)?));
         }
 
         // create a new log segment containing only the commits added after the version hint.
@@ -1234,7 +1262,6 @@ impl Scan {
             meta_predicate,
             physical_stats_read_schema,
             None,
-            self.cancellation_token.as_ref(),
         )?;
         // Only the cached suffix needs a kernel-side check. The engine owns cancellation for the
         // newly read action prefix.
@@ -1252,6 +1279,21 @@ impl Scan {
             engine,
             actions_with_checkpoint_info,
         )?))
+    }
+
+    fn with_cancellable_engine<T>(
+        &self,
+        engine: &dyn Engine,
+        operation: impl FnOnce(&dyn Engine) -> T,
+    ) -> T {
+        let scoped_engine = self
+            .cancellation_token
+            .clone()
+            .map(|token| CancellableEngine::new(engine, token));
+        let engine = scoped_engine
+            .as_ref()
+            .map_or(engine, |engine| engine as &dyn Engine);
+        operation(engine)
     }
 
     fn scan_metadata_inner(
@@ -1301,8 +1343,9 @@ impl Scan {
     #[cfg(feature = "declarative-plans")]
     /// Builds a declarative plan that produces the scan's live `add` actions.
     ///
-    /// `engine` supplies the plan executor used to inspect checkpoint shape. Returns `None` when
-    /// no Delta metadata matches this scan.
+    /// `engine` supplies the plan executor used to inspect checkpoint shape unless a CRC at least
+    /// as new as the checkpoint provides `allFiles`. Returns `None` when no Delta metadata matches
+    /// this scan.
     ///
     /// This method returns the metadata plan without executing it. A connector that consumes the
     /// resulting live `add` rows may run the plan through the generic
@@ -1313,9 +1356,9 @@ impl Scan {
     /// # Errors
     ///
     /// Returns an error if [`PartitionValuesOptions::with_timestamp_timezone`] was set on a table
-    /// with `TIMESTAMP` partition columns,
-    /// if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
-    /// or if log discovery, checkpoint inspection, or plan construction fails.
+    /// with `TIMESTAMP` partition columns, if planning requires a
+    /// [`PlanExecutor`](crate::plans::PlanExecutor) that the engine does not provide, or if log
+    /// discovery, checkpoint inspection, or plan construction fails.
     #[tracing::instrument(
         name = "scan.declarative_metadata_scan_plan",
         skip_all,
@@ -1338,17 +1381,21 @@ impl Scan {
                  use scan_metadata instead"
             )
         );
-        // Resolve the checkpoint shape once. Retain the leaf schema only when parsed metadata is
-        // needed for output or pruning.
-        let plan_executor = engine.require_plan_executor()?;
-        let needs_leaf_schema = self.state_info.physical_stats_read_schema().is_some()
-            || self.state_info.physical_partition_schema.is_some();
-        let shape = if needs_leaf_schema {
-            CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
-        } else {
-            CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?
-        };
-        self.build_metadata_scan_plan(&shape)
+
+        // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
+        if self.state_info.physical_predicate == PhysicalPredicate::StaticSkipAll {
+            return Ok(None);
+        }
+
+        let planner = scan_plan::MetadataPlanner::try_new(self)?;
+        let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine, &planner)?;
+        self.build_metadata_scan_plan_with(base, &planner)
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    /// Whether JSON stats synthesis requires the checkpoint's collation stats schema.
+    fn needs_collation_stats_schema(&self) -> bool {
+        self.stats.synthesize_json && self.snapshot.table_configuration().has_collations_feature()
     }
 
     // Factored out to facilitate testing
@@ -1372,7 +1419,6 @@ impl Scan {
                     .physical_partition_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
-                self.cancellation_token.as_ref(),
             )
     }
 
