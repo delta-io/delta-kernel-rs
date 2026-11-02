@@ -29,7 +29,7 @@ pub(crate) fn validate_collation_annotations(schema: &Schema) -> KernelResult<()
 ///
 /// Snapshot loading applies the same structural validation as CREATE and ALTER, even for binary
 /// reads of this writer-only feature.
-/// Returns a schema error for malformed annotations or an unsupported error for a missing feature.
+/// Returns a schema error for malformed annotations or a missing feature.
 pub(crate) fn validate_collations_feature_support(
     table_config: &TableConfiguration,
 ) -> KernelResult<()> {
@@ -40,8 +40,8 @@ pub(crate) fn validate_collations_feature_support(
     CollationAnnotationValidator.transform_struct(schema)?;
     require!(
         table_config.has_collations_feature(),
-        KernelError::unsupported(
-            "Table contains collation metadata but requires the 'collations' or \
+        KernelError::schema(
+            "Table containing collation metadata requires the 'collations' or \
              'collations-preview' table feature"
         )
     );
