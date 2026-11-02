@@ -72,7 +72,7 @@ pub(crate) fn validate_file_type_feature_support(tc: &TableConfiguration) -> Ker
 /// that contain one. Other fields are left out, so validating and writing `file` values walk only
 /// these paths.
 // Validating and writing `file` values, the only users, need `default-engine-base`.
-#[cfg_attr(not(feature = "default-engine-base"), allow(dead_code))]
+#[cfg(feature = "default-engine-base")]
 #[derive(Debug)]
 pub(crate) enum FilePaths {
     File,
@@ -83,7 +83,7 @@ pub(crate) enum FilePaths {
     Map(Box<FilePaths>),
 }
 
-#[cfg_attr(not(feature = "default-engine-base"), allow(dead_code))]
+#[cfg(feature = "default-engine-base")]
 impl FilePaths {
     /// Returns the paths to the `file` values in `schema`, or `None` if it has none. Each field is
     /// visited once. Fails if a map key contains a `file`.

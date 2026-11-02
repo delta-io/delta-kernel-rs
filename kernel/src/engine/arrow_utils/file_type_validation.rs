@@ -1,12 +1,10 @@
 //! Validation of `file` values read from or written to Parquet.
-//!
-//! [`visit_file_values`] finds each present `file` value in a batch, and the read and write rules
-//! are checks it applies to each one.
 
 use std::ops::Range;
 
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{Array, ArrayRef, OffsetSizeTrait, PrimitiveArray, StructArray};
+use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::cast;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Int64Type};
 use crate::engine::arrow_utils::make_arrow_error;
@@ -40,88 +38,6 @@ pub(crate) fn validate_file_values_for_write(
         validate_locator(value)?;
         validate_checksum_format(value.checksum())
     })
-}
-
-/// A present `file` value: row `row` of the sub-field columns `columns`.
-struct FileValue<'a> {
-    columns: &'a FileColumns<'a>,
-    row: usize,
-}
-
-impl FileValue<'_> {
-    fn has_uri(&self) -> bool {
-        self.columns.uri.is_valid(self.row)
-    }
-
-    fn has_inline(&self) -> bool {
-        self.columns.inline.is_valid(self.row)
-    }
-
-    fn offset(&self) -> Option<i64> {
-        int64_at(self.columns.offset, self.row)
-    }
-
-    fn size(&self) -> Option<i64> {
-        int64_at(self.columns.size, self.row)
-    }
-
-    /// The `checksum`, or `None` if it is null or not a string.
-    fn checksum(&self) -> Option<&str> {
-        string_at(self.columns.checksum.as_ref(), self.row)
-    }
-}
-
-/// The sub-field columns of an array of `file` values that the rules use.
-struct FileColumns<'a> {
-    uri: &'a ArrayRef,
-    offset: &'a PrimitiveArray<Int64Type>,
-    size: &'a PrimitiveArray<Int64Type>,
-    checksum: ArrayRef,
-    inline: &'a ArrayRef,
-}
-
-impl<'a> FileColumns<'a> {
-    fn new(file: &'a StructArray) -> KernelResult<Self> {
-        let field = |name: &str| {
-            file.column_by_name(name)
-                .ok_or_else(|| make_arrow_error(format!("`file` value is missing field '{name}'")))
-        };
-        let int64 = |name: &str| {
-            field(name)?
-                .as_primitive_opt::<Int64Type>()
-                .ok_or_else(|| make_arrow_error(format!("`file` field '{name}' is not an INT64")))
-        };
-        let checksum = field("checksum")?;
-        // A dictionary-encoded `checksum` is decoded once, so each value can be read as a string.
-        let checksum = match checksum.data_type() {
-            ArrowDataType::Dictionary(..) => cast(checksum, &ArrowDataType::Utf8)?,
-            _ => checksum.clone(),
-        };
-        Ok(Self {
-            uri: field("uri")?,
-            offset: int64("offset")?,
-            size: int64("size")?,
-            checksum,
-            inline: field("inline")?,
-        })
-    }
-}
-
-fn int64_at(array: &PrimitiveArray<Int64Type>, row: usize) -> Option<i64> {
-    array.is_valid(row).then(|| array.value(row))
-}
-
-/// Returns the string at `row` of a string array, or `None` if it is null or not a string.
-fn string_at(array: &dyn Array, row: usize) -> Option<&str> {
-    if array.is_null(row) {
-        return None;
-    }
-    match array.data_type() {
-        ArrowDataType::Utf8 => Some(array.as_string::<i32>().value(row)),
-        ArrowDataType::LargeUtf8 => Some(array.as_string::<i64>().value(row)),
-        ArrowDataType::Utf8View => Some(array.as_string_view().value(row)),
-        _ => None,
-    }
 }
 
 /// Checks the locator rules of the Parquet `FILE` specification, which readers must enforce:
@@ -184,8 +100,101 @@ fn validate_checksum_format(checksum: Option<&str>) -> Result<(), &'static str> 
     }
 }
 
+/// A present `file` value: row `row` of the sub-field columns `columns`.
+struct FileValue<'a> {
+    columns: &'a FileColumns<'a>,
+    row: usize,
+}
+
+impl FileValue<'_> {
+    fn has_uri(&self) -> bool {
+        is_set(&self.columns.uri_nulls, self.row)
+    }
+
+    fn has_inline(&self) -> bool {
+        is_set(&self.columns.inline_nulls, self.row)
+    }
+
+    fn offset(&self) -> Option<i64> {
+        int64_at(self.columns.offset, self.row)
+    }
+
+    fn size(&self) -> Option<i64> {
+        int64_at(self.columns.size, self.row)
+    }
+
+    /// The `checksum`, or `None` if it is null or not a string.
+    fn checksum(&self) -> Option<&str> {
+        string_at(self.columns.checksum.as_ref(), self.row)
+    }
+}
+
+/// The sub-field columns of an array of `file` values that the rules use.
+struct FileColumns<'a> {
+    /// Which `uri` values are null, after decoding (see [`Array::logical_nulls`]).
+    uri_nulls: Option<NullBuffer>,
+    offset: &'a PrimitiveArray<Int64Type>,
+    size: &'a PrimitiveArray<Int64Type>,
+    checksum: ArrayRef,
+    /// Which `inline` values are null, after decoding (see [`Array::logical_nulls`]).
+    inline_nulls: Option<NullBuffer>,
+}
+
+impl<'a> FileColumns<'a> {
+    fn new(file: &'a StructArray) -> KernelResult<Self> {
+        let field = |name: &str| {
+            file.column_by_name(name)
+                .ok_or_else(|| make_arrow_error(format!("`file` value is missing field '{name}'")))
+        };
+        let int64 = |name: &str| {
+            field(name)?
+                .as_primitive_opt::<Int64Type>()
+                .ok_or_else(|| make_arrow_error(format!("`file` field '{name}' is not an INT64")))
+        };
+        let checksum = field("checksum")?;
+        // A dictionary-encoded `checksum` is decoded once, so each value can be read as a string.
+        let checksum = match checksum.data_type() {
+            ArrowDataType::Dictionary(..) => cast(checksum, &ArrowDataType::Utf8)?,
+            _ => checksum.clone(),
+        };
+        // A dictionary-encoded value is null if its key is, or if the key points to a null value,
+        // so the nulls are taken after decoding.
+        Ok(Self {
+            uri_nulls: field("uri")?.logical_nulls(),
+            offset: int64("offset")?,
+            size: int64("size")?,
+            checksum,
+            inline_nulls: field("inline")?.logical_nulls(),
+        })
+    }
+}
+
+/// Whether row `row` is set, given the nulls of its array.
+fn is_set(nulls: &Option<NullBuffer>, row: usize) -> bool {
+    nulls.as_ref().is_none_or(|nulls| nulls.is_valid(row))
+}
+
+fn int64_at(array: &PrimitiveArray<Int64Type>, row: usize) -> Option<i64> {
+    array.is_valid(row).then(|| array.value(row))
+}
+
+/// Returns the string at `row` of a string array, or `None` if it is null or not a string.
+fn string_at(array: &dyn Array, row: usize) -> Option<&str> {
+    if array.is_null(row) {
+        return None;
+    }
+    match array.data_type() {
+        ArrowDataType::Utf8 => Some(array.as_string::<i32>().value(row)),
+        ArrowDataType::LargeUtf8 => Some(array.as_string::<i64>().value(row)),
+        ArrowDataType::Utf8View => Some(array.as_string_view().value(row)),
+        _ => None,
+    }
+}
+
 /// Applies `check` to each present `file` value in `data`, whose columns are matched to
-/// `kernel_schema` by name, and fails with the first problem it reports. A `file` column missing
+/// `kernel_schema` by name, and fails with the first problem it reports. It handles the schema
+/// navigation, Arrow decoding and null and container handling, so the read and write rules are
+/// only checks on one value. A `file` column missing
 /// from `data` is an error.
 fn visit_file_values(
     data: &StructArray,
@@ -426,7 +435,7 @@ mod tests {
         ArrayRef, BinaryArray, DictionaryArray, FixedSizeListArray, Int64Array, LargeListArray,
         LargeListViewArray, ListArray, ListViewArray, MapArray, StringArray,
     };
-    use crate::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+    use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{Field, Fields, Int32Type};
     use crate::arrow::error::ArrowError;
     use crate::engine::arrow_conversion::TryIntoArrow as _;
@@ -922,5 +931,38 @@ mod tests {
         );
         let (data, schema) = (data.slice(0, 1), schema);
         validate_file_values_for_write(&data, &schema).unwrap();
+    }
+
+    /// A dictionary-encoded `uri` or `inline` whose key points to a null value is null.
+    #[rstest]
+    #[case::uri("uri")]
+    #[case::inline("inline")]
+    fn dictionary_encoded_null_value_is_null(#[case] name: &str) {
+        let file = file_array(&[Some((Some("s3://b/a"), None, None, Some(b"x".as_slice())))]);
+        let (fields, mut columns, nulls) = file.into_parts();
+        let index = fields.iter().position(|f| f.name() == name).unwrap();
+        // One row whose key 0 is valid but points to a null dictionary value.
+        let values: ArrayRef = match name {
+            "uri" => Arc::new(StringArray::from(vec![None::<&str>])),
+            _ => Arc::new(BinaryArray::from(vec![None::<&[u8]>])),
+        };
+        let dictionary = DictionaryArray::<Int32Type>::try_new(vec![0].into(), values).unwrap();
+        let mut fields: Vec<_> = fields.iter().map(|f| f.as_ref().clone()).collect();
+        fields[index] = Field::new(name, dictionary.data_type().clone(), true);
+        columns[index] = Arc::new(dictionary);
+        // Keep the other locator set, so only the null value decides the result.
+        let file = StructArray::try_new(fields.into(), columns, nulls).unwrap();
+        let (data, schema) = top_level(file);
+        validate_file_values_for_read(&data, &schema).unwrap();
+
+        // With the other locator null too, the value has neither and is rejected.
+        let other = if name == "uri" { "inline" } else { "uri" };
+        let (fields, mut columns, nulls) = data.column(0).as_struct().clone().into_parts();
+        let other_index = fields.iter().position(|f| f.name() == other).unwrap();
+        columns[other_index] =
+            crate::arrow::array::new_null_array(columns[other_index].data_type(), 1);
+        let file = StructArray::try_new(fields, columns, nulls).unwrap();
+        let (data, schema) = top_level(file);
+        assert_no_referent(validate_file_values_for_read(&data, &schema), "f");
     }
 }

@@ -147,25 +147,68 @@ async fn write_table(
     data_type: DataType,
     column: ArrayRef,
 ) -> Result<WrittenTable, Box<dyn std::error::Error>> {
-    let schema = Arc::new(StructType::try_new([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("c", data_type),
-    ])?);
-    let (tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    let snapshot = create_table_and_load_snapshot(
-        &table_path,
-        schema.clone(),
-        engine.as_ref(),
+    let ids: ArrayRef = Arc::new(Int32Array::from_iter_values(0..column.len() as i32));
+    write_columns(
+        vec![
+            (StructField::nullable("id", DataType::INTEGER), ids),
+            (StructField::nullable("c", data_type), column),
+        ],
         &[("delta.columnMapping.mode", cm_mode)],
-    )?;
+    )
+    .await
+}
+
+/// Creates a table with `columns` and `properties` and writes one batch holding their values.
+async fn write_columns(
+    columns: Vec<(StructField, ArrayRef)>,
+    properties: &[(&str, &str)],
+) -> Result<WrittenTable, Box<dyn std::error::Error>> {
+    let (fields, arrays): (Vec<_>, Vec<_>) = columns.into_iter().unzip();
+    let schema = Arc::new(StructType::try_new(fields)?);
+    let (tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), properties)?;
     let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
-    let ids: Vec<i32> = (0..column.len() as i32).collect();
-    let batch = RecordBatch::try_new(
-        Arc::new(arrow_schema),
-        vec![Arc::new(Int32Array::from(ids)), column],
-    )?;
+    let batch = RecordBatch::try_new(Arc::new(arrow_schema), arrays)?;
     let result = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await;
     Ok((tmp_dir, table_path, engine, result))
+}
+
+/// Returns the statistics of the only data file of `snapshot`.
+fn data_file_stats(
+    snapshot: &SnapshotRef,
+    engine: &DefaultEngine<TokioMultiThreadExecutor>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let add_files = read_add_infos(snapshot, engine)?;
+    assert_eq!(add_files.len(), 1);
+    Ok(add_files[0]
+        .stats
+        .clone()
+        .expect("the data file has statistics"))
+}
+
+/// Returns the columns with an entry in `stats[kind]`, such as `minValues`, as sorted paths.
+fn stats_columns(stats: &serde_json::Value, kind: &str) -> Vec<String> {
+    fn visit(value: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+        match value.as_object() {
+            Some(object) => {
+                for (name, child) in object {
+                    let child_path = match path {
+                        "" => name.clone(),
+                        _ => format!("{path}.{name}"),
+                    };
+                    visit(child, &child_path, out);
+                }
+            }
+            None => out.push(path.to_string()),
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(value) = stats.get(kind) {
+        visit(value, "", &mut out);
+    }
+    out.sort();
+    out
 }
 
 /// A `file` column at top level, in a struct, as an array element, or as a map value is written as
@@ -334,5 +377,63 @@ fn test_create_table_with_iceberg_compat_rejects_file_column(
         error.contains("does not support type at column") && error.contains("file"),
         "got: {error}"
     );
+    Ok(())
+}
+
+/// A data file with a `file` column still records `numRecords`, but neither the `file` values nor
+/// their sub-fields get `minValues`, `maxValues` or `nullCount`, wherever the column appears.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_collects_no_stats_for_file_column(
+    #[values("top_level", "in_struct", "array_element", "map_value")] layout: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (data_type, column) = file_column(layout, file_values(), None);
+    let (_tmp_dir, _table_path, engine, snapshot) = write_table("none", data_type, column).await?;
+    let stats = data_file_stats(&snapshot?, engine.as_ref())?;
+
+    assert_eq!(stats["numRecords"], 3);
+    for kind in ["minValues", "maxValues"] {
+        assert_eq!(stats_columns(&stats, kind), ["id"], "{kind}: {stats}");
+    }
+    // An array or a map gets the null count of the column itself, as for any array or map, but
+    // nothing for the `file` values in it.
+    let null_counts: &[&str] = match layout {
+        "array_element" | "map_value" => &["c", "id"],
+        _ => &["id"],
+    };
+    assert_eq!(stats_columns(&stats, "nullCount"), null_counts, "{stats}");
+    Ok(())
+}
+
+/// A `file` column takes no slot against `delta.dataSkippingNumIndexedCols`, so the columns
+/// after it keep theirs, and naming it in `delta.dataSkippingStatsColumns` still gives it no
+/// statistics.
+#[rstest]
+#[case::num_indexed_cols(("delta.dataSkippingNumIndexedCols", "1"), &["id"])]
+#[case::stats_columns(("delta.dataSkippingStatsColumns", "c,x"), &["x"])]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_file_column_with_stats_column_settings(
+    #[case] property: (&str, &str),
+    #[case] expected: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ints = || Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+    let (_tmp_dir, _table_path, engine, snapshot) = write_columns(
+        vec![
+            (
+                StructField::nullable("c", DataType::file_type()),
+                Arc::new(file_values()) as ArrayRef,
+            ),
+            (StructField::nullable("id", DataType::INTEGER), ints()),
+            (StructField::nullable("x", DataType::INTEGER), ints()),
+        ],
+        &[property],
+    )
+    .await?;
+    let stats = data_file_stats(&snapshot?, engine.as_ref())?;
+
+    assert_eq!(stats["numRecords"], 3);
+    for kind in ["minValues", "maxValues", "nullCount"] {
+        assert_eq!(stats_columns(&stats, kind), expected, "{kind}: {stats}");
+    }
     Ok(())
 }
