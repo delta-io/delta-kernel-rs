@@ -77,7 +77,9 @@ async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> Kerne
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
-    let clustering_columns = snapshot.get_physical_clustering_columns(engine.as_ref())?;
+    let clustering_columns = snapshot
+        .reader()
+        .get_physical_clustering_columns(engine.as_ref())?;
     assert_eq!(clustering_columns, Some(expected_cols));
 
     let table_configuration = snapshot.table_configuration();
@@ -132,7 +134,9 @@ async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> KernelR
     );
 
     // Verify clustering columns via snapshot read path
-    let clustering_columns = snapshot.get_physical_clustering_columns(engine.as_ref())?;
+    let clustering_columns = snapshot
+        .reader()
+        .get_physical_clustering_columns(engine.as_ref())?;
     assert_eq!(clustering_columns, Some(vec![column_name!("id")]));
 
     Ok(())

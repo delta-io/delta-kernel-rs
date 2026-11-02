@@ -418,7 +418,7 @@ fn batch_version(data: &dyn EngineData) -> KernelResult<Version> {
         .ok_or_else(|| KernelError::internal_error("commit batch missing _file column"))?;
     let url = Url::parse(&file)
         .map_err(|e| KernelError::internal_error(format!("batch has invalid _file {file}: {e}")))?;
-    ParsedLogPath::try_from(url)?
+    ParsedLogPath::new(url)
         .map(|path| path.version)
         .ok_or_else(|| KernelError::internal_error(format!("batch from non-log file {file}")))
 }

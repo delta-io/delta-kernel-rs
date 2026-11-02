@@ -1,9 +1,9 @@
-//! Validation of `file` values read from or written to Parquet.
+//! Validation of `file` values read from Parquet.
 
 use std::ops::Range;
 
 use crate::arrow::array::cast::AsArray;
-use crate::arrow::array::{Array, OffsetSizeTrait, StructArray};
+use crate::arrow::array::{Array, ArrayRef, OffsetSizeTrait, StructArray};
 use crate::arrow::datatypes::{DataType as ArrowDataType, Int64Type};
 use crate::engine::arrow_utils::make_arrow_error;
 use crate::expressions::ColumnName;
@@ -23,80 +23,56 @@ pub(crate) fn validate_file_values(
     data: &StructArray,
     kernel_schema: &StructType,
 ) -> KernelResult<()> {
-    validate_root(data, kernel_schema, Mode::Read)
-}
-
-/// Fails if a `file` value in `data` is invalid for a writer to write: it breaks a rule
-/// [`validate_file_values`] applies, or its `checksum` is not of the form `<algorithm>:<digest>`
-/// with a digest of the encoding the Parquet `FILE` specification gives its algorithm. `ETAG`
-/// digests are opaque, and unknown algorithms are accepted, as readers ignore them.
-pub(crate) fn validate_file_values_for_write(
-    data: &StructArray,
-    kernel_schema: &StructType,
-) -> KernelResult<()> {
-    validate_root(data, kernel_schema, Mode::Write)
-}
-
-/// Which rules to apply: reads reject only what readers must, writes also check `checksum`.
-#[derive(Clone, Copy)]
-enum Mode {
-    Read,
-    Write,
-}
-
-fn validate_root(data: &StructArray, kernel_schema: &StructType, mode: Mode) -> KernelResult<()> {
-    let Some(file_paths) = FilePaths::of_struct(kernel_schema) else {
+    let Some(file_paths) = FilePaths::from_schema(kernel_schema)? else {
         return Ok(());
     };
-    // The top-level rows are all present; `validate` combines this with `data`'s own validity.
-    validate(
-        data,
-        &file_paths,
-        &vec![true; data.len()],
-        mode,
-        &mut Vec::new(),
-    )
+    // The top-level rows are all present; `validate_at_file_paths` combines this with `data`'s own
+    // validity.
+    validate_at_file_paths(data, &file_paths, &vec![true; data.len()], &mut Vec::new())
 }
 
 /// The parts of a schema that lead to `file` values: each `file`, and the structs, arrays and maps
 /// that contain one. Other fields are left out, so validating walks only these paths.
 #[derive(Debug)]
-pub(crate) enum FilePaths {
+enum FilePaths {
     File,
     /// The fields of a struct that contain a `file`.
     Struct(Vec<(String, FilePaths)>),
     Array(Box<FilePaths>),
-    Map {
-        key: Option<Box<FilePaths>>,
-        value: Option<Box<FilePaths>>,
-    },
+    /// The value of a map. A `file` cannot be in a map key.
+    Map(Box<FilePaths>),
 }
 
 impl FilePaths {
     /// Returns the paths to the `file` values in `schema`, or `None` if it has none. Each field is
-    /// visited once.
-    pub(crate) fn of_struct(schema: &StructType) -> Option<Self> {
-        let fields: Vec<_> = schema
-            .fields()
-            .filter_map(|field| Some((field.name().clone(), Self::of(field.data_type())?)))
-            .collect();
-        (!fields.is_empty()).then_some(Self::Struct(fields))
+    /// visited once. Fails if a map key contains a `file`.
+    fn from_schema(schema: &StructType) -> KernelResult<Option<Self>> {
+        let mut fields = Vec::new();
+        for field in schema.fields() {
+            if let Some(paths) = Self::from_data_type(field.data_type())? {
+                fields.push((field.name().clone(), paths));
+            }
+        }
+        Ok((!fields.is_empty()).then_some(Self::Struct(fields)))
     }
 
-    fn of(data_type: &DataType) -> Option<Self> {
-        match data_type {
+    fn from_data_type(data_type: &DataType) -> KernelResult<Option<Self>> {
+        Ok(match data_type {
             DataType::File(_) => Some(Self::File),
-            DataType::Struct(schema) => Self::of_struct(schema),
-            DataType::Array(array_type) => {
-                Some(Self::Array(Box::new(Self::of(array_type.element_type())?)))
-            }
+            DataType::Struct(schema) => Self::from_schema(schema)?,
+            DataType::Array(array_type) => Self::from_data_type(array_type.element_type())?
+                .map(|element| Self::Array(Box::new(element))),
             DataType::Map(map_type) => {
-                let key = Self::of(map_type.key_type()).map(Box::new);
-                let value = Self::of(map_type.value_type()).map(Box::new);
-                (key.is_some() || value.is_some()).then_some(Self::Map { key, value })
+                // Table schemas with a `file` in a map key are rejected when they are loaded.
+                if Self::from_data_type(map_type.key_type())?.is_some() {
+                    return Err(KernelError::internal_error(
+                        "A map key type must not contain a `file`",
+                    ));
+                }
+                Self::from_data_type(map_type.value_type())?.map(|value| Self::Map(Box::new(value)))
             }
             _ => None,
-        }
+        })
     }
 }
 
@@ -108,33 +84,62 @@ fn rows_present(array: &dyn Array, parent_present: &[bool]) -> Vec<bool> {
         .collect()
 }
 
-/// Returns, for each of the `len` child values of a list or map, whether a present row uses it.
-/// `range_of` gives the child values a row uses; it is only called for present rows, and ranges are
-/// clamped to `len`.
+/// Returns the span of a list's or map's `len` child values that present rows use, and for each
+/// value in that span whether a present row uses it. `range_of` gives the range of child values
+/// under a row; it is only called for present rows, and ranges are clamped to `len`. For example:
+///
+/// ```text
+/// Parent rows:     [A, B], NULL, [D]
+/// Child values:    [A, B, C, D]
+/// Parent ranges:   0..2,   2..3, 3..4
+/// Span:            0..4
+/// Child presence:  true, true, false, true
+/// ```
+///
+/// `C` is still stored but belongs only to a null parent, so it is not validated. Child values
+/// outside the span, such as those a sliced list no longer shows, are not scanned at all.
 fn entries_present(
     rows_present: &[bool],
     len: usize,
     range_of: impl Fn(usize) -> Range<usize>,
-) -> Vec<bool> {
+) -> (Range<usize>, Vec<bool>) {
+    let ranges: Vec<_> = (0..rows_present.len())
+        .filter(|&row| rows_present[row])
+        .map(|row| {
+            let range = range_of(row);
+            range.start.min(len)..range.end.min(len)
+        })
+        .filter(|range| range.start < range.end)
+        .collect();
+    let span_start = ranges.iter().map(|range| range.start).min().unwrap_or(0);
+    let span_end = ranges.iter().map(|range| range.end).max().unwrap_or(0);
     // Mark where each present row's range starts and ends; a running count above zero means a value
     // is used. This stays linear even when list-view ranges overlap.
-    let mut starts_minus_ends = vec![0i64; len + 1];
-    for row in (0..rows_present.len()).filter(|&row| rows_present[row]) {
-        let range = range_of(row);
-        let (start, end) = (range.start.min(len), range.end.min(len));
-        if start < end {
-            starts_minus_ends[start] += 1;
-            starts_minus_ends[end] -= 1;
-        }
+    let mut starts_minus_ends = vec![0i64; span_end - span_start + 1];
+    for range in &ranges {
+        starts_minus_ends[range.start - span_start] += 1;
+        starts_minus_ends[range.end - span_start] -= 1;
     }
     let mut count = 0;
-    starts_minus_ends[..len]
+    let present = starts_minus_ends[..span_end - span_start]
         .iter()
         .map(|delta| {
             count += delta;
             count > 0
         })
-        .collect()
+        .collect();
+    (span_start..span_end, present)
+}
+
+/// Returns the span of `values` that present rows use, and which of its values they use; see
+/// [`entries_present`].
+fn used_values(
+    values: &ArrayRef,
+    rows_present: &[bool],
+    range_of: impl Fn(usize) -> Range<usize>,
+) -> (ArrayRef, Vec<bool>) {
+    let (span, present) = entries_present(rows_present, values.len(), range_of);
+    (values.slice(span.start, span.len()), present)
 }
 
 /// The child values row `row` of a list or map uses, from its offsets.
@@ -148,47 +153,36 @@ fn view_range<O: OffsetSizeTrait>(offsets: &[O], sizes: &[O], row: usize) -> Ran
     start..start + sizes[row].as_usize()
 }
 
-/// Returns the child values of the list-like `array` and which of them a present row uses.
-fn list_entries<'a>(
-    array: &'a dyn Array,
-    present: &[bool],
-) -> KernelResult<(&'a dyn Array, Vec<bool>)> {
+/// Returns the child values of the list-like `array` that present rows use, and which of them they
+/// use; see [`used_values`].
+fn list_entries(array: &dyn Array, present: &[bool]) -> KernelResult<(ArrayRef, Vec<bool>)> {
     let list = match array.data_type() {
         ArrowDataType::List(_) => array.as_list_opt::<i32>().map(|list| {
             let offsets = list.value_offsets();
-            let entries = entries_present(present, list.values().len(), |row| {
-                offset_range(offsets, row)
-            });
-            (list.values().as_ref(), entries)
+            used_values(list.values(), present, |row| offset_range(offsets, row))
         }),
         ArrowDataType::LargeList(_) => array.as_list_opt::<i64>().map(|list| {
             let offsets = list.value_offsets();
-            let entries = entries_present(present, list.values().len(), |row| {
-                offset_range(offsets, row)
-            });
-            (list.values().as_ref(), entries)
+            used_values(list.values(), present, |row| offset_range(offsets, row))
         }),
         ArrowDataType::ListView(_) => array.as_list_view_opt::<i32>().map(|list| {
             let (offsets, sizes) = (list.value_offsets(), list.value_sizes());
-            let entries = entries_present(present, list.values().len(), |row| {
+            used_values(list.values(), present, |row| {
                 view_range(offsets, sizes, row)
-            });
-            (list.values().as_ref(), entries)
+            })
         }),
         ArrowDataType::LargeListView(_) => array.as_list_view_opt::<i64>().map(|list| {
             let (offsets, sizes) = (list.value_offsets(), list.value_sizes());
-            let entries = entries_present(present, list.values().len(), |row| {
+            used_values(list.values(), present, |row| {
                 view_range(offsets, sizes, row)
-            });
-            (list.values().as_ref(), entries)
+            })
         }),
         ArrowDataType::FixedSizeList(..) => array.as_fixed_size_list_opt().map(|list| {
             let length = list.value_length() as usize;
-            let entries = entries_present(present, list.values().len(), |row| {
+            used_values(list.values(), present, |row| {
                 let start = list.value_offset(row) as usize;
                 start..start + length
-            });
-            (list.values().as_ref(), entries)
+            })
         }),
         _ => None,
     };
@@ -202,50 +196,48 @@ fn list_entries<'a>(
 
 /// Validates the `file` values at `file_paths` in `array`, whose rows are present in its parent
 /// per `parent_present`.
-fn validate(
+fn validate_at_file_paths(
     array: &dyn Array,
     file_paths: &FilePaths,
     parent_present: &[bool],
-    mode: Mode,
-    path: &mut Vec<String>,
+    current_column_path: &mut Vec<String>,
 ) -> KernelResult<()> {
     let current_present = rows_present(array, parent_present);
     match file_paths {
-        FilePaths::File => validate_file(as_struct(array)?, &current_present, mode, path),
+        FilePaths::File => validate_file(as_struct(array)?, &current_present, current_column_path),
         FilePaths::Struct(fields) => {
             let array = as_struct(array)?;
             for (name, inner) in fields {
-                path.push(name.clone());
+                current_column_path.push(name.clone());
                 let column = array.column_by_name(name).ok_or_else(|| {
                     make_arrow_error(format!(
                         "`file` column '{}' is missing from the data",
-                        ColumnName::new(path.iter().cloned())
+                        ColumnName::new(current_column_path.iter().cloned())
                     ))
                 })?;
-                validate(column.as_ref(), inner, &current_present, mode, path)?;
-                path.pop();
+                validate_at_file_paths(
+                    column.as_ref(),
+                    inner,
+                    &current_present,
+                    current_column_path,
+                )?;
+                current_column_path.pop();
             }
             Ok(())
         }
         FilePaths::Array(element) => {
             let (values, entries) = list_entries(array, &current_present)?;
-            validate(values, element, &entries, mode, path)
+            validate_at_file_paths(values.as_ref(), element, &entries, current_column_path)
         }
-        FilePaths::Map { key, value } => {
+        FilePaths::Map(value) => {
             let map = array.as_map_opt().ok_or_else(|| {
                 make_arrow_error("Arrow claimed to be a map but isn't a MapArray")
             })?;
             let offsets = map.value_offsets();
-            let entries = entries_present(&current_present, map.entries().len(), |row| {
+            let (values, entries) = used_values(map.values(), &current_present, |row| {
                 offset_range(offsets, row)
             });
-            if let Some(key) = key {
-                validate(map.keys().as_ref(), key, &entries, mode, path)?;
-            }
-            if let Some(value) = value {
-                validate(map.values().as_ref(), value, &entries, mode, path)?;
-            }
-            Ok(())
+            validate_at_file_paths(values.as_ref(), value, &entries, current_column_path)
         }
     }
 }
@@ -256,12 +248,7 @@ fn as_struct(array: &dyn Array) -> KernelResult<&StructArray> {
         .ok_or_else(|| make_arrow_error("Arrow claimed to be a struct but isn't a StructArray"))
 }
 
-fn validate_file(
-    file: &StructArray,
-    present: &[bool],
-    mode: Mode,
-    path: &[String],
-) -> KernelResult<()> {
+fn validate_file(file: &StructArray, present: &[bool], path: &[String]) -> KernelResult<()> {
     let field = |name: &str| {
         file.column_by_name(name)
             .ok_or_else(|| make_arrow_error(format!("`file` value is missing field '{name}'")))
@@ -273,7 +260,6 @@ fn validate_file(
     };
     let (uri, inline) = (field("uri")?, field("inline")?);
     let (offset, size) = (int64("offset")?, int64("size")?);
-    let checksum = field("checksum")?;
     for row in (0..file.len()).filter(|&row| present[row]) {
         // The rules of the Parquet `FILE` specification, quoted from its `offset` and `size`
         // fields and its Resolution section.
@@ -296,12 +282,6 @@ fn validate_file(
         } else if size.is_valid(row) && size.value(row) < 0 {
             // `size`: "must be zero or a positive integer if set".
             "`size` is negative"
-        } else if let Some(problem) = matches!(mode, Mode::Write)
-            .then(|| string_at(checksum.as_ref(), row))
-            .flatten()
-            .and_then(checksum_problem)
-        {
-            problem
         } else {
             continue;
         };
@@ -311,41 +291,6 @@ fn validate_file(
         )));
     }
     Ok(())
-}
-
-/// Returns the string at `row` of a string array, or `None` if it is null or not a string.
-fn string_at(array: &dyn Array, row: usize) -> Option<&str> {
-    if array.is_null(row) {
-        return None;
-    }
-    match array.data_type() {
-        ArrowDataType::Utf8 => Some(array.as_string::<i32>().value(row)),
-        ArrowDataType::LargeUtf8 => Some(array.as_string::<i64>().value(row)),
-        ArrowDataType::Utf8View => Some(array.as_string_view().value(row)),
-        _ => None,
-    }
-}
-
-/// Returns what is wrong with `checksum` under the Parquet `FILE` specification, if anything.
-fn checksum_problem(checksum: &str) -> Option<&'static str> {
-    let Some((algorithm, digest)) = checksum.split_once(':') else {
-        return Some("`checksum` is not of the form `<algorithm>:<digest>`");
-    };
-    if algorithm.is_empty() || digest.is_empty() {
-        return Some("`checksum` is not of the form `<algorithm>:<digest>`");
-    }
-    // Hex digest length per algorithm; `ETAG` is opaque and other algorithms are not checked.
-    let hex_length = match algorithm {
-        "MD5" => 32,
-        "CRC32" | "CRC32C" => 8,
-        "SHA-256" => 64,
-        _ => return None,
-    };
-    let is_lowercase_hex = digest
-        .bytes()
-        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-    (digest.len() != hex_length || !is_lowercase_hex)
-        .then_some("`checksum` digest is not the lowercase hex its algorithm requires")
 }
 
 #[cfg(test)]
@@ -361,6 +306,7 @@ mod tests {
     };
     use crate::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{Field, Fields};
+    use crate::arrow::error::ArrowError;
     use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::schema::{ArrayType, MapType, StructField};
 
@@ -436,13 +382,7 @@ mod tests {
             Some((Some("s3://b/a"), None, None, None)),
             Some(row),
         ]));
-        let error = validate_file_values(&data, &schema)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains(&format!("Invalid value in `file` column 'f': {problem}")),
-            "got: {error}"
-        );
+        assert_invalid(validate_file_values(&data, &schema), "f", problem);
     }
 
     /// An invalid value is found in a struct field, an array element, and a map value, and the
@@ -506,17 +446,28 @@ mod tests {
         )]);
         let schema = StructType::new_unchecked([StructField::nullable(column, data_type)]);
 
-        let error = validate_file_values(&data, &schema)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains(&format!("Invalid value in `file` column '{path}'")),
-            "got: {error}"
-        );
+        assert_no_referent(validate_file_values(&data, &schema), path);
     }
 
     const INVALID: Row<'static> = Some((None, None, None, None));
     const VALID: Row<'static> = Some((Some("s3://b/a"), None, None, None));
+
+    /// Asserts that `result` is the error for an invalid value in `file` column `column`.
+    fn assert_invalid(result: KernelResult<()>, column: &str, problem: &str) {
+        let error = result.unwrap_err();
+        match error.without_backtrace() {
+            KernelError::Generic(message) => assert_eq!(
+                message,
+                &format!("Invalid value in `file` column '{column}': {problem}")
+            ),
+            other => panic!("expected an invalid `file` value error, got {other:?}"),
+        }
+    }
+
+    /// Asserts that `result` is the error for [`INVALID`] in `file` column `column`.
+    fn assert_no_referent(result: KernelResult<()>, column: &str) {
+        assert_invalid(result, column, "neither `uri` nor `inline` is set");
+    }
 
     fn list_of_files(
         file: StructArray,
@@ -529,15 +480,7 @@ mod tests {
             Arc::new(file),
             nulls,
         );
-        let data = StructArray::from(vec![(
-            Arc::new(Field::new("a", list.data_type().clone(), true)),
-            Arc::new(list) as ArrayRef,
-        )]);
-        let schema = StructType::new_unchecked([StructField::nullable(
-            "a",
-            ArrayType::new(DataType::file_type(), true),
-        )]);
-        (data, schema)
+        array_column(Arc::new(list))
     }
 
     /// An invalid value is not checked where no present row uses it: in the range of a null list
@@ -552,7 +495,7 @@ mod tests {
         // The slice keeps only the first slot, which spans the valid element.
         let (data, schema) = list_of_files(file_array(&[VALID, INVALID]), &[0, 1, 2], None);
         validate_file_values(&data.slice(0, 1), &schema).unwrap();
-        validate_file_values(&data, &schema).unwrap_err();
+        assert_no_referent(validate_file_values(&data, &schema), "a");
     }
 
     /// Wraps `list` as the only column, `a`, of an array of `file` values.
@@ -574,7 +517,7 @@ mod tests {
     fn slices_from_nonzero_start_check_only_their_values() {
         let (data, schema) = list_of_files(file_array(&[INVALID, VALID]), &[0, 1, 2], None);
         validate_file_values(&data.slice(1, 1), &schema).unwrap();
-        validate_file_values(&data, &schema).unwrap_err();
+        assert_no_referent(validate_file_values(&data, &schema), "a");
 
         let file = file_array(&[INVALID, INVALID, VALID, VALID]);
         let list = FixedSizeListArray::new(
@@ -585,11 +528,10 @@ mod tests {
         );
         let (data, schema) = array_column(Arc::new(list));
         validate_file_values(&data.slice(1, 1), &schema).unwrap();
-        validate_file_values(&data, &schema).unwrap_err();
+        assert_no_referent(validate_file_values(&data, &schema), "a");
     }
 
-    /// In a large list view, as in a list view, a row uses the values its offset and size give,
-    /// and overlapping views are checked once per value.
+    /// In a large list view, as in a list view, a row uses the values its offset and size give.
     #[test]
     fn large_list_view_values_follow_present_rows() {
         let large_list_view = |offsets: Vec<i64>, sizes: Vec<i64>, nulls| {
@@ -608,10 +550,10 @@ mod tests {
         let (data, schema) = large_list_view(vec![0, 0], vec![2, 1], nulls);
         validate_file_values(&data, &schema).unwrap();
         let (data, schema) = large_list_view(vec![0, 0], vec![2, 1], None);
-        validate_file_values(&data, &schema).unwrap_err();
+        assert_no_referent(validate_file_values(&data, &schema), "a");
     }
 
-    /// In a list view, a row uses the values its offset and size give, in any order, so an invalid
+    /// In a list view, a row uses the values its offset and size give, in any order. An invalid
     /// value is checked only where a present row's view covers it.
     #[test]
     fn list_view_values_follow_present_rows() {
@@ -630,7 +572,7 @@ mod tests {
         let (data, schema) = list_view(vec![1, 0], Some(NullBuffer::from(vec![false, true])));
         validate_file_values(&data, &schema).unwrap();
         let (data, schema) = list_view(vec![1, 0], None);
-        validate_file_values(&data, &schema).unwrap_err();
+        assert_no_referent(validate_file_values(&data, &schema), "a");
     }
 
     /// In a fixed-size list, an invalid value is checked only where a present row uses it,
@@ -650,7 +592,7 @@ mod tests {
         let (data, schema) = fixed_size_list(Some(NullBuffer::from(vec![true, false])));
         validate_file_values(&data, &schema).unwrap();
         let (data, schema) = fixed_size_list(None);
-        validate_file_values(&data, &schema).unwrap_err();
+        assert_no_referent(validate_file_values(&data, &schema), "a");
         validate_file_values(&data.slice(0, 1), &schema).unwrap();
     }
 
@@ -665,20 +607,12 @@ mod tests {
                 Arc::new(file),
                 nulls,
             );
-            let data = StructArray::from(vec![(
-                Arc::new(Field::new("a", list.data_type().clone(), true)),
-                Arc::new(list) as ArrayRef,
-            )]);
-            let schema = StructType::new_unchecked([StructField::nullable(
-                "a",
-                ArrayType::new(DataType::file_type(), true),
-            )]);
-            (data, schema)
+            array_column(Arc::new(list))
         };
         let (data, schema) = large_list(Some(NullBuffer::from(vec![true, false])));
         validate_file_values(&data, &schema).unwrap();
         let (data, schema) = large_list(None);
-        validate_file_values(&data, &schema).unwrap_err();
+        assert_no_referent(validate_file_values(&data, &schema), "a");
 
         let map = |nulls| {
             let file = file_array(&[VALID, INVALID]);
@@ -717,7 +651,7 @@ mod tests {
         let (data, schema) = map(Some(NullBuffer::from(vec![true, false])));
         validate_file_values(&data, &schema).unwrap();
         let (data, schema) = map(None);
-        validate_file_values(&data, &schema).unwrap_err();
+        assert_no_referent(validate_file_values(&data, &schema), "m");
     }
 
     /// An invalid value under a null struct inside a list is not checked.
@@ -768,64 +702,35 @@ mod tests {
             StructField::nullable("s", DataType::STRING),
             StructField::nullable("f", DataType::file_type()),
         ]);
-        let error = validate_file_values(&data, &schema)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("Invalid value in `file` column 'f'"),
-            "got: {error}"
-        );
+        assert_no_referent(validate_file_values(&data, &schema), "f");
 
         let data = StructArray::from(vec![(
             Arc::new(Field::new("s", ArrowDataType::Utf8, true)),
             other,
         )]);
-        let error = validate_file_values(&data, &schema)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("`file` column 'f' is missing from the data"),
-            "got: {error}"
-        );
-    }
-
-    /// Replaces the `checksum` field of `file` with `checksums`.
-    fn with_checksums(file: StructArray, checksums: &[Option<&str>]) -> StructArray {
-        let (fields, mut columns, nulls) = file.into_parts();
-        let index = fields.iter().position(|f| f.name() == "checksum").unwrap();
-        columns[index] = Arc::new(StringArray::from(checksums.to_vec()));
-        StructArray::try_new(fields, columns, nulls).unwrap()
-    }
-
-    /// Writes check the `checksum` format; reads do not, since readers ignore what they cannot use.
-    #[rstest]
-    #[case::md5(Some("MD5:d41d8cd98f00b204e9800998ecf8427e"), None)]
-    #[case::crc32c(Some("CRC32C:e3069283"), None)]
-    #[case::sha256(
-        Some("SHA-256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
-        None
-    )]
-    #[case::etag(Some("ETAG:\"0x8D9A\""), None)]
-    #[case::unknown_algorithm(Some("XXH64:anything"), None)]
-    #[case::null(None, None)]
-    #[case::no_separator(Some("d41d8cd98f00b204e9800998ecf8427e"), Some("not of the form"))]
-    #[case::empty_digest(Some("ETAG:"), Some("not of the form"))]
-    #[case::uppercase_hex(Some("MD5:D41D8CD98F00B204E9800998ECF8427E"), Some("lowercase hex"))]
-    #[case::wrong_length(Some("MD5:xyz"), Some("lowercase hex"))]
-    fn write_checks_checksum_format(#[case] checksum: Option<&str>, #[case] problem: Option<&str>) {
-        let (data, schema) = top_level(with_checksums(file_array(&[VALID]), &[checksum]));
-        validate_file_values(&data, &schema).unwrap();
-        let result = validate_file_values_for_write(&data, &schema);
-        match problem {
-            None => result.unwrap(),
-            Some(problem) => {
-                let error = result.unwrap_err().to_string();
-                assert!(
-                    error.contains("Invalid value in `file` column 'f': `checksum`"),
-                    "got: {error}"
-                );
-                assert!(error.contains(problem), "got: {error}");
+        let error = validate_file_values(&data, &schema).unwrap_err();
+        match error.without_backtrace() {
+            KernelError::Arrow(ArrowError::InvalidArgumentError(message)) => {
+                assert_eq!(message, "`file` column 'f' is missing from the data")
             }
+            other => panic!("expected a missing `file` column error, got {other:?}"),
         }
+    }
+
+    /// Only the span of child values that present rows use is marked, so a slice or a null row
+    /// at either end does not make validation scan the rest of the child values.
+    #[test]
+    fn entries_present_covers_only_the_used_span() {
+        let ranges = [0..2, 2..5, 5..6, 6..9];
+        let range_of = |row: usize| ranges[row].clone();
+        // Rows 1 and 2 are present.
+        let (span, present) = entries_present(&[false, true, true, false], 8, range_of);
+        assert_eq!((span, present), (2..6, vec![true; 4]));
+        // Only row 3 is present; its range is clamped to the 8 child values.
+        let (span, present) = entries_present(&[false, false, false, true], 8, range_of);
+        assert_eq!((span, present), (6..8, vec![true; 2]));
+        // No row is present.
+        let (span, present) = entries_present(&[false; 4], 8, range_of);
+        assert_eq!((span, present), (0..0, vec![]));
     }
 }

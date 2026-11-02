@@ -771,7 +771,7 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
     }
 
     /// Returns the schema this projection patch is applied to.
-    pub fn input_schema(&self) -> &StructType {
+    pub fn input_schema(&self) -> &'a StructType {
         self.input_schema
     }
 

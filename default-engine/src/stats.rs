@@ -50,25 +50,11 @@ const UTF8_MAX_CHAR: char = '\u{10FFFF}';
 ///
 /// Returns the original string if it's already within the limit.
 fn truncate_min_string(s: &str) -> &str {
-    if s.len() <= STRING_PREFIX_LENGTH {
-        return s;
-    }
-    // Find char boundary at or before STRING_PREFIX_LENGTH
     let end = s
         .char_indices()
-        .take(STRING_PREFIX_LENGTH + 1)
-        .last()
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
-
-    // Take exactly STRING_PREFIX_LENGTH chars
-    let truncated_end = s
-        .char_indices()
         .nth(STRING_PREFIX_LENGTH)
-        .map(|(i, _)| i)
-        .unwrap_or(end);
-
-    &s[..truncated_end]
+        .map_or(s.len(), |(i, _)| i);
+    &s[..end]
 }
 
 /// Truncate a string for max statistics.
@@ -1427,6 +1413,12 @@ mod tests {
         // Multi-byte characters
         let multi = format!("{}À", "a".repeat(35)); // 'À' is 2 bytes in UTF-8
         assert_eq!(truncate_min_string(&multi).chars().count(), 32);
+
+        // Exactly 32 characters but more than 32 bytes: keep the whole string
+        let s32_multibyte = format!("{}é", "a".repeat(31));
+        assert_eq!(s32_multibyte.chars().count(), 32);
+        assert!(s32_multibyte.len() > STRING_PREFIX_LENGTH);
+        assert_eq!(truncate_min_string(&s32_multibyte), s32_multibyte);
     }
 
     #[test]

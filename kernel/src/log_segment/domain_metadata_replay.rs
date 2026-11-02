@@ -18,21 +18,13 @@ use crate::{Engine, KernelResult, KernelResultIterator, RowVisitor as _, Version
 pub(crate) type DomainMetadataMap = HashMap<String, DomainMetadata>;
 
 impl LogSegment {
-    /// Scan this log segment for domain metadata actions. If a specific set of domains is
-    /// provided, terminate log replay early once all requested domains have been found. If no
-    /// filter is given, replay the entire log to collect all domains.
-    ///
-    /// Returns the latest domain metadata for each domain, accounting for tombstones
-    /// (`removed=true`) — removed domain metadatas will _never_ be present in the returned map.
-    #[instrument(name = "domain_metadata.scan", skip_all, fields(domains = ?domains.map(|d| d.iter().collect::<Vec<_>>())), err)]
+    /// [`scan_domain_metadata_actions`] over this segment's whole log.
     pub(crate) fn scan_domain_metadatas(
         &self,
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
     ) -> KernelResult<DomainMetadataMap> {
-        Ok(self
-            .visit_domain_metadatas(domains, engine)?
-            .into_domain_metadatas())
+        scan_domain_metadata_actions(self.read_domain_metadata_batches(engine)?, domains)
     }
 
     /// Answer a domain-metadata query rooted in an authoritative (`Complete`) but stale CRC's
@@ -90,33 +82,13 @@ impl LogSegment {
     }
 
     /// Reverse-replay this segment, folding domain metadata actions into a
-    /// [`DomainMetadataVisitor`] (newest-first, first-seen-wins). A domain filter terminates
-    /// the scan early once every requested domain is found; without one the whole segment is
-    /// replayed. The caller chooses whether to keep or strip tombstones from the returned
-    /// visitor.
+    /// [`DomainMetadataVisitor`] (see [`visit_domain_metadata_actions`]).
     fn visit_domain_metadatas(
         &self,
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
     ) -> KernelResult<DomainMetadataVisitor> {
-        let domain_filter = domains.map(|set| {
-            set.iter()
-                .map(|s| s.to_string())
-                .collect::<HashSet<String>>()
-        });
-        let mut visitor = DomainMetadataVisitor::new(domain_filter);
-        // If a specific set of domains is requested then we can terminate log replay early as
-        // soon as all requested domains have been found. If all domains are requested then we
-        // are forced to replay the entire log.
-        for actions in self.read_domain_metadata_batches(engine)? {
-            let domain_metadatas = actions?.actions;
-            visitor.visit_rows_of(domain_metadatas.as_ref())?;
-            // if all requested domains have been found, terminate early
-            if visitor.filter_found() {
-                break;
-            }
-        }
-        Ok(visitor)
+        visit_domain_metadata_actions(self.read_domain_metadata_batches(engine)?, domains)
     }
 
     /// Read action batches from the log, projecting rows to only contain domain metadata columns.
@@ -126,6 +98,47 @@ impl LogSegment {
     ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
         self.read_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())
     }
+}
+
+/// Folds `actions`, a newest-first replay read with [`LOG_DOMAIN_METADATA_SCHEMA`], into the latest
+/// domain metadata. If a specific set of domains is provided, stop reading once all requested
+/// domains have been found. If no filter is given, read every batch to collect all domains.
+///
+/// Returns the latest domain metadata for each domain, accounting for tombstones
+/// (`removed=true`) — removed domain metadatas will _never_ be present in the returned map.
+#[instrument(name = "domain_metadata.scan", skip_all, fields(domains = ?domains.map(|d| d.iter().collect::<Vec<_>>())), err)]
+fn scan_domain_metadata_actions(
+    actions: impl Iterator<Item = KernelResult<ActionsBatch>>,
+    domains: Option<&HashSet<&str>>,
+) -> KernelResult<DomainMetadataMap> {
+    Ok(visit_domain_metadata_actions(actions, domains)?.into_domain_metadatas())
+}
+
+/// Folds `actions` into a [`DomainMetadataVisitor`] (newest-first, first-seen-wins). A domain
+/// filter stops reading once every requested domain is found. The caller chooses whether to keep
+/// or strip tombstones from the returned visitor.
+fn visit_domain_metadata_actions(
+    actions: impl Iterator<Item = KernelResult<ActionsBatch>>,
+    domains: Option<&HashSet<&str>>,
+) -> KernelResult<DomainMetadataVisitor> {
+    let domain_filter = domains.map(|set| {
+        set.iter()
+            .map(|s| s.to_string())
+            .collect::<HashSet<String>>()
+    });
+    let mut visitor = DomainMetadataVisitor::new(domain_filter);
+    // If a specific set of domains is requested then we can terminate log replay early as
+    // soon as all requested domains have been found. If all domains are requested then we
+    // are forced to replay the entire log.
+    for actions in actions {
+        let domain_metadatas = actions?.actions;
+        visitor.visit_rows_of(domain_metadatas.as_ref())?;
+        // if all requested domains have been found, terminate early
+        if visitor.filter_found() {
+            break;
+        }
+    }
+    Ok(visitor)
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use serde::Serialize;
 use tempfile::TempDir;
 use test_utils::{
     copy_directory, delta_path_for_version, load_test_data, modify_add_file_partition_keys,
-    replace_array_row, AddFilePartitionKeyModify,
+    replace_array_row, replace_column, AddFilePartitionKeyModify,
 };
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -59,12 +59,11 @@ pub(crate) fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
 
 /// [`create_log_path`] with an explicit file size.
 pub(crate) fn create_log_path_with_size(path: &str, size: u64) -> ParsedLogPath<FileMeta> {
-    ParsedLogPath::try_from(FileMeta {
+    ParsedLogPath::new(FileMeta {
         location: Url::parse(path).expect("Invalid file URL"),
         last_modified: 0,
         size,
     })
-    .unwrap()
     .unwrap()
 }
 
@@ -226,47 +225,46 @@ pub(crate) fn create_valid_add_file_batch(all_nullable: bool) -> RecordBatch {
 }
 
 /// Builds one valid add-file row with a fully nullable schema.
-pub(crate) fn nullable_add_file() -> RecordBatch {
-    create_valid_add_file_batch(true /* all_nullable */)
+pub(crate) fn nullable_add_file(path: &str) -> RecordBatch {
+    replace_column(
+        &create_valid_add_file_batch(true /* all_nullable */),
+        "path",
+        Arc::new(StringArray::from(vec![path])),
+    )
 }
 
-/// Builds `row_count` valid add-file rows with a fully nullable schema.
-pub(crate) fn nullable_add_files(row_count: usize) -> RecordBatch {
-    let batch = nullable_add_file();
-    concat_batches(&batch.schema(), &vec![batch; row_count])
-        .expect("failed to concatenate rows into a multi-row add-file batch")
-}
-
-pub(crate) fn replace_column(batch: &RecordBatch, field: &str, column: ArrayRef) -> RecordBatch {
-    let schema = batch.schema();
-    let index = schema.index_of(field).expect("field in schema");
-    let mut columns = batch.columns().to_vec();
-    columns[index] = column;
-    RecordBatch::try_new(schema, columns).expect("failed to rebuild batch after replacing a column")
+/// Builds valid add-file rows with a fully nullable schema and specific paths.
+pub(crate) fn nullable_add_files(paths: &[&str]) -> RecordBatch {
+    let batches: Vec<_> = paths.iter().map(|path| nullable_add_file(path)).collect();
+    concat_batches(&batches[0].schema(), &batches).expect("failed to concatenate add-file rows")
 }
 
 pub(crate) fn set_field_as_null(batch: &RecordBatch, field: &str, row: usize) -> RecordBatch {
     let schema = batch.schema();
     let index = schema.index_of(field).expect("field in schema");
-    let mut columns = batch.columns().to_vec();
     let null = new_null_array(schema.field(index).data_type(), 1);
-    columns[index] = replace_array_row(&columns[index], null, row);
-    RecordBatch::try_new(schema, columns)
-        .expect("failed to rebuild batch after replacing a field value with null")
+    replace_column(
+        batch,
+        field,
+        replace_array_row(batch.column(index), null, row),
+    )
 }
 
 /// Returns nullable add-file rows with `partitionValues` replaced by `partition_values`.
 pub(crate) fn add_files_with_partition_values(
+    paths: &[&str],
     partition_values: &[&[(&str, Option<&str>)]],
 ) -> RecordBatch {
-    let batches: Vec<_> = partition_values
+    assert_eq!(paths.len(), partition_values.len());
+    let batches: Vec<_> = paths
         .iter()
-        .map(|entries| {
+        .zip(partition_values)
+        .map(|(path, entries)| {
             let modifications: Vec<_> = entries
                 .iter()
                 .map(|(key, value)| AddFilePartitionKeyModify::Insert { key, value: *value })
                 .collect();
-            modify_add_file_partition_keys(nullable_add_file(), &modifications)
+            modify_add_file_partition_keys(nullable_add_file(path), &modifications)
         })
         .collect();
     concat_batches(&batches[0].schema(), &batches)
@@ -328,19 +326,59 @@ pub(crate) mod adaptive_metadata_fixtures {
     use std::iter;
 
     use super::*;
-    use crate::actions::{CheckpointAction, ContentRoot};
+    use crate::actions::{CheckpointAction, ContentRoot, Sidecar};
     use crate::engine_data::FilteredEngineData;
+    use crate::expressions::Scalar;
     use crate::path::LogRoot;
     use crate::version_as_i64;
 
     /// The protocol and metadata of a minimal adaptiveMetadata table.
     pub(crate) fn adaptive_metadata_protocol_and_metadata() -> (Protocol, Metadata) {
-        let table_config =
-            adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
+        adaptive_metadata_pm(test_schema_flat_with_column_mapping(), &[])
+    }
+
+    /// The protocol and metadata of an adaptiveMetadata table with `schema`, partitioned by
+    /// `partition_columns`.
+    pub(crate) fn adaptive_metadata_pm(
+        schema: SchemaRef,
+        partition_columns: &[&str],
+    ) -> (Protocol, Metadata) {
+        let table_config = adaptive_metadata_table_configuration(schema, &[]);
+        let mut metadata = serde_json::to_value(table_config.metadata()).unwrap();
+        metadata["partitionColumns"] = serde_json::json!(partition_columns);
         (
             table_config.protocol().clone(),
-            table_config.metadata().clone(),
+            serde_json::from_value(metadata).unwrap(),
         )
+    }
+
+    /// Commit lines holding the top-level protocol and metadata of [`adaptive_metadata_pm`], and
+    /// no checkpoint action.
+    pub(crate) fn protocol_and_metadata_lines(
+        schema: SchemaRef,
+        partition_columns: &[&str],
+    ) -> String {
+        let (protocol, metadata) = adaptive_metadata_pm(schema, partition_columns);
+        format!(
+            "{}\n{}",
+            serde_json::json!({ "protocol": protocol }),
+            serde_json::json!({ "metaData": metadata }),
+        )
+    }
+
+    /// A `commitInfo` line with In-Commit Timestamp `timestamp` and, when given, a
+    /// `lastManifestCommit` `(version, contentRootVersion)`, as an AMT writer records on every
+    /// commit.
+    pub(crate) fn commit_info_line(timestamp: i64, pointer: Option<(i64, i64)>) -> String {
+        let mut commit_info =
+            serde_json::json!({ "timestamp": timestamp, "inCommitTimestamp": timestamp });
+        if let Some((version, content_root_version)) = pointer {
+            commit_info["lastManifestCommit"] = serde_json::json!({
+                "version": version,
+                "contentRootVersion": content_root_version,
+            });
+        }
+        serde_json::json!({ "commitInfo": commit_info }).to_string()
     }
 
     /// A minimal `checkpoint` action referencing `path` as the content root at `version`.
@@ -368,6 +406,34 @@ pub(crate) mod adaptive_metadata_fixtures {
             vec![],
             vec![],
         ))
+    }
+
+    /// Writes `rows` (each a value of `schema`'s single action field) as the checkpoint sidecar
+    /// `name` of the table at `table_root`.
+    pub(crate) fn write_sidecar(
+        engine: &SyncEngine,
+        table_root: &Url,
+        name: &str,
+        schema: SchemaRef,
+        rows: Vec<Scalar>,
+    ) -> Sidecar {
+        let rows = rows.into_iter().map(|row| vec![row]).collect();
+        let data = engine
+            .evaluation_handler()
+            .create_many(schema, rows)
+            .unwrap();
+        let log_root = LogRoot::new(table_root.clone()).unwrap();
+        let location = log_root
+            .log_root()
+            .join("_sidecars/")
+            .unwrap()
+            .join(name)
+            .unwrap();
+        let size = engine
+            .parquet_handler()
+            .write_parquet_file(location, Box::new(iter::once(Ok(data))))
+            .unwrap();
+        Sidecar::new(name.to_string(), size as i64, 0, None)
     }
 
     /// Creates an empty in-memory table and returns its engine and table-root URL.

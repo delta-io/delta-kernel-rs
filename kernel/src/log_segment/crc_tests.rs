@@ -511,7 +511,10 @@ impl BuiltCrcTest {
 
     fn assert_ict(&self, version: impl Into<Option<u64>>, expected_ict: Option<i64>) {
         let (snapshot, label) = self.snapshot_at(version.into());
-        let ict = snapshot.get_in_commit_timestamp(&self.engine).unwrap();
+        let ict = snapshot
+            .reader()
+            .get_in_commit_timestamp(&self.engine)
+            .unwrap();
         assert_eq!(ict, expected_ict, "ICT mismatch at {label}");
     }
 

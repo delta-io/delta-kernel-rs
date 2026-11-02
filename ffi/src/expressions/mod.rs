@@ -71,43 +71,43 @@ pub struct SharedOpaqueExpressionOp;
 ///
 /// # Safety
 /// Engine is responsible for passing a valid SharedExpression
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_kernel_expression(data: Handle<SharedExpression>) {
-    data.drop_handle();
+    unsafe { data.drop_handle() }
 }
 
 /// Free the memory the passed SharedPredicate
 ///
 /// # Safety
 /// Engine is responsible for passing a valid SharedPredicate
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_kernel_predicate(data: Handle<SharedPredicate>) {
-    data.drop_handle();
+    unsafe { data.drop_handle() }
 }
 
 /// Free the passed SharedOpaqueExpressionOp
 ///
 /// # Safety
 /// Engine is responsible for passing a valid SharedOpaqueExpressionOp
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_kernel_opaque_expression_op(data: Handle<SharedOpaqueExpressionOp>) {
-    data.drop_handle();
+    unsafe { data.drop_handle() }
 }
 
 /// Free the passed SharedOpaquePredicateOp
 ///
 /// # Safety
 /// Engine is responsible for passing a valid SharedOpaquePredicateOp
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_kernel_opaque_predicate_op(data: Handle<SharedOpaquePredicateOp>) {
-    data.drop_handle();
+    unsafe { data.drop_handle() }
 }
 
 /// Visits the name of a SharedOpaqueExpressionOp
 ///
 /// # Safety
 /// Engine is responsible for passing a valid SharedOpaqueExpressionOp
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_kernel_opaque_expression_op_name(
     op: Handle<SharedOpaqueExpressionOp>,
     data: *mut c_void,
@@ -122,7 +122,7 @@ pub unsafe extern "C" fn visit_kernel_opaque_expression_op_name(
 ///
 /// # Safety
 /// Engine is responsible for passing a valid SharedOpaquePredicateOp
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_kernel_opaque_predicate_op_name(
     op: Handle<SharedOpaquePredicateOp>,
     data: *mut c_void,
