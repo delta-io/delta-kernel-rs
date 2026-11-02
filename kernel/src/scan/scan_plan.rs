@@ -1044,7 +1044,7 @@ mod tests {
         Ok(())
     }
 
-    // Struct-only and no-stats requests omit collation bounds because they don't synthesize JSON.
+    // On a struct-only checkpoint, only JSON requests synthesize stats and read collation bounds.
     #[rstest::rstest]
     #[case::json(StatsOptions::json_only(), true)]
     #[case::both(StatsOptions::all(), true)]
@@ -1056,7 +1056,17 @@ mod tests {
         #[values(CheckpointType::Leaf, CheckpointType::Manifest)] checkpoint_type: CheckpointType,
     ) -> KernelResult<()> {
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
-        let scan = mock_snapshot(segment)?
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(partitioned_schema())
+            .with_partition_columns(["p"])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_writer_features([TableFeature::Collations])
+                    .build(),
+            )
+            .with_table_root("memory:///")
+            .try_build()?;
+        let scan = Arc::new(Snapshot::new(segment, config)?)
             .scan_builder()
             .with_stats(stats)
             .build()?;
@@ -1066,8 +1076,17 @@ mod tests {
                 nullable "test.ASCII_CI.2": { nullable "maxValues": { nullable "nested": { nullable "leaf": STRING } } },
             }))
             .build(&struct_stats_schema())?);
-        let shape = shape(checkpoint_type, Some(source));
-        let plan = scan.build_metadata_scan_plan(&shape)?.unwrap();
+        let checkpoint_schema = parquet_read_schema(Some(&source), None)?;
+        let leaf_checkpoint_schema = SchemaStructPatchBuilder::new()
+            .drop_at([ADD_NAME], STATS)
+            .build(&checkpoint_schema)?;
+        let shape = CheckpointShape {
+            checkpoint_type,
+            leaf_checkpoint_schema: Some(Arc::new(leaf_checkpoint_schema)),
+        };
+        let plan = scan
+            .build_metadata_scan_plan(&shape, &MetadataPlanner::try_new(&scan)?)?
+            .unwrap();
         let read_schema = leaf_read_schema(&plan, &shape);
         assert_eq!(source_collation_stats(read_schema).is_some(), preserve_json);
         assert_eq!(
