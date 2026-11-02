@@ -166,10 +166,14 @@ impl CountingStorageHandler {
 }
 
 impl StorageHandler for CountingStorageHandler {
-    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+    fn list_from(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         self.list_from_count.fetch_add(1, Ordering::Relaxed);
         let items_listed = self.items_listed.clone();
-        let iter = self.inner.list_from(path)?;
+        let iter = self.inner.list_from(path, end)?;
         Ok(Box::new(iter.inspect(move |_| {
             items_listed.fetch_add(1, Ordering::Relaxed);
         })))
@@ -357,7 +361,11 @@ fn test_log_tail_covers_entire_range_empty_filesystem() {
     // have nothing — e.g. a purely catalog-managed table.
     struct EmptyStorageHandler;
     impl StorageHandler for EmptyStorageHandler {
-        fn list_from(&self, _path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        fn list_from(
+            &self,
+            _path: &Url,
+            _end: Option<&Url>,
+        ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
             Ok(Box::new(std::iter::empty()))
         }
         fn read_files(
@@ -478,8 +486,7 @@ async fn test_listing_stops_at_first_staged_commit_without_consuming_the_rest() 
         (1, LogPathFileType::Commit, CommitSource::Filesystem),
         (2, LogPathFileType::Commit, CommitSource::Filesystem),
     ];
-    // Staged commits sort after every version-named file ('_' > '9'), so a sorted listing
-    // reaches them only after all relevant files. None should be consumed beyond the first.
+    // `_staged_commits/` sorts after `':'`, so unbounded listing never yields those files.
     log_files
         .extend((0..100).map(|v| (v, LogPathFileType::StagedCommit, CommitSource::Filesystem)));
 
@@ -492,14 +499,11 @@ async fn test_listing_stops_at_first_staged_commit_without_consuming_the_rest() 
     assert_eq!(commits.len(), 3);
     assert_eq!(latest_commit.unwrap().version, 2);
     assert_eq!(max_pub, Some(2));
-    // 3 commits plus the single staged commit that stops the listing
-    assert_eq!(storage.items_listed(), 4);
+    assert_eq!(storage.items_listed(), 3);
 }
 
-// Any path past the version-named region stops the listing, not just `_staged_commits/`:
-// checkpoint sidecars under `_sidecars/` and non-underscore names whose first byte sorts
-// past '9' (e.g. 'Z'). Both sentinels sort before `_staged_commits/`, so no staged commit
-// is ever consumed.
+// Paths past the version-named region (`_sidecars/`, `'Z'`, …) sort after `':'`, so unbounded
+// listing never yields them. Both also sort before `_staged_commits/`.
 #[rstest]
 #[case::sidecar("_delta_log/_sidecars/016ae953-37a9-438e-8683-9a9a4a79a395.parquet")]
 #[case::non_underscore_sentinel("_delta_log/Zsentinel")]
@@ -521,14 +525,12 @@ async fn test_listing_stops_at_first_non_version_named_path(#[case] sentinel_pat
     assert_eq!(commits.len(), 3);
     assert_eq!(latest_commit.unwrap().version, 2);
     assert_eq!(max_pub, Some(2));
-    // 3 commits plus the sentinel that stops the listing
-    assert_eq!(storage.items_listed(), 4);
+    assert_eq!(storage.items_listed(), 3);
 }
 
 #[tokio::test]
 async fn test_listing_stops_at_last_checkpoint_marker() {
-    // In a real table `_last_checkpoint` sorts before `_staged_commits/` ('_la' < '_st'), so
-    // it is the path that stops the listing.
+    // `_last_checkpoint` sorts after `':'` and before `_staged_commits/` (`_la` < `_st`).
     let mut log_files = vec![
         (0, LogPathFileType::Commit, CommitSource::Filesystem),
         (1, LogPathFileType::Commit, CommitSource::Filesystem),
@@ -556,9 +558,32 @@ async fn test_listing_stops_at_last_checkpoint_marker() {
     assert_eq!(latest_crc.unwrap().version, 2);
     assert_eq!(latest_commit.unwrap().version, 2);
     assert_eq!(max_pub, Some(2));
-    // 5 version-named files plus the `_last_checkpoint` that stops the listing; no staged
-    // commit is ever consumed
-    assert_eq!(storage.items_listed(), 6);
+    // 3 commits + checkpoint + crc; `_last_checkpoint` and staged commits are past `':'`
+    assert_eq!(storage.items_listed(), 5);
+}
+
+#[tokio::test]
+async fn test_listing_with_end_version_does_not_consume_later_commits() {
+    let log_files = vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (2, LogPathFileType::Commit, CommitSource::Filesystem),
+        (3, LogPathFileType::Commit, CommitSource::Filesystem),
+        (4, LogPathFileType::Commit, CommitSource::Filesystem),
+    ];
+
+    let (storage, log_root) = create_storage(log_files).await;
+    let storage = CountingStorageHandler::new(storage);
+
+    let (commits, _, _, _, latest_commit, max_pub) =
+        list_and_destructure(&storage, &log_root, vec![], None, Some(2));
+
+    assert_eq!(commits.len(), 3);
+    assert_eq!(commits[2].version, 2);
+    assert_eq!(latest_commit.unwrap().version, 2);
+    assert_eq!(max_pub, Some(2));
+    // versions 0-2 only; later commits are past `{end+1:020}`
+    assert_eq!(storage.items_listed(), 3);
 }
 
 #[tokio::test]
@@ -1775,7 +1800,11 @@ struct FiniteListingHandler {
 }
 
 impl StorageHandler for FiniteListingHandler {
-    fn list_from(&self, _path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+    fn list_from(
+        &self,
+        _path: &Url,
+        _end: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         let log_root = self.log_root.clone();
         let pulled = self.items_pulled.clone();
         let iter = (0..self.count as u64).map(move |version| {
@@ -1867,6 +1896,27 @@ fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
     assert!(matches!(iter.next(), Some(Err(KernelError::Cancelled))));
     // The listing stopped early rather than draining all 100 entries.
     assert!(pulled.load(Ordering::Relaxed) < 100);
+}
+
+#[rstest]
+#[case::unbounded(Version::MAX, "memory:///_delta_log/:", "9", "_")]
+#[case::finite(
+    2,
+    "memory:///_delta_log/00000000000000000003",
+    "00000000000000000002.json",
+    "00000000000000000003.json"
+)]
+fn delta_log_listing_end_is_exclusive_url(
+    #[case] end_version: Version,
+    #[case] expected: &str,
+    #[case] before: &str,
+    #[case] after: &str,
+) {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let end = super::delta_log_listing_end(&log_root, end_version).unwrap();
+    assert_eq!(end.as_str(), expected);
+    assert!(log_root.join(before).unwrap().as_str() < end.as_str());
+    assert!(end.as_str() < log_root.join(after).unwrap().as_str());
 }
 
 // With no token the listing is unchanged, so cancellation support is strictly opt-in.

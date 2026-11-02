@@ -32,7 +32,7 @@ files (as bytes) from storage.
 
 ```rust,ignore
 pub trait StorageHandler {
-    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
+    fn list_from(&self, path: &Url, end: Option<&Url>) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
 
     fn read_files(&self, files: Vec<FileSlice>) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>>;
 
@@ -48,7 +48,8 @@ pub trait StorageHandler {
 
 - **`list_from`**: Results must be sorted lexicographically by path. If the path ends with
   `/`, list all files in that directory. Otherwise, list files lexicographically greater than
-  the given path in the same directory.
+  the given path in the same directory. When `end` is `Some`, every yielded location must sort
+  strictly before it.
 
 - **`copy_atomic`**: Must fail with `KernelError::FileAlreadyExists` if the destination exists.
   This is used for commit publishing in catalog-managed tables.

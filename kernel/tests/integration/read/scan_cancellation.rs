@@ -328,18 +328,23 @@ struct CancelOnListHandler {
 }
 
 impl StorageHandler for CancelOnListHandler {
-    fn list_from(&self, path: &url::Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
-        self.inner.list_from(path)
+    fn list_from(
+        &self,
+        path: &url::Url,
+        end: Option<&url::Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        self.inner.list_from(path, end)
     }
 
     fn list_from_with_cancellation(
         &self,
         path: &url::Url,
+        end: Option<&url::Url>,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         self.token.cancel();
         self.inner
-            .list_from_with_cancellation(path, cancellation_token)
+            .list_from_with_cancellation(path, end, cancellation_token)
     }
 
     fn read_files(

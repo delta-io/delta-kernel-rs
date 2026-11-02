@@ -443,7 +443,11 @@ fn test_list_from_should_sort_and_filter(
     let storage = engine.storage_handler();
 
     let test_url = base_url.join(expected_names[0].as_ref()).unwrap();
-    let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
+    let files: Vec<_> = storage
+        .list_from(&test_url, None)
+        .unwrap()
+        .try_collect()
+        .unwrap();
     assert_eq!(files.len(), expected_names.len() - 1);
     for (file, expected) in files.iter().zip(expected_names.iter().skip(1)) {
         assert_eq!(file.location, base_url.join(expected.as_ref()).unwrap());
@@ -452,11 +456,19 @@ fn test_list_from_should_sort_and_filter(
     let test_url = base_url
         .join(delta_path_for_version(0, "json").as_ref())
         .unwrap();
-    let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
+    let files: Vec<_> = storage
+        .list_from(&test_url, None)
+        .unwrap()
+        .try_collect()
+        .unwrap();
     assert_eq!(files.len(), expected_names.len());
 
     let test_url = base_url.join("_delta_log/").unwrap();
-    let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
+    let files: Vec<_> = storage
+        .list_from(&test_url, None)
+        .unwrap()
+        .try_collect()
+        .unwrap();
     assert_eq!(files.len(), expected_names.len());
     for (file, expected) in files.iter().zip(expected_names.iter()) {
         assert_eq!(file.location, base_url.join(expected.as_ref()).unwrap());

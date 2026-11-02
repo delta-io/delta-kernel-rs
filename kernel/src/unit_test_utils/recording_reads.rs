@@ -99,8 +99,8 @@ macro_rules! plain_reads {
 
 impl StorageHandler for RecordingReads {
     plain_reads! {
-        /// Records an unscoped listing request.
-        fn list_from, list_from_with_cancellation(path: &Url)
+        /// Records a listing request.
+        fn list_from, list_from_with_cancellation(path: &Url, end: Option<&Url>)
             -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
 
         /// Records an unscoped byte-range read.
@@ -111,12 +111,13 @@ impl StorageHandler for RecordingReads {
     fn list_from_with_cancellation(
         &self,
         path: &Url,
+        end: Option<&Url>,
         token: Option<CancellationTokenRef>,
     ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         self.record(Read::List, &token)?;
         self.inner
             .storage_handler()
-            .list_from_with_cancellation(path, token)
+            .list_from_with_cancellation(path, end, token)
     }
 
     fn read_files_with_cancellation(

@@ -576,7 +576,17 @@ pub trait StorageHandler: AsAny {
     ///   contains all files at or below that directory.
     /// - Otherwise, the parent is the directory containing `path`, and only files (at any depth
     ///   under that parent) whose full path sorts strictly greater than `path` are returned.
-    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
+    ///
+    /// When `end` is present, every yielded location must sort strictly before it. Stream errors
+    /// are preserved and are not a stop signal.
+    ///
+    /// `path` and `end` are compared as URL strings (`Url::as_str`), so callers must pass bounds
+    /// that share the same serialization as listed locations.
+    fn list_from(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
 
     /// Cancellation-aware variant of [`list_from`].
     ///
@@ -589,10 +599,11 @@ pub trait StorageHandler: AsAny {
     fn list_from_with_cancellation(
         &self,
         path: &Url,
+        end: Option<&Url>,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         check_cancelled(cancellation_token.as_ref())?;
-        let iter = self.list_from(path)?;
+        let iter = self.list_from(path, end)?;
         Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
     }
 
@@ -640,6 +651,20 @@ pub trait StorageHandler: AsAny {
     /// This operation is idempotent: deleting a path that does not exist should return `Ok(())`.
     /// For any other error, this must propagate the corresponding error.
     fn delete(&self, path: &Url) -> KernelResult<()>;
+}
+
+/// Whether a listing item should be yielded given an exclusive URL upper bound.
+///
+/// Errors are never a stop signal. When `end` is `Some`, an `Ok` item is kept only if its
+/// location sorts strictly before `end`. Engines that list and then filter can use this as the
+/// `take_while` / `filter` predicate when implementing [`StorageHandler::list_from`].
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+#[delta_kernel_derive::internal_api]
+pub(crate) fn keep_listing(item: &KernelResult<FileMeta>, end: Option<&Url>) -> bool {
+    match item {
+        Ok(meta) => end.is_none_or(|end| &meta.location < end),
+        Err(_) => true,
+    }
 }
 
 /// Provides JSON handling functionality to Delta Kernel.

@@ -63,12 +63,12 @@ fn start_read(
     let schema = LOG_METADATA_SCHEMA.clone();
     match (read, api) {
         (Read::List, ReadApi::Default) => {
-            discard_read_values(engine.storage_handler().list_from(&path))
+            discard_read_values(engine.storage_handler().list_from(&path, None))
         }
         (Read::List, ReadApi::WithCancellation) => discard_read_values(
             engine
                 .storage_handler()
-                .list_from_with_cancellation(&path, token),
+                .list_from_with_cancellation(&path, None, token),
         ),
         (Read::Hint | Read::Crc, ReadApi::Default) => discard_read_values(
             engine
@@ -381,7 +381,8 @@ struct RecordingCopy {
 
 impl StorageHandler for RecordingCopy {
     forward_methods! {
-        fn list_from(path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
+        fn list_from(path: &Url, end: Option<&Url>)
+            -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
         fn read_files(files: Vec<FileSlice>) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>>;
         fn put(path: &Url, data: Bytes, overwrite: bool) -> KernelResult<()>;
         fn head(path: &Url) -> KernelResult<FileMeta>;

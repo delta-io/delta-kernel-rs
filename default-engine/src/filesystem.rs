@@ -4,9 +4,10 @@ use bytes::Bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
 use delta_kernel::{
-    CancellationTokenRef, FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator,
-    StorageHandler,
+    keep_listing, CancellationTokenRef, FileMeta, FileSlice, KernelError, KernelResult,
+    KernelResultIterator, StorageHandler,
 };
+use futures::future::ready;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use url::Url;
@@ -35,6 +36,19 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
         self.readahead = readahead;
         self
     }
+
+    fn list_from_iter(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        super::stream_future_to_cancellable_iter(
+            self.task_executor.clone(),
+            list_from_impl(self.inner.clone(), path.clone(), end.cloned()),
+            cancellation_token,
+        )
+    }
 }
 
 /// Native async implementation for list_from.
@@ -43,10 +57,15 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
 /// handler (e.g. inside `DefaultEngine`'s `storage_handler()`), so this function just
 /// returns the raw stream.
 ///
+/// When `end` is set, ordered stores apply the exclusive bound on the object_store stream so
+/// later pages are not fetched. Unordered stores still walk the prefix, but drop entries at or
+/// after `end` before sorting.
+///
 /// [`MeteredStorageHandler`]: delta_kernel::metrics::MeteredStorageHandler
 async fn list_from_impl(
     store: Arc<DynObjectStore>,
     path: Url,
+    end: Option<Url>,
 ) -> KernelResult<BoxStream<'static, KernelResult<FileMeta>>> {
     // The offset is used for list-after; the prefix is used to restrict the listing to a specific
     // directory. Unfortunately, `Path` provides no easy way to check whether a name is
@@ -81,15 +100,16 @@ async fn list_from_impl(
         });
 
     if !has_ordered_listing {
-        // Local filesystem doesn't return sorted list - need to collect and sort
-        let mut items: Vec<_> = stream.try_collect().await?;
+        // Local filesystem doesn't return a sorted list. Drop entries at or after `end` before
+        // sorting so protocol subdirs (e.g. `_staged_commits/`) are not part of the sort.
+        let mut items: Vec<_> = stream
+            .filter(move |item| ready(keep_listing(item, end.as_ref())))
+            .try_collect()
+            .await?;
         items.sort_unstable();
-        Ok(Box::pin(stream::iter(
-            items
-                .into_iter()
-                .map(Ok::<FileMeta, delta_kernel::KernelError>),
-        )))
+        Ok(Box::pin(stream::iter(items.into_iter().map(Ok))))
     } else {
+        let stream = stream.take_while(move |item| ready(keep_listing(item, end.as_ref())));
         Ok(Box::pin(stream))
     }
 }
@@ -194,22 +214,21 @@ async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> KernelResult<FileMet
 }
 
 impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
-    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
-        self.list_from_with_cancellation(path, None)
+    fn list_from(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        self.list_from_iter(path, end, None)
     }
 
     fn list_from_with_cancellation(
         &self,
         path: &Url,
+        end: Option<&Url>,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
-        let future = list_from_impl(self.inner.clone(), path.clone());
-        let iter = super::stream_future_to_cancellable_iter(
-            self.task_executor.clone(),
-            future,
-            cancellation_token,
-        )?;
-        Ok(iter)
+        self.list_from_iter(path, end, cancellation_token)
     }
 
     /// Read data specified by the start and end offset from the file.
@@ -421,7 +440,10 @@ mod tests {
         let engine = DefaultEngineBuilder::new(store).build();
         let files: Vec<_> = engine
             .storage_handler()
-            .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap())
+            .list_from(
+                &table_root.join("_delta_log").unwrap().join("0").unwrap(),
+                None,
+            )
             .unwrap()
             .try_collect()
             .unwrap();
@@ -451,7 +473,7 @@ mod tests {
         let engine = DefaultEngineBuilder::new(store).build();
         let files = engine
             .storage_handler()
-            .list_from(&url.join("_delta_log").unwrap().join("0").unwrap())
+            .list_from(&url.join("_delta_log").unwrap().join("0").unwrap(), None)
             .unwrap();
         let mut len = 0;
         for (file, expected) in files.zip(expected_names.iter()) {
@@ -615,7 +637,7 @@ mod tests {
         let url = Url::from_directory_path(tempdir.path()).unwrap();
         let token: CancellationTokenRef = Arc::new(test_utils::TestCancellationToken::cancelled());
 
-        let listed = handler.list_from_with_cancellation(&url, Some(token.clone()));
+        let listed = handler.list_from_with_cancellation(&url, None, Some(token.clone()));
         assert!(matches!(listed, Err(KernelError::Cancelled)));
 
         let read = handler.read_files_with_cancellation(vec![(url, None)], Some(token));

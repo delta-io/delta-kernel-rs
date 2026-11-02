@@ -44,9 +44,13 @@ impl std::fmt::Debug for MeteredStorageHandler {
 }
 
 impl StorageHandler for MeteredStorageHandler {
-    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+    fn list_from(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         let start = Instant::now();
-        let inner = self.inner.list_from(path)?;
+        let inner = self.inner.list_from(path, end)?;
         Ok(Box::new(MetricsIterator::<_, FileMeta>::new(
             inner,
             StorageListCompleted::NAME,
@@ -58,12 +62,13 @@ impl StorageHandler for MeteredStorageHandler {
     fn list_from_with_cancellation(
         &self,
         path: &Url,
+        end: Option<&Url>,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         let start = Instant::now();
         let inner = self
             .inner
-            .list_from_with_cancellation(path, cancellation_token)?;
+            .list_from_with_cancellation(path, end, cancellation_token)?;
         Ok(Box::new(MetricsIterator::<_, FileMeta>::new(
             inner,
             StorageListCompleted::NAME,
@@ -136,7 +141,11 @@ mod tests {
     }
 
     impl StorageHandler for StubStorageHandler {
-        fn list_from(&self, _path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        fn list_from(
+            &self,
+            _path: &Url,
+            _end: Option<&Url>,
+        ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
             let results: Vec<_> = self.list_results.iter().cloned().map(Ok).collect();
             Ok(Box::new(results.into_iter()))
         }
@@ -196,7 +205,7 @@ mod tests {
         });
         let storage = MeteredStorageHandler::new(inner);
 
-        let iter = storage.list_from(&fake_url()).unwrap();
+        let iter = storage.list_from(&fake_url(), None).unwrap();
         let _: Vec<_> = iter.collect();
 
         let events = reporter.events();
@@ -269,13 +278,18 @@ mod tests {
     }
 
     impl StorageHandler for TokenCapturingStorageHandler {
-        fn list_from(&self, _path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        fn list_from(
+            &self,
+            _path: &Url,
+            _end: Option<&Url>,
+        ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
             Ok(Box::new(std::iter::empty()))
         }
 
         fn list_from_with_cancellation(
             &self,
             _path: &Url,
+            _end: Option<&Url>,
             cancellation_token: Option<CancellationTokenRef>,
         ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
             *self.seen.lock().unwrap() = cancellation_token;
@@ -328,7 +342,7 @@ mod tests {
 
         if list {
             let iter = storage
-                .list_from_with_cancellation(&fake_url(), Some(token.clone()))
+                .list_from_with_cancellation(&fake_url(), None, Some(token.clone()))
                 .unwrap();
             let _: Vec<_> = iter.collect();
         } else {
@@ -361,7 +375,7 @@ mod tests {
         let storage = MeteredStorageHandler::new(inner);
 
         let _: Vec<_> = storage
-            .list_from_with_cancellation(&fake_url(), None)
+            .list_from_with_cancellation(&fake_url(), None, None)
             .unwrap()
             .collect();
         let _: Vec<_> = storage

@@ -20,9 +20,7 @@ use url::Url;
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
-use crate::path::{
-    may_begin_listable_log_path, CheckpointInstance, LogPathFileType, ParsedLogPath,
-};
+use crate::path::{CheckpointInstance, LogPathFileType, ParsedLogPath};
 use crate::{KernelError, KernelResult, KernelResultIterator, StorageHandler, Version};
 
 #[cfg(test)]
@@ -56,9 +54,9 @@ pub(crate) struct LogSegmentFiles {
 }
 
 /// Returns a lazy iterator of [`ParsedLogPath`]s from the filesystem over versions
-/// `[start_version, end_version]`. The iterator handles parsing, filtering out non-listable
-/// files (e.g. dot-prefixed files), and stopping at `end_version`. It stops consuming the
-/// underlying listing at the first path past the version-named region, so directories like
+/// `[start_version, end_version]`. The iterator handles parsing and filtering out non-listable
+/// files (e.g. dot-prefixed files). The version window and the end of the version-named region
+/// are encoded as a [`StorageHandler::list_from`] URL range, so directories like
 /// `_staged_commits/` and `_sidecars/` are never paged through.
 ///
 /// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
@@ -75,22 +73,9 @@ pub(crate) fn list_delta_log_from_storage(
     end_version: Version,
 ) -> KernelResult<impl KernelResultIterator<ParsedLogPath>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
-    let log_root_str = log_root.to_string();
+    let end_at = delta_log_listing_end(log_root, end_version)?;
     let files = storage
-        .list_from(&start_from)?
-        // The listing is sorted by full path, so nothing relevant follows the first relative path
-        // past the version-named region (see `may_begin_listable_log_path`). Stopping there avoids
-        // paging through `_staged_commits/` and `_sidecars/`, which can hold thousands of files.
-        // A path that doesn't strip the log_root prefix is kept; parsing discards it.
-        // TODO(#2740): push the bound into the listing request itself.
-        .take_while(move |meta_res| match meta_res {
-            Ok(meta) => meta
-                .location
-                .as_str()
-                .strip_prefix(&log_root_str)
-                .is_none_or(may_begin_listable_log_path),
-            Err(_) => true,
-        })
+        .list_from(&start_from, Some(&end_at))?
         .map_ok(ParsedLogPath::new)
         // NOTE: this filters out .crc files etc which start with "." - some engines
         // produce `.something.parquet.crc` corresponding to `something.parquet`. Kernel
@@ -98,13 +83,24 @@ pub(crate) fn list_delta_log_from_storage(
         // normal `version.crc` files which are listed + captured normally. Additionally
         // we likely aren't even 'seeing' these files since lexicographically the string
         // "." comes before the string "0".
-        .filter_map_ok(|path_opt| path_opt.filter(|p| p.should_list()))
-        .take_while(move |path_res| match path_res {
-            // discard any path with too-large version; keep errors
-            Ok(path) => path.version <= end_version,
-            Err(_) => true,
-        });
+        .filter_map_ok(|path_opt| path_opt.filter(|p| p.should_list()));
     Ok(files)
+}
+
+/// Exclusive listing URL just past the version-named files that can belong to
+/// `[start_version, end_version]`.
+///
+/// When `end_version` is unbounded, `':'` is the UTF-8 successor of `'9'`. Version-named log
+/// files start with a digit, so this bound stops after that region without putting protocol
+/// directory names into [`StorageHandler`]. A finite `end_version` uses the zero-padded
+/// `end_version + 1` path with no extension: `{end:020}.json` sorts before `{end+1:020}`, and
+/// `{end+1:020}.json` sorts after it.
+fn delta_log_listing_end(log_root: &Url, end_version: Version) -> KernelResult<Url> {
+    if end_version == Version::MAX {
+        Ok(log_root.join(":")?)
+    } else {
+        Ok(log_root.join(&format!("{:020}", end_version + 1))?)
+    }
 }
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.
