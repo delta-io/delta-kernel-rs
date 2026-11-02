@@ -3,13 +3,23 @@
 #include <stdbool.h>
 #include <delta_kernel_ffi.h>
 
-// This is how we represent our errors. The kernel will ask us to contruct this struct whenever it
-// enounters an error, and then return the contructed EngineError to us
-typedef struct Error
-{
-  struct EngineError etype;
+// Error objects belong to the connector; Kernel only returns their pointers.
+typedef struct ErrorParameter {
+  char* key;
+  char* value;
+} ErrorParameter;
+
+typedef struct Error {
+  bool is_delta;
+  FFIKernelError code;
+  char* condition;
+  char* sql_state;
+  ErrorParameter* parameters;
+  size_t parameter_count;
   char* msg;
 } Error;
+
+extern const ErrorAllocators error_allocators;
 
 void print_diag(char* fmt, ...);
 // Print out an error message, plus the code and kernel message of an error
@@ -18,9 +28,6 @@ void print_error(const char* msg, Error* err);
 void free_error(Error* error);
 // create a char* from a KernelStringSlice
 void* allocate_string(const KernelStringSlice slice);
-// kernel will call this to allocate our errors. This can be used to create an "engine native" type
-// error
-EngineError* allocate_error(FFIKernelError etype, const KernelStringSlice msg);
 // utility function to convert key/val into slices and set them on a builder
 // returns false on failure
 bool set_builder_opt(HandleExclusiveEngineBuilder* engine_builder, char* key, char* val);

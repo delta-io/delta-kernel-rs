@@ -212,6 +212,9 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
 ///
 /// # Safety
 ///
+/// `error_fn` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 ///  Caller is responsible for passing a valid pointer to a SharedFfiUCCommitClient, obtained via
 ///  calling [`get_uc_commit_client`], valid KernelStringSlices for `table_id`, `catalog`,
 ///  `schema`, and `table_name`, and a valid error function pointer.

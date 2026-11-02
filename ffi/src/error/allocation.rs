@@ -1,8 +1,8 @@
 //! Callbacks for converting Kernel and Delta errors into connector-owned error objects.
 //!
 //! The connector supplies an allocation callback for each error kind and a context pointer.
-//! Existing FFI entry points use the allocator defined in the parent module; this module provides
-//! the structured error information and callbacks independently of engine registration.
+//! Engine constructors copy the callback table into the engine. Standalone calls borrow a table
+//! for the duration of the call. The connector keeps callback code and context alive for every use.
 
 use std::ffi::c_void;
 
@@ -44,6 +44,7 @@ pub struct DeltaErrorInfo {
 /// and context must remain valid whenever they are called. If shared across threads, callbacks
 /// must support concurrent calls and synchronize access to their context as needed.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct ErrorAllocators {
     /// Connector state passed unchanged as the first argument to each callback. May be NULL.
     pub context: *mut c_void,
@@ -69,6 +70,11 @@ pub struct ErrorAllocators {
     pub allocate_delta_error:
         unsafe extern "C" fn(*mut c_void, *const DeltaErrorInfo) -> *mut c_void,
 }
+
+// SAFETY: Moving or sharing the table does not access its context. Calling either callback is
+// unsafe and requires the caller to uphold the context's lifetime and concurrency requirements.
+unsafe impl Send for ErrorAllocators {}
+unsafe impl Sync for ErrorAllocators {}
 
 impl ErrorAllocators {
     /// Calls the Kernel callback for `error` and returns its pointer unchanged, including NULL.
@@ -127,13 +133,16 @@ impl ErrorAllocators {
 #[cfg(test)]
 mod tests {
     use std::ffi::c_void;
+    use std::sync::Arc;
 
-    use delta_kernel::{DeltaError, DeltaErrorCondition, Error, KernelError};
+    use delta_kernel::{DeltaError, DeltaErrorCondition, Engine, Error, KernelError};
     use rstest::rstest;
 
     use super::{DeltaErrorInfo, ErrorAllocators, KernelErrorInfo};
-    use crate::error::{ExternResult, IntoExternResult};
-    use crate::OptionalValue;
+    use crate::error::{AllocateError, ExternResult, IntoExternResult};
+    use crate::{
+        allocate_kernel_string, kernel_string_slice, ExternEngine, KernelStringSlice, OptionalValue,
+    };
 
     #[derive(Default)]
     struct Capture {
@@ -197,12 +206,27 @@ mod tests {
         unsafe { capture(context, fields) }
     }
 
+    struct AllocationOnlyEngine {
+        allocators: ErrorAllocators,
+    }
+
+    impl ExternEngine for AllocationOnlyEngine {
+        fn engine(&self) -> Arc<dyn Engine> {
+            panic!("error conversion does not access the engine")
+        }
+
+        fn error_allocator(&self) -> &dyn AllocateError {
+            &self.allocators
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum EntryPoint {
         Direct,
         Kernel,
         KernelResult,
         Result,
+        EngineResult,
     }
 
     #[rstest]
@@ -212,6 +236,9 @@ mod tests {
     #[case::result_kernel(None, EntryPoint::Result)]
     #[case::result_delta(Some(false), EntryPoint::Result)]
     #[case::result_delta_with_kernel_source(Some(true), EntryPoint::Result)]
+    #[case::engine_result_kernel(None, EntryPoint::EngineResult)]
+    #[case::engine_result_delta(Some(false), EntryPoint::EngineResult)]
+    #[case::engine_result_delta_with_kernel_source(Some(true), EntryPoint::EngineResult)]
     #[case::delta(Some(false), EntryPoint::Direct)]
     #[case::delta_with_kernel_source(Some(true), EntryPoint::Direct)]
     fn dispatch_copies_diagnostics_and_preserves_callback_pointer(
@@ -275,6 +302,11 @@ mod tests {
                 let result: delta_kernel::Result<()> = Err(error);
                 unsafe { result.into_extern_result(&allocators) }
             }
+            (EntryPoint::EngineResult, error) => {
+                let engine = AllocationOnlyEngine { allocators };
+                let result: delta_kernel::Result<()> = Err(error);
+                unsafe { result.into_extern_result(&&engine) }
+            }
             (EntryPoint::Direct, error) => {
                 ExternResult::Err(unsafe { allocators.allocate_error(error) })
             }
@@ -304,5 +336,63 @@ mod tests {
         };
         assert!(matches!(result, ExternResult::Ok(7)));
         assert_eq!(output.calls, 0);
+    }
+    #[test]
+    fn standalone_export_forwards_context_and_returns_callback_pointer() {
+        let mut output = Capture::default();
+        let context = std::ptr::from_mut(&mut output).cast();
+        let allocators = ErrorAllocators {
+            context,
+            allocate_kernel_error: kernel,
+            allocate_delta_error: delta,
+        };
+        let bytes = [0xff];
+        let invalid_utf8 = KernelStringSlice {
+            ptr: bytes.as_ptr().cast(),
+            len: bytes.len(),
+        };
+        let result = unsafe { allocate_kernel_string(invalid_utf8, &allocators) };
+        let ExternResult::Err(pointer) = result else {
+            panic!("expected invalid UTF-8 error")
+        };
+        assert_eq!(pointer, context);
+        assert_eq!(output.calls, 1);
+        assert_eq!(output.fields[0], ("code".into(), "Utf8Error".into()));
+    }
+
+    #[cfg(feature = "default-engine-base")]
+    #[test]
+    fn builder_retains_callback_table_after_registration_returns() {
+        let mut output = Capture::default();
+        let context = std::ptr::from_mut(&mut output).cast();
+        let path = "file:///tmp/";
+        let value = "value";
+        let builder = {
+            let allocators = ErrorAllocators {
+                context,
+                allocate_kernel_error: kernel,
+                allocate_delta_error: delta,
+            };
+            let result =
+                unsafe { crate::get_engine_builder(kernel_string_slice!(path), &allocators) };
+            let ExternResult::Ok(builder) = result else {
+                panic!("expected a builder")
+            };
+            builder
+        };
+        let bytes = [0xff];
+        let invalid_utf8 = KernelStringSlice {
+            ptr: bytes.as_ptr().cast(),
+            len: bytes.len(),
+        };
+        let result = unsafe {
+            crate::builder_with_option(builder, invalid_utf8, kernel_string_slice!(value))
+        };
+        let ExternResult::Err(pointer) = result else {
+            panic!("expected invalid UTF-8 error")
+        };
+        assert_eq!(pointer, context);
+        assert_eq!(output.calls, 1);
+        assert_eq!(output.fields[0], ("code".into(), "Utf8Error".into()));
     }
 }

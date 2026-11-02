@@ -152,9 +152,12 @@ pub unsafe extern "C" fn free_arrow_ffi_data(result: *mut ArrowFFIData) {
 /// ownership of the schema stays the engine's.
 ///
 /// # Safety
+///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
 /// - `array` must be a valid FFI_ArrowArray
 /// - `schema` must be a valid pointer to a FFI_ArrowSchema
-/// - `allocate_error` must be a valid error allocation function
+/// - `allocate_error` must satisfy the callback table requirements above
 #[cfg(feature = "default-engine-base")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_engine_data(

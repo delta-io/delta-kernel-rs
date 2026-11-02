@@ -78,6 +78,9 @@ pub struct EngineMetadata {
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller must pass the active map supplied to `EngineMetadata::visitor`, valid key and value data
 /// for the call duration, a valid `kind` discriminant, and a valid error allocator. The state must
 /// not be aliased or retained beyond the callback.
@@ -193,8 +196,11 @@ fn visit_field_primitive_impl(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// and `allocate_error` callback table. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_string(
@@ -215,8 +221,11 @@ pub unsafe extern "C" fn visit_field_string(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// and `allocate_error` callback table. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_long(
@@ -237,8 +246,11 @@ pub unsafe extern "C" fn visit_field_long(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// and `allocate_error` callback table. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_integer(
@@ -259,8 +271,11 @@ pub unsafe extern "C" fn visit_field_integer(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// and `allocate_error` callback table. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_short(
@@ -281,8 +296,11 @@ pub unsafe extern "C" fn visit_field_short(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// and `allocate_error` callback table. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_byte(
@@ -303,8 +321,11 @@ pub unsafe extern "C" fn visit_field_byte(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// and `allocate_error` callback table. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_float(
@@ -325,8 +346,11 @@ pub unsafe extern "C" fn visit_field_float(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// and `allocate_error` callback table. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_double(
@@ -347,8 +371,11 @@ pub unsafe extern "C" fn visit_field_double(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// and `allocate_error` callback table. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_boolean(
@@ -369,8 +396,11 @@ pub unsafe extern "C" fn visit_field_boolean(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// and `allocate_error` callback table. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_binary(
@@ -391,8 +421,11 @@ pub unsafe extern "C" fn visit_field_binary(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// and `allocate_error` callback table. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_date(
@@ -413,8 +446,11 @@ pub unsafe extern "C" fn visit_field_date(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// and `allocate_error` callback table. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_timestamp(
@@ -440,8 +476,11 @@ pub unsafe extern "C" fn visit_field_timestamp(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// and `allocate_error` callback table. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_timestamp_ntz(
@@ -467,8 +506,11 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// and `allocate_error` callback table. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_interval_year_month(
@@ -494,8 +536,11 @@ pub unsafe extern "C" fn visit_field_interval_year_month(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// and `allocate_error` callback table. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_interval_day_time(
@@ -521,8 +566,11 @@ pub unsafe extern "C" fn visit_field_interval_day_time(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// and `allocate_error` callback table. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_void(
@@ -546,8 +594,11 @@ pub unsafe extern "C" fn visit_field_void(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, valid `name` and `crs` slices, and
-/// `allocate_error` function pointer, all valid for the duration of this call. When non-null,
+/// `allocate_error` callback table, all valid for the duration of this call. When non-null,
 /// `metadata` must point to a valid descriptor and callback.
 #[cfg(feature = "geo-type-in-dev")]
 #[unsafe(no_mangle)]
@@ -592,8 +643,11 @@ fn visit_field_geometry_impl(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, valid `name`, `crs`, and `algorithm`
-/// slices, and `allocate_error` function pointer, all valid for the duration of this call. When
+/// slices, and `allocate_error` callback table, all valid for the duration of this call. When
 /// non-null, `metadata` must point to a valid descriptor and callback.
 #[cfg(feature = "geo-type-in-dev")]
 #[unsafe(no_mangle)]
@@ -645,8 +699,11 @@ fn visit_field_geography_impl(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer. When non-null, `metadata` must point to a valid
+/// and `allocate_error` callback table. When non-null, `metadata` must point to a valid
 /// descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_decimal(
@@ -699,8 +756,11 @@ fn visit_field_decimal_impl(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing valid `state`, `name` slice, `field_ids` array pointing
-/// to valid field IDs previously returned by this visitor, and `allocate_error` function pointer.
+/// to valid field IDs previously returned by this visitor, and `allocate_error` callback table.
 /// When non-null, `metadata` must point to a valid descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_struct(
@@ -759,8 +819,11 @@ fn visit_field_struct_impl(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing valid `state`, `name` slice, `element_type_id` from
-/// a previous field visitor call, and `allocate_error` function pointer. When non-null, `metadata`
+/// a previous field visitor call, and `allocate_error` callback table. When non-null, `metadata`
 /// must point to a valid descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_array(
@@ -806,8 +869,11 @@ fn visit_field_array_impl(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for providing valid `state`, `name` slice, `key_type_id` and
-/// `value_type_id` from previous field visitor calls, and `allocate_error` function pointer. When
+/// `value_type_id` from previous field visitor calls, and `allocate_error` callback table. When
 /// non-null, `metadata` must point to a valid descriptor and callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_field_map(
@@ -875,6 +941,9 @@ fn visit_field_map_impl(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// `state` must be valid and exclusively borrowed. String slices must reference readable memory for
 /// their lengths. `annotation.ptr` must reference `annotation.len` initialized, aligned entries, or
 /// may be null when the length is zero. Optional values must have valid discriminants. All inputs
@@ -920,6 +989,9 @@ pub unsafe extern "C" fn visit_field_user_defined(
 /// previous `visit_field_struct` call.
 ///
 /// # Safety
+///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
 ///
 /// Caller must ensure:
 /// - All base parameters are valid as per visit_field_string
@@ -977,7 +1049,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::error::{EngineError, FFIKernelError};
+    use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
         allocate_err, assert_extern_result_error_contains, assert_extern_result_error_with_message,
         ok_or_panic,
@@ -2786,13 +2858,11 @@ mod tests {
         // Error allocator for tests that panics when invoked. It is used in tests where we don't
         // expect errors.
         #[unsafe(no_mangle)]
-        extern "C" fn ensure_map_err(
-            _etype: FFIKernelError,
-            msg: crate::KernelStringSlice,
-        ) -> *mut EngineError {
-            let msg = unsafe {
-                std::str::from_utf8_unchecked(std::slice::from_raw_parts(msg.ptr.cast(), msg.len))
-            };
+        unsafe extern "C" fn ensure_map_err(
+            _: *mut std::ffi::c_void,
+            info: *const crate::error::allocation::KernelErrorInfo,
+        ) -> *mut std::ffi::c_void {
+            let msg = unsafe { (*info).message.try_to_string().unwrap() };
             assert_eq!(
                 msg,
                 "Generic delta kernel error: Delta Map keys may not be nullable"
@@ -2811,7 +2881,10 @@ mod tests {
                 vf,
                 false,
                 null(),
-                ensure_map_err,
+                &ErrorAllocators {
+                    allocate_kernel_error: ensure_map_err,
+                    ..ERROR_ALLOCATORS
+                },
             )
         };
         assert!(res.is_err());

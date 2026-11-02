@@ -474,6 +474,9 @@ pub struct ExclusiveRustString;
 ///
 /// # Safety
 ///
+/// `error_fn` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller is responsible for passing a valid KernelStringSlice
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn allocate_kernel_string(
@@ -769,25 +772,6 @@ impl Drop for ExternEngineVtable {
     }
 }
 
-/// # Safety
-///
-/// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
-/// responsible for handling  any races that could result.
-#[cfg(feature = "default-engine-base")]
-unsafe impl Send for ExternEngineVtable {}
-
-/// # Safety
-///
-/// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
-/// responsible for handling any races that could result.
-///
-/// These are needed because anything wrapped in Arc "should" implement it
-/// Basically, by failing to implement these traits, we forbid the engine from being able to declare
-/// its thread-safety (because rust assumes it is not threadsafe). By implementing them, we leave it
-/// up to the engine to enforce thread safety if engine chooses to use threads at all.
-#[cfg(feature = "default-engine-base")]
-unsafe impl Sync for ExternEngineVtable {}
-
 #[cfg(feature = "default-engine-base")]
 impl ExternEngine for ExternEngineVtable {
     fn engine(&self) -> Arc<dyn Engine> {
@@ -874,6 +858,9 @@ pub struct ExclusiveEngineBuilder;
 /// [`builder_build`] or [`free_engine_builder`].
 ///
 /// # Safety
+///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
 /// Caller is responsible for passing a valid path pointer.
 #[cfg(feature = "default-engine-base")]
 #[unsafe(no_mangle)]
@@ -1088,6 +1075,9 @@ pub unsafe extern "C" fn builder_build(
 }
 
 /// # Safety
+///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
 ///
 /// Caller is responsible for passing a valid path pointer.
 #[cfg(feature = "default-engine-base")]
@@ -2296,15 +2286,17 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::error::{EngineError, FFIKernelError};
+    use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
         allocate_err, allocate_str, assert_extern_result_error_contains,
         assert_extern_result_error_with_message, build_snapshot, ok_or_panic, recover_string,
         setup_snapshot,
     };
 
-    #[unsafe(no_mangle)]
-    extern "C" fn allocate_null_err(_: FFIKernelError, _: KernelStringSlice) -> *mut EngineError {
+    unsafe extern "C" fn allocate_null_err(
+        _: *mut std::ffi::c_void,
+        _: *const crate::error::allocation::KernelErrorInfo,
+    ) -> *mut std::ffi::c_void {
         std::ptr::null_mut()
     }
 
@@ -2508,7 +2500,7 @@ mod tests {
 
     pub(crate) fn get_default_engine(path: &str) -> Handle<SharedExternEngine> {
         let path = kernel_string_slice!(path);
-        let builder = unsafe { ok_or_panic(get_engine_builder(path, allocate_err)) };
+        let builder = unsafe { ok_or_panic(get_engine_builder(path, &ERROR_ALLOCATORS)) };
         unsafe { ok_or_panic(builder_build(builder)) }
     }
 
@@ -3633,7 +3625,13 @@ mod tests {
         )
         .await?;
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_null_err);
+        let engine = engine_to_handle(
+            Arc::new(engine),
+            ErrorAllocators {
+                allocate_kernel_error: allocate_null_err,
+                ..ERROR_ALLOCATORS
+            },
+        );
 
         // Get a non-existent snapshot, this will call allocate_null_err
         let snapshot_at_non_existent_version = unsafe {

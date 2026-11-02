@@ -142,7 +142,7 @@ pub struct CAuthHeaders {
 ///
 /// The kernel invokes this when it needs fresh headers. For each entry in `headers[0..count]`,
 /// set `name` and `value` via [`allocate_kernel_string`](crate::allocate_kernel_string) using the
-/// supplied `allocate_error` callback (the same allocator the engine registered on
+/// supplied `allocate_error` callback table (the same allocator the engine registered on
 /// [`get_engine_builder`](crate::get_engine_builder)). Set `ttl_ms` to report how long those
 /// headers stay valid. With a non-zero TTL the kernel caches them and re-invokes near expiry; with
 /// `ttl_ms = 0` it invokes the callback on every request.
@@ -151,9 +151,13 @@ pub struct CAuthHeaders {
 /// [`builder_with_rest_object_store`](crate::builder_with_rest_object_store). `allocate_error` is
 /// forwarded on each invocation so the callback can pass it to
 /// [`allocate_kernel_string`](crate::allocate_kernel_string) without the engine having to stash it
-/// separately.
-pub type CAuthHeaderCallback =
-    extern "C" fn(context: NullableCvoid, out: *mut CAuthHeaders, allocate_error: AllocateErrorFn);
+/// separately. The table pointer is valid only until this callback returns; copy the table if it
+/// must be retained.
+pub type CAuthHeaderCallback = extern "C" fn(
+    context: NullableCvoid,
+    out: *mut CAuthHeaders,
+    allocate_error: *const ErrorAllocators,
+);
 
 /// State for [`crate::ObjectStoreBackend::Rest`], stored on
 /// [`FfiEngineBuilder`](crate::FfiEngineBuilder)

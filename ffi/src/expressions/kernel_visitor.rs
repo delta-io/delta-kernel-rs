@@ -228,6 +228,9 @@ pub extern "C" fn visit_expression_unknown(
 /// Returns an error for zero parts, empty parts, or invalid UTF-8.
 ///
 /// # Safety
+///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
 /// If `parts_len > 0`, `parts` must point to `parts_len` valid [`KernelStringSlice`] values.
 /// Every slice must remain valid for this call. The field parts are copied before returning.
 #[unsafe(no_mangle)]
@@ -286,6 +289,9 @@ pub extern "C" fn visit_predicate_is_null(
 }
 
 /// # Safety
+///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
 /// The string slice must be valid
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_expression_literal_string(
@@ -424,8 +430,12 @@ pub unsafe extern "C" fn visit_expression_literal_binary(
 /// visit a decimal literal expression
 ///
 /// Returns an error if the precision/scale combination is invalid.
+/// # Safety
+///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context
+/// and callbacks must remain valid for the call and support concurrency when shared.
 #[unsafe(no_mangle)]
-pub extern "C" fn visit_expression_literal_decimal(
+pub unsafe extern "C" fn visit_expression_literal_decimal(
     state: &mut KernelExpressionVisitorState,
     value_hi: u64,
     value_lo: u64,
@@ -434,7 +444,6 @@ pub extern "C" fn visit_expression_literal_decimal(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let result = visit_expression_literal_decimal_impl(state, value_hi, value_lo, precision, scale);
-    // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
     unsafe { result.into_extern_result(&allocate_error) }
 }
 
@@ -618,8 +627,12 @@ impl NullTypeTag {
 ///
 /// Returns an error if the type tag is unrecognized, if the tag is `NonPrimitive` (255), or
 /// if the decimal precision/scale is invalid.
+/// # Safety
+///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context
+/// and callbacks must remain valid for the call and support concurrency when shared.
 #[unsafe(no_mangle)]
-pub extern "C" fn visit_expression_literal_null(
+pub unsafe extern "C" fn visit_expression_literal_null(
     state: &mut KernelExpressionVisitorState,
     type_tag: u8,
     precision: u8,
@@ -627,7 +640,6 @@ pub extern "C" fn visit_expression_literal_null(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let result = visit_expression_literal_null_impl(state, type_tag, precision, scale);
-    // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
     unsafe { result.into_extern_result(&allocate_error) }
 }
 
@@ -714,6 +726,9 @@ pub unsafe extern "C" fn visit_expression_map_to_struct(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller must ensure that `engine_expression` points to a valid
 /// `EngineExpression` with a valid visitor function and expression pointer.
 #[unsafe(no_mangle)]
@@ -744,6 +759,9 @@ fn visit_engine_expression_impl(
 /// pattern.
 ///
 /// # Safety
+///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
 ///
 /// Caller must ensure that `engine_predicate` points to a valid
 /// `EnginePredicate` with a valid visitor function and predicate pointer.
@@ -799,6 +817,9 @@ fn resolve_opaque_children<I: IntoIterator<Item = usize>>(
 /// Returns 0 if any child ID is invalid.
 ///
 /// # Safety
+///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
 /// `name` must be valid UTF-8 for the duration of the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_predicate_opaque(
@@ -840,6 +861,9 @@ fn visit_predicate_opaque_impl(
 /// Returns 0 if any child ID is invalid.
 ///
 /// # Safety
+///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
 /// `name` must be valid UTF-8 for the duration of the call; the function
 /// pointers in `callbacks` must remain valid for the lifetime of the built
 /// predicate.

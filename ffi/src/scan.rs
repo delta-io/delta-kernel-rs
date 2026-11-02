@@ -928,6 +928,9 @@ pub unsafe extern "C" fn get_transform_for_row(
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// `dv_info` must be a valid pointer to a [`DvInfo`], borrowed for the duration of this call.
 /// When obtained from the `info` field of [`CDvInfo`], it is valid only during the scan callback.
 /// `allocate_error` must be a valid error allocator and copy any message it retains.
@@ -2290,7 +2293,7 @@ mod tests {
             })
             .unwrap_or_default();
 
-        let result = unsafe { cardinality_from_dv(&dv_info, allocate_err) };
+        let result = unsafe { cardinality_from_dv(&dv_info, &ERROR_ALLOCATORS) };
         match expected {
             Ok(expected) => assert_eq!(ok_or_panic(result), OptionalValue::from(expected)),
             Err(message) => assert_extern_result_error_contains(

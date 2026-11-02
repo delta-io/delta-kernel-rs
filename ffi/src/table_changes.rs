@@ -721,7 +721,8 @@ mod tests {
             // Take ownership of the boxed ArrowFFIData; the inner array/schema are moved
             // into get_engine_data which takes ownership of the FFI_ArrowArray.
             let ArrowFFIData { array, schema } = *unsafe { Box::from_raw(data_ptr) };
-            let engine_data = ok_or_panic(unsafe { get_engine_data(array, &schema, allocate_err) });
+            let engine_data =
+                ok_or_panic(unsafe { get_engine_data(array, &schema, &ERROR_ALLOCATORS) });
             let record_batch = unsafe { engine_data.into_inner().try_into_record_batch() }?;
 
             println!("Batch ({i}) num rows {:?}", record_batch.num_rows());

@@ -5,11 +5,11 @@ use delta_kernel::{Error, KernelError, KernelResult};
 use tracing::warn;
 
 use crate::handle::Handle;
-use crate::{kernel_string_slice, ExclusiveRustString, ExternEngine, KernelStringSlice};
+use crate::{ExclusiveRustString, ExternEngine};
 
 pub mod allocation;
 
-use allocation::ErrorAllocators;
+pub use allocation::ErrorAllocators;
 
 // We explicitly assign integer values to the error codes here because C and Rust are inconsistent
 // about values for "typedefed" features. Rust reserves the numbers for them regardless, so
@@ -25,7 +25,7 @@ use allocation::ErrorAllocators;
 // values we avoid this issue.
 
 #[repr(C)]
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum FFIKernelError {
     UnknownError = 0, // catch-all for unrecognized KernelError types

@@ -54,8 +54,11 @@ pub unsafe extern "C" fn free_plan_executor(executor: Handle<SharedPlanExecutor>
 ///
 /// # Safety
 ///
+/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
+/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+///
 /// Caller must pass a valid [`SharedPlanExecutor`] handle obtained from [`get_plan_executor`] and a
-/// valid [`AllocateErrorFn`]. When `fallback_engine` is [`OptionalValue::Some`], it must contain a
+/// valid [`ErrorAllocators`]. When `fallback_engine` is [`OptionalValue::Some`], it must contain a
 /// valid [`SharedExternEngine`] handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_plan_based_engine(
@@ -153,7 +156,7 @@ mod tests {
         let executor = unsafe { get_plan_executor(None, unreachable_callback) };
 
         let engine_handle =
-            unsafe { get_plan_based_engine(executor, OptionalValue::None, allocate_err) };
+            unsafe { get_plan_based_engine(executor, OptionalValue::None, &ERROR_ALLOCATORS) };
 
         assert_is_plan_based_engine(&engine_handle);
 
@@ -166,7 +169,7 @@ mod tests {
     fn without_fallback_unimplemented_operations_are_unsupported() {
         let executor = unsafe { get_plan_executor(None, unreachable_callback) };
         let engine_handle =
-            unsafe { get_plan_based_engine(executor, OptionalValue::None, allocate_err) };
+            unsafe { get_plan_based_engine(executor, OptionalValue::None, &ERROR_ALLOCATORS) };
 
         let engine = unsafe { engine_handle.as_ref() }.engine();
         let location = Url::parse("memory:///table/_delta_log/00000000000000000001.json").unwrap();

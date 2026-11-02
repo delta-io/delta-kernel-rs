@@ -7,7 +7,7 @@
 
 #include "kernel_utils.h"
 
-static void print_and_free_error(const char* msg, EngineError* err)
+static void print_and_free_error(const char* msg, void* err)
 {
   Error* error = (Error*)err;
   print_error(msg, error);
