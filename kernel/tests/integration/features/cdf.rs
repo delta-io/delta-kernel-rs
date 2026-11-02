@@ -6,13 +6,17 @@ use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::expressions::{col, lit, Predicate as Pred};
-use delta_kernel::schema::schema_ref;
+use delta_kernel::schema::{schema_ref, DataType, SchemaRef};
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::{KernelError, KernelResult, PredicateRef, Version};
+use delta_kernel::table_features::ColumnMappingMode;
+use delta_kernel::{Engine, KernelError, KernelResult, PredicateRef, Version};
 use itertools::Itertools;
+use rstest::rstest;
+use serde_json::{json, Value};
+use test_utils::column_mapping_fixtures::cm_field;
 use test_utils::{
-    add_commit, create_default_engine, create_default_engine_with_batch, create_table,
-    engine_store_setup, load_test_data,
+    add_commit, assert_result_error_with_message, create_default_engine,
+    create_default_engine_with_batch, create_table, engine_store_setup, load_test_data,
 };
 use url::Url;
 
@@ -69,6 +73,110 @@ fn read_cdf_for_table_with_batch_size(
         })
         .try_collect()?;
     Ok(batches)
+}
+
+fn cdf_partition_evolution_schema(column_mapping_mode: ColumnMappingMode) -> SchemaRef {
+    match column_mapping_mode {
+        ColumnMappingMode::None => schema_ref! {
+            nullable "id": INTEGER,
+            nullable "name": STRING,
+        },
+        ColumnMappingMode::Name | ColumnMappingMode::Id => schema_ref! {
+            (cm_field("id", 1, "id", DataType::INTEGER)),
+            (cm_field("name", 2, "name", DataType::STRING)),
+        },
+    }
+}
+
+fn cdf_protocol_action(column_mapping_mode: ColumnMappingMode) -> Value {
+    match column_mapping_mode {
+        ColumnMappingMode::None => json!({
+            "protocol": {
+                "minReaderVersion": 1,
+                "minWriterVersion": 4,
+            }
+        }),
+        ColumnMappingMode::Name | ColumnMappingMode::Id => json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["columnMapping"],
+                "writerFeatures": ["columnMapping", "changeDataFeed"],
+            }
+        }),
+    }
+}
+
+fn cdf_metadata_action(
+    schema: &SchemaRef,
+    partition_columns: &[&str],
+    column_mapping_mode: ColumnMappingMode,
+) -> Value {
+    let mut configuration = serde_json::Map::from_iter([(
+        "delta.enableChangeDataFeed".to_owned(),
+        Value::String("true".to_owned()),
+    )]);
+    if column_mapping_mode != ColumnMappingMode::None {
+        let max_column_id = schema
+            .fields()
+            .filter_map(|field| field.column_mapping_id())
+            .max()
+            .expect("mapped fixture schema has column IDs");
+        configuration.extend([
+            (
+                "delta.columnMapping.mode".to_owned(),
+                json!(column_mapping_mode),
+            ),
+            (
+                "delta.columnMapping.maxColumnId".to_owned(),
+                Value::String(max_column_id.to_string()),
+            ),
+        ]);
+    }
+
+    json!({
+        "metaData": {
+            "id": "cdf-partition-evolution",
+            "format": { "provider": "parquet", "options": {} },
+            "schemaString": serde_json::to_string(schema.as_ref()).unwrap(),
+            "partitionColumns": partition_columns,
+            "configuration": configuration,
+            "createdTime": 1_700_000_000_000i64,
+        }
+    })
+}
+
+async fn add_cdf_metadata_commit(
+    store: &delta_kernel::object_store::DynObjectStore,
+    table_url: &Url,
+    version: Version,
+    schema: &SchemaRef,
+    partition_columns: &[&str],
+    column_mapping_mode: ColumnMappingMode,
+) -> KernelResult<()> {
+    let mut actions = Vec::new();
+    if version == 0 {
+        actions.push(cdf_protocol_action(column_mapping_mode));
+    }
+    actions.push(cdf_metadata_action(
+        schema,
+        partition_columns,
+        column_mapping_mode,
+    ));
+    let commit = actions
+        .into_iter()
+        .map(|action| action.to_string())
+        .join("\n");
+    add_commit(table_url.as_str(), store, version, commit).await
+}
+
+fn collect_empty_cdf(table_changes: TableChanges, engine: Arc<dyn Engine>) -> KernelResult<usize> {
+    table_changes
+        .into_scan_builder()
+        .build()?
+        .execute(engine)?
+        .collect::<KernelResult<Vec<_>>>()
+        .map(|batches| batches.len())
 }
 
 #[test]
@@ -467,6 +575,166 @@ fn partition_table() -> KernelResult<()> {
     ];
     sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);
+    Ok(())
+}
+
+#[rstest]
+#[case::added(&[], &["id"])]
+#[case::removed(&["id"], &[])]
+#[case::reordered(&["id", "name"], &["name", "id"])]
+#[case::swapped(&["id"], &["name"])]
+#[tokio::test]
+async fn cdf_rejects_partition_column_changes(
+    #[values(ColumnMappingMode::None, ColumnMappingMode::Name)]
+    column_mapping_mode: ColumnMappingMode,
+    #[case] initial_partition_columns: &[&str],
+    #[case] read_partition_columns: &[&str],
+) -> KernelResult<()> {
+    let (store, engine, table_url) = engine_store_setup("cdf_partition_changes", None);
+    let schema = cdf_partition_evolution_schema(column_mapping_mode);
+    add_cdf_metadata_commit(
+        store.as_ref(),
+        &table_url,
+        0,
+        &schema,
+        initial_partition_columns,
+        column_mapping_mode,
+    )
+    .await?;
+    add_cdf_metadata_commit(
+        store.as_ref(),
+        &table_url,
+        1,
+        &schema,
+        read_partition_columns,
+        column_mapping_mode,
+    )
+    .await?;
+
+    assert_result_error_with_message(
+        TableChanges::try_new(table_url, &engine, 0, Some(1)),
+        "Change data feed encountered incompatible schema",
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case::added(&[], &["id"])]
+#[case::removed(&["id"], &[])]
+#[case::reordered(&["id", "name"], &["name", "id"])]
+#[tokio::test]
+async fn cdf_accepts_partition_layout_change_introduced_at_start_version(
+    #[case] initial_partition_columns: &[&str],
+    #[case] read_partition_columns: &[&str],
+) -> KernelResult<()> {
+    let (store, engine, table_url) = engine_store_setup("cdf_partition_change_at_start", None);
+    let engine: Arc<dyn Engine> = Arc::new(engine);
+    let schema = cdf_partition_evolution_schema(ColumnMappingMode::Name);
+    add_cdf_metadata_commit(
+        store.as_ref(),
+        &table_url,
+        0,
+        &schema,
+        initial_partition_columns,
+        ColumnMappingMode::Name,
+    )
+    .await?;
+    add_cdf_metadata_commit(
+        store.as_ref(),
+        &table_url,
+        1,
+        &schema,
+        read_partition_columns,
+        ColumnMappingMode::Name,
+    )
+    .await?;
+
+    let table_changes = TableChanges::try_new(table_url, engine.as_ref(), 1, Some(1))?;
+    assert_eq!(collect_empty_cdf(table_changes, engine)?, 0);
+    Ok(())
+}
+
+#[rstest]
+#[case::without_mapping(ColumnMappingMode::None)]
+#[case::with_mapping(ColumnMappingMode::Name)]
+#[tokio::test]
+async fn cdf_rejects_intermediate_partition_column_changes(
+    #[case] column_mapping_mode: ColumnMappingMode,
+) -> KernelResult<()> {
+    let (store, engine, table_url) = engine_store_setup("cdf_intermediate_partition_changes", None);
+    let engine = Arc::new(engine);
+    let schema = cdf_partition_evolution_schema(column_mapping_mode);
+    add_cdf_metadata_commit(
+        store.as_ref(),
+        &table_url,
+        0,
+        &schema,
+        &[],
+        column_mapping_mode,
+    )
+    .await?;
+    add_cdf_metadata_commit(
+        store.as_ref(),
+        &table_url,
+        1,
+        &schema,
+        &["id"],
+        column_mapping_mode,
+    )
+    .await?;
+    add_cdf_metadata_commit(
+        store.as_ref(),
+        &table_url,
+        2,
+        &schema,
+        &[],
+        column_mapping_mode,
+    )
+    .await?;
+
+    let table_changes = TableChanges::try_new(table_url, engine.as_ref(), 0, Some(2))?;
+    assert_result_error_with_message(
+        table_changes
+            .into_scan_builder()
+            .build()?
+            .execute(engine)?
+            .collect::<KernelResult<Vec<_>>>(),
+        "Change data feed encountered incompatible schema",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cdf_rejects_partition_column_type_changes_without_mapping() -> KernelResult<()> {
+    let (store, engine, table_url) = engine_store_setup("cdf_partition_column_type_change", None);
+    let initial_schema = cdf_partition_evolution_schema(ColumnMappingMode::None);
+    let read_schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "name": STRING,
+    };
+    add_cdf_metadata_commit(
+        store.as_ref(),
+        &table_url,
+        0,
+        &initial_schema,
+        &["id"],
+        ColumnMappingMode::None,
+    )
+    .await?;
+    add_cdf_metadata_commit(
+        store.as_ref(),
+        &table_url,
+        1,
+        &read_schema,
+        &["id"],
+        ColumnMappingMode::None,
+    )
+    .await?;
+
+    assert_result_error_with_message(
+        TableChanges::try_new(table_url, &engine, 0, Some(1)),
+        "Change data feed encountered incompatible schema",
+    );
     Ok(())
 }
 

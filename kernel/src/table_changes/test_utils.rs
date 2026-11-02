@@ -1,12 +1,16 @@
 //! Shared fixtures for table-change unit tests.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use url::Url;
 
 use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use crate::actions::{Metadata, Protocol};
+use crate::path::ParsedLogPath;
 use crate::schema::SchemaRef;
+use crate::table_changes::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
+use crate::table_changes::{CdfMode, TableChangesReadConfiguration};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::table_properties::{
@@ -14,6 +18,7 @@ use crate::table_properties::{
     MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
 use crate::unit_test_utils::{Action, MockTableConfigurationBuilder};
+use crate::{Engine, KernelResult, KernelResultIterator, PredicateRef};
 
 pub(crate) const TEST_MATERIALIZED_ROW_ID_COLUMN_NAME: &str = "_row_id";
 pub(crate) const TEST_MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME: &str = "_row_commit_version";
@@ -58,6 +63,29 @@ pub(crate) fn row_tracking_table_config(table_root: Url, schema: SchemaRef) -> T
         .with_protocol(row_tracking_protocol())
         .with_table_root(table_root)
         .build()
+}
+
+/// Replays commits with a read configuration fixed to mapping mode `None` and no partition
+/// columns. Tests for per-commit mapping or partition-layout validation must construct a real
+/// `TableChangesReadConfiguration` instead.
+pub(crate) fn replay_unmapped_unpartitioned_table_changes(
+    engine: Arc<dyn Engine>,
+    start_table_configuration: &TableConfiguration,
+    commit_files: impl IntoIterator<Item = ParsedLogPath, IntoIter: Send>,
+    read_schema: SchemaRef,
+    physical_predicate: Option<(PredicateRef, SchemaRef)>,
+    mode: CdfMode,
+) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
+    let read_configuration =
+        TableChangesReadConfiguration::new_unmapped_unpartitioned_for_test(read_schema);
+    table_changes_action_iter(
+        engine,
+        start_table_configuration,
+        &read_configuration,
+        commit_files,
+        physical_predicate,
+        mode,
+    )
 }
 
 pub(crate) fn test_deletion_vector(
