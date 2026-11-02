@@ -1,13 +1,18 @@
 //! Commits a caller-supplied root manifest file as the table's content root.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
-use crate::actions::visitors::SetTransactionMap;
-use crate::actions::{CheckpointAction, ContentRoot, DomainMetadata, SetTransaction};
+use crate::actions::visitors::{AddVisitor, CdcVisitor, RemoveVisitor, SetTransactionMap};
+use crate::actions::{
+    ADD_FIELD, ADD_NAME, CDC_FIELD, CDC_NAME, CheckpointAction, ContentRoot, DomainMetadata,
+    REMOVE_FIELD, REMOVE_NAME, SetTransaction,
+};
 use crate::crc::{DomainMetadataState, SetTransactionState, merge_domain_metadata};
+use crate::engine_data::RowVisitor as _;
 use crate::error::KernelError;
 use crate::log_segment::DomainMetadataMap;
+use crate::schema::{SchemaRef, lazy_schema_ref};
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
@@ -35,8 +40,8 @@ impl RootManifestFile {
     /// the table's protocol and metadata plus every active domain metadata and set transaction
     /// (this transaction's `dm_changes` and `set_transactions` merged in, newest wins).
     ///
-    /// Errors if an existing checkpoint does not already cover the read snapshot's version, meaning
-    /// delta log commits are still pending replay since it.
+    /// Errors if a log commit since the last checkpoint action has a file action (`add`, `remove`,
+    /// or `cdc`), since kernel cannot fold it into the caller-supplied root manifest.
     pub(super) fn compute_checkpoint_action(
         &self,
         engine: &dyn Engine,
@@ -67,17 +72,8 @@ impl RootManifestFile {
             calculate_transaction_expiration_timestamp(table_config.table_properties())?;
         transactions.retain(|_, txn| !txn.is_expired(expiration_timestamp));
 
-        let read_snapshot_version = version_as_i64(self.read_snapshot.version())?;
         if let Some(existing) = &existing_checkpoint {
-            require!(
-                existing.version() >= read_snapshot_version,
-                KernelError::generic(format!(
-                    "root manifest file commit requires no delta log commits pending replay since \
-                     the last checkpoint; existing checkpoint covers version {} but snapshot is \
-                     at {read_snapshot_version}",
-                    existing.version()
-                ))
-            );
+            self.validate_no_file_actions_since_checkpoint(engine, existing.version())?;
         }
 
         let version = version_as_i64(commit_version)?;
@@ -131,8 +127,15 @@ impl RootManifestFile {
             );
         }
 
+        let read_snapshot_version = version_as_i64(snapshot.version())?;
+        let no_log_commits_since_checkpoint = checkpoint_action
+            .as_ref()
+            .is_some_and(|c| c.version() == read_snapshot_version);
+
         let domain_metadata = match &checkpoint_action {
-            Some(checkpoint) if !domain_metadata_complete_in_crc => {
+            Some(checkpoint)
+                if no_log_commits_since_checkpoint && !domain_metadata_complete_in_crc =>
+            {
                 let mut domain_metadata = DomainMetadataMap::new();
                 merge_domain_metadata(
                     &mut domain_metadata,
@@ -149,18 +152,78 @@ impl RootManifestFile {
                 .get_domain_metadatas_internal(engine, None)?,
         };
         let transactions = match &checkpoint_action {
-            Some(checkpoint) if !transactions_complete_in_crc => checkpoint
-                .transactions
-                .iter()
-                .cloned()
-                .map(|txn| (txn.app_id.clone(), txn))
-                .collect(),
+            Some(checkpoint)
+                if no_log_commits_since_checkpoint && !transactions_complete_in_crc =>
+            {
+                checkpoint
+                    .transactions
+                    .iter()
+                    .cloned()
+                    .map(|txn| (txn.app_id.clone(), txn))
+                    .collect()
+            }
             _ => snapshot.get_app_id_versions(engine)?,
         };
 
         Ok((domain_metadata, transactions, checkpoint_action))
     }
+
+    /// Errors if a log commit after `checkpoint_version` has a file action.
+    fn validate_no_file_actions_since_checkpoint(
+        &self,
+        engine: &dyn Engine,
+        checkpoint_version: i64,
+    ) -> KernelResult<()> {
+        let log_segment = self.read_snapshot.log_segment();
+        // A classic checkpoint after the checkpoint action hides the commits before it.
+        if let Some(classic) = log_segment.checkpoint_version {
+            require!(
+                version_as_i64(classic)? <= checkpoint_version,
+                KernelError::generic(format!(
+                    "root manifest file commit cannot fold log commits behind checkpoint file at \
+                     version {classic}"
+                ))
+            );
+        }
+        for commit in &log_segment.listed.ascending_commit_files {
+            if version_as_i64(commit.version)? <= checkpoint_version {
+                continue;
+            }
+            let batches = engine.json_handler().read_json_files(
+                std::slice::from_ref(&commit.location),
+                LOG_FILE_ACTIONS_SCHEMA.clone(),
+                None,
+            )?;
+            let mut adds = AddVisitor::default();
+            let mut removes = RemoveVisitor::default();
+            let mut cdcs = CdcVisitor::default();
+            for batch in batches {
+                let batch = batch?;
+                adds.visit_rows_of(batch.as_ref())?;
+                removes.visit_rows_of(batch.as_ref())?;
+                cdcs.visit_rows_of(batch.as_ref())?;
+            }
+            let found = [
+                (ADD_NAME, adds.adds.is_empty()),
+                (REMOVE_NAME, removes.removes.is_empty()),
+                (CDC_NAME, cdcs.cdcs.is_empty()),
+            ]
+            .into_iter()
+            .find_map(|(action, empty)| (!empty).then_some(action));
+            if let Some(action) = found {
+                return Err(KernelError::generic(format!(
+                    "root manifest file commit cannot fold log commit at version {}: found \
+                     '{action}'",
+                    commit.version
+                )));
+            }
+        }
+        Ok(())
+    }
 }
+
+static LOG_FILE_ACTIONS_SCHEMA: LazyLock<SchemaRef> =
+    lazy_schema_ref! { (&ADD_FIELD), (&REMOVE_FIELD), (&CDC_FIELD) };
 
 #[cfg(test)]
 mod tests {
@@ -168,6 +231,8 @@ mod tests {
 
     use itertools::Itertools as _;
     use rstest::rstest;
+    use serde_json::json;
+    use test_utils::{TestAction, actions_to_string};
 
     use super::*;
     use crate::actions::{LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA, Sidecar};
@@ -177,12 +242,16 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
     use crate::snapshot::Snapshot;
+    use crate::table_features::TableFeature;
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
-        adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table,
-        write_commit, write_commit_after_manifest_commit, write_manifest_commit,
+        adaptive_metadata_protocol_and_metadata, commit_info_line, minimal_checkpoint_action,
+        protocol_and_metadata_lines, setup_table, write_commit, write_manifest_commit,
     };
-    use crate::unit_test_utils::{MockTableConfigurationBuilder, assert_result_error_with_message};
+    use crate::unit_test_utils::{
+        MockTableConfigurationBuilder, adaptive_metadata_table_configuration,
+        assert_result_error_with_message, test_schema_flat_with_column_mapping,
+    };
     use crate::{KernelResult, create_row};
 
     fn manifest_file(location: &str, size: u64) -> KernelResult<FileMeta> {
@@ -275,38 +344,167 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn compute_checkpoint_action_rejects_a_stale_checkpoint() -> KernelResult<()> {
-        let (engine, table_root) = setup_table()?;
-        let existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
-        write_manifest_commit(&engine, &table_root, 1, existing)?;
-        let domain_metadata = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
-        write_commit_after_manifest_commit(
-            &engine,
-            &table_root,
-            2,
-            1,
-            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)?,
-        )?;
+    // === Log commits after the last checkpoint action ===
+
+    /// Computes the checkpoint action for a root manifest commit on a table where v0 creates the
+    /// table, v1 is a manifest commit whose checkpoint action holds `domains` and `txns` (each also
+    /// written top-level), and each `log_commits` entry is the body of a later log commit.
+    fn compute_after_log_commits(
+        domains: &[DomainMetadata],
+        txns: &[SetTransaction],
+        log_commits: &[String],
+    ) -> KernelResult<CheckpointAction> {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let table_root = url::Url::parse("memory:///")?;
+        let mut checkpoint = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
+        checkpoint.domain_metadata = domains.to_vec();
+        checkpoint.transactions = txns.to_vec();
+        let manifest_commit = [
+            commit_info_line(2, Some((1, 1))),
+            json!({ "checkpoint": checkpoint }).to_string(),
+        ]
+        .into_iter()
+        .chain(domains.iter().map(|dm| domain_line(dm.clone())))
+        .chain(txns.iter().map(|txn| json!({ "txn": txn }).to_string()))
+        .join("\n");
+        let mut commits = vec![
+            format!(
+                "{}\n{}",
+                commit_info_line(1, None),
+                protocol_and_metadata_lines(test_schema_flat_with_column_mapping(), &[])
+            ),
+            manifest_commit,
+        ];
+        commits.extend(
+            (3..)
+                .zip(log_commits)
+                .map(|(ict, body)| format!("{}\n{body}", commit_info_line(ict, Some((1, 1))))),
+        );
+        let log_root = table_root.join("_delta_log/")?;
+        for (version, commit) in commits.into_iter().enumerate() {
+            engine.storage_handler().put(
+                &log_root.join(&format!("{version:020}.json"))?,
+                commit.into(),
+                false,
+            )?;
+        }
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-        assert_eq!(snapshot.version(), 2);
-        let manifest = root_manifest(
-            &table_root,
-            "metadata/root-v3.parquet",
-            4096,
-            snapshot.clone(),
-        );
-
-        let result = manifest.compute_checkpoint_action(
+        let manifest = root_manifest(&table_root, "metadata/root.parquet", 2048, snapshot.clone());
+        manifest.compute_checkpoint_action(
             &engine,
-            3,
+            snapshot.version() + 1,
             snapshot.table_configuration(),
             &[],
             &[],
+        )
+    }
+
+    fn domain(name: &str) -> DomainMetadata {
+        DomainMetadata::new(name.to_string(), "{}".to_string())
+    }
+
+    fn domain_line(dm: DomainMetadata) -> String {
+        json!({ "domainMetadata": dm }).to_string()
+    }
+
+    fn txn_line(app_id: &str, version: i64) -> String {
+        json!({ "txn": SetTransaction::new(app_id.to_string(), version, None) }).to_string()
+    }
+
+    #[rstest]
+    #[case::log_commit_adds_domain(vec![], domain_line(domain("test.domain")), true)]
+    #[case::log_commit_removes_domain(
+        vec![domain("test.domain")],
+        domain_line(DomainMetadata::remove("test.domain".into(), "{}".into())),
+        false
+    )]
+    #[case::log_commit_keeps_prior_domain(
+        vec![domain("test.domain")],
+        domain_line(domain("other.domain")),
+        true
+    )]
+    fn compute_checkpoint_action_carries_forward_log_commit_domains(
+        #[case] checkpoint_domains: Vec<DomainMetadata>,
+        #[case] log_commit: String,
+        #[case] expected_present: bool,
+    ) -> KernelResult<()> {
+        let checkpoint = compute_after_log_commits(&checkpoint_domains, &[], &[log_commit])?;
+        assert_eq!(
+            checkpoint
+                .domain_metadata
+                .iter()
+                .any(|dm| dm.domain() == "test.domain"),
+            expected_present
         );
-        assert_result_error_with_message(result, "commits pending replay");
         Ok(())
+    }
+
+    #[rstest]
+    #[case::log_commit_updates_txn(txn_line("app-1", 7), 7)]
+    #[case::log_commit_keeps_prior_txn(txn_line("app-2", 1), 5)]
+    fn compute_checkpoint_action_carries_forward_log_commit_txns(
+        #[case] log_commit: String,
+        #[case] expected_version: i64,
+    ) -> KernelResult<()> {
+        let prior = SetTransaction::new("app-1".to_string(), 5, None);
+        let checkpoint = compute_after_log_commits(&[], &[prior], &[log_commit])?;
+        let app = checkpoint
+            .transactions
+            .iter()
+            .find(|txn| txn.app_id == "app-1");
+        assert_eq!(app.map(|txn| txn.version), Some(expected_version));
+        Ok(())
+    }
+
+    #[test]
+    fn compute_checkpoint_action_carries_forward_log_commit_protocol_and_metadata()
+    -> KernelResult<()> {
+        let protocol = adaptive_metadata_table_configuration(
+            test_schema_flat_with_column_mapping(),
+            &[TableFeature::TimestampWithoutTimezone],
+        )
+        .protocol()
+        .clone();
+        let metadata = adaptive_metadata_protocol_and_metadata()
+            .1
+            .with_configuration_entry("test.key", "test.value");
+        let log_commit = format!(
+            "{}\n{}",
+            json!({ "protocol": protocol }),
+            json!({ "metaData": metadata })
+        );
+        let checkpoint = compute_after_log_commits(&[], &[], &[log_commit])?;
+        assert_eq!(checkpoint.protocol(), &protocol);
+        assert_eq!(checkpoint.metadata(), &metadata);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::add_log_commit_fails(vec![actions_to_string(vec![TestAction::Add("a".into())])], "add")]
+    #[case::remove_log_commit_fails(
+        vec![actions_to_string(vec![TestAction::Remove("a".into())])],
+        "remove"
+    )]
+    #[case::cdc_log_commit_fails(
+        vec![r#"{"cdc":{"path":"a","partitionValues":{},"size":1,"dataChange":false}}"#.into()],
+        "cdc"
+    )]
+    #[case::add_log_commit_before_valid_log_commit_fails(
+        vec![
+            actions_to_string(vec![TestAction::Add("a".into())]),
+            domain_line(domain("test.domain")),
+        ],
+        "add"
+    )]
+    fn compute_checkpoint_action_rejects_file_log_commits(
+        #[case] log_commits: Vec<String>,
+        #[case] action: &str,
+    ) {
+        assert_result_error_with_message(
+            compute_after_log_commits(&[], &[], &log_commits),
+            &format!("found '{action}'"),
+        );
     }
 
     #[test]
