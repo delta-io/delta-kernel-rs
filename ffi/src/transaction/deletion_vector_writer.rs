@@ -69,6 +69,10 @@ unsafe impl Send for DvWriter {}
 #[handle_descriptor(target=DvWriter, mutable=true, sized=true)]
 pub struct ExclusiveDvWriter;
 
+/// Exclusive compressed deletion vector. Add index chunks, then write or free it.
+#[handle_descriptor(target=KernelDeletionVector, mutable=true, sized=true)]
+pub struct ExclusiveDeletionVector;
+
 /// The offset, serialized size, and cardinality returned for one complete deletion vector.
 ///
 /// Combine these fields with the caller-selected output path to construct a DV descriptor.
@@ -81,6 +85,61 @@ pub struct FfiDvWriteResult {
     pub size_in_bytes: i32,
     /// Number of distinct deleted physical row indexes.
     pub cardinality: i64,
+}
+
+/// Creates an empty compressed deletion vector without writing anything.
+///
+/// Populate it with `deletion_vector_add_indexes`, then transfer it to `dv_writer_write`.
+/// Use `free_deletion_vector` to abandon it. The vector must contain all prior and new deletions
+/// before serialization; Kernel does not look up or merge a previously published DV.
+#[unsafe(no_mangle)]
+pub extern "C" fn new_deletion_vector() -> Handle<ExclusiveDeletionVector> {
+    Box::new(KernelDeletionVector::new()).into()
+}
+
+/// Adds a borrowed chunk of physical row indexes to the compressed vector.
+///
+/// Unsorted indexes and duplicates are accepted. An empty chunk, including `{NULL, 0}`, is a no-op.
+/// Indexes above `i64::MAX` or malformed chunks are rejected without changing the vector.
+/// The caller must additionally check indexes against the target file's physical row count.
+///
+/// # Safety
+/// A non-null `vector` must point to a live, exclusively borrowed handle. For nonzero length,
+/// `indexes` must address that many aligned, initialized u64 values readable for this call.
+/// The error allocator must be valid. No input memory is retained after the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn deletion_vector_add_indexes(
+    vector: *mut Handle<ExclusiveDeletionVector>,
+    indexes: FfiSlice<u64>,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<bool> {
+    let result: KernelResult<_> = (|| {
+        // SAFETY: a non-null input references a valid handle exclusively available for this call.
+        let handle = unsafe { vector.as_mut() }
+            .ok_or_else(|| KernelError::generic("Deletion vector pointer must not be null"))?;
+        // SAFETY: a nonempty input is aligned, initialized, and readable for this call.
+        let rows = unsafe { indexes.try_as_slice() }?;
+        if rows.iter().any(|index| *index > i64::MAX as u64) {
+            return Err(KernelError::deletion_vector(
+                "DV row indexes must not exceed i64::MAX",
+            ));
+        }
+        // SAFETY: the caller prevents concurrent access; validation completed before mutation.
+        unsafe { handle.as_mut() }.add_deleted_row_indexes(rows);
+        Ok(true)
+    })();
+    // SAFETY: the allocator is valid for this call and copies any error message.
+    unsafe { result.into_extern_result(&allocate_error) }
+}
+
+/// Consumes an abandoned deletion vector without serializing it.
+///
+/// # Safety
+/// `vector` must be a valid owned handle. Do not use or free it after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn free_deletion_vector(vector: Handle<ExclusiveDeletionVector>) {
+    // SAFETY: the caller transfers a live handle exactly once.
+    unsafe { vector.drop_handle() };
 }
 
 /// Creates a serializer copying `output`; does not write or upload anything.
@@ -98,7 +157,7 @@ pub struct FfiDvWriteResult {
 /// and context must satisfy `FfiDvWriterOutput`'s lifetime and threading contract for any returned
 /// handle. No caller record is retained, including when it was stack-allocated in a helper.
 /// The error allocator must be valid for this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn new_dv_writer(
     output: *const FfiDvWriterOutput,
     allocate_error: AllocateErrorFn,
@@ -133,30 +192,27 @@ pub unsafe extern "C" fn new_dv_writer(
 
 /// Serializes one complete vector, returning its offset, size, and cardinality.
 ///
-/// `deleted_rows` contains all deleted physical row indexes for that vector, including previous
-/// deletions. The serializer neither reads nor merges an existing vector. Input order is
-/// unrestricted; duplicate indexes are deduplicated and an empty slice represents an empty DV.
-/// Each call appends an independent vector to this writer's output.
-/// Indexes must be at most `i64::MAX` for Delta's portable bitmap format. The caller must also
-/// ensure each index is below the target Parquet file's physical row count.
+/// `vector` must contain all deleted physical row indexes, including previous deletions.
+/// The serializer neither reads nor merges an existing vector. Each call appends an independent
+/// vector to the writer's output and consumes its vector handle on both success and error.
 ///
 /// # Errors
-/// Returns an error for a null writer pointer, malformed input, indexes above `i64::MAX`,
-/// serialization/output failure, or a writer already failed by such an error. Invalid input does
-/// not change or poison the writer. After a
-/// serialization/output failure, abandon the output and free the handle; it cannot be resumed.
+/// A null writer pointer or an already failed writer still consumes the vector. After a
+/// serialization/output failure, abandon the output and free the writer; it cannot be resumed.
 ///
 /// # Safety
-/// A non-null `writer` must point to a valid, exclusively borrowed handle. For nonzero length,
-/// `deleted_rows` must address that many aligned, initialized u64 values, readable for this call.
-/// A zero-length slice may have a null pointer. The output's lifetime/threading contract continues
-/// to apply. Callbacks and the error allocator must be valid; no input rows are retained.
-#[no_mangle]
+/// A non-null `writer` must point to a valid, exclusively borrowed writer handle. `vector` must be
+/// a valid owned handle created with `new_deletion_vector`; do not use or free it after this call.
+/// The output's lifetime/threading contract applies and the error allocator must be valid.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dv_writer_write(
     writer: *mut Handle<ExclusiveDvWriter>,
-    deleted_rows: FfiSlice<u64>,
+    vector: Handle<ExclusiveDeletionVector>,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<FfiDvWriteResult> {
+    // SAFETY: the caller transfers the live vector exactly once. Consume before any fallible check
+    // so it is dropped on null-pointer, failed-writer, serialization, and output errors alike.
+    let vector = unsafe { vector.into_inner() };
     let result: KernelResult<_> = (|| {
         // SAFETY: a non-null pointer references a live, exclusively borrowed handle for this call.
         let handle = unsafe { writer.as_mut() }
@@ -168,19 +224,10 @@ pub unsafe extern "C" fn dv_writer_write(
                 "DV writer has failed",
             ));
         }
-        // SAFETY: nonempty input is aligned, initialized, and readable for this call.
-        let rows = unsafe { deleted_rows.try_as_slice() }?;
-        if rows.iter().any(|index| *index > i64::MAX as u64) {
-            return Err(KernelError::deletion_vector(
-                "DV row indexes must not exceed i64::MAX",
-            ));
-        }
-        let mut dv = KernelDeletionVector::new();
-        dv.add_deleted_row_indexes(rows);
         let serializer = writer.writer.as_mut().ok_or_else(|| {
             KernelError::invalid_transaction_state("DV writer has been finalized")
         })?;
-        let result = serializer.write_deletion_vector(dv);
+        let result = serializer.write_deletion_vector(*vector);
         writer.failed = result.is_err();
         result.map(FfiDvWriteResult::from)
     })();
@@ -199,7 +246,7 @@ pub unsafe extern "C" fn dv_writer_write(
 /// # Safety
 /// `writer` must be a valid owned handle, and its output must still satisfy its lifetime/threading
 /// contract. Do not use or free the handle again. The error allocator must be valid for this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dv_writer_finalize(
     writer: Handle<ExclusiveDvWriter>,
     allocate_error: AllocateErrorFn,
@@ -229,7 +276,7 @@ pub unsafe extern "C" fn dv_writer_finalize(
 /// # Safety
 /// `writer` must be a valid owned handle and the borrowed output must still be valid. Do not use
 /// or free the handle again.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_dv_writer(writer: Handle<ExclusiveDvWriter>) {
     // SAFETY: the caller transfers a live handle exactly once.
     unsafe { writer.drop_handle() };
@@ -308,13 +355,13 @@ mod tests {
     use std::sync::Arc;
 
     #[cfg(feature = "default-engine-base")]
+    use delta_kernel::Engine;
+    #[cfg(feature = "default-engine-base")]
     use delta_kernel::actions::deletion_vector::{
         DeletionVectorDescriptor, DeletionVectorStorageType,
     };
     #[cfg(feature = "default-engine-base")]
-    use delta_kernel::object_store::{path::Path, ObjectStoreExt};
-    #[cfg(feature = "default-engine-base")]
-    use delta_kernel::Engine;
+    use delta_kernel::object_store::{ObjectStoreExt, path::Path};
     #[cfg(feature = "default-engine-base")]
     use delta_kernel::{
         arrow::{
@@ -329,20 +376,23 @@ mod tests {
 
     use super::*;
     use crate::error::{EngineExecError, FFIKernelError};
-    use crate::ffi_test_utils::{allocate_err, ok_or_panic, recover_error};
+    use crate::ffi_test_utils::{
+        allocate_err, assert_extern_result_error_contains, assert_extern_result_error_with_message,
+        ok_or_panic,
+    };
     #[cfg(feature = "default-engine-base")]
     use crate::{
+        SharedSnapshot,
         ffi_test_utils::engine_handle_for_store,
         free_engine, free_snapshot, kernel_string_slice,
         scan::{free_scan, scan, scan_metadata_iter_init},
         transaction::{
-            committed_transaction_version, dv_descriptor_map_insert, dv_descriptor_map_new,
-            dv_descriptor_new, free_committed_transaction, new_update_table_txn_builder,
-            update_table_txn_add_files, update_table_txn_builder_build, update_table_txn_commit,
-            update_table_txn_update_deletion_vectors, KernelDvStorageType,
-            KernelUpdateTableOperation,
+            KernelDvStorageType, KernelUpdateTableOperation, committed_transaction_version,
+            dv_descriptor_map_insert, dv_descriptor_map_new, dv_descriptor_new,
+            free_committed_transaction, new_update_table_txn_builder, update_table_txn_add_files,
+            update_table_txn_builder_build, update_table_txn_commit,
+            update_table_txn_update_deletion_vectors,
         },
-        SharedSnapshot,
     };
 
     #[derive(Default)]
@@ -426,15 +476,12 @@ mod tests {
         unsafe { FfiSlice::new_unsafe(indexes) }
     }
 
-    fn expect_error<T>(result: ExternResult<T>, expected: FFIKernelError) -> String {
-        match result {
-            ExternResult::Err(error) => {
-                let error = unsafe { recover_error(error) };
-                assert_eq!(error.etype, expected, "{}", error.message);
-                error.message
-            }
-            ExternResult::Ok(_) => panic!("expected error kind {expected:?}"),
-        }
+    fn vector(indexes: &[u64]) -> Handle<ExclusiveDeletionVector> {
+        let mut vector = new_deletion_vector();
+        ok_or_panic(unsafe {
+            deletion_vector_add_indexes(&mut vector, rows(indexes), allocate_err)
+        });
+        vector
     }
 
     fn serialize(vectors: &[&[u64]]) -> (Output, Vec<FfiDvWriteResult>) {
@@ -444,7 +491,7 @@ mod tests {
         let results = vectors
             .iter()
             .map(|indexes| {
-                ok_or_panic(unsafe { dv_writer_write(&mut writer, rows(indexes), allocate_err) })
+                ok_or_panic(unsafe { dv_writer_write(&mut writer, vector(indexes), allocate_err) })
             })
             .collect();
         assert!(ok_or_panic(unsafe {
@@ -493,6 +540,43 @@ mod tests {
     }
 
     #[test]
+    fn vectors_accumulate_copied_chunks_and_deduplicate_across_additions() {
+        let mut dv = new_deletion_vector();
+        let mut first_chunk = vec![3, 1, 3];
+        ok_or_panic(unsafe {
+            deletion_vector_add_indexes(&mut dv, rows(&first_chunk), allocate_err)
+        });
+        first_chunk.fill(99);
+        drop(first_chunk);
+        ok_or_panic(unsafe {
+            deletion_vector_add_indexes(&mut dv, rows(&[9, 7, 1]), allocate_err)
+        });
+        ok_or_panic(unsafe {
+            deletion_vector_add_indexes(&mut dv, FfiSlice::empty(), allocate_err)
+        });
+        assert_eq!(unsafe { dv.as_ref() }.cardinality(), 4);
+
+        let mut output = Output::default();
+        let callbacks = output.callbacks();
+        let mut writer = ok_or_panic(unsafe { new_dv_writer(&callbacks, allocate_err) });
+        let result = ok_or_panic(unsafe { dv_writer_write(&mut writer, dv, allocate_err) });
+        assert_eq!(result.cardinality, 4);
+        ok_or_panic(unsafe { dv_writer_finalize(writer, allocate_err) });
+        assert_eq!(output.bytes, serialize(&[&[1, 3, 7, 9]]).0.bytes);
+    }
+
+    #[rstest]
+    fn abandoned_vectors_are_freed_without_output(#[values(false, true)] populated: bool) {
+        let mut dv = new_deletion_vector();
+        if populated {
+            ok_or_panic(unsafe {
+                deletion_vector_add_indexes(&mut dv, rows(&[1, 7]), allocate_err)
+            });
+        }
+        unsafe { free_deletion_vector(dv) };
+    }
+
+    #[test]
     fn empty_writer_finalizes_without_creating_a_vector() {
         let (output, results) = serialize(&[]);
         assert!(output.bytes.is_empty());
@@ -501,12 +585,15 @@ mod tests {
     }
 
     #[test]
-    fn null_empty_rows_are_a_complete_empty_vector() {
+    fn empty_index_chunks_preserve_a_complete_empty_vector() {
         let mut output = Output::default();
         let callbacks = output.callbacks();
         let mut writer = ok_or_panic(unsafe { new_dv_writer(&callbacks, allocate_err) });
-        let result =
-            ok_or_panic(unsafe { dv_writer_write(&mut writer, FfiSlice::empty(), allocate_err) });
+        let mut vector = new_deletion_vector();
+        ok_or_panic(unsafe {
+            deletion_vector_add_indexes(&mut vector, FfiSlice::empty(), allocate_err)
+        });
+        let result = ok_or_panic(unsafe { dv_writer_write(&mut writer, vector, allocate_err) });
         assert_eq!(result.cardinality, 0);
         assert!(ok_or_panic(unsafe {
             dv_writer_finalize(writer, allocate_err)
@@ -515,14 +602,15 @@ mod tests {
     }
 
     #[test]
-    fn invalid_row_slice_does_not_change_or_poison_the_writer() {
+    fn invalid_index_chunk_leaves_the_existing_vector_usable() {
         let mut output = Output::default();
         let callbacks = output.callbacks();
         let mut writer = ok_or_panic(unsafe { new_dv_writer(&callbacks, allocate_err) });
-        expect_error(
+        let mut vector = vector(&[1]);
+        assert_extern_result_error_with_message(
             unsafe {
-                dv_writer_write(
-                    &mut writer,
+                deletion_vector_add_indexes(
+                    &mut vector,
                     FfiSlice {
                         ptr: ptr::null(),
                         len: 1,
@@ -531,38 +619,47 @@ mod tests {
                 )
             },
             FFIKernelError::GenericError,
+            None,
         );
         assert!(output.bytes.is_empty());
-        let result = ok_or_panic(unsafe { dv_writer_write(&mut writer, rows(&[4]), allocate_err) });
+        ok_or_panic(unsafe { deletion_vector_add_indexes(&mut vector, rows(&[4]), allocate_err) });
+        let result = ok_or_panic(unsafe { dv_writer_write(&mut writer, vector, allocate_err) });
         assert_eq!(result.offset, 1);
-        assert_eq!(result.cardinality, 1);
+        assert_eq!(result.cardinality, 2);
         ok_or_panic(unsafe { dv_writer_finalize(writer, allocate_err) });
+        assert_eq!(output.bytes, serialize(&[&[1, 4]]).0.bytes);
     }
 
     #[rstest]
     #[case::signed_max(i64::MAX as u64, true)]
     #[case::above_signed_max(i64::MAX as u64 + 1, false)]
     #[case::unsigned_max(u64::MAX, false)]
-    fn protocol_index_bounds_are_checked_before_writing(
+    fn protocol_index_bounds_are_checked_before_mutating_a_chunk(
         #[case] index: u64,
         #[case] accepted: bool,
     ) {
         let mut output = Output::default();
         let callbacks = output.callbacks();
         let mut writer = ok_or_panic(unsafe { new_dv_writer(&callbacks, allocate_err) });
-        ok_or_panic(unsafe { dv_writer_write(&mut writer, rows(&[1]), allocate_err) });
-        let before = output.bytes.clone();
-        let result = unsafe { dv_writer_write(&mut writer, rows(&[0, index]), allocate_err) };
+        let mut dv = vector(&[1]);
+        let result =
+            unsafe { deletion_vector_add_indexes(&mut dv, rows(&[0, index]), allocate_err) };
         if accepted {
-            let result = ok_or_panic(result);
-            assert_eq!(result.cardinality, 2);
-            assert_eq!(output.bytes, serialize(&[&[1], &[0, index]]).0.bytes);
+            assert!(ok_or_panic(result));
+            let result = ok_or_panic(unsafe { dv_writer_write(&mut writer, dv, allocate_err) });
+            assert_eq!(result.cardinality, 3);
+            assert_eq!(output.bytes, serialize(&[&[0, 1, index]]).0.bytes);
         } else {
-            expect_error(result, FFIKernelError::DeletionVectorError);
-            assert_eq!(output.bytes, before);
-            // Invalid input leaves a previously used writer usable, without advancing its offset.
-            ok_or_panic(unsafe { dv_writer_write(&mut writer, rows(&[0, 7]), allocate_err) });
-            assert_eq!(output.bytes, serialize(&[&[1], &[0, 7]]).0.bytes);
+            assert_extern_result_error_with_message(
+                result,
+                FFIKernelError::DeletionVectorError,
+                None,
+            );
+            // The valid prefix of the rejected chunk must not be added either.
+            assert_eq!(unsafe { dv.as_ref() }.cardinality(), 1);
+            ok_or_panic(unsafe { deletion_vector_add_indexes(&mut dv, rows(&[7]), allocate_err) });
+            ok_or_panic(unsafe { dv_writer_write(&mut writer, dv, allocate_err) });
+            assert_eq!(output.bytes, serialize(&[&[1, 7]]).0.bytes);
         }
         ok_or_panic(unsafe { dv_writer_finalize(writer, allocate_err) });
     }
@@ -576,7 +673,7 @@ mod tests {
     fn copied_output_record_can_be_dropped_or_modified_after_creation() {
         let mut output = Output::default();
         let mut writer = writer_from_stack_record(&mut output);
-        ok_or_panic(unsafe { dv_writer_write(&mut writer, rows(&[1, 3]), allocate_err) });
+        ok_or_panic(unsafe { dv_writer_write(&mut writer, vector(&[1, 3]), allocate_err) });
         ok_or_panic(unsafe { dv_writer_finalize(writer, allocate_err) });
         assert_eq!(output.bytes, serialize(&[&[1, 3]]).0.bytes);
 
@@ -587,7 +684,7 @@ mod tests {
         callbacks.write = None;
         callbacks.flush = None;
         assert!(callbacks.write.is_none());
-        ok_or_panic(unsafe { dv_writer_write(&mut writer, rows(&[7]), allocate_err) });
+        ok_or_panic(unsafe { dv_writer_write(&mut writer, vector(&[7]), allocate_err) });
         ok_or_panic(unsafe { dv_writer_finalize(writer, allocate_err) });
         assert_eq!(output.bytes, serialize(&[&[7]]).0.bytes);
         assert_eq!(output.flushes, 1);
@@ -616,20 +713,29 @@ mod tests {
         };
         let mut writer = ok_or_panic(unsafe { new_dv_writer(&output, allocate_err) });
         let result =
-            ok_or_panic(unsafe { dv_writer_write(&mut writer, rows(&[1, 3]), allocate_err) });
+            ok_or_panic(unsafe { dv_writer_write(&mut writer, vector(&[1, 3]), allocate_err) });
         assert_eq!(result, serialize(&[&[1, 3]]).1[0]);
         ok_or_panic(unsafe { dv_writer_finalize(writer, allocate_err) });
     }
 
     #[test]
     fn null_output_and_writer_pointers_return_errors() {
-        expect_error(
+        assert_extern_result_error_with_message(
             unsafe { new_dv_writer(ptr::null_mut(), allocate_err) },
             FFIKernelError::GenericError,
+            None,
         );
-        expect_error(
-            unsafe { dv_writer_write(ptr::null_mut(), FfiSlice::empty(), allocate_err) },
+        assert_extern_result_error_with_message(
+            unsafe { dv_writer_write(ptr::null_mut(), vector(&[1, 7]), allocate_err) },
             FFIKernelError::GenericError,
+            None,
+        );
+        assert_extern_result_error_with_message(
+            unsafe {
+                deletion_vector_add_indexes(ptr::null_mut(), FfiSlice::empty(), allocate_err)
+            },
+            FFIKernelError::GenericError,
+            None,
         );
     }
 
@@ -644,9 +750,10 @@ mod tests {
         } else {
             callbacks.flush = None;
         }
-        expect_error(
+        assert_extern_result_error_with_message(
             unsafe { new_dv_writer(&callbacks, allocate_err) },
             FFIKernelError::GenericError,
+            None,
         );
         assert!(output.bytes.is_empty());
         assert_eq!(output.flushes, 0);
@@ -660,7 +767,7 @@ mod tests {
         };
         let callbacks = output.callbacks();
         let mut writer = ok_or_panic(unsafe { new_dv_writer(&callbacks, allocate_err) });
-        ok_or_panic(unsafe { dv_writer_write(&mut writer, rows(&[0, 7]), allocate_err) });
+        ok_or_panic(unsafe { dv_writer_write(&mut writer, vector(&[0, 7]), allocate_err) });
         ok_or_panic(unsafe { dv_writer_finalize(writer, allocate_err) });
         assert_eq!(output.bytes, serialize(&[&[0, 7]]).0.bytes);
     }
@@ -682,26 +789,28 @@ mod tests {
         };
         let callbacks = output.callbacks();
         let mut writer = ok_or_panic(unsafe { new_dv_writer(&callbacks, allocate_err) });
-        let error = expect_error(
-            unsafe { dv_writer_write(&mut writer, rows(&[1]), allocate_err) },
+        assert_extern_result_error_contains(
+            unsafe { dv_writer_write(&mut writer, vector(&[1]), allocate_err) },
             FFIKernelError::GenericError,
+            message,
         );
-        assert!(error.contains(message), "{error}");
         if matches!(mode, FailureMode::WriteAfterPrefix) {
             assert!(!output.bytes.is_empty());
         }
         // SAFETY: this test owns the context; no callback is running and no reference is retained.
         unsafe { (*callbacks.context.unwrap().as_ptr().cast::<Output>()).mode = None };
-        expect_error(
-            unsafe { dv_writer_write(&mut writer, rows(&[1]), allocate_err) },
+        assert_extern_result_error_with_message(
+            unsafe { dv_writer_write(&mut writer, vector(&[1]), allocate_err) },
             FFIKernelError::InvalidTransactionStateError,
+            None,
         );
         if free_after_failure {
             unsafe { free_dv_writer(writer) };
         } else {
-            expect_error(
+            assert_extern_result_error_with_message(
                 unsafe { dv_writer_finalize(writer, allocate_err) },
                 FFIKernelError::InvalidTransactionStateError,
+                None,
             );
         }
         assert_eq!(output.flushes, 0);
@@ -718,12 +827,12 @@ mod tests {
         };
         let callbacks = output.callbacks();
         let mut writer = ok_or_panic(unsafe { new_dv_writer(&callbacks, allocate_err) });
-        ok_or_panic(unsafe { dv_writer_write(&mut writer, rows(&[1]), allocate_err) });
-        let error = expect_error(
+        ok_or_panic(unsafe { dv_writer_write(&mut writer, vector(&[1]), allocate_err) });
+        assert_extern_result_error_contains(
             unsafe { dv_writer_finalize(writer, allocate_err) },
             FFIKernelError::GenericError,
+            message,
         );
-        assert!(error.contains(message), "{error}");
         assert_eq!(output.flushes, 1);
     }
 
@@ -732,7 +841,7 @@ mod tests {
         let mut output = Output::default();
         let callbacks = output.callbacks();
         let mut writer = ok_or_panic(unsafe { new_dv_writer(&callbacks, allocate_err) });
-        ok_or_panic(unsafe { dv_writer_write(&mut writer, rows(&[1]), allocate_err) });
+        ok_or_panic(unsafe { dv_writer_write(&mut writer, vector(&[1]), allocate_err) });
         unsafe { free_dv_writer(writer) };
         assert!(!output.bytes.is_empty());
         assert_eq!(output.flushes, 0);
@@ -746,7 +855,7 @@ mod tests {
         let result = std::thread::spawn(move || {
             let mut writer = writer;
             let result =
-                ok_or_panic(unsafe { dv_writer_write(&mut writer, rows(&[1, 3]), allocate_err) });
+                ok_or_panic(unsafe { dv_writer_write(&mut writer, vector(&[1, 3]), allocate_err) });
             ok_or_panic(unsafe { dv_writer_finalize(writer, allocate_err) });
             result
         })
@@ -759,6 +868,7 @@ mod tests {
 
     #[cfg(feature = "default-engine-base")]
     #[tokio::test]
+    // Exercises safe Engine/object-store setup, not the FFI lifetime boundary; runs natively.
     #[cfg_attr(miri, ignore)]
     async fn kernel_reader_decodes_independent_vectors_from_shared_and_separate_outputs() {
         let vectors: &[&[u64]] = &[&[1, 3, 7], &[2, 8], &[]];
@@ -804,6 +914,7 @@ mod tests {
     #[case::shared_output(true)]
     #[case::separate_outputs(false)]
     #[tokio::test]
+    // Parquet/Engine transaction integration is expensive under Miri and tested natively.
     #[cfg_attr(miri, ignore)]
     async fn serialized_results_stage_with_new_files_and_commit_through_ffi(
         #[case] shared: bool,

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::expressions::{
-    col, column_name, column_pred, lit, ArrayData, Expression as Expr, OpaqueExpressionOp,
-    OpaquePredicateOp, Predicate as Pred, ScalarExpressionEvaluator, StructData,
+    ArrayData, Expression as Expr, OpaqueExpressionOp, OpaquePredicateOp, Predicate as Pred,
+    ScalarExpressionEvaluator, StructData, col, column_name, column_pred, lit,
 };
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::scan::data_skipping::as_data_skipping_predicate;

@@ -135,9 +135,9 @@ mod tests {
     use crate::log_replay::FileActionKey;
     use crate::log_segment::CheckpointReadInfo;
     use crate::metrics::{MetricEvent, ScanType, WithMetricsReporterLayer};
+    use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStoreExt as _;
     use crate::parallel::parallel_scan_metadata::{
         AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState,
     };
@@ -148,9 +148,9 @@ mod tests {
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
     use crate::scan::{ScanBuilder, StatsOptions};
-    use crate::schema::{schema_ref, DataType, StructField, StructType};
+    use crate::schema::{DataType, StructField, StructType, schema_ref};
     use crate::unit_test_utils::{
-        install_thread_local_metrics_reporter, load_test_table, parse_json_batch, CapturingReporter,
+        CapturingReporter, install_thread_local_metrics_reporter, load_test_table, parse_json_batch,
     };
     use crate::utils::FoldWithOption as _;
     use crate::{PredicateRef, SnapshotRef};

@@ -13,9 +13,9 @@ use super::log_replay::TableChangesScanMetadata;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::visitors::visit_deletion_vector_at;
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{col, lit, Expression};
+use crate::expressions::{Expression, col, lit};
 use crate::scan::state::DvInfo;
-use crate::schema::{lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, SchemaRef};
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef, lazy_schema_ref};
 use crate::utils::require;
 use crate::{KernelError, KernelResult, KernelResultIterator, RowVisitor};
 
@@ -486,25 +486,25 @@ mod tests {
     use itertools::Itertools;
     use rstest::rstest;
 
-    use super::{scan_metadata_to_scan_file, CdfScanFile, CdfScanFileType, TableChangesFileAction};
+    use super::{CdfScanFile, CdfScanFileType, TableChangesFileAction, scan_metadata_to_scan_file};
+    use crate::Engine as _;
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::actions::{Add, Cdc, Remove};
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
     use crate::scan::state::DvInfo;
     use crate::schema::schema_ref;
+    use crate::table_changes::CdfMode;
     use crate::table_changes::log_replay::{
         table_changes_action_iter, table_changes_action_iter_with_mode,
     };
     use crate::table_changes::test_utils::{row_tracking_table_config, test_deletion_vector};
-    use crate::table_changes::CdfMode;
     use crate::table_features::ColumnMappingMode;
     use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
     use crate::unit_test_utils::{
-        assert_result_error_with_message, Action, LocalMockTable, MockProtocolBuilder,
-        MockTableConfigurationBuilder,
+        Action, LocalMockTable, MockProtocolBuilder, MockTableConfigurationBuilder,
+        assert_result_error_with_message,
     };
-    use crate::Engine as _;
 
     fn row_tracking_add(
         path: &str,
@@ -784,9 +784,11 @@ mod tests {
 
         // The cdc action in commit 1 is ignored: only add/remove-derived files appear. The
         // metadata-only add (`data_change == false`) in commit 3 is also excluded.
-        assert!(scan_files
-            .iter()
-            .all(|f| f.scan_type != CdfScanFileType::Cdc));
+        assert!(
+            scan_files
+                .iter()
+                .all(|f| f.scan_type != CdfScanFileType::Cdc)
+        );
         assert!(
             !scan_files.iter().any(|f| f.path == "path_6"),
             "metadata-only add (data_change=false) must be excluded"

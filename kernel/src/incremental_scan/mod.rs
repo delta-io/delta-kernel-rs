@@ -7,12 +7,12 @@ use std::sync::{Arc, LazyLock};
 use url::Url;
 
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
-use crate::expressions::{column_name, ColumnName};
+use crate::expressions::{ColumnName, column_name};
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
 use crate::log_replay::{FileActionDeduplicator, FileActionKey};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::{
-    map_to_struct_options, PartitionValuesOptions, PhysicalPredicate, COMMIT_READ_SCHEMA,
+    COMMIT_READ_SCHEMA, PartitionValuesOptions, PhysicalPredicate, map_to_struct_options,
 };
 use crate::schema::{ColumnNamesAndTypes, DataType};
 use crate::snapshot::SnapshotRef;

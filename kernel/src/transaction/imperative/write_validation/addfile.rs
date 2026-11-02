@@ -7,8 +7,8 @@ use super::utils::{validate_partition_keys, validate_required_field_exist};
 use super::{FileActionUniquenessValidator, StagedDataValidator, Validation};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::scan::log_replay::CLUSTERING_PROVIDER_NAME;
-use crate::schema::{column_name, schema_ref, ColumnNamesAndTypes};
-use crate::transaction::{mandatory_add_file_schema, ADD_FILE_CLUSTERING_PROVIDER_FIELD};
+use crate::schema::{ColumnNamesAndTypes, column_name, schema_ref};
+use crate::transaction::{ADD_FILE_CLUSTERING_PROVIDER_FIELD, mandatory_add_file_schema};
 use crate::utils::require;
 use crate::{EngineData, KernelError, KernelResult};
 

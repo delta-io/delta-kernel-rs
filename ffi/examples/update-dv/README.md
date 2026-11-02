@@ -45,12 +45,16 @@ installs the descriptor and lets the kernel stage the matching remove/add action
 
 # Kernel DV serialization
 
-The FFI exposes the lifecycle of Rust's `StreamingDeletionVectorWriter`:
+The FFI exposes Rust's separate compressed-vector and serializer lifecycles:
 
 ```text
+dv = new_deletion_vector()
+deletion_vector_add_indexes(&dv, previous_deleted_rows, allocate_error)
+deletion_vector_add_indexes(&dv, new_deleted_rows_chunk, allocate_error)
+deletion_vector_add_indexes(&dv, another_chunk, allocate_error)
 writer = new_dv_writer(output, allocate_error)
-a = dv_writer_write(&writer, complete_deleted_rows_for_a, allocate_error)
-b = dv_writer_write(&writer, complete_deleted_rows_for_b, allocate_error)
+result = dv_writer_write(&writer, dv, allocate_error) // consumes dv, also on error
+// Write additional completed vectors into this output, or create separate writers.
 dv_writer_finalize(writer, allocate_error)
 ```
 
@@ -59,12 +63,16 @@ in a shared output, each with its own offset. Create separate writers for separa
 outputs. Each write returns `FfiDvWriteResult` with `offset`, `size_in_bytes`, and
 `cardinality`; it does not create a descriptor or choose a path.
 
-Each row-index slice is the **complete** vector, including previous deletions, not
-just newly deleted indexes. Indexes are zero-based physical row ordinals across the
+Add prior deletions and new deletions in chunks with `deletion_vector_add_indexes`.
+Each chunk is copied into the compressed bitmap, so the input array can be released
+after the call; the final write requires no complete uncompressed index array.
+Before writing, the vector must contain **all** deletions, not just the newly deleted
+indexes. Indexes are zero-based physical row ordinals across the
 whole data file, must not exceed `i64::MAX`, and must be below that file's physical
-row count. The serializer enforces the protocol's `i64::MAX` limit; the connector
-validates the file-specific bound. Unsorted indexes and duplicates are deduplicated.
-An empty slice, including `{NULL, 0}`, serializes an empty vector.
+row count. Adding indexes validates the protocol limit before changing the bitmap;
+the connector validates the file-specific bound. Unsorted indexes and duplicates
+across chunks are deduplicated. An empty chunk, including `{NULL, 0}`, is a no-op.
+Writing a newly created vector with no additions serializes an empty DV.
 Omitting earlier deletions when replacing a DV would make those rows visible again.
 
 ## Output ownership and errors
@@ -84,16 +92,19 @@ Callbacks must not unwind or re-enter the same writer. If the handle moves betwe
 threads, the output must support those sequential calls.
 
 `dv_writer_finalize` consumes the handle on success or error. `free_dv_writer`
-abandons it without flushing. Invalid input is rejected without changing the
-writer; serialization or output failures make it unusable. Abandon failed output
+abandons it without flushing. `dv_writer_write` consumes the vector on success and
+error, including when the writer pointer is null or the writer has already failed.
+Use `free_deletion_vector` to release a vector abandoned before writing.
+Invalid chunks leave the vector unchanged; serialization or output failures make
+the writer unusable. Abandon failed output
 rather than retrying into a potentially partially written stream. The serializer
 does not upload, publish, or clean up that output.
 
 ## Connector responsibilities
 
 Snapshot lookup, file/row validation, existing-DV reads and merging, path generation,
-and upload remain outside serialization. For example, `{1, 3}` from an existing DV
-plus new deletions `{7}` must be supplied as `{1, 3, 7}`.
+and upload remain outside serialization. For example, add `{1, 3}` from an existing
+DV and `{7}` as a subsequent chunk to obtain the complete vector `{1, 3, 7}`.
 
 After finalization, use the write results and the caller-selected output paths to
 build descriptors with `dv_descriptor_new`, then insert them into a descriptor map.

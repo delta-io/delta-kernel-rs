@@ -82,9 +82,9 @@ mod tests {
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::scan::scan_row_schema;
-    use crate::schema::{schema_ref, ToSchema};
-    use crate::transaction::exec_mode::StagedDataChanges;
+    use crate::schema::{ToSchema, schema_ref};
     use crate::transaction::UpdateTableOperation;
+    use crate::transaction::exec_mode::StagedDataChanges;
     use crate::unit_test_utils::load_test_table;
 
     #[rstest]

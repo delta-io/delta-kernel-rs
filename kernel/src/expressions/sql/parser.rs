@@ -142,8 +142,8 @@ fn expected(what: &str, found: Option<Token>) -> KernelError {
 mod tests {
     use rstest::rstest;
 
-    use super::super::token::{tokenize, Keyword, Token};
-    use super::{parse, CmpOp, Comparison, Operand};
+    use super::super::token::{Keyword, Token, tokenize};
+    use super::{CmpOp, Comparison, Operand, parse};
     use crate::expressions::ColumnName;
 
     fn ident(s: &str) -> Token {

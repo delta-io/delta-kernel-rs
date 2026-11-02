@@ -10,12 +10,12 @@ use url::Url;
 use super::data_skipping::DataSkippingFilter;
 use super::metrics::ScanMetrics;
 use super::state_info::{ResolvedPhysicalStatsSchemas, StateInfo};
-use super::{map_to_struct_options, PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
+use super::{COMMIT_READ_SCHEMA, PhysicalPredicate, ScanMetadata, map_to_struct_options};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
-    col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionRef, Predicate,
-    PredicateRef, UnaryExpressionOp,
+    ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, UnaryExpressionOp, col,
+    column_expr_ref, column_name, null_lit,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
@@ -24,15 +24,15 @@ use crate::log_replay::{
 };
 use crate::log_segment::CheckpointReadInfo;
 use crate::scan::transform_spec::{
-    get_transform_expr, parse_partition_values, FileRowTrackingMetadata, TransformSpec,
+    FileRowTrackingMetadata, TransformSpec, get_transform_expr, parse_partition_values,
 };
 use crate::schema::{
-    lazy_schema_ref, ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
-    StructField, StructType, ToSchema as _,
+    ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder, StructField,
+    StructType, ToSchema as _, lazy_schema_ref,
 };
-use crate::struct_patch::{project_struct_preserving_nulls, ProjectionStructPatchBuilder};
+use crate::struct_patch::{ProjectionStructPatchBuilder, project_struct_preserving_nulls};
 use crate::table_features::ColumnMappingMode;
-use crate::utils::{require, FoldWithOption as _};
+use crate::utils::{FoldWithOption as _, require};
 use crate::{Engine, ExpressionEvaluator, KernelError, KernelResult, KernelResultIterator};
 
 /// Read-time stats toggles consumed by [`ScanLogReplayProcessor`].
@@ -1286,25 +1286,25 @@ pub(crate) fn scan_action_iter(
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use rstest::rstest;
     use url::Url;
 
     use super::{
-        get_add_transform_expr, scan_action_iter, InternalScanState, ScanLogReplayProcessor,
-        ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
+        InternalScanState, ScanLogReplayProcessor, ScanPartitionValuesOptions, ScanStatsOptions,
+        SerializableScanState, get_add_transform_expr, scan_action_iter,
     };
+    use crate::arrow::array::StringArray;
     use crate::arrow::array::cast::AsArray;
     use crate::arrow::array::types::TimestampMicrosecondType;
-    use crate::arrow::array::StringArray;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
-        col, column_name, lit, null_lit, BinaryExpressionOp, Expression, OpaquePredicateOp,
-        Predicate, Scalar, ScalarExpressionEvaluator, UnaryExpressionOp,
+        BinaryExpressionOp, Expression, OpaquePredicateOp, Predicate, Scalar,
+        ScalarExpressionEvaluator, UnaryExpressionOp, col, column_name, lit, null_lit,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -1314,17 +1314,17 @@ mod tests {
     use crate::log_segment::CheckpointReadInfo;
     use crate::metrics::{MetricId, ScanType};
     use crate::scan::state::ScanFile;
-    use crate::scan::state_info::tests::{
-        assert_transform_spec, get_simple_state_info, get_state_info, get_state_info_with_stats,
-        RowTrackingState, ROW_TRACKING_FEATURES,
-    };
     use crate::scan::state_info::StateInfo;
+    use crate::scan::state_info::tests::{
+        ROW_TRACKING_FEATURES, RowTrackingState, assert_transform_spec, get_simple_state_info,
+        get_state_info, get_state_info_with_stats,
+    };
     use crate::scan::test_utils::{
         add_batch_for_row_tracking, add_batch_simple, add_batch_with_partition_col,
         add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
-    use crate::scan::{PhysicalPredicate, StatsOptions, COMMIT_READ_SCHEMA};
-    use crate::schema::{schema_ref, DataType, MetadataColumnSpec, SchemaRef};
+    use crate::scan::{COMMIT_READ_SCHEMA, PhysicalPredicate, StatsOptions};
+    use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, schema_ref};
     use crate::table_features::ColumnMappingMode;
     use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{
@@ -2186,11 +2186,12 @@ mod tests {
             .unwrap();
         let mut blob: serde_json::Value =
             serde_json::from_slice(&state.internal_state_blob).unwrap();
-        assert!(blob
-            .as_object_mut()
-            .unwrap()
-            .remove("dv_normalization_root")
-            .is_some());
+        assert!(
+            blob.as_object_mut()
+                .unwrap()
+                .remove("dv_normalization_root")
+                .is_some()
+        );
         state.internal_state_blob = serde_json::to_vec(&blob).unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(&engine, state).unwrap();
         assert_eq!(deserialized.state_info.dv_normalization_root, None);

@@ -7,13 +7,13 @@
 
 use std::sync::LazyLock;
 
+use crate::KernelResult;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::error::KernelError;
-use crate::expressions::{column_name, ColumnName};
+use crate::expressions::{ColumnName, column_name};
 use crate::schema::{ColumnNamesAndTypes, DataType, DecimalType, PrimitiveType};
 use crate::utils::require;
-use crate::KernelResult;
 
 /// Verifies that add file statistics contain required columns.
 ///

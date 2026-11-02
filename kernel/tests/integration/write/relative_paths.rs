@@ -3,13 +3,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::Snapshot;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
-use delta_kernel::Snapshot;
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::{
     begin_transaction_with, create_table_and_load_snapshot, read_add_infos, test_table_setup,
     write_batch_to_table,
@@ -74,8 +74,8 @@ async fn test_write_uses_relative_paths_and_readback() -> Result<(), Box<dyn std
 }
 
 #[tokio::test]
-async fn test_multiple_files_in_commit_all_use_relative_paths(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_multiple_files_in_commit_all_use_relative_paths()
+-> Result<(), Box<dyn std::error::Error>> {
     let schema = get_simple_schema();
     let (_tmp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
@@ -116,8 +116,8 @@ async fn test_multiple_files_in_commit_all_use_relative_paths(
 }
 
 #[tokio::test]
-async fn test_multiple_commits_with_relative_paths_all_readable(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_multiple_commits_with_relative_paths_all_readable()
+-> Result<(), Box<dyn std::error::Error>> {
     let schema = get_simple_schema();
     let (_tmp_dir, table_path, engine) = test_table_setup()?;
     let mut snapshot =

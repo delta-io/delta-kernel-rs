@@ -67,15 +67,15 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::assert_batches_eq;
     use datafusion::prelude::SessionContext;
+    use delta_kernel::PlanBuilder;
     use delta_kernel::expressions::{
-        col, Expression as KernelExpr, Predicate as KernelPredicate, Scalar as KernelScalar,
+        Expression as KernelExpr, Predicate as KernelPredicate, Scalar as KernelScalar, col,
     };
     use delta_kernel::plans::ir::nodes::{
         Filter as KernelFilter, Project as KernelProject, Values as KernelValues,
     };
     use delta_kernel::plans::ir::plan::PlanNode as KernelPlanNode;
-    use delta_kernel::schema::{schema, DataType, StructField, StructType};
-    use delta_kernel::PlanBuilder;
+    use delta_kernel::schema::{DataType, StructField, StructType, schema};
     use rstest::rstest;
 
     use super::*;

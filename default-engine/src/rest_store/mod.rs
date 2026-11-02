@@ -27,9 +27,9 @@ mod store;
 mod tests;
 
 pub use auth::{
-    headers_from_pairs, AuthHeaderProvider, RefreshingHeaderProvider, StaticHeaderProvider,
+    AuthHeaderProvider, RefreshingHeaderProvider, StaticHeaderProvider, headers_from_pairs,
 };
-pub use client::{build_rest_client, RestClientOptions};
+pub use client::{RestClientOptions, build_rest_client};
 pub use config::RestEndpointConfig;
 // Re-exported so callers can name the header type in `AuthHeaderProvider`'s public API.
 pub use reqwest::header::HeaderMap;

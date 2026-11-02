@@ -33,6 +33,6 @@ pub use clients::{UCDeltaTableClient, UCUpdateTableRestClient};
 pub use config::{ClientConfig, ClientConfigBuilder};
 pub use error::{Error, Result};
 pub use unity_catalog_delta_client_api as api;
+pub use unity_catalog_delta_client_api::UpdateTableClient;
 pub use unity_catalog_delta_client_api::credentials::*;
 pub use unity_catalog_delta_client_api::models::*;
-pub use unity_catalog_delta_client_api::UpdateTableClient;
