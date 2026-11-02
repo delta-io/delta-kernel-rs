@@ -37,7 +37,8 @@ pub enum UpdateTableOperation {
     /// An operation name recorded verbatim in commit history and successful transaction metrics.
     ///
     /// The name must be nonempty and must not exactly match a typed operation's name or a reserved
-    /// create/replace-table name. This comparison is case-sensitive. Kernel does not infer
+    /// operation name. `REORG` is reserved for log replay and cannot be used for custom
+    /// transactions. This comparison is case-sensitive. Kernel does not infer
     /// built-in operation semantics from the name, but all other transaction and protocol
     /// checks still apply. Custom operations do not qualify for incremental version checksum
     /// construction.
@@ -126,7 +127,9 @@ impl From<UpdateTableOperation> for CommitOperation {
     }
 }
 
-const RESERVED_TABLE_OPERATION_NAMES: &[&str] = &[
+const RESERVED_OPERATION_NAMES: &[&str] = &[
+    // Replay trusts REORG's file accounting, so custom transactions cannot use its name.
+    "REORG",
     "CREATE TABLE",
     "REPLACE TABLE",
     "CREATE TABLE AS SELECT",
@@ -139,11 +142,9 @@ fn validate_custom_name(name: &str) -> Result<(), String> {
         return Err("custom operation name cannot be empty".to_string());
     }
     if UpdateTableOperation::iter().any(|operation| operation.as_str() == name)
-        || RESERVED_TABLE_OPERATION_NAMES.contains(&name)
+        || RESERVED_OPERATION_NAMES.contains(&name)
     {
-        return Err(format!(
-            "custom operation name '{name}' is reserved; use the matching transaction builder or typed update-table operation"
-        ));
+        return Err(format!("custom operation name '{name}' is reserved"));
     }
     Ok(())
 }
@@ -197,6 +198,7 @@ mod tests {
             .map(|operation| operation.as_str().to_owned())
             .chain(
                 [
+                    "REORG",
                     "CREATE TABLE",
                     "REPLACE TABLE",
                     "CREATE TABLE AS SELECT",
@@ -221,7 +223,7 @@ mod tests {
 
     #[test]
     fn custom_name_validation_is_case_sensitive_and_preserves_whitespace() {
-        for name in ["write", "Write", " WRITE ", "INSERT"] {
+        for name in ["write", "Write", " WRITE ", "reorg", " REORG ", "INSERT"] {
             let operation = UpdateTableOperation::Custom(name.to_string());
             assert!(operation.validate().is_ok());
             assert_eq!(operation.as_str(), name);
