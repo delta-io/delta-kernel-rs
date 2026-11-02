@@ -1,15 +1,15 @@
 //! IcebergCompatV2 checks.
 
 use super::{
-    check_no_legacy_nested_ids, check_only_supported_types, IcebergCompatCheck,
-    IcebergCompatValidator, IcebergCompatVersion,
+    IcebergCompatCheck, IcebergCompatValidator, IcebergCompatVersion, check_no_legacy_nested_ids,
+    check_only_supported_types,
 };
+use crate::KernelResult;
 use crate::schema::DataType;
 use crate::schema::PrimitiveType::*;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::transforms::SchemaTransform as _;
-use crate::KernelResult;
 
 /// V2 invariants paired with the version constant. Fed to
 /// [`super::validate_iceberg_compat_if_needed`].
@@ -85,8 +85,8 @@ mod tests {
 
     use super::*;
     use crate::schema::{
-        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
-        StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        schema,
     };
     use crate::table_configuration::TableConfiguration;
     use crate::table_features::TableFeature;

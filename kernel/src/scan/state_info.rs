@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use tracing::{debug, enabled, warn, Level};
+use tracing::{Level, debug, enabled, warn};
 use url::Url;
 
 use crate::actions::NULL_COUNT;
@@ -14,7 +14,7 @@ use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, StructStats};
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, TableFeature};
+use crate::table_features::{ColumnMappingMode, TableFeature, get_any_level_column_physical_name};
 use crate::{KernelError, KernelResult, PredicateRef, StructField};
 
 /// Resolved physical statistics schemas for a scan.
@@ -445,7 +445,7 @@ impl StateInfo {
                         let Some(row_id_col_name) = metadata_info.materialized_row_id_column_name
                         else {
                             return Err(KernelError::internal_error(
-                                "Should always return a materialized_row_id_column_name if selecting row ids"
+                                "Should always return a materialized_row_id_column_name if selecting row ids",
                             ));
                         };
 
@@ -492,7 +492,8 @@ impl StateInfo {
                         {
                             return Err(KernelError::Schema(format!(
                                 "Metadata column names must not match physical columns, but logical column '{}' has physical name '{}'",
-                                logical_field.name(), physical_name,
+                                logical_field.name(),
+                                physical_name,
                             )));
                         }
                         last_physical_field = Some(physical_name);
@@ -683,24 +684,26 @@ pub(crate) mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::KernelResult;
     use crate::actions::{MAX_VALUES, MIN_VALUES};
-    use crate::expressions::{col, column_name, lit, Predicate as Pred};
+    use crate::expressions::{Predicate as Pred, col, column_name, lit};
     #[cfg(feature = "geo-type-in-dev")]
     use crate::scan::build_stats_output_schemas;
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::GeometryType;
-    use crate::schema::{schema, schema_ref, ColumnMetadataKey, MetadataValue};
+    use crate::schema::{ColumnMetadataKey, MetadataValue, schema, schema_ref};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{
-        assert_result_error_with_message, MockProtocolBuilder, MockTableConfigurationBuilder,
+        MockProtocolBuilder, MockTableConfigurationBuilder, assert_result_error_with_message,
     };
-    use crate::KernelResult;
 
     #[test]
     fn stats_schemas_can_both_be_absent() {
-        assert!(ResolvedPhysicalStatsSchemas::try_new(None, None)
-            .unwrap()
-            .is_none());
+        assert!(
+            ResolvedPhysicalStatsSchemas::try_new(None, None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1388,7 +1391,7 @@ pub(crate) mod tests {
         );
         assert_result_error_with_message(
             res,
-            "Schema error: Metadata column names must not match physical columns, but logical column 'id' has physical name 'other'"
+            "Schema error: Metadata column names must not match physical columns, but logical column 'id' has physical name 'other'",
         );
     }
 
@@ -1781,18 +1784,24 @@ pub(crate) mod tests {
                 }
             }
         }
-        assert!(output
-            .logical
-            .field_at(&column_name!("nullCount.part"))
-            .is_err());
+        assert!(
+            output
+                .logical
+                .field_at(&column_name!("nullCount.part"))
+                .is_err()
+        );
         // Scan requests do not change the default schema used by writers and other callers.
         let default_schema = config.stats_schema_builder().build().unwrap();
-        assert!(default_schema
-            .field_at(&column_name!("minValues.g"))
-            .is_err());
-        assert!(default_schema
-            .field_at(&column_name!("minValues.phys_g"))
-            .is_err());
+        assert!(
+            default_schema
+                .field_at(&column_name!("minValues.g"))
+                .is_err()
+        );
+        assert!(
+            default_schema
+                .field_at(&column_name!("minValues.phys_g"))
+                .is_err()
+        );
     }
 
     // === eligible_physical_stats_columns trims the predicate-derived stats schema ===
@@ -1955,9 +1964,11 @@ pub(crate) mod tests {
         .unwrap();
         assert!(state_info.physical_stats_read_schema().is_none());
         assert!(!state_info.eligible_physical_stats_columns.is_empty());
-        assert!(!state_info
-            .eligible_physical_stats_columns
-            .contains(&column_name!("s.c")));
+        assert!(
+            !state_info
+                .eligible_physical_stats_columns
+                .contains(&column_name!("s.c"))
+        );
     }
 
     /// `delta.dataSkippingStatsColumns` selects exactly the listed leaves, regardless of
@@ -2171,9 +2182,11 @@ pub(crate) mod tests {
             .physical_stats_read_schema()
             .expect("stats schema present because c4 is extra_indexed");
         assert_stats_leaves(stats_schema, &["c4"], &[]);
-        assert!(state_info
-            .eligible_physical_stats_columns
-            .contains(&column_name!("c4")));
+        assert!(
+            state_info
+                .eligible_physical_stats_columns
+                .contains(&column_name!("c4"))
+        );
     }
 
     #[test]
@@ -2213,9 +2226,11 @@ pub(crate) mod tests {
                 "s.d (extra_indexed, past cap) present"
             );
         }
-        assert!(state_info
-            .eligible_physical_stats_columns
-            .contains(&column_name!("s.d")));
+        assert!(
+            state_info
+                .eligible_physical_stats_columns
+                .contains(&column_name!("s.d"))
+        );
     }
 
     #[test]
@@ -2240,12 +2255,16 @@ pub(crate) mod tests {
             StatsOptions::all_struct_with_extra_indexed(vec![column_name!("s")]),
         )
         .unwrap();
-        assert!(state_info
-            .eligible_physical_stats_columns
-            .contains(&column_name!("s.c")));
-        assert!(state_info
-            .eligible_physical_stats_columns
-            .contains(&column_name!("s.d")));
+        assert!(
+            state_info
+                .eligible_physical_stats_columns
+                .contains(&column_name!("s.c"))
+        );
+        assert!(
+            state_info
+                .eligible_physical_stats_columns
+                .contains(&column_name!("s.d"))
+        );
         assert!(
             !state_info
                 .eligible_physical_stats_columns
@@ -2281,8 +2300,10 @@ pub(crate) mod tests {
             .physical_stats_read_schema()
             .expect("stats schema present");
         assert_stats_leaves(stats_schema, &["phys_a", "phys_c"], &["col_c", "phys_b"]);
-        assert!(state_info
-            .eligible_physical_stats_columns
-            .contains(&column_name!("phys_c")));
+        assert!(
+            state_info
+                .eligible_physical_stats_columns
+                .contains(&column_name!("phys_c"))
+        );
     }
 }

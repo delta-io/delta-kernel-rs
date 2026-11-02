@@ -8,8 +8,8 @@ use crate::expressions::{
     VariadicExpression,
 };
 use crate::transforms::{
-    map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, transform_output_type,
-    Carrier,
+    Carrier, map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else,
+    transform_output_type,
 };
 use crate::{KernelError, KernelResult};
 
@@ -567,15 +567,15 @@ mod tests {
     use super::*;
     use crate::expressions::VariadicExpressionOp::Coalesce;
     use crate::expressions::{
-        col, column_name, column_pred, lit, Expression, Expression as Expr, MapToStructOptions,
-        OpaqueExpressionOp, OpaquePredicateOp, ParseJsonExpression, Predicate as Pred, Scalar,
-        ScalarExpressionEvaluator, VariadicExpression,
+        Expression, Expression as Expr, MapToStructOptions, OpaqueExpressionOp, OpaquePredicateOp,
+        ParseJsonExpression, Predicate as Pred, Scalar, ScalarExpressionEvaluator,
+        VariadicExpression, col, column_name, column_pred, lit,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
         IndirectDataSkippingPredicateEvaluator,
     };
-    use crate::schema::{schema_ref, DataType, StructType};
+    use crate::schema::{DataType, StructType, schema_ref};
 
     #[derive(Debug, PartialEq)]
     struct OpaqueTestOp(String);

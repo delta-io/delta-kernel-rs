@@ -154,7 +154,7 @@ pub(crate) fn parse_clustering_columns(json_str: &str) -> KernelResult<Vec<Colum
 mod tests {
     use super::*;
     use crate::expressions::column_name;
-    use crate::schema::{schema, DataType, StructField};
+    use crate::schema::{DataType, StructField, schema};
 
     #[rstest::rstest]
     #[case::simple(
@@ -199,10 +199,12 @@ mod tests {
         let columns = vec![column_name!("nonexistent")];
         let result = validate_clustering_columns(&schema, &columns);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not found in schema"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not found in schema")
+        );
     }
 
     #[test]
@@ -244,10 +246,12 @@ mod tests {
         let columns = vec![column_name!("flat_col", "child")];
         let result = validate_clustering_columns(&schema, &columns);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("is not a struct type"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("is not a struct type")
+        );
     }
 
     #[test]
@@ -260,10 +264,12 @@ mod tests {
         let columns = vec![column_name!("parent", "nonexistent")];
         let result = validate_clustering_columns(&schema, &columns);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not found in schema"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not found in schema")
+        );
     }
 
     #[test]

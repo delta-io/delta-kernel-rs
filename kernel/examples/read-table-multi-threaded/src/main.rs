@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 use std::sync::mpsc::Sender;
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 
 use clap::Parser;
@@ -10,7 +10,7 @@ use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-use delta_kernel::scan::state::{transform_to_logical, DvInfo, ScanFile};
+use delta_kernel::scan::state::{DvInfo, ScanFile, transform_to_logical};
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{Engine, ExpressionRef, FileMeta, KernelResult, Snapshot};
 use url::Url;

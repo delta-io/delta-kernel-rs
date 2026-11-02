@@ -9,7 +9,7 @@ use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::metrics::{MetricEvent, MetricsReporter, TableType, TransactionCommitSuccess};
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::schema::{schema_ref, DataType, StructField};
+use delta_kernel::schema::{DataType, StructField, schema_ref};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel::{KernelResult, Snapshot};

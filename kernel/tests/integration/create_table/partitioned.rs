@@ -2,12 +2,12 @@
 //!
 //! TODO(#2201): Add end-to-end tests for insert + scan + checkpoint on partitioned tables.
 
+use delta_kernel::KernelResult;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::KernelResult;
 use rstest::rstest;
 use test_utils::test_table_setup;
 

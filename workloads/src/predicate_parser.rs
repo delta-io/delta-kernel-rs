@@ -46,8 +46,8 @@ use bigdecimal::BigDecimal;
 // - K-prefix: Kernel types (KExpr, KPred, KBinOp, KPredOp)
 // - P-prefix: Parser/sqlparser types (PExpr, PBinOp, PUnaryOp, PVal)
 use delta_kernel::expressions::{
-    lit, null_lit, ArrayData, BinaryExpressionOp as KBinOp, BinaryPredicateOp as KPredOp,
-    ColumnName, Expression as KExpr, Predicate as KPred, Scalar,
+    ArrayData, BinaryExpressionOp as KBinOp, BinaryPredicateOp as KPredOp, ColumnName,
+    Expression as KExpr, Predicate as KPred, Scalar, lit, null_lit,
 };
 use delta_kernel::schema::{ArrayType, DataType, DecimalType, PrimitiveType, Schema};
 use itertools::Itertools as _;
@@ -377,7 +377,7 @@ fn synthesize_binary_exprs(
         }
         (Some((_, ty)), None) | (None, Some((_, ty))) => ty.clone(),
         (None, None) => {
-            return Err(format!("Cannot determine types for: {left:?} and {right:?}").into())
+            return Err(format!("Cannot determine types for: {left:?} and {right:?}").into());
         }
     };
 
@@ -518,9 +518,9 @@ fn between_to_pred(
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::expressions::col;
     use delta_kernel::expressions::Scalar::*;
-    use delta_kernel::schema::{schema, Schema, StructField};
+    use delta_kernel::expressions::col;
+    use delta_kernel::schema::{Schema, StructField, schema};
     use rstest::rstest;
 
     use super::*;
@@ -1025,10 +1025,12 @@ mod tests {
         let schema = test_schema();
         let result = parse_predicate("unknown_col < 500", &schema);
         assert!(result.is_err(), "Unknown columns should produce an error");
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Cannot determine type"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot determine type")
+        );
     }
 
     #[test]
@@ -1037,10 +1039,12 @@ mod tests {
         let schema = test_schema();
         let result = parse_predicate("5 > 3", &schema);
         assert!(result.is_err(), "Literal-only comparisons should fail");
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Cannot determine types"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot determine types")
+        );
     }
 
     // IN list with NULL values (tests ArrayType nullability)

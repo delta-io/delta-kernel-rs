@@ -6,10 +6,10 @@
 //! - 0-byte checkpoint files are skipped, falling back to an older checkpoint
 //! - 0-byte CRC files are skipped (CRC is optional)
 
-use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::schema::{schema_ref, SchemaRef};
 use delta_kernel::Snapshot;
+use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::schema::{SchemaRef, schema_ref};
 use test_utils::{add_commit, compacted_log_path_for_versions, create_table, engine_store_setup};
 
 fn simple_schema() -> SchemaRef {

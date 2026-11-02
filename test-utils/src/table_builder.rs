@@ -55,7 +55,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
     StructArray, TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::buffer::NullBuffer;
@@ -68,16 +68,16 @@ use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, Error as ObjectStoreError, ObjectStoreExt as _};
-use delta_kernel::schema::{schema_ref, DataType, PrimitiveType, SchemaRef, StructType};
+use delta_kernel::schema::{DataType, PrimitiveType, SchemaRef, StructType, schema_ref};
 use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Engine, KernelResult, Snapshot};
+use delta_kernel_default_engine::executor::TaskExecutor;
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
-use delta_kernel_default_engine::executor::TaskExecutor;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 
 // ===========================================================================
@@ -1892,8 +1892,8 @@ pub(crate) fn default_schema() -> SchemaRef {
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStore;
+    use delta_kernel::object_store::path::Path;
     use rstest::rstest;
 
     use super::*;

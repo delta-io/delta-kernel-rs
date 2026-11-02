@@ -17,7 +17,7 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::{ADD_NAME, STATS_PARSED as STATS_PARSED_FIELD};
 use crate::expressions::{
-    col, column_name, Expression, ExpressionRef, MapToStructOptions, UnaryExpressionOp,
+    Expression, ExpressionRef, MapToStructOptions, UnaryExpressionOp, col, column_name,
 };
 use crate::schema::{DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType};
 use crate::struct_patch::ProjectionStructPatchBuilder;
@@ -294,7 +294,7 @@ mod tests {
     use super::*;
     use crate::actions::NUM_RECORDS;
     use crate::expressions::ExpressionStructPatch;
-    use crate::schema::{schema, schema_ref, MapType};
+    use crate::schema::{MapType, schema, schema_ref};
 
     #[test]
     fn test_config_defaults() {

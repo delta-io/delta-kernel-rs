@@ -163,11 +163,11 @@ mod tests {
     use roaring::RoaringTreemap;
 
     use super::resolve_scan_file_dv;
+    use crate::KernelError;
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::engine::sync::SyncEngine;
     use crate::scan::state::DvInfo;
     use crate::table_changes::scan_file::{CdfScanFile, CdfScanFileType};
-    use crate::KernelError;
 
     fn treemap_to_dv_descriptor(map: RoaringTreemap) -> DeletionVectorDescriptor {
         let buf = Vec::new();

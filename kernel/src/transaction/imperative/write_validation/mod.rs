@@ -7,8 +7,8 @@ mod dv;
 mod removefile;
 mod utils;
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 pub(super) use addfile::{validate_add_files, validate_no_clustering_providers_set};
 use derive_more::Constructor;
@@ -93,7 +93,7 @@ impl FileActionUniquenessValidator {
 /// A single row-level validation.
 pub(crate) trait Validation {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>])
-        -> KernelResult<()>;
+    -> KernelResult<()>;
 }
 
 /// Runs validations over batches that share one staged-data schema.

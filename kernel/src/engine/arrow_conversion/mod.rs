@@ -546,7 +546,7 @@ fn collect_nested_field_ids_from_arrow(
             other => {
                 return Err(ArrowError::SchemaError(format!(
                     "Map entries must be a struct with exactly 2 fields (key, value), got {other}"
-                )))
+                )));
             }
         },
         // Dictionary is a transparent wrapper (kernel side collapses it to its value type), so
@@ -686,24 +686,24 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::KernelResult;
     use crate::engine::arrow_conversion::ArrowField;
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-    use crate::schema::collation_utils::validate_collation_annotations;
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::EdgeInterpolationAlgorithm;
+    use crate::schema::collation_utils::validate_collation_annotations;
     use crate::schema::{
-        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType,
-        StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
+        StructType, schema,
     };
-    use crate::transforms::{transform_output_type, SchemaTransform};
+    use crate::transforms::{SchemaTransform, transform_output_type};
     use crate::unit_test_utils::{
         array_in_map_kernel_schema, assert_result_error_with_message, collect_arrow_field_metadata,
         complex_nested_with_field_ids,
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::unit_test_utils::{geography_type, geometry_type};
-    use crate::KernelResult;
 
     #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
@@ -760,10 +760,12 @@ mod tests {
     fn invalid_arrow_collation_json_is_rejected() {
         let field = ArrowField::new("field", ArrowDataType::Utf8, true)
             .with_metadata(HashMap::from([("__COLLATIONS".into(), "{invalid".into())]));
-        assert!(StructField::try_from_arrow(&field)
-            .unwrap_err()
-            .to_string()
-            .contains("__COLLATIONS"));
+        assert!(
+            StructField::try_from_arrow(&field)
+                .unwrap_err()
+                .to_string()
+                .contains("__COLLATIONS")
+        );
     }
 
     // Delta tables can have void columns. The kernel should parse them and convert
@@ -883,10 +885,12 @@ mod tests {
             StructField::nullable("typed_value", DataType::INTEGER),
         ])?;
         let shredded_variant_arrow = ArrowDataType::try_from_kernel(&shredded_variant);
-        assert!(shredded_variant_arrow
-            .unwrap_err()
-            .to_string()
-            .contains("Incorrect Variant Schema"));
+        assert!(
+            shredded_variant_arrow
+                .unwrap_err()
+                .to_string()
+                .contains("Incorrect Variant Schema")
+        );
         Ok(())
     }
 
@@ -1163,9 +1167,11 @@ mod tests {
             .try_into_kernel()
             .unwrap();
         let array_in_map = kernel_schema.fields().next().unwrap();
-        assert!(!array_in_map
-            .metadata()
-            .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref()));
+        assert!(
+            !array_in_map
+                .metadata()
+                .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref())
+        );
     }
 
     /// A non-integer `PARQUET:field_id` on an inner list/map field must produce a clear error

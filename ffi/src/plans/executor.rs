@@ -11,7 +11,7 @@ use prost::Message as _;
 use crate::error::EngineExecResult;
 use crate::plans::iter::{FfiBytesIter, FfiEngineDataIter, FfiFileMetaIter};
 use crate::plans::result::{CParquetFooter, CPlanResult};
-use crate::{kernel_bytes_slice, KernelBytesSlice, NullableCvoid};
+use crate::{KernelBytesSlice, NullableCvoid, kernel_bytes_slice};
 
 /// A shared (`Arc`-like) handle to an [`PlanExecutor`].
 #[handle_descriptor(target=dyn PlanExecutor, mutable=false)]
@@ -63,14 +63,15 @@ impl PlanExecutor for FfiPlanExecutor {
 
         let mut out = EngineExecResult::Uninit;
         (self.callback)(self.context, plan_proto_slice, &mut out);
-        let plan_result =
-            match out {
-                EngineExecResult::Success(plan) => plan,
-                EngineExecResult::Failure(err) => return Err(err.into()),
-                EngineExecResult::Uninit => return Err(KernelError::internal_error(
+        let plan_result = match out {
+            EngineExecResult::Success(plan) => plan,
+            EngineExecResult::Failure(err) => return Err(err.into()),
+            EngineExecResult::Uninit => {
+                return Err(KernelError::internal_error(
                     "FFI engine returned from execute_op upcall without writing the plan result",
-                )),
-            };
+                ));
+            }
+        };
         match plan_result {
             CPlanResult::Unit => Ok(PlanResult::Unit),
             CPlanResult::Data(it) => Ok(PlanResult::Data(Box::new(FfiEngineDataIter::new(it)))),
@@ -106,10 +107,10 @@ mod tests {
     use std::ptr::NonNull;
     use std::sync::{Arc, Mutex};
 
+    use delta_kernel::KernelError;
     use delta_kernel::arrow::array::ffi::FFI_ArrowArray;
     use delta_kernel::plans::proto::{operation as proto, schema as proto_schema};
-    use delta_kernel::schema::{schema, DataType as KernelDataType};
-    use delta_kernel::KernelError;
+    use delta_kernel::schema::{DataType as KernelDataType, schema};
     use prost::Message;
     use url::Url;
 
@@ -120,8 +121,8 @@ mod tests {
     use crate::plans::iter::{CBytesIterator, CEngineDataIterator, CFileMetaIterator};
     use crate::plans::result::CParquetFooter;
     use crate::{
-        allocate_kernel_bytes, kernel_bytes_slice, ExclusiveEngineData, ExclusiveRustString,
-        OptionalValue,
+        ExclusiveEngineData, ExclusiveRustString, OptionalValue, allocate_kernel_bytes,
+        kernel_bytes_slice,
     };
 
     extern "C" fn noop_free(_state: NullableCvoid) {}

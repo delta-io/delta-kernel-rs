@@ -38,7 +38,7 @@ use url::Url;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector};
-use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, column_name};
 use crate::utils::require;
 use crate::{KernelError, KernelResult, KernelResultIterator};
 
@@ -695,9 +695,9 @@ mod tests {
     use itertools::Itertools;
 
     use super::*;
+    use crate::KernelError;
     use crate::arrow::array::StringArray;
     use crate::unit_test_utils::{action_batch, parse_json_batch};
-    use crate::KernelError;
 
     /// Helper function to create test batches from JSON strings
     fn create_batch(json_strings: Vec<&str>) -> KernelResult<ActionsBatch> {
@@ -776,8 +776,8 @@ mod tests {
     /// - Remove actions with deletionTimestamp > minimumFileRetentionTimestamp (should be included)
     /// - Remove actions with missing deletionTimestamp (defaults to 0, should be excluded)
     #[test]
-    fn test_action_reconciliation_visitor_boundary_cases_for_tombstone_expiration(
-    ) -> KernelResult<()> {
+    fn test_action_reconciliation_visitor_boundary_cases_for_tombstone_expiration()
+    -> KernelResult<()> {
         let json_strings: StringArray = vec![
             r#"{"remove":{"path":"exactly_at_threshold","deletionTimestamp":100,"dataChange":true,"partitionValues":{}}}"#,
             r#"{"remove":{"path":"one_below_threshold","deletionTimestamp":99,"dataChange":true,"partitionValues":{}}}"#,
@@ -1045,7 +1045,7 @@ mod tests {
 
         // Verify results
         assert_eq!(results.len(), 2); // The third batch should be filtered out since there are no
-                                      // selected actions
+        // selected actions
         assert_eq!(results[0].selection_vector(), &vec![true]);
         assert_eq!(results[1].selection_vector(), &vec![false, true]);
         assert_eq!(actions_count, 2);
@@ -1057,8 +1057,8 @@ mod tests {
     /// This test ensures that the processor correctly deduplicates and filters
     /// file actions (add, remove) with deletion vectors across multiple batches.
     #[test]
-    fn test_action_reconciliation_actions_iter_file_actions_with_deletion_vectors(
-    ) -> KernelResult<()> {
+    fn test_action_reconciliation_actions_iter_file_actions_with_deletion_vectors()
+    -> KernelResult<()> {
         // Batch 1: add actions with deletion vectors
         let batch1 = vec![
             // (file1, DV_ONE) New, should be included
@@ -1137,8 +1137,8 @@ mod tests {
     // the app_id must be dropped entirely: the expired newest suppresses the older duplicate, and
     // neither reaches the checkpoint. Guards against resurrecting the older txn (a stale winner).
     #[test]
-    fn test_action_reconciliation_expired_newest_txn_suppresses_older_txn_for_same_app(
-    ) -> KernelResult<()> {
+    fn test_action_reconciliation_expired_newest_txn_suppresses_older_txn_for_same_app()
+    -> KernelResult<()> {
         let json_strings: StringArray = vec![
             // Newest for "app" (visited first), expired.
             r#"{"txn":{"appId":"app","version":2,"lastUpdated":500}}"#,
@@ -1348,10 +1348,12 @@ mod tests {
         let getters = vec![&getter as &dyn GetData<'_>; 5]; // Wrong count (should be 15)!
         let result = visitor.visit(1, &getters);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Wrong number of visitor getters"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Wrong number of visitor getters")
+        );
 
         // Test 2: Basic type mismatch errors using parameterized approach
         let test_cases = [
@@ -1377,10 +1379,12 @@ mod tests {
                 getters.iter().map(|g| g as &dyn GetData<'_>).collect();
             let result = visitor.visit(1, &getter_refs);
             assert!(result.is_err(), "Expected error for {field_name}");
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains(expected_error_text));
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected_error_text)
+            );
         }
     }
 
@@ -1437,10 +1441,12 @@ mod tests {
         getters.extend(defaults2.iter().map(|g| g as &dyn GetData<'_>));
         let result = visitor.visit(1, &getters);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("deletionTimestamp is not of type i64"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("deletionTimestamp is not of type i64")
+        );
     }
 
     #[test]

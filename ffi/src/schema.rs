@@ -7,7 +7,7 @@ use crate::delta_types::FfiNullableStringMap;
 use crate::delta_types::FfiNullableStringMapEntry;
 use crate::handle::Handle;
 use crate::scan::CMetadataMap;
-use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
+use crate::{KernelStringSlice, SharedSchema, kernel_string_slice};
 
 /// The `EngineSchemaVisitor` defines a visitor system to allow engines to build their own
 /// representation of a schema from a particular schema within kernel.

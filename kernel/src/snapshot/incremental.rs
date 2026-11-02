@@ -11,8 +11,8 @@ use super::{IncrementalReplay, PreparedSnapshot, Snapshot};
 use crate::log_segment::{LogSegment, PmResolution};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
-    emit_log_segment_load, emit_log_segment_load_failure, emit_protocol_metadata_load,
-    emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
+    SnapshotLoadMetricContext, emit_log_segment_load, emit_log_segment_load_failure,
+    emit_protocol_metadata_load, emit_protocol_metadata_load_failure,
 };
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
@@ -584,7 +584,7 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
     use test_utils::table_builder::TestTableBuilder;
-    use test_utils::{delta_path_for_version, LoggingTest};
+    use test_utils::{LoggingTest, delta_path_for_version};
     use url::Url;
 
     use super::*;
@@ -597,13 +597,13 @@ mod tests {
         LogSegmentLoadSuccess, LogSegmentLoadType, MetricEvent, MetricId,
         ProtocolMetadataLoadSuccess, ProtocolMetadataSource,
     };
-    use crate::object_store::memory::InMemory;
     use crate::object_store::ObjectStoreExt as _;
+    use crate::object_store::memory::InMemory;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::LogPathFileType;
-    use crate::snapshot::{commit, CheckpointWriteResult};
+    use crate::snapshot::{CheckpointWriteResult, commit};
     use crate::unit_test_utils::{
-        install_thread_local_metrics_reporter, string_array_to_engine_data, CapturingReporter,
+        CapturingReporter, install_thread_local_metrics_reporter, string_array_to_engine_data,
     };
     use crate::{Engine, KernelResult};
 
@@ -918,8 +918,8 @@ mod tests {
     // ============================================================================
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_skip_new_checkpoints_preserves_checkpoint_history_across_updates(
-    ) -> KernelResult<()> {
+    async fn test_skip_new_checkpoints_preserves_checkpoint_history_across_updates()
+    -> KernelResult<()> {
         // ===== GIVEN =====
         let ctx = setup_incremental_snapshot_test()?;
         let table_root = ctx.url.as_str();
@@ -1099,9 +1099,11 @@ mod tests {
             .expect_err("an incremental update cannot move backward");
 
         // ===== THEN =====
-        assert!(older
-            .to_string()
-            .contains("older than snapshot hint version"));
+        assert!(
+            older
+                .to_string()
+                .contains("older than snapshot hint version")
+        );
 
         // ===== WHEN =====
         let unavailable = Snapshot::builder_from(base.clone())
@@ -1215,8 +1217,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_skip_new_checkpoints_rejects_missing_history_hidden_by_newer_checkpoint(
-    ) -> KernelResult<()> {
+    async fn test_skip_new_checkpoints_rejects_missing_history_hidden_by_newer_checkpoint()
+    -> KernelResult<()> {
         // ===== GIVEN =====
         let ctx = setup_incremental_snapshot_test()?;
         let table_root = ctx.url.as_str();
@@ -1255,8 +1257,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_snapshot_picks_up_checkpoint_written_at_current_version(
-    ) -> KernelResult<()> {
+    async fn test_incremental_snapshot_picks_up_checkpoint_written_at_current_version()
+    -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
 
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 2).await?;
@@ -1281,8 +1283,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_snapshot_picks_up_newer_checkpoint_below_current_version(
-    ) -> KernelResult<()> {
+    async fn test_incremental_snapshot_picks_up_newer_checkpoint_below_current_version()
+    -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
 
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
@@ -1315,8 +1317,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_explicit_same_version_request_keeps_existing_snapshot_after_checkpoint_write(
-    ) -> KernelResult<()> {
+    async fn test_explicit_same_version_request_keeps_existing_snapshot_after_checkpoint_write()
+    -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
 
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 2).await?;
@@ -1349,8 +1351,8 @@ mod tests {
     /// since v1 >= listing_start). The P&M change at commit 2 lies between the new checkpoint (v1)
     /// and existing_snapshot_version (v3); the incremental update must preserve it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_at_or_below_snapshot_version_preserves_pm_from_commits_in_between(
-    ) -> KernelResult<()> {
+    async fn test_checkpoint_at_or_below_snapshot_version_preserves_pm_from_commits_in_between()
+    -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         let table_root = ctx.url.as_str();
 
@@ -1812,8 +1814,8 @@ mod tests {
     // rebuild would return Metadata from commit 2. `compare_snapshots` catches that on
     // `table_configuration`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_snapshot_drops_stale_crc_preserves_correct_metadata(
-    ) -> KernelResult<()> {
+    async fn test_incremental_snapshot_drops_stale_crc_preserves_correct_metadata()
+    -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         let table_root = ctx.url.as_str();
 
@@ -1900,8 +1902,8 @@ mod tests {
     // P+M-replay path). The pruned replay on commits > v3 is empty, so without the skip
     // it would fall back to CRC@v1 and regress to the pre-v2 configuration.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_snapshot_preserves_metadata_when_below_checkpoint_crc_is_stale(
-    ) -> KernelResult<()> {
+    async fn test_incremental_snapshot_preserves_metadata_when_below_checkpoint_crc_is_stale()
+    -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         let table_root = ctx.url.as_str();
 
@@ -1985,8 +1987,8 @@ mod tests {
     // Verifies that a CRC carried through the v5 hop is dropped when the new checkpoint
     // invalidates it, so the rebuilt v10 snapshot has no CRC.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_snapshot_multi_hop_replay_then_rebuild_drops_stale_crc(
-    ) -> KernelResult<()> {
+    async fn test_incremental_snapshot_multi_hop_replay_then_rebuild_drops_stale_crc()
+    -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 11).await?;
 
@@ -2203,11 +2205,13 @@ mod tests {
             .at_version(2)
             .build(&engine)?;
         assert_eq!(snapshot_v2.version(), 2);
-        assert!(snapshot_v2
-            .log_segment
-            .listed
-            .ascending_compaction_files
-            .is_empty());
+        assert!(
+            snapshot_v2
+                .log_segment
+                .listed
+                .ascending_compaction_files
+                .is_empty()
+        );
 
         // Add commit 3
         commit(
@@ -2223,11 +2227,13 @@ mod tests {
             .at_version(3)
             .build(&engine)?;
         assert_eq!(snapshot_v3.version(), 3);
-        assert!(snapshot_v3
-            .log_segment
-            .listed
-            .ascending_compaction_files
-            .is_empty());
+        assert!(
+            snapshot_v3
+                .log_segment
+                .listed
+                .ascending_compaction_files
+                .is_empty()
+        );
 
         Ok(())
     }
@@ -2647,8 +2653,8 @@ mod tests {
     // Case C.1: requesting a version beyond the log errors and emits a LogSegmentLoadFailure,
     // matching the fresh path (which also fails a request for an unavailable version).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_unavailable_version_emits_log_segment_load_failure(
-    ) -> KernelResult<()> {
+    async fn test_incremental_unavailable_version_emits_log_segment_load_failure()
+    -> KernelResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?; // v0..=v2
         let base = Snapshot::builder_for(ctx.url.as_str())

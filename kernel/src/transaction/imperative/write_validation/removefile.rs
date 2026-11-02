@@ -3,8 +3,8 @@
 use std::sync::LazyLock;
 
 use super::utils::{
-    columns_and_types_from_schema, dv_id_at, validate_required_field_exist, DELETION_VECTOR_NAME,
-    OFFSET_NAME, PATH_OR_INLINE_DV_NAME, STORAGE_TYPE_NAME,
+    DELETION_VECTOR_NAME, OFFSET_NAME, PATH_OR_INLINE_DV_NAME, STORAGE_TYPE_NAME,
+    columns_and_types_from_schema, dv_id_at, validate_required_field_exist,
 };
 use super::{FileActionUniquenessValidator, StagedDataValidator, Validation};
 use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
@@ -127,7 +127,7 @@ mod tests {
     use test_utils::{deletion_vector_array, replace_column};
 
     use super::*;
-    use crate::arrow::array::{new_null_array, ArrayRef, Int64Array, StringArray};
+    use crate::arrow::array::{ArrayRef, Int64Array, StringArray, new_null_array};
     use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::arrow::record_batch::RecordBatch;
@@ -185,11 +185,13 @@ mod tests {
         } else {
             let batch =
                 nullable_staged_remove_files(&["same", "same"], &[Some("dv-1"), Some("dv-2")]);
-            vec![FilteredEngineData::try_new(
-                Box::new(ArrowEngineData::new(batch)),
-                selection_vector.to_vec(),
-            )
-            .expect("selection vector length should match staged RemoveFile row count")]
+            vec![
+                FilteredEngineData::try_new(
+                    Box::new(ArrowEngineData::new(batch)),
+                    selection_vector.to_vec(),
+                )
+                .expect("selection vector length should match staged RemoveFile row count"),
+            ]
         };
         let result = validate_remove_files(&removes);
 
