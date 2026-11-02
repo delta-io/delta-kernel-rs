@@ -105,11 +105,11 @@ fn assert_gate_error<T: std::fmt::Debug>(result: KernelResult<T>) {
     );
 }
 
-/// The `(name, raw_sql)` pairs of `generated_columns`, in order.
+/// The `(logical_name, raw_sql)` pairs of `generated_columns`, in order.
 fn generated_column_pairs(generated_columns: &[GeneratedColumn]) -> Vec<(&str, &str)> {
     generated_columns
         .iter()
-        .map(|column| (column.name(), column.raw_sql()))
+        .map(|column| (column.logical_name(), column.raw_sql()))
         .collect()
 }
 

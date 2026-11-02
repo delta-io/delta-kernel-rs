@@ -13,14 +13,14 @@ use crate::KernelResult;
 /// [generated column]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#generated-columns
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedColumn {
-    name: String,
+    logical_name: String,
     raw_sql: String,
 }
 
 impl GeneratedColumn {
     /// The generated column's logical name.
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn logical_name(&self) -> &str {
+        &self.logical_name
     }
 
     /// The column's generation expression, verbatim from its `delta.generationExpression`
@@ -43,7 +43,7 @@ pub(crate) fn collect_generated_columns(schema: &StructType) -> KernelResult<Vec
     for field in schema.fields() {
         if let Some(raw_sql) = field.get_string_config_value(&key)? {
             generated_columns.push(GeneratedColumn {
-                name: field.name().clone(),
+                logical_name: field.name().clone(),
                 raw_sql: raw_sql.to_string(),
             });
         }
@@ -79,7 +79,7 @@ mod tests {
 
         let column_pairs: Vec<_> = generated_columns
             .iter()
-            .map(|column| (column.name(), column.raw_sql()))
+            .map(|column| (column.logical_name(), column.raw_sql()))
             .collect();
         let expected = [
             ("event_year", "YEAR(event_time)"),

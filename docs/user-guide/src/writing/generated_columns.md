@@ -61,8 +61,8 @@ txn.commit(..)               fails on a table with generated columns without the
 
 `Snapshot::generated_columns()` returns a table's generated columns at the snapshot's version, and
 `Transaction::generated_columns()` returns the effective generated columns of the transaction.
-Each `GeneratedColumn` provides the column's name through `name()` and its generation expression,
-verbatim from the table, through `raw_sql()`.
+Each `GeneratedColumn` provides the column's logical name through `logical_name()` and its
+generation expression, verbatim from the table, through `raw_sql()`.
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -76,7 +76,7 @@ verbatim from the table, through `raw_sql()`.
 
 let snapshot = Snapshot::builder_for(url).build(&engine)?;
 for column in snapshot.generated_columns()? {
-    println!("{}: {}", column.name(), column.raw_sql());
+    println!("{}: {}", column.logical_name(), column.raw_sql());
 }
 # Ok(())
 # }
@@ -141,7 +141,7 @@ async fn append_with_generated_columns(
     let mut generations = Vec::new();
     for column in txn.generated_columns()? {
         let expression = compile_generation(column.raw_sql())?;
-        generations.push((column.name().to_string(), expression));
+        generations.push((column.logical_name().to_string(), expression));
     }
 
     // 3. Acknowledge responsibility for enforcement and prepare the write context.

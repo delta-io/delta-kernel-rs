@@ -1858,7 +1858,7 @@ mod test {
 
         let column_pairs: Vec<_> = generated_columns
             .iter()
-            .map(|column| (column.name(), column.raw_sql()))
+            .map(|column| (column.logical_name(), column.raw_sql()))
             .collect();
         assert_eq!(column_pairs, expected);
     }
