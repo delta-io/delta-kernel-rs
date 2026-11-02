@@ -43,7 +43,7 @@ use crate::{KernelError, KernelResult};
 ///   Otherwise, if at least one child changed or was filtered out, build a new parent around the
 ///   children. Otherwise, return the parent unchanged.
 ///
-/// * CASE WHEN - If any condition, result, or ELSE was filtered out, filter out the parent.
+/// * CASE WHEN - If any direct condition, result, or ELSE was filtered out, filter out the parent.
 ///   Otherwise, rebuild only if a child changed.
 ///
 /// Implementations can call these as needed but will generally not need to override them.
@@ -433,8 +433,8 @@ pub trait ExpressionTransform<'a> {
         map_owned_children_or_else(v, children, |exprs| VariadicExpression::new(v.op, exprs))
     }
 
-    /// Recursively transforms CASE WHEN branches and ELSE. Filtering any child filters out the
-    /// entire CASE.
+    /// Recursively transforms CASE WHEN branches and ELSE. Filtering any direct condition, result,
+    /// or ELSE filters out the entire CASE.
     fn recurse_into_expr_case_when(
         &mut self,
         c: &'a CaseWhenExpression,

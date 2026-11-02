@@ -525,6 +525,17 @@ fn evaluate_case_when(
     batch: &RecordBatch,
     result_type: Option<&DataType>,
 ) -> KernelResult<ArrayRef> {
+    let evaluate_result = |expr: &Expression, batch: &RecordBatch| {
+        let values = evaluate_expression(expr, batch, result_type)?;
+        if values.len() != batch.num_rows() && values.len() != 1 {
+            return Err(KernelError::internal_error(format!(
+                "CASE WHEN result has {} rows, expected {} or 1",
+                values.len(),
+                batch.num_rows(),
+            )));
+        }
+        Ok(values)
+    };
     let mut remaining_batch = batch.clone();
     let mut remaining_rows: Vec<_> = (0..batch.num_rows()).collect();
     // arrays holds each evaluated branch's results. For each original row, output_row_sources
@@ -550,12 +561,15 @@ fn evaluate_case_when(
         };
         let selected_batch = filter_record_batch(&remaining_batch, &selected)?;
         let array_index = arrays.len();
-        let values = evaluate_expression(result, &selected_batch, result_type)?;
+        let values = evaluate_result(result, &selected_batch)?;
+        let is_scalar = values.len() == 1;
         arrays.push(values);
+        // Scalar results, like literal-only IN, use source row 0 for every selected row.
         let mut selected_row = 0;
         for (row, &original_row) in remaining_rows.iter().enumerate() {
             if selected.value(row) {
-                output_row_sources[original_row] = (array_index, selected_row);
+                output_row_sources[original_row] =
+                    (array_index, if is_scalar { 0 } else { selected_row });
                 selected_row += 1;
             }
         }
@@ -574,21 +588,18 @@ fn evaluate_case_when(
     }
 
     if arrays.is_empty() || !remaining_rows.is_empty() {
-        let fallback = evaluate_expression(&case_when.else_expr, &remaining_batch, result_type)?;
-        for (row, &original_row) in remaining_rows.iter().enumerate() {
-            output_row_sources[original_row] = (arrays.len(), row);
-        }
+        let fallback = evaluate_result(&case_when.else_expr, &remaining_batch)?;
+        let is_scalar = fallback.len() == 1;
+        let array_index = arrays.len();
         arrays.push(fallback);
+        for (row, &original_row) in remaining_rows.iter().enumerate() {
+            output_row_sources[original_row] = (array_index, if is_scalar { 0 } else { row });
+        }
     }
 
-    if arrays.len() == 1 {
+    if arrays.len() == 1 && arrays[0].len() == batch.num_rows() {
         return validate_array_type(arrays.remove(0), result_type);
     }
-    // Normalize array representations to view types and ensure they match before interleaving.
-    let arrays: Vec<ArrayRef> = arrays
-        .into_iter()
-        .map(arrow_convert_to_view_type)
-        .try_collect()?;
     let data_type = arrays[0].data_type();
     if arrays.iter().any(|values| values.data_type() != data_type) {
         return Err(KernelError::generic(
@@ -4126,17 +4137,17 @@ mod tests {
         Ok(Int32Array::from(vec![Some(1), Some(2), Some(3)]).to_data()),
     )]
     #[case::strings_literal_else(
-        ["s", "large_s", "view_s"].map(|name| Expr::case_when(
-            [(col!("a").ge(lit(2)), Expr::column([name]))],
+        [Expr::case_when(
+            [(col!("a").ge(lit(2)), col!("s"))],
             lit("fallback"),
-        )),
+        )],
         Ok(StringArray::from(vec![Some("fallback"), None, Some("last")]).to_data()),
     )]
     #[case::strings_null_else(
-        ["s", "large_s", "view_s"].map(|name| Expr::case_when(
-            [(col!("a").ge(lit(2)), Expr::column([name]))],
+        [Expr::case_when(
+            [(col!("a").ge(lit(2)), col!("s"))],
             null_lit(DataType::STRING),
-        )),
+        )],
         Ok(StringArray::from(vec![None, None, Some("last")]).to_data()),
     )]
     #[case::struct_literal_else(
@@ -4191,7 +4202,6 @@ mod tests {
         #[case] expected: Result<ArrowArrayData, &str>,
     ) {
         let batch = case_when_batch();
-        let expected = expected.map(|data| arrow_convert_to_view_type(make_array(data)).unwrap());
         for expr in exprs {
             let expected = match &expected {
                 Ok(expected) => expected,
@@ -4210,13 +4220,99 @@ mod tests {
                     continue;
                 }
                 let result = evaluate_expression(&expr, &batch, result_type).unwrap();
-                let result = arrow_convert_to_view_type(result).unwrap();
-                assert_eq!(
-                    result.to_data(),
-                    expected.to_data(),
-                    "{expr:?}, {result_type:?}"
-                );
+                assert_eq!(result.to_data(), *expected, "{expr:?}, {result_type:?}");
             }
+        }
+    }
+
+    #[rstest]
+    #[case::all(Predicate::TRUE, [true; 3])]
+    #[case::first_row(col!("a").eq(lit(1)), [true, false, false])]
+    #[case::nonadjacent_rows(col!("a").ne(lit(2)), [true, false, true])]
+    #[case::none(Predicate::FALSE, [false; 3])]
+    fn test_evaluate_case_when_scalar_results(
+        #[case] condition: Predicate,
+        #[case] selected: [bool; 3],
+        #[values(true, false)] scalar_then: bool,
+        #[values(0, 1, 3)] num_rows: usize,
+        #[values(None, Some(&DataType::BOOLEAN))] result_type: Option<&DataType>,
+    ) {
+        let scalar = Predicate::binary(
+            BinaryPredicateOp::In,
+            lit(1),
+            Scalar::Array(
+                ArrayData::try_new(
+                    ArrayType::new(DataType::INTEGER, false),
+                    vec![Scalar::Integer(1)],
+                )
+                .unwrap(),
+            ),
+        )
+        .into();
+        let (then_expr, else_expr) = if scalar_then {
+            (scalar, lit(false))
+        } else {
+            (lit(false), scalar)
+        };
+        let expr = Expr::case_when([(condition, then_expr)], else_expr);
+        let batch = case_when_batch().slice(0, num_rows);
+        let result = evaluate_expression(&expr, &batch, result_type).unwrap();
+        let expected = BooleanArray::from_iter(
+            selected
+                .into_iter()
+                .take(num_rows)
+                .map(|selected| Some(selected == scalar_then)),
+        );
+        assert_eq!(result.to_data(), expected.to_data());
+    }
+
+    #[rstest]
+    fn test_evaluate_case_when_string_types(
+        #[values("s", "large_s", "view_s")] column: &str,
+        #[values(false, true)] nested: bool,
+        #[values(false, true)] null_else: bool,
+    ) {
+        let source = case_when_batch();
+        let strings = source.column_by_name(column).unwrap().clone();
+        let values: ArrayRef = if nested {
+            Arc::new(StructArray::from(vec![(
+                Arc::new(ArrowField::new("value", strings.data_type().clone(), true)),
+                strings,
+            )]))
+        } else {
+            strings
+        };
+        let batch = RecordBatch::try_from_iter([
+            ("a", source.column_by_name("a").unwrap().clone()),
+            ("value", values.clone()),
+        ])
+        .unwrap();
+        let output_type: DataType = values.data_type().try_into_kernel().unwrap();
+        let fallback = if null_else {
+            null_lit(output_type)
+        } else {
+            col!("value")
+        };
+        let expr = Expr::case_when([(col!("a").gt(lit(2)), col!("value"))], fallback);
+        let result = evaluate_expression(&expr, &batch, None);
+        if null_else && column != "s" {
+            assert_result_error_with_message(result, "CASE WHEN branches must have the same type");
+        } else {
+            let expected: ArrayRef = if null_else {
+                let strings = Arc::new(StringArray::from(vec![None, None, Some("last")]));
+                if nested {
+                    Arc::new(StructArray::new(
+                        values.as_struct().fields().clone(),
+                        vec![strings],
+                        Some(NullBuffer::from(vec![false, false, true])),
+                    ))
+                } else {
+                    strings
+                }
+            } else {
+                values
+            };
+            assert_eq!(result.unwrap().to_data(), expected.to_data());
         }
     }
 

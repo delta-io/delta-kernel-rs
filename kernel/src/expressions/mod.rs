@@ -371,8 +371,8 @@ pub struct VariadicExpression {
 /// An empty branch list evaluates to `else_expr`.
 /// Every THEN result and `else_expr` must have the same logical data type, including typed NULLs.
 /// For example, integer results require an integer ELSE or a NULL typed as [`DataType::INTEGER`].
-/// No implicit casts or numeric widening are applied. Compatible engine representations of the
-/// same logical type, such as Arrow string and string-view arrays, are allowed.
+/// No implicit casts or numeric widening are applied. The Arrow evaluator requires evaluated
+/// results to have identical Arrow types, including string representations and nested fields.
 /// Runtime type validation checks evaluated results; unused branches are not evaluated to check
 /// their types.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

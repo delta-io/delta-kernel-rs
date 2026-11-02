@@ -1123,6 +1123,35 @@ fn mixed_string_kernel_schema() -> StructType {
     }
 }
 
+#[rstest]
+#[case::then_only(Predicate::TRUE, ["a", "b", "c"])]
+#[case::else_only(Predicate::FALSE, ["fallback"; 3])]
+#[case::both(col!("s").eq(lit("a")), ["a", "fallback", "fallback"])]
+fn test_evaluator_case_when_strings(#[case] condition: Predicate, #[case] expected: [&str; 3]) {
+    let batch = ArrowEngineData::new(
+        RecordBatch::try_from_iter([(
+            "s",
+            Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+        )])
+        .unwrap(),
+    );
+    let expression = Expr::case_when([(condition, col!("s"))], lit("fallback"));
+    let result = ArrowEvaluationHandler
+        .new_expression_evaluator(
+            schema_ref! { nullable "s": STRING },
+            Arc::new(expression),
+            KernelDataType::STRING,
+        )
+        .unwrap()
+        .evaluate(&batch)
+        .try_into_record_batch()
+        .unwrap();
+    assert_eq!(
+        result.column(0).to_data(),
+        StringArray::from(expected.to_vec()).to_data()
+    );
+}
+
 /// Evaluator must succeed when a struct contains Utf8, LargeUtf8, and Utf8View columns in the
 /// empty patch branch. The output schema is derived from actual column types, so
 /// `LargeUtf8` and `Utf8View` columns remain valid even though the kernel type is `STRING`.
