@@ -81,7 +81,7 @@ pub type FfiNullableStringMap = FfiSlice<FfiNullableStringMapEntry>;
 ///
 /// Connectors that only supply log paths can request inference. Connectors exporting a built
 /// snapshot must preserve its observed publication state, which may not be recoverable from the
-/// retained paths. [`snapshot_to_snapshot_hint`](crate::snapshot_hint::snapshot_to_snapshot_hint)
+/// retained paths. [`snapshot_to_snapshot_hint`](crate::snapshot::hint::snapshot_to_snapshot_hint)
 /// always reports one of the two explicit variants.
 ///
 /// cbindgen:prefix-with-name=true
