@@ -1,0 +1,118 @@
+name: Windows storage experiment
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/windows-storage-experiment.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-storage-experiment-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  compare:
+    name: windows storage (${{ matrix.storage }})
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        storage: [baseline, local-disk]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        id: cache
+        with:
+          cache-bin: false
+          shared-key: all-features-test
+          save-if: false
+      - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf
+      - name: Record runner and original storage paths
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors |
+            Format-Table
+          Get-Volume -DriveLetter C, D |
+            Select-Object DriveLetter, FileSystem, Size, SizeRemaining |
+            Format-Table
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else {
+            Join-Path $env:USERPROFILE '.cargo'
+          }
+          Write-Host "Cargo home: $cargoHome"
+          Write-Host "Workspace: $env:GITHUB_WORKSPACE"
+          Write-Host "TEMP: $env:TEMP"
+          Write-Host "TMP: $env:TMP"
+          Write-Host "Resolved temp directory: $([System.IO.Path]::GetTempPath())"
+          "### Storage: $env:STORAGE_VARIANT" >> $env:GITHUB_STEP_SUMMARY
+          "Main cache exact hit: $env:CACHE_HIT" >> $env:GITHUB_STEP_SUMMARY
+        env:
+          STORAGE_VARIANT: ${{ matrix.storage }}
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+      - name: Move cached dependencies and temporary files to D
+        if: matrix.storage == 'local-disk'
+        shell: pwsh
+        run: |
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else {
+            Join-Path $env:USERPROFILE '.cargo'
+          }
+          $localRoot = 'D:\kernel-storage-experiment'
+          $localCargo = Join-Path $localRoot 'cargo'
+          $localTemp = Join-Path $localRoot 'temp'
+          New-Item -ItemType Directory -Force -Path $localCargo, $localTemp | Out-Null
+
+          # Keep source paths stable so relocating the registry does not invalidate build artifacts.
+          foreach ($directory in 'registry', 'git') {
+            $source = Join-Path $cargoHome $directory
+            $destination = Join-Path $localCargo $directory
+            New-Item -ItemType Directory -Force -Path $destination | Out-Null
+            if (Test-Path -LiteralPath $source) {
+              robocopy $source $destination /E /COPY:DAT /DCOPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP
+              if ($LASTEXITCODE -ge 8) { throw "Copying $directory failed: $LASTEXITCODE" }
+              Move-Item -LiteralPath $source -Destination "${source}-before-relocation"
+            }
+            New-Item -ItemType Junction -Path $source -Target $destination | Out-Null
+            Get-Item -LiteralPath $source | Select-Object FullName, LinkType, Target | Format-List
+          }
+          "TEMP=$localTemp" >> $env:GITHUB_ENV
+          "TMP=$localTemp" >> $env:GITHUB_ENV
+          $global:LASTEXITCODE = 0
+      - name: Record effective storage paths
+        shell: pwsh
+        run: |
+          Write-Host "TEMP: $env:TEMP"
+          Write-Host "TMP: $env:TMP"
+          Write-Host "Resolved temp directory: $([System.IO.Path]::GetTempPath())"
+          "Test temp directory: $([System.IO.Path]::GetTempPath())" >> $env:GITHUB_STEP_SUMMARY
+      - name: Compile all-features tests
+        run: >-
+          cargo nextest run --locked --workspace --all-features --no-run
+          -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
+      - name: Run all-features tests
+        run: >-
+          cargo nextest run --locked --workspace --all-features
+          -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
+      - name: Run doctests
+        run: cargo test --locked --workspace --all-features --doc
+      - name: Run FFI compile-fail tests
+        run: cargo test --locked --package delta_kernel_ffi --features internal-api -- invalid_handle_code
+      - name: Run metrics tester
+        shell: bash
+        run: |
+          output=$(cargo run --locked --profile test --example metrics-tester)
+          grep -q 'invalid_field' <<< "$output"
+          grep -q 'Invalid uuid' <<< "$output"
