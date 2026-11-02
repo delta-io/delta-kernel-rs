@@ -507,7 +507,7 @@ pub fn collect_stats(
     let null_count_only_columns = interval_column_names(physical_schema, stats_columns);
     reduce_stats(
         &collect_stats_raw(batch, stats_columns, &null_count_only_columns)?,
-        /* truncate_strings */ true,
+        /* truncate_stats */ true,
     )
 }
 
@@ -518,7 +518,7 @@ pub(crate) fn collect_stats_for_test(
 ) -> KernelResult<StructArray> {
     reduce_stats(
         &collect_stats_raw(batch, stats_columns, &[])?,
-        /* truncate_strings */ true,
+        /* truncate_stats */ true,
     )
 }
 
@@ -720,7 +720,7 @@ impl FileStatsAccumulator {
             return Err(KernelError::stats_validation(FAILED));
         };
         total
-            .map(|stats| reduce_stats(&stats, /* truncate_strings */ true))
+            .map(|stats| reduce_stats(&stats, /* truncate_stats */ true))
             .transpose()
     }
 }
@@ -742,17 +742,17 @@ fn merge_raw_stats(left: &StructArray, right: &StructArray) -> KernelResult<Stru
     let combined = combined
         .as_struct_opt()
         .ok_or_else(|| KernelError::internal_error("concatenated stats are not a struct"))?;
-    reduce_stats(combined, /* truncate_strings */ false)
+    reduce_stats(combined, /* truncate_stats */ false)
 }
 
 /// Reduce raw statistics rows into one: sum `numRecords` and `nullCount`, combine min/max bounds,
-/// and AND `tightBounds`. When `truncate_strings` is true, truncate string bounds for publication.
+/// and AND `tightBounds`. When `truncate_stats` is true, truncate string bounds for publication.
 ///
 /// Returns `Err` if `stats` is not shaped like the output of `collect_stats_raw`.
-fn reduce_stats(stats: &StructArray, truncate_strings: bool) -> KernelResult<StructArray> {
+fn reduce_stats(stats: &StructArray, truncate_stats: bool) -> KernelResult<StructArray> {
     let reduce_minmax = |col: &ArrayRef, agg| -> KernelResult<ArrayRef> {
         let bound = match compute_leaf_agg(col, agg)? {
-            Some(bound) if truncate_strings => truncate_stats_bound(&bound, agg)?,
+            Some(bound) if truncate_stats => truncate_stats_bound(&bound, agg)?,
             bound => bound,
         };
         Ok(bound.unwrap_or_else(|| new_null_array(col.data_type(), 1)))
@@ -2651,7 +2651,7 @@ mod tests {
         )
         .unwrap();
         assert_internal_error(
-            reduce_stats(&stats, /* truncate_strings */ true),
+            reduce_stats(&stats, /* truncate_stats */ true),
             "unknown stats section",
         );
     }
