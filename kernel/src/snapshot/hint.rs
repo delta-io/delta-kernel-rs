@@ -368,7 +368,7 @@ impl SnapshotHint {
             SnapshotHintError::MaxPublishedVersion { hint: version }.into()
         );
         require!(
-            log_segment.checkpoint_version.is_some()
+            log_segment.checkpoint_version().is_some()
                 || log_segment
                     .listed
                     .ascending_commit_files
@@ -379,7 +379,7 @@ impl SnapshotHint {
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, table_url, version)?;
         if let Some(crc) = crc.as_ref() {
-            if let Some(checkpoint) = log_segment.checkpoint_version {
+            if let Some(checkpoint) = log_segment.checkpoint_version() {
                 require!(
                     crc.version >= checkpoint,
                     SnapshotHintError::CrcBeforeCheckpoint {
@@ -828,7 +828,7 @@ mod tests {
         } else {
             let snapshot = result?;
             let segment = snapshot.log_segment();
-            assert_eq!(segment.checkpoint_version, Some(10));
+            assert_eq!(segment.checkpoint_version(), Some(10));
             assert!(segment.listed.ascending_commit_files.is_empty());
             assert!(segment.listed.latest_commit_file.is_none());
             assert!(segment.listed.latest_crc_file.is_none());
@@ -1230,8 +1230,8 @@ mod tests {
             .with_snapshot_hint(hint)
             .build(engine.as_ref())?;
         assert_eq!(
-            hinted_snapshot.log_segment().checkpoint_version,
-            storage_snapshot.log_segment().checkpoint_version
+            hinted_snapshot.log_segment().checkpoint_version(),
+            storage_snapshot.log_segment().checkpoint_version()
         );
         assert_eq!(
             hinted_snapshot.log_segment().listed.checkpoint_parts,
@@ -1449,8 +1449,8 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn snapshot_hint_rejects_crc_before_checkpoint_with_typed_error(
-    ) -> KernelResult<(), Box<dyn std::error::Error>> {
+    async fn snapshot_hint_rejects_crc_before_checkpoint_with_typed_error()
+    -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, table_root, _, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         let checkpoint = hint.version;
@@ -1475,8 +1475,8 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn snapshot_hint_rejects_conflicting_builder_options_and_reports_failure(
-    ) -> KernelResult<(), Box<dyn std::error::Error>> {
+    async fn snapshot_hint_rejects_conflicting_builder_options_and_reports_failure()
+    -> KernelResult<(), Box<dyn std::error::Error>> {
         let (engine, table_root, snapshot, hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         let log_path = LogPath::try_new(

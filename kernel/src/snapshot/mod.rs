@@ -285,7 +285,7 @@ impl Snapshot {
         SnapshotCrc::try_new(
             crc,
             table_configuration.version(),
-            log_segment.checkpoint_version,
+            log_segment.checkpoint_version(),
             crc_origin,
         )
     }
@@ -644,9 +644,9 @@ impl Snapshot {
 
     /// Returns the selected checkpoint specification, when known, without performing engine I/O.
     ///
-    /// Returns `None` if no checkpoint was selected or its specification is not yet known.
-    /// Ordinary checkpoint reads may establish the type. The table's configured
-    /// checkpoint policy does not determine this value.
+    /// Returns `None` if no checkpoint was selected and `Some(CheckpointType::Unresolved)` if
+    /// the type was not established during construction. This observation remains fixed for the
+    /// snapshot's lifetime. The table's configured checkpoint policy does not determine it.
     pub fn checkpoint_type(&self) -> Option<CheckpointType> {
         self.log_segment.checkpoint_type()
     }
@@ -1610,7 +1610,7 @@ impl Snapshot {
         }
 
         // Case 3: no CRC, but a checkpoint to root at.
-        if let Some(checkpoint_version) = log_segment.checkpoint_version {
+        if let Some(checkpoint_version) = log_segment.checkpoint_version() {
             record_root("checkpoint", ChecksumWriteResolutionMode::Full);
             if checkpoint_version == end {
                 // A checkpoint carries no ICT or lastManifestCommit (it has no commitInfo). Since
@@ -1718,7 +1718,7 @@ impl Snapshot {
     ) -> KernelResult<(CheckpointWriteResult, SnapshotRef)> {
         let start = Instant::now();
         let span = tracing::Span::current();
-        if self.log_segment.checkpoint_version == Some(self.log_segment.end_version) {
+        if self.log_segment.checkpoint_version() == Some(self.log_segment.end_version) {
             info!(
                 "Checkpoint already exists for snapshot version {}",
                 self.version()
@@ -1815,14 +1815,14 @@ impl Snapshot {
         let checkpoint_log_path = ParsedLogPath::new(info.file_meta).ok_or_else(|| {
             KernelError::internal_error("Checkpoint path could not be parsed as a log path")
         })?;
-        let new_log_segment = self
-            .log_segment
-            .try_new_with_checkpoint(checkpoint_log_path)?;
-        new_log_segment.observe_checkpoint_type(if v2_supported {
+        let checkpoint_type = if v2_supported {
             CheckpointType::V2
         } else {
             CheckpointType::V1
-        });
+        };
+        let new_log_segment = self
+            .log_segment
+            .try_new_with_checkpoint(checkpoint_log_path, checkpoint_type)?;
         // Carry only an at-version CRC forward: the checkpoint drops the commits below it, so a
         // stale base could no longer be advanced over them. Dropping it leaves unknown CRC origin.
         let new_snapshot = Arc::new(Snapshot::new_with_crc(

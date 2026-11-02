@@ -34,7 +34,8 @@ impl FfiCrcProvenance {
 }
 
 /// Returns the selected checkpoint specification, when known, without engine I/O.
-/// Returns absent if no checkpoint was selected or its specification is not yet known.
+/// Returns absent if no checkpoint was selected, or `Unresolved` if its type was not retained
+/// during construction. The observation remains fixed for the snapshot's lifetime.
 ///
 /// # Safety
 /// `snapshot` must be valid and remain owned by the caller throughout the call.

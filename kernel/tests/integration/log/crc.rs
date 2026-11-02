@@ -836,7 +836,7 @@ async fn test_write_checksum_preserves_stats_across_metadata_only_commits(
     assert_eq!(fresh.version(), 4);
     assert_eq!(fresh.crc_at_version().is_some(), incremental_build);
     assert_eq!(
-        fresh.log_segment().checkpoint_version,
+        fresh.log_segment().checkpoint_version(),
         checkpoint.as_ref().map(|_| 1)
     );
     assert_eq!(
@@ -974,10 +974,10 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
     // still produced correct contents cannot pass silently.
     match root {
         WriteRoot::CheckpointNoTail | WriteRoot::CheckpointWithTail => assert_eq!(
-            fresh.log_segment().checkpoint_version,
+            fresh.log_segment().checkpoint_version(),
             Some(CHECKPOINT_OR_CRC_VERSION as u64)
         ),
-        WriteRoot::VersionZero => assert!(fresh.log_segment().checkpoint_version.is_none()),
+        WriteRoot::VersionZero => assert!(fresh.log_segment().checkpoint_version().is_none()),
         WriteRoot::StaleCrcIncrementalBuild | WriteRoot::StaleCrcNonIncrementalBuild => {
             assert!(crc_file_path(&table_path, CHECKPOINT_OR_CRC_VERSION as u64).exists())
         }
@@ -1097,7 +1097,7 @@ async fn test_write_checksum_after_checkpoint_with_stale_base_resolves_from_chec
     let snap1 = Snapshot::builder_for(table_path).build(engine.as_ref())?;
     assert!(snap1.crc_at_version().is_none());
     let (_, checkpointed) = snap1.checkpoint(engine.as_ref(), None)?;
-    assert_eq!(checkpointed.log_segment().checkpoint_version, Some(1));
+    assert_eq!(checkpointed.log_segment().checkpoint_version(), Some(1));
 
     // Resolution must not trip the below-checkpoint base on the emptied commit tail.
     assert_eq!(
@@ -1176,7 +1176,7 @@ async fn test_incremental_unlimited_skips_below_checkpoint_base() -> delta_kerne
         .with_incremental_crc_replay(IncrementalReplay::Unlimited)
         .build(engine.as_ref())?;
     assert_eq!(updated.version(), 3);
-    assert_eq!(updated.log_segment().checkpoint_version, Some(2));
+    assert_eq!(updated.log_segment().checkpoint_version(), Some(2));
 
     Ok(())
 }
@@ -1192,7 +1192,7 @@ async fn test_write_checksum_incremental_stale_base_below_new_checkpoint_resolve
 
     // Disabled update keeps the below-checkpoint base@1 un-advanced on the combined segment.
     let updated = Snapshot::builder_from(base).build(engine.as_ref())?;
-    assert_eq!(updated.log_segment().checkpoint_version, Some(2));
+    assert_eq!(updated.log_segment().checkpoint_version(), Some(2));
 
     // Case 2 must skip the below-checkpoint base and resolve from the checkpoint root.
     assert_eq!(

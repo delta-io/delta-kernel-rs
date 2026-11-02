@@ -702,7 +702,7 @@ impl ScanBuilder {
         if self.snapshot.skipped_new_checkpoints() && commits_since_checkpoint > 0 {
             warn!(
                 snapshot_version = self.snapshot.version(),
-                checkpoint_version = ?self.snapshot.log_segment().checkpoint_version,
+                checkpoint_version = ?self.snapshot.log_segment().checkpoint_version(),
                 commits_since_checkpoint,
                 "Full scan may replay extra transaction-log commits because the snapshot was \
                  built with skip_new_checkpoints()"
@@ -1301,7 +1301,7 @@ impl Scan {
         // only has deltas after the checkpoint, so we cannot update from prior versions.
         // TODO: we may be able to apply heuristics or other logic to try and fetch missing deltas
         // from the log.
-        if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
+        if matches!(log_segment.checkpoint_version(), Some(v) if v > existing_version) {
             return Ok(Box::new(self.scan_metadata_with_engine(engine)?));
         }
         // Likewise for an AMT checkpoint action: commits at or below its version may no longer be

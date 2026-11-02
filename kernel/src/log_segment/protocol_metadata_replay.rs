@@ -325,7 +325,7 @@ impl LogSegment {
         let commit_schema = Arc::new(StructType::try_new(
             commit_schema.fields().cloned().chain([file_column]),
         )?);
-        let checkpoint_version = self.checkpoint_version.map(|v| v as i64);
+        let checkpoint_version = self.checkpoint_version().map(|v| v as i64);
         let batches = self
             .read_actions_with_projected_checkpoint_actions(
                 engine,
