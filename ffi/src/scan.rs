@@ -19,7 +19,7 @@ use super::handle::Handle;
 use crate::delta_types::FfiColumnNameArray;
 #[cfg(feature = "default-engine-base")]
 use crate::engine_data::ArrowFFIData;
-use crate::error::AllocateErrorFn;
+use crate::error::ErrorAllocators;
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::expressions::SharedExpression;
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
@@ -923,24 +923,26 @@ pub unsafe extern "C" fn get_transform_for_row(
 /// Returns the number of rows removed by `dv_info`, or [`OptionalValue::None`] if there is no
 /// deletion vector. Reads descriptor metadata without loading the deletion vector.
 ///
-/// A negative cardinality returns a deletion-vector error allocated by `allocate_error`.
+/// A negative cardinality returns a deletion-vector error allocated by `error_allocators`.
 /// The caller owns the returned error and must free it.
 ///
 /// # Safety
 ///
-/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
-/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
+/// and callbacks must remain valid for every use and support concurrent calls if shared across
+/// threads.
 ///
 /// `dv_info` must be a valid pointer to a [`DvInfo`], borrowed for the duration of this call.
 /// When obtained from the `info` field of [`CDvInfo`], it is valid only during the scan callback.
-/// `allocate_error` must be a valid error allocator and copy any message it retains.
+/// `error_allocators` must be a valid error allocator and copy any message it retains.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cardinality_from_dv(
     dv_info: &DvInfo,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<OptionalValue<u64>> {
+    let error_allocators = unsafe { *error_allocators };
     let result = dv_info.cardinality().map(Into::into);
-    unsafe { result.into_extern_result(&allocate_error) }
+    unsafe { result.into_extern_result(&error_allocators) }
 }
 
 /// Get a selection vector out of a [`DvInfo`] struct
@@ -1188,7 +1190,7 @@ mod scan_builder_tests {
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::ffi_test_utils::build_snapshot;
-    use crate::ffi_test_utils::{allocate_err, ok_or_panic, recover_error, setup_snapshot};
+    use crate::ffi_test_utils::{ok_or_panic, recover_error, setup_snapshot, ERROR_ALLOCATORS};
     use crate::schema_visitor::{
         visit_field_integer, visit_field_struct, KernelSchemaVisitorState,
     };
@@ -1249,7 +1251,7 @@ mod scan_builder_tests {
                 kernel_string_slice!(id),
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &ERROR_ALLOCATORS,
             ))
         };
         let field_ids = [id_field_id];
@@ -1262,7 +1264,7 @@ mod scan_builder_tests {
                 1,
                 false,
                 std::ptr::null(),
-                allocate_err,
+                &ERROR_ALLOCATORS,
             ))
         }
     }
@@ -1281,7 +1283,7 @@ mod scan_builder_tests {
                 kernel_string_slice!(crs),
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &ERROR_ALLOCATORS,
             ))
         };
         let geog = "geog";
@@ -1294,7 +1296,7 @@ mod scan_builder_tests {
                 kernel_string_slice!(algorithm),
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &ERROR_ALLOCATORS,
             ))
         };
         let field_ids = [geom_field_id, geog_field_id];
@@ -1307,7 +1309,7 @@ mod scan_builder_tests {
                 field_ids.len(),
                 false,
                 std::ptr::null(),
-                allocate_err,
+                &ERROR_ALLOCATORS,
             ))
         }
     }
@@ -1324,7 +1326,7 @@ mod scan_builder_tests {
                 state,
                 parts.as_ptr(),
                 parts.len(),
-                allocate_err,
+                &ERROR_ALLOCATORS,
             ))
         };
         let lit = visit_expression_literal_int(state, 10);
@@ -1492,7 +1494,7 @@ mod scan_builder_tests {
                 kernel_string_slice!(bare_field),
                 true,
                 std::ptr::null(),
-                allocate_err,
+                &ERROR_ALLOCATORS,
             ))
         }
     }
@@ -2266,7 +2268,9 @@ mod tests {
 
     use super::cardinality_from_dv;
     use crate::error::FFIKernelError;
-    use crate::ffi_test_utils::{allocate_err, assert_extern_result_error_contains, ok_or_panic};
+    use crate::ffi_test_utils::{
+        assert_extern_result_error_contains, ok_or_panic, ERROR_ALLOCATORS,
+    };
     use crate::{KernelStringSlice, NullableCvoid, OptionalValue, TryFromStringSlice};
 
     #[rstest]
@@ -2352,7 +2356,7 @@ mod tests {
         use crate::expressions::kernel_visitor::{
             visit_expression_literal_bool, KernelExpressionVisitorState,
         };
-        use crate::ffi_test_utils::{allocate_err, ok_or_panic, setup_snapshot};
+        use crate::ffi_test_utils::{ok_or_panic, setup_snapshot, ERROR_ALLOCATORS};
         use crate::handle::Handle;
         use crate::plans::result::CPlanResult;
         use crate::plans::{get_plan_based_engine, get_plan_executor};
@@ -2385,7 +2389,7 @@ mod tests {
                 get_plan_based_engine(
                     executor,
                     OptionalValue::Some(fallback.shallow_copy()),
-                    allocate_err,
+                    &ERROR_ALLOCATORS,
                 )
             }
         }

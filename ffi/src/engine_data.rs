@@ -16,7 +16,7 @@ use delta_kernel::KernelResult;
 
 use super::handle::Handle;
 #[cfg(feature = "default-engine-base")]
-use crate::error::AllocateErrorFn;
+use crate::error::ErrorAllocators;
 use crate::ExclusiveEngineData;
 #[cfg(feature = "default-engine-base")]
 use crate::{ExternResult, IntoExternResult, SharedExternEngine};
@@ -153,20 +153,22 @@ pub unsafe extern "C" fn free_arrow_ffi_data(result: *mut ArrowFFIData) {
 ///
 /// # Safety
 ///
-/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
-/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
+/// and callbacks must remain valid for every use and support concurrent calls if shared across
+/// threads.
 /// - `array` must be a valid FFI_ArrowArray
 /// - `schema` must be a valid pointer to a FFI_ArrowSchema
-/// - `allocate_error` must satisfy the callback table requirements above
+/// - `error_allocators` must satisfy the callback table requirements above
 #[cfg(feature = "default-engine-base")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_engine_data(
     array: FFI_ArrowArray,
     schema: &FFI_ArrowSchema,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<ExclusiveEngineData>> {
+    let error_allocators = unsafe { *error_allocators };
     let result = unsafe { get_engine_data_impl(array, schema) };
-    unsafe { result.into_extern_result(&allocate_error) }
+    unsafe { result.into_extern_result(&error_allocators) }
 }
 
 #[cfg(feature = "default-engine-base")]

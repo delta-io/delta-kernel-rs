@@ -8,7 +8,7 @@ use delta_kernel::{Engine, PlanExecutor};
 
 use crate::handle::Handle;
 use crate::plans::executor::{CExecuteOpFn, FfiPlanExecutor, SharedPlanExecutor};
-use crate::{engine_to_handle, AllocateErrorFn, NullableCvoid, OptionalValue, SharedExternEngine};
+use crate::{engine_to_handle, ErrorAllocators, NullableCvoid, OptionalValue, SharedExternEngine};
 
 pub mod executor;
 pub mod iter;
@@ -54,8 +54,9 @@ pub unsafe extern "C" fn free_plan_executor(executor: Handle<SharedPlanExecutor>
 ///
 /// # Safety
 ///
-/// `allocate_error` must point to an initialized [`ErrorAllocators`] for this call. Its context and
-/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
+/// and callbacks must remain valid for every use and support concurrent calls if shared across
+/// threads.
 ///
 /// Caller must pass a valid [`SharedPlanExecutor`] handle obtained from [`get_plan_executor`] and a
 /// valid [`ErrorAllocators`]. When `fallback_engine` is [`OptionalValue::Some`], it must contain a
@@ -64,15 +65,16 @@ pub unsafe extern "C" fn free_plan_executor(executor: Handle<SharedPlanExecutor>
 pub unsafe extern "C" fn get_plan_based_engine(
     plan_executor: Handle<SharedPlanExecutor>,
     fallback_engine: OptionalValue<Handle<SharedExternEngine>>,
-    allocate_error: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> Handle<SharedExternEngine> {
+    let error_allocators = unsafe { *error_allocators };
     let executor: Arc<dyn PlanExecutor> = unsafe { plan_executor.into_inner() };
     let fallback = match fallback_engine {
         OptionalValue::Some(engine) => Some(unsafe { engine.as_ref() }.engine()),
         OptionalValue::None => None,
     };
     let engine: Arc<dyn Engine> = Arc::new(PlanBasedEngine::new(fallback, executor));
-    engine_to_handle(engine, allocate_error)
+    engine_to_handle(engine, error_allocators)
 }
 
 #[cfg(test)]
@@ -86,7 +88,7 @@ mod tests {
 
     use super::*;
     use crate::error::EngineExecResult;
-    use crate::ffi_test_utils::allocate_err;
+    use crate::ffi_test_utils::ERROR_ALLOCATORS;
     use crate::free_engine;
     use crate::plans::result::CPlanResult;
 
@@ -115,13 +117,13 @@ mod tests {
         // The caller retains ownership of the fallback engine handle. `shallow_copy` mimics C
         // passing the pointer by value, so we can still free our own handle afterward.
         let fallback = DefaultEngineBuilder::new(Arc::new(InMemory::new())).build();
-        let fallback_handle = engine_to_handle(Arc::new(fallback), allocate_err);
+        let fallback_handle = engine_to_handle(Arc::new(fallback), ERROR_ALLOCATORS);
 
         let engine_handle = unsafe {
             get_plan_based_engine(
                 executor,
                 OptionalValue::Some(fallback_handle.shallow_copy()),
-                allocate_err,
+                &ERROR_ALLOCATORS,
             )
         };
 

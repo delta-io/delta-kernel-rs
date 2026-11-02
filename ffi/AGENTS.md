@@ -288,7 +288,7 @@ The REST authentication callback similarly fills a caller-provided record:
 pub type CAuthHeaderCallback = extern "C" fn(
     context: NullableCvoid,
     out: *mut CAuthHeaders,
-    allocate_error: *const ErrorAllocators,
+    error_allocators: *const ErrorAllocators,
 );
 ```
 
@@ -468,7 +468,7 @@ valid for every use and support concurrent calls when shared. Standalone exports
 for the call. Use the stored allocator when an engine or builder is already available:
 
 ```rust
-result.into_extern_result(&allocate_error); // Local copy of the supplied table.
+result.into_extern_result(&error_allocators); // Local copy of the supplied table.
 result.into_extern_result(&engine.as_ref()); // The engine stores the table.
 ```
 
@@ -517,10 +517,11 @@ pub struct CMetadataEntries {
 pub unsafe extern "C" fn set_metadata(
     builder: *mut FfiBuilder,
     entries: CMetadataEntries,
-    allocate_error: *const ErrorAllocators,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<bool> {
+    let error_allocators = unsafe { *error_allocators };
     let result = unsafe { set_metadata_impl(builder, entries) };
-    unsafe { result.into_extern_result(&allocate_error) }
+    unsafe { result.into_extern_result(&error_allocators) }
 }
 
 unsafe fn set_metadata_impl(

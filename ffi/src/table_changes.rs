@@ -361,7 +361,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::ffi_test_utils::{allocate_err, allocate_str, ok_or_panic, recover_string};
+    use crate::ffi_test_utils::{allocate_str, ok_or_panic, recover_string, ERROR_ALLOCATORS};
     use crate::{engine_to_handle, free_engine, free_schema, kernel_string_slice};
 
     const PARQUET_FILE1: &str =
@@ -550,7 +550,7 @@ mod tests {
         commit_add_file(table_root, storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
 
         let engine = DefaultEngineBuilder::new(storage).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), ERROR_ALLOCATORS);
 
         let table_changes = ok_or_panic(unsafe {
             table_changes_from_version(kernel_string_slice!(table_root), engine.shallow_copy(), 0)
@@ -638,7 +638,7 @@ mod tests {
         commit_add_file(table_root, storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
 
         let engine = DefaultEngineBuilder::new(storage).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), ERROR_ALLOCATORS);
 
         let table_changes = ok_or_panic(unsafe {
             table_changes_from_version(kernel_string_slice!(table_root), engine.shallow_copy(), 0)
@@ -695,7 +695,7 @@ mod tests {
         commit_add_file(table_root, storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
 
         let engine = DefaultEngineBuilder::new(storage).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), ERROR_ALLOCATORS);
 
         let table_changes = ok_or_panic(unsafe {
             table_changes_from_version(kernel_string_slice!(table_root), engine.shallow_copy(), 0)
@@ -779,7 +779,7 @@ mod tests {
         commit_remove_file(table_root, storage.as_ref(), 3, PARQUET_FILE2.to_string()).await?;
 
         let engine = DefaultEngineBuilder::new(storage).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(Arc::new(engine), ERROR_ALLOCATORS);
 
         let table_changes = ok_or_panic(unsafe {
             table_changes_between_versions(

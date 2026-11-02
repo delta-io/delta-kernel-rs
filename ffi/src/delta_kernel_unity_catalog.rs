@@ -18,7 +18,7 @@ use unity_catalog_delta_client_api::{
     UpdateTableRequest as ClientUpdateTableRequest,
 };
 
-use crate::error::{AllocateErrorFn, ExternResult, IntoExternResult as _};
+use crate::error::{ErrorAllocators, ExternResult, IntoExternResult as _};
 use crate::transaction::MutableCommitter;
 use crate::{ExclusiveRustString, NullableCvoid};
 
@@ -212,8 +212,9 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
 ///
 /// # Safety
 ///
-/// `error_fn` must point to an initialized [`ErrorAllocators`] for this call. Its context and
-/// callbacks must remain valid for every use and support concurrent calls if shared across threads.
+/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
+/// and callbacks must remain valid for every use and support concurrent calls if shared across
+/// threads.
 ///
 ///  Caller is responsible for passing a valid pointer to a SharedFfiUCCommitClient, obtained via
 ///  calling [`get_uc_commit_client`], valid KernelStringSlices for `table_id`, `catalog`,
@@ -225,10 +226,11 @@ pub unsafe extern "C" fn get_uc_committer(
     catalog: KernelStringSlice,
     schema: KernelStringSlice,
     table_name: KernelStringSlice,
-    error_fn: AllocateErrorFn,
+    error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<MutableCommitter>> {
+    let error_allocators = unsafe { *error_allocators };
     let result = get_uc_committer_impl(commit_client, table_id, catalog, schema, table_name);
-    unsafe { result.into_extern_result(&error_fn) }
+    unsafe { result.into_extern_result(&error_allocators) }
 }
 
 fn get_uc_committer_impl(
@@ -280,7 +282,7 @@ pub(crate) mod tests {
     };
 
     use super::*;
-    use crate::ffi_test_utils::{allocate_err, ok_or_panic};
+    use crate::ffi_test_utils::{ok_or_panic, ERROR_ALLOCATORS};
     use crate::{allocate_kernel_string, kernel_string_slice, OptionalValue};
 
     pub(crate) struct TestContext {
@@ -334,7 +336,7 @@ pub(crate) mod tests {
             let error_str = unsafe {
                 ok_or_panic(allocate_kernel_string(
                     kernel_string_slice!(error_msg),
-                    allocate_err,
+                    &ERROR_ALLOCATORS,
                 ))
             };
             OptionalValue::Some(error_str)
@@ -450,7 +452,7 @@ pub(crate) mod tests {
                 kernel_string_slice!(catalog),
                 kernel_string_slice!(schema),
                 kernel_string_slice!(table_name),
-                allocate_err,
+                &ERROR_ALLOCATORS,
             ))
         };
 

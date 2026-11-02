@@ -34,7 +34,7 @@ static bool print_commit_files(const char* table_path)
   SharedCommitFilesIterator* iter = NULL;
   KernelStringSlice path = { table_path, strlen(table_path) };
 
-  ExternResultHandleSharedExternEngine engine_result = get_default_engine(path, allocate_error);
+  ExternResultHandleSharedExternEngine engine_result = get_default_engine(path, &error_allocators);
   if (engine_result.tag != OkHandleSharedExternEngine) {
     print_and_free_error("Could not build engine", engine_result.err);
     goto cleanup;

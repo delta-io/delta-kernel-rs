@@ -24,7 +24,7 @@ use delta_kernel_default_engine::rest_store::{
 use derive_more::Constructor;
 use url::Url;
 
-use crate::error::AllocateErrorFn;
+use crate::error::ErrorAllocators;
 use crate::handle::Handle;
 use crate::{ExclusiveRustString, KernelStringSlice, NullableCvoid, TryFromStringSlice};
 
@@ -142,13 +142,13 @@ pub struct CAuthHeaders {
 ///
 /// The kernel invokes this when it needs fresh headers. For each entry in `headers[0..count]`,
 /// set `name` and `value` via [`allocate_kernel_string`](crate::allocate_kernel_string) using the
-/// supplied `allocate_error` callback table (the same allocator the engine registered on
+/// supplied `error_allocators` callback table (the same allocator the engine registered on
 /// [`get_engine_builder`](crate::get_engine_builder)). Set `ttl_ms` to report how long those
 /// headers stay valid. With a non-zero TTL the kernel caches them and re-invokes near expiry; with
 /// `ttl_ms = 0` it invokes the callback on every request.
 ///
 /// `context` is the opaque pointer registered via
-/// [`builder_with_rest_object_store`](crate::builder_with_rest_object_store). `allocate_error` is
+/// [`builder_with_rest_object_store`](crate::builder_with_rest_object_store). `error_allocators` is
 /// forwarded on each invocation so the callback can pass it to
 /// [`allocate_kernel_string`](crate::allocate_kernel_string) without the engine having to stash it
 /// separately. The table pointer is valid only until this callback returns; copy the table if it
@@ -156,7 +156,7 @@ pub struct CAuthHeaders {
 pub type CAuthHeaderCallback = extern "C" fn(
     context: NullableCvoid,
     out: *mut CAuthHeaders,
-    allocate_error: *const ErrorAllocators,
+    error_allocators: *const ErrorAllocators,
 );
 
 /// State for [`crate::ObjectStoreBackend::Rest`], stored on
@@ -174,7 +174,7 @@ pub(crate) struct RestBuilderState {
 pub(crate) struct FfiAuthHeaderProvider {
     callback: CAuthHeaderCallback,
     context: NullableCvoid,
-    allocate_error: AllocateErrorFn,
+    error_allocators: ErrorAllocators,
 }
 // SAFETY: see [`builder_with_rest_object_store`](crate::builder_with_rest_object_store): `context`
 // and `callback` must be safe to invoke from any thread concurrently.
@@ -189,7 +189,7 @@ impl FfiAuthHeaderProvider {
         // only those slots are read below.
         unsafe { (*out).count = 0 };
         unsafe { (*out).ttl_ms = 0 };
-        (self.callback)(self.context, out, self.allocate_error);
+        (self.callback)(self.context, out, &self.error_allocators);
         let ttl_ms = unsafe { (*out).ttl_ms };
         let ttl = (ttl_ms != 0).then(|| Duration::from_millis(ttl_ms));
         let pairs = unsafe { take_auth_pairs_from_c(out)? };
@@ -202,11 +202,11 @@ pub(crate) fn rest_builder_state_from_ffi(
     endpoint_config: &CRestEndpointConfig,
     callback: Option<CAuthHeaderCallback>,
     context: NullableCvoid,
-    allocate_error: AllocateErrorFn,
+    error_allocators: ErrorAllocators,
 ) -> KernelResult<RestBuilderState> {
     Ok(RestBuilderState {
         endpoint_config: rest_endpoint_config_from_c(endpoint_config)?,
-        auth_callback: callback.map(|cb| FfiAuthHeaderProvider::new(cb, context, allocate_error)),
+        auth_callback: callback.map(|cb| FfiAuthHeaderProvider::new(cb, context, error_allocators)),
     })
 }
 
@@ -386,7 +386,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::ffi_test_utils::allocate_err;
+    use crate::ffi_test_utils::ERROR_ALLOCATORS;
     use crate::kernel_string_slice;
 
     // Miri policy for this module. See ffi/AGENTS.md "Testing under Miri" for the policy;
@@ -397,8 +397,8 @@ mod tests {
     //   3. Client-build tests: reach `build_rest_client`. Their `unsafe` is a subset of what groups
     //      1-2 run under Miri, so the slow ones are `#[cfg_attr(miri, ignore)]`.
 
-    fn test_allocate_error() -> AllocateErrorFn {
-        allocate_err
+    fn test_error_allocators() -> ErrorAllocators {
+        ERROR_ALLOCATORS
     }
 
     fn test_auth_header_pair(name: &str, value: &str) -> CAuthHeaderPair {
@@ -455,7 +455,7 @@ mod tests {
             &test_c_rest_endpoint_config(),
             None,
             None,
-            test_allocate_error(),
+            test_error_allocators(),
         )
         .unwrap()
     }
@@ -587,7 +587,11 @@ mod tests {
         assert!(unsafe { take_auth_pairs_from_c(storage.as_mut_ptr()).is_err() });
     }
 
-    extern "C" fn fill_auth_direct(_: NullableCvoid, out: *mut CAuthHeaders, _: AllocateErrorFn) {
+    extern "C" fn fill_auth_direct(
+        _: NullableCvoid,
+        out: *mut CAuthHeaders,
+        _: *const ErrorAllocators,
+    ) {
         write_test_auth_headers(&[("authorization", "Bearer t")], out);
         unsafe {
             (*out).ttl_ms = 60_000;
@@ -599,7 +603,7 @@ mod tests {
         let provider = FfiAuthHeaderProvider {
             callback: fill_auth_direct,
             context: None,
-            allocate_error: test_allocate_error(),
+            error_allocators: test_error_allocators(),
         };
         let (headers, ttl) = provider.collect().unwrap();
         assert_eq!(headers.get("authorization").unwrap(), "Bearer t");
@@ -709,7 +713,7 @@ mod tests {
             &test_c_rest_endpoint_config(),
             Some(fill_auth_direct),
             None,
-            test_allocate_error(),
+            test_error_allocators(),
         )
         .unwrap();
         assert!(build_rest_object_store(&test_base_url(), &HashMap::new(), &rest).is_ok());
@@ -741,7 +745,8 @@ mod tests {
         let mut config = test_c_rest_endpoint_config();
         config.files_prefix = kernel_string_slice!(prefix);
         config.entry_strip_prefix = kernel_string_slice!(prefix);
-        let rest = rest_builder_state_from_ffi(&config, None, None, test_allocate_error()).unwrap();
+        let rest =
+            rest_builder_state_from_ffi(&config, None, None, test_error_allocators()).unwrap();
 
         let mut options = HashMap::new();
         options.insert(

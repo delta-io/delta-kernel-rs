@@ -107,7 +107,7 @@ pub(crate) fn ok_or_panic<T>(result: ExternResult<T>) -> T {
 }
 
 struct ErrorOnlyExternEngine {
-    allocate_error: ErrorAllocators,
+    error_allocators: ErrorAllocators,
 }
 
 impl ExternEngine for ErrorOnlyExternEngine {
@@ -116,14 +116,14 @@ impl ExternEngine for ErrorOnlyExternEngine {
     }
 
     fn error_allocator(&self) -> &dyn AllocateError {
-        &self.allocate_error
+        &self.error_allocators
     }
 }
 
 /// Return a lightweight engine handle for tests that only exercise FFI error allocation.
 pub(crate) fn error_only_engine_handle() -> crate::handle::Handle<SharedExternEngine> {
     let engine: Arc<dyn ExternEngine> = Arc::new(ErrorOnlyExternEngine {
-        allocate_error: ERROR_ALLOCATORS,
+        error_allocators: ERROR_ALLOCATORS,
     });
     engine.into()
 }
