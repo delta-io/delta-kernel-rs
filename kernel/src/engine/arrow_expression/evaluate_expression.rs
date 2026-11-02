@@ -709,7 +709,7 @@ pub fn evaluate_predicate(
                     // and map elements/needles are unsupported: `logical_eq` returns `false` for
                     // them, so they never match, not even a structurally identical value.
                     let exists = ad.array_elements().iter().any(|e| lit.logical_eq(e));
-                    Ok(BooleanArray::from(vec![exists]))
+                    Ok(BooleanArray::from(vec![exists; batch.num_rows()]))
                 }
                 (l, r) => Err(KernelError::invalid_expression(format!(
                     "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
