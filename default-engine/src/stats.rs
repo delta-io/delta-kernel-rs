@@ -892,12 +892,13 @@ mod tests {
     use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
     use delta_kernel::arrow::compute::concat_batches;
     use delta_kernel::arrow::datatypes::{Fields, Int32Type, Int64Type, Schema};
+    use delta_kernel::arrow::util::pretty::pretty_format_batches;
     use delta_kernel::engine::arrow_conversion::TryFromArrow as _;
     use delta_kernel::engine::arrow_expression::evaluate_expression::to_json;
     use delta_kernel::expressions::column_name;
     use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use delta_kernel::schema::schema;
-    use test_utils::assert_result_error_with_message;
+    use test_utils::{assert_batches_sorted_eq, assert_result_error_with_message};
 
     use super::*;
 
@@ -1891,33 +1892,87 @@ mod tests {
         assert!(acc.finish().unwrap().is_none());
     }
 
-    #[test]
-    fn test_file_stats_accumulator_single_batch_matches_collect_stats() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Utf8, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+    #[rstest::rstest]
+    #[case::nan(vec![1.0, 2.0, f64::NAN, 0.5])]
+    #[case::signed_zero(vec![0.0, -0.0, 0.0, -0.0])]
+    #[case::signed_zero_reversed(vec![-0.0, 0.0, -0.0, 0.0])]
+    fn test_file_stats_accumulator_matches_collect_stats(
+        #[case] values: Vec<f64>,
+        #[values(None, Some("UTC"), Some("America/Los_Angeles"))] timezone: Option<&str>,
+        #[values(1, 2, 4)] batch_size: usize,
+    ) {
+        let timestamps = PrimitiveArray::<TimestampMicrosecondType>::from(vec![
+            Some(5),
+            None,
+            Some(-3),
+            Some(10),
+        ])
+        .with_timezone_opt(timezone);
+        let whole = batch_of(
             vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+                Field::new("id", DataType::Int64, false),
+                Field::new("value", DataType::Utf8, true),
+                Field::new("f", DataType::Float64, true),
+                Field::new("t", timestamps.data_type().clone(), true),
             ],
-        )
-        .unwrap();
-        let cols = vec![column_name!("id"), column_name!("value")];
-        let physical_schema = StructType::try_from_arrow(schema.as_ref()).unwrap();
-
-        let single = collect_stats(&batch, &cols).unwrap();
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    None,
+                    Some("c"),
+                    Some("d"),
+                ])),
+                Arc::new(Float64Array::from(values)),
+                Arc::new(timestamps),
+            ],
+        );
+        let timestamp_type = if timezone.is_some() {
+            KernelDataType::TIMESTAMP
+        } else {
+            KernelDataType::TIMESTAMP_NTZ
+        };
+        let physical_schema = schema! {
+            not_null "id": LONG,
+            nullable "value": STRING,
+            nullable "f": DOUBLE,
+            nullable "t": (timestamp_type),
+        };
+        let cols = vec![
+            column_name!("id"),
+            column_name!("value"),
+            column_name!("f"),
+            column_name!("t"),
+        ];
+        let single = collect_stats(&whole, &cols).unwrap();
 
         let mut acc = FileStatsAccumulator::new(&cols, &physical_schema);
-        acc.merge(&batch).unwrap();
+        for offset in (0..whole.num_rows()).step_by(batch_size) {
+            acc.merge(&whole.slice(offset, batch_size.min(whole.num_rows() - offset)))
+                .unwrap();
+        }
         let merged = acc.finish().unwrap().unwrap();
 
-        assert_eq!(
-            to_json(&merged).unwrap().as_string::<i32>().value(0),
-            to_json(&single).unwrap().as_string::<i32>().value(0),
-        );
+        assert_eq!(merged.data_type(), single.data_type());
+        for section in [MIN_VALUES, MAX_VALUES] {
+            assert_eq!(
+                flat_stat::<Float64Type>(&merged, section, "f").to_bits(),
+                flat_stat::<Float64Type>(&single, section, "f").to_bits(),
+                "{section} must preserve NaN and signed-zero ordering",
+            );
+            assert_eq!(
+                child_struct(&merged, section)
+                    .column_by_name("t")
+                    .unwrap()
+                    .data_type(),
+                whole.column_by_name("t").unwrap().data_type(),
+            );
+        }
+        let expected = pretty_format_batches(&[RecordBatch::from(single)])
+            .unwrap()
+            .to_string();
+        let expected_lines: Vec<&str> = expected.trim().lines().collect();
+        assert_batches_sorted_eq!(expected_lines, &[RecordBatch::from(merged)]);
     }
 
     /// Extracts a named child column from a StructArray, downcasting it to StructArray.
@@ -2320,74 +2375,6 @@ mod tests {
         );
         assert_eq!(flat_stat::<Decimal128Type>(&merged, MIN_VALUES, "d"), 50);
         assert_eq!(flat_stat::<Decimal128Type>(&merged, MAX_VALUES, "d"), 900);
-    }
-
-    #[rstest::rstest]
-    #[case::nan(vec![1.0, 2.0, f64::NAN, 0.5])]
-    #[case::signed_zero(vec![0.0, -0.0, 0.0, -0.0])]
-    #[case::signed_zero_reversed(vec![-0.0, 0.0, -0.0, 0.0])]
-    fn test_file_stats_accumulator_float_ordering_matches_single_shot(
-        #[case] values: Vec<f64>,
-        #[values(1, 2, 4)] batch_size: usize,
-    ) {
-        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, true)]));
-        let physical_schema = StructType::try_from_arrow(schema.as_ref()).unwrap();
-        let whole =
-            RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(values))]).unwrap();
-        let single = collect_stats(&whole, &[column_name!("f")]).unwrap();
-        let mut acc = FileStatsAccumulator::new(&[column_name!("f")], &physical_schema);
-        for offset in (0..whole.num_rows()).step_by(batch_size) {
-            acc.merge(&whole.slice(offset, batch_size.min(whole.num_rows() - offset)))
-                .unwrap();
-        }
-        let merged = acc.finish().unwrap().unwrap();
-
-        for section in [MIN_VALUES, MAX_VALUES] {
-            assert_eq!(
-                flat_stat::<Float64Type>(&merged, section, "f").to_bits(),
-                flat_stat::<Float64Type>(&single, section, "f").to_bits(),
-                "{section} must preserve NaN and signed-zero ordering",
-            );
-        }
-    }
-
-    #[rstest::rstest]
-    fn test_file_stats_accumulator_preserves_timestamp_timezone(
-        #[values(None, Some("UTC"), Some("America/Los_Angeles"))] timezone: Option<&str>,
-    ) {
-        let array = PrimitiveArray::<TimestampMicrosecondType>::from(vec![
-            Some(5),
-            None,
-            Some(-3),
-            Some(10),
-        ])
-        .with_timezone_opt(timezone);
-        let data_type = array.data_type().clone();
-        let schema = Arc::new(Schema::new(vec![Field::new("t", data_type.clone(), true)]));
-        let timestamp_type = if timezone.is_some() {
-            KernelDataType::TIMESTAMP
-        } else {
-            KernelDataType::TIMESTAMP_NTZ
-        };
-        let physical_schema = schema! { nullable "t": (timestamp_type) };
-        let whole = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
-        let single = collect_stats(&whole, &[column_name!("t")]).unwrap();
-        let mut acc = FileStatsAccumulator::new(&[column_name!("t")], &physical_schema);
-        for offset in 0..whole.num_rows() {
-            acc.merge(&whole.slice(offset, 1)).unwrap();
-        }
-        let merged = acc.finish().unwrap().unwrap();
-
-        assert_eq!(merged, single);
-        for section in [MIN_VALUES, MAX_VALUES] {
-            assert_eq!(
-                child_struct(&merged, section)
-                    .column_by_name("t")
-                    .unwrap()
-                    .data_type(),
-                &data_type,
-            );
-        }
     }
 
     #[rstest::rstest]
