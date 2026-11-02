@@ -2203,12 +2203,20 @@ mod tests {
         Scalar::interval_year_month(12, IntervalYearToMonthType::IntervalYear).unwrap()
     )]
     #[case(
+        "INTERVAL '-1' YEAR",
+        Scalar::interval_year_month(-12, IntervalYearToMonthType::IntervalYear).unwrap()
+    )]
+    #[case(
         "INTERVAL '-6' MONTH",
         Scalar::interval_year_month(-6, IntervalYearToMonthType::IntervalMonth).unwrap()
     )]
     #[case(
         "INTERVAL '2-6' YEAR TO MONTH",
         Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap()
+    )]
+    #[case(
+        "INTERVAL '-1-6' YEAR TO MONTH",
+        Scalar::interval_year_month(-18, IntervalYearToMonthType::IntervalYearToMonth).unwrap()
     )]
     #[case("INTERVAL '1' DAY", Scalar::IntervalDayTime(86_400_000_000))]
     #[case("INTERVAL '25' HOUR", Scalar::IntervalDayTime(90_000_000_000))]
