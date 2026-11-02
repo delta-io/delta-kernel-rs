@@ -8,7 +8,6 @@ mod removefile;
 mod utils;
 
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 
 pub(super) use addfile::{validate_add_files, validate_no_clustering_providers_set};
 use derive_more::Constructor;
@@ -38,48 +37,60 @@ pub(crate) enum RowTrackingEnablement {
 ///
 /// Note that [`FileActionDeduplicator`](crate::log_replay::FileActionDeduplicator) uses different
 /// rules: it deduplicates `(path, dv_id)` pairs during log replay.
-// TODO(#3692): Optimize by using only one map.
 #[derive(Default)]
 pub(super) struct FileActionUniquenessValidator {
-    add_paths: HashMap<String, Option<String>>,
-    remove_paths: HashMap<String, Option<String>>,
+    paths: HashMap<String, SeenActions>,
+}
+
+enum FileActionType {
+    Add,
+    Remove,
+}
+
+enum SeenActions {
+    Add(Option<String>),
+    Remove(Option<String>),
+    Both,
 }
 
 impl FileActionUniquenessValidator {
     fn record_add(&mut self, path: &str, dv_id: Option<String>) -> KernelResult<()> {
-        Self::record(
-            path,
-            dv_id,
-            "AddFile",
-            &mut self.add_paths,
-            &self.remove_paths,
-        )
+        self.record(path, dv_id, FileActionType::Add)
     }
 
     fn record_remove(&mut self, path: &str, dv_id: Option<String>) -> KernelResult<()> {
-        Self::record(
-            path,
-            dv_id,
-            "RemoveFile",
-            &mut self.remove_paths,
-            &self.add_paths,
-        )
+        self.record(path, dv_id, FileActionType::Remove)
     }
 
     fn record(
+        &mut self,
         path: &str,
         dv_id: Option<String>,
-        action_name: &str,
-        same_type_actions: &mut HashMap<String, Option<String>>,
-        different_type_actions: &HashMap<String, Option<String>>,
+        action_type: FileActionType,
     ) -> KernelResult<()> {
-        let Entry::Vacant(entry) = same_type_actions.entry(path.to_owned()) else {
-            return Err(KernelError::invalid_transaction_state(format!(
-                "Transaction contains multiple {action_name} actions for path '{path}'"
-            )));
+        let Some(seen_actions) = self.paths.get_mut(path) else {
+            let seen = match action_type {
+                FileActionType::Add => SeenActions::Add(dv_id),
+                FileActionType::Remove => SeenActions::Remove(dv_id),
+            };
+            self.paths.insert(path.to_owned(), seen);
+            return Ok(());
+        };
+        let previous_dv_id = match (&*seen_actions, &action_type) {
+            (SeenActions::Add(previous_dv_id), FileActionType::Remove) => previous_dv_id,
+            (SeenActions::Remove(previous_dv_id), FileActionType::Add) => previous_dv_id,
+            _ => {
+                let action_name = match action_type {
+                    FileActionType::Add => "AddFile",
+                    FileActionType::Remove => "RemoveFile",
+                };
+                return Err(KernelError::invalid_transaction_state(format!(
+                    "Transaction contains multiple {action_name} actions for path '{path}'"
+                )));
+            }
         };
         require!(
-            different_type_actions.get(path) != Some(&dv_id),
+            previous_dv_id != &dv_id,
             KernelError::invalid_transaction_state(match dv_id.as_deref() {
                 Some(dv_id) => format!(
                     "Transaction contains AddFile and RemoveFile actions for path '{path}' with the \
@@ -91,7 +102,7 @@ impl FileActionUniquenessValidator {
                 ),
             })
         );
-        entry.insert(dv_id);
+        *seen_actions = SeenActions::Both;
         Ok(())
     }
 }
@@ -328,6 +339,46 @@ mod tests {
             ),
         ],
         None,
+    )]
+    #[case::add_after_dv_update(
+        &[
+            FileActionUniquenessValidatorTestCase::new(
+                TestFileActionType::Remove,
+                "same_path" /* path */,
+                Some("dv-1"),
+            ),
+            FileActionUniquenessValidatorTestCase::new(
+                TestFileActionType::Add,
+                "same_path" /* path */,
+                Some("dv-2"),
+            ),
+            FileActionUniquenessValidatorTestCase::new(
+                TestFileActionType::Add,
+                "same_path" /* path */,
+                Some("dv-3"),
+            ),
+        ],
+        Some("multiple AddFile actions for path 'same_path'"),
+    )]
+    #[case::remove_after_dv_update(
+        &[
+            FileActionUniquenessValidatorTestCase::new(
+                TestFileActionType::Add,
+                "same_path" /* path */,
+                Some("dv-1"),
+            ),
+            FileActionUniquenessValidatorTestCase::new(
+                TestFileActionType::Remove,
+                "same_path" /* path */,
+                Some("dv-2"),
+            ),
+            FileActionUniquenessValidatorTestCase::new(
+                TestFileActionType::Remove,
+                "same_path" /* path */,
+                Some("dv-3"),
+            ),
+        ],
+        Some("multiple RemoveFile actions for path 'same_path'"),
     )]
     #[case::same_dv_different_paths(
         &[
