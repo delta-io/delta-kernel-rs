@@ -454,7 +454,10 @@ pub enum Scalar {
     /// `YEAR` values must be multiples of 12 months; other qualifiers accept any `i32`.
     #[from]
     IntervalYearMonth(IntervalYearMonthData),
-    /// Day-time interval, stored as a signed 64bit count of microseconds (matches Spark Catalyst).
+    /// Day-time interval, stored as signed microseconds aligned to its ANSI qualifier.
+    ///
+    /// Qualifiers ending in `DAY`, `HOUR`, or `MINUTE` require whole end units; those ending in
+    /// `SECOND` accept any `i64` microsecond count.
     #[from]
     IntervalDayTime(IntervalDayTimeData),
     /// Date stored as a signed 32bit int days since UNIX epoch 1970-01-01
@@ -1284,7 +1287,10 @@ fn parse_year_month_interval(raw: &str, target: IntervalYearToMonthType) -> Kern
     Scalar::interval_year_month(months, target).map_err(|_| parse_error())
 }
 
-/// Parses a day-time interval literal into a scalar with the target qualifier.
+/// Parses `raw` as a day-time interval literal aligned to the `target` qualifier.
+///
+/// Returns a scalar only when the literal's qualifier matches `target` and its microsecond count
+/// fits in `i64`. Fractional seconds beyond microsecond precision are truncated.
 fn parse_day_time_interval(raw: &str, target: IntervalDayToSecondType) -> KernelResult<Scalar> {
     let parse_error = || PrimitiveType::interval_day_time(target).parse_error(raw);
     let (_, range) = extract_interval_literal(raw).ok_or_else(parse_error)?;
