@@ -10,35 +10,35 @@ use itertools::Itertools;
 use serde::Serialize;
 use tempfile::TempDir;
 use test_utils::{
-    copy_directory, delta_path_for_version, load_test_data, modify_add_file_partition_keys,
-    replace_array_row, replace_column, AddFilePartitionKeyModify,
+    AddFilePartitionKeyModify, copy_directory, delta_path_for_version, load_test_data,
+    modify_add_file_partition_keys, replace_array_row, replace_column,
 };
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use url::Url;
 
-use crate::actions::{get_all_actions_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
+use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove, get_all_actions_schema};
 use crate::arrow::array::{
-    new_empty_array, new_null_array, ArrayRef, Int64Array, MapArray, RecordBatch, StringArray,
-    StructArray,
+    ArrayRef, Int64Array, MapArray, RecordBatch, StringArray, StructArray, new_empty_array,
+    new_null_array,
 };
 use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::concat_batches;
 use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use crate::committer::FileSystemCommitter;
-use crate::engine::arrow_conversion::{parquet_field_id_metadata, TryIntoArrow as _};
+use crate::engine::arrow_conversion::{TryIntoArrow as _, parquet_field_id_metadata};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
 use crate::metrics::{MetricEvent, MetricsReporter, WithMetricsReporterLayer as _};
+use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::local::LocalFileSystem;
 use crate::object_store::memory::InMemory;
-use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    ColumnMappingMode, FeatureType, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    ColumnMappingMode, FeatureType, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
 };
 use crate::table_properties::COLUMN_MAPPING_MODE;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -46,7 +46,7 @@ use crate::table_properties::{
     ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
 };
 use crate::transaction::create_table::create_table;
-use crate::transaction::{CreateTable, Transaction, BASE_ADD_FILES_SCHEMA};
+use crate::transaction::{BASE_ADD_FILES_SCHEMA, CreateTable, Transaction};
 use crate::{
     Engine, EngineData, FileMeta, KernelError, KernelResult, Snapshot, SnapshotRef, Version,
 };
@@ -120,8 +120,8 @@ pub(crate) enum Action {
 }
 
 use crate::schema::{
-    schema, schema_ref, ArrayType, ColumnMetadataKey, DataType as KernelDataType, MapType,
-    MetadataValue, SchemaRef, StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType as KernelDataType, MapType, MetadataValue, SchemaRef,
+    StructField, StructType, schema, schema_ref,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType, PrimitiveType};
@@ -334,12 +334,51 @@ pub(crate) mod adaptive_metadata_fixtures {
 
     /// The protocol and metadata of a minimal adaptiveMetadata table.
     pub(crate) fn adaptive_metadata_protocol_and_metadata() -> (Protocol, Metadata) {
-        let table_config =
-            adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
+        adaptive_metadata_pm(test_schema_flat_with_column_mapping(), &[])
+    }
+
+    /// The protocol and metadata of an adaptiveMetadata table with `schema`, partitioned by
+    /// `partition_columns`.
+    pub(crate) fn adaptive_metadata_pm(
+        schema: SchemaRef,
+        partition_columns: &[&str],
+    ) -> (Protocol, Metadata) {
+        let table_config = adaptive_metadata_table_configuration(schema, &[]);
+        let mut metadata = serde_json::to_value(table_config.metadata()).unwrap();
+        metadata["partitionColumns"] = serde_json::json!(partition_columns);
         (
             table_config.protocol().clone(),
-            table_config.metadata().clone(),
+            serde_json::from_value(metadata).unwrap(),
         )
+    }
+
+    /// Commit lines holding the top-level protocol and metadata of [`adaptive_metadata_pm`], and
+    /// no checkpoint action.
+    pub(crate) fn protocol_and_metadata_lines(
+        schema: SchemaRef,
+        partition_columns: &[&str],
+    ) -> String {
+        let (protocol, metadata) = adaptive_metadata_pm(schema, partition_columns);
+        format!(
+            "{}\n{}",
+            serde_json::json!({ "protocol": protocol }),
+            serde_json::json!({ "metaData": metadata }),
+        )
+    }
+
+    /// A `commitInfo` line with In-Commit Timestamp `timestamp` and, when given, a
+    /// `lastManifestCommit` `(version, contentRootVersion)`, as an AMT writer records on every
+    /// commit.
+    pub(crate) fn commit_info_line(timestamp: i64, pointer: Option<(i64, i64)>) -> String {
+        let mut commit_info =
+            serde_json::json!({ "timestamp": timestamp, "inCommitTimestamp": timestamp });
+        if let Some((version, content_root_version)) = pointer {
+            commit_info["lastManifestCommit"] = serde_json::json!({
+                "version": version,
+                "contentRootVersion": content_root_version,
+            });
+        }
+        serde_json::json!({ "commitInfo": commit_info }).to_string()
     }
 
     /// A minimal `checkpoint` action referencing `path` as the content root at `version`.
@@ -709,6 +748,19 @@ impl MockProtocolBuilder {
 //
 // Reusable test schemas
 // Each variant exists with and without column mapping metadata.
+
+/// Builds a nullable [`StructField`] carrying `metadata_value` as its `delta.generationExpression`
+/// metadata.
+pub(crate) fn field_with_generation_expression(
+    name: &str,
+    data_type: impl Into<KernelDataType>,
+    metadata_value: impl Into<MetadataValue>,
+) -> StructField {
+    StructField::nullable(name, data_type).add_metadata([(
+        ColumnMetadataKey::GenerationExpression.as_ref(),
+        metadata_value.into(),
+    )])
+}
 
 /// Builds a nullable [`StructField`] carrying column-mapping id + physical name metadata.
 fn cm_field(
@@ -1349,8 +1401,8 @@ pub(crate) fn load_test_table(
 
 pub(crate) mod column_mapping_physical_name_dedup_fixtures {
     use crate::schema::{
-        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
-        StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        schema,
     };
 
     /// Two fields with the same physical name at different physical paths should be accepted.

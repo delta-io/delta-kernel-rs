@@ -8,7 +8,7 @@ use delta_kernel::{Engine, PlanExecutor};
 
 use crate::handle::Handle;
 use crate::plans::executor::{CExecuteOpFn, FfiPlanExecutor, SharedPlanExecutor};
-use crate::{engine_to_handle, AllocateErrorFn, NullableCvoid, OptionalValue, SharedExternEngine};
+use crate::{AllocateErrorFn, NullableCvoid, OptionalValue, SharedExternEngine, engine_to_handle};
 
 pub mod executor;
 pub mod iter;

@@ -9,24 +9,24 @@ use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{column_name, ArrayData, ColumnName, MapData, Scalar};
-use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::expressions::{ArrayData, ColumnName, MapData, Scalar, column_name};
 use delta_kernel::object_store::DynObjectStore;
-use delta_kernel::schema::{schema_ref, ArrayType, DataType, MapType, StructField, StructType};
-use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType, schema_ref};
+use delta_kernel::table_features::{ColumnMappingMode, get_any_level_column_physical_name};
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::{
-    Transaction, UpdateTableOperation, CLUSTERING_PROVIDER_NAME, TAGS_NAME,
+    CLUSTERING_PROVIDER_NAME, TAGS_NAME, Transaction, UpdateTableOperation,
 };
 use delta_kernel::{EngineData as _, Snapshot};
 use itertools::Itertools;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
+use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
-use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
     assert_result_error_with_message, create_add_files_metadata, create_default_engine_mt_executor,
     into_record_batch, nested_batches, nested_schema, read_actions_from_commit, test_table_setup,

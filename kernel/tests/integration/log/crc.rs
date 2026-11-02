@@ -4,33 +4,34 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(feature = "internal-api")]
+use delta_kernel::LogPath;
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::crc::{Crc, DomainMetadataState, SetTransactionState};
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::ParsedLogPath;
-use delta_kernel::schema::{schema_ref, SchemaRef};
+use delta_kernel::schema::{SchemaRef, schema_ref};
 use delta_kernel::snapshot::{ChecksumWriteResult, IncrementalReplay, Snapshot, SnapshotRef};
 #[cfg(feature = "internal-api")]
 use delta_kernel::snapshot::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
-#[cfg(feature = "internal-api")]
-use delta_kernel::LogPath;
 use delta_kernel::{
     Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, FileSize,
-    FileStats, JsonHandler, KernelResult, KernelResultIterator, ParquetFooter, ParquetHandler,
-    PredicateRef, StorageHandler, Version,
+    FileStats, JsonHandler, KernelError, KernelResult, KernelResultIterator, ParquetFooter,
+    ParquetHandler, PredicateRef, StorageHandler, Version,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
-    add_commit, begin_transaction_with, copy_directory, insert_data, test_table_setup,
-    test_table_setup_mt,
+    add_commit, begin_transaction_with, copy_directory, insert_data, insert_data_with,
+    test_table_setup, test_table_setup_mt,
 };
 use url::Url;
 
@@ -180,10 +181,12 @@ async fn test_get_all_files_none_when_crc_advanced_via_safe_commit() -> KernelRe
 
     let snapshot = Snapshot::builder_for(table_path.clone()).build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 0);
-    assert!(snapshot
-        .crc_at_version()
-        .and_then(|c| c.all_files())
-        .is_some());
+    assert!(
+        snapshot
+            .crc_at_version()
+            .and_then(|c| c.all_files())
+            .is_some()
+    );
 
     // ===== WHEN =====
     // Safe (WRITE) commit with no file actions advances to version 1 (no new CRC written).
@@ -566,7 +569,7 @@ async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> KernelResult
     let stats_v2 = crc_v2.file_stats().unwrap();
     assert_eq!(stats_v2.num_files(), 2); // <--- 2 files added
     assert!(stats_v2.table_size_bytes() > stats_v1.table_size_bytes()); // <--- size is greater than
-                                                                        // after first insert
+    // after first insert
 
     // ===== WHEN: Remove all files =====
     let scan = snapshot_v2.clone().scan_builder().build()?;
@@ -647,9 +650,11 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> KernelResult<(
     Ok(())
 }
 
+#[rstest]
 #[tokio::test]
-async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate() -> KernelResult<()>
-{
+async fn test_post_commit_crc_metadata_only_custom_op_makes_file_stats_indeterminate(
+    #[values("ANALYZE STATS", "VACUUM END", "SET TBLPROPERTIES")] operation: &str,
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // ===== GIVEN: Create table (v0) and insert data (v1) =====
@@ -662,11 +667,11 @@ async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate(
         .unwrap_committed();
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
 
-    // ===== WHEN: Commit a non-incremental operation (ANALYZE STATS) =====
+    // ===== WHEN: Commit a custom operation without file actions =====
     let committed = begin_transaction_with(
         snapshot_v1.clone(),
         engine.as_ref(),
-        delta_kernel::transaction::UpdateTableOperation::Custom("ANALYZE STATS".to_string()),
+        UpdateTableOperation::Custom(operation.to_string()),
         "test-engine",
         true,
         |builder| builder,
@@ -679,6 +684,16 @@ async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate(
     let snapshot_v2 = committed.post_commit_snapshot().unwrap();
     let crc_v2 = snapshot_v2.crc_at_version().unwrap();
     assert!(crc_v2.file_stats_state().is_indeterminate());
+    assert!(matches!(
+        snapshot_v2.write_checksum(engine.as_ref()),
+        Err(KernelError::ChecksumWriteUnsupported(_))
+    ));
+
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        fresh.write_checksum(engine.as_ref())?.0,
+        ChecksumWriteResult::Written
+    );
 
     Ok(())
 }
@@ -727,6 +742,113 @@ async fn test_write_checksum_double_write_returns_already_exists(
     };
     assert_eq!(second, ChecksumWriteResult::AlreadyExists);
 
+    Ok(())
+}
+
+#[rstest]
+#[case::version_zero(WriteRoot::VersionZero, None)]
+#[case::stale_crc_incremental(WriteRoot::StaleCrcIncrementalBuild, None)]
+#[case::stale_crc_non_incremental(WriteRoot::StaleCrcNonIncrementalBuild, None)]
+#[case::checkpoint_v1(WriteRoot::CheckpointWithTail, Some(CheckpointSpec::V1))]
+#[case::checkpoint_v2(
+    WriteRoot::CheckpointWithTail,
+    Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
+)]
+#[case::checkpoint_v2_sidecars(
+    WriteRoot::CheckpointWithTail,
+    Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+        file_actions_per_sidecar_hint: Some(1),
+    }))
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_write_checksum_preserves_stats_across_metadata_only_commits(
+    #[case] root: WriteRoot,
+    #[case] checkpoint: Option<CheckpointSpec>,
+    #[values("VACUUM START", "VACUUM END", "SET TBLPROPERTIES", "ANALYZE STATS")] operation: &str,
+) -> KernelResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let mut builder = create_table(
+        &table_path,
+        schema_ref! { nullable "id": INTEGER },
+        "test_engine",
+        true,
+    )
+    .with_table_properties([("delta.feature.domainMetadata", "supported")]);
+    if matches!(&checkpoint, Some(CheckpointSpec::V2(_))) {
+        builder = builder.with_table_properties([("delta.checkpointPolicy", "v2")]);
+    }
+    let snap = builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let mut snap = insert_data(snap, &engine, vec![Arc::new(Int32Array::from(vec![1]))])
+        .await?
+        .unwrap_post_commit_snapshot();
+    match root {
+        WriteRoot::CheckpointWithTail => {
+            snap = snap.checkpoint(engine.as_ref(), checkpoint.as_ref())?.1;
+        }
+        WriteRoot::StaleCrcIncrementalBuild | WriteRoot::StaleCrcNonIncrementalBuild => {
+            snap.write_checksum(engine.as_ref())?;
+        }
+        WriteRoot::VersionZero => {}
+        WriteRoot::CheckpointNoTail => unreachable!("metadata-only commits require a tail"),
+    }
+
+    for version in 2..=4 {
+        snap = if version == 3 {
+            insert_data(snap, &engine, vec![Arc::new(Int32Array::from(vec![2]))])
+                .await?
+                .unwrap_post_commit_snapshot()
+        } else {
+            snap.update_table(
+                UpdateTableOperation::Custom(operation.to_string()),
+                "test_engine",
+                false,
+            )
+            .with_domain_metadata("metadata_only", format!("v{version}"))
+            .with_transaction_id("metadata_only", version)
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot()
+        };
+    }
+
+    let incremental_build = root == WriteRoot::StaleCrcIncrementalBuild;
+    let replay = if incremental_build {
+        IncrementalReplay::Unlimited
+    } else {
+        IncrementalReplay::Disabled
+    };
+    let fresh = Snapshot::builder_for(&table_path)
+        .with_incremental_crc_replay(replay)
+        .build(engine.as_ref())?;
+    assert_eq!(fresh.version(), 4);
+    assert_eq!(fresh.crc_at_version().is_some(), incremental_build);
+    assert_eq!(
+        fresh.log_segment().checkpoint_version,
+        checkpoint.as_ref().map(|_| 1)
+    );
+    assert_eq!(
+        fresh.write_checksum(engine.as_ref())?.0,
+        ChecksumWriteResult::Written
+    );
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let crc = reloaded.crc_at_version().unwrap();
+    let sizes = parquet_file_sizes_on_disk(&table_path);
+    assert_eq!(sizes.len(), 2);
+    let stats = crc.file_stats().unwrap();
+    assert_eq!(stats.num_files(), 2);
+    assert_eq!(stats.table_size_bytes(), sizes.iter().sum::<i64>());
+    assert_histogram_totals(stats, 2, sizes.iter().sum());
+    assert_eq!(
+        crc.domain_metadata_state.expect_complete()["metadata_only"].configuration(),
+        "v4"
+    );
+    assert_eq!(
+        crc.set_transaction_state.expect_complete()["metadata_only"].version(),
+        4
+    );
     Ok(())
 }
 
@@ -940,8 +1062,8 @@ async fn test_disabled_load_retains_stale_crc_as_base() -> KernelResult<()> {
 /// The checkpoint drops the commits below it, so the stale base can no longer be advanced over
 /// them; resolution must fall back to the checkpoint root instead of erroring on a missing commit.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_write_checksum_after_checkpoint_with_stale_base_resolves_from_checkpoint(
-) -> KernelResult<()> {
+async fn test_write_checksum_after_checkpoint_with_stale_base_resolves_from_checkpoint()
+-> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let source_path = std::fs::canonicalize(PathBuf::from("./tests/data/crc-full/")).unwrap();
     copy_directory(&source_path, _temp_dir.path()).unwrap();
@@ -1051,8 +1173,8 @@ async fn test_incremental_unlimited_skips_below_checkpoint_base() -> KernelResul
 /// newly-listed checkpoint, `write_checksum` must skip that below-checkpoint base and resolve from
 /// the checkpoint root rather than erroring on the commits the checkpoint subsumed.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_write_checksum_incremental_stale_base_below_new_checkpoint_resolves(
-) -> KernelResult<()> {
+async fn test_write_checksum_incremental_stale_base_below_new_checkpoint_resolves()
+-> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let base = setup_incremental_below_checkpoint_base(&engine, &table_path).await?;
 
@@ -1080,8 +1202,8 @@ async fn test_write_checksum_incremental_stale_base_below_new_checkpoint_resolve
 /// ICT enabled, checkpoint at the current version, but v_end's commit file is unreadable: the
 /// ICT read error propagates instead of being laundered into a generic "CRC unresolved" error.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_propagates_read_error(
-) -> KernelResult<()> {
+async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_propagates_read_error()
+-> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
     let schema = schema_ref! { nullable "id": INTEGER };
@@ -1121,38 +1243,52 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupported(
+#[rstest]
+#[case::checkpoint(true)]
+#[case::stale_crc(false)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
+    #[case] with_checkpoint: bool,
 ) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-
-    let schema = schema_ref! { nullable "id": INTEGER };
-    let snap = create_table(&table_path, schema, "test_engine", true)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
-        .unwrap_post_commit_snapshot();
-    let snap = insert_data(
+    let snap = create_table_and_commit(&table_path, engine.as_ref())?
+        .post_commit_snapshot()
+        .unwrap()
+        .clone();
+    if !with_checkpoint {
+        snap.write_checksum(engine.as_ref())?;
+    }
+    let mut snap = insert_data(
         snap,
         &engine,
         vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
     )
     .await?
     .unwrap_post_commit_snapshot();
-    let (_, snap) = snap.checkpoint(engine.as_ref(), None)?;
-    // Non-incremental operation in the tail dooms file stats regardless of the checkpoint.
-    begin_transaction_with(
+    if with_checkpoint {
+        snap = snap.checkpoint(engine.as_ref(), None)?.1;
+    }
+    insert_data_with(
         snap,
-        engine.as_ref(),
-        delta_kernel::transaction::UpdateTableOperation::Custom("ANALYZE STATS".to_string()),
-        "test-engine",
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+        Box::new(FileSystemCommitter::new()),
+        "ANALYZE STATS",
         true,
-        |builder| builder,
-    )?
-    .commit(engine.as_ref())?
+        false,
+    )
+    .await?
     .unwrap_committed();
 
-    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    assert!(fresh.crc_at_version().is_none());
+    let fresh = Snapshot::builder_for(&table_path)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(engine.as_ref())?;
+    assert_eq!(fresh.version(), 2);
+    assert_eq!(fresh.crc_at_version().is_some(), !with_checkpoint);
+    assert_eq!(fresh.get_file_stats_if_present(), None);
+    if let Some(crc) = fresh.crc_at_version() {
+        assert!(crc.file_stats_state().is_indeterminate());
+    }
     assert!(matches!(
         fresh.write_checksum(engine.as_ref()),
         Err(delta_kernel::KernelError::ChecksumWriteUnsupported(_))
@@ -1329,10 +1465,12 @@ async fn test_write_checksum_with_no_dms_writes_empty_list(
         .unwrap_committed();
 
     let snapshot = committed.post_commit_snapshot().unwrap();
-    assert!(snapshot
-        .reader()
-        .get_all_domain_metadata(engine.as_ref())?
-        .is_empty());
+    assert!(
+        snapshot
+            .reader()
+            .get_all_domain_metadata(engine.as_ref())?
+            .is_empty()
+    );
     let crc = write_and_verify_crc(snapshot, &table_path, engine.as_ref());
     // CREATE TABLE without any DM actions produces an authoritative empty map.
     assert_eq!(
@@ -1413,11 +1551,13 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> KernelResult<()
                 .unwrap(),
             None
         );
-        assert!(snapshot
-            .reader()
-            .get_domain_metadata_internal("delta.clustering", engine)
-            .unwrap()
-            .is_some());
+        assert!(
+            snapshot
+                .reader()
+                .get_domain_metadata_internal("delta.clustering", engine)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             snapshot
                 .reader()
@@ -1517,13 +1657,15 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> KernelRes
     );
 
     // Miss: "zip" is not in this Partial cache; FailingEngine panics, real engine finds it.
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        snapshot_v1
-            .reader()
-            .get_domain_metadata("zip", &FailingEngine)
-            .ok()
-    }))
-    .is_err());
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            snapshot_v1
+                .reader()
+                .get_domain_metadata("zip", &FailingEngine)
+                .ok()
+        }))
+        .is_err()
+    );
     assert_eq!(
         snapshot_v1
             .reader()
@@ -1752,13 +1894,15 @@ async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> Kern
     );
 
     // Miss: "v1-app" is NOT in the Partial cache; FailingEngine panics, real engine finds it.
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        snapshot_v2
-            .reader()
-            .get_app_id_version("v1-app", &FailingEngine)
-            .ok()
-    }))
-    .is_err());
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            snapshot_v2
+                .reader()
+                .get_app_id_version("v1-app", &FailingEngine)
+                .ok()
+        }))
+        .is_err()
+    );
     assert_eq!(
         snapshot_v2
             .reader()
@@ -2516,10 +2660,12 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     // === Check: ICT ===
     // - If no CRC, then we must re-read the latest commit -> need real engine.
     // - Else, we did CRC replay and cached the result -> use fake engine.
-    assert!(fresh
-        .reader()
-        .get_in_commit_timestamp(real_engine_iff_crc_missing)?
-        .is_some());
+    assert!(
+        fresh
+            .reader()
+            .get_in_commit_timestamp(real_engine_iff_crc_missing)?
+            .is_some()
+    );
 
     // For both domain metadata and set transaction checks below:
     // - If no CRC, then we must read non-zero commits -> need real engine.
@@ -2531,21 +2677,25 @@ async fn test_stale_crc_fresh_build_advance_matrix(
 
     // === Check: domain metadata written *before* the CRC ===
     for domain in ["domain_at_create", "delta.clustering"] {
-        assert!(fresh
-            .reader()
-            .get_domain_metadata_internal(
-                domain,
-                real_engine_iff_crc_missing_or_crc_missing_opt_fields
-            )?
-            .is_some());
+        assert!(
+            fresh
+                .reader()
+                .get_domain_metadata_internal(
+                    domain,
+                    real_engine_iff_crc_missing_or_crc_missing_opt_fields
+                )?
+                .is_some()
+        );
     }
 
     // === Check: domain metadata written *after* the CRC ===
     for domain in ["domain", "delta.rowTracking"] {
-        assert!(fresh
-            .reader()
-            .get_domain_metadata_internal(domain, real_engine_iff_crc_missing)?
-            .is_some());
+        assert!(
+            fresh
+                .reader()
+                .get_domain_metadata_internal(domain, real_engine_iff_crc_missing)?
+                .is_some()
+        );
     }
 
     // === Check: set transactions written *before* the CRC ===
@@ -2564,56 +2714,6 @@ async fn test_stale_crc_fresh_build_advance_matrix(
             .get_app_id_version("app", real_engine_iff_crc_missing)?,
         Some(LATEST_VERSION)
     );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate() -> KernelResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-
-    // ===== GIVEN: a CRC at v0 (made stale by an insert at v1) =====
-    let snap = create_table_and_commit(&table_path, engine.as_ref())?
-        .post_commit_snapshot()
-        .unwrap()
-        .clone();
-    snap.write_checksum(engine.as_ref())?;
-    let snap = insert_data(
-        snap,
-        &engine,
-        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-    )
-    .await?
-    .unwrap_post_commit_snapshot();
-
-    // ===== WHEN: a non-incremental operation (ANALYZE STATS) commits at v2 =====
-    begin_transaction_with(
-        snap,
-        engine.as_ref(),
-        delta_kernel::transaction::UpdateTableOperation::Custom("ANALYZE STATS".to_string()),
-        "test-engine",
-        true,
-        |builder| builder,
-    )?
-    .commit(engine.as_ref())?
-    .unwrap_committed();
-
-    // ===== THEN: advancing the stale CRC trips file stats to Indeterminate, so they are not
-    // served and write_checksum is rejected =====
-    let fresh = Snapshot::builder_for(&table_path)
-        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
-        .build(engine.as_ref())?;
-    assert_eq!(fresh.version(), 2);
-    assert!(fresh
-        .crc_at_version()
-        .unwrap()
-        .file_stats_state()
-        .is_indeterminate());
-    assert_eq!(fresh.get_file_stats_if_present(), None);
-    assert!(matches!(
-        fresh.write_checksum(engine.as_ref()),
-        Err(delta_kernel::KernelError::ChecksumWriteUnsupported(_))
-    ));
 
     Ok(())
 }
@@ -2641,10 +2741,12 @@ async fn test_stale_crc_fresh_build_fails_load_when_advance_commit_is_corrupt() 
         .join("_delta_log/00000000000000000001.json");
     std::fs::write(&commit_v1, b"}}} not valid commit json").unwrap();
 
-    assert!(Snapshot::builder_for(&table_path)
-        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
-        .build(engine.as_ref())
-        .is_err());
+    assert!(
+        Snapshot::builder_for(&table_path)
+            .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+            .build(engine.as_ref())
+            .is_err()
+    );
 
     Ok(())
 }
@@ -2856,13 +2958,15 @@ async fn test_dm_query_stale_partial_crc_falls_through_to_full_scan() -> KernelR
     let no_parquet = NoParquetReadsEngine {
         inner: engine.clone(),
     };
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        fresh
-            .reader()
-            .get_domain_metadata("dom_before", &no_parquet)
-            .ok()
-    }))
-    .is_err());
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fresh
+                .reader()
+                .get_domain_metadata("dom_before", &no_parquet)
+                .ok()
+        }))
+        .is_err()
+    );
 
     Ok(())
 }
@@ -2971,13 +3075,15 @@ async fn test_txn_query_stale_partial_crc_falls_through_to_full_scan() -> Kernel
     let no_parquet = NoParquetReadsEngine {
         inner: engine.clone(),
     };
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        fresh
-            .reader()
-            .get_app_id_version("app_before", &no_parquet)
-            .ok()
-    }))
-    .is_err());
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fresh
+                .reader()
+                .get_app_id_version("app_before", &no_parquet)
+                .ok()
+        }))
+        .is_err()
+    );
 
     Ok(())
 }

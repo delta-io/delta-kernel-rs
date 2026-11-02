@@ -11,7 +11,7 @@ use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
 use delta_kernel::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_utils::{
-    fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan, RowIndexBuilder,
+    RowIndexBuilder, fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan,
 };
 use delta_kernel::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use delta_kernel::engine::{reader_options, writer_options};
@@ -39,10 +39,10 @@ use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
 
+use crate::UrlExt;
 use crate::executor::TaskExecutor;
 use crate::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use crate::stats::collect_stats;
-use crate::UrlExt;
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -633,10 +633,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
+    use delta_kernel::EngineData;
     use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
     use delta_kernel::arrow::array::{
         Array, AsArray, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-        Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+        Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
         TimestampMicrosecondArray,
     };
     use delta_kernel::arrow::compute::cast;
@@ -645,7 +646,7 @@ mod tests {
     };
     use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::expressions::{col, lit, Predicate, Scalar};
+    use delta_kernel::expressions::{Predicate, Scalar, col, lit};
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::{
@@ -654,10 +655,9 @@ mod tests {
     };
     use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use delta_kernel::schema::{
-        schema, schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue,
-        StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        schema, schema_ref,
     };
-    use delta_kernel::EngineData;
     use delta_kernel_default_engine_test_utils::{
         assert_result_error_with_message, current_time_ms,
         try_into_record_batch as into_record_batch,
@@ -673,8 +673,8 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::DEFAULT_BATCH_SIZE;
+    use crate::executor::tokio::TokioBackgroundExecutor;
 
     fn long_schema(name: &str) -> StructType {
         schema! { nullable (name): LONG }
@@ -1683,9 +1683,11 @@ mod tests {
             .unwrap();
         assert_eq!(timestamp_col.value(0), 1609459200000000i64);
         assert_eq!(timestamp_col.value(4), 1609804800000000i64);
-        assert!(timestamp_col
-            .timezone()
-            .is_some_and(|tz| tz.eq_ignore_ascii_case("utc")));
+        assert!(
+            timestamp_col
+                .timezone()
+                .is_some_and(|tz| tz.eq_ignore_ascii_case("utc"))
+        );
         col_idx += 1;
 
         // Verify timestamp_ntz column (without timezone)

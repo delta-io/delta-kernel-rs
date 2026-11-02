@@ -88,26 +88,27 @@ mod streaming_metrics_iterator;
 use std::sync::Arc;
 
 pub use events::{
-    emit_json_read_completed, emit_parquet_read_completed, CommitFailureReason, CrcReadSuccess,
-    DomainMetadataLoadSuccess, JsonReadCompleted, LogSegmentLoadFailure, LogSegmentLoadSuccess,
-    LogSegmentLoadType, MetricEvent, MetricId, ParquetReadCompleted, ProtocolMetadataLoadFailure,
-    ProtocolMetadataLoadSuccess, ProtocolMetadataSource, ScanMetadataCompleted, ScanType,
-    SetTransactionLoadSuccess, SnapshotBuildFailure, SnapshotBuildSuccess,
-    SnapshotLoadMetricContext, SnapshotLoadType, StorageCopyCompleted, StorageListCompleted,
-    StorageReadCompleted, TableType, TransactionCommitFailure, TransactionCommitSuccess,
+    CommitFailureReason, CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted,
+    LogSegmentLoadFailure, LogSegmentLoadSuccess, LogSegmentLoadType, MetricEvent, MetricId,
+    ParquetReadCompleted, ProtocolMetadataLoadFailure, ProtocolMetadataLoadSuccess,
+    ProtocolMetadataSource, ScanMetadataCompleted, ScanType, SetTransactionLoadSuccess,
+    SnapshotBuildFailure, SnapshotBuildSuccess, SnapshotLoadMetricContext, SnapshotLoadType,
+    StorageCopyCompleted, StorageListCompleted, StorageReadCompleted, TableType,
+    TransactionCommitFailure, TransactionCommitSuccess, emit_json_read_completed,
+    emit_parquet_read_completed,
 };
 pub(crate) use events::{
     emit_log_segment_load, emit_log_segment_load_failure, emit_protocol_metadata_load,
     emit_protocol_metadata_load_failure,
 };
-pub use frame_reporter::{FrameReporter, FrameReporterLayer, ENABLE_CALL_FRAME_FIELD};
+pub use frame_reporter::{ENABLE_CALL_FRAME_FIELD, FrameReporter, FrameReporterLayer};
 pub use metered_engine::MeteredDeltaEngine;
 pub use metered_json::MeteredJsonHandler;
 pub use metered_parquet::MeteredParquetHandler;
 pub use metered_storage::MeteredStorageHandler;
 pub(crate) use precounted_metrics_iterator::PrecountedMetricsIterator;
 pub use reporter::{LoggingMetricsReporter, MetricsReporter, ReportGeneratorLayer};
-pub(crate) use streaming_metrics_iterator::{emit_storage_span, MetricsIterator};
+pub(crate) use streaming_metrics_iterator::{MetricsIterator, emit_storage_span};
 use tracing::Subscriber;
 use tracing_subscriber::layer::{Layered, SubscriberExt as _};
 use tracing_subscriber::registry::LookupSpan;

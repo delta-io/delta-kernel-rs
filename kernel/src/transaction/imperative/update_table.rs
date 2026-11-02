@@ -7,9 +7,9 @@ use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
 use super::{Imperative, Transaction, UpdateTable};
-use crate::actions::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::BackReference;
+use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
@@ -18,12 +18,12 @@ use crate::error::KernelError;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::null_lit;
 use crate::expressions::{
-    col, column_name, lit, ArrayData, ColumnName, ExpressionStructPatchBuilder, Scalar, StructData,
+    ArrayData, ColumnName, ExpressionStructPatchBuilder, Scalar, StructData, col, column_name, lit,
 };
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
-use crate::schema::{lazy_schema_ref, ArrayType, SchemaRef, StructField, ToSchema};
+use crate::schema::{ArrayType, SchemaRef, StructField, ToSchema, lazy_schema_ref};
 use crate::table_features::TableFeature;
 use crate::{DataType, Engine, Expression, KernelResult, KernelResultIterator};
 

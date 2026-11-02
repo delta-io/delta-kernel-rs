@@ -9,8 +9,8 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::schema_ref;
-use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::{KernelResult, Snapshot};
 use tempfile::tempdir;
 use test_utils::{
@@ -127,8 +127,8 @@ async fn test_write_parquet_succeed_with_logical_partition_names() -> KernelResu
 }
 
 #[tokio::test]
-async fn test_write_context_builder_rejects_partition_values_on_unpartitioned_table(
-) -> KernelResult<()> {
+async fn test_write_context_builder_rejects_partition_values_on_unpartitioned_table()
+-> KernelResult<()> {
     let schema = get_simple_int_schema();
 
     for (table_url, engine, _store, _table_name) in

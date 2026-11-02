@@ -13,24 +13,24 @@ use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, Scan};
 use crate::actions::{
-    get_all_actions_schema, Add, ADD_FIELD, ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA, REMOVE_FIELD,
-    REMOVE_NAME, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
+    ADD_FIELD, ADD_NAME, ADD_SCHEMA, Add, LOG_ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME, SIDECAR_FIELD,
+    SIDECAR_NAME, STATS_PARSED, get_all_actions_schema,
 };
 use crate::checkpoint::collation_stats::source_collation_stats;
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
-    col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, Predicate,
-    UnaryExpressionOp,
+    ColumnName, Expression as Expr, Predicate, UnaryExpressionOp, col, column_name,
+    joined_column_expr, lit,
 };
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
 use crate::schema::{
-    lazy_schema_ref, schema, schema_ref, CheckpointFieldKind, DataType, SchemaRef,
-    SchemaStructPatchBuilder, StructField, StructType,
+    CheckpointFieldKind, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
+    lazy_schema_ref, schema, schema_ref,
 };
 use crate::struct_patch::ProjectionStructPatchBuilder;
-use crate::transforms::{transform_output_type, ExpressionTransform};
+use crate::transforms::{ExpressionTransform, transform_output_type};
 use crate::utils::FoldWithOption as _;
 use crate::{KernelError, KernelResult, PlanBuilder, Version};
 
@@ -729,18 +729,18 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
     use crate::log_segment_files::LogSegmentFiles;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStoreExt as _;
-    use crate::plans::ir::nodes::Operator;
     use crate::plans::Operation as PlanOperation;
+    use crate::plans::ir::nodes::Operator;
     use crate::scan::data_skipping::stats_schema::expected_stats_schema;
     use crate::scan::{PartitionValuesOptions, StatsOptions};
     use crate::schema::StructType;
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{
-        create_log_path, MockProtocolBuilder, MockTableConfigurationBuilder,
+        MockProtocolBuilder, MockTableConfigurationBuilder, create_log_path,
     };
     use crate::{Engine as _, KernelResult};
 
@@ -1089,9 +1089,10 @@ mod tests {
     fn metadata_plan_empty_is_none() -> KernelResult<()> {
         let segment = log_segment(log_root(), &[], None);
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
-        assert!(scan
-            .build_metadata_scan_plan(&no_checkpoint(), &MetadataPlanner::try_new(&scan)?)?
-            .is_none());
+        assert!(
+            scan.build_metadata_scan_plan(&no_checkpoint(), &MetadataPlanner::try_new(&scan)?)?
+                .is_none()
+        );
         Ok(())
     }
 
@@ -1106,12 +1107,13 @@ mod tests {
             scan.state_info.physical_predicate,
             PhysicalPredicate::StaticSkipAll
         );
-        assert!(scan
-            .build_metadata_scan_plan(
+        assert!(
+            scan.build_metadata_scan_plan(
                 &shape(CheckpointType::Leaf, None),
                 &MetadataPlanner::try_new(&scan)?,
             )?
-            .is_none());
+            .is_none()
+        );
         Ok(())
     }
 

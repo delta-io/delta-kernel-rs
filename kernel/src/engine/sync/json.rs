@@ -93,9 +93,9 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::KernelError;
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-    use crate::KernelError;
 
     // Helper function to create test data
     fn create_test_data(values: Vec<&str>) -> KernelResult<Box<dyn EngineData>> {

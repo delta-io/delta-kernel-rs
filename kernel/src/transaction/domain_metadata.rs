@@ -4,7 +4,7 @@ use super::{ExecutionMode, Transaction};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::error::KernelError;
 use crate::row_tracking::{
-    RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK,
+    ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK, RowTrackingDomainMetadata,
 };
 use crate::table_features::TableFeature;
 use crate::{Engine, KernelResult};

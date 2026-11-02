@@ -8,9 +8,9 @@ use tracing::{debug, error};
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::expressions::{
-    col, column_name, column_pred, lit, BinaryPredicateOp, ColumnName, Expression as Expr,
-    ExpressionRef, JunctionPredicateOp, MapToStructOptions, OpaquePredicateOpRef,
-    Predicate as Pred, PredicateRef, Scalar,
+    BinaryPredicateOp, ColumnName, Expression as Expr, ExpressionRef, JunctionPredicateOp,
+    MapToStructOptions, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar, col,
+    column_name, column_pred, lit,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -18,7 +18,7 @@ use crate::kernel_predicates::{
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use crate::scan::metrics::ScanMetrics;
-use crate::schema::{lazy_schema_ref, schema_ref, DataType, PrimitiveType, SchemaRef};
+use crate::schema::{DataType, PrimitiveType, SchemaRef, lazy_schema_ref, schema_ref};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{
