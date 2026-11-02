@@ -95,7 +95,7 @@ impl LogSegment {
     fn read_domain_metadata_batches(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
         self.read_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())
     }
 }

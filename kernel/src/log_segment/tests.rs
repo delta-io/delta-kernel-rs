@@ -72,7 +72,7 @@ fn process_sidecars(
     batch: &dyn EngineData,
     checkpoint_read_schema: SchemaRef,
     meta_predicate: Option<PredicateRef>,
-) -> KernelResult<Option<impl KernelResultIterator<Box<dyn EngineData>>>> {
+) -> KernelResult<Option<impl KernelResultIterator<Box<dyn EngineData>> + use<>>> {
     // Visit the rows of the checkpoint batch to extract sidecar file references
     let mut visitor = SidecarVisitor::default();
     visitor.visit_rows_of(batch)?;

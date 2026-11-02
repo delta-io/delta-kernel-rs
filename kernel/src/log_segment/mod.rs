@@ -919,7 +919,8 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
-    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch>>> {
+    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch> + use<>>>
+    {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
@@ -952,7 +953,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         action_schema: SchemaRef,
-    ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
         let result = self.read_actions_with_projected_checkpoint_actions(
             engine,
             action_schema.clone(),
@@ -1027,7 +1028,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         schema: SchemaRef,
-    ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
         Self::read_commit_files(engine, &self.find_commit_cover(), schema)
     }
 
@@ -1096,7 +1097,7 @@ impl LogSegment {
         engine: &dyn Engine,
         commit_files: &[FileMeta],
         schema: SchemaRef,
-    ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
         let actions = engine
             .json_handler()
             .read_json_files(commit_files, schema, None)?
@@ -1280,7 +1281,8 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
-    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch>>> {
+    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch> + use<>>>
+    {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
         let (file_actions_schema, sidecar_files) = if need_file_actions {

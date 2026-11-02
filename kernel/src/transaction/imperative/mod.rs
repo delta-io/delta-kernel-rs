@@ -593,12 +593,15 @@ impl<STATE> Transaction<STATE, Imperative> {
     /// [`remove_files`]: Transaction::remove_files
     /// [`update_deletion_vectors`]: Transaction::update_deletion_vectors
     #[instrument(name = "txn.gen_removes", skip_all, err)]
-    fn generate_remove_actions<'a>(
+    fn generate_remove_actions<'a, T>(
         &'a self,
         engine: &dyn Engine,
-        remove_files_metadata: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
+        remove_files_metadata: T,
         has_dv_update_columns: bool,
-    ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + 'a> {
+    ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + use<'a, STATE, T>>
+    where
+        T: Iterator<Item = &'a FilteredEngineData> + Send + 'a,
+    {
         // Create-table transactions should not have any remove actions.
         // Only error if there are actually files queued for removal.
         if self.is_create_table() && !self.staged_data_changes.remove_files_metadata.is_empty() {
@@ -699,7 +702,7 @@ fn build_add_actions<'a, I, T>(
     add_files_metadata: I,
     row_tracking: bool,
     data_change: bool,
-) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + 'a>
+) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<'a, I, T>>
 where
     I: KernelResultIterator<T> + 'a,
     T: Deref<Target = dyn EngineData> + Send + 'a,

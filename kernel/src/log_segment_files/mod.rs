@@ -73,7 +73,7 @@ pub(crate) fn list_delta_log_from_storage(
     log_root: &Url,
     start_version: Version,
     end_version: Version,
-) -> KernelResult<impl KernelResultIterator<ParsedLogPath>> {
+) -> KernelResult<impl KernelResultIterator<ParsedLogPath> + use<>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
     let log_root_str = log_root.to_string();
     let files = storage
