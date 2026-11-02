@@ -43,7 +43,9 @@ For a rewrite that preserves logical data, select the data operation, such as
 > [!NOTE]
 > The supported operations are adding columns and making columns nullable. Other schema operations
 > (drop column, rename, type changes) are not yet available through the
-> transaction builder.
+> transaction builder. With the experimental `check-constraints-in-dev` Cargo feature, the builder
+> can also add and drop CHECK constraints. See
+> [Check constraints](./check_constraints.md#adding-and-dropping-constraints).
 
 ## Adding a column
 
