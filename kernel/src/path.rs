@@ -200,6 +200,7 @@ fn path_contains_delta_log_dir(mut path_segments: std::str::Split<'_, char>) -> 
 /// can still be followed by version-named files, and stopping there would silently drop them.
 /// Such paths are kept here and discarded by [`ParsedLogPath`] parsing instead. An empty
 /// `rel_path` is conservatively kept.
+#[cfg(test)]
 pub(crate) fn may_begin_listable_log_path(rel_path: &str) -> bool {
     rel_path.as_bytes().first().is_none_or(|b| *b <= b'9')
 }

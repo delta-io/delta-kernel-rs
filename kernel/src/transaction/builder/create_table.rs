@@ -161,7 +161,7 @@ fn ensure_table_does_not_exist(
     delta_log_url: &Url,
     table_path: &str,
 ) -> KernelResult<()> {
-    match storage.list_from(delta_log_url) {
+    match storage.list_from(delta_log_url, None) {
         Ok(mut files) => {
             // files.next() returns Option<KernelResult<FileMeta>>
             // - Some(Ok(_)) means a file exists -> table exists

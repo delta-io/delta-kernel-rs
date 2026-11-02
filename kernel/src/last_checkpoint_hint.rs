@@ -1488,7 +1488,11 @@ mod tests {
     struct NoIoStorageHandler;
 
     impl StorageHandler for NoIoStorageHandler {
-        fn list_from(&self, _path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        fn list_from(
+            &self,
+            _path: &Url,
+            _end: Option<&Url>,
+        ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
             panic!("list_from should not be called");
         }
         fn read_files(

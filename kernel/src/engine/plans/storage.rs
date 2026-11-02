@@ -23,9 +23,17 @@ impl PlanBasedStorageHandler {
 }
 
 impl StorageHandler for PlanBasedStorageHandler {
-    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
-        self.execute_io(IoOperation::file_listing(path.clone()))?
-            .into_file_meta()
+    fn list_from(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        let end = end.cloned();
+        let iter = self
+            .execute_io(IoOperation::file_listing(path.clone()))?
+            .into_file_meta()?
+            .take_while(move |item| crate::keep_listing(item, end.as_ref()));
+        Ok(Box::new(iter))
     }
 
     fn read_files(
@@ -97,14 +105,22 @@ mod tests {
         // Listing from a file URL is exclusive of the offset itself, so listing from index 1
         // returns only index 2.
         let from = Url::from_file_path(tmp.path().join("00000000000000000001.json")).unwrap();
-        let files: Vec<_> = storage.list_from(&from).unwrap().try_collect().unwrap();
+        let files: Vec<_> = storage
+            .list_from(&from, None)
+            .unwrap()
+            .try_collect()
+            .unwrap();
         assert_eq!(files.len(), 1);
         let expected = Url::from_file_path(tmp.path().join("00000000000000000002.json")).unwrap();
         assert_eq!(files[0].location, expected);
 
         // Listing the directory returns all 3 files.
         let dir = Url::from_directory_path(tmp.path()).unwrap();
-        let all: Vec<_> = storage.list_from(&dir).unwrap().try_collect().unwrap();
+        let all: Vec<_> = storage
+            .list_from(&dir, None)
+            .unwrap()
+            .try_collect()
+            .unwrap();
         assert_eq!(all.len(), 3);
     }
 

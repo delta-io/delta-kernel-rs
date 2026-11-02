@@ -156,7 +156,8 @@ impl SyncPlanExecutor {
                 // `StorageHandler::list_from` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
-                let metas: Vec<KernelResult<FileMeta>> = self.storage.list_from(&url)?.collect();
+                let metas: Vec<KernelResult<FileMeta>> =
+                    self.storage.list_from(&url, None)?.collect();
                 Ok(PlanResult::FileMeta(Box::new(metas.into_iter())))
             }
             IoOperation::ReadBytes { files } => {
