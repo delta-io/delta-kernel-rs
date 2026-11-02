@@ -697,9 +697,9 @@ impl FileStatsAccumulator {
         }
         let batch_stats =
             collect_stats_raw(batch, &self.stats_columns, &self.null_count_only_columns)?;
-        *total = match total.take() {
+        *total = match total.as_ref() {
             None => Some(batch_stats),
-            Some(previous) => Some(merge_raw_stats(&previous, &batch_stats)?),
+            Some(previous) => Some(merge_raw_stats(previous, &batch_stats)?),
         };
         Ok(())
     }
