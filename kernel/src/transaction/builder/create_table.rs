@@ -1084,6 +1084,13 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
 
         // Build TableConfiguration directly for the new table
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
+        // TODO(#3695): Support creating tables with generated columns.
+        if table_configuration.has_generation_expressions() {
+            return Err(KernelError::unsupported(
+                "Setting `delta.generationExpression` column metadata is not supported during \
+                 CREATE TABLE",
+            ));
+        }
 
         // Create Transaction<CreateTable> with the effective table configuration
         let transaction = try_new_create_table(
@@ -1161,7 +1168,7 @@ mod tests {
     use crate::transforms::SchemaTransform;
     use crate::unit_test_utils::{
         assert_result_error_with_message, build_complex_nested_kernel_schema,
-        install_thread_local_metrics_reporter, CapturingReporter,
+        field_with_generation_expression, install_thread_local_metrics_reporter, CapturingReporter,
     };
 
     fn test_schema() -> SchemaRef {
@@ -1406,6 +1413,30 @@ mod tests {
         let properties = HashMap::from([(key.to_string(), "amount > 0".to_string())]);
         let result = validate_extract_table_features_and_properties(properties);
         assert_result_error_with_message(result, "Setting CHECK constraint property");
+    }
+
+    #[test]
+    fn create_table_rejects_generation_expressions() -> KernelResult<()> {
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join("table");
+        std::fs::create_dir(&table_path)?;
+        let schema = schema_ref! {
+            nullable "event_time": TIMESTAMP,
+            (field_with_generation_expression("event_year", DataType::INTEGER, "YEAR(event_time)")),
+        };
+
+        let result = CreateTableTransactionBuilder::new(
+            table_path.to_string_lossy(),
+            schema,
+            "test-engine",
+            true,
+        )
+        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()));
+
+        let is_unsupported = matches!(&result, Err(KernelError::Unsupported(_)));
+        assert!(is_unsupported);
+        assert_result_error_with_message(result, "delta.generationExpression");
+        Ok(())
     }
 
     #[test]

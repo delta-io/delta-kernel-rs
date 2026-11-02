@@ -309,6 +309,10 @@ fn try_new_update_table<MODE: ExecutionMode>(
         .table_configuration()
         .ensure_operation_supported(Operation::Write)?;
 
+    // TODO(#3223): Strip generation expressions on metadata updates when the pre-update protocol
+    // did not support generated columns, so a protocol upgrade cannot activate previously ignored
+    // formulas.
+
     // TODO(#3240): Validate that delta.enableRowTracking=true has the required protocol support
     // and materialized column-name properties. Materialized names must be distinct and must not
     // collide with physical data columns.
