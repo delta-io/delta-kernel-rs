@@ -586,11 +586,10 @@ fn collect_stats_raw(
 /// to [`FileStatsAccumulator::merge`] as the row group closes, then calls
 /// [`FileStatsAccumulator::finish`] once the file is complete to get the file-level statistics for
 /// the Add action. The accumulator retains one raw statistics row, combining each batch's
-/// statistics into it without retaining the input batches or their individual statistics.
+/// statistics into it.
 ///
 /// Raw statistics are reduced incrementally. [`FileStatsAccumulator::finish`] truncates string
-/// bounds once. Raw bounds compose across row groups where truncated ones would not, so the
-/// statistics are byte-identical to collecting statistics over the whole file at once.
+/// bounds once.
 ///
 /// Every batch must have the same Arrow schema, since the statistics shape derives from it:
 /// [`FileStatsAccumulator::merge`] rejects a batch whose Arrow schema differs from that of the
