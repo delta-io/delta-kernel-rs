@@ -647,7 +647,15 @@ pub fn evaluate_predicate(
             };
             Ok(eval_op_fn(&arr)?)
         }
-        Binary(BinaryPredicate { op, left, right }) => {
+        Binary(BinaryPredicate {
+            collation: Some(collation),
+            ..
+        }) => Err(KernelError::unsupported(format!(
+            "Collated comparison '{collation}' requires a connector-defined opaque evaluator"
+        ))),
+        Binary(BinaryPredicate {
+            op, left, right, ..
+        }) => {
             let (left, right) = (left.as_ref(), right.as_ref());
 
             // IN is different from all the others, and also quite complex, so factor it out.

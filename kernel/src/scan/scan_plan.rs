@@ -823,6 +823,23 @@ mod tests {
         plan.nodes.iter().map(|node| node.op.to_string()).collect()
     }
 
+    // Inspect the leaf read schema to verify collation bounds survive checkpoint projection.
+    fn leaf_read_schema<'plan>(plan: &'plan Plan, shape: &CheckpointShape) -> &'plan SchemaRef {
+        plan.nodes
+            .iter()
+            .find_map(|node| match &node.op {
+                Operator::ScanParquet(scan) if shape.checkpoint_type == CheckpointType::Leaf => {
+                    Some(&scan.schema)
+                }
+                Operator::DynamicScan(scan) => {
+                    assert!(scan.dv_column.is_none(), "sidecar scan sets no dv column");
+                    Some(&scan.schema)
+                }
+                _ => None,
+            })
+            .expect("checkpoint leaf scan")
+    }
+
     fn add_struct(schema: &SchemaRef) -> &StructType {
         let DataType::Struct(add_struct) = schema
             .field(ADD_NAME)
@@ -996,20 +1013,7 @@ mod tests {
             .build_metadata_scan_plan(&shape, &MetadataPlanner::try_new(&scan)?)?
             .expect("non-empty");
 
-        let checkpoint_schema = plan
-            .nodes
-            .iter()
-            .find_map(|node| match &node.op {
-                Operator::ScanParquet(scan) if shape.checkpoint_type == CheckpointType::Leaf => {
-                    Some(&scan.schema)
-                }
-                Operator::DynamicScan(scan) => {
-                    assert!(scan.dv_column.is_none(), "sidecar scan sets no dv column");
-                    Some(&scan.schema)
-                }
-                _ => None,
-            })
-            .expect("checkpoint leaf scan");
+        let checkpoint_schema = leaf_read_schema(&plan, &shape);
         assert_eq!(
             add_struct(checkpoint_schema).field(STATS_PARSED).is_some(),
             parsed_stats.is_some(),
@@ -1037,6 +1041,61 @@ mod tests {
             !expect_native_partitions
         );
         assert!(!normalization.contains("COALESCE"));
+        Ok(())
+    }
+
+    // On a struct-only checkpoint, only JSON requests synthesize stats and read collation bounds.
+    #[rstest::rstest]
+    #[case::json(StatsOptions::json_only(), true)]
+    #[case::both(StatsOptions::all(), true)]
+    #[case::struct_only(StatsOptions::all_struct(), false)]
+    #[case::none(StatsOptions::none(), false)]
+    fn metadata_plan_reads_full_collation_source_only_for_json(
+        #[case] stats: StatsOptions,
+        #[case] preserve_json: bool,
+        #[values(CheckpointType::Leaf, CheckpointType::Manifest)] checkpoint_type: CheckpointType,
+    ) -> KernelResult<()> {
+        let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(partitioned_schema())
+            .with_partition_columns(["p"])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_writer_features([TableFeature::Collations])
+                    .build(),
+            )
+            .with_table_root("memory:///")
+            .try_build()?;
+        let scan = Arc::new(Snapshot::new(segment, config)?)
+            .scan_builder()
+            .with_stats(stats)
+            .build()?;
+        let source = Arc::new(SchemaStructPatchBuilder::new()
+            .append(StructField::nullable("statsWithCollation", schema! {
+                nullable "test.ASCII_CI.1": { nullable "minValues": { nullable "nested": { nullable "leaf": STRING } } },
+                nullable "test.ASCII_CI.2": { nullable "maxValues": { nullable "nested": { nullable "leaf": STRING } } },
+            }))
+            .build(&struct_stats_schema())?);
+        let checkpoint_schema = parquet_read_schema(Some(&source), None)?;
+        let leaf_checkpoint_schema = SchemaStructPatchBuilder::new()
+            .drop_at([ADD_NAME], STATS)
+            .build(&checkpoint_schema)?;
+        let shape = CheckpointShape {
+            checkpoint_type,
+            leaf_checkpoint_schema: Some(Arc::new(leaf_checkpoint_schema)),
+        };
+        let plan = scan
+            .build_metadata_scan_plan(&shape, &MetadataPlanner::try_new(&scan)?)?
+            .unwrap();
+        let read_schema = leaf_read_schema(&plan, &shape);
+        assert_eq!(source_collation_stats(read_schema).is_some(), preserve_json);
+        assert_eq!(
+            plan.nodes.iter().any(|node| match &node.op {
+                Operator::Project(project) => project.expr.to_string().contains("TO_JSON"),
+                _ => false,
+            }),
+            preserve_json
+        );
         Ok(())
     }
 

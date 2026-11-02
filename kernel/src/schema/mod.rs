@@ -20,6 +20,7 @@ use tracing::warn;
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
+use crate::schema::collation_utils::rewrite_collation_field_prefix;
 use crate::table_features::{
     validate_and_extract_column_mapping_annotations, validate_column_mapping_id, ColumnMappingMode,
     StaleAnnotationPolicy,
@@ -235,7 +236,7 @@ pub enum ColumnMetadataKey {
     ///
     /// Kernel preserves these identifiers; string predicates use UTF-8 binary semantics.
     /// See [`ScanBuilder::with_predicate`](crate::scan::ScanBuilder::with_predicate) and the
-    /// [collation RFC](https://github.com/delta-io/delta/pull/3068).
+    /// [collation RFC](https://github.com/delta-io/delta/blob/master/protocol_rfcs/collated-string-type.md).
     Collations,
     ColumnMappingId,
     ColumnMappingPhysicalName,
@@ -721,6 +722,9 @@ impl StructField {
     /// `Id` or `Name`, this is specified in [`ColumnMetadataKey::ColumnMappingPhysicalName`].
     /// Otherwise, the field's logical name is used.
     ///
+    /// Collation annotation paths use the physical field name as their owning-field prefix.
+    /// The logical field's annotations are unchanged.
+    ///
     /// Returns an error if a field has invalid or inconsistent column mapping annotations (e.g.
     /// missing or wrong-typed when column mapping is enabled), or if a metadata column is
     /// encountered (metadata columns should not participate in column mapping). When column
@@ -809,6 +813,11 @@ impl StructField {
                 base_metadata.remove(parquet_field_id_key);
                 // TODO(#1070): Remove nested column ids when they are supported in kernel
             }
+        }
+        // Keep collation paths rooted at the physical field name, as required by the protocol.
+        let physical_name = self.physical_name(column_mapping_mode);
+        if let Some(annotation) = base_metadata.get_mut(ColumnMetadataKey::Collations.as_ref()) {
+            rewrite_collation_field_prefix(annotation, self.name(), physical_name);
         }
         base_metadata
     }
@@ -3355,6 +3364,69 @@ mod tests {
         };
         let struct_field = stype.fields.get_index(0).unwrap().1;
         assert_eq!(struct_field.name, "d");
+    }
+
+    #[rstest]
+    #[case::string(DataType::STRING, "")]
+    #[case::array(DataType::from(ArrayType::new(DataType::STRING, true)), ".element")]
+    #[case::nested_array(
+        DataType::from(ArrayType::new(ArrayType::new(DataType::STRING, true), true)),
+        ".element.element"
+    )]
+    #[case::map_key(
+        DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)),
+        ".key"
+    )]
+    #[case::map_value(
+        DataType::from(MapType::new(DataType::INTEGER, DataType::STRING, true)),
+        ".value"
+    )]
+    #[case::array_map(
+        DataType::from(ArrayType::new(
+            MapType::new(DataType::STRING, DataType::STRING, true),
+            true
+        )),
+        ".element.value"
+    )]
+    fn physical_collation_annotations_resolve_to_physical_fields(
+        #[case] data_type: DataType,
+        #[case] suffix: &str,
+        #[values(
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id
+        )]
+        mode: ColumnMappingMode,
+    ) {
+        let logical_path = format!("name{suffix}");
+        let annotation = MetadataValue::Other(serde_json::json!({
+            &logical_path: "test.ASCII_CI"
+        }));
+        let logical = StructField::nullable("name", data_type).with_metadata([
+            (ColumnMetadataKey::Collations.as_ref(), annotation.clone()),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-physical".to_string()),
+            ),
+        ]);
+        let physical = logical.make_physical(mode).unwrap();
+        let physical_path = format!("{}{suffix}", physical.name());
+        assert_eq!(
+            physical.get_config_value(&ColumnMetadataKey::Collations),
+            Some(&MetadataValue::Other(serde_json::json!({
+                physical_path: "test.ASCII_CI"
+            })))
+        );
+        assert_eq!(
+            logical.get_config_value(&ColumnMetadataKey::Collations),
+            Some(&annotation)
+        );
+        collation_utils::validate_collation_annotations(&StructType::try_new([physical]).unwrap())
+            .unwrap();
     }
 
     #[test]

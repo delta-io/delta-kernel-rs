@@ -174,6 +174,59 @@ let scan = snapshot
 `with_predicate` takes `impl Into<Option<PredicateRef>>`, so you can pass an
 `Arc<Predicate>` directly.
 
+## Collation-aware queries
+
+To execute a collation-aware query, your connector owns the string comparison rules and
+the original row filter. Kernel preserves `__COLLATIONS` schema annotations.
+Unannotated string comparisons and [data skipping](#how-data-skipping-works) use UTF-8 binary semantics.
+An ordinary equality predicate for `"alice"` can skip a file containing `"Alice"`.
+Evaluating a case-insensitive comparison later cannot recover that file.
+
+For connector-owned skipping, request typed `statsWithCollation` bounds with
+`StatsOptions::with_collation_stats(identifier, columns)` on your chosen statistics options.
+JSON bounds remain available by [requesting JSON stats](#controlling-statistics) with
+`StatsOptions::json_only()` or `StatsOptions::all()`;
+`StatsOptions::all_struct()` disables JSON synthesis. Select bounds that match the filtering
+operation's collation exactly: provider, name, and version. Obtain the version from your
+execution comparator. The operation determines the collation, which can differ from the
+schema's default. Use those bounds only with a comparison you implement for that exact
+collation. If the matching entry or required bounds are absent, retain the file.
+Never substitute binary bounds or another collation/version.
+
+Where your evaluator supports opaque predicates, you can implement `OpaquePredicateOp`.
+Each `as_data_skipping_predicate` or `eval_as_data_skipping_predicate` callback must return a
+safe result for its `inverted` flag's polarity, or `None` when it can't safely prune.
+Kernel combines those results conservatively. Scalar evaluation has a different contract:
+`eval_pred_scalar` returns `Err` for unsupported evaluation and `Ok(None)` for a SQL NULL result.
+Opaque predicates can't be serialized; reconstruct them on each worker when distributing a scan.
+
+If you don't use opaque predicates, mark unsupported collated comparisons with
+`Predicate::binary_with_collation` so Kernel defers their binary pruning. The annotation
+doesn't enable row evaluation. Alternatively, derive a conservative binary predicate before
+calling `ScanBuilder::with_predicate`:
+every row that is TRUE under the original filter must also be TRUE under the derived
+predicate. Let `C` be an unsupported collation-aware comparison and `B` a supported binary
+predicate:
+
+| Original filter | Conservative pushdown |
+|-----------------|-----------------------|
+| `C AND B` | `B` |
+| `C OR B` | `TRUE` |
+| `NOT C` | `TRUE` |
+| `NOT (C AND B)` | `TRUE` |
+| `NOT (C OR B)` | `NOT B` |
+
+The last two rows show why negation must precede relaxation: De Morgan's laws produce different
+safe predicates for negated `AND` and `OR`. Push negations to leaves before replacing unsupported
+comparisons, including their negated forms, with `TRUE`. Then simplify the predicate.
+Dropping an unsupported `OR` branch or negating an already relaxed predicate can discard matching
+rows.
+
+Apply the same restriction to filter and row-group-skipping predicates sent to an underlying
+Parquet reader. Keep the original collation-aware filter and evaluate it on the rows that
+survive these optimizations. The [collation RFC](https://github.com/delta-io/delta/blob/master/protocol_rfcs/collated-string-type.md#reader-requirements-for-collations)
+defines the statistics-matching requirements.
+
 ## How data skipping works
 
 When a scan has a predicate, Kernel applies it in two stages to eliminate files before

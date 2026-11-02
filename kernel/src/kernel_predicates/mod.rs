@@ -350,9 +350,12 @@ pub trait KernelPredicateEvaluator {
             BooleanExpression(expr) => self.eval_pred_expr(expr, inverted),
             Not(pred) => self.eval_pred_not(pred, inverted),
             Unary(UnaryPredicate { op, expr }) => self.eval_pred_unary(*op, expr, inverted),
-            Binary(BinaryPredicate { op, left, right }) => {
-                self.eval_pred_binary(*op, left, right, inverted)
-            }
+            Binary(BinaryPredicate {
+                collation: Some(_), ..
+            }) => None,
+            Binary(BinaryPredicate {
+                op, left, right, ..
+            }) => self.eval_pred_binary(*op, left, right, inverted),
             Junction(JunctionPredicate { op, preds }) => {
                 self.eval_pred_junction(*op, preds, inverted)
             }
@@ -478,7 +481,12 @@ pub trait KernelPredicateEvaluator {
                     .map(|pred| self.eval_pred_sql_where(pred, inverted));
                 self.finish_eval_pred_junction(*op, &mut preds, inverted)
             }
-            Binary(BinaryPredicate { op, left, right }) if op.is_null_intolerant() => {
+            Binary(BinaryPredicate {
+                collation: Some(_), ..
+            }) => None,
+            Binary(BinaryPredicate {
+                op, left, right, ..
+            }) if op.is_null_intolerant() => {
                 // Perform a nullsafe comparison instead of the usual `eval_pred_binary`
                 let mut preds = [
                     self.eval_pred_unary(UnaryPredicateOp::IsNull, left, true),

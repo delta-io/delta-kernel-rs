@@ -22,7 +22,8 @@ use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{KernelError, KernelResult, Snapshot};
 
-const COLLATION_STATS: &str = "statsWithCollation";
+/// Statistics extension keyed by exact versioned collation identifiers.
+pub(crate) const COLLATION_STATS: &str = "statsWithCollation";
 
 /// Returns the source collation stats field, if present in parsed checkpoint stats.
 pub(crate) fn source_collation_stats(schema: &StructType) -> Option<&StructField> {
@@ -61,9 +62,12 @@ pub(crate) fn build_collation_stats_read_transform(
         Some(_) => return Err(KernelError::schema("stats_parsed must be a struct")),
         None => schema! { nullable NUM_RECORDS: LONG, nullable TIGHT_BOUNDS: BOOLEAN },
     };
-    let stats = SchemaStructPatchBuilder::new()
-        .append(source.clone())
-        .build(&stats)?;
+    let stats = if stats.field(COLLATION_STATS).is_some() {
+        SchemaStructPatchBuilder::new().replace(COLLATION_STATS, source.clone())
+    } else {
+        SchemaStructPatchBuilder::new().append(source.clone())
+    }
+    .build(&stats)?;
     let raw_field = StructField::nullable("stats_parsed", stats);
     let read_schema = Arc::new(
         if target.is_some() {
