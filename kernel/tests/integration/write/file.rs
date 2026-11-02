@@ -12,8 +12,7 @@ use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
-use delta_kernel::parquet::basic::LogicalType;
-use delta_kernel::parquet::schema::types::Type as ParquetType;
+use delta_kernel::engine::{file_groups, FileGroup};
 use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
 };
@@ -23,8 +22,8 @@ use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    create_table_and_load_snapshot, read_add_infos, read_scan, test_table_setup_mt,
-    write_batch_to_table,
+    create_table_and_load_snapshot, read_add_infos, read_scan, test_table_setup,
+    test_table_setup_mt, write_batch_to_table,
 };
 use url::Url;
 
@@ -169,27 +168,6 @@ async fn write_table(
     Ok((tmp_dir, table_path, engine, result))
 }
 
-/// Returns the sub-field ids of each `FILE`-annotated group in `schema`, with the group's own id.
-fn file_groups(schema: &ParquetType) -> Vec<(Option<i32>, Vec<Option<i32>>)> {
-    let id = |field: &ParquetType| {
-        let info = field.get_basic_info();
-        info.has_id().then(|| info.id())
-    };
-    let mut out = Vec::new();
-    let mut stack = vec![schema];
-    while let Some(field) = stack.pop() {
-        if !field.is_group() {
-            continue;
-        }
-        if field.get_basic_info().logical_type_ref() == Some(&LogicalType::File) {
-            let sub_field_ids = field.get_fields().iter().map(|f| id(f)).collect();
-            out.push((id(field), sub_field_ids));
-        }
-        stack.extend(field.get_fields().iter().map(|f| f.as_ref()));
-    }
-    out
-}
-
 /// A `file` column at top level, in a struct, as an array element, or as a map value is written as
 /// a `FILE`-annotated group whose sub-field ids follow its own id, and reads back unchanged.
 #[rstest]
@@ -209,7 +187,9 @@ async fn test_write_and_read_nested_file_column(
     let root = read_parquet_root_schema(&parquet_path);
     let groups = file_groups(&root);
     assert_eq!(groups.len(), 1);
-    let (id, sub_field_ids) = &groups[0];
+    let FileGroup {
+        id, sub_field_ids, ..
+    } = &groups[0];
     let column = snapshot.schema().field("c").unwrap().clone();
     // The column is written under its physical name.
     let physical_name = match column.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
@@ -221,8 +201,9 @@ async fn test_write_and_read_nested_file_column(
         .get_fields()
         .iter()
         .any(|field| field.name() == physical_name));
-    // Under column mapping, a `file` struct field has its column mapping id. This test does not
-    // enable Iceberg compatibility, so an array element or map value carries no id.
+    // Under column mapping, a `file` struct field has its column mapping id. An array element or
+    // map value has an id only under Iceberg compatibility, which does not allow `file` (see
+    // `test_create_table_with_iceberg_compat_rejects_file_column`), so here it has none.
     let file_field = match (cm_mode, layout) {
         ("none", _) | (_, "array_element" | "map_value") => None,
         (_, "top_level") => Some(column),
@@ -325,5 +306,33 @@ async fn test_write_ignores_file_value_under_null_struct() -> Result<(), Box<dyn
     let (data_type, column) = file_column("in_struct", files, struct_nulls);
     let (_tmp_dir, _table_path, _engine, result) = write_table("none", data_type, column).await?;
     result?;
+    Ok(())
+}
+
+/// IcebergCompat V2 and V3 do not allow the `file` type, so creating a table with a `file` column
+/// and either of them fails, wherever the column appears.
+#[rstest]
+fn test_create_table_with_iceberg_compat_rejects_file_column(
+    #[values("top_level", "in_struct", "array_element", "map_value")] layout: &str,
+    #[values("delta.enableIcebergCompatV2", "delta.enableIcebergCompatV3")] property: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (data_type, _) = file_column(layout, file_values(), None);
+    let schema = Arc::new(StructType::try_new([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("c", data_type),
+    ])?);
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let error = create_table_and_load_snapshot(
+        &table_path,
+        schema,
+        engine.as_ref(),
+        &[(property, "true"), ("delta.columnMapping.mode", "name")],
+    )
+    .expect_err("IcebergCompat does not allow `file`")
+    .to_string();
+    assert!(
+        error.contains("does not support type at column") && error.contains("file"),
+        "got: {error}"
+    );
     Ok(())
 }

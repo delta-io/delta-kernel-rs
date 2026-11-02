@@ -362,8 +362,9 @@ Features enabled when specific column types or annotations appear in the schema.
 > the struct of its six fields. It does not yet collect statistics for the column or resolve the
 > bytes a value refers to.
 >
-> The default engine writes a `FILE` column as the protocol requires, which needs the `arrow-60`
-> feature; with `arrow-59` it refuses to write one. An engine that writes its own Parquet files
+> The default engine writes a `FILE` column as the protocol requires, which needs an Arrow
+> version whose Parquet writer supports the `FILE` logical type (`arrow-60` or later); with an
+> older one it refuses to write one. An engine that writes its own Parquet files
 > must write a `FILE` column the same way:
 >
 > - annotate the group with the Parquet `FILE` logical type,

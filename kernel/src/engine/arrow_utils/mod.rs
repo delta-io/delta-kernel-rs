@@ -1,7 +1,7 @@
 //! Some utilities for working with arrow data types
 
 pub(crate) mod apply_schema;
-pub(crate) mod file_values;
+pub(crate) mod file_type_validation;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -14,7 +14,7 @@ use itertools::Itertools;
 use tracing::debug;
 
 use self::apply_schema::apply_schema_to_struct;
-use self::file_values::validate_file_values;
+use self::file_type_validation::validate_file_values_for_read;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
     make_array, new_null_array, Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray,
@@ -237,7 +237,7 @@ impl RowIndexBuilder {
 /// are `Identical` to the kernel target.
 ///
 /// **File values.** A non-null `file` value that the File type requires readers to reject fails
-/// the read; `validate_file_values` in `file_values.rs` lists the rules.
+/// the read; `validate_file_values_for_read` in `file_type_validation.rs` lists the rules.
 ///
 /// **Cost.** O(F) per batch where F is the total number of fields (including nested), plus O(R)
 /// per `file` column for R rows. Row data (Arrow buffers, offsets, null buffers) is shared via
@@ -254,7 +254,7 @@ pub(crate) fn fixup_parquet_read(
     let data = fix_nested_null_masks(data);
     let data = if let Some(schema) = target_schema {
         let data = apply_schema_to_struct(&data, schema)?;
-        validate_file_values(&data, schema)?;
+        validate_file_values_for_read(&data, schema)?;
         data
     } else {
         data
@@ -271,7 +271,7 @@ pub(crate) fn validate_file_values_for_write(
     batch: &RecordBatch,
     kernel_schema: &StructType,
 ) -> KernelResult<()> {
-    file_values::validate_file_values_for_write(&batch.clone().into(), kernel_schema)
+    file_type_validation::validate_file_values_for_write(&batch.clone().into(), kernel_schema)
 }
 
 /*

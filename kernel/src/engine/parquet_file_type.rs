@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::arrow::datatypes::Schema as ArrowSchema;
-use crate::engine::arrow_utils::file_values::FilePaths;
 use crate::expressions::ColumnName;
 use crate::parquet::arrow::arrow_writer::ArrowWriterOptions;
 #[cfg(feature = "arrow-60")]
@@ -21,9 +20,10 @@ use crate::parquet::arrow::ArrowSchemaConverter;
 use crate::parquet::basic::LogicalType;
 #[cfg(feature = "arrow-60")]
 use crate::parquet::schema::types::{SchemaDescriptor, Type, TypePtr};
-#[cfg(feature = "arrow-60")]
-use crate::schema::DataType;
+use crate::schema::file_utils::FilePaths;
 use crate::schema::StructType;
+#[cfg(feature = "arrow-60")]
+use crate::schema::FILE_FIELDS;
 use crate::{KernelError, KernelResult};
 
 /// Returns `options` set up to write batches of `arrow_schema` as a data file with
@@ -35,12 +35,13 @@ pub(super) fn with_file_columns(
     arrow_schema: &ArrowSchema,
     physical_kernel_schema: &StructType,
 ) -> KernelResult<ArrowWriterOptions> {
-    let Some(FilePaths::Struct(file_fields)) = FilePaths::of_struct(physical_kernel_schema) else {
+    let Some(FilePaths::Struct(file_fields)) = FilePaths::from_schema(physical_kernel_schema)?
+    else {
         return Ok(options);
     };
     let descriptor = ArrowSchemaConverter::new().convert(arrow_schema)?;
     let root = descriptor.root_schema();
-    let fields = annotate_struct(root.get_fields(), &file_fields, &[])?;
+    let fields = annotate_struct(root.get_fields(), &file_fields, &mut Vec::new())?;
     let root = Type::group_type_builder(root.name())
         .with_fields(fields)
         .build()?;
@@ -55,7 +56,7 @@ pub(super) fn with_file_columns(
     _arrow_schema: &ArrowSchema,
     physical_kernel_schema: &StructType,
 ) -> KernelResult<ArrowWriterOptions> {
-    match FilePaths::of_struct(physical_kernel_schema) {
+    match FilePaths::from_schema(physical_kernel_schema)? {
         Some(file_paths) => Err(KernelError::unsupported(format!(
             "Writing `file` column '{}' requires the `arrow-60` feature.",
             first_column(&file_paths)
@@ -83,46 +84,53 @@ fn first_column(mut file_paths: &FilePaths) -> ColumnName {
 fn annotate_struct(
     fields: &[TypePtr],
     file_fields: &[(String, FilePaths)],
-    path: &[String],
+    path: &mut Vec<String>,
 ) -> KernelResult<Vec<TypePtr>> {
-    let column_path = |name: &str| ColumnName::new(path.iter().cloned().chain([name.to_string()]));
     let file_paths_by_name: HashMap<&str, &FilePaths> = file_fields
         .iter()
         .map(|(name, file_paths)| (name.as_str(), file_paths))
         .collect();
-    // A `file` column the batch lacks would otherwise be written unannotated, or not at all.
+    // Reject `file` columns the kernel schema has but the batch lacks.
     if let Some((name, _)) = file_fields
         .iter()
         .find(|(name, _)| !fields.iter().any(|field| field.name() == name))
     {
         return Err(KernelError::generic(format!(
             "`file` column '{}' is missing from the data",
-            column_path(name)
+            ColumnName::new(path.iter().cloned().chain([name.clone()]))
         )));
     }
     fields
         .iter()
         .map(|field| match file_paths_by_name.get(field.name()) {
-            Some(file_paths) => annotate(field, file_paths, &column_path(field.name())),
+            Some(file_paths) => {
+                path.push(field.name().to_string());
+                let annotated = annotate(field, file_paths, path);
+                path.pop();
+                annotated
+            }
+            // A field without `file` values is written as is.
             None => Ok(field.clone()),
         })
         .collect()
 }
 
-/// Annotates the `file` values at `file_paths` in `field`, the Parquet type written for `column`.
+/// Annotates the `file` values at `file_paths` in `field`, the Parquet type written for the
+/// column at `path`.
 #[cfg(feature = "arrow-60")]
-fn annotate(field: &TypePtr, file_paths: &FilePaths, column: &ColumnName) -> KernelResult<TypePtr> {
+fn annotate(
+    field: &TypePtr,
+    file_paths: &FilePaths,
+    path: &mut Vec<String>,
+) -> KernelResult<TypePtr> {
     let fields = match file_paths {
-        FilePaths::File => return annotate_file(field, column),
-        FilePaths::Struct(file_fields) => {
-            annotate_struct(group_fields(field)?, file_fields, column.path())?
-        }
+        FilePaths::File => return annotate_file(field, path),
+        FilePaths::Struct(file_fields) => annotate_struct(group_fields(field)?, file_fields, path)?,
         // A list is a `LIST` group holding a repeated group holding the element.
-        FilePaths::Array(element) => annotate_repeated(field, &[Some(element)], column)?,
-        // A map is a `MAP` group holding a repeated group holding the key and value.
-        FilePaths::Map { key, value } => {
-            annotate_repeated(field, &[key.as_deref(), value.as_deref()], column)?
-        }
+        FilePaths::Array(element) => annotate_repeated(field, &[Some(element)], path)?,
+        // A map is a `MAP` group holding a repeated group holding the key and value. A key never
+        // has `file` values.
+        FilePaths::Map(value) => annotate_repeated(field, &[None, Some(value)], path)?,
     };
     rebuild_group(
         field,
@@ -137,7 +145,7 @@ fn annotate(field: &TypePtr, file_paths: &FilePaths, column: &ColumnName) -> Ker
 fn annotate_repeated(
     field: &TypePtr,
     file_paths: &[Option<&FilePaths>],
-    column: &ColumnName,
+    path: &mut Vec<String>,
 ) -> KernelResult<Vec<TypePtr>> {
     let [repeated] = group_fields(field)? else {
         return Err(unexpected_layout(field));
@@ -150,20 +158,21 @@ fn annotate_repeated(
         .iter()
         .zip(file_paths)
         .map(|(child, file_paths)| match file_paths {
-            Some(file_paths) => annotate(child, file_paths, column),
+            Some(file_paths) => annotate(child, file_paths, path),
+            // A child without `file` values, such as a map key, is written as is.
             None => Ok(child.clone()),
         })
         .collect::<KernelResult<_>>()?;
+    // The repeated group itself has no logical type.
     Ok(vec![rebuild_group(repeated, None, children)?])
 }
 
-/// Annotates the group `field`, written for the `file` column `column`, with the `FILE` logical
+/// Annotates the group `field`, written for the `file` column at `path`, with the `FILE` logical
 /// type and, if it has a field id, gives each sub-field the id reserved for it.
 #[cfg(feature = "arrow-60")]
-fn annotate_file(field: &TypePtr, column: &ColumnName) -> KernelResult<TypePtr> {
-    let DataType::File(file_fields) = DataType::file_type() else {
-        return Err(KernelError::internal_error("`file_type()` is not a `file`"));
-    };
+fn annotate_file(field: &TypePtr, path: &[String]) -> KernelResult<TypePtr> {
+    let column = || ColumnName::new(path.iter().cloned());
+    let file_fields = &*FILE_FIELDS;
     let sub_fields = group_fields(field)?;
     // A `FILE` group must have exactly the canonical sub-fields, which readers require.
     let mut names: Vec<_> = sub_fields
@@ -175,7 +184,8 @@ fn annotate_file(field: &TypePtr, column: &ColumnName) -> KernelResult<TypePtr> 
     expected.sort_unstable();
     if names != expected {
         return Err(KernelError::generic(format!(
-            "`file` column '{column}' must have the sub-fields [{}], got [{}]",
+            "`file` column '{}' must have the sub-fields [{}], got [{}]",
+            column(),
             expected.join(", "),
             names.join(", ")
         )));
@@ -191,17 +201,15 @@ fn annotate_file(field: &TypePtr, column: &ColumnName) -> KernelResult<TypePtr> 
                 .ok_or_else(|| unexpected_layout(field))?;
             // Without a field id on the column, no sub-field gets one either, even if the
             // batch carries ids for them.
+            // `offset + 1` is 1 to 6, so the cast is lossless.
             let sub_field_id = id
                 .map(|id| {
-                    i32::try_from(offset + 1)
-                        .ok()
-                        .and_then(|offset| id.checked_add(offset))
-                        .ok_or_else(|| {
-                            KernelError::generic(format!(
-                                "The sub-field ids of `file` column '{column}' (field id {id}) \
-                                 overflow"
-                            ))
-                        })
+                    id.checked_add((offset + 1) as i32).ok_or_else(|| {
+                        KernelError::generic(format!(
+                            "The sub-field ids of `file` column '{}' (field id {id}) overflow",
+                            column()
+                        ))
+                    })
                 })
                 .transpose()?;
             with_id(sub_field, sub_field_id)
@@ -269,18 +277,74 @@ fn unexpected_layout(field: &TypePtr) -> KernelError {
     ))
 }
 
+/// A `FILE`-annotated group in a Parquet schema; see [`file_groups`].
+#[cfg(all(feature = "arrow-60", any(test, feature = "test-utils")))]
+#[derive(Debug, PartialEq)]
+pub struct FileGroup {
+    /// The path of the group from the root, with `.` between names.
+    pub path: String,
+    /// The field id of the group.
+    pub id: Option<i32>,
+    /// The names of the sub-fields, in order.
+    pub sub_field_names: Vec<String>,
+    /// The field ids of the sub-fields, in order.
+    pub sub_field_ids: Vec<Option<i32>>,
+}
+
+/// Returns each `FILE`-annotated group in `schema`, depth first in schema order. For tests that
+/// check how `file` columns are written.
+#[cfg(all(feature = "arrow-60", any(test, feature = "test-utils")))]
+pub fn file_groups(schema: &Type) -> Vec<FileGroup> {
+    fn id(field: &Type) -> Option<i32> {
+        let info = field.get_basic_info();
+        info.has_id().then(|| info.id())
+    }
+    fn visit(field: &Type, path: String, out: &mut Vec<FileGroup>) {
+        if !field.is_group() {
+            return;
+        }
+        if field.get_basic_info().logical_type_ref() == Some(&LogicalType::File) {
+            out.push(FileGroup {
+                path: path.clone(),
+                id: id(field),
+                sub_field_names: field
+                    .get_fields()
+                    .iter()
+                    .map(|f| f.name().to_string())
+                    .collect(),
+                sub_field_ids: field.get_fields().iter().map(|f| id(f)).collect(),
+            });
+        }
+        for child in field.get_fields() {
+            let child_path = match path.as_str() {
+                "" => child.name().to_string(),
+                _ => format!("{path}.{}", child.name()),
+            };
+            visit(child, child_path, out);
+        }
+    }
+    let mut out = Vec::new();
+    visit(schema, String::new(), &mut out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "arrow-60")]
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use rstest::rstest;
 
     use super::*;
     use crate::arrow::array::RecordBatch;
+    #[cfg(feature = "arrow-60")]
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
     use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::engine::writer_options;
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     #[cfg(feature = "arrow-60")]
+    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::parquet::file::reader::{FileReader as _, SerializedFileReader};
     use crate::schema::{
         ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
@@ -312,6 +376,7 @@ mod tests {
     }
 
     fn file_field(name: &str, id: Option<i64>) -> StructField {
+        // A `file` field has no nested ids: its sub-field ids follow from its own id.
         with_field_ids(StructField::nullable(name, DataType::file_type()), id, &[])
     }
 
@@ -337,6 +402,17 @@ mod tests {
         )])
     }
 
+    /// A map whose value is an array of `file` values: `MAP<STRING, ARRAY<FILE>>`.
+    fn array_in_map_value() -> StructType {
+        let array = ArrayType::new(DataType::file_type(), true);
+        let map = MapType::new(DataType::STRING, array, true);
+        StructType::new_unchecked([with_field_ids(
+            StructField::nullable("m", map),
+            Some(1),
+            &[("m.key", 2), ("m.value", 3), ("m.value.element", 4)],
+        )])
+    }
+
     fn map_value() -> StructType {
         let map = MapType::new(DataType::STRING, DataType::file_type(), true);
         StructType::new_unchecked([with_field_ids(
@@ -351,7 +427,7 @@ mod tests {
         write_arrow(physical_schema.try_into_arrow()?, physical_schema)
     }
 
-    /// Writes an empty batch of `arrow_schema` with [`with_file_columns`] for `physical_schema`.
+    /// Writes an empty batch of `arrow_schema`, which may contain `file` columns.
     fn write_arrow(
         arrow_schema: ArrowSchema,
         physical_schema: &StructType,
@@ -365,44 +441,18 @@ mod tests {
         Ok(buffer)
     }
 
-    /// Returns the path and sub-field ids of each `FILE`-annotated group in `schema`.
+    /// Returns the path and sub-field ids of each `FILE`-annotated group in `schema`, checking that
+    /// each has the canonical sub-fields in order.
     #[cfg(feature = "arrow-60")]
-    fn file_groups(schema: &Type) -> Vec<(String, Vec<Option<i32>>)> {
-        fn visit(field: &Type, path: String, out: &mut Vec<(String, Vec<Option<i32>>)>) {
-            if !field.is_group() {
-                return;
-            }
-            if field.get_basic_info().logical_type_ref() == Some(&LogicalType::File) {
-                let names: Vec<_> = field.get_fields().iter().map(|f| f.name()).collect();
-                assert_eq!(
-                    names,
-                    [
-                        "uri",
-                        "offset",
-                        "size",
-                        "content_type",
-                        "checksum",
-                        "inline"
-                    ]
-                );
-                let ids = field
-                    .get_fields()
-                    .iter()
-                    .map(|f| f.get_basic_info().has_id().then(|| f.get_basic_info().id()))
-                    .collect();
-                out.push((path.clone(), ids));
-            }
-            for child in field.get_fields() {
-                let child_path = match path.as_str() {
-                    "" => child.name().to_string(),
-                    _ => format!("{path}.{}", child.name()),
-                };
-                visit(child, child_path, out);
-            }
-        }
-        let mut out = Vec::new();
-        visit(schema, String::new(), &mut out);
-        out
+    fn file_group_ids(schema: &Type) -> Vec<(String, Vec<Option<i32>>)> {
+        file_groups(schema)
+            .into_iter()
+            .map(|group| {
+                let expected: Vec<_> = FILE_FIELDS.fields().map(|f| f.name().clone()).collect();
+                assert_eq!(group.sub_field_names, expected);
+                (group.path, group.sub_field_ids)
+            })
+            .collect()
     }
 
     /// A `file` column is written as a `FILE`-annotated group and, when it has a field id, each
@@ -414,6 +464,7 @@ mod tests {
     #[case::in_struct(in_struct(), "s.f", Some(3))]
     #[case::array_element(array_element(), "a.list.element", Some(6))]
     #[case::map_value(map_value(), "m.key_value.value", Some(4))]
+    #[case::array_in_map_value(array_in_map_value(), "m.key_value.value.list.element", Some(5))]
     fn writes_annotated_file_column(
         #[case] physical_schema: StructType,
         #[case] path: &str,
@@ -429,7 +480,10 @@ mod tests {
         let sub_field_ids = (0..6)
             .map(|offset| first_sub_field_id.map(|id| id + offset))
             .collect();
-        assert_eq!(file_groups(&root), vec![(path.to_string(), sub_field_ids)]);
+        assert_eq!(
+            file_group_ids(&root),
+            vec![(path.to_string(), sub_field_ids)]
+        );
     }
 
     /// Without the `FILE` logical type in parquet 59, a `file` column cannot be written wherever
@@ -440,6 +494,7 @@ mod tests {
     #[case::in_struct(in_struct(), "s.f")]
     #[case::array_element(array_element(), "a")]
     #[case::map_value(map_value(), "m")]
+    #[case::array_in_map_value(array_in_map_value(), "m")]
     fn rejects_file_column(#[case] physical_schema: StructType, #[case] column: &str) {
         let error = write(&physical_schema).unwrap_err().to_string();
         assert!(
@@ -454,10 +509,6 @@ mod tests {
     #[cfg(feature = "arrow-60")]
     #[test]
     fn drops_stale_sub_field_ids_without_field_id() {
-        use std::collections::HashMap;
-
-        use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
-        use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
         let physical_schema = top_level(None);
         let arrow_schema: ArrowSchema = (&physical_schema).try_into_arrow().unwrap();
         let ArrowDataType::Struct(sub_fields) = arrow_schema.field(0).data_type() else {
@@ -481,7 +532,10 @@ mod tests {
             .file_metadata()
             .schema_descr()
             .root_schema_ptr();
-        assert_eq!(file_groups(&root), vec![("f".to_string(), vec![None; 6])]);
+        assert_eq!(
+            file_group_ids(&root),
+            vec![("f".to_string(), vec![None; 6])]
+        );
     }
 
     /// A batch whose columns are in another order than `physical_schema` is annotated by name, and
@@ -505,7 +559,7 @@ mod tests {
             .schema_descr()
             .root_schema_ptr();
         let ids = (11..=16).map(Some).collect();
-        assert_eq!(file_groups(&root), vec![("f".to_string(), ids)]);
+        assert_eq!(file_group_ids(&root), vec![("f".to_string(), ids)]);
 
         let without_file = StructType::new_unchecked([StructField::nullable("x", DataType::LONG)]);
         let error = write_arrow((&without_file).try_into_arrow().unwrap(), &physical_schema)
@@ -521,8 +575,6 @@ mod tests {
     #[cfg(feature = "arrow-60")]
     #[test]
     fn rejects_missing_sub_field() {
-        use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
-
         let physical_schema = top_level(None);
         let arrow_schema: ArrowSchema = (&physical_schema).try_into_arrow().unwrap();
         let ArrowDataType::Struct(sub_fields) = arrow_schema.field(0).data_type() else {
@@ -573,10 +625,26 @@ mod tests {
         );
     }
 
-    /// A schema without a `file` column is written with the writer's own schema.
+    /// A schema without a `file` column is written with the writer's own schema, field ids
+    /// included.
     #[test]
     fn writes_schema_without_file_column() {
-        let schema = StructType::new_unchecked([StructField::nullable("x", DataType::LONG)]);
-        write(&schema).unwrap();
+        let schema = StructType::new_unchecked([with_field_ids(
+            StructField::nullable("x", DataType::LONG),
+            Some(7),
+            &[],
+        )]);
+        let buffer = write(&schema).unwrap();
+        let reader = SerializedFileReader::new(bytes::Bytes::from(buffer)).unwrap();
+        let root = reader
+            .metadata()
+            .file_metadata()
+            .schema_descr()
+            .root_schema_ptr();
+        let [x] = root.get_fields() else {
+            panic!("the schema has one field");
+        };
+        let info = x.get_basic_info();
+        assert_eq!((x.name(), info.has_id().then(|| info.id())), ("x", Some(7)));
     }
 }
