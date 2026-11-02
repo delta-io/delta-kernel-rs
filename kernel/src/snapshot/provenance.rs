@@ -2,27 +2,19 @@
 
 use crate::Version;
 
-/// The specification of the checkpoint selected for a snapshot.
+/// The specification followed by a checkpoint, independently of the table's checkpoint policy.
 ///
-/// This describes the selected checkpoint, independently of the table's checkpoint policy.
 /// A classic checkpoint filename alone does not distinguish V1 from V2.
-/// Classic-named V2 checkpoints without sidecars can remain unknown when ordinary reads do not
-/// inspect their checkpoint metadata action.
 ///
 /// cbindgen:prefix-with-name=true
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[repr(C)]
-pub enum SelectedCheckpointKind {
-    /// No checkpoint was selected.
-    None,
-    /// The selected checkpoint follows the V1 specification.
+pub enum CheckpointType {
+    /// The checkpoint follows the V1 specification.
     V1,
-    /// The selected checkpoint follows the V2 specification, with or without sidecars.
+    /// The checkpoint follows the V2 specification, with or without sidecars.
     V2,
-    /// Ordinary snapshot processing has not established the checkpoint specification.
-    #[default]
-    Unknown,
 }
 
 /// How the retained checksum relates to an observed checksum file and the snapshot version.
@@ -86,7 +78,7 @@ mod tests {
     use crate::Snapshot;
 
     #[rstest::rstest]
-    fn checkpoint_kind_from_ordinary_scan_survives_hint(
+    fn checkpoint_type_from_ordinary_scan_survives_hint(
         #[values(false, true)] v2: bool,
         #[values(false, true)] sidecars: bool,
     ) {
@@ -114,15 +106,15 @@ mod tests {
             batch.unwrap();
         }
         let expected = if v2 {
-            SelectedCheckpointKind::V2
+            CheckpointType::V2
         } else {
-            SelectedCheckpointKind::V1
+            CheckpointType::V1
         };
-        assert_eq!(snapshot.selected_checkpoint_kind(), expected);
+        assert_eq!(snapshot.checkpoint_type(), Some(expected));
         let hinted = Snapshot::builder_for(table.table_root())
             .with_snapshot_hint(snapshot.to_snapshot_hint().unwrap())
             .build(&engine)
             .unwrap();
-        assert_eq!(hinted.selected_checkpoint_kind(), expected);
+        assert_eq!(hinted.checkpoint_type(), Some(expected));
     }
 }

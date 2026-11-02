@@ -157,9 +157,9 @@ pub(crate) struct LogSegment {
     /// [`Self::checkpoint_hint_sidecars`] accessors built on it). Read this field directly only
     /// when the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
     pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
-    /// Kind established by ordinary reads or checkpoint writes, shared by the same checkpoint.
-    pub(crate) checkpoint_kind: Arc<OnceLock<crate::snapshot::SelectedCheckpointKind>>,
-    pub(crate) checkpoint_kind_hint: crate::snapshot::SelectedCheckpointKind,
+    /// Type established by ordinary reads or checkpoint writes, shared by the same checkpoint.
+    pub(crate) checkpoint_type: Arc<OnceLock<crate::snapshot::CheckpointType>>,
+    pub(crate) checkpoint_type_hint: Option<crate::snapshot::CheckpointType>,
 }
 
 // Observations can be refined by readers without changing the selected log segment.
@@ -400,8 +400,8 @@ impl LogSegment {
             checkpoint_version: None,
             log_root,
             last_checkpoint_metadata: None,
-            checkpoint_kind: Default::default(),
-            checkpoint_kind_hint: Default::default(),
+            checkpoint_type: Default::default(),
+            checkpoint_type_hint: Default::default(),
             listed: LogSegmentFiles {
                 max_published_version: Some(commit_file.version),
                 latest_commit_file: Some(commit_file.clone()),
@@ -455,8 +455,8 @@ impl LogSegment {
             checkpoint_version,
             log_root,
             last_checkpoint_metadata,
-            checkpoint_kind: Default::default(),
-            checkpoint_kind_hint: Default::default(),
+            checkpoint_type: Default::default(),
+            checkpoint_type_hint: Default::default(),
             listed: listed_files,
         };
 
@@ -846,8 +846,8 @@ impl LogSegment {
         // scan will read the checkpoint parquet footer to determine the schema (e.g.
         // whether stats_parsed or sidecar columns exist).
         new_log_segment.last_checkpoint_metadata = None;
-        new_log_segment.checkpoint_kind = Default::default();
-        new_log_segment.checkpoint_kind_hint = Default::default();
+        new_log_segment.checkpoint_type = Default::default();
+        new_log_segment.checkpoint_type_hint = Default::default();
         Ok(new_log_segment)
     }
 
@@ -1654,7 +1654,7 @@ impl LogSegment {
         }
 
         if metadata.found || !visitor.sidecars.is_empty() {
-            self.observe_checkpoint_kind(crate::snapshot::SelectedCheckpointKind::V2);
+            self.observe_checkpoint_type(crate::snapshot::CheckpointType::V2);
         }
 
         // Convert to FileMeta
@@ -1684,8 +1684,8 @@ impl LogSegment {
             checkpoint_version: None,
             log_root: self.log_root.clone(),
             last_checkpoint_metadata: None,
-            checkpoint_kind: Default::default(),
-            checkpoint_kind_hint: Default::default(),
+            checkpoint_type: Default::default(),
+            checkpoint_type_hint: Default::default(),
             listed: LogSegmentFiles {
                 ascending_commit_files: commits,
                 ascending_compaction_files: compactions,

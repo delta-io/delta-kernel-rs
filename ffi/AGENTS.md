@@ -765,7 +765,7 @@ pub struct FfiSnapshotHint {
     pub last_checkpoint: *const FfiLastCheckpoint,
     pub crc: *const FfiCrc,
     pub publication_watermark: FfiPublicationWatermark,
-    pub checkpoint_kind: SelectedCheckpointKind,
+    pub checkpoint_type: OptionalValue<CheckpointType>,
     pub crc_provenance: FfiCrcProvenance,
 }
 
@@ -841,7 +841,9 @@ when the callback returns; copy retained values during the callback. No hint han
 Supply the copied values through `snapshot_builder_with_snapshot_hint` when rebuilding a snapshot.
 The hint preserves build-time freshness, a matching checkpoint hint, retained CRC state (including
 stale baselines), and checkpoint and CRC provenance. `crc` is null only when no checksum is retained.
-Callers supply `Unknown` for observations they have not established. Compaction files are unsupported.
+The checkpoint type is optional, with `V1`/`V2` when known. Checksum provenance uses `Unknown`
+when unestablished; `Missing`/`Unusable` are preserved with a null CRC. Claims of a usable checksum
+require a non-null CRC. Compaction files are unsupported.
 
 Export includes an explicit publication watermark,
 preserving absence even when published commits are not represented by the retained paths.

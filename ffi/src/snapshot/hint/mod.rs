@@ -1,7 +1,7 @@
 //! Construction and export of snapshot hints.
 
 use delta_kernel::snapshot::{
-    SelectedCheckpointKind, SnapshotHint, SnapshotHintError, SnapshotHintFreshness,
+    CheckpointType, SnapshotHint, SnapshotHintError, SnapshotHintFreshness,
 };
 use delta_kernel::{KernelError, KernelResult, Version};
 
@@ -13,7 +13,7 @@ use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
 use crate::snapshot::provenance::FfiCrcProvenance;
-use crate::{NullableCvoid, SharedExternEngine, SharedSnapshot};
+use crate::{NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot};
 
 mod export;
 
@@ -96,9 +96,12 @@ pub struct FfiSnapshotHint {
     ///
     /// Export always uses an explicit variant, never `InferFromLogPaths`.
     pub publication_watermark: FfiPublicationWatermark,
-    /// Selected checkpoint specification. Use `Unknown` when it has not been established.
-    pub checkpoint_kind: SelectedCheckpointKind,
+    /// Selected checkpoint specification, absent when no checkpoint is selected or its type is
+    /// unknown.
+    pub checkpoint_type: OptionalValue<CheckpointType>,
     /// Retained checksum observation. Use `Unknown` with no base version when it is not known.
+    /// `Missing` and `Unusable` require a null `crc` and no base version. `AtVersion`,
+    /// `Reconstructed`, and `Stale` require a non-null `crc` and a compatible base version.
     pub crc_provenance: FfiCrcProvenance,
 }
 
@@ -166,7 +169,10 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         last_checkpoint_hint,
         crc,
         freshness,
-        Some((value.checkpoint_kind, value.crc_provenance.to_kernel())),
+        Some((
+            Option::<&CheckpointType>::from(&value.checkpoint_type).copied(),
+            value.crc_provenance.to_kernel(),
+        )),
     )?;
     builder.snapshot_hint = Some(Box::new(snapshot_hint));
     Ok(())
