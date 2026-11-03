@@ -1154,6 +1154,7 @@ impl StructType {
     }
 
     /// Gets a mutable reference to the underlying field map.
+    #[internal_api]
     pub(crate) fn field_map_mut(&mut self) -> &mut IndexMap<String, StructField> {
         &mut self.fields
     }
