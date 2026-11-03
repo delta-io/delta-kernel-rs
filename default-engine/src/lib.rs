@@ -208,14 +208,14 @@ pub struct DefaultEngineBuilder<E> {
     object_store: Arc<DynObjectStore>,
     /// The state is either [`DefaultTaskExecutor`] or `Arc<E>` with a custom task executor.
     task_executor: E,
-    /// Read-path I/O concurrency config applied to the JSON and Parquet handlers. `None` fields
+    /// Read-path I/O config applied to the JSON and Parquet handlers. `None` fields
     /// fall back to the handlers' defaults.
     io_config: ReadIoConfig,
 }
 
 /// Read-path I/O tuning for [`DefaultEngine`]'s JSON and Parquet handlers.
 ///
-/// Both knobs default to the handlers' built-in defaults when left unset.
+/// Unset options use the handlers' built-in defaults.
 #[derive(Debug, Default, Clone, Copy)]
 struct ReadIoConfig {
     /// Maximum number of files read concurrently (file-level readahead depth). See
@@ -223,6 +223,8 @@ struct ReadIoConfig {
     buffer_size: Option<NonZero<usize>>,
     /// Maximum number of rows per yielded batch. See [`DefaultEngineBuilder::with_batch_size`].
     batch_size: Option<NonZero<usize>>,
+    /// Initial Parquet metadata tail read size in bytes.
+    parquet_footer_size_hint: Option<usize>,
 }
 
 /// Represents the default [`TaskExecutor`]. The executor is created lazily to avoid unnecessary
@@ -281,6 +283,18 @@ impl<E> DefaultEngineBuilder<E> {
         self.io_config.batch_size = Some(batch_size);
         self
     }
+
+    /// Set the initial Parquet metadata tail read size in bytes, including the 8-byte trailer.
+    ///
+    /// Defaults to 64 KiB. A hint large enough to contain the footer avoids a second metadata
+    /// request; smaller hints fall back to another read. Values at most 8 disable speculative
+    /// reads and fetch the trailer first. Larger values may read bytes preceding the metadata.
+    /// Applies to object-store reads of both data files and standalone footers. Presigned URL
+    /// reads download the whole file and do not use this hint.
+    pub fn with_parquet_footer_size_hint(mut self, hint: usize) -> Self {
+        self.io_config.parquet_footer_size_hint = Some(hint);
+        self
+    }
 }
 
 impl<E: TaskExecutor> DefaultEngineBuilder<Arc<E>> {
@@ -319,7 +333,12 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             .with_batch_size(batch_size);
         let parquet = DefaultParquetHandler::new(object_store.clone(), task_executor.clone())
             .with_buffer_size(buffer_size)
-            .with_batch_size(batch_size);
+            .with_batch_size(batch_size)
+            .with_footer_size_hint(
+                io_config
+                    .parquet_footer_size_hint
+                    .unwrap_or(parquet::DEFAULT_FOOTER_SIZE_HINT),
+            );
         let raw_json: Arc<dyn JsonHandler> = Arc::new(json);
         let raw_parquet = Arc::new(parquet);
         Self {
@@ -513,6 +532,7 @@ mod tests {
         let object_store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
         let engine = DefaultEngineBuilder::new(object_store)
+            .with_parquet_footer_size_hint(128 * 1024)
             .with_task_executor(executor)
             .with_buffer_size(NonZero::new(4).unwrap())
             .with_batch_size(NonZero::new(8).unwrap())

@@ -18,7 +18,7 @@ use delta_kernel::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use delta_kernel::engine::{data_file_writer_options, reader_options, writer_options};
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
+use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _, ObjectStoreScheme};
 use delta_kernel::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ParquetRecordBatchReaderBuilder,
 };
@@ -45,6 +45,9 @@ use crate::executor::TaskExecutor;
 use crate::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use crate::stats::collect_stats;
 
+/// Initial tail read size, including the Parquet trailer, used to avoid metadata round trips.
+pub(crate) const DEFAULT_FOOTER_SIZE_HINT: usize = 64 * 1024;
+
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
@@ -54,6 +57,8 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
     buffer_size: NonZero<usize>,
     /// The maximum number of rows per RecordBatch yielded by the read stream.
     batch_size: NonZero<usize>,
+    /// Initial metadata tail read size, including the 8-byte trailer.
+    footer_size_hint: usize,
 }
 
 /// Metadata of a data file (typically a parquet file).
@@ -157,6 +162,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
             task_executor,
             buffer_size: super::DEFAULT_READ_BUFFER_SIZE,
             batch_size: super::DEFAULT_READ_BATCH_SIZE,
+            footer_size_hint: DEFAULT_FOOTER_SIZE_HINT,
         }
     }
 
@@ -183,6 +189,17 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     /// Defaults to `super::DEFAULT_READ_BATCH_SIZE` rows.
     pub fn with_batch_size(mut self, batch_size: NonZero<usize>) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    /// Set the initial metadata tail read size in bytes, including the 8-byte Parquet trailer.
+    ///
+    /// Defaults to 64 KiB. If the footer fits, it is fetched in one request. Smaller hints fall
+    /// back to another read; values at most 8 fetch only the trailer first. Larger hints may
+    /// read bytes preceding the metadata. Applies to object-store data and footer reads;
+    /// presigned URL reads download the whole file and do not use this hint.
+    pub fn with_footer_size_hint(mut self, hint: usize) -> Self {
+        self.footer_size_hint = hint;
         self
     }
 
@@ -275,6 +292,7 @@ async fn read_parquet_files_impl(
     predicate: Option<PredicateRef>,
     buffer_size: usize,
     batch_size: usize,
+    footer_size_hint: usize,
 ) -> KernelResult<BoxStream<'static, KernelResult<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
@@ -307,7 +325,18 @@ async fn read_parquet_files_impl(
         let store = store.clone();
         let schema = physical_schema.clone();
         let predicate = predicate.clone();
-        async move { open_parquet_file(store, schema, predicate, None, batch_size, file).await }
+        async move {
+            open_parquet_file(
+                store,
+                schema,
+                predicate,
+                None,
+                batch_size,
+                footer_size_hint,
+                file,
+            )
+            .await
+        }
     });
     // create a stream from that iterator which buffers up to `buffer_size` futures at a time
     let result_stream = stream::iter(file_futures)
@@ -344,6 +373,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             predicate,
             self.buffer_size.get(),
             self.batch_size.get(),
+            self.footer_size_hint,
         );
         super::stream_future_to_cancellable_iter(
             self.task_executor.clone(),
@@ -416,23 +446,25 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         cancellation_token: Option<CancellationTokenRef>,
     ) -> KernelResult<ParquetFooter> {
         let store = self.store.clone();
-        let location = file.location.clone();
-        let file_size = file.size;
+        let file = file.clone();
+        let footer_size_hint = self.footer_size_hint;
 
         let footer_future = async move {
-            let metadata = if location.is_presigned() {
+            let metadata = if file.location.is_presigned() {
                 let client = reqwest::Client::new();
-                let response = client.get(location.as_str()).send().await.map_err(|e| {
-                    KernelError::generic(format!("Failed to fetch presigned URL: {e}"))
-                })?;
+                let response = client
+                    .get(file.location.as_str())
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        KernelError::generic(format!("Failed to fetch presigned URL: {e}"))
+                    })?;
                 let bytes = response.bytes().await.map_err(|e| {
                     KernelError::generic(format!("Failed to read response bytes: {e}"))
                 })?;
                 ArrowReaderMetadata::load(&bytes, reader_options())?
             } else {
-                let path = Path::from_url_path(location.path())?;
-                #[allow(deprecated)]
-                let mut reader = ParquetObjectReader::new(store, path).with_file_size(file_size);
+                let mut reader = parquet_object_reader(store, &file, footer_size_hint).await?;
                 ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?
             };
 
@@ -456,37 +488,11 @@ async fn open_parquet_file(
     predicate: Option<PredicateRef>,
     limit: Option<usize>,
     batch_size: usize,
+    footer_size_hint: usize,
     file_meta: FileMeta,
 ) -> KernelResult<BoxStream<'static, KernelResult<RecordBatch>>> {
     let file_location = file_meta.location.to_string();
-    let path = Path::from_url_path(file_meta.location.path())?;
-
-    #[allow(deprecated)]
-    let mut reader = {
-        use delta_kernel::object_store::ObjectStoreScheme;
-        // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
-        // request which isn't supported by Azure. For now we just detect if the URL is
-        // pointing to azure and if so, do a HEAD request so we can pass in file size to the
-        // reader which will cause the reader to avoid a suffix range request.
-        // see also: https://github.com/delta-io/delta-kernel-rs/issues/968
-
-        // Since the `Remove` action's size value is optional as specified in the delta protocol
-        // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#add-file-and-remove-file,
-        // the extracted size will be zero in this case. Thus, this function
-        // need to handle the case of zero file_meta.size.
-        if file_meta.size != 0 {
-            ParquetObjectReader::new(store, path).with_file_size(file_meta.size)
-        } else if let Ok((ObjectStoreScheme::MicrosoftAzure, _)) =
-            ObjectStoreScheme::parse(&file_meta.location)
-        {
-            // also note doing HEAD then actual GET isn't atomic, and leaves us vulnerable
-            // to file changing between the two calls.
-            let meta = store.head(&path).await?;
-            ParquetObjectReader::new(store, path).with_file_size(meta.size)
-        } else {
-            ParquetObjectReader::new(store, path)
-        }
-    };
+    let mut reader = parquet_object_reader(store, &file_meta, footer_size_hint).await?;
 
     let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?;
     let (requested_ordering, mask) = parquet_read_plan(&table_schema, &metadata)?;
@@ -516,6 +522,30 @@ async fn open_parquet_file(
         .map(Into::into)
     });
     Ok(stream.boxed())
+}
+
+#[allow(deprecated)]
+async fn parquet_object_reader(
+    store: Arc<DynObjectStore>,
+    file: &FileMeta,
+    footer_size_hint: usize,
+) -> KernelResult<ParquetObjectReader> {
+    let path = Path::from_url_path(file.location.path())?;
+    // Remove actions may omit the file size. Azure requires bounded ranges rather than suffix
+    // requests, so discover the size when it is missing (see issue #968).
+    let file_size = if file.size != 0 {
+        Some(file.size)
+    } else if matches!(
+        ObjectStoreScheme::parse(&file.location),
+        Ok((ObjectStoreScheme::MicrosoftAzure, _))
+    ) {
+        Some(store.head(&path).await?.size)
+    } else {
+        None
+    };
+    Ok(ParquetObjectReader::new(store, path)
+        .with_footer_size_hint(footer_size_hint)
+        .fold_with(file_size, ParquetObjectReader::with_file_size))
 }
 
 /// Implements [`FileOpener`] for a opening a parquet file from a presigned URL
@@ -599,12 +629,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
-    use delta_kernel::EngineData;
     use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
     use delta_kernel::arrow::array::{
-        Array, AsArray, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-        Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        TimestampMicrosecondArray,
+        Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
+        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch,
+        StringArray, TimestampMicrosecondArray,
     };
     use delta_kernel::arrow::compute::cast;
     use delta_kernel::arrow::datatypes::{
@@ -613,16 +642,23 @@ mod tests {
     use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::expressions::{Predicate, Scalar, col, lit};
+    use delta_kernel::object_store::aws::AmazonS3Builder;
+    use delta_kernel::object_store::azure::MicrosoftAzureBuilder;
+    use delta_kernel::object_store::gcp::GoogleCloudStorageBuilder;
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+        ClientOptions, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        Result as ObjectStoreResult,
     };
     use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
+    use delta_kernel::parquet::file::metadata::{KeyValue, PageIndexPolicy};
+    use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
     use delta_kernel::schema::{
         ColumnMetadataKey, DataType, MetadataValue, StructField, StructType, schema, schema_ref,
     };
+    use delta_kernel::{Engine, EngineData};
     use delta_kernel_default_engine_test_utils::{
         assert_result_error_with_message, current_time_ms,
         try_into_record_batch as into_record_batch,
@@ -636,10 +672,12 @@ mod tests {
         test_parquet_handler_write_omits_arrow_schema,
     };
     use url::Url;
+    use wiremock::matchers::{header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::DEFAULT_BATCH_SIZE;
     use crate::executor::tokio::TokioBackgroundExecutor;
+    use crate::{DEFAULT_BATCH_SIZE, DefaultEngineBuilder};
 
     fn long_schema(name: &str) -> StructType {
         schema! { nullable (name): LONG }
@@ -757,6 +795,7 @@ mod tests {
             None,
             None,
             DEFAULT_BATCH_SIZE,
+            DEFAULT_FOOTER_SIZE_HINT,
             file_meta,
         )
         .await
@@ -802,56 +841,246 @@ mod tests {
         assert_eq!(data[0].num_rows(), 10);
     }
 
-    #[tokio::test]
-    async fn test_open_parquet_file_fetches_footer_once() {
-        let path = std::fs::canonicalize(PathBuf::from(
-            "../kernel/tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
-        )).unwrap();
-        let file_size = std::fs::metadata(&path).unwrap().len();
-        let url = Url::from_file_path(&path).unwrap();
-        let location = Path::from_url_path(url.path()).unwrap();
+    #[rstest::rstest]
+    #[case::default(None, [1, 2])]
+    #[case::disabled(Some(0), [2, 2])]
+    #[case::trailer_only(Some(8), [2, 2])]
+    #[case::partial_footer(Some(9), [2, 2])]
+    #[case::oversized(Some(4 * DEFAULT_FOOTER_SIZE_HINT), [1, 1])]
+    fn test_parquet_footer_prefetch_request_count(
+        #[case] hint: Option<usize>,
+        #[case] expected_gets: [usize; 2],
+        #[values(false, true)] large_footer: bool,
+        #[values(false, true)] known_file_size: bool,
+        #[values(false, true)] footer_only: bool,
+    ) {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from_iter_values(0..100)) as ArrayRef,
+        )])
+        .unwrap();
+        let padding = if large_footer {
+            2 * DEFAULT_FOOTER_SIZE_HINT
+        } else {
+            0
+        };
+        let properties = WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                "padding".into(),
+                "x".repeat(padding),
+            )]))
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, batch.schema(), Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
 
-        // Baseline: how many `get_opts` calls a single footer load makes (one or more range GETs,
-        // depending on parquet version). The reader builder must not exceed this.
-        let baseline_store = Arc::new(GetOptsCountingStore::new(LocalFileSystem::new()));
-        #[allow(deprecated)]
-        let mut reader =
-            ParquetObjectReader::new(baseline_store.clone(), location).with_file_size(file_size);
-        let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options())
+        let file = FileMeta::new(
+            Url::parse("memory:///test.parquet").unwrap(),
+            0,
+            if known_file_size {
+                bytes.len() as u64
+            } else {
+                0
+            },
+        );
+        let store = Arc::new(GetOptsCountingStore::new(InMemory::new()));
+        let mut builder = DefaultEngineBuilder::new(store.clone());
+        if let Some(hint) = hint {
+            builder = builder.with_parquet_footer_size_hint(hint);
+        }
+        let engine = builder.build();
+        let write_store = store.clone();
+        engine
+            .task_executor
+            .block_on(async move {
+                write_store
+                    .put(&Path::from("test.parquet"), bytes.into())
+                    .await
+            })
+            .unwrap();
+        let schema = Arc::new(batch.schema().try_into_kernel().unwrap());
+        if footer_only {
+            let footer = engine.parquet_handler().read_parquet_footer(&file).unwrap();
+            assert_eq!(footer.schema, schema);
+        } else {
+            let batches: Vec<_> = engine
+                .parquet_handler()
+                .read_parquet_files(&[file], schema, None)
+                .unwrap()
+                .map(|batch| into_record_batch(batch).unwrap())
+                .collect();
+            assert_eq!(batches, vec![batch]);
+        }
+        assert_eq!(
+            store.get_opts_count(),
+            expected_gets[usize::from(large_footer)]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::indexes_and_footer(|indexes, _| indexes, 1)]
+    #[case::partial_indexes(|indexes, _| indexes - 1, 2)]
+    #[case::footer_only(|_, footer| footer, 2)]
+    #[case::partial_footer(|_, footer| footer - 1, 3)]
+    #[case::disabled(|_, _| 0, 3)]
+    #[tokio::test]
+    async fn test_parquet_prefetch_reuses_page_index_bytes(
+        #[case] hint: fn(usize, usize) -> usize,
+        #[case] expected_gets: usize,
+    ) {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(StringArray::from_iter_values(
+                (0..100).map(|i| format!("value_{i}")),
+            )) as ArrayRef,
+        )])
+        .unwrap();
+        let properties = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .set_data_page_row_count_limit(10)
+            .set_write_batch_size(10)
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, batch.schema(), Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let file_size = bytes.len();
+        let footer_size =
+            u32::from_le_bytes(bytes[file_size - 8..file_size - 4].try_into().unwrap()) as usize
+                + 8;
+        let bytes = Bytes::from(bytes);
+        let reference = ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).unwrap();
+        let column = reference.metadata().row_group(0).column(0);
+        let index_start = column
+            .column_index_offset()
+            .unwrap()
+            .min(column.offset_index_offset().unwrap());
+        let indexes_and_footer_size = file_size - index_start as usize;
+        assert!(indexes_and_footer_size > footer_size);
+        let store = Arc::new(GetOptsCountingStore::new(InMemory::new()));
+        store
+            .put(&Path::from("test.parquet"), bytes.into())
             .await
             .unwrap();
-        let footer_load_gets = baseline_store.get_opts_count();
-        assert!(
-            footer_load_gets > 0,
-            "footer load should issue at least one GET"
+        let file = FileMeta::new(
+            Url::parse("memory:///test.parquet").unwrap(),
+            0,
+            file_size as u64,
         );
-        let physical_schema = Arc::new(metadata.schema().clone().try_into_kernel().unwrap());
-
-        // `open_parquet_file` must reuse the loaded footer rather than re-fetch it when building
-        // the reader, so its footer GETs equal a single load, not double.
-        let counting_store = Arc::new(GetOptsCountingStore::new(LocalFileSystem::new()));
-        let file_meta = FileMeta {
-            location: url,
-            last_modified: 0,
-            size: file_size,
-        };
-        let stream = open_parquet_file(
-            counting_store.clone(),
-            physical_schema,
-            None,
-            None,
-            DEFAULT_BATCH_SIZE,
-            file_meta,
+        let mut reader = parquet_object_reader(
+            store.clone(),
+            &file,
+            hint(indexes_and_footer_size, footer_size),
         )
         .await
         .unwrap();
-        let _batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        // Request indexes here to verify the reader retains prefetched bytes without enabling
+        // page-index reads on the default engine's production read path.
+        let metadata = ArrowReaderMetadata::load_async(
+            &mut reader,
+            reader_options().with_page_index_policy(PageIndexPolicy::Required),
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.get_opts_count(), expected_gets);
+        let batches: Vec<_> = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata)
+            .build()
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches, vec![batch]);
+    }
 
-        assert_eq!(
-            counting_store.get_opts_count(),
-            footer_load_gets,
-            "footer should be fetched once, not re-fetched when constructing the reader"
-        );
+    #[rstest::rstest]
+    #[case::s3("s3://bucket/test.parquet")]
+    #[case::azure("abfss://container@account.dfs.core.windows.net/test.parquet")]
+    #[case::gcs("gs://bucket/test.parquet")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_parquet_footer_prefetch_cloud_range_requests(
+        #[case] location: &str,
+        #[values(false, true)] known_file_size: bool,
+    ) {
+        // Exercise each cloud client's HTTP range handling against a local storage endpoint.
+        let bytes = std::fs::read(
+            "../kernel/tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet",
+        ).unwrap();
+        let size = bytes.len();
+        assert!(size < DEFAULT_FOOTER_SIZE_HINT);
+        let location = Url::parse(location).unwrap();
+        let is_azure = location.scheme() == "abfss";
+        let needs_head = is_azure && !known_file_size;
+        let range = if known_file_size || is_azure {
+            format!("bytes=0-{}", size - 1)
+        } else {
+            format!("bytes=-{DEFAULT_FOOTER_SIZE_HINT}")
+        };
+        let reference =
+            ArrowReaderMetadata::load(&Bytes::copy_from_slice(&bytes), reader_options()).unwrap();
+        let expected_schema = StructType::try_from_arrow(reference.schema().as_ref()).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", size.to_string())
+                    .insert_header("etag", "\"test\"")
+                    .insert_header("last-modified", "Tue, 03 Nov 2026 00:00:00 GMT"),
+            )
+            .expect(u64::from(needs_head))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(header("range", range))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", format!("bytes 0-{}/{size}", size - 1))
+                    .insert_header("etag", "\"test\"")
+                    .insert_header("last-modified", "Tue, 03 Nov 2026 00:00:00 GMT")
+                    .set_body_bytes(bytes),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let store: Arc<DynObjectStore> = match location.scheme() {
+            "s3" => Arc::new(
+                AmazonS3Builder::new()
+                    .with_bucket_name("bucket")
+                    .with_region("us-east-1")
+                    .with_endpoint(server.uri())
+                    .with_allow_http(true)
+                    .with_skip_signature(true)
+                    .build()
+                    .unwrap(),
+            ),
+            "abfss" => Arc::new(
+                MicrosoftAzureBuilder::new()
+                    .with_account("account")
+                    .with_container_name("container")
+                    .with_endpoint(server.uri())
+                    .with_allow_http(true)
+                    .with_skip_signature(true)
+                    .build()
+                    .unwrap(),
+            ),
+            "gs" => Arc::new(
+                GoogleCloudStorageBuilder::new()
+                    .with_bucket_name("bucket")
+                    .with_base_url(&server.uri())
+                    .with_client_options(ClientOptions::new().with_allow_http(true))
+                    .with_skip_signature(true)
+                    .build()
+                    .unwrap(),
+            ),
+            _ => unreachable!(),
+        };
+        let file = FileMeta::new(location, 0, if known_file_size { size as u64 } else { 0 });
+        let engine = DefaultEngineBuilder::new(store).build();
+        let footer = engine.parquet_handler().read_parquet_footer(&file).unwrap();
+        assert_eq!(footer.schema.as_ref(), &expected_schema);
+        server.verify().await;
     }
 
     #[tokio::test]
