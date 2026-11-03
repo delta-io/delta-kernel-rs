@@ -1131,7 +1131,7 @@ impl LogSegment {
     }
 
     /// The commit cover over versions in `(oldest_exclusive, newest_inclusive]`, in descending
-    /// order. Each of `required_deltas` is read as its own commit file, never through a log
+    /// order. Each of `required_commits` is read as its own commit file, never through a log
     /// compaction. A compaction that crosses either end of the range is read as its individual
     /// commits within the range.
     #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
@@ -1141,7 +1141,7 @@ impl LogSegment {
         &self,
         oldest_exclusive: Option<Version>,
         newest_inclusive: Version,
-        required_deltas: &[Version],
+        required_commits: &[Version],
     ) -> Vec<&ParsedLogPath> {
         let commits = self
             .listed
@@ -1156,7 +1156,7 @@ impl LogSegment {
                 matches!(
                     compaction.file_type,
                     LogPathFileType::CompactedCommit { hi } if hi <= newest_inclusive
-                        && !required_deltas.iter().any(|v| (compaction.version..=hi).contains(v))
+                        && !required_commits.iter().any(|v| (compaction.version..=hi).contains(v))
                 )
             });
         Self::commit_cover_paths_using(commits, compactions, oldest_exclusive)

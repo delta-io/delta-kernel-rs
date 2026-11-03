@@ -2419,9 +2419,9 @@ fn commit_cover_after_excludes_compaction_starting_at_or_before_bound(
 )]
 #[case::empty_range((Some(4), 4), &[], &[])]
 #[tokio::test]
-async fn commit_cover_in_range_reads_required_deltas_as_their_own_files(
+async fn commit_cover_in_range_reads_required_commits_as_their_own_files(
     #[case] (oldest_exclusive, newest_inclusive): (Option<Version>, Version),
-    #[case] required_deltas: &[Version],
+    #[case] required_commits: &[Version],
     #[case] expected_files: &[ExpectedFile],
 ) {
     let mut log_segment = create_segment_for(LogSegmentConfig {
@@ -2440,7 +2440,7 @@ async fn commit_cover_in_range_reads_required_deltas_as_their_own_files(
     log_segment.listed.ascending_compaction_files = compactions;
 
     let cover = log_segment
-        .find_commit_cover_paths_in_range(oldest_exclusive, newest_inclusive, required_deltas)
+        .find_commit_cover_paths_in_range(oldest_exclusive, newest_inclusive, required_commits)
         .into_iter()
         .map(|path| path.location.location.clone())
         .collect_vec();
