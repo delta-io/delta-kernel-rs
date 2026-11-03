@@ -15,15 +15,17 @@ use delta_kernel::arrow::datatypes::{
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::{FileGroup, file_groups};
 use delta_kernel::expressions::{Predicate as Pred, Scalar, column_expr};
+use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
 };
-use delta_kernel::snapshot::SnapshotRef;
+use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::{
-    create_table_and_load_snapshot, read_add_infos, read_scan, test_table_setup,
+    add_commit, create_table_and_load_snapshot, read_add_infos, read_scan, test_table_setup,
     test_table_setup_mt, write_batch_to_table,
 };
 use url::Url;
@@ -494,6 +496,61 @@ async fn test_predicate_on_file_column_skips_no_files() -> Result<(), Box<dyn st
     }
     // The control: `id` has statistics, so `id >= 10` skips the first data file.
     let skipping = Pred::ge(column_expr!("id"), Scalar::from(10));
+    assert_eq!(scan_file_count(&snapshot, engine.as_ref(), skipping)?, 1);
+    Ok(())
+}
+
+/// Kernel ignores statistics for `file` sub-fields, which the protocol allows and other engines
+/// may write, so a predicate on a sub-field skips no data file even when those statistics rule
+/// it out, while one on another column still does.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_predicate_on_file_column_ignores_file_stats() -> Result<(), Box<dyn std::error::Error>>
+{
+    let schema = Arc::new(StructType::try_new([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("c", DataType::file_type()),
+    ])?);
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &[])?;
+    // Two data files whose statistics cover `uri`, `offset`, `size` and `content_type` as the
+    // protocol defines them, keyed by the `file` column and the sub-field name.
+    let add = |path: &str, id: i32| {
+        let stats = serde_json::json!({
+            "numRecords": 1,
+            "minValues": {"id": id, "c": {"uri": "s3://b/a", "offset": 0, "size": 10, "content_type": "image/png"}},
+            "maxValues": {"id": id, "c": {"uri": "s3://b/a", "offset": 0, "size": 10, "content_type": "image/png"}},
+            "nullCount": {"id": 0, "c": {"uri": 0, "offset": 0, "size": 0, "content_type": 0, "checksum": 1, "inline": 1}},
+        });
+        serde_json::json!({"add": {
+            "path": path, "size": 1024, "modificationTime": 1700000000000i64, "dataChange": true,
+            "partitionValues": {}, "stats": stats.to_string(),
+        }})
+        .to_string()
+    };
+    let commit = [
+        r#"{"commitInfo":{"timestamp":1700000000000,"operation":"WRITE"}}"#.to_string(),
+        add("a.parquet", 1),
+        add("b.parquet", 2),
+    ]
+    .join("\n");
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+    add_commit(table_url.as_str(), store.as_ref(), 1, commit).await?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+
+    // Each predicate contradicts both files' statistics for the `file` column.
+    for predicate in [
+        Pred::eq(column_expr!("c.uri"), Scalar::from("s3://b/other")),
+        Pred::gt(column_expr!("c.offset"), Scalar::from(100i64)),
+        Pred::lt(column_expr!("c.size"), Scalar::from(5i64)),
+        Pred::eq(column_expr!("c.content_type"), Scalar::from("text/plain")),
+        Pred::is_null(column_expr!("c.uri")),
+    ] {
+        let files = scan_file_count(&snapshot, engine.as_ref(), predicate.clone())?;
+        assert_eq!(files, 2, "{predicate:?}");
+    }
+    // The control: `id` statistics are used, so `id = 2` skips `a.parquet`.
+    let skipping = Pred::eq(column_expr!("id"), Scalar::from(2));
     assert_eq!(scan_file_count(&snapshot, engine.as_ref(), skipping)?, 1);
     Ok(())
 }
