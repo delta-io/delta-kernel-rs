@@ -359,18 +359,20 @@ impl RestObjectStore {
                 for meta in page.objects {
                     // Enforce the exclusive-offset contract client-side.
                     if let Some(off) = &exclusive_offset
-                        && meta.location <= *off {
-                            continue;
-                        }
+                        && meta.location <= *off
+                    {
+                        continue;
+                    }
                     if let Some(last) = &last_path
-                        && meta.location < *last {
-                            yield Err(generic_error(format!(
-                                "REST listing returned out-of-order entry `{}` after `{}`; \
-                                 RestEndpointConfig must return lexicographically sorted paths",
-                                meta.location, last
-                            )));
-                            break 'pages;
-                        }
+                        && meta.location < *last
+                    {
+                        yield Err(generic_error(format!(
+                            "REST listing returned out-of-order entry `{}` after `{}`; \
+                             RestEndpointConfig must return lexicographically sorted paths",
+                            meta.location, last
+                        )));
+                        break 'pages;
+                    }
                     last_path = Some(meta.location.clone());
                     yield Ok(meta);
                 }

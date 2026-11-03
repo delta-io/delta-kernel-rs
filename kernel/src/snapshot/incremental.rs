@@ -405,8 +405,9 @@ impl Snapshot {
             // at or above the new checkpoint still advances per `incremental_replay`.
             return Ok(NewSegment::Rebuild(new_log_segment));
         }
-        // Case D.2: checkpoint at or below existing snapshot; fall through to case F to
-        // replay only the new commits and advance the checkpoint base.
+        // Not Case D.1. Fall through: Case E if the version did not advance and there is no
+        // checkpoint; otherwise Case F (including D.2: checkpoint at or below the existing
+        // snapshot).
 
         // Case E: no new checkpoint, version did not advance; return existing.
         if new_end_version == existing_snapshot_version
