@@ -1,5 +1,7 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use std::fmt::Display;
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
@@ -976,15 +978,18 @@ impl LogSegment {
         engine: &dyn Engine,
         pointer: &LastManifestCommit,
     ) -> KernelResult<CheckpointAction> {
-        let commit = self
-            .find_pointed_commit(pointer)
-            .ok_or_else(|| pointer.inconsistency("this log segment does not list that commit"))?;
+        let commit = self.find_pointed_commit(pointer).ok_or_else(|| {
+            last_manifest_commit_inconsistency(
+                pointer,
+                "this log segment does not list that commit",
+            )
+        })?;
         let files = std::slice::from_ref(&commit.location);
         let batches =
             engine
                 .json_handler()
                 .read_json_files(files, LOG_CHECKPOINT_SCHEMA.clone(), None)?;
-        pointer.require_checkpoint_action(first_checkpoint_action(batches)?)
+        require_pointed_checkpoint_action(pointer, first_checkpoint_action(batches)?)
     }
 
     /// The listed commit at `pointer`'s version, or `None` when this segment does not list it.
@@ -1740,6 +1745,42 @@ fn first_checkpoint_action(
         }
     }
     Ok(None)
+}
+
+/// Returns `action`, read from the manifest commit `pointer` names, after checking that it exists
+/// and has the pointer's content root version.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn require_pointed_checkpoint_action(
+    pointer: &LastManifestCommit,
+    action: Option<CheckpointAction>,
+) -> KernelResult<CheckpointAction> {
+    let action = action.ok_or_else(|| {
+        last_manifest_commit_inconsistency(pointer, "that commit carries no checkpoint action")
+    })?;
+    require!(
+        action.content_root_version() == pointer.content_root_version,
+        last_manifest_commit_inconsistency(
+            pointer,
+            format!(
+                "that commit's checkpoint action has content root version {}",
+                action.content_root_version()
+            )
+        )
+    );
+    Ok(action)
+}
+
+/// The error for a `pointer` that the log contradicts, as explained by `detail`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn last_manifest_commit_inconsistency(
+    pointer: &LastManifestCommit,
+    detail: impl Display,
+) -> KernelError {
+    KernelError::invalid_log_segment(format!(
+        "lastManifestCommit names manifest commit version {} as the source of content root \
+         version {}, but {detail}",
+        pointer.version, pointer.content_root_version
+    ))
 }
 
 fn validate_compaction_files(compactions: &[ParsedLogPath]) -> KernelResult<()> {
