@@ -202,4 +202,22 @@ mod tests {
             );
         }
     }
+
+    /// Building the paths to `file` values fails for a map whose key contains a `file`, which a
+    /// table schema never has.
+    #[cfg(feature = "default-engine-base")]
+    #[rstest]
+    #[case::file_key(MapType::new(DataType::file_type(), DataType::STRING, true))]
+    #[case::array_of_files_key(MapType::new(
+        ArrayType::new(DataType::file_type(), true),
+        DataType::STRING,
+        true
+    ))]
+    fn file_paths_reject_file_in_map_key(#[case] map: MapType) {
+        let schema = StructType::new_unchecked([StructField::nullable("m", map)]);
+        assert_result_error_with_message(
+            super::FilePaths::from_schema(&schema),
+            "A map key type must not contain a `file`",
+        );
+    }
 }
