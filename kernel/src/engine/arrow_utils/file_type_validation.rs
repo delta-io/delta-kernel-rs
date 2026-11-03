@@ -432,7 +432,8 @@ mod tests {
     use super::*;
     use crate::arrow::array::{
         ArrayRef, BinaryArray, DictionaryArray, FixedSizeListArray, Int64Array, LargeListArray,
-        LargeListViewArray, ListArray, ListViewArray, MapArray, StringArray,
+        LargeListViewArray, LargeStringArray, ListArray, ListViewArray, MapArray, StringArray,
+        StringViewArray,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{Field, Fields, Int32Type};
@@ -910,6 +911,37 @@ mod tests {
             None => result.unwrap(),
             Some(problem) => assert_invalid(result, "f", problem),
         }
+    }
+
+    /// A `checksum` in any Arrow string encoding is checked.
+    #[rstest]
+    #[case::large_utf8(Arc::new(LargeStringArray::from(vec![Some("MD5:xyz")])) as ArrayRef)]
+    #[case::utf8_view(Arc::new(StringViewArray::from(vec![Some("MD5:xyz")])) as ArrayRef)]
+    fn write_checks_checksum_in_any_string_encoding(#[case] checksums: ArrayRef) {
+        let (data, schema) = top_level(with_checksums(file_array(&[VALID]), checksums));
+        assert_invalid(
+            validate_file_values_for_write(&data, &schema),
+            "f",
+            "`checksum` digest is not the lowercase hex its algorithm requires",
+        );
+    }
+
+    /// A column whose Arrow type does not match the array or map the schema has for it fails.
+    #[rstest]
+    #[case::array(ArrayType::new(DataType::file_type(), true).into(), "Expected a list")]
+    #[case::map(
+        MapType::new(DataType::STRING, DataType::file_type(), true).into(),
+        "isn't a MapArray"
+    )]
+    fn mismatched_container_fails(#[case] data_type: DataType, #[case] message: &str) {
+        let column = Arc::new(StringArray::from(vec!["x"])) as ArrayRef;
+        let data = StructArray::from(vec![(
+            Arc::new(Field::new("a", ArrowDataType::Utf8, true)),
+            column,
+        )]);
+        let schema = StructType::new_unchecked([StructField::nullable("a", data_type)]);
+        let error = validate_file_values_for_read(&data, &schema).unwrap_err();
+        assert!(error.to_string().contains(message), "got: {error}");
     }
 
     /// A dictionary-encoded `checksum` is checked like a plain string one.

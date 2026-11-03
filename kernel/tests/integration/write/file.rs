@@ -14,15 +14,18 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::{FileGroup, file_groups};
+use delta_kernel::expressions::{Predicate as Pred, Scalar, column_expr};
+use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
 };
-use delta_kernel::snapshot::SnapshotRef;
+use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::{
-    create_table_and_load_snapshot, read_add_infos, read_scan, test_table_setup,
+    add_commit, create_table_and_load_snapshot, read_add_infos, read_scan, test_table_setup,
     test_table_setup_mt, write_batch_to_table,
 };
 use url::Url;
@@ -436,5 +439,118 @@ async fn test_write_file_column_with_stats_column_settings(
     for kind in ["minValues", "maxValues", "nullCount"] {
         assert_eq!(stats_columns(&stats, kind), expected, "{kind}: {stats}");
     }
+    Ok(())
+}
+
+/// Returns the number of data files a scan of `snapshot` with `predicate` keeps, after data
+/// skipping.
+fn scan_file_count(
+    snapshot: &SnapshotRef,
+    engine: &DefaultEngine<TokioMultiThreadExecutor>,
+    predicate: Pred,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+    let mut count = 0usize;
+    for scan_metadata in scan.scan_metadata(engine)? {
+        count = scan_metadata?.visit_scan_files(count, |count, _| *count += 1)?;
+    }
+    Ok(count)
+}
+
+/// A `file` column has no statistics, so a predicate on its sub-fields never skips a data file,
+/// while one on another column still does.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_predicate_on_file_column_skips_no_files() -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, _table_path, engine, snapshot) =
+        write_table("none", DataType::file_type(), Arc::new(file_values())).await?;
+    let mut snapshot = snapshot?;
+    // A second data file, so a predicate could skip one of the two.
+    let (data_type, column) = file_column("top_level", file_values(), None);
+    let schema = StructType::try_new([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("c", data_type),
+    ])?;
+    let schema: ArrowSchema = (&schema).try_into_arrow()?;
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(Int32Array::from(vec![10, 11, 12])), column],
+    )?;
+    snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+
+    // Neither data file has values like these, but neither has statistics to show it. (Predicates
+    // resolve only leaf columns, so a predicate on the whole `file` column, like one on a whole
+    // struct, is rejected when the scan is built.)
+    for predicate in [
+        Pred::eq(
+            column_expr!("c.uri"),
+            Scalar::from("s3://bucket/missing.png"),
+        ),
+        Pred::gt(column_expr!("c.size"), Scalar::from(1_000_000i64)),
+    ] {
+        let files = scan_file_count(&snapshot, engine.as_ref(), predicate.clone())?;
+        assert_eq!(files, 2, "{predicate:?}");
+    }
+    // The control: `id` has statistics, so `id >= 10` skips the first data file.
+    let skipping = Pred::ge(column_expr!("id"), Scalar::from(10));
+    assert_eq!(scan_file_count(&snapshot, engine.as_ref(), skipping)?, 1);
+    Ok(())
+}
+
+/// Kernel ignores statistics for `file` sub-fields, which the protocol allows and other engines
+/// may write, so a predicate on a sub-field skips no data file even when those statistics rule
+/// it out, while one on another column still does.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_predicate_on_file_column_ignores_file_stats() -> Result<(), Box<dyn std::error::Error>>
+{
+    let schema = Arc::new(StructType::try_new([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("c", DataType::file_type()),
+    ])?);
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &[])?;
+    // Two data files whose statistics cover `uri`, `offset`, `size` and `content_type` as the
+    // protocol defines them, keyed by the `file` column and the sub-field name.
+    let add = |path: &str, id: i32| {
+        let stats = serde_json::json!({
+            "numRecords": 1,
+            "minValues": {"id": id, "c": {"uri": "s3://b/a", "offset": 0, "size": 10, "content_type": "image/png"}},
+            "maxValues": {"id": id, "c": {"uri": "s3://b/a", "offset": 0, "size": 10, "content_type": "image/png"}},
+            "nullCount": {"id": 0, "c": {"uri": 0, "offset": 0, "size": 0, "content_type": 0, "checksum": 1, "inline": 1}},
+        });
+        serde_json::json!({"add": {
+            "path": path, "size": 1024, "modificationTime": 1700000000000i64, "dataChange": true,
+            "partitionValues": {}, "stats": stats.to_string(),
+        }})
+        .to_string()
+    };
+    let commit = [
+        r#"{"commitInfo":{"timestamp":1700000000000,"operation":"WRITE"}}"#.to_string(),
+        add("a.parquet", 1),
+        add("b.parquet", 2),
+    ]
+    .join("\n");
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+    add_commit(table_url.as_str(), store.as_ref(), 1, commit).await?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+
+    // Each predicate contradicts both files' statistics for the `file` column.
+    for predicate in [
+        Pred::eq(column_expr!("c.uri"), Scalar::from("s3://b/other")),
+        Pred::gt(column_expr!("c.offset"), Scalar::from(100i64)),
+        Pred::lt(column_expr!("c.size"), Scalar::from(5i64)),
+        Pred::eq(column_expr!("c.content_type"), Scalar::from("text/plain")),
+        Pred::is_null(column_expr!("c.uri")),
+    ] {
+        let files = scan_file_count(&snapshot, engine.as_ref(), predicate.clone())?;
+        assert_eq!(files, 2, "{predicate:?}");
+    }
+    // The control: `id` statistics are used, so `id = 2` skips `a.parquet`.
+    let skipping = Pred::eq(column_expr!("id"), Scalar::from(2));
+    assert_eq!(scan_file_count(&snapshot, engine.as_ref(), skipping)?, 1);
     Ok(())
 }
