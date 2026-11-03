@@ -8,6 +8,7 @@ use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
+use IntervalDayToSecondType::*;
 use delta_kernel_derive::internal_api;
 use derive_more::From;
 use indexmap::IndexMap;
@@ -2192,7 +2193,6 @@ pub enum IntervalDayToSecondType {
 
 impl IntervalDayToSecondType {
     pub(crate) fn unit_micros(&self) -> i64 {
-        use IntervalDayToSecondType::*;
         match self {
             IntervalDay => 86_400_000_000,
             IntervalHour | IntervalDayToHour => 3_600_000_000,
