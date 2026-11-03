@@ -101,10 +101,10 @@ fn load_specs_from_table(
     })?;
 
     // Skip this table if BENCH_TAGS is set and none of its tags match
-    if let Some(tags) = required_tags {
-        if !table_info.matches_tags(tags) {
-            return Ok(vec![]);
-        }
+    if let Some(tags) = required_tags
+        && !table_info.matches_tags(tags)
+    {
+        return Ok(vec![]);
     }
 
     // Remote tables (table_path or catalog_info present) don't need local data.
@@ -187,25 +187,25 @@ mod tests {
     fn test_get_required_tags() {
         // These cases must run sequentially b/c env vars conflict when these tests are separate (as
         // they run in parallel)
-        std::env::remove_var(BENCH_TAGS_ENV_VAR);
+        unsafe { std::env::remove_var(BENCH_TAGS_ENV_VAR) };
         assert!(get_required_tags().is_none());
 
-        std::env::set_var(BENCH_TAGS_ENV_VAR, "");
+        unsafe { std::env::set_var(BENCH_TAGS_ENV_VAR, "") };
         assert!(get_required_tags().is_none());
 
-        std::env::set_var(BENCH_TAGS_ENV_VAR, "ci");
+        unsafe { std::env::set_var(BENCH_TAGS_ENV_VAR, "ci") };
         assert_eq!(get_required_tags().unwrap(), vec!["ci"]);
 
-        std::env::set_var(BENCH_TAGS_ENV_VAR, "ci,checkpoints,v2");
+        unsafe { std::env::set_var(BENCH_TAGS_ENV_VAR, "ci,checkpoints,v2") };
         assert_eq!(
             get_required_tags().unwrap(),
             vec!["ci", "checkpoints", "v2"]
         );
 
-        std::env::set_var(BENCH_TAGS_ENV_VAR, " ci , checkpoints ");
+        unsafe { std::env::set_var(BENCH_TAGS_ENV_VAR, " ci , checkpoints ") };
         assert_eq!(get_required_tags().unwrap(), vec!["ci", "checkpoints"]);
 
-        std::env::remove_var(BENCH_TAGS_ENV_VAR);
+        unsafe { std::env::remove_var(BENCH_TAGS_ENV_VAR) };
     }
 
     #[test]

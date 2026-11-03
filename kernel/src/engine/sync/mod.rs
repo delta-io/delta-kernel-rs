@@ -228,14 +228,12 @@ pub(super) fn put_bytes(
     data: Bytes,
     overwrite: bool,
 ) -> KernelResult<()> {
-    if location.scheme() == "file" {
-        if let Ok(file_path) = location.to_file_path() {
-            if let Some(parent) = file_path.parent() {
-                if !parent.exists() {
-                    std::fs::create_dir_all(parent)?;
-                }
-            }
-        }
+    if location.scheme() == "file"
+        && let Ok(file_path) = location.to_file_path()
+        && let Some(parent) = file_path.parent()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     let (store, _, object_path) = resolve_scope(default_store, location)?;
     let opts = if overwrite {

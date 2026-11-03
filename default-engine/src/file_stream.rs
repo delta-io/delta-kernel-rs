@@ -165,12 +165,11 @@ impl FileStream {
                 },
                 FileStreamState::Scan { reader, next } => {
                     // We need to poll the next `FileOpenFuture` here to drive it forward
-                    if let Some(next_open_future) = next {
-                        if let NextOpen::Pending(f) = next_open_future {
-                            if let Poll::Ready(reader) = f.as_mut().poll(cx) {
-                                *next_open_future = NextOpen::Ready(reader);
-                            }
-                        }
+                    if let Some(next_open_future) = next
+                        && let NextOpen::Pending(f) = next_open_future
+                        && let Poll::Ready(reader) = f.as_mut().poll(cx)
+                    {
+                        *next_open_future = NextOpen::Ready(reader);
                     }
                     match ready!(reader.poll_next_unpin(cx)) {
                         Some(Ok(batch)) => {

@@ -128,8 +128,7 @@ mod tests {
         let reporter = Arc::new(CapturingFrameReporter::default());
         let subscriber = Registry::default().with(FrameReporterLayer::new(reporter.clone()));
         with_default(subscriber, f);
-        let events = reporter.events.lock().unwrap().clone();
-        events
+        reporter.events.lock().unwrap().clone()
     }
 
     fn entered_callstacks(events: &[FrameEvent]) -> Vec<Vec<&'static str>> {

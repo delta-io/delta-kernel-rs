@@ -444,17 +444,16 @@ impl TryFromArrow<&ArrowField> for StructField {
         if let (Some(arrow_id), Some(kernel_id)) = (
             arrow_metadata.get(PARQUET_FIELD_ID_META_KEY),
             arrow_metadata.get(ColumnMetadataKey::ParquetFieldId.as_ref()),
-        ) {
-            if arrow_id != kernel_id {
-                return Err(ArrowError::SchemaError(format!(
-                    "Field '{}': conflicting parquet field IDs: '{}' ({}) vs '{}' ({})",
-                    arrow_field.name(),
-                    arrow_id,
-                    PARQUET_FIELD_ID_META_KEY,
-                    kernel_id,
-                    ColumnMetadataKey::ParquetFieldId.as_ref(),
-                )));
-            }
+        ) && arrow_id != kernel_id
+        {
+            return Err(ArrowError::SchemaError(format!(
+                "Field '{}': conflicting parquet field IDs: '{}' ({}) vs '{}' ({})",
+                arrow_field.name(),
+                arrow_id,
+                PARQUET_FIELD_ID_META_KEY,
+                kernel_id,
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+            )));
         }
         let mut kernel_metadata: HashMap<String, MetadataValue> = arrow_metadata
             .iter()

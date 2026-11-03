@@ -914,12 +914,12 @@ impl StructType {
             }
 
             // Check for duplicate metadata columns
-            if let Some(metadata_column_spec) = field.get_metadata_column_spec() {
-                if metadata_columns.insert(metadata_column_spec, i).is_some() {
-                    return Err(KernelError::schema(format!(
-                        "Duplicate metadata column: {metadata_column_spec:?}",
-                    )));
-                }
+            if let Some(metadata_column_spec) = field.get_metadata_column_spec()
+                && metadata_columns.insert(metadata_column_spec, i).is_some()
+            {
+                return Err(KernelError::schema(format!(
+                    "Duplicate metadata column: {metadata_column_spec:?}",
+                )));
             }
 
             // Delta column names are case-insensitive; reject schemas with duplicates that differ
@@ -2434,25 +2434,25 @@ impl<'de> serde::Deserialize<'de> for DataType {
         }
 
         // Object values are complex types - dispatch based on "type" field
-        if let Value::Object(map) = &value {
-            if let Some(Value::String(type_str)) = map.get("type") {
-                return match type_str.as_str() {
-                    "array" => ArrayType::deserialize(value)
-                        .map(DataType::from)
-                        .map_err(|e| Error::custom(e.to_string())),
-                    "struct" => StructType::deserialize(value)
-                        .map(DataType::from)
-                        .map_err(|e| Error::custom(e.to_string())),
-                    "map" => MapType::deserialize(value)
-                        .map(DataType::from)
-                        .map_err(|e| Error::custom(e.to_string())),
-                    #[cfg(feature = "udt-in-dev")]
-                    "udt" => UserDefinedType::deserialize(value)
-                        .map(DataType::UserDefined)
-                        .map_err(Error::custom),
-                    _ => Err(unsupported_delta_type_error(type_str)),
-                };
-            }
+        if let Value::Object(map) = &value
+            && let Some(Value::String(type_str)) = map.get("type")
+        {
+            return match type_str.as_str() {
+                "array" => ArrayType::deserialize(value)
+                    .map(DataType::from)
+                    .map_err(|e| Error::custom(e.to_string())),
+                "struct" => StructType::deserialize(value)
+                    .map(DataType::from)
+                    .map_err(|e| Error::custom(e.to_string())),
+                "map" => MapType::deserialize(value)
+                    .map(DataType::from)
+                    .map_err(|e| Error::custom(e.to_string())),
+                #[cfg(feature = "udt-in-dev")]
+                "udt" => UserDefinedType::deserialize(value)
+                    .map(DataType::UserDefined)
+                    .map_err(Error::custom),
+                _ => Err(unsupported_delta_type_error(type_str)),
+            };
         }
 
         // Fallback error with the actual value that failed

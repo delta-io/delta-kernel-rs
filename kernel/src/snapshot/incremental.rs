@@ -395,18 +395,18 @@ impl Snapshot {
                  older than the existing snapshot version {existing_snapshot_version}"
             )));
         }
-        if let Some(new_checkpoint_version) = new_log_segment.checkpoint_version {
-            if new_checkpoint_version > existing_snapshot_version {
-                // Case D.1: checkpoint ahead of existing snapshot. Commits between
-                // existing_snapshot_version+1 and new_checkpoint_version were filtered out
-                // of the listing, so a full rebuild is required. The existing snapshot's CRC
-                // is older than the new checkpoint and cannot apply, but a fresh on-disk CRC
-                // at or above the new checkpoint still advances per `incremental_replay`.
-                return Ok(NewSegment::Rebuild(new_log_segment));
-            }
-            // Case D.2: checkpoint at or below existing snapshot; fall through to case F to
-            // replay only the new commits and advance the checkpoint base.
+        if let Some(new_checkpoint_version) = new_log_segment.checkpoint_version
+            && new_checkpoint_version > existing_snapshot_version
+        {
+            // Case D.1: checkpoint ahead of existing snapshot. Commits between
+            // existing_snapshot_version+1 and new_checkpoint_version were filtered out
+            // of the listing, so a full rebuild is required. The existing snapshot's CRC
+            // is older than the new checkpoint and cannot apply, but a fresh on-disk CRC
+            // at or above the new checkpoint still advances per `incremental_replay`.
+            return Ok(NewSegment::Rebuild(new_log_segment));
         }
+        // Case D.2: checkpoint at or below existing snapshot; fall through to case F to
+        // replay only the new commits and advance the checkpoint base.
 
         // Case E: no new checkpoint, version did not advance; return existing.
         if new_end_version == existing_snapshot_version
