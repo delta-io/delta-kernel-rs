@@ -474,9 +474,9 @@ pub struct ExclusiveRustString;
 ///
 /// # Safety
 ///
-/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
-/// and callbacks must remain valid for every use and support concurrent calls if shared across
-/// threads.
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements until
+/// this call returns.
 ///
 /// Caller is responsible for passing a valid KernelStringSlice
 #[unsafe(no_mangle)]
@@ -751,9 +751,11 @@ pub unsafe extern "C" fn free_engine_data(engine_data: Handle<ExclusiveEngineDat
     unsafe { engine_data.drop_handle() }
 }
 
-// A wrapper for Engine which defines additional FFI-specific methods.
+/// An engine and the connector callbacks used to return its FFI errors.
 pub trait ExternEngine: Send + Sync {
+    /// Returns a shared reference to the engine used for Kernel operations.
     fn engine(&self) -> Arc<dyn Engine>;
+    /// Returns the registered allocator for errors from operations using this engine.
     fn error_allocator(&self) -> &dyn AllocateError;
 }
 
@@ -861,9 +863,10 @@ pub struct ExclusiveEngineBuilder;
 ///
 /// # Safety
 ///
-/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
-/// and callbacks must remain valid for every use and support concurrent calls if shared across
-/// threads. Caller is responsible for passing a valid path pointer.
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. The table is copied; its callbacks and context must satisfy [`ErrorAllocators`]'s
+/// requirements for the lifetime of the returned builder and any engine built from it.
+/// Caller is responsible for passing a valid path pointer.
 #[cfg(feature = "default-engine-base")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_engine_builder(
@@ -1077,13 +1080,15 @@ pub unsafe extern "C" fn builder_build(
     unsafe { result.into_extern_result(&builder_box.error_allocators) }
 }
 
+/// Creates a default engine for `path` and retains a copy of its error allocation callbacks.
+///
+/// Returns an engine handle, or an allocated error if the path or engine configuration is invalid.
+///
 /// # Safety
 ///
-/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
-/// and callbacks must remain valid for every use and support concurrent calls if shared across
-/// threads.
-///
-/// Caller is responsible for passing a valid path pointer.
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements for
+/// the lifetime of the returned engine. `path` must reference readable memory for its length.
 #[cfg(feature = "default-engine-base")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_default_engine(

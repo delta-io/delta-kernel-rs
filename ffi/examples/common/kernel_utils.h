@@ -3,14 +3,17 @@
 #include <stdbool.h>
 #include <delta_kernel_ffi.h>
 
-// Error objects belong to the connector; Kernel only returns their pointers.
+// Owned copies of one Delta error parameter's name and value.
 typedef struct ErrorParameter {
   char* key;
   char* value;
 } ErrorParameter;
 
+// Both callbacks allocate this connector-owned object and copy the borrowed diagnostics into it.
+// Kernel returns its pointer through ExternResult; the caller releases it with free_error.
 typedef struct Error {
   bool is_delta;
+  // Used only for Kernel errors; Delta errors use condition, sql_state, and parameters.
   FFIKernelError code;
   char* condition;
   char* sql_state;
@@ -19,12 +22,13 @@ typedef struct Error {
   char* msg;
 } Error;
 
+// Callbacks shared by the examples; neither callback needs connector context.
 extern const ErrorAllocators error_allocators;
 
 void print_diag(char* fmt, ...);
-// Print out an error message, plus the code and kernel message of an error
+// Print Kernel or Delta diagnostics, or report allocation failure when err is NULL.
 void print_error(const char* msg, Error* err);
-// free an error
+// Free the error and its copied diagnostics. Accepts NULL.
 void free_error(Error* error);
 // create a char* from a KernelStringSlice
 void* allocate_string(const KernelStringSlice slice);

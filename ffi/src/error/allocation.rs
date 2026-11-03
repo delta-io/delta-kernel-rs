@@ -1,8 +1,9 @@
 //! Callbacks for converting Kernel and Delta errors into connector-owned error objects.
 //!
 //! The connector supplies an allocation callback for each error kind and a context pointer.
-//! Engine constructors copy the callback table into the engine. Standalone calls borrow a table
-//! for the duration of the call. The connector keeps callback code and context alive for every use.
+//! Builders and engines retain a copy of the callback table; standalone calls use it only during
+//! the call. Copying the table copies its pointers, not the connector state they reference. The
+//! connector keeps that state and the callback code alive for every use.
 
 use std::ffi::c_void;
 
@@ -37,7 +38,7 @@ pub struct DeltaErrorInfo {
     pub message: KernelStringSlice,
 }
 
-/// Connector context and required callbacks for structured Kernel/Delta Error allocation.
+/// Connector-supplied callbacks that turn Kernel and Delta errors into connector-owned objects.
 ///
 /// Kernel never reads or frees the error objects returned by these callbacks. The connector is
 /// responsible for freeing them. Callbacks must not unwind across the FFI boundary. Their code
@@ -46,7 +47,7 @@ pub struct DeltaErrorInfo {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ErrorAllocators {
-    /// Connector state passed unchanged as the first argument to each callback. May be NULL.
+    /// Connector state passed unchanged to both callbacks; NULL is allowed if unused.
     pub context: *mut c_void,
     /// Creates a connector error object from the Kernel error information in the second argument.
     ///

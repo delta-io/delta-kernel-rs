@@ -180,14 +180,18 @@ impl From<&KernelError> for FFIKernelError {
 /// An FFI result containing a value or a connector-owned error pointer.
 ///
 /// Kernel returns the pointer produced by the connector's allocation callback unchanged, including
-/// NULL when allocation fails. The connector is responsible for freeing non-null error objects.
+/// NULL when allocation fails. `Err(NULL)` is still a failure. The connector interprets and frees
+/// non-null error objects; Kernel does not inspect their contents.
 #[repr(C)]
 pub enum ExternResult<T> {
+    /// The operation succeeded with this value.
     Ok(T),
+    /// The operation failed; the pointer comes from the connector's allocation callback.
     Err(*mut c_void),
 }
 
 impl<T> ExternResult<T> {
+    /// Returns `true` for `Ok` and `false` for `Err`, including `Err(NULL)`.
     pub fn is_ok(&self) -> bool {
         match self {
             Self::Ok(_) => true,
@@ -239,12 +243,15 @@ impl<T: ExternEngine + ?Sized> AllocateError for &T {
     }
 }
 
-/// Converts a Kernel or top-level result into an FFI result using the connector's allocator.
+/// Converts [`KernelResult`] or [`delta_kernel::Result`] to an FFI result.
 ///
-/// # Safety
-///
-/// The allocator's callbacks and context must satisfy [`ErrorAllocators`]'s requirements.
+/// Only errors invoke the allocator.
 pub(crate) trait IntoExternResult<T> {
+    /// Preserves a successful value or calls `alloc` to create the returned error pointer.
+    ///
+    /// # Safety
+    ///
+    /// `alloc` must satisfy [`ErrorAllocators`]'s callback and context requirements.
     unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T>;
 }
 
@@ -266,14 +273,11 @@ impl<T> IntoExternResult<T> for delta_kernel::Result<T> {
     }
 }
 
-/// An error that can be returned from engine-side execution (e.g during an upcall).
+/// An error the engine returns to Kernel when an execution callback fails.
 ///
-/// This is intended to be a kernel-allocated error which Engines can return TO kernel. It is the
-/// inverse of the connector-owned error pointer returned FROM kernel in [`ExternResult`].
-///
-/// The message is an [`ExclusiveRustString`] handle, which means the engine must
-/// downcall to [`allocate_kernel_string`](crate::allocate_kernel_string) to construct it. Kernel
-/// can then take ownership and free it appropriately after receiving the error.
+/// The engine creates `message` with [`allocate_kernel_string`](crate::allocate_kernel_string)
+/// and transfers ownership of that handle to Kernel with the error. Kernel consumes and frees
+/// the message. Errors returned to the connector through [`ExternResult`] are connector-owned.
 #[repr(C)]
 pub struct EngineExecError {
     // TODO: we re-use FFIKernelError for convenience, but we should ideally split this into a

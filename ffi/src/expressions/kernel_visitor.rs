@@ -229,11 +229,11 @@ pub extern "C" fn visit_expression_unknown(
 ///
 /// # Safety
 ///
-/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
-/// and callbacks must remain valid for every use and support concurrent calls if shared across
-/// threads. If `parts_len > 0`, `parts` must point to `parts_len` valid [`KernelStringSlice`]
-/// values. Every slice must remain valid for this call. The field parts are copied before
-/// returning.
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
+/// If `parts_len > 0`, `parts` must point to `parts_len` valid [`KernelStringSlice`] values.
+/// Every slice must remain valid for this call. The field parts are copied before returning.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_expression_column(
     state: &mut KernelExpressionVisitorState,
@@ -292,9 +292,10 @@ pub extern "C" fn visit_predicate_is_null(
 
 /// # Safety
 ///
-/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
-/// and callbacks must remain valid for every use and support concurrent calls if shared across
-/// threads. The string slice must be valid
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
+/// The string slice must be valid
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_expression_literal_string(
     state: &mut KernelExpressionVisitorState,
@@ -731,9 +732,9 @@ pub unsafe extern "C" fn visit_expression_map_to_struct(
 ///
 /// # Safety
 ///
-/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
-/// and callbacks must remain valid for every use and support concurrent calls if shared across
-/// threads.
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
 ///
 /// Caller must ensure that `engine_expression` points to a valid
 /// `EngineExpression` with a valid visitor function and expression pointer.
@@ -767,9 +768,9 @@ fn visit_engine_expression_impl(
 ///
 /// # Safety
 ///
-/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
-/// and callbacks must remain valid for every use and support concurrent calls if shared across
-/// threads.
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
 ///
 /// Caller must ensure that `engine_predicate` points to a valid
 /// `EnginePredicate` with a valid visitor function and predicate pointer.
@@ -827,9 +828,10 @@ fn resolve_opaque_children<I: IntoIterator<Item = usize>>(
 ///
 /// # Safety
 ///
-/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
-/// and callbacks must remain valid for every use and support concurrent calls if shared across
-/// threads. `name` must be valid UTF-8 for the duration of the call.
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
+/// `name` must be valid UTF-8 for the duration of the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_predicate_opaque(
     state: &mut KernelExpressionVisitorState,
@@ -872,9 +874,10 @@ fn visit_predicate_opaque_impl(
 ///
 /// # Safety
 ///
-/// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
-/// and callbacks must remain valid for every use and support concurrent calls if shared across
-/// threads. `name` must be valid UTF-8 for the duration of the call; the function
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
+/// `name` must be valid UTF-8 for the duration of the call; the function
 /// pointers in `callbacks` must remain valid for the lifetime of the built
 /// predicate.
 #[cfg(feature = "default-engine-base")]

@@ -150,9 +150,9 @@ pub struct CAuthHeaders {
 /// `context` is the opaque pointer registered via
 /// [`builder_with_rest_object_store`](crate::builder_with_rest_object_store). `error_allocators` is
 /// forwarded on each invocation so the callback can pass it to
-/// [`allocate_kernel_string`](crate::allocate_kernel_string) without the engine having to stash it
-/// separately. The table pointer is valid only until this callback returns; copy the table if it
-/// must be retained.
+/// [`allocate_kernel_string`](crate::allocate_kernel_string). The table pointer is valid only
+/// until this callback returns. Copying the table does not extend the lifetime of its context
+/// or callback code.
 pub type CAuthHeaderCallback = extern "C" fn(
     context: NullableCvoid,
     out: *mut CAuthHeaders,
