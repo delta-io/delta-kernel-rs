@@ -869,28 +869,23 @@ fn test_create_table_with_checkpoint_stats_properties(
 }
 
 #[rstest]
-#[case::zstd("zstd", Some(ParquetCompressionCodec::Zstd))]
-#[case::uncompressed("uncompressed", Some(ParquetCompressionCodec::Uncompressed))]
-#[case::none_alias("none", Some(ParquetCompressionCodec::Uncompressed))]
-#[case::snappy("snappy", Some(ParquetCompressionCodec::Snappy))]
-#[case::gzip("gzip", Some(ParquetCompressionCodec::Gzip))]
-#[case::lz4("lz4", Some(ParquetCompressionCodec::Lz4))]
-#[case::lz4_raw("lz4_raw", Some(ParquetCompressionCodec::Lz4Raw))]
-#[case::mixed_case("zStD", Some(ParquetCompressionCodec::Zstd))]
-#[case::brotli("brotli", None)]
-#[case::lzo("lzo", None)]
+#[case::zstd("zstd", ParquetCompressionCodec::Zstd)]
+#[case::uncompressed("uncompressed", ParquetCompressionCodec::Uncompressed)]
+#[case::none_alias("none", ParquetCompressionCodec::Uncompressed)]
+#[case::snappy("snappy", ParquetCompressionCodec::Snappy)]
+#[case::gzip("gzip", ParquetCompressionCodec::Gzip)]
+#[case::lz4("lz4", ParquetCompressionCodec::Lz4)]
+#[case::lz4_raw("lz4_raw", ParquetCompressionCodec::Lz4Raw)]
+#[case::mixed_case("zStD", ParquetCompressionCodec::Zstd)]
+#[case::uppercase("ZSTD", ParquetCompressionCodec::Zstd)]
+#[case::uppercase_none_alias("NONE", ParquetCompressionCodec::Uncompressed)]
 fn create_table_compression_codec_round_trips(
     #[case] codec: &str,
-    #[case] expected: Option<ParquetCompressionCodec>,
-    #[values(false, true)] uppercase: bool,
+    #[case] expected: ParquetCompressionCodec,
 ) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let property = "delta.parquet.compression.codec";
-    let value = if uppercase {
-        codec.to_ascii_uppercase()
-    } else {
-        codec.to_string()
-    };
+    let value = codec.to_string();
 
     create_table(&table_path, simple_schema()?, "test", true)
         .with_table_properties([(property, value.as_str())])
@@ -908,25 +903,22 @@ fn create_table_compression_codec_round_trips(
         Some(&value)
     );
     let properties = snapshot.table_properties();
-    assert_eq!(properties.parquet_compression_codec, expected);
-    assert_eq!(
-        properties.compression_codec_or_default(),
-        expected.unwrap_or(ParquetCompressionCodec::Zstd)
-    );
-    assert_eq!(
-        properties.unknown_properties.get(property),
-        expected.is_none().then_some(&value)
-    );
+    assert_eq!(properties.parquet_compression_codec, Some(expected));
+    assert_eq!(properties.compression_codec_or_default(), expected);
+    assert!(!properties.unknown_properties.contains_key(property));
 
     Ok(())
 }
 
 #[rstest]
 fn create_table_rejects_invalid_compression_codec(
-    #[values("foobar", "FOOBAR", "", " zstd", "zstd ")] codec: &str,
-) -> Result<()> {
+    #[values(
+        "brotli", "BROTLI", "lzo", "LZO", "foobar", "FOOBAR", "", " zstd", "zstd "
+    )]
+    codec: &str,
+) -> KernelResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let result = create_table(&table_path, simple_schema()?, "test")
+    let result = create_table(&table_path, simple_schema()?, "test", true)
         .with_table_properties([("delta.parquet.compression.codec", codec)])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
 
