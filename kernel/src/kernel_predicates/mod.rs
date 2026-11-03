@@ -80,7 +80,6 @@ pub type IndirectDataSkippingPredicateEvaluator<'a> =
 /// stats-based skipping is well-defined. If an arbitrary data skipping predicate evaluates to
 /// NULL, there is no way to tell whether the original predicate really evaluated to NULL (safe to
 /// use), or the data skipping version evaluated to NULL due to missing stats (very unsafe to use).
-/// CASE WHEN inputs are first resolved to their selected result before applying this restriction.
 ///
 /// NOTE: The error-handling semantics of this trait's scalar-based predicate evaluation may differ
 /// from those of the engine's predicate evaluation, because kernel predicates don't include the
@@ -230,9 +229,11 @@ pub trait KernelPredicateEvaluator {
     ) -> Option<Self::Output> {
         match op {
             UnaryPredicateOp::IsNull => match expr {
-                // Only literals and columns can be safely null-checked. Resolve CASE WHEN first.
-                // NULL from an arbitrary expression could mean missing stats or an unresolved
-                // non-partition column, rather than a known SQL NULL.
+                // WARNING: Only literals and columns can be safely null-checked. Attempting to
+                // null-check an expression such as `a < 10` could wrongly produce FALSE in case
+                // `a` is just plain missing (rather than known to be NULL). A missing value can
+                // arise e.g. if data skipping encounters a column with missing stats, or if
+                // partition pruning encounters a non-partition column.
                 Expr::Literal(val) => self.eval_pred_scalar_is_null(val, inverted),
                 Expr::Column(col) => self.eval_pred_is_null(col, inverted),
                 Expr::CaseWhen(case_when) => {
@@ -491,28 +492,8 @@ pub trait KernelPredicateEvaluator {
     /// WARNING: Not an idempotent transform. If data skipping eval produces a sql predicate,
     /// evaluating the result with sql semantics has undefined behavior.
     fn eval_pred_sql_where(&self, pred: &Pred, inverted: bool) -> Option<Self::Output> {
-        use Pred::*;
         match pred {
-            Junction(JunctionPredicate { op, preds }) => {
-                // Recursively invoke `eval_pred_sql_where` instead of the usual `eval_pred` for
-                // AND/OR.
-                let mut preds = preds
-                    .iter()
-                    .map(|pred| self.eval_pred_sql_where(pred, inverted));
-                self.finish_eval_pred_junction(*op, &mut preds, inverted)
-            }
-            Binary(BinaryPredicate { op, left, right }) if op.is_null_intolerant() => {
-                // Perform a nullsafe comparison instead of the usual `eval_pred_binary`
-                let mut preds = [
-                    self.eval_pred_unary(UnaryPredicateOp::IsNull, left, true),
-                    self.eval_pred_unary(UnaryPredicateOp::IsNull, right, true),
-                    self.eval_pred_binary(*op, left, right, inverted),
-                ]
-                .into_iter();
-                self.finish_eval_pred_junction(JunctionPredicateOp::And, &mut preds, false)
-            }
-            Not(pred) => self.eval_pred_sql_where(pred, !inverted),
-            BooleanExpression(Expr::Column(col)) => {
+            Pred::BooleanExpression(Expr::Column(col)) => {
                 // Perform a nullsafe comparison instead of the usual `eval_pred_column`
                 let mut preds = [
                     self.eval_pred_is_null(col, true),
@@ -521,27 +502,9 @@ pub trait KernelPredicateEvaluator {
                 .into_iter();
                 self.finish_eval_pred_junction(JunctionPredicateOp::And, &mut preds, false)
             }
-            BooleanExpression(Expr::Predicate(pred)) => self.eval_pred_sql_where(pred, inverted),
-            // Process all remaining predicates normally, because they are not proven safe. Indeed,
-            // predicates like DISTINCT and IS [NOT] NULL are known-unsafe under SQL semantics:
-            //
-            // ```
-            // x IS NULL    # when x really is NULL
-            // = AND(x IS NOT NULL, x IS NULL)
-            // = AND(FALSE, TRUE)
-            // = FALSE
-            //
-            // DISTINCT(x, 10)  # when x is NULL
-            // = AND(x IS NOT NULL, 10 IS NOT NULL, DISTINCT(x, 10))
-            // = AND(FALSE, TRUE, TRUE)
-            // = FALSE
-            //
-            // DISTINCT(x, NULL) # when x is not NULL
-            // = AND(x IS NOT NULL, NULL IS NOT NULL, DISTINCT(x, NULL))
-            // = AND(TRUE, FALSE, TRUE)
-            // = FALSE
-            // ```
-            _ => self.eval_pred(pred, inverted),
+            _ => eval_pred_sql_where(self, pred, inverted, |pred, inverted| {
+                self.eval_pred_sql_where(pred, inverted)
+            }),
         }
     }
 
@@ -686,13 +649,6 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
     // boolean inputs here without changing the unknown NULL sentinels used by pruning callers.
     fn eval_case_when_condition(&self, pred: &Pred, inverted: bool) -> Option<bool> {
         match pred {
-            Pred::Not(pred) => self.eval_case_when_condition(pred, !inverted),
-            Pred::Junction(JunctionPredicate { op, preds }) => {
-                let mut preds = preds
-                    .iter()
-                    .map(|pred| self.eval_case_when_condition(pred, inverted));
-                self.finish_eval_pred_junction(*op, &mut preds, inverted)
-            }
             Pred::BooleanExpression(expr) => {
                 let mut expr = expr;
                 while let Expr::CaseWhen(case_when) = expr {
@@ -707,7 +663,9 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                     },
                 }
             }
-            _ => self.eval_pred_sql_where(pred, inverted),
+            _ => eval_pred_sql_where(self, pred, inverted, |pred, inverted| {
+                self.eval_case_when_condition(pred, inverted)
+            }),
         }
     }
 
@@ -1160,5 +1118,53 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         inverted: bool,
     ) -> Option<Self::Output> {
         self.finish_eval_pred_junction(op, preds, inverted)
+    }
+}
+
+// Keep the caller's boolean-expression semantics when recursing through SQL WHERE predicates.
+fn eval_pred_sql_where<E: KernelPredicateEvaluator + ?Sized>(
+    evaluator: &E,
+    pred: &Pred,
+    inverted: bool,
+    recurse: impl Fn(&Pred, bool) -> Option<E::Output>,
+) -> Option<E::Output> {
+    use Pred::*;
+    match pred {
+        Junction(JunctionPredicate { op, preds }) => {
+            let mut preds = preds.iter().map(|pred| recurse(pred, inverted));
+            evaluator.finish_eval_pred_junction(*op, &mut preds, inverted)
+        }
+        Binary(BinaryPredicate { op, left, right }) if op.is_null_intolerant() => {
+            // Perform a nullsafe comparison instead of the usual `eval_pred_binary`
+            let mut preds = [
+                evaluator.eval_pred_unary(UnaryPredicateOp::IsNull, left, true),
+                evaluator.eval_pred_unary(UnaryPredicateOp::IsNull, right, true),
+                evaluator.eval_pred_binary(*op, left, right, inverted),
+            ]
+            .into_iter();
+            evaluator.finish_eval_pred_junction(JunctionPredicateOp::And, &mut preds, false)
+        }
+        Not(pred) => recurse(pred, !inverted),
+        BooleanExpression(Expr::Predicate(pred)) => recurse(pred, inverted),
+        // Process all remaining predicates normally, because they are not proven safe. Indeed,
+        // predicates like DISTINCT and IS [NOT] NULL are known-unsafe under SQL semantics:
+        //
+        // ```
+        // x IS NULL    # when x really is NULL
+        // = AND(x IS NOT NULL, x IS NULL)
+        // = AND(FALSE, TRUE)
+        // = FALSE
+        //
+        // DISTINCT(x, 10)  # when x is NULL
+        // = AND(x IS NOT NULL, 10 IS NOT NULL, DISTINCT(x, 10))
+        // = AND(FALSE, TRUE, TRUE)
+        // = FALSE
+        //
+        // DISTINCT(x, NULL) # when x is not NULL
+        // = AND(x IS NOT NULL, NULL IS NOT NULL, DISTINCT(x, NULL))
+        // = AND(TRUE, FALSE, TRUE)
+        // = FALSE
+        // ```
+        _ => evaluator.eval_pred(pred, inverted),
     }
 }

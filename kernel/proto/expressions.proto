@@ -237,9 +237,6 @@ message Predicate {
 // ============================================================================
 
 message Expression {
-  reserved 9;
-  reserved "if_expr";
-
   oneof kind {
     Scalar literal = 1;
     ColumnName column = 2;

@@ -285,9 +285,6 @@ pub struct EngineExpressionVisitor {
     /// Conditions (predicates) and results (expressions) are in separate lists identified by
     /// `condition_list_id` and `result_list_id`, with matching order and length.
     /// `else_list_id` identifies a list containing exactly one fallback expression.
-    ///
-    /// Engines MUST provide a non-null callback for this slot; kernel dispatches to it
-    /// whenever a CASE WHEN expression is encountered.
     pub visit_case_when: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,

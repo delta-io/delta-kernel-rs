@@ -412,10 +412,10 @@ pub fn evaluate_expression(
             };
             validate_array_type(output, result_type)
         }
+        (CaseWhen(case_when), result_type) => evaluate_case_when(case_when, batch, result_type),
         (Unknown(name), _) => Err(KernelError::unsupported(format!(
             "Unknown expression: {name:?}"
         ))),
-        (CaseWhen(case_when), result_type) => evaluate_case_when(case_when, batch, result_type),
     }
 }
 
@@ -525,17 +525,6 @@ fn evaluate_case_when(
     batch: &RecordBatch,
     result_type: Option<&DataType>,
 ) -> KernelResult<ArrayRef> {
-    let evaluate_result = |expr: &Expression, batch: &RecordBatch| {
-        let values = evaluate_expression(expr, batch, result_type)?;
-        if values.len() != batch.num_rows() && values.len() != 1 {
-            return Err(KernelError::internal_error(format!(
-                "CASE WHEN result has {} rows, expected {} or 1",
-                values.len(),
-                batch.num_rows(),
-            )));
-        }
-        Ok(values)
-    };
     let mut remaining_batch = batch.clone();
     let mut remaining_rows: Vec<_> = (0..batch.num_rows()).collect();
     // arrays holds each evaluated branch's results. For each original row, output_row_sources
@@ -543,6 +532,25 @@ fn evaluate_case_when(
     // interleave uses this mapping to restore the original row order.
     let mut arrays: Vec<ArrayRef> = Vec::new();
     let mut output_row_sources = vec![(0, 0); batch.num_rows()];
+    let mut append_result =
+        |expr: &Expression, input: &RecordBatch, output_rows: &mut dyn Iterator<Item = usize>| {
+            let values = evaluate_expression(expr, input, result_type)?;
+            if values.len() != input.num_rows() && values.len() != 1 {
+                return Err(KernelError::internal_error(format!(
+                    "CASE WHEN result has {} rows, expected {} or 1",
+                    values.len(),
+                    input.num_rows(),
+                )));
+            }
+            let array_index = arrays.len();
+            let is_scalar = values.len() == 1;
+            arrays.push(values);
+            // Scalar results, like literal-only IN, use source row 0 for every output row.
+            for (row, original_row) in output_rows.enumerate() {
+                output_row_sources[original_row] = (array_index, if is_scalar { 0 } else { row });
+            }
+            Ok(())
+        };
 
     for (condition, result) in &case_when.branches {
         if remaining_rows.is_empty() {
@@ -560,19 +568,11 @@ fn evaluate_case_when(
             BooleanArray::from_iter(condition.iter().map(|value| Some(value == Some(true))))
         };
         let selected_batch = filter_record_batch(&remaining_batch, &selected)?;
-        let array_index = arrays.len();
-        let values = evaluate_result(result, &selected_batch)?;
-        let is_scalar = values.len() == 1;
-        arrays.push(values);
-        // Scalar results, like literal-only IN, use source row 0 for every selected row.
-        let mut selected_row = 0;
-        for (row, &original_row) in remaining_rows.iter().enumerate() {
-            if selected.value(row) {
-                output_row_sources[original_row] =
-                    (array_index, if is_scalar { 0 } else { selected_row });
-                selected_row += 1;
-            }
-        }
+        let mut selected_rows = remaining_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, &original_row)| selected.value(row).then_some(original_row));
+        append_result(result, &selected_batch, &mut selected_rows)?;
 
         // Later conditions and results see only rows not selected by an earlier WHEN.
         // For example, remaining_rows = [2, 5, 8] and selected = [false, true, false]
@@ -587,14 +587,13 @@ fn evaluate_case_when(
         }
     }
 
-    if arrays.is_empty() || !remaining_rows.is_empty() {
-        let fallback = evaluate_result(&case_when.else_expr, &remaining_batch)?;
-        let is_scalar = fallback.len() == 1;
-        let array_index = arrays.len();
-        arrays.push(fallback);
-        for (row, &original_row) in remaining_rows.iter().enumerate() {
-            output_row_sources[original_row] = (array_index, if is_scalar { 0 } else { row });
-        }
+    // Empty batches still evaluate ELSE to establish the result type.
+    if batch.num_rows() == 0 || !remaining_rows.is_empty() {
+        append_result(
+            &case_when.else_expr,
+            &remaining_batch,
+            &mut remaining_rows.iter().copied(),
+        )?;
     }
 
     if arrays.len() == 1 && arrays[0].len() == batch.num_rows() {

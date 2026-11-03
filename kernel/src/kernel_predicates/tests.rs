@@ -1051,6 +1051,10 @@ fn test_sql_where() {
     let null_filter = DefaultKernelPredicateEvaluator::from(NullColumnResolver);
     let empty_filter = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
 
+    for sentinel in [Pred::NULL, Pred::not(Pred::NULL)] {
+        expect_eq!(empty_filter.eval_sql_where(&sentinel), None, "{sentinel}");
+    }
+
     // Basic sanity check
     expect_eq!(
         null_filter.eval_sql_where(&Pred::from_expr(VAL)),
@@ -1163,6 +1167,19 @@ fn test_sql_where() {
     Pred::from_expr(Expr::case_when(
         [(Pred::TRUE, Pred::NULL.into())], lit(true),
     )), Some(false), Some(false)
+)]
+#[case::nested_null_predicate(
+    Pred::from_expr(Expr::case_when(
+        [(Pred::TRUE, Pred::not(Pred::or(Pred::NULL, Pred::FALSE)).into())], lit(true),
+    )), Some(false), Some(false)
+)]
+#[case::cast_null_boolean(
+    Pred::from_expr(Expr::cast(null_lit(DataType::STRING), DataType::BOOLEAN)),
+    Some(false),
+    Some(false)
+)]
+#[case::cast_missing_boolean(
+    Pred::from_expr(Expr::cast(col!("missing"), DataType::BOOLEAN)), None, None
 )]
 fn test_eval_case_when_conditions(
     #[case] condition: Pred,
