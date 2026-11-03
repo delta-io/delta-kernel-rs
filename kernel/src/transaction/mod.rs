@@ -2858,6 +2858,11 @@ mod tests {
         CommitOperation::UpdateTable(UpdateTableOperation::Custom("WRITE".to_string())),
         "custom operation name 'WRITE' is reserved"
     )]
+    #[case::reserved_reorg_operation(
+        false,
+        CommitOperation::UpdateTable(UpdateTableOperation::Custom("REORG".to_string())),
+        "custom operation name 'REORG' is reserved"
+    )]
     fn operation_compatibility_rejects_invalid_internal_state(
         #[case] is_create_table: bool,
         #[case] operation: CommitOperation,

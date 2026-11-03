@@ -614,19 +614,24 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn custom_operation_rejects_reserved_known_name() -> KernelResult<()> {
+    #[rstest]
+    fn custom_operation_rejects_reserved_known_name(
+        #[values("ALTER TABLE", "REORG")] operation: &str,
+    ) -> KernelResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let error = snapshot
             .update_table(
-                UpdateTableOperation::Custom("ALTER TABLE".to_string()),
+                UpdateTableOperation::Custom(operation.to_string()),
                 "test-engine",
-                true,
+                false,
             )
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
 
-        assert!(error.to_string().contains("reserved"));
+        assert!(
+            matches!(&error, KernelError::InvalidTransactionState(message)
+            if message == &format!("custom operation name '{operation}' is reserved"))
+        );
         Ok(())
     }
 
@@ -708,6 +713,7 @@ mod tests {
             UpdateTableOperation::Update,
             UpdateTableOperation::Merge,
             UpdateTableOperation::Optimize,
+            UpdateTableOperation::Reorg,
             UpdateTableOperation::Custom("UNKNOWN".to_string())
         )]
         operation: UpdateTableOperation,

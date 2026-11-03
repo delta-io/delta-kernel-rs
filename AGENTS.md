@@ -157,6 +157,12 @@ transactions. `data_change` is never inferred from staged files, including for e
 `build()` rejects ALTER with `true` and blind append with `false`; `commit()` retains operation and
 staged-file checks. `UpdateTableOperation::AlterTable` records schema-changing DDL without
 introducing a separate transaction type.
+
+Incremental CRC replay trusts operation names in `INCREMENTAL_SAFE_OPS`
+(`kernel/src/crc/file_stats.rs`). Adding an operation requires both correct net Add/Remove file
+accounting and rejecting its exact name for `UpdateTableOperation::Custom`. Represent update-table
+operations with typed variants so name reservation is automatic, and mirror them in the FFI.
+
 Writers configure transaction intent before `build()`, then call
 `Transaction::write_state`, then bind partition values through the returned `WriteState` to get a
 `BoundWriteContext`. Distributed writers can encode and transport the state before binding it.
