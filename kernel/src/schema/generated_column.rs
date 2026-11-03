@@ -1,8 +1,8 @@
 //! Generated columns: top-level columns whose value is defined by a SQL expression stored in the
 //! column's `delta.generationExpression` metadata.
 
-use crate::schema::{ColumnMetadataKey, StructType};
 use crate::KernelResult;
+use crate::schema::{ColumnMetadataKey, StructType};
 
 /// A [generated column]: a top-level column whose value is defined by a SQL expression over the
 /// row's other columns.
@@ -54,7 +54,7 @@ pub(crate) fn collect_generated_columns(schema: &StructType) -> KernelResult<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{schema, DataType};
+    use crate::schema::{DataType, schema};
     use crate::unit_test_utils::{
         assert_result_error_with_message, field_with_generation_expression,
     };

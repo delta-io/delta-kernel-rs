@@ -253,8 +253,8 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_generated_colum
 }
 
 #[tokio::test]
-async fn expressions_without_feature_define_no_generated_columns_and_writes_need_no_ack(
-) -> KernelResult<()> {
+async fn expressions_without_feature_define_no_generated_columns_and_writes_need_no_ack()
+-> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = write_table(&table_path, &[], EVENT_YEAR).await?;
 
@@ -270,8 +270,8 @@ async fn expressions_without_feature_define_no_generated_columns_and_writes_need
 }
 
 #[tokio::test]
-async fn protocol_upgrade_turns_existing_expressions_into_generated_columns_that_require_ack(
-) -> KernelResult<()> {
+async fn protocol_upgrade_turns_existing_expressions_into_generated_columns_that_require_ack()
+-> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let table_url = write_table(&table_path, &[], EVENT_YEAR).await?;
     let before_upgrade = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
