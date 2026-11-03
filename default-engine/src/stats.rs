@@ -725,6 +725,19 @@ impl FileStatsAccumulator {
 }
 
 /// Combine two raw statistics rows, rejecting different shapes and preserving untruncated bounds.
+///
+/// Concatenate `left` and `right` into two rows, then reduce to one: sum record and null counts,
+/// take each column's minimum and maximum, and AND `tightBounds`.
+///
+/// For a column `n`, batches `[5, null, 1]` and `[9, 2]` produce the following statistics:
+///
+/// | Statistic | Left | Right | Merged |
+/// | --- | --- | --- | --- |
+/// | `numRecords` | 3 | 2 | 5 |
+/// | `nullCount.n` | 1 | 0 | 1 |
+/// | `minValues.n` | 1 | 2 | 1 |
+/// | `maxValues.n` | 5 | 9 | 9 |
+/// | `tightBounds` | true | true | true |
 fn merge_raw_stats(left: &StructArray, right: &StructArray) -> KernelResult<StructArray> {
     // Equal batch schemas can hide different nested field names in the underlying arrays.
     if left.data_type() != right.data_type() {
@@ -753,7 +766,7 @@ enum TruncateStats {
 
 /// Reduce raw statistics rows into one: sum `numRecords` and `nullCount`, combine min/max bounds,
 /// and AND `tightBounds`. When `truncate_stats` is [`TruncateStats::Yes`], truncate string bounds
-/// for publication.
+/// in the final file statistics.
 ///
 /// Returns `Err` if `stats` is not shaped like the output of `collect_stats_raw`.
 fn reduce_stats(stats: &StructArray, truncate_stats: TruncateStats) -> KernelResult<StructArray> {
