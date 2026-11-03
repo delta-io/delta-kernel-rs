@@ -1364,12 +1364,15 @@ mod tests {
     #[test]
     fn null_parameters_reject_invalid_active_fields_and_tags() {
         let mut state = KernelExpressionVisitorState::default();
-        let parameters = KernelNullTypeParameters::default();
+        let invalid_interval_parameters = KernelNullTypeParameters {
+            interval_year_month_kind: 3,
+            ..KernelNullTypeParameters::default()
+        };
         assert_extern_result_error_contains(
             visit_expression_literal_null(
                 &mut state,
                 NullTypeTag::IntervalYearMonth as u8,
-                parameters,
+                invalid_interval_parameters,
                 &TEST_ERROR_ALLOCATORS,
             ),
             FFIKernelError::SchemaError,
@@ -1379,7 +1382,7 @@ mod tests {
             visit_expression_literal_null(
                 &mut state,
                 NullTypeTag::Decimal as u8,
-                parameters,
+                KernelNullTypeParameters::default(),
                 &TEST_ERROR_ALLOCATORS,
             ),
             FFIKernelError::InvalidDecimalError,
