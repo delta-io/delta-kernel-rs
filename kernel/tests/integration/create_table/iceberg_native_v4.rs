@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 
+use delta_kernel::FileMeta;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::Snapshot;
@@ -13,7 +14,7 @@ use test_utils::{read_actions_from_commit, test_table_setup};
 use url::Url;
 
 #[test]
-fn test_create_table_iceberg_native_v4_then_commit_without_file_actions()
+fn test_create_table_iceberg_native_v4_then_commit_root_manifest_only()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
@@ -75,11 +76,31 @@ fn test_create_table_iceberg_native_v4_then_commit_without_file_actions()
     assert!(read_actions_from_commit(&table_url, 0, "add")?.is_empty());
     assert!(read_actions_from_commit(&table_url, 0, "checkpoint")?.is_empty());
 
+    let root_manifest = FileMeta {
+        location: table_url.join("metadata/root-v1.parquet")?,
+        last_modified: 0,
+        size: 1024,
+    };
     let committed = snapshot
-        .update_table(UpdateTableOperation::Write, "Test/1.0", false)
+        .update_table(UpdateTableOperation::Write, "Test/1.0", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .with_root_manifest_file(root_manifest.clone())?
         .commit(engine.as_ref())?
         .unwrap_committed();
     assert_eq!(committed.commit_version(), 1);
+
+    assert!(read_actions_from_commit(&table_url, 1, "add")?.is_empty());
+    let checkpoint_actions = read_actions_from_commit(&table_url, 1, "checkpoint")?;
+    assert_eq!(checkpoint_actions.len(), 1);
+    let content_root = checkpoint_actions[0]
+        .as_array()
+        .expect("checkpoint is an array")
+        .iter()
+        .find_map(|e| e.get("contentRoot"))
+        .expect("contentRoot entry");
+    assert_eq!(
+        content_root["path"].as_str(),
+        Some(root_manifest.location.as_str())
+    );
     Ok(())
 }
