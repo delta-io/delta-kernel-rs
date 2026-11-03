@@ -11,11 +11,10 @@ use tracing::{info, instrument};
 use url::Url;
 
 use super::LogSegment;
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+use super::missing_pointed_checkpoint_action;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use super::{
-    last_manifest_commit_inconsistency, missing_pointed_checkpoint_action,
-    require_pointed_checkpoint_action,
-};
+use super::{last_manifest_commit_inconsistency, require_pointed_checkpoint_action};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::LastManifestCommitVisitor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -190,7 +189,7 @@ impl LogSegment {
     #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
     fn ensure_needed_checkpoint_action(&self, resolved: &PmCandidate) -> KernelResult<()> {
         match self.required_checkpoint_pointer_to_read(resolved) {
-            Some(pointer) => Err(missing_pointed_checkpoint_action(pointer)),
+            Some(pointer) => Err(missing_pointed_checkpoint_action(&pointer)),
             None => Ok(()),
         }
     }
@@ -810,7 +809,7 @@ fn resolve_pm_batches(
                 .filter(|version| i64::try_from(*version).ok() != Some(pointer.version))
             {
                 return Err(last_manifest_commit_inconsistency(
-                    pointer,
+                    &pointer,
                     format!("commit {version} carries a checkpoint action"),
                 ));
             }
@@ -821,7 +820,7 @@ fn resolve_pm_batches(
                 if let Some(checkpoint) =
                     CheckpointAction::try_new_from_data(batch.actions.as_ref())?
                 {
-                    let checkpoint = require_pointed_checkpoint_action(pointer, Some(checkpoint))?;
+                    let checkpoint = require_pointed_checkpoint_action(&pointer, Some(checkpoint))?;
                     resolved = resolved.with_checkpoint(checkpoint);
                 }
             }
