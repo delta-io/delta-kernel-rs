@@ -620,13 +620,16 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// transaction is subsequently modified, call this method again to capture the updated
     /// configuration.
     ///
-    /// Returns an error if the table has an empty or unsupported schema, or if the table declares
-    /// column defaults or CHECK constraints that the connector has not acknowledged.
+    /// Returns an error if the table has an empty or unsupported schema, if the table declares
+    /// column defaults or CHECK constraints that the connector has not acknowledged, or if the
+    /// table has Concurrent Identity Columns (writing data to them is not yet supported).
     pub fn write_state(&self) -> KernelResult<Arc<WriteState>> {
         self.ensure_schema_non_empty_for_write_state()?;
         self.ensure_column_defaults_acknowledged()?;
         #[cfg(feature = "check-constraints-in-dev")]
         self.ensure_check_constraints_acknowledged()?;
+        #[cfg(feature = "concurrent-identity-columns-in-dev")]
+        self.ensure_no_concurrent_identity_columns()?;
         self.validate_for_data_write()?;
         // The effective table configuration can change while building a transaction, so this
         // state must be derived on demand rather than cached on the transaction. TODO(#3149):
@@ -1001,6 +1004,20 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         Ok(())
     }
 
+    /// Rejects data writes (write-state creation or committing adds) when the table has Concurrent
+    /// Identity Columns.
+    // TODO(#3586): surface the CIC columns to the connector instead of rejecting.
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    fn ensure_no_concurrent_identity_columns(&self) -> KernelResult<()> {
+        require!(
+            !self.effective_table_config.has_concurrent_identity_column(),
+            KernelError::unsupported(
+                "Writing data to a table with Concurrent Identity Columns is not yet supported",
+            )
+        );
+        Ok(())
+    }
+
     fn ensure_row_tracking_preservation_acknowledged(&self) -> KernelResult<()> {
         if !self
             .effective_table_config
@@ -1169,6 +1186,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         // metadata-only commits are always allowed.
         if self.staged_data_changes.has_adds() {
             validate_schema_for_write(&self.effective_table_config.logical_schema())?;
+            #[cfg(feature = "concurrent-identity-columns-in-dev")]
+            self.ensure_no_concurrent_identity_columns()?;
         }
 
         // If a data-changing transaction has add files together with remove files or DV updates,
@@ -1568,12 +1587,16 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::scan::state_info::tests::RowTrackingState;
-    use crate::schema::{ArrayType, MapType, StructType, column_name, schema, schema_ref};
+    use crate::schema::{
+        ArrayType, MapType, StructType, column_name, concurrent_identity_column, schema, schema_ref,
+    };
     use crate::table_features::{ColumnMappingMode, TableFeature};
     use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_ROW_TRACKING};
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
     use crate::transaction::exec_mode::StagedDataChanges;
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    use crate::unit_test_utils::concurrent_identity_config;
     use crate::unit_test_utils::{
         CapturingReporter, MockProtocolBuilder, MockTableConfigurationBuilder,
         assert_result_error_with_message, copy_test_table, create_valid_add_file_batch,
@@ -2272,6 +2295,48 @@ mod tests {
             // Orphaned column-default metadata (no `allowColumnDefaults` feature) is tolerated.
             let txn = txn_with_schema_and_writer_features(schema, []);
             assert!(txn.top_level_column_defaults().unwrap().is_empty());
+        }
+    }
+
+    #[rstest]
+    #[case::top_level(concurrent_identity_column("id", "seq-abc", 1, 1, false))]
+    #[case::nested(StructField::nullable(
+        "wrapper",
+        StructType::try_new([concurrent_identity_column("id", "seq-abc", 1, 1, false)]).unwrap(),
+    ))]
+    fn create_table_rejects_concurrent_identity_columns(#[case] field: StructField) {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let schema = StructType::try_new([field]).unwrap();
+        let result = create_table("memory:///", Arc::new(schema), "test-engine", true)
+            .with_table_properties([
+                ("io.unitycatalog.tableId", "cic-test"),
+                ("delta.feature.catalogManaged", "supported"),
+            ])
+            .build(&engine, Box::new(MockCatalogCommitter));
+        assert_result_error_with_message(
+            result,
+            "Creating a table with Concurrent Identity Columns is not yet supported",
+        );
+    }
+
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    #[rstest]
+    fn data_writes_rejected_but_metadata_commits_allowed_on_concurrent_identity_columns(
+        #[values(true, false)] stage_adds: bool,
+    ) {
+        const MSG: &str = "Writing data to a table with Concurrent Identity Columns";
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn().unwrap();
+        let schema =
+            StructType::try_new([concurrent_identity_column("id", "seq-abc", 1, 1, false)]);
+        txn.replace_effective_table_config(concurrent_identity_config(schema.unwrap()));
+        assert_result_error_with_message(txn.write_state(), MSG);
+        if stage_adds {
+            // A connector that bypasses `write_state` and stages adds directly is rejected at
+            // commit.
+            add_dummy_file(&mut txn);
+            assert_result_error_with_message(txn.validate_commit(), MSG);
+        } else {
+            txn.validate_commit().unwrap();
         }
     }
 
