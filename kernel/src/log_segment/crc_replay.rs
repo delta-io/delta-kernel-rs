@@ -773,6 +773,7 @@ mod tests {
     #[case::safe(Some("WRITE"), true)]
     #[case::streaming_update(Some("STREAMING UPDATE"), true)]
     #[case::reorg(Some("REORG"), true)]
+    #[case::reorg_upgrade_uniform(Some("REORG TABLE UPGRADE UNIFORM"), false)]
     #[case::unsafe_op(Some("ANALYZE STATS"), false)]
     #[case::vacuum_start(Some("VACUUM START"), false)]
     #[case::vacuum_end(Some("VACUUM END"), false)]
