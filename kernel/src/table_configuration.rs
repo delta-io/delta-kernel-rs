@@ -2610,10 +2610,7 @@ mod test {
                         .build(),
                 )
                 .build();
-            assert_result_error_with_message(
-                config.ensure_operation_supported(Operation::Write),
-                r#"Feature 'geospatial' is not supported for writes"#,
-            );
+            assert!(config.ensure_operation_supported(Operation::Write).is_ok());
         }
     }
 

@@ -4,6 +4,8 @@ mod clustering;
 mod column_mapping;
 mod ctas;
 mod file;
+#[cfg(feature = "geo-type-in-dev")]
+mod geospatial;
 mod iceberg_compat;
 mod ict;
 mod interval;

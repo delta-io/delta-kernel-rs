@@ -9,7 +9,7 @@ use crate::{KernelError, KernelResult};
 
 /// Returns `true` if the schema contains at least one geometry or geography column,
 /// including nested structs, arrays, and maps.
-fn schema_contains_geospatial(schema: &Schema) -> bool {
+pub(crate) fn schema_contains_geospatial(schema: &Schema) -> bool {
     UsesGeo.transform_struct(schema).is_err()
 }
 
