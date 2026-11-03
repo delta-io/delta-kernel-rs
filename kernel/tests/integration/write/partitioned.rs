@@ -16,7 +16,7 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
-use delta_kernel::schema::{schema, schema_ref, DataType, IntervalYearToMonthType, StructType};
+use delta_kernel::schema::{DataType, IntervalYearToMonthType, StructType, schema, schema_ref};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
@@ -252,9 +252,11 @@ async fn test_write_rejects_qualifier_mismatch() -> Result<(), Box<dyn std::erro
     )
     .await
     .expect_err("mismatched partition qualifier should fail");
-    assert!(error
-        .to_string()
-        .contains("partition column 'period' has type"));
+    assert!(
+        error
+            .to_string()
+            .contains("partition column 'period' has type")
+    );
 
     let latest = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(latest.version(), snapshot.version());

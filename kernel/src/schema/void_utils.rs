@@ -190,8 +190,8 @@ fn add_void_stripping_inner<'a>(
 mod tests {
     use super::*;
     use crate::schema::{
-        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
-        StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        schema,
     };
 
     // ---- validate_schema_for_write tests ----

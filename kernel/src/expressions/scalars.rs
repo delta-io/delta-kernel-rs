@@ -11,10 +11,12 @@ use serde::{Deserialize, Serialize};
 use strum::AsRefStr;
 
 use crate::error::add_scalar_path_context;
+use crate::schema::IntervalField::{Day, Hour, Minute, Month, Second, Year};
+use crate::schema::IntervalYearToMonthType::{IntervalMonth, IntervalYear, IntervalYearToMonth};
 use crate::schema::derive_macro_utils::{GetStructField, ToDataType};
 use crate::schema::{
-    parse_interval_type, ArrayType, DataType, DecimalType, IntervalField, IntervalFieldRange,
-    IntervalYearToMonthType, MapType, PrimitiveType, StructField, StructType,
+    ArrayType, DataType, DecimalType, IntervalFieldRange, IntervalYearToMonthType, MapType,
+    PrimitiveType, StructField, StructType, parse_interval_type,
 };
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
@@ -1193,9 +1195,6 @@ fn checked_day_time_micros(
 /// Returns a scalar only when the literal's qualifier matches `target` and its month count fits
 /// in `i32`. `YEAR` values are whole multiples of 12 months; parsing never rounds or truncates.
 fn parse_year_month_interval(raw: &str, target: IntervalYearToMonthType) -> KernelResult<Scalar> {
-    use IntervalField::*;
-    use IntervalYearToMonthType::*;
-
     let parse_error = || PrimitiveType::interval_year_month(target).parse_error(raw);
     let (body, field_range) = extract_interval_literal(raw).ok_or_else(parse_error)?;
     let (negative, magnitude) = interval_magnitude(body).ok_or_else(parse_error)?;
@@ -1236,8 +1235,6 @@ fn parse_year_month_interval(raw: &str, target: IntervalYearToMonthType) -> Kern
 
 /// Parses a day-time interval literal into a signed total microsecond count.
 fn parse_day_time_interval(raw: &str) -> Option<i64> {
-    use IntervalField::*;
-
     let (body, field_range) = extract_interval_literal(raw)?;
     let (negative, magnitude) = interval_magnitude(body)?;
     let (days, hours, minutes, seconds, micros) = match (field_range.start, field_range.end) {

@@ -30,8 +30,8 @@ use crate::kernel_predicates::{
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::EdgeInterpolationAlgorithm;
 use crate::schema::{
-    schema, schema_ref, ArrayType, DataType as KernelDataType, IntervalYearToMonthType, MapType,
-    StructField, StructType,
+    ArrayType, DataType as KernelDataType, IntervalYearToMonthType, MapType, StructField,
+    StructType, schema, schema_ref,
 };
 use crate::unit_test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]

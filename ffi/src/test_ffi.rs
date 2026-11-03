@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use delta_kernel::KernelResult;
 use delta_kernel::expressions::{
-    col, column_name, column_pred, lit, null_lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
-    Expression as Expr, ExpressionStructPatchBuilder, MapData, MapToStructOptions,
-    OpaqueExpressionOp, OpaquePredicateOp, Predicate as Pred, Scalar, ScalarExpressionEvaluator,
-    StructData,
+    ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
+    ExpressionStructPatchBuilder, MapData, MapToStructOptions, OpaqueExpressionOp,
+    OpaquePredicateOp, Predicate as Pred, Scalar, ScalarExpressionEvaluator, StructData, col,
+    column_name, column_pred, lit, null_lit,
 };
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,

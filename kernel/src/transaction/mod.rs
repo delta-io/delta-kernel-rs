@@ -1568,7 +1568,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::scan::state_info::tests::RowTrackingState;
-    use crate::schema::{column_name, schema, schema_ref, ArrayType, MapType, StructType};
+    use crate::schema::{ArrayType, MapType, StructType, column_name, schema, schema_ref};
     use crate::table_features::{ColumnMappingMode, TableFeature};
     use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_ROW_TRACKING};
     use crate::transaction::create_table::create_table;

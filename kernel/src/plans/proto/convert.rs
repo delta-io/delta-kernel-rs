@@ -1068,11 +1068,11 @@ mod tests {
     use super::EdgeAlgo;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{
-        col, column_name, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
-        DecimalData, Expression, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
-        MapToStructOptions, OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar,
-        ScalarExpressionEvaluator, StructData, UnaryExpressionOp, UnaryPredicateOp,
-        VariadicExpressionOp,
+        ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName, DecimalData, Expression,
+        ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, MapToStructOptions,
+        OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
+        StructData, UnaryExpressionOp, UnaryPredicateOp, VariadicExpressionOp, col, column_name,
+        lit,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -1089,8 +1089,8 @@ mod tests {
     };
     use crate::plans::{IoOperation, Operation};
     use crate::schema::{
-        schema, schema_ref, ArrayType, DataType, DecimalType, IntervalYearToMonthType, MapType,
-        MetadataValue, PrimitiveType, SchemaRef, StructField, StructType, ToSchema as _,
+        ArrayType, DataType, DecimalType, IntervalYearToMonthType, MapType, MetadataValue,
+        PrimitiveType, SchemaRef, StructField, StructType, ToSchema as _, schema, schema_ref,
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};

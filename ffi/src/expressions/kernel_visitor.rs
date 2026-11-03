@@ -6,10 +6,10 @@ use delta_kernel::KernelResult;
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
 use delta_kernel::expressions::{
-    lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
-    JunctionPredicateOp, Predicate, Scalar, UnaryPredicateOp,
+    BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp, Predicate,
+    Scalar, UnaryPredicateOp, lit, null_lit,
 };
-use delta_kernel::schema::{DataType, IntervalYearToMonthType, PrimitiveType};
+use delta_kernel::schema::{DataType, PrimitiveType};
 
 #[cfg(feature = "default-engine-base")]
 use crate::expressions::FfiOpaquePredicateOp;
@@ -880,8 +880,8 @@ fn visit_predicate_opaque_with_eval_impl(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use delta_kernel::expressions::{col, lit, MapToStructOptions, Scalar};
-    use delta_kernel::schema::{schema, ArrayType, DataType, IntervalYearToMonthType, MapType};
+    use delta_kernel::expressions::{MapToStructOptions, Scalar, col, lit};
+    use delta_kernel::schema::{ArrayType, DataType, IntervalYearToMonthType, MapType, schema};
     use rstest::rstest;
 
     use super::*;

@@ -2140,7 +2140,7 @@ impl Display for IntervalYearToMonthType {
 fn serialize_interval_year_month<S: serde::Serializer>(
     dtype: &IntervalYearToMonthType,
     serializer: S,
-) -> Result<S::Ok, S::Error> {
+) -> KernelResult<S::Ok, S::Error> {
     serializer.serialize_str(&dtype.to_string())
 }
 

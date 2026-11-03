@@ -21,13 +21,13 @@ use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{
-    col, column_name, lit, Expression as Expr, Predicate as Pred, PredicateRef, Scalar,
+    Expression as Expr, Predicate as Pred, PredicateRef, Scalar, col, column_name, lit,
 };
 use delta_kernel::metrics::{MetricEvent, ScanType};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, Scan, StatsOptions};
 use delta_kernel::schema::{
-    schema, schema_ref, DataType, IntervalYearToMonthType, SchemaRef, StructField, StructType,
+    DataType, IntervalYearToMonthType, SchemaRef, StructField, StructType, schema, schema_ref,
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;

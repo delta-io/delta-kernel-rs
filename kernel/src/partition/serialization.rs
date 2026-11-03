@@ -14,7 +14,7 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 
-use crate::expressions::{DecimalData, IntervalYearMonthData, Scalar, MONTHS_PER_YEAR};
+use crate::expressions::{DecimalData, IntervalYearMonthData, MONTHS_PER_YEAR, Scalar};
 use crate::schema::IntervalYearToMonthType;
 use crate::{KernelError, KernelResult};
 
