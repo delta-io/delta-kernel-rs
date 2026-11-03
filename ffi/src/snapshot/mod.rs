@@ -2,6 +2,7 @@
 
 mod builder;
 pub mod hint;
+pub mod provenance;
 
 pub use builder::{
     ExclusiveSnapshotBuilder, FfiIncrementalReplay, FfiSnapshotBuilder, free_snapshot_builder,

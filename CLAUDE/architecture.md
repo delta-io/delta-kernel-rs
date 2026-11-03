@@ -67,9 +67,15 @@ the connector must canonicalize them into the same URL form as the table root. B
 hint's table membership against the builder's root and validates structural consistency. The
 connector owns protocol/metadata provenance, publication state, and freshness.
 `Snapshot::to_snapshot_hint()` exports retained state without engine I/O, preserving build-time
-freshness, the selected log files and publication watermark, a matching checkpoint hint, and any CRC
-resolved at the snapshot version. It rejects log compactions. The FFI exports one complete borrowed
-typed hint through a callback; connectors must copy any state retained after the callback returns.
+freshness, the selected log files and publication watermark, a matching checkpoint hint, and the
+retained CRC baseline and provenance. It rejects log compactions. `FfiSnapshotHint` preserves this
+state, including stale CRC baselines. Export delivers one complete borrowed typed hint through a
+callback; connectors must copy any state retained after
+the callback returns. `Snapshot::checkpoint_type()` returns `None` without a selected checkpoint,
+or `Some(Unresolved/V1/V2)` for a selected checkpoint. This observation is fixed at construction;
+scans do not refine it. `LogSegment` stores checkpoint version and type together, with no mutable
+provenance cache. `Snapshot::crc_provenance()` exposes retained checksum observations without engine
+I/O. CRC reconstruction keeps the original disk baseline across incremental updates.
 
 **Snapshot loading internals:**
 1. Ordinary builds discover commits and checkpoints through **LogSegment**

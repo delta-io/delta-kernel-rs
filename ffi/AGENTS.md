@@ -770,6 +770,8 @@ pub struct FfiSnapshotHint {
     pub last_checkpoint: *const FfiLastCheckpoint,
     pub crc: *const FfiCrc,
     pub publication_watermark: FfiPublicationWatermark,
+    pub checkpoint_type: OptionalValue<CheckpointType>,
+    pub crc_provenance: FfiCrcProvenance,
 }
 
 pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint(
@@ -796,6 +798,7 @@ FFI-specific ownership, conversion, and engine support code can use its own modu
   with their backing storage and conversions colocated
 - `src/snapshot/builder.rs` -- snapshot builders and their configuration
 - `src/snapshot/hint/` -- typed snapshot-hint input and callback export
+- `src/snapshot/provenance.rs` -- retained checkpoint and checksum provenance getters
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
@@ -841,8 +844,13 @@ engine I/O through one callback with a complete borrowed `FfiSnapshotHint`. Both
 borrowed. The callback runs once on success and is not invoked on error. All nested pointers expire
 when the callback returns; copy retained values during the callback. No hint handle is returned.
 Supply the copied values through `snapshot_builder_with_snapshot_hint` when rebuilding a snapshot.
-The hint preserves build-time freshness, not current freshness, and includes only a matching
-checkpoint hint and an at-version CRC. Compaction files are unsupported.
+The hint preserves build-time freshness, a matching checkpoint hint, retained CRC state (including
+stale baselines), and checkpoint and CRC provenance. `crc` is null only when no checksum is retained.
+The checkpoint type is `None` when no checkpoint was selected, or `Unresolved`/`V1`/`V2` for a
+selected checkpoint. Snapshot observations stay fixed after construction; reads do not refine them.
+Input hints may omit a type claim and let the paths establish presence. Checksum provenance uses
+`Unknown` when unestablished; `Missing`/`Unusable` are preserved with a null CRC. Claims of a usable
+checksum require a non-null CRC. Compaction files are unsupported.
 
 Export includes an explicit publication watermark,
 preserving absence even when published commits are not represented by the retained paths.

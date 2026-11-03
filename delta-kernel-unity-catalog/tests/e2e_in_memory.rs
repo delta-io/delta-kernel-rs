@@ -302,7 +302,7 @@ async fn test_snapshot_from_catalog_response_with_published_commits(
     let snapshot = Snapshot::builder_for(table_uri)
         .with_max_catalog_version(3)
         .build(engine.as_ref())?;
-    assert_eq!(snapshot.log_segment().checkpoint_version, Some(3));
+    assert_eq!(snapshot.log_segment().checkpoint_version(), Some(3));
     Ok(())
 }
 
@@ -414,7 +414,7 @@ async fn test_checkpoint_after_publish() -> Result<(), TestError> {
     let snapshot = Snapshot::builder_for(table_uri)
         .with_max_catalog_version(3)
         .build(&engine)?;
-    assert_eq!(snapshot.log_segment().checkpoint_version, Some(3));
+    assert_eq!(snapshot.log_segment().checkpoint_version(), Some(3));
 
     Ok(())
 }

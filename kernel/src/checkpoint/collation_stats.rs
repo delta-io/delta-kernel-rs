@@ -414,7 +414,7 @@ mod tests {
             };
             writer.finalize(&engine, &written.last_checkpoint_stats)?;
             let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
-            assert_eq!(reloaded.log_segment().checkpoint_version, Some(version));
+            assert_eq!(reloaded.log_segment().checkpoint_version(), Some(version));
             let scan = reloaded.scan_builder().build()?;
             let rows = sample_rows_by_path(json_rows(
                 scan.scan_metadata(&engine)?
@@ -519,7 +519,7 @@ mod tests {
         commit(store.as_ref(), 1, &replacement_commit).await;
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
         assert_eq!(
-            snapshot.log_segment().checkpoint_version,
+            snapshot.log_segment().checkpoint_version(),
             earlier_checkpoint.then_some(0)
         );
         let binary_stats = schema_ref! { nullable "numRecords": LONG };
@@ -624,7 +624,7 @@ mod tests {
         actions.push(add);
         write_checkpoint_rows(&engine, source, &actions, has_json)?;
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-        assert_eq!(snapshot.log_segment().checkpoint_version, Some(0));
+        assert_eq!(snapshot.log_segment().checkpoint_version(), Some(0));
         let stats = if parsed {
             StatsOptions::all()
         } else {
