@@ -1132,8 +1132,10 @@ impl LogSegment {
 
     /// The commit cover over versions in `(oldest_exclusive, newest_inclusive]`, in descending
     /// order. Each of `required_deltas` is read as its own commit file, never through a log
-    /// compaction.
+    /// compaction. A compaction that crosses either end of the range is read as its individual
+    /// commits within the range.
     #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+    // Used by plan-based P&M replay.
     #[cfg_attr(not(test), allow(dead_code))]
     fn find_commit_cover_paths_in_range(
         &self,

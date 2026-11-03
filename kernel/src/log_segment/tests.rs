@@ -2397,6 +2397,26 @@ fn commit_cover_after_excludes_compaction_starting_at_or_before_bound(
     &[],
     &[ExpectedFile::Commit(2), ExpectedFile::Compaction(0, 1)]
 )]
+#[case::compaction_ending_at_newest_inclusive(
+    (None, 3),
+    &[],
+    &[ExpectedFile::Compaction(2, 3), ExpectedFile::Compaction(0, 1)]
+)]
+#[case::oldest_exclusive_inside_compaction(
+    (Some(0), 4),
+    &[],
+    &[ExpectedFile::Commit(4), ExpectedFile::Compaction(2, 3), ExpectedFile::Commit(1)]
+)]
+#[case::oldest_exclusive_at_compaction_start(
+    (Some(2), 4),
+    &[],
+    &[ExpectedFile::Commit(4), ExpectedFile::Commit(3)]
+)]
+#[case::required_delta_outside_range_is_ignored(
+    (Some(1), 4),
+    &[1],
+    &[ExpectedFile::Commit(4), ExpectedFile::Compaction(2, 3)]
+)]
 #[case::empty_range((Some(4), 4), &[], &[])]
 #[tokio::test]
 async fn commit_cover_in_range_reads_required_deltas_as_their_own_files(
