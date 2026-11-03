@@ -354,17 +354,17 @@ void visit_interval_year_month(void* data,
                                struct KernelStringSlice name,
                                bool is_nullable,
                                const CMetadataMap * metadata,
-                               enum KernelIntervalYearToMonthType kind)
+                               enum FfiIntervalYearToMonthType kind)
 {
   char* type_name = NULL;
   switch (kind) {
-    case KernelIntervalYearToMonthTypeIntervalYear:
+    case FfiIntervalYearToMonthTypeIntervalYear:
       type_name = "interval year";
       break;
-    case KernelIntervalYearToMonthTypeIntervalMonth:
+    case FfiIntervalYearToMonthTypeIntervalMonth:
       type_name = "interval month";
       break;
-    case KernelIntervalYearToMonthTypeIntervalYearToMonth:
+    case FfiIntervalYearToMonthTypeIntervalYearToMonth:
       type_name = "interval year to month";
       break;
   }

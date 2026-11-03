@@ -144,14 +144,14 @@ fn visit_clustering_columns_impl(
     for info in &infos {
         let logical = info.logical_column.to_string();
         let physical = info.physical_column.to_string();
-        let (tag, precision, scale) = NullTypeTag::from_data_type(&info.data_type);
+        let (tag, parameters) = NullTypeTag::from_data_type(&info.data_type);
         visitor(
             engine_context,
             kernel_string_slice!(logical),
             kernel_string_slice!(physical),
             tag as u8,
-            precision,
-            scale,
+            parameters.decimal_precision,
+            parameters.decimal_scale,
         );
     }
     Ok(OptionalValue::Some(infos.len()))

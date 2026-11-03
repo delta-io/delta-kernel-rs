@@ -1,0 +1,10 @@
+Reading table at ../../../../acceptance/workloads/interval_types_intv_001_interval_ym_basic/delta/
+version: 2
+
+Schema:
+├─ id: integer
+└─ period: interval year to month
+
+Scan schema:
+├─ id: integer
+└─ period: interval year to month

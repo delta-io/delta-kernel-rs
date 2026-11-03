@@ -6,7 +6,7 @@ use crate::delta_types::FfiNullableStringMap;
 #[cfg(feature = "udt-in-dev")]
 use crate::delta_types::FfiNullableStringMapEntry;
 use crate::handle::Handle;
-use crate::interval::KernelIntervalYearToMonthType;
+use crate::interval::FfiIntervalYearToMonthType;
 use crate::scan::CMetadataMap;
 use crate::{KernelStringSlice, SharedSchema, kernel_string_slice};
 
@@ -205,7 +205,7 @@ pub struct EngineSchemaVisitor {
         name: KernelStringSlice,
         is_nullable: bool,
         metadata: &CMetadataMap,
-        kind: KernelIntervalYearToMonthType,
+        kind: FfiIntervalYearToMonthType,
     ),
 
     /// Visit an `interval day to second` belonging to the list identified by `sibling_list_id`.
@@ -493,9 +493,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use delta_kernel::schema::{schema, IntervalYearToMonthType, StructField};
     #[cfg(feature = "geo-type-in-dev")]
     use delta_kernel::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
+    use delta_kernel::schema::{IntervalYearToMonthType, StructField, schema};
 
     use super::*;
     use crate::TryFromStringSlice;
@@ -679,12 +679,12 @@ mod tests {
         name: KernelStringSlice,
         is_nullable: bool,
         _metadata: &CMetadataMap,
-        kind: KernelIntervalYearToMonthType,
+        kind: FfiIntervalYearToMonthType,
     ) {
         let data_type = match kind {
-            KernelIntervalYearToMonthType::IntervalYear => "interval year",
-            KernelIntervalYearToMonthType::IntervalMonth => "interval month",
-            KernelIntervalYearToMonthType::IntervalYearToMonth => "interval year to month",
+            FfiIntervalYearToMonthType::IntervalYear => "interval year",
+            FfiIntervalYearToMonthType::IntervalMonth => "interval month",
+            FfiIntervalYearToMonthType::IntervalYearToMonth => "interval year to month",
         };
         add_field(data, sibling_list_id, name, is_nullable, data_type, None);
     }

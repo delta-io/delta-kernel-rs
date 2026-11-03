@@ -84,21 +84,10 @@ uintptr_t convert_engine_to_kernel_literal(
       }
       return result.ok;
     }
-    case IntervalYearMonthNull: {
-      ExternResultusize result = visit_expression_literal_null_interval_year_month(
-          state, lit->value.interval_year_month_data.kind, &error_allocators);
-      if (result.tag == Errusize) {
-        print_error("visit_expression_literal_null_interval_year_month failed",
-            (Error*)result.err);
-        free_error((Error*)result.err);
-        abort();
-      }
-      return result.ok;
-    }
     case Null: {
       struct NullTypeInfo* nt = &lit->value.null_type;
       ExternResultusize result = visit_expression_literal_null(
-          state, nt->type_tag, nt->precision, nt->scale, &error_allocators);
+          state, nt->type_tag, nt->parameters, &error_allocators);
       if (result.tag == Errusize) {
         print_error("visit_expression_literal_null failed", (Error*)result.err);
         free_error((Error*)result.err);

@@ -10,13 +10,13 @@ use delta_kernel::{KernelError, KernelResult};
 /// cbindgen:prefix-with-name=true
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KernelIntervalYearToMonthType {
+pub enum FfiIntervalYearToMonthType {
     IntervalYear = 1,
     IntervalMonth = 2,
     IntervalYearToMonth = 3,
 }
 
-impl From<IntervalYearToMonthType> for KernelIntervalYearToMonthType {
+impl From<IntervalYearToMonthType> for FfiIntervalYearToMonthType {
     fn from(value: IntervalYearToMonthType) -> Self {
         match value {
             IntervalYearToMonthType::IntervalYear => Self::IntervalYear,
@@ -26,23 +26,27 @@ impl From<IntervalYearToMonthType> for KernelIntervalYearToMonthType {
     }
 }
 
-impl From<KernelIntervalYearToMonthType> for IntervalYearToMonthType {
-    fn from(value: KernelIntervalYearToMonthType) -> Self {
+impl From<FfiIntervalYearToMonthType> for IntervalYearToMonthType {
+    fn from(value: FfiIntervalYearToMonthType) -> Self {
         match value {
-            KernelIntervalYearToMonthType::IntervalYear => Self::IntervalYear,
-            KernelIntervalYearToMonthType::IntervalMonth => Self::IntervalMonth,
-            KernelIntervalYearToMonthType::IntervalYearToMonth => Self::IntervalYearToMonth,
+            FfiIntervalYearToMonthType::IntervalYear => Self::IntervalYear,
+            FfiIntervalYearToMonthType::IntervalMonth => Self::IntervalMonth,
+            FfiIntervalYearToMonthType::IntervalYearToMonth => Self::IntervalYearToMonth,
         }
     }
 }
 
-pub(crate) fn decode_interval_year_month_kind(kind: u32) -> KernelResult<IntervalYearToMonthType> {
-    match kind {
-        1 => Ok(IntervalYearToMonthType::IntervalYear),
-        2 => Ok(IntervalYearToMonthType::IntervalMonth),
-        3 => Ok(IntervalYearToMonthType::IntervalYearToMonth),
-        other => Err(KernelError::schema(format!(
-            "invalid interval year-month kind: {other}"
-        ))),
+impl TryFrom<u32> for FfiIntervalYearToMonthType {
+    type Error = KernelError;
+
+    fn try_from(kind: u32) -> KernelResult<Self> {
+        match kind {
+            1 => Ok(Self::IntervalYear),
+            2 => Ok(Self::IntervalMonth),
+            3 => Ok(Self::IntervalYearToMonth),
+            other => Err(KernelError::schema(format!(
+                "invalid interval year-month kind: {other}"
+            ))),
+        }
     }
 }

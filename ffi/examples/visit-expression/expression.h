@@ -51,7 +51,6 @@ enum LitType {
   Binary,
   Decimal,
   Null,
-  IntervalYearMonthNull,
   Struct,
   Array,
   Map
@@ -152,7 +151,7 @@ struct Decimal {
 };
 struct IntervalYearMonthData {
   int32_t months;
-  enum KernelIntervalYearToMonthType kind;
+  enum FfiIntervalYearToMonthType kind;
 };
 typedef struct {
   size_t list_count;
@@ -171,8 +170,7 @@ struct MapData {
 };
 struct NullTypeInfo {
   uint8_t type_tag;
-  uint8_t precision;
-  uint8_t scale;
+  KernelNullTypeParameters parameters;
 };
 struct Literal {
   enum LitType type;
@@ -271,7 +269,7 @@ void visit_expr_interval_year_month_literal(
     void* data,
     uintptr_t sibling_list_id,
     int32_t months,
-    enum KernelIntervalYearToMonthType kind) {
+    enum FfiIntervalYearToMonthType kind) {
   struct Literal* lit = malloc(sizeof(struct Literal));
   lit->type = IntervalYearMonth;
   lit->value.interval_year_month_data.months = months;
@@ -327,24 +325,11 @@ void visit_expr_null_literal(
     void* data,
     uintptr_t sibling_id_list,
     uint8_t type_tag,
-    uint8_t precision,
-    uint8_t scale) {
+    KernelNullTypeParameters parameters) {
   struct Literal* literal = malloc(sizeof(struct Literal));
   literal->type = Null;
   literal->value.null_type.type_tag = type_tag;
-  literal->value.null_type.precision = precision;
-  literal->value.null_type.scale = scale;
-  put_expr_item(data, sibling_id_list, literal, Literal);
-}
-
-void visit_expr_interval_year_month_null_literal(
-    void* data,
-    uintptr_t sibling_id_list,
-    enum KernelIntervalYearToMonthType kind) {
-  struct Literal* literal = malloc(sizeof(struct Literal));
-  literal->type = IntervalYearMonthNull;
-  literal->value.interval_year_month_data.months = 0;
-  literal->value.interval_year_month_data.kind = kind;
+  literal->value.null_type.parameters = parameters;
   put_expr_item(data, sibling_id_list, literal, Literal);
 }
 
@@ -573,7 +558,6 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_literal_interval_day_time = visit_expr_interval_day_time_literal,
     .visit_literal_binary = visit_expr_binary_literal,
     .visit_literal_null = visit_expr_null_literal,
-    .visit_literal_null_interval_year_month = visit_expr_interval_year_month_null_literal,
     .visit_literal_decimal = visit_expr_decimal_literal,
     .visit_literal_string = visit_expr_string_literal,
     .visit_literal_struct = visit_expr_struct_literal,
@@ -629,7 +613,6 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_literal_interval_day_time = visit_expr_interval_day_time_literal,
     .visit_literal_binary = visit_expr_binary_literal,
     .visit_literal_null = visit_expr_null_literal,
-    .visit_literal_null_interval_year_month = visit_expr_interval_year_month_null_literal,
     .visit_literal_decimal = visit_expr_decimal_literal,
     .visit_literal_string = visit_expr_string_literal,
     .visit_literal_struct = visit_expr_struct_literal,
@@ -754,7 +737,6 @@ void free_expression_item(ExpressionItem ref) {
         case TimestampNtz:
         case Date:
         case IntervalYearMonth:
-        case IntervalYearMonthNull:
         case IntervalDayTime:
         case Decimal:
         case Null:

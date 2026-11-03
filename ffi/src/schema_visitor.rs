@@ -34,7 +34,7 @@ use delta_kernel::{KernelError, KernelResult};
 use tracing::warn;
 
 use crate::delta_types::FfiNullableStringMap;
-use crate::interval::decode_interval_year_month_kind;
+use crate::interval::FfiIntervalYearToMonthType;
 use crate::scan::{CMetadataMap, CMetadataValueKind};
 use crate::{
     ErrorAllocators, ExternResult, IntoExternResult, KernelStringSlice, ReferenceSet,
@@ -506,13 +506,11 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
 
 /// Visit an interval year-month field with its exact qualifier.
 ///
-/// `kind` accepts the numeric values of
-/// [`KernelIntervalYearToMonthType`](crate::interval::KernelIntervalYearToMonthType): `1` for
-/// `interval year`, `2` for `interval month`, and `3` for `interval year to month`. Other values
-/// return an allocated [`FFIKernelError::SchemaError`](crate::error::FFIKernelError::SchemaError)
-/// before metadata callbacks run or a field is inserted. On success the returned ID is owned by
-/// the builder state and can be passed to complex field builders. When non-null, `metadata` is a
-/// borrowed synchronous descriptor; Kernel copies its entries and does not retain it.
+/// `kind` accepts the numeric values of [`FfiIntervalYearToMonthType`]: `1` for `interval year`,
+/// `2` for `interval month`, and `3` for `interval year to month`. Invalid values return a schema
+/// error before metadata callbacks run or a field is inserted. On success the returned ID is
+/// owned by the builder state. When non-null, `metadata` is borrowed for this call; Kernel copies
+/// its entries and does not retain it.
 ///
 /// # Safety
 ///
@@ -532,12 +530,12 @@ pub unsafe extern "C" fn visit_field_interval_year_month(
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let result = decode_interval_year_month_kind(kind).and_then(|kind| {
+    let result = FfiIntervalYearToMonthType::try_from(kind).and_then(|kind| {
         let metadata = visit_engine_metadata(unsafe { metadata.as_ref() });
         visit_field_primitive_impl(
             state,
             name_str,
-            PrimitiveType::IntervalYearMonth(kind),
+            PrimitiveType::IntervalYearMonth(kind.into()),
             nullable,
             metadata,
         )
@@ -1070,7 +1068,7 @@ mod tests {
         TEST_ERROR_ALLOCATORS, assert_extern_result_error_contains,
         assert_extern_result_error_with_message, ok_or_panic,
     };
-    use crate::interval::KernelIntervalYearToMonthType;
+    use crate::interval::FfiIntervalYearToMonthType;
     use crate::scan::visit_metadata_map;
     use crate::{KernelStringSlice, NullableCvoid};
 
@@ -1665,7 +1663,7 @@ mod tests {
                     KernelStringSlice::new_unsafe($name),
                     $nullable,
                     $metadata,
-                    KernelIntervalYearToMonthType::IntervalYearToMonth as u32,
+                    FfiIntervalYearToMonthType::IntervalYearToMonth as u32,
                     &TEST_ERROR_ALLOCATORS,
                 )
             })
@@ -1867,7 +1865,7 @@ mod tests {
                     "number",
                     MetadataValue::Number(17),
                 )])),
-                KernelIntervalYearToMonthType::IntervalYearToMonth as u32,
+                FfiIntervalYearToMonthType::IntervalYearToMonth as u32,
                 &TEST_ERROR_ALLOCATORS,
             ))
         };
@@ -1898,19 +1896,19 @@ mod tests {
 
     #[rstest]
     #[case::year(
-        KernelIntervalYearToMonthType::IntervalYear,
+        FfiIntervalYearToMonthType::IntervalYear,
         IntervalYearToMonthType::IntervalYear
     )]
     #[case::month(
-        KernelIntervalYearToMonthType::IntervalMonth,
+        FfiIntervalYearToMonthType::IntervalMonth,
         IntervalYearToMonthType::IntervalMonth
     )]
     #[case::year_to_month(
-        KernelIntervalYearToMonthType::IntervalYearToMonth,
+        FfiIntervalYearToMonthType::IntervalYearToMonth,
         IntervalYearToMonthType::IntervalYearToMonth
     )]
     fn interval_year_month_field_preserves_kind(
-        #[case] ffi_kind: KernelIntervalYearToMonthType,
+        #[case] ffi_kind: FfiIntervalYearToMonthType,
         #[case] expected: IntervalYearToMonthType,
     ) {
         let mut state = KernelSchemaVisitorState::default();
@@ -1969,7 +1967,7 @@ mod tests {
                 KernelStringSlice::new_unsafe("ym"),
                 false,
                 null(),
-                KernelIntervalYearToMonthType::IntervalMonth as u32,
+                FfiIntervalYearToMonthType::IntervalMonth as u32,
                 &TEST_ERROR_ALLOCATORS,
             )
         };
@@ -1993,7 +1991,7 @@ mod tests {
                 KernelStringSlice::new_unsafe("ym"),
                 false,
                 &rejected_engine_metadata(),
-                KernelIntervalYearToMonthType::IntervalYear as u32,
+                FfiIntervalYearToMonthType::IntervalYear as u32,
                 &TEST_ERROR_ALLOCATORS,
             )
         };
@@ -2010,7 +2008,7 @@ mod tests {
                 KernelStringSlice::new_unsafe("ym"),
                 false,
                 &test_engine_metadata(&mut metadata),
-                KernelIntervalYearToMonthType::IntervalYear as u32,
+                FfiIntervalYearToMonthType::IntervalYear as u32,
                 &TEST_ERROR_ALLOCATORS,
             ))
         };

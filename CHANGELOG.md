@@ -384,24 +384,6 @@
     `internal-api` feature or use expression evaluation; `evaluate_predicate` remains public.
 19. Strip gratuitous Transaction suffix from CommitResult variants ([#3384])
     - `CommitResult` enum variant names are now shorter.
-20. Preserve exact year-month interval qualifiers in Rust, protobuf, and FFI.
-    - Rust `PrimitiveType::IntervalYearMonth` and `Scalar::IntervalYearMonth` now carry whether
-    the value is `interval year`, `interval month`, or `interval year to month`. Derived scalar
-    JSON changes shape to include both `months` and `ty`.
-    - Data writes accept narrow year-month interval schemas and require `interval year` values to
-    contain whole years.
-    - The declarative-plan protobuf schema replaces the old broad year-month simple primitive and
-    raw month scalar with qualifier-aware messages. Consumers must regenerate protobuf caches and
-    reject old simple14/raw18 year-month encodings during coordinated upgrades.
-    - The FFI ABI version is now 2. `EngineSchemaVisitor`, `EngineExpressionVisitor`,
-    `visit_field_interval_year_month`, and year-month literal builders require an explicit
-    `KernelIntervalYearToMonthType`. Year-month typed nulls use the new
-    `visit_expression_literal_null_interval_year_month` API instead of the generic null tag.
-    Inbound constructors accept kind codes `1`, `2`, and `3`; other values return
-    `SchemaError`. Year-month literal payloads use signed total-month `i32` values; `interval year`
-    values must be divisible by 12. Consumers should check
-    `kernel_ffi_abi_version()` before filling visitor structs; old consumers are not
-    automatically protected from this ABI break.
 
 ### 🚀 Features / new APIs
 

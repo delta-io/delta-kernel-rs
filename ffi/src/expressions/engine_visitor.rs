@@ -10,26 +10,23 @@ use delta_kernel::expressions::{
     Scalar, StructData, UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp,
     VariadicExpression, VariadicExpressionOp,
 };
-use delta_kernel::schema::{DataType, PrimitiveType};
 
-use super::kernel_visitor::NullTypeTag;
+use super::kernel_visitor::{KernelNullTypeParameters, NullTypeTag};
 use crate::expressions::{
     FfiMapToStructOptions, SharedExpression, SharedOpaqueExpressionOp, SharedOpaquePredicateOp,
     SharedPredicate,
 };
 use crate::handle::Handle;
-use crate::interval::KernelIntervalYearToMonthType;
-use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
+use crate::interval::FfiIntervalYearToMonthType;
+use crate::{KernelStringSlice, SharedSchema, kernel_string_slice};
 
 type VisitLiteralFn<T> = extern "C" fn(data: *mut c_void, sibling_list_id: usize, value: T);
-type VisitYearMonthIntervalFn = extern "C" fn(
+type VisitIntervalYearMonthFn = extern "C" fn(
     data: *mut c_void,
     sibling_list_id: usize,
     value: i32,
-    kind: KernelIntervalYearToMonthType,
+    kind: FfiIntervalYearToMonthType,
 );
-type VisitYearMonthIntervalNullFn =
-    extern "C" fn(data: *mut c_void, sibling_list_id: usize, kind: KernelIntervalYearToMonthType);
 type VisitUnaryFn = extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
 type VisitBinaryFn = extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
 type VisitVariadicFn =
@@ -117,7 +114,7 @@ pub struct EngineExpressionVisitor {
     /// belongs to the list identified by `sibling_list_id`.
     pub visit_literal_date: VisitLiteralFn<i32>,
     /// Visit a year-month interval literal as a signed month count with its exact qualifier.
-    pub visit_literal_interval_year_month: VisitYearMonthIntervalFn,
+    pub visit_literal_interval_year_month: VisitIntervalYearMonthFn,
     /// Visit an `interval day to second` literal as a signed microsecond count.
     pub visit_literal_interval_day_time: VisitLiteralFn<i64>,
     /// Visit binary data at the `buffer` with length `len` belonging to the list identified by
@@ -159,18 +156,15 @@ pub struct EngineExpressionVisitor {
     ),
     /// Visits a typed null value belonging to the list identified by `sibling_list_id`.
     ///
-    /// The `type_tag` identifies reconstructible primitive types with tags 0-14. Decimal nulls
-    /// use tag 12 with `precision` and `scale`; interval year-month and day-time nulls use tags
-    /// 13 and 14. Non-primitive types and `void` use the sentinel tag 255.
+    /// The `type_tag` identifies reconstructible primitive types with tags 0-14. Decimal tag 12
+    /// reads precision and scale from `parameters`; year-month tag 13 reads its qualifier.
+    /// Other fields are ignored. Non-primitive types and `void` use the sentinel tag 255.
     pub visit_literal_null: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
         type_tag: u8,
-        precision: u8,
-        scale: u8,
+        parameters: KernelNullTypeParameters,
     ),
-    /// Visits a year-month interval typed null with its exact qualifier.
-    pub visit_literal_null_interval_year_month: VisitYearMonthIntervalNullFn,
     /// Visits an `and` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expressions of the array are in a list identified by `child_list_id`
     pub visit_and: VisitJunctionFn,
@@ -630,21 +624,14 @@ fn visit_expression_scalar(
                 v.scale()
             )
         }
-        Scalar::Null(DataType::Primitive(PrimitiveType::IntervalYearMonth(kind))) => call!(
-            visitor,
-            visit_literal_null_interval_year_month,
-            sibling_list_id,
-            (*kind).into()
-        ),
         Scalar::Null(data_type) => {
-            let (tag, precision, scale) = NullTypeTag::from_data_type(data_type);
+            let (tag, parameters) = NullTypeTag::from_data_type(data_type);
             call!(
                 visitor,
                 visit_literal_null,
                 sibling_list_id,
                 tag as u8,
-                precision,
-                scale
+                parameters
             )
         }
         Scalar::IntervalYearMonth(val) => {
@@ -839,7 +826,7 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
 mod tests {
     use std::sync::Arc;
 
-    use delta_kernel::expressions::{lit, Expression, MapToStructOptions, Scalar};
+    use delta_kernel::expressions::{Expression, MapToStructOptions, Scalar, lit};
     use delta_kernel::schema::{DataType, IntervalYearToMonthType, PrimitiveType};
     use rstest::rstest;
 
@@ -852,7 +839,7 @@ mod tests {
         IntervalYearMonth {
             sibling_list_id: usize,
             value: i32,
-            kind: KernelIntervalYearToMonthType,
+            kind: FfiIntervalYearToMonthType,
         },
         IntervalDayTime {
             sibling_list_id: usize,
@@ -861,12 +848,7 @@ mod tests {
         Null {
             sibling_list_id: usize,
             tag: u8,
-            precision: u8,
-            scale: u8,
-        },
-        IntervalYearMonthNull {
-            sibling_list_id: usize,
-            kind: KernelIntervalYearToMonthType,
+            parameters: KernelNullTypeParameters,
         },
         Column {
             sibling_list_id: usize,
@@ -917,7 +899,7 @@ mod tests {
         data: *mut c_void,
         sibling_list_id: usize,
         value: i32,
-        kind: KernelIntervalYearToMonthType,
+        kind: FfiIntervalYearToMonthType,
     ) {
         let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
         builder.events.push(LiteralEvent::IntervalYearMonth {
@@ -998,27 +980,13 @@ mod tests {
         data: *mut c_void,
         sibling_list_id: usize,
         tag: u8,
-        precision: u8,
-        scale: u8,
+        parameters: KernelNullTypeParameters,
     ) {
         let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
         builder.events.push(LiteralEvent::Null {
             sibling_list_id,
             tag,
-            precision,
-            scale,
-        });
-    }
-
-    extern "C" fn visit_literal_null_interval_year_month(
-        data: *mut c_void,
-        sibling_list_id: usize,
-        kind: KernelIntervalYearToMonthType,
-    ) {
-        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
-        builder.events.push(LiteralEvent::IntervalYearMonthNull {
-            sibling_list_id,
-            kind,
+            parameters,
         });
     }
 
@@ -1051,7 +1019,6 @@ mod tests {
             visit_literal_array: ignore_child_list,
             visit_literal_map: ignore_map_literal,
             visit_literal_null,
-            visit_literal_null_interval_year_month,
             visit_and: ignore_child_list,
             visit_or: ignore_child_list,
             visit_not: ignore_child_list,
@@ -1105,7 +1072,7 @@ mod tests {
         LiteralEvent::IntervalYearMonth {
             sibling_list_id: 0,
             value: 26,
-            kind: KernelIntervalYearToMonthType::IntervalYearToMonth,
+            kind: FfiIntervalYearToMonthType::IntervalYearToMonth,
         }
     )]
     #[case(
@@ -1113,7 +1080,7 @@ mod tests {
         LiteralEvent::IntervalYearMonth {
             sibling_list_id: 0,
             value: 24,
-            kind: KernelIntervalYearToMonthType::IntervalYear,
+            kind: FfiIntervalYearToMonthType::IntervalYear,
         }
     )]
     #[case(
@@ -1121,7 +1088,7 @@ mod tests {
         LiteralEvent::IntervalYearMonth {
             sibling_list_id: 0,
             value: -13,
-            kind: KernelIntervalYearToMonthType::IntervalMonth,
+            kind: FfiIntervalYearToMonthType::IntervalMonth,
         }
     )]
     #[case(
@@ -1133,7 +1100,7 @@ mod tests {
         LiteralEvent::IntervalYearMonth {
             sibling_list_id: 0,
             value: -13,
-            kind: KernelIntervalYearToMonthType::IntervalYearToMonth,
+            kind: FfiIntervalYearToMonthType::IntervalYearToMonth,
         }
     )]
     #[case(
@@ -1141,7 +1108,7 @@ mod tests {
         LiteralEvent::IntervalYearMonth {
             sibling_list_id: 0,
             value: i32::MIN,
-            kind: KernelIntervalYearToMonthType::IntervalYearToMonth,
+            kind: FfiIntervalYearToMonthType::IntervalYearToMonth,
         }
     )]
     #[case(
@@ -1149,7 +1116,23 @@ mod tests {
         LiteralEvent::IntervalYearMonth {
             sibling_list_id: 0,
             value: i32::MAX,
-            kind: KernelIntervalYearToMonthType::IntervalYearToMonth,
+            kind: FfiIntervalYearToMonthType::IntervalYearToMonth,
+        }
+    )]
+    #[case(
+        lit(Scalar::interval_year_month(i32::MAX - 7, IntervalYearToMonthType::IntervalYear).unwrap()),
+        LiteralEvent::IntervalYearMonth {
+            sibling_list_id: 0,
+            value: i32::MAX - 7,
+            kind: FfiIntervalYearToMonthType::IntervalYear,
+        }
+    )]
+    #[case(
+        lit(Scalar::interval_year_month(i32::MAX, IntervalYearToMonthType::IntervalMonth).unwrap()),
+        LiteralEvent::IntervalYearMonth {
+            sibling_list_id: 0,
+            value: i32::MAX,
+            kind: FfiIntervalYearToMonthType::IntervalMonth,
         }
     )]
     #[case(
@@ -1181,9 +1164,7 @@ mod tests {
     #[case(IntervalYearToMonthType::IntervalYear)]
     #[case(IntervalYearToMonthType::IntervalMonth)]
     #[case(IntervalYearToMonthType::IntervalYearToMonth)]
-    fn visit_expression_uses_dedicated_interval_year_month_null_callback(
-        #[case] dtype: IntervalYearToMonthType,
-    ) {
+    fn visit_expression_uses_qualified_null_callback(#[case] dtype: IntervalYearToMonthType) {
         let expression = lit(Scalar::Null(DataType::Primitive(
             PrimitiveType::IntervalYearMonth(dtype),
         )));
@@ -1195,9 +1176,13 @@ mod tests {
         assert_eq!(top_level_id, 0);
         assert_eq!(
             builder.events,
-            vec![LiteralEvent::IntervalYearMonthNull {
+            vec![LiteralEvent::Null {
                 sibling_list_id: 0,
-                kind: dtype.into(),
+                tag: NullTypeTag::IntervalYearMonth as u8,
+                parameters: KernelNullTypeParameters {
+                    interval_year_month_kind: FfiIntervalYearToMonthType::from(dtype) as u32,
+                    ..KernelNullTypeParameters::default()
+                },
             }]
         );
     }
@@ -1224,11 +1209,15 @@ mod tests {
                 LiteralEvent::IntervalYearMonth {
                     sibling_list_id: 1,
                     value: -12,
-                    kind: KernelIntervalYearToMonthType::IntervalYear,
+                    kind: FfiIntervalYearToMonthType::IntervalYear,
                 },
-                LiteralEvent::IntervalYearMonthNull {
+                LiteralEvent::Null {
                     sibling_list_id: 1,
-                    kind: KernelIntervalYearToMonthType::IntervalMonth,
+                    tag: NullTypeTag::IntervalYearMonth as u8,
+                    parameters: KernelNullTypeParameters {
+                        interval_year_month_kind: FfiIntervalYearToMonthType::IntervalMonth as u32,
+                        ..KernelNullTypeParameters::default()
+                    },
                 },
             ]
         );

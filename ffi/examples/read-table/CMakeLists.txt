@@ -16,15 +16,6 @@ target_link_directories(read_table PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../../
 target_link_libraries(read_table PUBLIC delta_kernel_ffi)
 target_compile_options(read_table PUBLIC)
 
-add_executable(schema_roundtrip schema_roundtrip.c ../common/kernel_utils.c)
-target_compile_definitions(schema_roundtrip PUBLIC DEFINE_DEFAULT_ENGINE_BASE)
-target_include_directories(schema_roundtrip PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/ffi-headers"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../common")
-target_link_directories(schema_roundtrip PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/debug")
-target_link_libraries(schema_roundtrip PUBLIC delta_kernel_ffi)
-target_compile_options(schema_roundtrip PUBLIC)
-
 include(CTest)
 # The C string model rejects embedded NULs. UDT_IN_DEV enables the engine-backed annotation
 # round trip against the schema-only Delta fixture.
@@ -49,11 +40,20 @@ target_include_directories(commit_range_commit_files PUBLIC
 target_link_directories(commit_range_commit_files PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/debug")
 target_link_libraries(commit_range_commit_files PUBLIC delta_kernel_ffi)
 set(TestRunner "../../../tests/read-table-testing/run_test.sh")
-set(SchemaRoundtripTestRunner
-  "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/run_schema_roundtrip_test.sh")
 set(DatPath "../../../../acceptance/tests/dat/out/reader_tests/generated")
 set(ExpectedPath "../../../tests/read-table-testing/expected-data")
 set(KernelTestPath "../../../../kernel/tests/data")
+if(PRINT_DATA)
+  # PRINT_DATA=ON supports -a, which avoids reading interval Parquet values; its output includes
+  # a [No data] line. PRINT_DATA=OFF cannot use -a and omits that line.
+  set(
+    IntervalYearMonthSchemaExpected
+    "${ExpectedPath}/interval-year-month-schema-arrow.expected")
+  set(IntervalYearMonthSchemaOptions "-a -cid,period -s")
+else()
+  set(IntervalYearMonthSchemaExpected "${ExpectedPath}/interval-year-month-schema.expected")
+  set(IntervalYearMonthSchemaOptions "-cid,period -s")
+endif()
 add_test(NAME read_and_print_all_prim COMMAND ${TestRunner} ${DatPath}/all_primitive_types/delta/ ${ExpectedPath}/all-prim-types.expected)
 add_test(NAME read_and_print_all_prim_cols COMMAND ${TestRunner} ${DatPath}/all_primitive_types/delta/ ${ExpectedPath}/all-prim-types-cols.expected -cdecimal,float64)
 add_test(NAME read_and_print_nested COMMAND ${TestRunner} ${DatPath}/nested_types/delta/ ${ExpectedPath}/nested-types.expected)
@@ -76,9 +76,9 @@ add_test(NAME commit_range_commit_files_basic_partitioned
   COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/run_commit_range_commit_files_test.sh"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../../acceptance/tests/dat/out/reader_tests/generated/basic_partitioned/delta/"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/expected-data/commit-range-commit-files-basic-partitioned.expected")
-add_test(NAME schema_roundtrip_interval_year_month COMMAND ${SchemaRoundtripTestRunner}
-  "${CMAKE_CURRENT_SOURCE_DIR}/../../../kernel/tests/data/table-with-interval-year-month-schema/"
-  "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/expected-data/interval-year-month-schema-roundtrip.expected")
+add_test(NAME read_interval_year_month_schema COMMAND ${TestRunner}
+  ../../../../acceptance/workloads/interval_types_intv_001_interval_ym_basic/delta/
+  ${IntervalYearMonthSchemaExpected} "${IntervalYearMonthSchemaOptions}")
 if(GEO_TYPE_IN_DEV)
   target_compile_definitions(read_table PUBLIC DEFINE_GEO_TYPE_IN_DEV)
   add_test(NAME read_and_print_geo COMMAND ${TestRunner} ${KernelTestPath}/table-with-geo/ ${ExpectedPath}/table-with-geo.expected)
@@ -88,7 +88,6 @@ endif()
 if(WIN32)
   set(CMAKE_C_FLAGS_DEBUG "/MT")
   target_link_libraries(read_table PUBLIC ws2_32 userenv bcrypt ncrypt crypt32 secur32 ntdll RuntimeObject)
-  target_link_libraries(schema_roundtrip PUBLIC ws2_32 userenv bcrypt ncrypt crypt32 secur32 ntdll RuntimeObject)
 endif(WIN32)
 
 if(MSVC)
@@ -127,10 +126,3 @@ if(PRINT_DATA)
   target_compile_options(read_table PUBLIC ${ARROW_GLIB_CFLAGS_FILTERED})
   target_compile_definitions(read_table PUBLIC PRINT_ARROW_DATA)
 endif(PRINT_DATA)
-
-if(MSVC)
-  target_compile_options(schema_roundtrip PRIVATE /W3 /WX)
-else()
-  target_compile_options(schema_roundtrip PRIVATE -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address)
-  target_link_options(schema_roundtrip PRIVATE -g -fsanitize=address)
-endif()

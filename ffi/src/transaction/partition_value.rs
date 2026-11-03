@@ -14,7 +14,7 @@ use delta_kernel::expressions::Scalar;
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::error::{ExternResult, IntoExternResult};
-use crate::expressions::kernel_visitor::NullTypeTag;
+use crate::expressions::kernel_visitor::{KernelNullTypeParameters, NullTypeTag};
 use crate::handle::Handle;
 use crate::{KernelStringSlice, SharedExternEngine, TryFromStringSlice};
 
@@ -343,11 +343,11 @@ pub unsafe extern "C" fn partition_value_map_insert_decimal(
 
 /// Insert a typed `null` partition value under `name`. The `type_tag` identifies the column's
 /// data type using the same `NullTypeTag` encoding as `visit_expression_literal_null` in
-/// [`kernel_visitor`](crate::expressions::kernel_visitor). For the decimal tag, `precision` and
-/// `scale` specify the decimal parameters; for all other types, pass 0 for both.
+/// [`kernel_visitor`](crate::expressions::kernel_visitor). Fixed types ignore `parameters`.
+/// Decimal and year-month interval nulls read their respective [`KernelNullTypeParameters`] fields.
 ///
-/// Returns an error if the tag is unrecognized, is the non-primitive sentinel (255), or carries an
-/// invalid decimal precision/scale. A null partition value is only legal for a nullable partition
+/// Returns an error if the tag is unrecognized, is the non-primitive sentinel (255), or carries
+/// invalid active parameters. A null partition value is only legal for a nullable partition
 /// column; the kernel rejects it otherwise when the write context is built.
 ///
 /// # Safety
@@ -358,15 +358,14 @@ pub unsafe extern "C" fn partition_value_map_insert_null(
     mut map: Handle<ExclusivePartitionValueMap>,
     name: KernelStringSlice,
     type_tag: u8,
-    precision: u8,
-    scale: u8,
+    parameters: KernelNullTypeParameters,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
     let map = unsafe { map.as_mut() };
     let engine = unsafe { engine.as_ref() };
     let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let scalar = NullTypeTag::try_from(type_tag)
-        .and_then(|tag| tag.to_data_type(precision, scale))
+        .and_then(|tag| tag.to_data_type(parameters))
         .map(Scalar::Null);
     let result = partition_value_map_insert_impl(map, name, scalar);
     unsafe { result.into_extern_result(&engine) }
@@ -434,7 +433,7 @@ mod tests {
             inner: HashMap::new(),
         };
         let scalar = NullTypeTag::try_from(NullTypeTag::Integer as u8)
-            .and_then(|tag| tag.to_data_type(0, 0))
+            .and_then(|tag| tag.to_data_type(KernelNullTypeParameters::default()))
             .map(Scalar::Null);
         partition_value_map_insert_impl(&mut map, Ok("p"), scalar).unwrap();
         assert_eq!(
@@ -605,13 +604,17 @@ mod tests {
 
             // Decimal null carries precision/scale through to the data type.
             let n = "dec_null";
+            let decimal_parameters = KernelNullTypeParameters {
+                decimal_precision: 10,
+                decimal_scale: 2,
+                interval_year_month_kind: 0,
+            };
             ok_or_panic(unsafe {
                 partition_value_map_insert_null(
                     map.shallow_copy(),
                     kernel_string_slice!(n),
                     NullTypeTag::Decimal as u8,
-                    10,
-                    2,
+                    decimal_parameters,
                     engine.shallow_copy(),
                 )
             });
@@ -621,6 +624,31 @@ mod tests {
                 unsafe { map.as_ref() }.inner.get("dec_null"),
                 Some(&expected)
             );
+
+            for (name, kind, data_type) in [
+                ("year_null", 1, DataType::INTERVAL_YEAR),
+                ("month_null", 2, DataType::INTERVAL_MONTH),
+                ("year_month_null", 3, DataType::INTERVAL_YEAR_MONTH),
+            ] {
+                let parameters = KernelNullTypeParameters {
+                    decimal_precision: 0,
+                    decimal_scale: 0,
+                    interval_year_month_kind: kind,
+                };
+                ok_or_panic(unsafe {
+                    partition_value_map_insert_null(
+                        map.shallow_copy(),
+                        kernel_string_slice!(name),
+                        NullTypeTag::IntervalYearMonth as u8,
+                        parameters,
+                        engine.shallow_copy(),
+                    )
+                });
+                assert_eq!(
+                    unsafe { map.as_ref() }.inner.get(name),
+                    Some(&Scalar::Null(data_type))
+                );
+            }
 
             // The non-primitive sentinel and unrecognized tags are rejected.
             let expect_err = |result: ExternResult<bool>| match result {
@@ -633,8 +661,7 @@ mod tests {
                     map.shallow_copy(),
                     kernel_string_slice!(n),
                     NullTypeTag::NonPrimitive as u8,
-                    0,
-                    0,
+                    KernelNullTypeParameters::default(),
                     engine.shallow_copy(),
                 )
             });
@@ -643,9 +670,33 @@ mod tests {
                 partition_value_map_insert_null(
                     map.shallow_copy(),
                     kernel_string_slice!(n),
+                    NullTypeTag::IntervalYearMonth as u8,
+                    KernelNullTypeParameters::default(),
+                    engine.shallow_copy(),
+                )
+            });
+            assert_eq!(err, FFIKernelError::SchemaError);
+            let invalid_kind = KernelNullTypeParameters {
+                decimal_precision: 0,
+                decimal_scale: 0,
+                interval_year_month_kind: 42,
+            };
+            let err = expect_err(unsafe {
+                partition_value_map_insert_null(
+                    map.shallow_copy(),
+                    kernel_string_slice!(n),
+                    NullTypeTag::IntervalYearMonth as u8,
+                    invalid_kind,
+                    engine.shallow_copy(),
+                )
+            });
+            assert_eq!(err, FFIKernelError::SchemaError);
+            let err = expect_err(unsafe {
+                partition_value_map_insert_null(
+                    map.shallow_copy(),
+                    kernel_string_slice!(n),
                     200, // unrecognized tag
-                    0,
-                    0,
+                    KernelNullTypeParameters::default(),
                     engine.shallow_copy(),
                 )
             });

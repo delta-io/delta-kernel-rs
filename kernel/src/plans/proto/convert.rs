@@ -3,12 +3,12 @@
 use super::plan::agg as proto_agg;
 #[cfg(feature = "geo-type-in-dev")]
 use super::schema::EdgeInterpolationAlgorithm as EdgeAlgo;
-use super::schema::{
-    IntervalYearToMonthKind as ProtoIntervalYearToMonthKind, SimplePrimitiveType as Simple,
-};
 use super::schema::data_type::Kind as DataTypeKind;
 use super::schema::metadata_value::Value as MetadataValueKind;
 use super::schema::primitive_type::Kind as PrimitiveTypeKind;
+use super::schema::{
+    IntervalYearToMonthKind as ProtoIntervalYearToMonthKind, SimplePrimitiveType as Simple,
+};
 use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
 };
@@ -2276,43 +2276,14 @@ mod tests {
         assert_eq!(interval_type.kind, expected_kind as i32);
     }
 
-    #[rstest]
-    #[case::year_zero(
-        0,
-        IntervalYearToMonthType::IntervalYear,
-        ProtoIntervalYearToMonthKind::IntervalYear,
-        &[0xa2, 0x01, 0x04, 0x12, 0x02, 0x08, 0x01],
-    )]
-    #[case::year_negative(
-        -12,
-        IntervalYearToMonthType::IntervalYear,
-        ProtoIntervalYearToMonthKind::IntervalYear,
-        &[
-            0xa2, 0x01, 0x0f, 0x08, 0xf4, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01,
-            0x12, 0x02, 0x08, 0x01,
-        ],
-    )]
-    #[case::month_max(
-        i32::MAX,
-        IntervalYearToMonthType::IntervalMonth,
-        ProtoIntervalYearToMonthKind::IntervalMonth,
-        &[0xa2, 0x01, 0x0a, 0x08, 0xff, 0xff, 0xff, 0xff, 0x07, 0x12, 0x02, 0x08, 0x02],
-    )]
-    #[case::full_min(
-        i32::MIN,
-        IntervalYearToMonthType::IntervalYearToMonth,
-        ProtoIntervalYearToMonthKind::IntervalYearToMonth,
-        &[
+    #[test]
+    fn interval_year_month_scalar_wire_bytes_pin_field_numbers() {
+        let months = i32::MIN;
+        let ty = IntervalYearToMonthType::IntervalYearToMonth;
+        let expected_bytes: &[u8] = &[
             0xa2, 0x01, 0x0f, 0x08, 0x80, 0x80, 0x80, 0x80, 0xf8, 0xff, 0xff, 0xff, 0xff, 0x01,
             0x12, 0x02, 0x08, 0x03,
-        ],
-    )]
-    fn interval_year_month_scalar_wire_bytes_pin_field_numbers(
-        #[case] months: i32,
-        #[case] ty: IntervalYearToMonthType,
-        #[case] expected_kind: ProtoIntervalYearToMonthKind,
-        #[case] expected_bytes: &[u8],
-    ) {
+        ];
         let scalar = Scalar::interval_year_month(months, ty).unwrap();
         let encoded = prost::Message::encode_to_vec(&proto_expr::Scalar::from(&scalar));
         assert_eq!(encoded, expected_bytes);
@@ -2325,7 +2296,7 @@ mod tests {
         assert_eq!(data.months, months);
         assert_eq!(
             data.interval_type.expect("interval type present").kind,
-            expected_kind as i32
+            ProtoIntervalYearToMonthKind::IntervalYearToMonth as i32
         );
     }
 

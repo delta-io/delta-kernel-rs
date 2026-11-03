@@ -19,14 +19,6 @@ cargo build -p delta_kernel_ffi --release
 # - delta_kernel_ffi.hpp (C++)
 ```
 
-The generated headers expose `KERNEL_FFI_ABI_VERSION` and the runtime
-`kernel_ffi_abi_version()` function. Check these values before filling visitor
-structs, because visitor layouts can change between ABI versions. Version 2
-changes schema and expression visitor layouts for year-month intervals; a
-missing accessor or mismatched value is incompatible with these headers. This
-check is explicit: old consumers are not automatically protected from loading a
-newer library.
-
 ### Feature flags
 
 | Feature | Default | Description |
@@ -196,23 +188,10 @@ borrowed slices. Don't retain the callback's state.
 | `visit_field_void` | Build a void primitive `StructField` |
 | `visit_field_string` / `visit_field_binary` / `visit_field_date` / `visit_field_timestamp` / `visit_field_timestamp_ntz` | Build a string, binary, or date/time primitive `StructField` |
 | `visit_field_decimal` | Build a decimal `StructField` with explicit precision and scale |
-| `visit_field_interval_year_month` | Build an `interval year`, `interval month`, or `interval year to month` field with an explicit `KernelIntervalYearToMonthType` kind (`1`, `2`, or `3`) |
+| `visit_field_interval_year_month` | Build an `interval year`, `interval month`, or `interval year to month` field with an explicit `FfiIntervalYearToMonthType` kind (`1`, `2`, or `3`) |
 | `visit_field_geometry` / `visit_field_geography` | Build a geospatial `StructField` (geometry with a CRS; geography with a CRS and edge-interpolation algorithm) |
 | `visit_field_struct` / `visit_field_array` / `visit_field_map` / `visit_field_variant` | Build a complex `StructField` (struct, array, map, or variant) from previously created field or struct IDs |
 | `visit_metadata_value` | Insert a UTF-8 value tagged with `CMetadataValueKind` into the active field metadata map |
-
-`KernelIntervalYearToMonthType` is the outgoing `repr(C)` enum used in visitor
-callbacks. Engine-to-kernel constructors receive the same values as `u32`: `1`
-for `interval year`, `2` for `interval month`, and `3` for
-`interval year to month`. `visit_field_interval_year_month` validates the
-incoming kind before it invokes metadata callbacks or inserts a field into the
-visitor state. Invalid kind values return `FFIKernelError::SchemaError` through
-your `allocate_error` callback. The failed call leaves existing IDs usable and
-does not insert a new field; recover the allocated error exactly once before
-retrying. Kernel copies metadata keys and values before returning. It does not
-retain the optional borrowed synchronous `EngineMetadata` descriptor, its
-callback state, or borrowed string slices. Returned IDs are owned by the builder
-state and can be passed to complex field builders.
 
 **Reading (scans)**
 
@@ -302,6 +281,7 @@ unpartitioned writes.
 | `free_write_state` / `free_write_context_builder` | Release unused owned handles |
 | `update_table_txn_get_unpartitioned_write_context` | Get a `SharedWriteContext` covering all rows in the transaction |
 | `update_table_txn_get_partitioned_write_context` | Get a `SharedWriteContext` for one partition (requires a `PartitionValueMap`) |
+| `partition_value_map_insert_null` | Insert a typed null; decimal and year-month tags use their `KernelNullTypeParameters` fields, while other tags ignore the record |
 | `get_write_dir` | Return the recommended write subdirectory for a partitioned `SharedWriteContext` |
 | `get_write_path` | Return the table root URL from a `SharedWriteContext` (engines append their own subdirectory and filename) |
 | `get_write_schema` | Return the logical (user-facing) write schema from a `SharedWriteContext` |
@@ -415,38 +395,23 @@ Kernel's expression system is exposed through two parallel surfaces:
 
 Most engines need only one of the two surfaces.
 
+`EngineExpressionVisitor.visit_literal_null` receives the type tag and
+`KernelNullTypeParameters` by value. Year-month nulls carry their qualifier in the parameter record.
+
 | Function | Purpose |
 |----------|---------|
 | `visit_engine_expression` / `visit_engine_predicate` | Build a Kernel `SharedExpression` / `SharedPredicate` from an engine-side AST (Build surface) |
 | `visit_expression` / `visit_predicate` | Walk a Kernel expression or predicate with an `EngineExpressionVisitor` (Walk surface) |
 | `visit_expression_ref` / `visit_predicate_ref` | Walk a pre-interned expression or predicate reference (Walk surface) |
 | `visit_expression_column` / `visit_expression_struct` / `visit_expression_plus` / `visit_expression_literal_*` / ... | Builder functions the engine calls from inside `visit_engine_expression` to construct Kernel expression nodes; see `delta_kernel_ffi.h` for the full list |
-| `visit_expression_literal_interval_year_month` / `visit_expression_literal_null_interval_year_month` | Build year-month interval literals and typed nulls with an explicit `KernelIntervalYearToMonthType` kind (`1`, `2`, or `3`) |
+| `visit_expression_literal_interval_year_month` | Build a year-month interval literal with an explicit `FfiIntervalYearToMonthType` kind (`1`, `2`, or `3`) |
+| `visit_expression_literal_null` | Build a typed null; decimal and year-month tags use their `KernelNullTypeParameters` fields, while other tags ignore the record |
 | `visit_predicate_eq` / `visit_predicate_and` / `visit_predicate_or` / ... | Builder functions the engine calls from inside `visit_engine_predicate` to construct Kernel predicate nodes |
 | `visit_expression_unknown` / `visit_predicate_unknown` | Builder helpers that bridge an opaque engine operator through Kernel unchanged |
 | `visit_kernel_opaque_expression_op_name` / `visit_kernel_opaque_predicate_op_name` | Inspect the name of an opaque op carried through by the above |
 | `new_expression_evaluator` / `evaluate_expression` / `free_expression_evaluator` | Compile and invoke an expression against an `EngineData` batch |
 | `expressions_are_equal` / `predicates_are_equal` | Compare two expressions or predicates for structural equality |
 | `free_kernel_expression` / `free_kernel_predicate` / `free_kernel_opaque_expression_op` / `free_kernel_opaque_predicate_op` | Release the corresponding handles |
-
-Year-month interval literals carry a signed `i32` total-month count. `interval year`
-values must be divisible by 12; other values return `InvalidIntervalError`. The inbound kind values
-match `KernelIntervalYearToMonthType`: `1` for `interval year`, `2` for
-`interval month`, and `3` for `interval year to month`. Invalid kind values
-return `FFIKernelError::SchemaError` through `allocate_error`, leave existing
-IDs usable, and do not insert a new expression node. Recover the allocated
-error exactly once before retrying.
-
-The generic expression-null builder rejects tag `13` for year-month intervals
-with `FFIKernelError::GenericError`; use
-`visit_expression_literal_null_interval_year_month` so the null carries the
-same qualifier as a non-null year-month interval literal. Tag `14` remains the
-generic interval day-time null tag, and decimal tag `12` keeps its shared
-precision/scale behavior. When Kernel walks an expression,
-`EngineExpressionVisitor` receives year-month interval values and year-month
-interval nulls through qualifier-aware callbacks. The callback arguments are
-borrowed only for the duration of the call, and the engine owns any
-representation it stores.
 
 **Tracing**
 
