@@ -6,13 +6,16 @@ use std::sync::LazyLock;
 use super::utils::{
     DELETION_VECTOR_NAME, OFFSET_NAME, PATH_OR_INLINE_DV_NAME, STORAGE_TYPE_NAME,
     columns_and_types_from_schema, dv_id_at, validate_partition_keys,
-    validate_required_field_exist,
+    validate_required_field_exist, validate_row_tracking_metadata,
 };
-use super::{FileActionUniquenessValidator, StagedDataValidator, Validation};
+use super::{
+    FileActionUniquenessValidator, RowTrackingEnablement, StagedDataValidator, Validation,
+};
 use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::expressions::column_name;
 use crate::scan::log_replay::{
-    FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
+    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME,
+    PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
 };
 use crate::schema::ColumnNamesAndTypes;
 use crate::transaction::imperative::update_table::{
@@ -29,6 +32,8 @@ const PARTITION_VALUES: usize = 3;
 const OLD_DELETION_VECTOR_STORAGE_TYPE: usize = 4;
 /// The to-be-attached deletion vector's `storageType` column in [`intermediate_dv_schema`].
 const NEW_DELETION_VECTOR_STORAGE_TYPE: usize = 7;
+const BASE_ROW_ID: usize = 10;
+const DEFAULT_ROW_COMMIT_VERSION: usize = 11;
 const MODIFICATION_TIME_NAME: &str = "modificationTime";
 
 static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNamesAndTypes>> =
@@ -44,6 +49,8 @@ static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNames
             column_name!(NEW_DELETION_VECTOR_NAME, STORAGE_TYPE_NAME),
             column_name!(NEW_DELETION_VECTOR_NAME, PATH_OR_INLINE_DV_NAME),
             column_name!(NEW_DELETION_VECTOR_NAME, OFFSET_NAME),
+            column_name!(FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME),
+            column_name!(FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME),
         ];
         columns_and_types_from_schema(intermediate_dv_schema(), names)
     });
@@ -56,15 +63,21 @@ static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNames
 pub(crate) fn validate_dv_matched_files(
     dv_matched_files: &[FilteredEngineData],
     physical_partition_columns: impl IntoIterator<Item = String>,
+    row_tracking_enablement: RowTrackingEnablement,
     uniqueness_validator: Option<&mut FileActionUniquenessValidator>,
 ) -> KernelResult<()> {
-    StagedDataValidator::for_dv_updates(physical_partition_columns, uniqueness_validator)?
-        .validate_selected_rows(dv_matched_files)
+    StagedDataValidator::for_dv_updates(
+        physical_partition_columns,
+        row_tracking_enablement,
+        uniqueness_validator,
+    )?
+    .validate_selected_rows(dv_matched_files)
 }
 
 /// Mandatory validations for every selected DV-update row.
 struct MandatoryDvUpdateValidation {
     physical_partition_columns: HashSet<String>,
+    row_tracking_enablement: RowTrackingEnablement,
 }
 
 impl Validation for MandatoryDvUpdateValidation {
@@ -104,6 +117,14 @@ impl Validation for MandatoryDvUpdateValidation {
             path,
             MODIFICATION_TIME_NAME,
         )?;
+        if self.row_tracking_enablement == RowTrackingEnablement::Enabled {
+            validate_row_tracking_metadata(
+                path,
+                getters[BASE_ROW_ID].get_opt(row, BASE_ROW_ID_NAME)?,
+                getters[DEFAULT_ROW_COMMIT_VERSION]
+                    .get_opt(row, DEFAULT_ROW_COMMIT_VERSION_NAME)?,
+            )?;
+        }
         Ok(())
     }
 }
@@ -131,6 +152,7 @@ impl Validation for DvUpdateUniquenessValidation<'_> {
 impl<'a> StagedDataValidator<'a> {
     fn for_dv_updates(
         physical_partition_columns: impl IntoIterator<Item = String>,
+        row_tracking_enablement: RowTrackingEnablement,
         uniqueness_validator: Option<&'a mut FileActionUniquenessValidator>,
     ) -> KernelResult<Self> {
         let columns = DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION
@@ -143,6 +165,7 @@ impl<'a> StagedDataValidator<'a> {
         let mut validations: Vec<Box<dyn Validation + 'a>> =
             vec![Box::new(MandatoryDvUpdateValidation {
                 physical_partition_columns: physical_partition_columns.into_iter().collect(),
+                row_tracking_enablement,
             })];
         if let Some(uniqueness_validator) = uniqueness_validator {
             validations.push(Box::new(DvUpdateUniquenessValidation {
@@ -274,7 +297,15 @@ mod tests {
             names[NEW_DELETION_VECTOR_STORAGE_TYPE + 2],
             column_name!(NEW_DELETION_VECTOR_NAME, OFFSET_NAME)
         );
-        assert_eq!(names.len(), 10);
+        assert_eq!(
+            names[BASE_ROW_ID],
+            column_name!(FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME)
+        );
+        assert_eq!(
+            names[DEFAULT_ROW_COMMIT_VERSION],
+            column_name!(FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME)
+        );
+        assert_eq!(names.len(), 12);
     }
 
     #[rstest]
@@ -318,6 +349,7 @@ mod tests {
         let mut uniqueness_validator = FileActionUniquenessValidator::default();
         let result = StagedDataValidator::for_dv_updates(
             std::iter::empty(),
+            RowTrackingEnablement::Disabled,
             dedup_validation_enabled.then_some(&mut uniqueness_validator),
         )
         .expect("DV validator should use the intermediate DV schema")
@@ -345,10 +377,14 @@ mod tests {
             vec![true],
         )];
         let mut uniqueness_validator = FileActionUniquenessValidator::default();
-        StagedDataValidator::for_dv_updates(std::iter::empty(), Some(&mut uniqueness_validator))
-            .expect("DV validator should use the intermediate DV schema")
-            .validate_selected_rows(&batches)
-            .expect("protocol-valid boundary value should be accepted");
+        StagedDataValidator::for_dv_updates(
+            std::iter::empty(),
+            RowTrackingEnablement::Disabled,
+            Some(&mut uniqueness_validator),
+        )
+        .expect("DV validator should use the intermediate DV schema")
+        .validate_selected_rows(&batches)
+        .expect("protocol-valid boundary value should be accepted");
     }
 
     #[rstest]
@@ -382,6 +418,7 @@ mod tests {
         assert_result_error_with_message(
             StagedDataValidator::for_dv_updates(
                 std::iter::empty(),
+                RowTrackingEnablement::Disabled,
                 Some(&mut uniqueness_validator),
             )
             .expect("DV validator should use the intermediate DV schema")
@@ -413,6 +450,7 @@ mod tests {
         let mut uniqueness_validator = FileActionUniquenessValidator::default();
         let result = StagedDataValidator::for_dv_updates(
             ["p1".to_string(), "p2".to_string()],
+            RowTrackingEnablement::Disabled,
             Some(&mut uniqueness_validator),
         )
         .expect("DV validator should use the intermediate DV schema")

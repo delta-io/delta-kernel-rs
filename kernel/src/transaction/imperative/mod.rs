@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use tracing::instrument;
 use update_table::{intermediate_dv_schema, new_dv_column_schema};
+use write_validation::RowTrackingEnablement;
 
 use super::stats_verifier::StatsColumnVerifier;
 use super::{
@@ -328,14 +329,24 @@ impl<STATE> Transaction<STATE, Imperative> {
             )?;
         }
 
+        let row_tracking_enablement = if self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::RowTracking)
+        {
+            RowTrackingEnablement::Enabled
+        } else {
+            RowTrackingEnablement::Disabled
+        };
         write_validation::validate_dv_matched_files(
             &self.staged_data_changes.dv_matched_files,
             self.effective_table_config.physical_partition_columns(),
+            row_tracking_enablement,
             uniqueness_validator.as_mut(),
         )?;
 
         write_validation::validate_remove_files(
             &self.staged_data_changes.remove_files_metadata,
+            row_tracking_enablement,
             uniqueness_validator.as_mut(),
         )?;
 
