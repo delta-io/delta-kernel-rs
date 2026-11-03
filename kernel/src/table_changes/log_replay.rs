@@ -51,13 +51,17 @@ pub(crate) struct TableChangesScanMetadata {
 ///
 /// Note: The [`ParsedLogPath`]s in the `commit_files` iterator must be ordered, contiguous
 /// (JSON) commit files.
-pub(crate) fn table_changes_action_iter(
+pub(crate) fn table_changes_action_iter<I>(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
-    commit_files: impl IntoIterator<Item = ParsedLogPath, IntoIter: Send>,
+    commit_files: I,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
-) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
+) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata> + use<I>>
+where
+    I: IntoIterator<Item = ParsedLogPath>,
+    I::IntoIter: Send,
+{
     // The data-reading (`execute`) path always uses change-data-file semantics.
     table_changes_action_iter_with_mode(
         engine,
@@ -74,14 +78,18 @@ pub(crate) fn table_changes_action_iter(
 /// [`CdfMode::ChangeDataFeed`] uses `AddCDCFile` actions because they contain changes recorded by
 /// the writer. [`CdfMode::RowTracking`] ignores those actions and reconstructs changes from
 /// row lineage in the data files referenced by `add` and `remove` actions.
-pub(crate) fn table_changes_action_iter_with_mode(
+pub(crate) fn table_changes_action_iter_with_mode<I>(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
-    commit_files: impl IntoIterator<Item = ParsedLogPath, IntoIter: Send>,
+    commit_files: I,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
     mode: CdfMode,
-) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
+) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata> + use<I>>
+where
+    I: IntoIterator<Item = ParsedLogPath>,
+    I::IntoIter: Send,
+{
     // Skip against the raw `{ add, remove, ... }` action batch: table_changes must resolve
     // deletion vector pairs before filtering, so unlike the scan path it operates on raw
     // batches with stats parsed from `add.stats` JSON.
@@ -335,7 +343,7 @@ impl LogReplayScanner {
         self,
         engine: Arc<dyn Engine>,
         filter: Option<Arc<DataSkippingFilter>>,
-    ) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
+    ) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata> + use<>> {
         let Self {
             has_cdc_action,
             remove_dvs,

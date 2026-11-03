@@ -37,7 +37,7 @@ pub(crate) fn resolve_scan_file_dv(
     engine: &dyn Engine,
     table_root: &Url,
     scan_file: CdfScanFile,
-) -> KernelResult<impl Iterator<Item = ResolvedCdfScanFile>> {
+) -> KernelResult<impl Iterator<Item = ResolvedCdfScanFile> + use<>> {
     let add_dv = scan_file.dv_info.get_treemap(engine, table_root)?;
     let rm_dv = scan_file
         .remove_dv
