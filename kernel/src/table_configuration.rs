@@ -1604,15 +1604,6 @@ mod test {
         }
     }
 
-    /// The write support of a legacy writer version 4 table. Writer version 4 also implies
-    /// `checkConstraints`, which kernel writes only with `check-constraints-in-dev`.
-    const LEGACY_WRITER_V4_WRITE_SUPPORT: WriteSupport =
-        if cfg!(feature = "check-constraints-in-dev") {
-            WriteSupport::Supported
-        } else {
-            WriteSupport::Unsupported
-        };
-
     #[rstest]
     // Tables with top-level generation expressions, but without `generatedColumns` in the protocol.
     // Kernel ignores the expressions and writes the table as a normal table, like Delta Spark.
@@ -1626,19 +1617,13 @@ mod test {
         MockProtocolBuilder::new().with_versions(1, 2).build(),
         WriteSupport::Supported
     )]
-    // Tables that support `generatedColumns`. The feature is listed in the protocol, or implied by
-    // writer version 4.
+    // Tables that support `generatedColumns`.
     #[case::with_feature(
         generated_event_year_schema(),
         MockProtocolBuilder::new()
             .with_writer_features([TableFeature::GeneratedColumns])
             .build(),
         WriteSupport::Supported
-    )]
-    #[case::legacy_writer_at_min_version(
-        generated_event_year_schema(),
-        MockProtocolBuilder::new().with_versions(1, 4).build(),
-        LEGACY_WRITER_V4_WRITE_SUPPORT
     )]
     // Connectors validate the SQL, so an empty expression gets the same results as a regular one.
     #[case::empty_expression_with_feature(

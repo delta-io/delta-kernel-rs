@@ -314,6 +314,7 @@ async fn schema_changes_fail_only_on_tables_with_generated_columns(
     #[case] operation: UpdateTableOperation,
     #[case] data_change: bool,
     #[values(true, false)] lists_feature: bool,
+    #[values(true, false)] has_expression: bool,
 ) -> KernelResult<()> {
     let (_tmp, table_path, engine) = test_table_setup()?;
     let writer_features = if lists_feature {
@@ -321,7 +322,8 @@ async fn schema_changes_fail_only_on_tables_with_generated_columns(
     } else {
         &[]
     };
-    let table_url = write_table(&table_path, writer_features, EVENT_YEAR).await?;
+    let generated = if has_expression { EVENT_YEAR } else { &[] };
+    let table_url = write_table(&table_path, writer_features, generated).await?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let result = begin_transaction_with(
@@ -333,12 +335,52 @@ async fn schema_changes_fail_only_on_tables_with_generated_columns(
         |builder| builder.add_column(StructField::nullable("note", DataType::STRING)),
     );
 
-    if lists_feature {
+    if lists_feature && has_expression {
         let expected = "Schema changes are not yet supported on tables with generated columns";
         let rejected = matches!(&result, Err(KernelError::Unsupported(msg)) if msg == expected);
         assert!(rejected);
     } else {
         let _txn = result?;
     }
+    Ok(())
+}
+
+#[rstest]
+#[case::alter_table(UpdateTableOperation::AlterTable, false)]
+#[case::write_with_schema_evolution(UpdateTableOperation::Write, true)]
+#[tokio::test]
+async fn adding_a_column_with_a_generation_expression_fails(
+    #[case] operation: UpdateTableOperation,
+    #[case] data_change: bool,
+    #[values(true, false)] nested: bool,
+) -> KernelResult<()> {
+    let (_tmp, table_path, engine) = test_table_setup()?;
+    // The table supports `generatedColumns` but has no generated columns, so other schema changes
+    // pass.
+    let table_url = write_table(&table_path, GENERATED_COLUMNS_FEATURE, &[]).await?;
+    let generated = StructField::nullable("next_age", DataType::INTEGER).add_metadata([(
+        ColumnMetadataKey::GenerationExpression.as_ref(),
+        MetadataValue::String("age + 1".to_string()),
+    )]);
+    let added = if nested {
+        let details = StructType::try_new([generated]).expect("test schema must be valid");
+        StructField::nullable("details", details)
+    } else {
+        generated
+    };
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let result = begin_transaction_with(
+        snapshot,
+        engine.as_ref(),
+        operation,
+        "Test/1.0",
+        data_change,
+        |builder| builder.add_column(added),
+    );
+
+    let key = ColumnMetadataKey::GenerationExpression.as_ref();
+    let rejected = matches!(&result, Err(KernelError::Schema(msg)) if msg.contains(key));
+    assert!(rejected);
     Ok(())
 }
