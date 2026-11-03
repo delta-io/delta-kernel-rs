@@ -408,9 +408,14 @@ static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     feature_requirements: &[],
     kernel_support: KernelSupport::Custom(|protocol, _properties, operation| match operation {
         Operation::Write
-            if cfg!(feature = "concurrent-identity-columns-in-dev")
-                && protocol.has_table_feature(&TableFeature::ConcurrentIdentityColumns) =>
+            if protocol.has_table_feature(&TableFeature::ConcurrentIdentityColumns) =>
         {
+            if !cfg!(feature = "concurrent-identity-columns-in-dev") {
+                return Err(KernelError::unsupported(
+                    "Feature 'concurrentIdentityColumns' requires the \
+                     `concurrent-identity-columns-in-dev` cargo feature.",
+                ));
+            }
             Ok(())
         }
         Operation::Write => Err(KernelError::unsupported(

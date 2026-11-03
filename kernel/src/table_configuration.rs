@@ -306,7 +306,8 @@ pub(crate) struct TableConfiguration {
     logical_schema: SchemaRef,
     /// Whether any field in the logical schema declares a column default.
     has_column_with_default: bool,
-    /// Whether the logical schema has a top-level Concurrent Identity Column.
+    /// Whether the logical schema has a top-level field that carries a `sequenceId`. Also set when
+    /// the table does not support `concurrentIdentityColumns`. Kernel then rejects data writes.
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
     has_concurrent_identity_column: bool,
     /// The subset of the logical schema that remains after excluding partition columns.
@@ -2727,29 +2728,38 @@ mod test {
             .unwrap();
     }
 
+    // Each case drops one requirement of `concurrentIdentityColumns`. The write is then rejected
+    // by the feature-requirement check.
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
-    #[test]
-    fn concurrent_identity_columns_write_requires_catalog_managed() {
-        // Dropping `catalogManaged` (and its inCommitTimestamp) leaves an incomplete CIC protocol;
-        // the write is rejected by the feature-requirement check.
+    #[rstest]
+    #[case::missing_catalog_managed(
+        &[TableFeature::IdentityColumns, TableFeature::ConcurrentIdentityColumns],
+        "requires 'catalogManaged'"
+    )]
+    #[case::missing_identity_columns(
+        &[
+            TableFeature::ConcurrentIdentityColumns,
+            TableFeature::CatalogManaged,
+            TableFeature::InCommitTimestamp,
+        ],
+        "requires 'identityColumns'"
+    )]
+    fn concurrent_identity_columns_write_rejected_with_incomplete_protocol(
+        #[case] features: &[TableFeature],
+        #[case] expected_error: &str,
+    ) {
         let schema = StructType::try_new(vec![concurrent_identity_column(
             "id", "seq-abc", 1, 1, false,
         )])
         .expect("valid schema");
         let config = MockTableConfigurationBuilder::new()
             .with_schema(schema)
-            .with_protocol(
-                MockProtocolBuilder::new()
-                    .with_features([
-                        TableFeature::IdentityColumns,
-                        TableFeature::ConcurrentIdentityColumns,
-                    ])
-                    .build(),
-            )
+            .with_properties([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
+            .with_protocol(MockProtocolBuilder::new().with_features(features).build())
             .build();
         assert_result_error_with_message(
             config.ensure_operation_supported(Operation::Write),
-            "requires 'catalogManaged'",
+            expected_error,
         );
     }
 
@@ -2764,6 +2774,14 @@ mod test {
         "delta.identity.highWaterMark"
     )]
     #[case::step_zero(concurrent_identity_column("id2", "seq-2", 1, 0, false), "step 0")]
+    #[case::nested_cic(
+        StructField::nullable(
+            "wrapper",
+            StructType::try_new(vec![concurrent_identity_column("id2", "seq-2", 1, 1, false)])
+                .unwrap(),
+        ),
+        "nested"
+    )]
     fn concurrent_identity_columns_write_rejected_but_scan_allowed(
         #[case] field: StructField,
         #[case] expected_error: &str,

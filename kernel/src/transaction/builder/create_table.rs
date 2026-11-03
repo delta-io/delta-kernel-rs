@@ -1099,6 +1099,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
                  CREATE TABLE",
             ));
         }
+        // Defensive check: It prevents the creation of a table it cannot write once #3586 lands.
         table_configuration.validate_concurrent_identity_columns()?;
 
         // Create Transaction<CreateTable> with the effective table configuration
