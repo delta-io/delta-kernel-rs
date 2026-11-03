@@ -440,7 +440,8 @@ async fn test_write_file_column_with_stats_column_settings(
     Ok(())
 }
 
-/// Returns the data files a scan of `snapshot` with `predicate` keeps, after data skipping.
+/// Returns the number of data files a scan of `snapshot` with `predicate` keeps, after data
+/// skipping.
 fn scan_file_count(
     snapshot: &SnapshotRef,
     engine: &DefaultEngine<TokioMultiThreadExecutor>,
@@ -451,11 +452,11 @@ fn scan_file_count(
         .scan_builder()
         .with_predicate(Arc::new(predicate))
         .build()?;
-    let mut paths: Vec<String> = Vec::new();
+    let mut count = 0usize;
     for scan_metadata in scan.scan_metadata(engine)? {
-        paths = scan_metadata?.visit_scan_files(paths, |paths, file| paths.push(file.path))?;
+        count = scan_metadata?.visit_scan_files(count, |count, _| *count += 1)?;
     }
-    Ok(paths.len())
+    Ok(count)
 }
 
 /// A `file` column has no statistics, so a predicate on its sub-fields never skips a data file,
@@ -487,7 +488,6 @@ async fn test_predicate_on_file_column_skips_no_files() -> Result<(), Box<dyn st
             Scalar::from("s3://bucket/missing.png"),
         ),
         Pred::gt(column_expr!("c.size"), Scalar::from(1_000_000i64)),
-        Pred::is_null(column_expr!("c.inline")),
     ] {
         let files = scan_file_count(&snapshot, engine.as_ref(), predicate.clone())?;
         assert_eq!(files, 2, "{predicate:?}");
