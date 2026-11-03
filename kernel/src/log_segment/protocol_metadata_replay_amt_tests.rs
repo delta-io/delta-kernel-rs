@@ -604,11 +604,11 @@ async fn plan_replay_bounded_by_crc_or_checkpoint_runs_one_plan(
 )]
 #[case::newest_manifest_commit_also_has_pm(
     vec![
-        standalone_pm_commit(one_column_schema()),
+        protocol_and_metadata_lines(one_column_schema(), &[]),
         format!(
             "{}\n{}",
             checkpoint_commit(1, &[], one_column_schema()),
-            standalone_pm_commit(one_column_schema())
+            protocol_and_metadata_lines(one_column_schema(), &[])
         ),
     ],
     Some(1),
