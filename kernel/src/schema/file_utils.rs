@@ -68,6 +68,55 @@ pub(crate) fn validate_file_type_feature_support(tc: &TableConfiguration) -> Ker
     Ok(())
 }
 
+/// The parts of a schema that lead to `file` values: each `file`, and the structs, arrays and maps
+/// that contain one. Other fields are left out, so validating and writing `file` values walk only
+/// these paths.
+// Validating and writing `file` values, the only users, need `default-engine-base`.
+#[cfg(feature = "default-engine-base")]
+#[derive(Debug)]
+pub(crate) enum FilePaths {
+    File,
+    /// The fields of a struct that contain a `file`.
+    Struct(Vec<(String, FilePaths)>),
+    Array(Box<FilePaths>),
+    /// The value of a map. A `file` cannot be in a map key.
+    Map(Box<FilePaths>),
+}
+
+#[cfg(feature = "default-engine-base")]
+impl FilePaths {
+    /// Returns the paths to the `file` values in `schema`, or `None` if it has none. Each field is
+    /// visited once. Fails if a map key contains a `file`.
+    pub(crate) fn from_schema(schema: &StructType) -> KernelResult<Option<Self>> {
+        let mut fields = Vec::new();
+        for field in schema.fields() {
+            if let Some(paths) = Self::from_data_type(field.data_type())? {
+                fields.push((field.name().clone(), paths));
+            }
+        }
+        Ok((!fields.is_empty()).then_some(Self::Struct(fields)))
+    }
+
+    fn from_data_type(data_type: &DataType) -> KernelResult<Option<Self>> {
+        Ok(match data_type {
+            DataType::File(_) => Some(Self::File),
+            DataType::Struct(schema) => Self::from_schema(schema)?,
+            DataType::Array(array_type) => Self::from_data_type(array_type.element_type())?
+                .map(|element| Self::Array(Box::new(element))),
+            DataType::Map(map_type) => {
+                // Table schemas with a `file` in a map key are rejected when they are loaded.
+                if Self::from_data_type(map_type.key_type())?.is_some() {
+                    return Err(KernelError::internal_error(
+                        "A map key type must not contain a `file`",
+                    ));
+                }
+                Self::from_data_type(map_type.value_type())?.map(|value| Self::Map(Box::new(value)))
+            }
+            _ => None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
