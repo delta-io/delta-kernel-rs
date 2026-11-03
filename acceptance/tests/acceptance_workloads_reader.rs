@@ -211,11 +211,11 @@ const EXPECTED_KERNEL_FAILURES: &[ExpectedFailure] = &[
             "corruption_truncated_commit_json/specs/corruption_truncated_commit_json_read_all",
         ],
     },
-    // Both readers reject the corrupt Parquet file, but Kernel reports the invalid byte range
-    // surfaced by Arrow instead of Spark's FAILED_READ_FILE.NO_HINT category.
+    // Both readers reject the truncated Parquet file, but Kernel reports Arrow's EOF error
+    // from footer prefetching instead of Spark's FAILED_READ_FILE.NO_HINT category.
     ExpectedFailure {
-        reason: "Kernel exposes an Arrow range error instead of Spark's file-read category",
-        expected_error: "Requested range was invalid",
+        reason: "Kernel exposes an Arrow EOF error instead of Spark's file-read category",
+        expected_error: "EOF: metadata requires",
         patterns: &["corruption_parquet/specs/corruption_parquet_read_all"],
     },
     // Both readers reject unavailable versions. Kernel has a typed MissingVersion error, while
