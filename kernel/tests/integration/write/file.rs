@@ -14,6 +14,7 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::{FileGroup, file_groups};
+use delta_kernel::expressions::{Predicate as Pred, Scalar, column_expr};
 use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
 };
@@ -436,5 +437,63 @@ async fn test_write_file_column_with_stats_column_settings(
     for kind in ["minValues", "maxValues", "nullCount"] {
         assert_eq!(stats_columns(&stats, kind), expected, "{kind}: {stats}");
     }
+    Ok(())
+}
+
+/// Returns the data files a scan of `snapshot` with `predicate` keeps, after data skipping.
+fn scan_file_count(
+    snapshot: &SnapshotRef,
+    engine: &DefaultEngine<TokioMultiThreadExecutor>,
+    predicate: Pred,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+    let mut paths: Vec<String> = Vec::new();
+    for scan_metadata in scan.scan_metadata(engine)? {
+        paths = scan_metadata?.visit_scan_files(paths, |paths, file| paths.push(file.path))?;
+    }
+    Ok(paths.len())
+}
+
+/// A `file` column has no statistics, so a predicate on its sub-fields never skips a data file,
+/// while one on another column still does.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_predicate_on_file_column_skips_no_files() -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, _table_path, engine, snapshot) =
+        write_table("none", DataType::file_type(), Arc::new(file_values())).await?;
+    let mut snapshot = snapshot?;
+    // A second data file, so a predicate could skip one of the two.
+    let (data_type, column) = file_column("top_level", file_values(), None);
+    let schema = StructType::try_new([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("c", data_type),
+    ])?;
+    let schema: ArrowSchema = (&schema).try_into_arrow()?;
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(Int32Array::from(vec![10, 11, 12])), column],
+    )?;
+    snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+
+    // Neither data file has values like these, but neither has statistics to show it. (Predicates
+    // resolve only leaf columns, so a predicate on the whole `file` column, like one on a whole
+    // struct, is rejected when the scan is built.)
+    for predicate in [
+        Pred::eq(
+            column_expr!("c.uri"),
+            Scalar::from("s3://bucket/missing.png"),
+        ),
+        Pred::gt(column_expr!("c.size"), Scalar::from(1_000_000i64)),
+        Pred::is_null(column_expr!("c.inline")),
+    ] {
+        let files = scan_file_count(&snapshot, engine.as_ref(), predicate.clone())?;
+        assert_eq!(files, 2, "{predicate:?}");
+    }
+    // The control: `id` has statistics, so `id >= 10` skips the first data file.
+    let skipping = Pred::ge(column_expr!("id"), Scalar::from(10));
+    assert_eq!(scan_file_count(&snapshot, engine.as_ref(), skipping)?, 1);
     Ok(())
 }
