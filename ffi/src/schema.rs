@@ -493,9 +493,11 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use delta_kernel::schema::{schema, IntervalDayToSecondType, StructField};
+    use delta_kernel::schema::schema;
     #[cfg(feature = "geo-type-in-dev")]
-    use delta_kernel::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
+    use delta_kernel::schema::{
+        EdgeInterpolationAlgorithm, GeographyType, GeometryType, StructField,
+    };
 
     use super::*;
     use crate::TryFromStringSlice;
@@ -753,14 +755,8 @@ mod tests {
             nullable "narrow_year": INTERVAL_YEAR,
             nullable "narrow_month": INTERVAL_MONTH,
             not_null "dt": INTERVAL_DAY_TIME,
-            (StructField::nullable(
-                "narrow_day",
-                DataType::interval_day_time(IntervalDayToSecondType::IntervalDay)
-            )),
-            (StructField::nullable(
-                "narrow_hour_minute",
-                DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToMinute)
-            )),
+            nullable "narrow_day": INTERVAL_DAY,
+            nullable "narrow_hour_minute": INTERVAL_HOUR_MINUTE,
             nullable "nested": {
                 nullable "inner_ym": INTERVAL_YEAR_MONTH,
             },

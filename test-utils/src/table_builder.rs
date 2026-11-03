@@ -69,8 +69,8 @@ use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, Error as ObjectStoreError, ObjectStoreExt as _};
 use delta_kernel::schema::{
-    schema_ref, DataType, IntervalDayToSecondType, IntervalYearToMonthType, PrimitiveType,
-    SchemaRef, StructType,
+    DataType, IntervalDayToSecondType, IntervalYearToMonthType, PrimitiveType, SchemaRef,
+    StructType, schema_ref,
 };
 use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::table_features::TableFeature;

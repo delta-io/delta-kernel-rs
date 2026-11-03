@@ -9,10 +9,7 @@ use delta_kernel::expressions::{
     BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp, Predicate,
     Scalar, UnaryPredicateOp, lit, null_lit,
 };
-use delta_kernel::schema::{
-    DataType, IntervalDayToSecondType, IntervalYearToMonthType, PrimitiveType,
-};
-use delta_kernel::Result;
+use delta_kernel::schema::{DataType, PrimitiveType};
 
 #[cfg(feature = "default-engine-base")]
 use crate::expressions::FfiOpaquePredicateOp;
@@ -404,28 +401,12 @@ pub extern "C" fn visit_expression_literal_interval_year_month(
 }
 
 /// Visit an interval day-time literal (signed microsecond count).
-///
-/// Returns an allocated error if scalar construction fails.
-///
-/// # Safety
-///
-/// The caller must provide a valid `allocate_error` callback.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visit_expression_literal_interval_day_time(
+pub extern "C" fn visit_expression_literal_interval_day_time(
     state: &mut KernelExpressionVisitorState,
     value: i64,
-    allocate_error: AllocateErrorFn,
-) -> ExternResult<usize> {
-    visit_expression_literal_interval_day_time_impl(state, value)
-        .into_extern_result(&allocate_error)
-}
-
-fn visit_expression_literal_interval_day_time_impl(
-    state: &mut KernelExpressionVisitorState,
-    value: i64,
-) -> Result<usize> {
-    let scalar = Scalar::interval_day_time(value, IntervalDayToSecondType::IntervalDayToSecond)?;
-    Ok(wrap_expression(state, lit(scalar)))
+) -> usize {
+    wrap_expression(state, lit(Scalar::IntervalDayTime(value.into())))
 }
 
 /// visit a binary literal expression
@@ -900,7 +881,9 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use delta_kernel::expressions::{MapToStructOptions, Scalar, col, lit};
-    use delta_kernel::schema::{ArrayType, DataType, IntervalYearToMonthType, MapType, schema};
+    use delta_kernel::schema::{
+        ArrayType, DataType, IntervalDayToSecondType, IntervalYearToMonthType, MapType, schema,
+    };
     use rstest::rstest;
 
     use super::*;
@@ -969,18 +952,8 @@ mod tests {
     #[case(DataType::TIMESTAMP_NTZ, NullTypeTag::TimestampNtz, 0, 0)]
     #[case(DataType::INTERVAL_YEAR_MONTH, NullTypeTag::IntervalYearMonth, 0, 0)]
     #[case(DataType::INTERVAL_DAY_TIME, NullTypeTag::IntervalDayTime, 0, 0)]
-    #[case(
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalDay),
-        NullTypeTag::IntervalDayTime,
-        0,
-        0
-    )]
-    #[case(
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToMinute),
-        NullTypeTag::IntervalDayTime,
-        0,
-        0
-    )]
+    #[case(DataType::INTERVAL_DAY, NullTypeTag::IntervalDayTime, 0, 0)]
+    #[case(DataType::INTERVAL_HOUR_MINUTE, NullTypeTag::IntervalDayTime, 0, 0)]
     fn from_data_type_primitive(
         #[case] dt: DataType,
         #[case] expected_tag: NullTypeTag,
@@ -1196,6 +1169,7 @@ mod tests {
     #[rstest]
     #[case(Scalar::interval_year_month(17, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
     #[case(Scalar::interval_day_time(1_234_567, IntervalDayToSecondType::IntervalDayToSecond).unwrap())]
+    #[case(Scalar::interval_day_time(1, IntervalDayToSecondType::IntervalDayToSecond).unwrap())]
     #[case(Scalar::interval_year_month(-13, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
     #[case(Scalar::interval_year_month(i32::MIN, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
     #[case(Scalar::interval_year_month(i32::MAX, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
@@ -1209,14 +1183,7 @@ mod tests {
                 visit_expression_literal_interval_year_month(&mut state, value.months())
             }
             Scalar::IntervalDayTime(ref value) => {
-                // SAFETY: allocate_err is a valid test callback.
-                ok_or_panic(unsafe {
-                    visit_expression_literal_interval_day_time(
-                        &mut state,
-                        value.micros(),
-                        allocate_err,
-                    )
-                })
+                visit_expression_literal_interval_day_time(&mut state, value.micros())
             }
             _ => unreachable!(),
         };

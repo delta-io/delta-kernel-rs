@@ -17,7 +17,7 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::{
-    schema, schema_ref, DataType, IntervalDayToSecondType, IntervalYearToMonthType, StructType,
+    DataType, IntervalDayToSecondType, IntervalYearToMonthType, StructType, schema, schema_ref,
 };
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::UpdateTableOperation;
@@ -155,47 +155,47 @@ async fn test_write_partitioned_normal_values_roundtrip(
      "INTERVAL '1 12:30:45' DAY TO SECOND"
  )]
 #[case::day(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalDay),
+    DataType::INTERVAL_DAY,
     Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay).unwrap(),
     "INTERVAL '1' DAY"
 )]
 #[case::hour(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalHour),
+    DataType::INTERVAL_HOUR,
     Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalHour).unwrap(),
     "INTERVAL '26' HOUR"
 )]
 #[case::minute(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalMinute),
+    DataType::INTERVAL_MINUTE,
     Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalMinute).unwrap(),
     "INTERVAL '1563' MINUTE"
 )]
 #[case::second(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalSecond),
+    DataType::INTERVAL_SECOND,
     Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalSecond).unwrap(),
     "INTERVAL '93784.5' SECOND"
 )]
 #[case::day_hour(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalDayToHour),
+    DataType::INTERVAL_DAY_HOUR,
     Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap(),
     "INTERVAL '1 02' DAY TO HOUR"
 )]
 #[case::day_minute(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalDayToMinute),
+    DataType::INTERVAL_DAY_MINUTE,
     Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalDayToMinute).unwrap(),
     "INTERVAL '1 02:03' DAY TO MINUTE"
 )]
 #[case::hour_minute(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToMinute),
+    DataType::INTERVAL_HOUR_MINUTE,
     Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalHourToMinute).unwrap(),
     "INTERVAL '26:03' HOUR TO MINUTE"
 )]
 #[case::hour_second(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToSecond),
+    DataType::INTERVAL_HOUR_SECOND,
     Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalHourToSecond).unwrap(),
     "INTERVAL '26:03:04.5' HOUR TO SECOND"
 )]
 #[case::minute_second(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalMinuteToSecond),
+    DataType::INTERVAL_MINUTE_SECOND,
     Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalMinuteToSecond).unwrap(),
     "INTERVAL '1563:04.5' MINUTE TO SECOND"
 )]
@@ -271,11 +271,23 @@ async fn write_partitioned_interval_roundtrip(
     Ok(())
 }
 
+#[rstest]
+#[case::year_month(
+    DataType::INTERVAL_YEAR,
+    Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalMonth).unwrap()
+)]
+#[case::day_time(
+    DataType::INTERVAL_DAY,
+    Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalHour).unwrap()
+)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_write_rejects_qualifier_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_write_rejects_qualifier_mismatch(
+    #[case] interval: DataType,
+    #[case] partition_value: Scalar,
+) -> Result<(), Box<dyn std::error::Error>> {
     let schema = schema_ref! {
         nullable "value": INTEGER,
-        nullable "period": INTERVAL_YEAR,
+        nullable "period": (interval),
     };
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let snapshot = create_interval_partitioned_table(
@@ -290,7 +302,6 @@ async fn test_write_rejects_qualifier_mismatch() -> Result<(), Box<dyn std::erro
         Arc::new((&data_schema).try_into_arrow()?),
         vec![Arc::new(Int32Array::from(vec![7]))],
     )?;
-    let partition_value = Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalMonth)?;
     let error = write_batch_to_table(
         &snapshot,
         engine.as_ref(),
@@ -333,47 +344,47 @@ async fn test_write_rejects_qualifier_mismatch() -> Result<(), Box<dyn std::erro
      "INTERVAL '1 12:30:45' DAY TO SECOND"
  )]
 #[case::day(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalDay),
+    DataType::INTERVAL_DAY,
     Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay).unwrap(),
     "INTERVAL '1' DAY"
 )]
 #[case::hour(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalHour),
+    DataType::INTERVAL_HOUR,
     Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalHour).unwrap(),
     "INTERVAL '26' HOUR"
 )]
 #[case::minute(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalMinute),
+    DataType::INTERVAL_MINUTE,
     Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalMinute).unwrap(),
     "INTERVAL '1563' MINUTE"
 )]
 #[case::second(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalSecond),
+    DataType::INTERVAL_SECOND,
     Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalSecond).unwrap(),
     "INTERVAL '93784.5' SECOND"
 )]
 #[case::day_hour(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalDayToHour),
+    DataType::INTERVAL_DAY_HOUR,
     Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap(),
     "INTERVAL '1 02' DAY TO HOUR"
 )]
 #[case::day_minute(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalDayToMinute),
+    DataType::INTERVAL_DAY_MINUTE,
     Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalDayToMinute).unwrap(),
     "INTERVAL '1 02:03' DAY TO MINUTE"
 )]
 #[case::hour_minute(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToMinute),
+    DataType::INTERVAL_HOUR_MINUTE,
     Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalHourToMinute).unwrap(),
     "INTERVAL '26:03' HOUR TO MINUTE"
 )]
 #[case::hour_second(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToSecond),
+    DataType::INTERVAL_HOUR_SECOND,
     Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalHourToSecond).unwrap(),
     "INTERVAL '26:03:04.5' HOUR TO SECOND"
 )]
 #[case::minute_second(
-    DataType::interval_day_time(IntervalDayToSecondType::IntervalMinuteToSecond),
+    DataType::INTERVAL_MINUTE_SECOND,
     Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalMinuteToSecond).unwrap(),
     "INTERVAL '1563:04.5' MINUTE TO SECOND"
 )]

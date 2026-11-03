@@ -7,9 +7,9 @@ use rstest::rstest;
 use super::*;
 use crate::KernelResult;
 use crate::arrow::array::{
-    create_array, Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array,
-    Int32Builder, Int64Array, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames,
-    StringArray, StringBuilder, StringViewArray, StructArray,
+    Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array, Int32Builder,
+    Int64Array, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray,
+    StringBuilder, StringViewArray, StructArray, create_array,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
@@ -30,8 +30,8 @@ use crate::kernel_predicates::{
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::EdgeInterpolationAlgorithm;
 use crate::schema::{
-    schema, schema_ref, ArrayType, DataType as KernelDataType, IntervalDayToSecondType,
-    IntervalYearToMonthType, MapType, StructField, StructType,
+    ArrayType, DataType as KernelDataType, IntervalDayToSecondType, IntervalYearToMonthType,
+    MapType, StructField, StructType, schema, schema_ref,
 };
 use crate::unit_test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]
