@@ -1273,7 +1273,6 @@ impl StructType {
     ///
     /// Uses a single transformer so duplicate column mapping IDs are detected across all
     /// fields in this struct, not just within each field's subtree.
-    #[allow(unused)]
     #[internal_api]
     pub(crate) fn make_physical(
         &self,
@@ -1281,14 +1280,6 @@ impl StructType {
     ) -> KernelResult<Self> {
         let mut transformer = MakePhysical::new(column_mapping_mode);
         transformer.transform_struct(self).map(|s| s.into_owned())
-    }
-
-    /// Materialize physical names and metadata after read-path column mapping validation.
-    /// The caller must keep this schema and its column mapping mode unchanged after validation.
-    pub(crate) fn make_validated_physical(&self, mode: ColumnMappingMode) -> Self {
-        MaterializePhysical(mode)
-            .transform_struct(self)
-            .into_owned()
     }
 
     /// Validates that there are no metadata columns in the given fields.
@@ -2740,7 +2731,7 @@ impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
     }
 }
 
-/// What a [`MakePhysical`] walk does with each field. The modes bundle the physical-rewrite
+/// What a [`MakePhysical`] walk does with each field. The two modes bundle the physical-rewrite
 /// behavior with the matching treatment of a stale `delta.columnMapping.*` annotation left over on
 /// a mapping-disabled table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2749,8 +2740,6 @@ enum MakePhysicalMode {
     /// annotation in `None` mode is tolerated: resolved by logical name and dropped from the
     /// physical metadata.
     Rewrite,
-    /// Validate read-path annotations without constructing a physical schema.
-    ValidateRead,
     /// Validate annotations only, without rewriting (the strict write-path check). A stale
     /// annotation in `None` mode is rejected.
     ValidateStrict,
@@ -2759,7 +2748,7 @@ enum MakePhysicalMode {
 impl MakePhysicalMode {
     fn stale_annotation_policy(self) -> StaleAnnotationPolicy {
         match self {
-            Self::Rewrite | Self::ValidateRead => StaleAnnotationPolicy::Ignore,
+            Self::Rewrite => StaleAnnotationPolicy::Ignore,
             Self::ValidateStrict => StaleAnnotationPolicy::Reject,
         }
     }
@@ -2790,18 +2779,6 @@ impl<'a> MakePhysical<'a> {
             sibling_names_stack: vec![],
             mode: MakePhysicalMode::Rewrite,
         }
-    }
-
-    /// Apply the same annotation checks as physical rewriting, without copying the schema.
-    pub(crate) fn validate_read_column_mapping(
-        mode: ColumnMappingMode,
-        schema: &'a StructType,
-    ) -> KernelResult<()> {
-        let mut walker = Self {
-            mode: MakePhysicalMode::ValidateRead,
-            ..Self::new(mode)
-        };
-        walker.transform_struct(schema).map(|_| ())
     }
 
     /// Walks `schema` and validates its column-mapping annotations, rejecting stale annotations
@@ -2865,7 +2842,7 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         }
 
         self.transform_inner(field.name(), |this| {
-            if this.mode != MakePhysicalMode::Rewrite {
+            if this.mode == MakePhysicalMode::ValidateStrict {
                 return this.recurse_into_struct_field(field);
             }
             let data_type = this.transform(field.data_type())?.into_owned();
@@ -2890,31 +2867,6 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         // subject to column mapping and carry no column mapping metadata, so we do not recurse
         // into them.
         Ok(Cow::Borrowed(stype))
-    }
-}
-
-/// Rewrites immutable fields whose annotations have already passed read-path validation.
-struct MaterializePhysical(ColumnMappingMode);
-
-impl<'a> SchemaTransform<'a> for MaterializePhysical {
-    transform_output_type!(|'a, T| Cow<'a, T>);
-
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
-        if field.is_metadata_column() {
-            return Cow::Borrowed(field);
-        }
-        let field = self.recurse_into_struct_field(field);
-        let name = field.physical_name(self.0).to_owned();
-        let metadata = field.logical_to_physical_metadata(self.0);
-        Cow::Owned(field.with_name(name).with_metadata(metadata))
-    }
-
-    fn transform_variant(&mut self, stype: &'a StructType) -> Cow<'a, StructType> {
-        Cow::Borrowed(stype)
-    }
-
-    fn transform_file(&mut self, stype: &'a StructType) -> Cow<'a, StructType> {
-        Cow::Borrowed(stype)
     }
 }
 
@@ -3619,10 +3571,6 @@ mod tests {
             schema.make_physical(ColumnMappingMode::Id),
             "Duplicate column mapping ID",
         );
-        assert_result_error_with_message(
-            MakePhysical::validate_read_column_mapping(ColumnMappingMode::Id, &schema),
-            "Duplicate column mapping ID",
-        );
     }
 
     #[rstest]
@@ -3646,11 +3594,6 @@ mod tests {
         // The same dedup rules should apply under both CM modes.
         for mode in [ColumnMappingMode::Name, ColumnMappingMode::Id] {
             let result = schema.make_physical(mode);
-            let validation = MakePhysical::validate_read_column_mapping(mode, &schema);
-            assert_eq!(
-                result.as_ref().map(|_| ()).map_err(ToString::to_string),
-                validation.map_err(|error| error.to_string()),
-            );
             match &expected_error_substring {
                 None => {
                     result.expect("The input schema should be valid");

@@ -93,8 +93,9 @@ pub(crate) fn declarative_metadata_scan_plan_from_state_with_metadata(
 
 /// Build a default metadata plan from portable state validated by a source snapshot.
 ///
-/// The configuration is materialized only for this call. Source-proven schema, protocol, and log
-/// compatibility checks are not repeated, and no native configuration survives the call.
+/// The configuration is materialized only for this call. Source-proven protocol, schema-feature,
+/// and log compatibility checks are skipped. Physical-schema construction still validates
+/// column-mapping annotations. No native configuration survives the call.
 #[cfg(all(feature = "declarative-plans", feature = "internal-api"))]
 #[internal_api]
 pub(crate) fn declarative_metadata_scan_plan_from_trusted_state(

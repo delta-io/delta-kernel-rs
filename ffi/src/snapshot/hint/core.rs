@@ -335,9 +335,10 @@ fn metadata_plan(
 /// Build a declarative scan plan from portable state validated by the source snapshot.
 ///
 /// Unlike the ordinary planning entry point, this reconstructs ephemeral native configuration
-/// without repeating source-proven compatibility checks. Only a core created by
+/// while skipping source-proven protocol, schema-feature, and log compatibility checks. Physical
+/// schema construction still validates column-mapping annotations. Only a core created by
 /// [`snapshot_externalize_trusted_core`] grants access to this path. Generation, version,
-/// freshness, FFI bounds, and scan-operation checks still run. Portable metadata and log paths
+/// freshness, FFI bounds, and metadata-plan checks still run. Portable metadata and log paths
 /// are parsed, but no substantial native snapshot state survives the call.
 ///
 /// # Safety
@@ -526,8 +527,9 @@ pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan_with_schema(
 
 /// Trusted planning variant that consumes a transferred schema.
 ///
-/// The completed upload is parsed to materialize an ephemeral table configuration. Compatibility
-/// checks already performed by the source snapshot are not repeated.
+/// The completed upload is parsed to materialize an ephemeral table configuration. Source-proven
+/// protocol, schema-feature, and log compatibility checks are skipped; physical-schema construction
+/// still validates column-mapping annotations.
 ///
 /// # Safety
 /// Consumes `upload` unconditionally, including on errors. Other handles and `value` are borrowed

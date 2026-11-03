@@ -2,7 +2,6 @@
 ///
 /// Not intended for use by normal code.
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use bytes::Bytes;
 use delta_kernel_derive::internal_api;
@@ -52,7 +51,6 @@ macro_rules! impl_to_data_type {
 
 impl_to_data_type!(
     (String, DataType::STRING),
-    (Arc<String>, DataType::STRING),
     (Bytes, DataType::BINARY),
     (i64, DataType::LONG),
     (i32, DataType::INTEGER),

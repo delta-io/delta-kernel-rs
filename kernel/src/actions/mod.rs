@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use delta_kernel_derive::{IntoStructData, ToSchema, TryFromStructData, internal_api};
 use derive_more::Constructor;
@@ -342,8 +342,8 @@ pub struct Metadata {
     description: Option<String>,
     /// Specification of the encoding for the files stored in the table
     format: Format,
-    /// Immutable schema JSON shared by metadata clones.
-    schema_string: Arc<String>,
+    /// Schema of the table
+    schema_string: String,
     /// Column names by which the data should be partitioned
     partition_columns: Vec<String>,
     /// The time when this metadata action is created, in milliseconds since the Unix epoch
@@ -379,7 +379,7 @@ impl Metadata {
                 provider: format_provider,
                 options: format_options,
             },
-            schema_string: Arc::new(schema_string),
+            schema_string,
             partition_columns,
             created_time,
             configuration,
@@ -419,7 +419,7 @@ impl Metadata {
             // both for legacy reasons and to enable possible support for other formats in the
             // future (See delta-io/delta#87).
             format: Format::default(),
-            schema_string: Arc::new(serde_json::to_string(&schema)?),
+            schema_string: serde_json::to_string(&schema)?,
             partition_columns,
             created_time: Some(created_time),
             configuration,
@@ -533,7 +533,7 @@ impl Metadata {
     #[internal_api]
     pub(crate) fn with_schema(self, schema: SchemaRef) -> KernelResult<Self> {
         Ok(Self {
-            schema_string: Arc::new(serde_json::to_string(&schema)?),
+            schema_string: serde_json::to_string(&schema)?,
             ..self
         })
     }
@@ -567,7 +567,7 @@ impl Metadata {
             name,
             description,
             format,
-            schema_string: Arc::new(schema_string.into()),
+            schema_string: schema_string.into(),
             partition_columns,
             created_time,
             configuration,
@@ -2241,7 +2241,7 @@ mod tests {
     #[case::exceeded(42, true)]
     fn parse_schema_nesting_boundary(#[case] depth: usize, #[case] exceeds_limit: bool) {
         let metadata = Metadata {
-            schema_string: Arc::new(serde_json::to_string(&nested_schema(depth)).unwrap()),
+            schema_string: serde_json::to_string(&nested_schema(depth)).unwrap(),
             ..Default::default()
         };
 
@@ -2306,7 +2306,7 @@ mod tests {
         #[case] expected_error: &str,
     ) {
         let metadata = Metadata {
-            schema_string: Arc::new(schema_string.to_string()),
+            schema_string: schema_string.to_string(),
             ..Default::default()
         };
         // Error conversion captures a backtrace only when enabled, so normalize both forms before
@@ -2812,33 +2812,6 @@ mod tests {
     }
 
     #[test]
-    fn metadata_clone_preserves_schema_when_another_copy_changes() {
-        let original_schema = schema_ref! { not_null "id": INTEGER };
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            original_schema.clone(),
-            vec![],
-            0,
-            HashMap::new(),
-        )
-        .unwrap();
-        let saved_json = serde_json::to_value(&metadata).unwrap();
-        let copy = metadata.clone();
-        let changed = metadata
-            .with_schema(schema_ref! { nullable "name": STRING })
-            .unwrap();
-        assert_eq!(copy.parse_schema().unwrap(), *original_schema);
-        assert_ne!(changed.schema_string(), copy.schema_string());
-        drop(changed);
-        assert_eq!(serde_json::to_value(&copy).unwrap(), saved_json);
-        let decoded: Metadata = serde_json::from_value(saved_json).unwrap();
-        assert_eq!(decoded, copy);
-        let scalar = Scalar::from(copy.schema_string.clone());
-        assert_eq!(scalar, Scalar::String(copy.schema_string().clone()));
-    }
-
-    #[test]
     fn test_metadata_try_new() {
         let schema = schema_ref! { not_null "id": INTEGER };
         let config = HashMap::from([("key1".to_string(), "value1".to_string())]);
@@ -2856,7 +2829,7 @@ mod tests {
         assert!(!metadata.id.is_empty());
         assert_eq!(metadata.name, Some("test_table".to_string()));
         assert_eq!(
-            metadata.schema_string.as_str(),
+            metadata.schema_string,
             serde_json::to_string(&schema).unwrap()
         );
         assert_eq!(metadata.created_time, Some(1234567890));
