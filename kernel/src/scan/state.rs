@@ -8,9 +8,9 @@ use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use super::log_replay::SCAN_ROW_SCHEMA;
 use super::ScanMetadata;
-use crate::actions::deletion_vector::{deletion_treemap_to_bools, DeletionVectorDescriptor};
+use super::log_replay::SCAN_ROW_SCHEMA;
+use crate::actions::deletion_vector::{DeletionVectorDescriptor, deletion_treemap_to_bools};
 use crate::actions::visitors::visit_deletion_vector_at;
 use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData};
 use crate::scan::get_transform_for_row;
@@ -244,11 +244,11 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
 mod tests {
     use rstest::rstest;
 
+    use crate::KernelError;
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+    use crate::scan::COMMIT_READ_SCHEMA;
     use crate::scan::state::{DvInfo, ScanFile};
     use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
-    use crate::scan::COMMIT_READ_SCHEMA;
-    use crate::KernelError;
 
     #[rstest]
     #[case::negative(-1)]

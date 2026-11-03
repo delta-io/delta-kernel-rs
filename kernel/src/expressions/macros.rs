@@ -203,8 +203,8 @@ mod tests {
     use rstest::rstest;
 
     use crate::expressions::{
-        col, expr, lit, null_lit, BinaryPredicateOp, Expression, Predicate, Scalar,
-        UnaryPredicateOp,
+        BinaryPredicateOp, Expression, Predicate, Scalar, UnaryPredicateOp, col, expr, lit,
+        null_lit,
     };
     use crate::schema::DataType;
 

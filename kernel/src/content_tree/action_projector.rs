@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use super::struct_expr_from_schema;
-use crate::expressions::{null_lit, Expression};
+use crate::expressions::{Expression, null_lit};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{Engine, EngineData, ExpressionEvaluator, KernelError, KernelResult};
 
@@ -96,14 +96,14 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::actions::{Add, ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME};
+    use crate::actions::{ADD_NAME, ADD_SCHEMA, Add, LOG_ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME};
     use crate::arrow::array::{AsArray as _, RecordBatch, StringArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
     use crate::unit_test_utils::{
-        assert_result_error_with_message, string_array_to_engine_data, Action,
+        Action, assert_result_error_with_message, string_array_to_engine_data,
     };
 
     /// A batch of `add` actions (matching [`LOG_ADD_SCHEMA`]) for `paths`, with a null `add` for

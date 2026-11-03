@@ -292,7 +292,7 @@ mod tests {
     use bytes::Bytes;
     use delta_kernel_derive::ToSchema;
 
-    use crate::schema::{schema, ToSchema};
+    use crate::schema::{ToSchema, schema};
 
     #[derive(ToSchema)]
     struct AllPrimitivesNotNull {

@@ -62,7 +62,9 @@ fn get_app_id_version_impl(
     app_id_res: KernelResult<String>,
     extern_engine: &dyn ExternEngine,
 ) -> KernelResult<Option<i64>> {
-    snapshot.get_app_id_version(&app_id_res?, extern_engine.engine().as_ref())
+    snapshot
+        .reader()
+        .get_app_id_version(&app_id_res?, extern_engine.engine().as_ref())
 }
 
 #[cfg(test)]
@@ -80,8 +82,9 @@ mod tests {
         assert_extern_result_error_contains, engine_handle_for_store, ok_or_panic,
     };
     use crate::transaction::{
-        free_committed_transaction, new_update_table_txn_builder, update_table_txn_builder_build,
-        update_table_txn_commit, update_table_txn_with_transaction_id, KernelUpdateTableOperation,
+        KernelUpdateTableOperation, free_committed_transaction, new_update_table_txn_builder,
+        update_table_txn_builder_build, update_table_txn_commit,
+        update_table_txn_with_transaction_id,
     };
     use crate::{free_engine, free_snapshot, kernel_string_slice};
 
@@ -173,9 +176,18 @@ mod tests {
                 .build(&engine)?;
 
             // Check versions
-            assert_eq!(snapshot.get_app_id_version("app_id1", &engine)?, Some(1));
-            assert_eq!(snapshot.get_app_id_version("app_id2", &engine)?, Some(2));
-            assert_eq!(snapshot.get_app_id_version("app_id3", &engine)?, None);
+            assert_eq!(
+                snapshot.reader().get_app_id_version("app_id1", &engine)?,
+                Some(1)
+            );
+            assert_eq!(
+                snapshot.reader().get_app_id_version("app_id2", &engine)?,
+                Some(2)
+            );
+            assert_eq!(
+                snapshot.reader().get_app_id_version("app_id3", &engine)?,
+                None
+            );
 
             // Check versions through ffi handles. `get_app_id_version` borrows the handle, so
             // one handle serves all three calls and is freed once at the end.

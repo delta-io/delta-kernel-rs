@@ -1,12 +1,12 @@
-use delta_kernel::snapshot::Snapshot;
 use delta_kernel::KernelResult;
+use delta_kernel::snapshot::Snapshot;
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::expressions::kernel_visitor::NullTypeTag;
 use crate::handle::Handle;
 use crate::{
-    kernel_string_slice, AllocateStringFn, ExternEngine, KernelStringSlice, NullableCvoid,
-    OptionalValue, SharedExternEngine, SharedSnapshot, TryFromStringSlice,
+    AllocateStringFn, ExternEngine, KernelStringSlice, NullableCvoid, OptionalValue,
+    SharedExternEngine, SharedSnapshot, TryFromStringSlice, kernel_string_slice,
 };
 
 /// The row-tracking high-water mark before any fresh row IDs have been assigned.
@@ -43,6 +43,7 @@ fn get_domain_metadata_impl(
     allocate_fn: AllocateStringFn,
 ) -> KernelResult<NullableCvoid> {
     Ok(snapshot
+        .reader()
         .get_domain_metadata(&domain?, extern_engine.engine().as_ref())?
         .and_then(|config| allocate_fn(kernel_string_slice!(config))))
 }
@@ -65,6 +66,7 @@ pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark(
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
     let result = snapshot
+        .reader()
         .get_row_tracking_high_water_mark(engine_ref.engine().as_ref())
         .map(OptionalValue::from);
     unsafe { result.into_extern_result(&engine_ref) }
@@ -133,7 +135,10 @@ fn visit_clustering_columns_impl(
     engine_context: NullableCvoid,
     visitor: ClusteringColumnVisitor,
 ) -> KernelResult<OptionalValue<usize>> {
-    let Some(infos) = snapshot.get_clustering_column_infos(extern_engine.engine().as_ref())? else {
+    let Some(infos) = snapshot
+        .reader()
+        .get_clustering_column_infos(extern_engine.engine().as_ref())?
+    else {
         return Ok(OptionalValue::None);
     };
     for info in &infos {
@@ -186,7 +191,9 @@ fn visit_domain_metadata_impl(
         value: KernelStringSlice,
     ),
 ) -> KernelResult<bool> {
-    let res = snapshot.get_all_domain_metadata(extern_engine.engine().as_ref())?;
+    let res = snapshot
+        .reader()
+        .get_all_domain_metadata(extern_engine.engine().as_ref())?;
     res.iter().for_each(|metadata| {
         let domain = &metadata.domain();
         let configuration = &metadata.configuration();
@@ -206,8 +213,8 @@ mod tests {
     use std::ptr::NonNull;
     use std::sync::Arc;
 
-    use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::KernelResult;
+    use delta_kernel::object_store::memory::InMemory;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use serde_json::json;
@@ -325,7 +332,13 @@ mod tests {
 
         let domain3 = "delta.domain3";
         let res = get_domain_metadata_helper(domain3);
-        assert_extern_result_error_with_message(res, FFIKernelError::GenericError, Some("Generic delta kernel error: User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
+        assert_extern_result_error_with_message(
+            res,
+            FFIKernelError::GenericError,
+            Some(
+                "Generic delta kernel error: User DomainMetadata are not allowed to use system-controlled 'delta.*' domain",
+            ),
+        );
 
         // Secondly, we visit the entire domain metadata
 

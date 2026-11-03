@@ -192,7 +192,7 @@ mod tests {
 
     use rstest::rstest;
 
-    use super::{render_template, DeltaError, DeltaErrorParameter};
+    use super::{DeltaError, DeltaErrorParameter, render_template};
     use crate::{DeltaErrorCondition, Error, Result};
 
     struct LimitedWriter {

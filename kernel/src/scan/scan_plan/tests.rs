@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use ::test_utils::table_builder::{
-    checkpoint_json_stats, checkpoint_struct_stats, no_checkpoint_stats, DataLayoutConfig,
-    FeatureSet, LogState, TableConfig, TestTableBuilder,
+    DataLayoutConfig, FeatureSet, LogState, TableConfig, TestTableBuilder, checkpoint_json_stats,
+    checkpoint_struct_stats, no_checkpoint_stats,
 };
 use rstest::rstest;
 use serde_json::Value;
@@ -11,17 +11,17 @@ use super::*;
 use crate::arrow::array::{Array, ArrayRef, BooleanArray, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
-use crate::arrow::json::writer::JsonArray;
 use crate::arrow::json::WriterBuilder;
+use crate::arrow::json::writer::JsonArray;
 use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::pretty::pretty_format_batches;
 use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
-use crate::expressions::{col, column_name, lit, Predicate as Pred};
-use crate::plans::ir::nodes::Operator;
+use crate::expressions::{Predicate as Pred, col, column_name, lit};
 use crate::plans::Operation as PlanOperation;
+use crate::plans::ir::nodes::Operator;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
 use crate::unit_test_utils::load_test_table;
 use crate::{Engine, KernelResult, PredicateRef, Snapshot, Version};
@@ -278,10 +278,11 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
         .declarative_metadata_scan_plan(engine.as_ref())?
         .expect("metadata plan");
 
-    assert!(plan
-        .nodes
-        .iter()
-        .all(|node| !matches!(&node.op, Operator::DynamicScan(_))));
+    assert!(
+        plan.nodes
+            .iter()
+            .all(|node| !matches!(&node.op, Operator::DynamicScan(_)))
+    );
     assert!(plan.nodes.iter().any(|node| {
         let Operator::ScanParquet(scan) = &node.op else {
             return false;
@@ -564,7 +565,9 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
                 );
                 // JSON must retain columns omitted from the requested structured subset.
                 for stats in stats.iter().flatten() {
-                    assert!(serde_json::from_str::<Value>(stats)?["minValues"]["value"].is_string());
+                    assert!(
+                        serde_json::from_str::<Value>(stats)?["minValues"]["value"].is_string()
+                    );
                 }
             }
         }
@@ -1272,8 +1275,9 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Kern
         .scan_builder()
         .with_predicate(Arc::new(Pred::FALSE))
         .build()?;
-    assert!(scan
-        .declarative_metadata_scan_plan(&no_plan_engine)?
-        .is_none());
+    assert!(
+        scan.declarative_metadata_scan_plan(&no_plan_engine)?
+            .is_none()
+    );
     Ok(())
 }

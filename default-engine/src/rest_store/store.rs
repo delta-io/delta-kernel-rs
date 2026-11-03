@@ -12,18 +12,18 @@ use delta_kernel::object_store::{
     GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
 };
-use futures::stream::BoxStream;
 use futures::StreamExt as _;
-use reqwest::header::HeaderMap;
+use futures::stream::BoxStream;
 use reqwest::Client;
+use reqwest::header::HeaderMap;
 use tracing::{info, warn};
 
 use super::auth::AuthHeaderProvider;
 use super::config::RestEndpointConfig;
 use super::generic_error;
 use super::response::{
-    classify_put_create_response, ensure_list_response, ensure_success_response,
-    is_retryable_http_status, is_transient, PutCreateDisposition, RetryFailure,
+    PutCreateDisposition, RetryFailure, classify_put_create_response, ensure_list_response,
+    ensure_success_response, is_retryable_http_status, is_transient,
 };
 
 /// A generic REST/HTTP-backed [`ObjectStore`]. See the [module docs](super).
@@ -187,7 +187,7 @@ impl RestObjectStore {
                     return Err(ObjectStoreError::AlreadyExists {
                         path: path.to_string(),
                         source: "verified conflicting write".into(),
-                    })
+                    });
                 }
                 Ok(WriteState::Absent) => {}
                 Err(e) if retries >= self.max_retries => {

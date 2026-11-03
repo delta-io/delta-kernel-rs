@@ -10,7 +10,7 @@ use crate::table_changes::{
     CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
 };
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
@@ -197,7 +197,7 @@ mod tests {
 
     use super::*;
     use crate::schema::{
-        schema, ArrayType, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType, schema,
     };
 
     // === Schema builders for test cases ===

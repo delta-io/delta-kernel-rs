@@ -6,12 +6,12 @@ use crate::amt_path_util::{
     validate_table_relative,
 };
 use crate::content_tree::{
-    DeletionVectorInfo, DV_INFO, DV_INFO_CARDINALITY, DV_INFO_COLUMNS, DV_INFO_OFFSET,
-    DV_INFO_SIZE_IN_BYTES, KEY_METADATA, LOCATION,
+    DV_INFO, DV_INFO_CARDINALITY, DV_INFO_COLUMNS, DV_INFO_OFFSET, DV_INFO_SIZE_IN_BYTES,
+    DeletionVectorInfo, KEY_METADATA, LOCATION,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{lit, ArrayData, Expression, Scalar};
-use crate::schema::{column_name, lazy_schema_ref, ArrayType, ColumnName, DataType, SchemaRef};
+use crate::expressions::{ArrayData, Expression, Scalar, lit};
+use crate::schema::{ArrayType, ColumnName, DataType, SchemaRef, column_name, lazy_schema_ref};
 use crate::{EngineData, KernelError, KernelResult};
 
 /// Extracts deletion vector content from a DeletionVectorDescriptor.
@@ -410,14 +410,14 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::Engine;
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::content_tree::test_utils::test_dv_info;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::StructData;
     use crate::schema::{
-        schema, schema_ref, ColumnNamesAndTypes, StructField, StructType, ToSchema,
+        ColumnNamesAndTypes, StructField, StructType, ToSchema, schema, schema_ref,
     };
-    use crate::Engine;
 
     /// Decoded DV columns read back from an augmented batch, one entry per row.
     #[derive(Default)]

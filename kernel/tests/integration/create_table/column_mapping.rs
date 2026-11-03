@@ -7,16 +7,16 @@
 
 use std::sync::Arc;
 
+use delta_kernel::KernelResult;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
-    schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
-    StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+    schema_ref,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::KernelResult;
 use test_utils::{
     column_mapping_fixtures as fixtures, create_table_and_load_snapshot, test_table_setup,
 };
@@ -270,10 +270,12 @@ fn test_column_mapping_invalid_mode_rejected() {
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Invalid column mapping mode"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid column mapping mode")
+    );
 }
 
 /// CREATE TABLE with column mapping disabled strips every column-mapping annotation the input
@@ -379,7 +381,9 @@ fn test_create_clustered_table_with_column_mapping(
     assert!(table_config.is_feature_supported(&TableFeature::DomainMetadata));
 
     // Verify clustering domain metadata exists and uses physical column names
-    let clustering_columns = snapshot.get_physical_clustering_columns(engine.as_ref())?;
+    let clustering_columns = snapshot
+        .reader()
+        .get_physical_clustering_columns(engine.as_ref())?;
     let columns = clustering_columns.expect("Clustering columns should be present");
     assert_eq!(
         columns.len(),
@@ -570,7 +574,9 @@ fn test_create_clustered_table_nested_with_column_mapping(
     };
     assert_column_mapping_config(&snapshot, expected_cm_mode);
 
-    let clustering_columns = snapshot.get_physical_clustering_columns(engine.as_ref())?;
+    let clustering_columns = snapshot
+        .reader()
+        .get_physical_clustering_columns(engine.as_ref())?;
     let columns = clustering_columns.expect("Clustering columns should be present");
     assert_eq!(columns.len(), expected_cols.len());
 
@@ -644,7 +650,9 @@ fn test_partitioned_table_stores_logical_column_names_with_column_mapping(
         );
     }
 
-    let clustering = snapshot.get_physical_clustering_columns(engine.as_ref())?;
+    let clustering = snapshot
+        .reader()
+        .get_physical_clustering_columns(engine.as_ref())?;
     assert!(
         clustering.is_none(),
         "Partitioned table should not have clustering columns"

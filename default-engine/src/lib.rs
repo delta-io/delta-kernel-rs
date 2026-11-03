@@ -60,8 +60,8 @@ mod stats_verifier_tests;
 pub(crate) fn stream_future_to_cancellable_iter<U: Send + 'static, E: executor::TaskExecutor>(
     task_executor: Arc<E>,
     stream_future: impl Future<Output = KernelResult<BoxStream<'static, KernelResult<U>>>>
-        + Send
-        + 'static,
+    + Send
+    + 'static,
     cancellation_token: Option<CancellationTokenRef>,
 ) -> KernelResult<Box<dyn KernelResultIterator<U>>> {
     let Some(token) = cancellation_token else {

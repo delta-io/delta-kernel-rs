@@ -20,7 +20,7 @@ use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{
-    col, column_name, column_pred, lit, Expression as Expr, Predicate as Pred, Scalar,
+    Expression as Expr, Predicate as Pred, Scalar, col, column_name, column_pred, lit,
 };
 use crate::object_store::memory::InMemory;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -28,13 +28,13 @@ use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
 use crate::schema::{
-    self, schema, schema_ref, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField,
-    StructType,
+    self, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType, schema,
+    schema_ref,
 };
 use crate::transaction::create_table::create_table;
 use crate::transaction::data_layout::DataLayout;
-use crate::unit_test_utils::recording_reads::{Read, RecordingReads};
 use crate::unit_test_utils::TestCancellationToken;
+use crate::unit_test_utils::recording_reads::{Read, RecordingReads};
 use crate::{
     CancellationTokenRef, Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
     KernelResult, KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
@@ -2763,9 +2763,11 @@ fn scan_builder_stats_output_schemas_follow_struct_columns(
     assert!(logical_min_values.field("id").is_none());
     let physical_min_values = stats_struct_field(&schemas.physical, MIN_VALUES);
     if column_mapping_mode.is_some() {
-        assert!(physical_min_values
-            .fields()
-            .all(|field| field.name().starts_with("col-")));
+        assert!(
+            physical_min_values
+                .fields()
+                .all(|field| field.name().starts_with("col-"))
+        );
     } else {
         assert_eq!(physical_min_values, logical_min_values);
     }
@@ -2879,12 +2881,12 @@ mod scan_metadata_completed_tests {
     use rstest::rstest;
 
     use super::ScanBuilder;
-    use crate::engine::sync::SyncEngine;
-    use crate::expressions::{col, lit, Expression as Expr, Predicate as Pred};
-    use crate::metrics::MetricEvent;
-    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
-    use crate::utils::FoldWithOption as _;
     use crate::Snapshot;
+    use crate::engine::sync::SyncEngine;
+    use crate::expressions::{Expression as Expr, Predicate as Pred, col, lit};
+    use crate::metrics::MetricEvent;
+    use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
+    use crate::utils::FoldWithOption as _;
 
     fn run_scan(
         table: &str,
@@ -3004,9 +3006,11 @@ mod scan_metadata_completed_tests {
             let _ = iter.next();
             // Drop without exhausting -- callback must not fire
         }
-        assert!(reporter
-            .events()
-            .iter()
-            .all(|e| !matches!(e, MetricEvent::ScanMetadataCompleted(_))));
+        assert!(
+            reporter
+                .events()
+                .iter()
+                .all(|e| !matches!(e, MetricEvent::ScanMetadataCompleted(_)))
+        );
     }
 }

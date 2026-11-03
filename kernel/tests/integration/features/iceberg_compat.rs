@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    new_null_array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
-    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, MapArray,
-    RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, MapArray, RecordBatch, StringArray, StructArray,
+    TimestampMicrosecondArray, new_null_array,
 };
 use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
 use delta_kernel::arrow::datatypes::{
@@ -15,21 +15,21 @@ use delta_kernel::arrow::datatypes::{
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::expressions::{ColumnName, Scalar};
+use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::memory::InMemory;
-use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::parquet::basic::Type as ParquetPhysicalType;
 use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::schema::{
-    schema, schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue,
-    StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+    schema, schema_ref,
 };
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
+use delta_kernel::table_features::{ColumnMappingMode, get_any_level_column_physical_name};
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::UpdateTableOperation;
-use delta_kernel::transforms::{transform_output_type, SchemaTransform};
+use delta_kernel::transforms::{SchemaTransform, transform_output_type};
 use test_utils::delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };

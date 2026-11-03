@@ -10,35 +10,35 @@ use itertools::Itertools;
 use serde::Serialize;
 use tempfile::TempDir;
 use test_utils::{
-    copy_directory, delta_path_for_version, load_test_data, modify_add_file_partition_keys,
-    replace_array_row, replace_column, AddFilePartitionKeyModify,
+    AddFilePartitionKeyModify, copy_directory, delta_path_for_version, load_test_data,
+    modify_add_file_partition_keys, replace_array_row, replace_column,
 };
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use url::Url;
 
-use crate::actions::{get_all_actions_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
+use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove, get_all_actions_schema};
 use crate::arrow::array::{
-    new_empty_array, new_null_array, ArrayRef, Int64Array, MapArray, RecordBatch, StringArray,
-    StructArray,
+    ArrayRef, Int64Array, MapArray, RecordBatch, StringArray, StructArray, new_empty_array,
+    new_null_array,
 };
 use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::concat_batches;
 use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use crate::committer::FileSystemCommitter;
-use crate::engine::arrow_conversion::{parquet_field_id_metadata, TryIntoArrow as _};
+use crate::engine::arrow_conversion::{TryIntoArrow as _, parquet_field_id_metadata};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
 use crate::metrics::{MetricEvent, MetricsReporter, WithMetricsReporterLayer as _};
+use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::local::LocalFileSystem;
 use crate::object_store::memory::InMemory;
-use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    ColumnMappingMode, FeatureType, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    ColumnMappingMode, FeatureType, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
 };
 use crate::table_properties::COLUMN_MAPPING_MODE;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -46,7 +46,7 @@ use crate::table_properties::{
     ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
 };
 use crate::transaction::create_table::create_table;
-use crate::transaction::{CreateTable, Transaction, BASE_ADD_FILES_SCHEMA};
+use crate::transaction::{BASE_ADD_FILES_SCHEMA, CreateTable, Transaction};
 use crate::{
     Engine, EngineData, FileMeta, KernelError, KernelResult, Snapshot, SnapshotRef, Version,
 };
@@ -120,8 +120,8 @@ pub(crate) enum Action {
 }
 
 use crate::schema::{
-    schema, schema_ref, ArrayType, ColumnMetadataKey, DataType as KernelDataType, MapType,
-    MetadataValue, SchemaRef, StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType as KernelDataType, MapType, MetadataValue, SchemaRef,
+    StructField, StructType, schema, schema_ref,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType, PrimitiveType};
@@ -326,19 +326,62 @@ pub(crate) mod adaptive_metadata_fixtures {
     use std::iter;
 
     use super::*;
-    use crate::actions::{CheckpointAction, ContentRoot};
+    use crate::actions::{
+        CheckpointAction, ContentRoot, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA,
+        LastManifestCommit, Sidecar,
+    };
     use crate::engine_data::FilteredEngineData;
+    use crate::expressions::Scalar;
     use crate::path::LogRoot;
-    use crate::version_as_i64;
+    use crate::{create_row, version_as_i64};
 
     /// The protocol and metadata of a minimal adaptiveMetadata table.
     pub(crate) fn adaptive_metadata_protocol_and_metadata() -> (Protocol, Metadata) {
-        let table_config =
-            adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
+        adaptive_metadata_pm(test_schema_flat_with_column_mapping(), &[])
+    }
+
+    /// The protocol and metadata of an adaptiveMetadata table with `schema`, partitioned by
+    /// `partition_columns`.
+    pub(crate) fn adaptive_metadata_pm(
+        schema: SchemaRef,
+        partition_columns: &[&str],
+    ) -> (Protocol, Metadata) {
+        let table_config = adaptive_metadata_table_configuration(schema, &[]);
+        let mut metadata = serde_json::to_value(table_config.metadata()).unwrap();
+        metadata["partitionColumns"] = serde_json::json!(partition_columns);
         (
             table_config.protocol().clone(),
-            table_config.metadata().clone(),
+            serde_json::from_value(metadata).unwrap(),
         )
+    }
+
+    /// Commit lines holding the top-level protocol and metadata of [`adaptive_metadata_pm`], and
+    /// no checkpoint action.
+    pub(crate) fn protocol_and_metadata_lines(
+        schema: SchemaRef,
+        partition_columns: &[&str],
+    ) -> String {
+        let (protocol, metadata) = adaptive_metadata_pm(schema, partition_columns);
+        format!(
+            "{}\n{}",
+            serde_json::json!({ "protocol": protocol }),
+            serde_json::json!({ "metaData": metadata }),
+        )
+    }
+
+    /// A `commitInfo` line with In-Commit Timestamp `timestamp` and, when given, a
+    /// `lastManifestCommit` `(version, contentRootVersion)`, as an AMT writer records on every
+    /// commit.
+    pub(crate) fn commit_info_line(timestamp: i64, pointer: Option<(i64, i64)>) -> String {
+        let mut commit_info =
+            serde_json::json!({ "timestamp": timestamp, "inCommitTimestamp": timestamp });
+        if let Some((version, content_root_version)) = pointer {
+            commit_info["lastManifestCommit"] = serde_json::json!({
+                "version": version,
+                "contentRootVersion": content_root_version,
+            });
+        }
+        serde_json::json!({ "commitInfo": commit_info }).to_string()
     }
 
     /// A minimal `checkpoint` action referencing `path` as the content root at `version`.
@@ -368,6 +411,34 @@ pub(crate) mod adaptive_metadata_fixtures {
         ))
     }
 
+    /// Writes `rows` (each a value of `schema`'s single action field) as the checkpoint sidecar
+    /// `name` of the table at `table_root`.
+    pub(crate) fn write_sidecar(
+        engine: &SyncEngine,
+        table_root: &Url,
+        name: &str,
+        schema: SchemaRef,
+        rows: Vec<Scalar>,
+    ) -> Sidecar {
+        let rows = rows.into_iter().map(|row| vec![row]).collect();
+        let data = engine
+            .evaluation_handler()
+            .create_many(schema, rows)
+            .unwrap();
+        let log_root = LogRoot::new(table_root.clone()).unwrap();
+        let location = log_root
+            .log_root()
+            .join("_sidecars/")
+            .unwrap()
+            .join(name)
+            .unwrap();
+        let size = engine
+            .parquet_handler()
+            .write_parquet_file(location, Box::new(iter::once(Ok(data))))
+            .unwrap();
+        Sidecar::new(name.to_string(), size as i64, 0, None)
+    }
+
     /// Creates an empty in-memory table and returns its engine and table-root URL.
     pub(crate) fn setup_table() -> KernelResult<(SyncEngine, Url)> {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
@@ -389,13 +460,109 @@ pub(crate) mod adaptive_metadata_fixtures {
         version: Version,
         data: Box<dyn EngineData>,
     ) -> KernelResult<()> {
-        let filtered = FilteredEngineData::with_all_rows_selected(data);
+        write_commit_batches(engine, table_root, version, vec![data])
+    }
+
+    /// Writes a manifest commit at `version`: a `commitInfo` whose `lastManifestCommit` names this
+    /// commit and `checkpoint`'s content root, then `checkpoint`'s protocol and metaData as
+    /// top-level actions, then `checkpoint`.
+    pub(crate) fn write_manifest_commit(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        checkpoint: CheckpointAction,
+    ) -> KernelResult<()> {
+        // A `setup_table` table starts without adaptiveMetadata, and enabling it changes the
+        // protocol, which must be written as a top-level action.
+        let pm_actions = vec![
+            create_row(
+                engine,
+                LOG_PROTOCOL_SCHEMA.clone(),
+                checkpoint.protocol().clone(),
+            )?,
+            create_row(
+                engine,
+                LOG_METADATA_SCHEMA.clone(),
+                checkpoint.metadata().clone(),
+            )?,
+        ];
+        write_manifest_commit_with(engine, table_root, version, pm_actions, checkpoint)
+    }
+
+    /// [`write_manifest_commit`] without top-level protocol and metaData, as written by a commit
+    /// that leaves them unchanged.
+    pub(crate) fn write_manifest_commit_keeping_pm(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        checkpoint: CheckpointAction,
+    ) -> KernelResult<()> {
+        write_manifest_commit_with(engine, table_root, version, vec![], checkpoint)
+    }
+
+    /// Writes a log commit at `version`: a `commitInfo` carrying forward the `lastManifestCommit`
+    /// that names `manifest_version` (whose content root is at that version too), followed by
+    /// `data`.
+    pub(crate) fn write_commit_after_manifest_commit(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        manifest_version: Version,
+        data: Box<dyn EngineData>,
+    ) -> KernelResult<()> {
+        let manifest_version = version_as_i64(manifest_version)?;
+        let commit_info = last_manifest_commit_info(manifest_version, manifest_version);
+        let commit_info = parse_json_batch(vec![commit_info.to_string()].into());
+        write_commit_batches(engine, table_root, version, vec![commit_info, data])
+    }
+
+    /// A `commitInfo` action whose `lastManifestCommit` names `version` and
+    /// `content_root_version`. The pointer is not validated, so tests can write inconsistent ones.
+    pub(crate) fn last_manifest_commit_info(
+        version: i64,
+        content_root_version: i64,
+    ) -> serde_json::Value {
+        let commit_info = CommitInfo {
+            in_commit_timestamp: Some(1),
+            data_change: Some(false),
+            last_manifest_commit: Some(LastManifestCommit {
+                version,
+                content_root_version,
+            }),
+            ..Default::default()
+        };
+        serde_json::json!({ "commitInfo": commit_info })
+    }
+
+    fn write_manifest_commit_with(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        top_level_actions: Vec<Box<dyn EngineData>>,
+        checkpoint: CheckpointAction,
+    ) -> KernelResult<()> {
+        let commit_info =
+            last_manifest_commit_info(version_as_i64(version)?, checkpoint.content_root_version());
+        let batches = iter::once(parse_json_batch(vec![commit_info.to_string()].into()))
+            .chain(top_level_actions)
+            .chain(iter::once(checkpoint.into_engine_data(engine)?))
+            .collect();
+        write_commit_batches(engine, table_root, version, batches)
+    }
+
+    fn write_commit_batches(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        batches: Vec<Box<dyn EngineData>>,
+    ) -> KernelResult<()> {
         let commit_path = LogRoot::new(table_root.clone())?.new_commit_path(version)?;
-        engine.json_handler().write_json_file(
-            &commit_path.location,
-            Box::new(iter::once(Ok(filtered))),
-            false,
-        )?;
+        let batches = batches
+            .into_iter()
+            .map(|data| Ok(FilteredEngineData::with_all_rows_selected(data)));
+        engine
+            .json_handler()
+            .write_json_file(&commit_path.location, Box::new(batches), false)?;
         Ok(())
     }
 }
@@ -680,6 +847,19 @@ impl MockProtocolBuilder {
 //
 // Reusable test schemas
 // Each variant exists with and without column mapping metadata.
+
+/// Builds a nullable [`StructField`] carrying `metadata_value` as its `delta.generationExpression`
+/// metadata.
+pub(crate) fn field_with_generation_expression(
+    name: &str,
+    data_type: impl Into<KernelDataType>,
+    metadata_value: impl Into<MetadataValue>,
+) -> StructField {
+    StructField::nullable(name, data_type).add_metadata([(
+        ColumnMetadataKey::GenerationExpression.as_ref(),
+        metadata_value.into(),
+    )])
+}
 
 /// Builds a nullable [`StructField`] carrying column-mapping id + physical name metadata.
 fn cm_field(
@@ -1320,8 +1500,8 @@ pub(crate) fn load_test_table(
 
 pub(crate) mod column_mapping_physical_name_dedup_fixtures {
     use crate::schema::{
-        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
-        StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        schema,
     };
 
     /// Two fields with the same physical name at different physical paths should be accepted.

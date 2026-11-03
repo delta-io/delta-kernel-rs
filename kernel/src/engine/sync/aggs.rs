@@ -7,7 +7,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 
 use super::plan::encode_keys_as_rows;
-use crate::arrow::array::{new_null_array, Array, ArrayRef, Int64Array, RecordBatch};
+use crate::arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, new_null_array};
 use crate::arrow::compute::interleave;
 use crate::arrow::datatypes::DataType as ArrowDataType;
 use crate::arrow::row::OwnedRow;

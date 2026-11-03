@@ -5,9 +5,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use crc::{Crc, CRC_32_ISO_HDLC};
+use crc::{CRC_32_ISO_HDLC, Crc};
 use delta_kernel::schema::derive_macro_utils::ToDataType;
-use delta_kernel_derive::{internal_api, IntoStructData, ToSchema};
+use delta_kernel_derive::{IntoStructData, ToSchema, internal_api};
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -831,11 +831,11 @@ mod tests {
     use roaring::RoaringTreemap;
 
     use super::{DeletionVectorDescriptor, *};
-    use crate::engine::sync::SyncEngine;
-    use crate::engine::CancellableEngine;
-    use crate::scan::state::DvInfo;
-    use crate::unit_test_utils::{assert_result_error_with_message, TestCancellationToken};
     use crate::Engine;
+    use crate::engine::CancellableEngine;
+    use crate::engine::sync::SyncEngine;
+    use crate::scan::state::DvInfo;
+    use crate::unit_test_utils::{TestCancellationToken, assert_result_error_with_message};
 
     fn dv_relative() -> DeletionVectorDescriptor {
         DeletionVectorDescriptor {
@@ -1404,13 +1404,17 @@ mod tests {
         assert!("P".parse::<DeletionVectorStorageType>().is_err());
         assert!("".parse::<DeletionVectorStorageType>().is_err());
         assert!("invalid".parse::<DeletionVectorStorageType>().is_err());
-        assert!("PersistedRelative"
-            .parse::<DeletionVectorStorageType>()
-            .is_err());
+        assert!(
+            "PersistedRelative"
+                .parse::<DeletionVectorStorageType>()
+                .is_err()
+        );
         assert!("Inline".parse::<DeletionVectorStorageType>().is_err());
-        assert!("PersistedAbsolute"
-            .parse::<DeletionVectorStorageType>()
-            .is_err());
+        assert!(
+            "PersistedAbsolute"
+                .parse::<DeletionVectorStorageType>()
+                .is_err()
+        );
         #[cfg(not(feature = "adaptive-metadata-in-dev"))]
         assert!("r".parse::<DeletionVectorStorageType>().is_err());
     }

@@ -6,7 +6,7 @@ use delta_kernel::arrow::datatypes::{Int32Type, Int64Type};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::schema::{schema_ref, MetadataColumnSpec};
+use delta_kernel::schema::{MetadataColumnSpec, schema_ref};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::transaction::{RowTrackingMetadataColumns, UpdateTableOperation};
 use delta_kernel::{Engine, KernelResult, Snapshot};
@@ -22,8 +22,8 @@ mod row_tracking_preservation {
     use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
     use delta_kernel::arrow::array::{Array, ArrayRef, MapBuilder, StringArray, StringBuilder};
     use delta_kernel::schema::{DataType, SchemaRef, StructField};
-    use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use test_utils::delta_kernel_default_engine::DefaultEngine;
+    use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use test_utils::{read_actions_from_commit, read_add_infos};
     use url::Url;
 
@@ -574,8 +574,8 @@ mod row_tracking_preservation {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn optimize_preserves_row_tracking_metadata_after_deletion_vector_update(
-    ) -> KernelResult<()> {
+    async fn optimize_preserves_row_tracking_metadata_after_deletion_vector_update()
+    -> KernelResult<()> {
         // === Write the source file ===
         let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
         let table_url = Url::from_directory_path(&table_path).unwrap();

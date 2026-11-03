@@ -10,8 +10,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    new_null_array, Array, ArrayRef, ListArray, MapArray, RecordBatch, StructArray,
-    TimestampNanosecondArray,
+    Array, ArrayRef, ListArray, MapArray, RecordBatch, StructArray, TimestampNanosecondArray,
+    new_null_array,
 };
 use delta_kernel::arrow::compute::{cast, concat_batches};
 use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef};
@@ -528,13 +528,15 @@ mod tests {
     fn expected_error_rejects_unrelated_kernel_error() {
         let expected = expected_error("DELTA_STATE_RECOVER_ERROR");
         assert!(validate_expected_error(&Error::MissingMetadata, &expected).is_ok());
-        assert!(validate_expected_error(
-            &Error::InvalidCheckpoint(
-                "Had a _last_checkpoint hint but didn't find any checkpoints".to_string()
-            ),
-            &expected
-        )
-        .is_ok());
+        assert!(
+            validate_expected_error(
+                &Error::InvalidCheckpoint(
+                    "Had a _last_checkpoint hint but didn't find any checkpoints".to_string()
+                ),
+                &expected
+            )
+            .is_ok()
+        );
 
         let error = validate_expected_error(&Error::FileNotFound("x".into()), &expected)
             .expect_err("wrong error category must fail");
@@ -769,9 +771,11 @@ mod tests {
 
         let nullability_error =
             require_map_compatibility(false, false, &nullable, &required).unwrap_err();
-        assert!(nullability_error
-            .to_string()
-            .contains("map entry nullability"));
+        assert!(
+            nullability_error
+                .to_string()
+                .contains("map entry nullability")
+        );
     }
 
     #[test]
