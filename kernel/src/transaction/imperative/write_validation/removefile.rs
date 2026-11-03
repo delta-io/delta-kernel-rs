@@ -7,7 +7,9 @@ use super::utils::{
     columns_and_types_from_schema, dv_id_at, validate_required_field_exist,
     validate_row_tracking_metadata,
 };
-use super::{FileActionUniquenessValidator, StagedDataValidator, Validation};
+use super::{
+    FileActionUniquenessValidator, RowTrackingEnablement, StagedDataValidator, Validation,
+};
 use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::expressions::column_name;
 use crate::scan::log_replay::{
@@ -46,16 +48,16 @@ static REMOVE_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNamesAndT
 /// For example, this can detect a file staged for both removal and a DV update.
 pub(crate) fn validate_remove_files(
     removes: &[FilteredEngineData],
-    row_tracking_enabled: bool,
+    row_tracking_enablement: RowTrackingEnablement,
     uniqueness_validator: Option<&mut FileActionUniquenessValidator>,
 ) -> KernelResult<()> {
-    StagedDataValidator::for_remove_files(row_tracking_enabled, uniqueness_validator)?
+    StagedDataValidator::for_remove_files(row_tracking_enablement, uniqueness_validator)?
         .validate_selected_rows(removes)
 }
 
 impl<'a> StagedDataValidator<'a> {
     fn for_remove_files(
-        row_tracking_enabled: bool,
+        row_tracking_enablement: RowTrackingEnablement,
         uniqueness_validator: Option<&'a mut FileActionUniquenessValidator>,
     ) -> KernelResult<Self> {
         let columns = REMOVE_FILE_COLUMNS_FOR_VALIDATION
@@ -67,7 +69,7 @@ impl<'a> StagedDataValidator<'a> {
             })?;
         let mut validations: Vec<Box<dyn Validation + 'a>> =
             vec![Box::new(MandatoryRemoveFileValidation {
-                row_tracking_enabled,
+                row_tracking_enablement,
             })];
         if let Some(uniqueness_validator) = uniqueness_validator {
             validations.push(Box::new(RemoveFileUniquenessValidation {
@@ -85,7 +87,7 @@ impl<'a> StagedDataValidator<'a> {
 /// The protocol defines `size` as optional, but kernel requires it because its `RemoveFile`
 /// actions currently come only from `AddFile` actions, which provide `size`.
 struct MandatoryRemoveFileValidation {
-    row_tracking_enabled: bool,
+    row_tracking_enablement: RowTrackingEnablement,
 }
 
 impl Validation for MandatoryRemoveFileValidation {
@@ -112,7 +114,7 @@ impl Validation for MandatoryRemoveFileValidation {
                 "RemoveFile for '{path}' has negative size {size}; size must be non-negative"
             ))
         );
-        if self.row_tracking_enabled {
+        if self.row_tracking_enablement == RowTrackingEnablement::Enabled {
             validate_row_tracking_metadata(
                 path,
                 getters[BASE_ROW_ID].get_opt(row, BASE_ROW_ID_NAME)?,
@@ -372,7 +374,7 @@ mod tests {
         let mut uniqueness_validator = FileActionUniquenessValidator::default();
         super::validate_remove_files(
             removes,
-            false, /* row_tracking_enabled */
+            RowTrackingEnablement::Disabled,
             Some(&mut uniqueness_validator),
         )
     }

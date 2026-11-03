@@ -2660,60 +2660,58 @@ async fn create_number_table(
 
 #[template]
 #[rstest]
-#[case::enabled_selected(
-    RowTrackingState::Enabled,
-    &[true, true, true] /* selection_vector */,
-    Some("row-tracking field") /* expected_error */,
-)]
-#[case::supported_selected(
-    RowTrackingState::Supported,
-    &[true, true, true] /* selection_vector */,
-    None /* expected_error */,
-)]
-#[case::suspended_selected(
-    RowTrackingState::Suspended,
-    &[true, true, true] /* selection_vector */,
-    None /* expected_error */,
-)]
-#[case::unsupported_selected(
-    RowTrackingState::Unsupported,
-    &[true, true, true] /* selection_vector */,
-    None /* expected_error */,
-)]
-#[case::enabled_implicitly_selected(
-    RowTrackingState::Enabled,
-    &[false] /* selection_vector */,
-    Some("row-tracking field") /* expected_error */,
-)]
-#[case::supported_implicitly_selected(
-    RowTrackingState::Supported,
-    &[false] /* selection_vector */,
-    None /* expected_error */,
-)]
-#[case::enabled_unselected(
-    RowTrackingState::Enabled,
-    &[true, false, true] /* selection_vector */,
-    None /* expected_error */,
-)]
-#[case::supported_unselected(
-    RowTrackingState::Supported,
-    &[true, false, true] /* selection_vector */,
-    None /* expected_error */,
-)]
-#[case::enabled_none_selected(
-    RowTrackingState::Enabled,
-    &[false, false, false] /* selection_vector */,
-    None /* expected_error */,
-)]
-#[case::supported_none_selected(
-    RowTrackingState::Supported,
-    &[false, false, false] /* selection_vector */,
-    None /* expected_error */,
-)]
+#[case::enabled_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Enabled,
+    selection_vector: &[true, true, true],
+    expected_error: Some("row-tracking field"),
+})]
+#[case::supported_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Supported,
+    selection_vector: &[true, true, true],
+    expected_error: None,
+})]
+#[case::suspended_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Suspended,
+    selection_vector: &[true, true, true],
+    expected_error: None,
+})]
+#[case::unsupported_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Unsupported,
+    selection_vector: &[true, true, true],
+    expected_error: None,
+})]
+#[case::enabled_implicitly_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Enabled,
+    selection_vector: &[false],
+    expected_error: Some("row-tracking field"),
+})]
+#[case::supported_implicitly_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Supported,
+    selection_vector: &[false],
+    expected_error: None,
+})]
+#[case::enabled_invalid_row_unselected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Enabled,
+    selection_vector: &[true, false, true],
+    expected_error: None,
+})]
+#[case::supported_invalid_row_unselected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Supported,
+    selection_vector: &[true, false, true],
+    expected_error: None,
+})]
+#[case::enabled_none_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Enabled,
+    selection_vector: &[false, false, false],
+    expected_error: None,
+})]
+#[case::supported_none_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Supported,
+    selection_vector: &[false, false, false],
+    expected_error: None,
+})]
 fn row_tracking_metadata_cases(
-    #[case] row_tracking_state: RowTrackingState,
-    #[case] selection_vector: &[bool],
-    #[case] expected_error: Option<&str>,
+    #[case] case: RowTrackingMetadataCase,
     #[values(None, Some(-1))] value: Option<i64>,
     #[values("baseRowId", "defaultRowCommitVersion")] field: &'static str,
     #[values("none", "name", "id")] cm_mode: &str,
@@ -2723,13 +2721,16 @@ fn row_tracking_metadata_cases(
 #[apply(row_tracking_metadata_cases)]
 #[tokio::test]
 async fn commit_validates_remove_row_tracking_metadata(
-    row_tracking_state: RowTrackingState,
-    selection_vector: &[bool],
-    expected_error: Option<&str>,
+    case: RowTrackingMetadataCase,
     value: Option<i64>,
     field: &'static str,
     cm_mode: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let RowTrackingMetadataCase {
+        row_tracking_state,
+        selection_vector,
+        expected_error,
+    } = case;
     // === Given a table with row tracking in the requested state ===
     let (_temp_dir, engine, snapshot) = create_row_tracking_table(row_tracking_state, cm_mode)?;
     let (original, corrupted) = batch_with_invalid_row_tracking_meta(
@@ -2773,13 +2774,16 @@ async fn commit_validates_remove_row_tracking_metadata(
 #[apply(row_tracking_metadata_cases)]
 #[tokio::test]
 async fn commit_validates_dv_row_tracking_metadata(
-    row_tracking_state: RowTrackingState,
-    selection_vector: &[bool],
-    expected_error: Option<&str>,
+    case: RowTrackingMetadataCase,
     value: Option<i64>,
     field: &'static str,
     cm_mode: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let RowTrackingMetadataCase {
+        row_tracking_state,
+        selection_vector,
+        expected_error,
+    } = case;
     // === Given a table with row tracking in the requested state ===
     let (_temp_dir, engine, snapshot) = create_row_tracking_table(row_tracking_state, cm_mode)?;
     let (original, corrupted) = batch_with_invalid_row_tracking_meta(
@@ -2822,6 +2826,13 @@ async fn commit_validates_dv_row_tracking_metadata(
         )?;
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState,
+    selection_vector: &'static [bool],
+    expected_error: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

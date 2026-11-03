@@ -23,6 +23,12 @@ use crate::schema::{ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{EngineData, KernelError, KernelResult};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowTrackingEnablement {
+    Enabled,
+    Disabled,
+}
+
 /// Validates staged file-action (addFile, removeFile) uniqueness across a transaction.
 ///
 /// - AddFile paths must be unique, regardless of deletion vector ID.

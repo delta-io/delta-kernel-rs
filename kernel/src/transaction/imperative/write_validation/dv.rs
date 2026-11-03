@@ -8,7 +8,9 @@ use super::utils::{
     columns_and_types_from_schema, dv_id_at, validate_partition_keys,
     validate_required_field_exist, validate_row_tracking_metadata,
 };
-use super::{FileActionUniquenessValidator, StagedDataValidator, Validation};
+use super::{
+    FileActionUniquenessValidator, RowTrackingEnablement, StagedDataValidator, Validation,
+};
 use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::expressions::column_name;
 use crate::scan::log_replay::{
@@ -61,12 +63,12 @@ static DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION: LazyLock<KernelResult<ColumnNames
 pub(crate) fn validate_dv_matched_files(
     dv_matched_files: &[FilteredEngineData],
     physical_partition_columns: impl IntoIterator<Item = String>,
-    row_tracking_enabled: bool,
+    row_tracking_enablement: RowTrackingEnablement,
     uniqueness_validator: Option<&mut FileActionUniquenessValidator>,
 ) -> KernelResult<()> {
     StagedDataValidator::for_dv_updates(
         physical_partition_columns,
-        row_tracking_enabled,
+        row_tracking_enablement,
         uniqueness_validator,
     )?
     .validate_selected_rows(dv_matched_files)
@@ -75,7 +77,7 @@ pub(crate) fn validate_dv_matched_files(
 /// Mandatory validations for every selected DV-update row.
 struct MandatoryDvUpdateValidation {
     physical_partition_columns: HashSet<String>,
-    row_tracking_enabled: bool,
+    row_tracking_enablement: RowTrackingEnablement,
 }
 
 impl Validation for MandatoryDvUpdateValidation {
@@ -115,7 +117,7 @@ impl Validation for MandatoryDvUpdateValidation {
             path,
             MODIFICATION_TIME_NAME,
         )?;
-        if self.row_tracking_enabled {
+        if self.row_tracking_enablement == RowTrackingEnablement::Enabled {
             validate_row_tracking_metadata(
                 path,
                 getters[BASE_ROW_ID].get_opt(row, BASE_ROW_ID_NAME)?,
@@ -150,7 +152,7 @@ impl Validation for DvUpdateUniquenessValidation<'_> {
 impl<'a> StagedDataValidator<'a> {
     fn for_dv_updates(
         physical_partition_columns: impl IntoIterator<Item = String>,
-        row_tracking_enabled: bool,
+        row_tracking_enablement: RowTrackingEnablement,
         uniqueness_validator: Option<&'a mut FileActionUniquenessValidator>,
     ) -> KernelResult<Self> {
         let columns = DV_MATCHED_FILE_COLUMNS_FOR_VALIDATION
@@ -163,7 +165,7 @@ impl<'a> StagedDataValidator<'a> {
         let mut validations: Vec<Box<dyn Validation + 'a>> =
             vec![Box::new(MandatoryDvUpdateValidation {
                 physical_partition_columns: physical_partition_columns.into_iter().collect(),
-                row_tracking_enabled,
+                row_tracking_enablement,
             })];
         if let Some(uniqueness_validator) = uniqueness_validator {
             validations.push(Box::new(DvUpdateUniquenessValidation {
@@ -347,7 +349,7 @@ mod tests {
         let mut uniqueness_validator = FileActionUniquenessValidator::default();
         let result = StagedDataValidator::for_dv_updates(
             std::iter::empty(),
-            false, /* row_tracking_enabled */
+            RowTrackingEnablement::Disabled,
             dedup_validation_enabled.then_some(&mut uniqueness_validator),
         )
         .expect("DV validator should use the intermediate DV schema")
@@ -377,7 +379,7 @@ mod tests {
         let mut uniqueness_validator = FileActionUniquenessValidator::default();
         StagedDataValidator::for_dv_updates(
             std::iter::empty(),
-            false, /* row_tracking_enabled */
+            RowTrackingEnablement::Disabled,
             Some(&mut uniqueness_validator),
         )
         .expect("DV validator should use the intermediate DV schema")
@@ -416,7 +418,7 @@ mod tests {
         assert_result_error_with_message(
             StagedDataValidator::for_dv_updates(
                 std::iter::empty(),
-                false, /* row_tracking_enabled */
+                RowTrackingEnablement::Disabled,
                 Some(&mut uniqueness_validator),
             )
             .expect("DV validator should use the intermediate DV schema")
@@ -448,7 +450,7 @@ mod tests {
         let mut uniqueness_validator = FileActionUniquenessValidator::default();
         let result = StagedDataValidator::for_dv_updates(
             ["p1".to_string(), "p2".to_string()],
-            false, /* row_tracking_enabled */
+            RowTrackingEnablement::Disabled,
             Some(&mut uniqueness_validator),
         )
         .expect("DV validator should use the intermediate DV schema")

@@ -79,8 +79,8 @@ pub(super) fn validate_partition_keys(
     Ok(())
 }
 
-/// Requires non-null, non-negative `baseRowId` and `defaultRowCommitVersion` when row tracking is
-/// enabled.
+/// Requires non-null, non-negative `baseRowId` and `defaultRowCommitVersion`.
+/// Callers must verify that row tracking is enabled before invoking this function.
 pub(super) fn validate_row_tracking_metadata(
     path: &str,
     base_row_id: Option<i64>,
