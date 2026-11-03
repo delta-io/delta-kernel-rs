@@ -162,7 +162,7 @@ link to rustdoc for handler signatures and contracts.
 | `connector/overview.md` | Explanation | What a connector is, Kernel vs. connector responsibilities |
 | `configuring_storage.md` | How-to | "To configure S3/GCS/Azure storage, pass these options" |
 | `checkpointing.md` | How-to | "To checkpoint a table, call these APIs" |
-| `ffi/overview.md` | Explanation + Reference | Consider splitting if it grows |
+| `ffi/overview.md` | Explanation | What crosses the FFI boundary and how ownership works |
 
 ### Type-specific guidance
 

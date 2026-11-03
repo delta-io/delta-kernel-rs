@@ -30,7 +30,8 @@ Choose where to document something by the reader's task and the scope of the exp
 - **Source comments** explain implementation invariants, pitfalls, and low-level design decisions
   next to the code they concern.
 - **Agent docs** explain repository workflows, test helpers, code conventions, source navigation,
-  and design considerations spanning modules. Link to source comments for implementation details.
+  and internal design considerations spanning modules. Link to source comments for implementation
+  details.
 
 Give each contract, inventory, or dependency setup example one authoritative location. Summarize
 what readers need for their task and link to that location instead of maintaining another copy.
