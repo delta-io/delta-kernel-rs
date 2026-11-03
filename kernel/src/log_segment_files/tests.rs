@@ -1,16 +1,16 @@
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use rstest::rstest;
 use url::Url;
 
 use super::*;
+use crate::engine::CancellableEngine;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
-use crate::engine::CancellableEngine;
+use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
-use crate::object_store::ObjectStoreExt as _;
 use crate::path::tests::multipart_checkpoint_name;
 use crate::unit_test_utils::TestCancellationToken;
 use crate::{Engine as _, FileMeta, KernelResultIterator, StorageHandler};
@@ -700,11 +700,13 @@ async fn backward_scan_single_checkpoint_cases(
         assert_eq!(result.checkpoint_parts[0].version, cp_version);
     }
 
-    assert!(result
-        .ascending_commit_files
-        .iter()
-        .map(|f| f.version)
-        .eq(expected_commits));
+    assert!(
+        result
+            .ascending_commit_files
+            .iter()
+            .map(|f| f.version)
+            .eq(expected_commits)
+    );
 }
 
 /// end_version=3000. Window 2 contains an incomplete 2-of-2 multipart checkpoint (only
@@ -716,8 +718,8 @@ async fn backward_scan_single_checkpoint_cases(
 /// Window 1 [2001, 3001): commits v2001..=v3000, no checkpoint -> continue
 /// Window 2 [1001, 2001): commits v1001..=v2000, v1500 (1-of-2 parts) incomplete -> continue
 /// Window 3 [1, 1001):    commits v1..=v1000, v500 (complete) -> checkpoint found -> break
-fn files_incomplete_in_second_window_complete_in_third_window(
-) -> Vec<(Version, LogPathFileType, CommitSource)> {
+fn files_incomplete_in_second_window_complete_in_third_window()
+-> Vec<(Version, LogPathFileType, CommitSource)> {
     let mut log_files: Vec<(Version, LogPathFileType, CommitSource)> = (0u64..=3000)
         .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
         .collect();
@@ -820,10 +822,12 @@ async fn backward_scan_multipart_checkpoint_cases(
 
     assert_eq!(counter.call_count(), expected_listings);
     assert_eq!(result.checkpoint_parts.len(), expected_checkpoint_parts);
-    assert!(result
-        .checkpoint_parts
-        .iter()
-        .all(|p| p.version == expected_checkpoint_version));
+    assert!(
+        result
+            .checkpoint_parts
+            .iter()
+            .all(|p| p.version == expected_checkpoint_version)
+    );
     assert_eq!(result.ascending_commit_files.len(), expected_commit_count);
     assert_eq!(
         result.ascending_commit_files.first().unwrap().version,

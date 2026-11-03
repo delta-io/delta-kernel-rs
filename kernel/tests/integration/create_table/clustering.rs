@@ -2,14 +2,14 @@
 
 use std::sync::Arc;
 
+use delta_kernel::KernelResult;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::expressions::{column_name, ColumnName};
-use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
+use delta_kernel::expressions::{ColumnName, column_name};
+use delta_kernel::schema::{DataType, StructField, StructType, schema_ref};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::KernelResult;
 use rstest::rstest;
 use test_utils::{assert_result_error_with_message, test_table_setup};
 

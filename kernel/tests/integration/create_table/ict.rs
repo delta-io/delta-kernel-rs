@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
-    TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{Engine, KernelResult};

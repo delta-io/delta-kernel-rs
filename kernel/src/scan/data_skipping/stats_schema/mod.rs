@@ -7,12 +7,12 @@ use std::borrow::Cow;
 use column_filter::StatsColumnFilter;
 pub(crate) use column_filter::StatsConfig;
 
+use crate::KernelResult;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::schema::{
     ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, StructField, StructType,
 };
-use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::KernelResult;
+use crate::transforms::{SchemaTransform, transform_output_type};
 
 /// Generates the expected schema for file statistics.
 ///

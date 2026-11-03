@@ -18,9 +18,9 @@ use delta_kernel::{EngineData, KernelResult, KernelResultIterator, Snapshot};
 use itertools::Itertools;
 use tempfile::tempdir;
 use test_utils::{
-    add_commit, create_add_files_metadata, create_default_engine_mt_executor, create_table,
-    engine_store_setup, generate_batch, into_record_batch, read_actions_from_commit,
-    record_batch_to_bytes, IntoArray,
+    IntoArray, add_commit, create_add_files_metadata, create_default_engine_mt_executor,
+    create_table, engine_store_setup, generate_batch, into_record_batch, read_actions_from_commit,
+    record_batch_to_bytes,
 };
 
 use crate::common::write_utils::{
@@ -271,7 +271,7 @@ async fn test_write_deletion_vectors_end_to_end() -> KernelResult<()> {
 
     let mut dv_file2 = KernelDeletionVector::new();
     dv_file2.add_deleted_row_indexes(FILE2_DELETE_INDEXES); // Delete rows at indices 2 and 5 (ids
-                                                            // 12, 15)
+    // 12, 15)
 
     // Step 8: Update deletion vectors for both files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;

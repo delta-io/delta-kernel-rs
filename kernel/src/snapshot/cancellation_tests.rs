@@ -11,7 +11,7 @@ use crate::engine::sync::SyncEngine;
 use crate::metrics::{LogSegmentLoadType, MetricEvent, SnapshotLoadType};
 use crate::unit_test_utils::recording_reads::{Read, RecordingReads};
 use crate::unit_test_utils::{
-    copy_test_table, install_thread_local_metrics_reporter, CapturingReporter,
+    CapturingReporter, copy_test_table, install_thread_local_metrics_reporter,
 };
 use crate::{CancellationTokenRef, KernelError, Snapshot};
 
@@ -154,8 +154,10 @@ fn only_cancelled_crc_read_blocks_incremental_snapshot_build(
             )
         })
         .collect();
-    let [MetricEvent::ProtocolMetadataLoadFailure(pm), MetricEvent::SnapshotBuildFailure(build)] =
-        failures.as_slice()
+    let [
+        MetricEvent::ProtocolMetadataLoadFailure(pm),
+        MetricEvent::SnapshotBuildFailure(build),
+    ] = failures.as_slice()
     else {
         panic!("expected one protocol/metadata and snapshot failure: {events:?}");
     };

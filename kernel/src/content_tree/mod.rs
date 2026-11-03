@@ -22,7 +22,7 @@ use delta_kernel_derive::ToSchema;
 use url::Url;
 
 use crate::engine_data::{EngineData, GetData, TypedGetData as _};
-use crate::expressions::{null_lit, Expression, Scalar, StructData};
+use crate::expressions::{Expression, Scalar, StructData, null_lit};
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::{ColumnNamesAndTypes, DataType, StructType, ToSchema as _};
 use crate::{KernelError, KernelResult, Version};
@@ -135,6 +135,10 @@ pub(crate) struct DeletionVectorInfo {
     #[field_id = 149]
     pub(crate) key_metadata: Option<Bytes>,
 }
+
+/// The `deletionVector.*` leaf columns of a content entry, in [`DeletionVectorInfo`] field order.
+pub(crate) static DV_INFO_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| DeletionVectorInfo::to_schema().leaves(DV_INFO));
 
 /// Sub-struct of ContentTreeNodeEntry that tracks details
 /// of the history of a file in the AMT (its current state,

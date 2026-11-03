@@ -6,9 +6,9 @@ use crate::action_reconciliation::ActionReconciliationIterator;
 use crate::actions::{ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::filter_by_predicate;
 use crate::expressions::{
-    col, null_lit, Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData,
+    Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData, col, null_lit,
 };
-use crate::schema::{try_schema, DataType, SchemaRef, StructField};
+use crate::schema::{DataType, SchemaRef, StructField, try_schema};
 use crate::{
     Engine, EngineData, EvaluationHandler, ExpressionEvaluator, FileMeta, KernelError,
     KernelResult, PredicateEvaluator,
@@ -335,7 +335,7 @@ impl Iterator for SingleSidecarDataIterator {
             Err(e) => {
                 return Some(Err(KernelError::internal_error(format!(
                     "sidecar splitter lock poisoned: {e}"
-                ))))
+                ))));
             }
         };
         match splitter.next_file_actions_batch() {

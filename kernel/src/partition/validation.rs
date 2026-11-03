@@ -264,7 +264,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::Scalar;
-    use crate::schema::{schema, ArrayType, DataType, MapType};
+    use crate::schema::{ArrayType, DataType, MapType, schema};
 
     fn assert_type_ok(data_type: DataType, value: Scalar) {
         let schema = schema! { not_null "p": (data_type) };

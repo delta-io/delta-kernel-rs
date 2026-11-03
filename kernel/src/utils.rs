@@ -311,8 +311,8 @@ mod tests {
     }
 
     mod on_complete_tests {
-        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
         use super::*;
 

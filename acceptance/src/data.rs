@@ -6,16 +6,16 @@ use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::ObjectStore;
+use delta_kernel::object_store::local::LocalFileSystem;
 #[allow(deprecated)]
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{Engine, KernelError, KernelResult};
-use futures::stream::TryStreamExt;
 use futures::StreamExt;
+use futures::stream::TryStreamExt;
 use itertools::Itertools;
 
 use crate::{TestCaseInfo, TestResult};

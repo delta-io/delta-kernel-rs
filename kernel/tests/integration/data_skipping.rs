@@ -21,23 +21,24 @@ use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{
-    col, column_name, lit, Expression as Expr, Predicate as Pred, PredicateRef, Scalar,
+    Expression as Expr, Predicate as Pred, PredicateRef, Scalar, col, column_name, lit,
 };
 use delta_kernel::metrics::{MetricEvent, ScanType};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, Scan, StatsOptions};
-use delta_kernel::schema::{schema, schema_ref, DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType, schema, schema_ref};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{KernelError, Snapshot, SnapshotRef};
 use rstest::rstest;
 use serde::Serialize;
-use serde_json::{json, Value};
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use serde_json::{Value, json};
 use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::{
-    add_commit, create_table_and_load_snapshot, install_thread_local_metrics_reporter,
-    into_record_batch, test_table_setup_mt, write_batch_to_table, CapturingReporter,
+    CapturingReporter, add_commit, create_table_and_load_snapshot,
+    install_thread_local_metrics_reporter, into_record_batch, test_table_setup_mt,
+    write_batch_to_table,
 };
 use url::Url;
 
@@ -78,8 +79,8 @@ fn long_batch(schema: &SchemaRef, c0_start: i64, rows: i64) -> RecordBatch {
 /// Creates a fresh table with `dataSkippingNumIndexedCols=2`, writes three add-files with
 /// disjoint `c0`/`c1` ranges, then checkpoints. Returns `(temp_dir, table_path, engine)`.
 /// The `temp_dir` keeps the on-disk table alive for the duration of the test.
-async fn build_capped_table_with_checkpoint(
-) -> Result<(tempfile::TempDir, String, Arc<TestEngine>), Box<dyn std::error::Error>> {
+async fn build_capped_table_with_checkpoint()
+-> Result<(tempfile::TempDir, String, Arc<TestEngine>), Box<dyn std::error::Error>> {
     let schema = capped_schema();
     let (tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = Url::from_directory_path(&table_path)

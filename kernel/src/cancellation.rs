@@ -278,11 +278,13 @@ mod tests {
     fn downcast_to_the_wrong_type_fails() {
         let erased: CancellationTokenRef = Arc::new(TestToken::default());
         assert!(erased.clone().as_any().downcast::<OtherToken>().is_err());
-        assert!(erased
-            .as_ref()
-            .any_ref()
-            .downcast_ref::<OtherToken>()
-            .is_none());
+        assert!(
+            erased
+                .as_ref()
+                .any_ref()
+                .downcast_ref::<OtherToken>()
+                .is_none()
+        );
     }
 
     // `Arc<dyn CancellationToken>` satisfies the blanket `AsAny` impl in its own right, so

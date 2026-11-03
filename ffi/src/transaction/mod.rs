@@ -16,10 +16,11 @@ pub use committed::{
 };
 pub use create_table::*;
 pub use deletion_vector::{
-    dv_descriptor_map_insert, dv_descriptor_map_new, dv_descriptor_new, free_dv_descriptor,
-    free_dv_descriptor_map, update_table_txn_update_deletion_vectors, ExclusiveDvDescriptor,
-    ExclusiveDvDescriptorMap, KernelDvStorageType,
+    ExclusiveDvDescriptor, ExclusiveDvDescriptorMap, KernelDvStorageType, dv_descriptor_map_insert,
+    dv_descriptor_map_new, dv_descriptor_new, free_dv_descriptor, free_dv_descriptor_map,
+    update_table_txn_update_deletion_vectors,
 };
+use delta_kernel::EngineData;
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::transaction::create_table::{
@@ -29,17 +30,16 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::{
     CommittedTransaction, Transaction, UpdateTableOperation, UpdateTableTransactionBuilder,
 };
-use delta_kernel::EngineData;
 use delta_kernel_ffi_macros::handle_descriptor;
 pub use partition_value::{
-    free_partition_value_map, partition_value_map_insert_binary, partition_value_map_insert_bool,
-    partition_value_map_insert_byte, partition_value_map_insert_date,
-    partition_value_map_insert_decimal, partition_value_map_insert_double,
-    partition_value_map_insert_float, partition_value_map_insert_int,
-    partition_value_map_insert_long, partition_value_map_insert_null,
-    partition_value_map_insert_short, partition_value_map_insert_string,
-    partition_value_map_insert_timestamp, partition_value_map_insert_timestamp_ntz,
-    partition_value_map_new, ExclusivePartitionValueMap,
+    ExclusivePartitionValueMap, free_partition_value_map, partition_value_map_insert_binary,
+    partition_value_map_insert_bool, partition_value_map_insert_byte,
+    partition_value_map_insert_date, partition_value_map_insert_decimal,
+    partition_value_map_insert_double, partition_value_map_insert_float,
+    partition_value_map_insert_int, partition_value_map_insert_long,
+    partition_value_map_insert_null, partition_value_map_insert_short,
+    partition_value_map_insert_string, partition_value_map_insert_timestamp,
+    partition_value_map_insert_timestamp_ntz, partition_value_map_new,
 };
 pub use update_table::*;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -51,7 +51,7 @@ use crate::engine_funcs::FileMeta;
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::scan::EngineSchema;
-use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
+use crate::schema_visitor::{KernelSchemaVisitorState, extract_kernel_schema};
 use crate::{
     ExclusiveEngineData, ExternEngine, KernelResult, KernelStringSlice, SharedExternEngine,
     SharedSnapshot, TryFromStringSlice,
@@ -111,8 +111,8 @@ use create_table::{collect_create_table_columns, create_table_txn_builder_with_d
 #[cfg(test)]
 mod tests {
     use std::os::raw::c_void;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use delta_kernel::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StructArray};
     use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
@@ -129,7 +129,7 @@ mod tests {
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
     use delta_kernel::schema::{
-        schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+        ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType, schema_ref,
     };
     use delta_kernel::table_features::TableFeature;
     use delta_kernel::transaction::create_table::create_table;
@@ -137,7 +137,7 @@ mod tests {
     use delta_kernel_ffi::delta_types::{
         FfiColumnNameArray, FfiNullableStringMap, FfiNullableStringMapEntry, FfiStringArray,
     };
-    use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
+    use delta_kernel_ffi::engine_data::{ArrowFFIData, get_engine_data};
     use delta_kernel_ffi::error::FFIKernelError;
     use delta_kernel_ffi::ffi_test_utils::{
         allocate_bytes, allocate_err, allocate_str, assert_extern_result_error_contains,
@@ -147,23 +147,23 @@ mod tests {
     use delta_kernel_ffi::tests::get_default_engine;
     use itertools::Itertools;
     use rstest::rstest;
-    use serde_json::{json, Deserializer};
+    use serde_json::{Deserializer, json};
     use tempfile::tempdir;
-    use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
     use test_utils::delta_kernel_default_engine::DefaultEngine;
+    use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
     use test_utils::{
-        install_thread_local_metrics_reporter, set_json_value, setup_test_tables, test_read,
-        CapturingReporter,
+        CapturingReporter, install_thread_local_metrics_reporter, set_json_value,
+        setup_test_tables, test_read,
     };
     use write_context::{
+        FfiRowTrackingMetadataColumns, SharedWriteContext,
         create_table_txn_get_partitioned_write_context,
         create_table_txn_get_unpartitioned_write_context, free_write_context,
         get_logical_to_physical, get_physical_write_schema, get_write_dir, get_write_path,
         get_write_schema, resolve_file_path, update_table_txn_get_partitioned_write_context,
         update_table_txn_get_unpartitioned_write_context, visit_partition_values,
         write_context_builder_build, write_context_builder_with_partition_values,
-        write_context_builder_with_physical_partition_values, FfiRowTrackingMetadataColumns,
-        SharedWriteContext,
+        write_context_builder_with_physical_partition_values,
     };
 
     use super::*;
@@ -175,8 +175,8 @@ mod tests {
         visit_field_integer, visit_field_long, visit_field_string, visit_field_struct,
     };
     use crate::{
-        free_engine, free_schema, free_snapshot, kernel_bytes_slice, kernel_string_slice,
-        logical_schema, version, KernelStringSlice, NullableCvoid, OptionalValue, Url,
+        KernelStringSlice, NullableCvoid, OptionalValue, Url, free_engine, free_schema,
+        free_snapshot, kernel_bytes_slice, kernel_string_slice, logical_schema, version,
     };
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
@@ -1410,7 +1410,9 @@ mod tests {
         assert_extern_result_error_with_message(
             result,
             FFIKernelError::GenericError,
-            Some("Generic delta kernel error: Cannot modify domains that start with 'delta.' as those are system controlled"),
+            Some(
+                "Generic delta kernel error: Cannot modify domains that start with 'delta.' as those are system controlled",
+            ),
         );
 
         unsafe { free_engine(engine) };
@@ -1627,7 +1629,9 @@ mod tests {
         assert_extern_result_error_with_message(
             result,
             FFIKernelError::GenericError,
-            Some("Generic delta kernel error: Metadata for domain dup already specified in this transaction"),
+            Some(
+                "Generic delta kernel error: Metadata for domain dup already specified in this transaction",
+            ),
         );
 
         unsafe { free_engine(engine) };
@@ -1682,7 +1686,9 @@ mod tests {
         assert_extern_result_error_with_message(
             result,
             FFIKernelError::UnsupportedError,
-            Some("Unsupported: Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"),
+            Some(
+                "Unsupported: Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature",
+            ),
         );
 
         unsafe { free_engine(engine) };
@@ -1700,9 +1706,9 @@ mod tests {
             cast_test_context, get_test_context, recover_test_context,
         };
         use crate::delta_kernel_unity_catalog::{
-            free_uc_commit_client, get_uc_commit_client, get_uc_committer, CommitRequest,
+            CommitRequest, free_uc_commit_client, get_uc_commit_client, get_uc_committer,
         };
-        use crate::{snapshot_publish_with_committer, Handle, NullableCvoid, OptionalValue};
+        use crate::{Handle, NullableCvoid, OptionalValue, snapshot_publish_with_committer};
 
         #[unsafe(no_mangle)]
         extern "C" fn test_uc_commit(
@@ -3328,6 +3334,7 @@ mod tests {
     #[case(KernelUpdateTableOperation::Update, "UPDATE")]
     #[case(KernelUpdateTableOperation::Merge, "MERGE")]
     #[case(KernelUpdateTableOperation::Optimize, "OPTIMIZE")]
+    #[case(KernelUpdateTableOperation::Reorg, "REORG")]
     #[tokio::test]
     async fn update_table_operation_variants_commit_expected_history_name(
         #[case] operation: KernelUpdateTableOperation,
@@ -3691,10 +3698,12 @@ mod tests {
         for info in &infos {
             assert_eq!(info.physical_column != info.logical_column, column_mapping);
         }
-        assert!(snapshot
-            .table_configuration()
-            .logical_partition_columns()
-            .is_empty());
+        assert!(
+            snapshot
+                .table_configuration()
+                .logical_partition_columns()
+                .is_empty()
+        );
         unsafe { free_engine(engine) };
         Ok(())
     }
@@ -4696,8 +4705,8 @@ mod tests {
         use delta_kernel::object_store::path::Path as ObjectStorePath;
         use delta_kernel_ffi::scan::{free_scan, scan, scan_metadata_iter_init};
         use delta_kernel_ffi::transaction::{
-            dv_descriptor_map_insert, dv_descriptor_map_new, dv_descriptor_new,
-            update_table_txn_update_deletion_vectors, KernelDvStorageType,
+            KernelDvStorageType, dv_descriptor_map_insert, dv_descriptor_map_new,
+            dv_descriptor_new, update_table_txn_update_deletion_vectors,
         };
         use test_utils::record_batch_to_bytes;
 
