@@ -412,7 +412,7 @@ pub extern "C" fn visit_expression_literal_timestamp_ntz(
 pub unsafe extern "C" fn visit_expression_literal_interval_year_month(
     state: &mut KernelExpressionVisitorState,
     value: i32,
-    kind: u32,
+    kind: u8,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
     let result = FfiIntervalYearToMonthType::try_from(kind)
@@ -640,9 +640,8 @@ impl NullTypeTag {
             Self::Timestamp => Ok(DataType::TIMESTAMP),
             Self::TimestampNtz => Ok(DataType::TIMESTAMP_NTZ),
             Self::IntervalYearMonth => {
-                let kind = FfiIntervalYearToMonthType::try_from(u32::from(
-                    parameters.interval_year_month_kind,
-                ))?;
+                let kind =
+                    FfiIntervalYearToMonthType::try_from(parameters.interval_year_month_kind)?;
                 Ok(DataType::Primitive(PrimitiveType::IntervalYearMonth(
                     kind.into(),
                 )))
@@ -1441,7 +1440,7 @@ mod tests {
                 visit_expression_literal_interval_year_month(
                     &mut state,
                     value.months(),
-                    FfiIntervalYearToMonthType::from(*value.ty()) as u32,
+                    FfiIntervalYearToMonthType::from(*value.ty()) as u8,
                     &TEST_ERROR_ALLOCATORS,
                 )
             }),
@@ -1456,8 +1455,8 @@ mod tests {
 
     #[rstest]
     #[case::literal_first_invalid(3)]
-    #[case::literal_unknown(u32::MAX)]
-    fn interval_year_month_literal_rejects_invalid_kind(#[case] invalid_kind: u32) {
+    #[case::literal_unknown(u8::MAX)]
+    fn interval_year_month_literal_rejects_invalid_kind(#[case] invalid_kind: u8) {
         let mut state = KernelExpressionVisitorState::default();
         let existing = visit_expression_literal_int(&mut state, 7);
         let result = unsafe {
@@ -1483,7 +1482,7 @@ mod tests {
             visit_expression_literal_interval_year_month(
                 &mut state,
                 -12,
-                FfiIntervalYearToMonthType::IntervalYear as u32,
+                FfiIntervalYearToMonthType::IntervalYear as u8,
                 &TEST_ERROR_ALLOCATORS,
             )
         };
@@ -1502,7 +1501,7 @@ mod tests {
             visit_expression_literal_interval_year_month(
                 &mut state,
                 -13,
-                FfiIntervalYearToMonthType::IntervalYear as u32,
+                FfiIntervalYearToMonthType::IntervalYear as u8,
                 &TEST_ERROR_ALLOCATORS,
             )
         };

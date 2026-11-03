@@ -30,7 +30,6 @@ enum SimplePrimitiveType {
 }
 
 enum IntervalYearToMonthKind {
-  // Proto3 defaults omitted enum fields to zero; this sentinel keeps omission detectable.
   INTERVAL_YEAR_TO_MONTH_KIND_UNSPECIFIED = 0;
   INTERVAL_YEAR_TO_MONTH_KIND_INTERVAL_YEAR = 1;
   INTERVAL_YEAR_TO_MONTH_KIND_INTERVAL_MONTH = 2;

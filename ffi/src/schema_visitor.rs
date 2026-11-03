@@ -526,7 +526,7 @@ pub unsafe extern "C" fn visit_field_interval_year_month(
     name: KernelStringSlice,
     nullable: bool,
     metadata: *const EngineMetadata,
-    kind: u32,
+    kind: u8,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
@@ -1663,7 +1663,7 @@ mod tests {
                     KernelStringSlice::new_unsafe($name),
                     $nullable,
                     $metadata,
-                    FfiIntervalYearToMonthType::IntervalYearToMonth as u32,
+                    FfiIntervalYearToMonthType::IntervalYearToMonth as u8,
                     &TEST_ERROR_ALLOCATORS,
                 )
             })
@@ -1865,7 +1865,7 @@ mod tests {
                     "number",
                     MetadataValue::Number(17),
                 )])),
-                FfiIntervalYearToMonthType::IntervalYearToMonth as u32,
+                FfiIntervalYearToMonthType::IntervalYearToMonth as u8,
                 &TEST_ERROR_ALLOCATORS,
             ))
         };
@@ -1918,7 +1918,7 @@ mod tests {
                 KernelStringSlice::new_unsafe("ym"),
                 true,
                 null(),
-                ffi_kind as u32,
+                ffi_kind as u8,
                 &TEST_ERROR_ALLOCATORS,
             ))
         };
@@ -1933,8 +1933,8 @@ mod tests {
 
     #[rstest]
     #[case::first_invalid(3)]
-    #[case::unknown(u32::MAX)]
-    fn interval_year_month_field_rejects_invalid_kind_before_metadata(#[case] invalid_kind: u32) {
+    #[case::unknown(u8::MAX)]
+    fn interval_year_month_field_rejects_invalid_kind_before_metadata(#[case] invalid_kind: u8) {
         let mut metadata_source = TestMetadata::from([("visited", MetadataValue::Boolean(true))]);
         let metadata = test_engine_metadata(&mut metadata_source);
         let mut state = KernelSchemaVisitorState::default();
@@ -1967,7 +1967,7 @@ mod tests {
                 KernelStringSlice::new_unsafe("ym"),
                 false,
                 null(),
-                FfiIntervalYearToMonthType::IntervalMonth as u32,
+                FfiIntervalYearToMonthType::IntervalMonth as u8,
                 &TEST_ERROR_ALLOCATORS,
             )
         };
@@ -1991,7 +1991,7 @@ mod tests {
                 KernelStringSlice::new_unsafe("ym"),
                 false,
                 &rejected_engine_metadata(),
-                FfiIntervalYearToMonthType::IntervalYear as u32,
+                FfiIntervalYearToMonthType::IntervalYear as u8,
                 &TEST_ERROR_ALLOCATORS,
             )
         };
@@ -2008,7 +2008,7 @@ mod tests {
                 KernelStringSlice::new_unsafe("ym"),
                 false,
                 &test_engine_metadata(&mut metadata),
-                FfiIntervalYearToMonthType::IntervalYear as u32,
+                FfiIntervalYearToMonthType::IntervalYear as u8,
                 &TEST_ERROR_ALLOCATORS,
             ))
         };

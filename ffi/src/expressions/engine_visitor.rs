@@ -951,6 +951,20 @@ mod tests {
         });
     }
 
+    extern "C" fn visit_literal_null(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        tag: u8,
+        parameters: KernelNullTypeParameters,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        builder.events.push(LiteralEvent::Null {
+            sibling_list_id,
+            tag,
+            parameters,
+        });
+    }
+
     macro_rules! ignore_fn {
         ($fn_name:ident $(, $arg_type:ty)*) => {
             extern "C" fn $fn_name(
@@ -976,20 +990,6 @@ mod tests {
     ignore_fn!(ignore_child_list, usize);
     ignore_fn!(ignore_map_literal, usize, usize);
     ignore_fn!(ignore_case_when, usize, usize, usize);
-    extern "C" fn visit_literal_null(
-        data: *mut c_void,
-        sibling_list_id: usize,
-        tag: u8,
-        parameters: KernelNullTypeParameters,
-    ) {
-        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
-        builder.events.push(LiteralEvent::Null {
-            sibling_list_id,
-            tag,
-            parameters,
-        });
-    }
-
     ignore_fn!(ignore_parse_json, usize, Handle<SharedSchema>);
     ignore_fn!(ignore_struct_patch, usize, usize, usize, usize);
     ignore_fn!(ignore_field_patch, KernelStringSlice, usize, bool, bool);
