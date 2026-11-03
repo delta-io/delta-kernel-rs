@@ -16,9 +16,9 @@ target_link_directories(read_table PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../../
 target_link_libraries(read_table PUBLIC delta_kernel_ffi)
 target_compile_options(read_table PUBLIC)
 
-include(CTest)
 # The C string model rejects embedded NULs. UDT_IN_DEV enables the engine-backed annotation
 # round trip against the schema-only Delta fixture.
+include(CTest)
 add_executable(udt_annotation_test udt_annotation_test.c ../common/kernel_utils.c)
 target_compile_definitions(udt_annotation_test PUBLIC DEFINE_DEFAULT_ENGINE_BASE)
 target_include_directories(udt_annotation_test PUBLIC
