@@ -327,8 +327,8 @@ pub(crate) mod adaptive_metadata_fixtures {
 
     use super::*;
     use crate::actions::{
-        CheckpointAction, ContentRoot, LastManifestCommit, Sidecar, LOG_METADATA_SCHEMA,
-        LOG_PROTOCOL_SCHEMA,
+        CheckpointAction, ContentRoot, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA,
+        LastManifestCommit, Sidecar,
     };
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::Scalar;
