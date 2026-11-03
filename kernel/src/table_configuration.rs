@@ -29,10 +29,10 @@ use crate::schema::{
     ColumnMetadataKey, SchemaRef, StructField, StructType, schema_has_invariants,
     validate_column_defaults_metadata,
 };
-#[cfg(feature = "geo-type-in-dev")]
-use crate::table_features::validate_geospatial_feature_support;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_features::V4_VALIDATOR;
+#[cfg(feature = "geo-type-in-dev")]
+use crate::table_features::validate_geospatial_feature_support;
 use crate::table_features::{
     ColumnMappingMode, EnablementCheck, FeatureRequirement, FeatureType,
     IcebergCompatValidationContext, KernelSupport, LEGACY_WRITER_FEATURES,

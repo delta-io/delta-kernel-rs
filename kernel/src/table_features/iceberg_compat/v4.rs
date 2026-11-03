@@ -2,12 +2,12 @@
 
 use super::v3::is_v3_supported_type;
 use super::{
-    check_only_supported_types, IcebergCompatCheck, IcebergCompatValidator, IcebergCompatVersion,
+    IcebergCompatCheck, IcebergCompatValidator, IcebergCompatVersion, check_only_supported_types,
 };
+use crate::KernelResult;
 use crate::schema::DataType;
 use crate::schema::PrimitiveType::{Byte, Short};
 use crate::table_configuration::TableConfiguration;
-use crate::KernelResult;
 
 /// IcebergNativeV4 invariants paired with the version constant. Fed to
 /// [`super::validate_iceberg_compat_if_needed`].
@@ -36,8 +36,8 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{schema, StructType};
-    use crate::unit_test_utils::{assert_result_error_with_message, MockTableConfigurationBuilder};
+    use crate::schema::{StructType, schema};
+    use crate::unit_test_utils::{MockTableConfigurationBuilder, assert_result_error_with_message};
 
     #[rstest]
     #[case::integer(schema! { nullable "i": INTEGER }, None)]

@@ -2854,9 +2854,10 @@ mod tests {
         );
         let schema = config.logical_schema();
         let top = schema.field("top").unwrap();
-        assert!(top
-            .metadata()
-            .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref()));
+        assert!(
+            top.metadata()
+                .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref())
+        );
     }
 
     /// Builds `ValidatedTableProperties` directly because some of these properties are not in

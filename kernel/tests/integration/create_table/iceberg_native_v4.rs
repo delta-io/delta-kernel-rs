@@ -7,14 +7,14 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
-use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::UpdateTableOperation;
+use delta_kernel::transaction::create_table::create_table;
 use test_utils::{read_actions_from_commit, test_table_setup};
 use url::Url;
 
 #[test]
-fn test_create_table_iceberg_native_v4_then_commit_without_file_actions(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn test_create_table_iceberg_native_v4_then_commit_without_file_actions()
+-> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = schema_ref! {
         nullable "id": LONG,
@@ -65,9 +65,11 @@ fn test_create_table_iceberg_native_v4_then_commit_without_file_actions(
     assert_eq!(properties.enable_deletion_vectors, Some(true));
     assert_eq!(properties.enable_in_commit_timestamps, Some(true));
     assert!(properties.materialized_row_id_column_name.is_some());
-    assert!(properties
-        .materialized_row_commit_version_column_name
-        .is_some());
+    assert!(
+        properties
+            .materialized_row_commit_version_column_name
+            .is_some()
+    );
 
     let table_url = Url::from_directory_path(&table_path).expect("valid path");
     assert!(read_actions_from_commit(&table_url, 0, "add")?.is_empty());
