@@ -38,7 +38,7 @@ pub(crate) use concurrent_identity_column::classic_identity_column;
 pub(crate) use concurrent_identity_column::concurrent_identity_column;
 pub(crate) use concurrent_identity_column::schema_has_concurrent_sequence_id;
 #[cfg(feature = "concurrent-identity-columns-in-dev")]
-pub use concurrent_identity_column::{concurrent_identity_column, ConcurrentIdentityColumn};
+pub use concurrent_identity_column::{ConcurrentIdentityColumn, concurrent_identity_column};
 #[cfg(feature = "concurrent-identity-columns-in-dev")]
 pub(crate) use concurrent_identity_column::{
     has_concurrent_sequence_id, try_collect_concurrent_identity_columns,

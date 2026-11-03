@@ -2042,9 +2042,11 @@ mod tests {
             maybe_enable_concurrent_identity_columns(&schema, &mut validated),
             Err(KernelError::Unsupported(_))
         ));
-        assert!(!validated
-            .writer_features
-            .contains(&TableFeature::ConcurrentIdentityColumns));
+        assert!(
+            !validated
+                .writer_features
+                .contains(&TableFeature::ConcurrentIdentityColumns)
+        );
     }
 
     fn multi_column_schema() -> SchemaRef {

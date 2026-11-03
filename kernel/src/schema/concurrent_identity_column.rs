@@ -438,9 +438,11 @@ mod tests {
             StructField::new("name", DataType::STRING, true),
         ])
         .unwrap();
-        assert!(try_collect_concurrent_identity_columns(&schema)
-            .unwrap()
-            .is_empty());
+        assert!(
+            try_collect_concurrent_identity_columns(&schema)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
