@@ -76,6 +76,12 @@ impl<STATE> Transaction<STATE, Imperative> {
     ///
     /// `ALTER TABLE` returns a validation error if any data-file batches or manifest writes are
     /// staged. Empty or fully unselected data-file batches are also rejected.
+    ///
+    /// Catalog-managed commits can leave publication pending. After a ratified downgrade, the
+    /// next path-based commit cannot proceed until the downgrade commit has been published.
+    /// Path-based commits return [`KernelError::UnpublishedVersion`] if a retained catalog commit
+    /// is not known published. Ensure publication completes and refresh the read snapshot before
+    /// retrying; this method does not publish pending commits or wait for publication.
     #[instrument(
         parent = &self.span,
         name = TRANSACTION_COMMIT_SPAN,

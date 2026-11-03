@@ -80,14 +80,21 @@ let snapshot = Snapshot::builder_for(table_url)
     .build(&engine)?;
 ```
 
-The log tail must be a **contiguous sequence** `M..=N`: ascending by version, no gaps,
+When nonempty, the log tail must be a **contiguous sequence** `M..=N`: ascending by version, no gaps,
 no duplicates. The first version `M` can be any value `>= 0` (typical catalog clients
-return a suffix of recent commits, not the full history). The last version `N` depends
-on whether you are time-traveling:
+return a suffix of recent commits, not the full history). When you supply
+`max_catalog_version`, the last version `N` must satisfy these constraints:
 
 - Without time travel, `N` must equal `max_catalog_version`.
-- With `.at_version(v)`, `N` must be `>= v`, and `max_catalog_version` must still be
-  set. Both constraints apply simultaneously.
+- With `.at_version(v)`, `N` must be `>= v`, and `v` must not exceed
+  `max_catalog_version`.
+
+If you supply staged paths in a fresh log tail, you must also supply `max_catalog_version`.
+This requirement applies even when those commits have published copies in `_delta_log/`.
+A tail containing only published paths doesn't itself require a catalog bound.
+
+The order of `.at_version()`, `.with_log_tail()`, and `.with_max_catalog_version()`
+doesn't matter.
 
 The log tail can overlap with published commits already in `_delta_log/`. For any
 version present in both, Kernel uses the log-tail entry, as the Delta spec requires
@@ -95,12 +102,32 @@ readers to prefer the catalog-supplied commit when the catalog provides one.
 
 Call `.with_max_catalog_version(N)` to tell Kernel the highest version the catalog has
 ratified. This prevents Kernel from loading filesystem commits beyond what the catalog
-knows about.
+knows about. Supply this bound even when the catalog returns an empty tail.
 
-> [!NOTE]
-> To time-travel to a specific version within a catalog-managed table, call both
-> `.at_version(v)` and `.with_max_catalog_version(N)` on the builder. Call order does
-> not matter. The requested version must not exceed `N`.
+## Time travel and management changes
+
+When using catalog discovery, pass its bound together with `.at_version(v)` for time
+travel. The requested version must not exceed the bound, regardless of the protocol at
+that version. Without an explicit target, Kernel rejects a Snapshot whose protocol is
+catalog-managed unless you supply a bound.
+
+For an explicit target, Kernel doesn't require a bound solely because that historical
+version was catalog-managed. For example, after a published downgrade, you can read an
+earlier catalog-managed version from published history without a bound. Your connector
+must still perform catalog discovery when required by the table's current management
+state. Kernel doesn't load newer protocol state to validate this obligation.
+
+Retained staged paths in an existing Snapshot or complete snapshot hint don't themselves
+require a new bound: their ratification is already part of the Snapshot or hint's contract.
+Any supplied bound still applies to an explicit target.
+
+A catalog-ratified downgrade produces a non-catalog-managed Snapshot. You can read it
+with the catalog bound when its commit is supplied in the catalog tail, or already
+published and omitted from that tail. An unpublished commit must remain available through
+the supplied tail or a retained Snapshot or complete hint. To discover later filesystem
+commits, refresh without the old bound.
+Reading the downgrade Snapshot doesn't establish that publication has completed for a
+subsequent filesystem write.
 
 For a complete Unity Catalog example, see
 [Reading Unity Catalog tables](../unity_catalog/reading.md).

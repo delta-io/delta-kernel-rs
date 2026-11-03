@@ -1189,6 +1189,21 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// This method does not introspect into staged file-actions (see validate_file_actions
     /// instead).
     fn validate_commit(&self) -> KernelResult<()> {
+        if Self::determine_commit_type(self.is_create_table(), &self.effective_table_config)
+            == CommitType::PathBasedWrite
+        {
+            // A ratified downgrade can be readable before publication. Its path-based successor
+            // must observe publication first; use the snapshot's evidence without additional I/O.
+            if let Some(commit) = self
+                .read_snapshot()?
+                .log_segment()
+                .get_unpublished_catalog_commits()?
+                .first()
+            {
+                return Err(KernelError::UnpublishedVersion(commit.version()));
+            }
+        }
+
         // Kernel cannot distinguish Remove actions and DV updates that only delete rows from those
         // that accompany copied or updated rows, so both require the preservation acknowledgment.
         if self.staged_data_changes.has_removes() || self.staged_data_changes.has_dv_updates() {
@@ -1596,8 +1611,11 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    use ::test_utils::get_column;
+    use ::test_utils::{
+        TestAction, actions_to_string_catalog_managed, add_commit, add_staged_commit, get_column,
+    };
     use rstest::rstest;
     use url::Url;
 
@@ -1620,7 +1638,10 @@ mod tests {
     use crate::expressions::{
         ArrayData, ExpressionStructPatchBuilder, MapData, Scalar, StructData,
     };
-    use crate::metrics::{CommitFailureReason, MetricEvent, TableType, TransactionCommitFailure};
+    use crate::log_path::LogPath;
+    use crate::metrics::{
+        CommitFailureReason, MeteredDeltaEngine, MetricEvent, TableType, TransactionCommitFailure,
+    };
     use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
@@ -1875,7 +1896,7 @@ mod tests {
         }
     }
 
-    /// A mock catalog committer, used to test catalog committer validation.
+    /// A catalog committer that reports a conflict without writing to storage.
     struct MockCatalogCommitter;
 
     impl Committer for MockCatalogCommitter {
@@ -1883,10 +1904,11 @@ mod tests {
             &self,
             _engine: &dyn Engine,
             _actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
-            _commit_metadata: CommitMetadata,
+            commit_metadata: CommitMetadata,
         ) -> KernelResult<CommitResponse> {
-            // This won't be reached in tests — the validation error fires before commit.
-            Ok(CommitResponse::Conflict { version: 0 })
+            Ok(CommitResponse::Conflict {
+                version: commit_metadata.version(),
+            })
         }
         fn is_catalog_committer(&self) -> bool {
             true
@@ -1898,6 +1920,213 @@ mod tests {
         ) -> KernelResult<()> {
             Ok(())
         }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReadSnapshotSource {
+        Full,
+        Incremental,
+        Cached,
+        Hint,
+    }
+
+    struct ObservedCommitter {
+        inner: Box<dyn Committer>,
+        called: Arc<AtomicBool>,
+    }
+
+    impl Committer for ObservedCommitter {
+        fn commit(
+            &self,
+            engine: &dyn Engine,
+            actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
+            metadata: CommitMetadata,
+        ) -> KernelResult<CommitResponse> {
+            self.called.store(true, Ordering::SeqCst);
+            self.inner.commit(engine, actions, metadata)
+        }
+
+        fn is_catalog_committer(&self) -> bool {
+            self.inner.is_catalog_committer()
+        }
+
+        fn publish(&self, engine: &dyn Engine, metadata: PublishMetadata) -> KernelResult<()> {
+            self.inner.publish(engine, metadata)
+        }
+    }
+
+    #[rstest]
+    #[case::full(ReadSnapshotSource::Full)]
+    #[case::incremental(ReadSnapshotSource::Incremental)]
+    #[case::cached(ReadSnapshotSource::Cached)]
+    #[case::hint(ReadSnapshotSource::Hint)]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn filesystem_commit_requires_observed_catalog_publication(
+        #[case] source: ReadSnapshotSource,
+        #[values(false, true)] published: bool,
+        #[values(false, true)] checkpointed: bool,
+        #[values(false, true)] downgrade: bool,
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let store = Arc::new(InMemory::new());
+        let engine = MeteredDeltaEngine::new(Arc::new(SyncEngine::new_with_store(store.clone())));
+        let table_root = "memory:///";
+        add_commit(
+            table_root,
+            store.as_ref(),
+            0,
+            actions_to_string_catalog_managed(vec![TestAction::Metadata]),
+        )
+        .await?;
+        let base = Snapshot::builder_for(table_root)
+            .with_max_catalog_version(0)
+            .build(&engine)?;
+        let base = if checkpointed {
+            base.checkpoint(&engine, None)?.1
+        } else {
+            base
+        };
+        let mut actions = serde_json::json!({"commitInfo": {
+            "timestamp": 1_587_968_586_155_u64,
+            "inCommitTimestamp": 1_587_968_586_155_u64,
+            "txnId": "test-txn-1",
+            "operation": "WRITE"
+        }})
+        .to_string();
+        if downgrade {
+            actions.push('\n');
+            actions.push_str(
+                &serde_json::json!({"protocol": Protocol::try_new_modern(
+                    std::iter::empty::<TableFeature>(),
+                    [TableFeature::InCommitTimestamp],
+                )?})
+                .to_string(),
+            );
+        }
+        let staged = add_staged_commit(table_root, store.as_ref(), 1, actions.clone()).await?;
+        let tail = vec![LogPath::try_new(FileMeta::new(
+            Url::parse(table_root)?.join(staged.as_ref())?,
+            0,
+            actions.len() as u64,
+        ))?];
+        if published {
+            add_commit(table_root, store.as_ref(), 1, actions.clone()).await?;
+        }
+        let snapshot = if matches!(source, ReadSnapshotSource::Incremental) {
+            Snapshot::builder_from(base)
+                .with_log_tail(tail)
+                .with_max_catalog_version(1)
+                .build(&engine)?
+        } else {
+            Snapshot::builder_for(table_root)
+                .with_log_tail(tail)
+                .with_max_catalog_version(1)
+                .build(&engine)?
+        };
+        let snapshot = match source {
+            ReadSnapshotSource::Full | ReadSnapshotSource::Incremental => snapshot,
+            ReadSnapshotSource::Cached => Snapshot::builder_from(snapshot)
+                .at_version(1)
+                .build(&engine)?,
+            ReadSnapshotSource::Hint => Snapshot::builder_for(table_root)
+                .at_version(1)
+                .with_snapshot_hint(snapshot.to_snapshot_hint()?)
+                .build(&engine)?,
+        };
+        assert_eq!(snapshot.version(), 1);
+        assert_eq!(
+            snapshot.table_configuration().is_catalog_managed(),
+            !downgrade
+        );
+        assert_eq!(snapshot.log_segment().listed.staged_commits().count(), 1);
+
+        let committer_called = Arc::new(AtomicBool::new(false));
+        let transaction = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .build(
+                &engine,
+                Box::new(ObservedCommitter {
+                    inner: if downgrade {
+                        Box::new(FileSystemCommitter::new())
+                    } else {
+                        Box::new(MockCatalogCommitter)
+                    },
+                    called: committer_called.clone(),
+                }),
+            )?;
+        let events_before_commit = reporter.events().len();
+        let result = transaction.commit(&engine);
+        assert_eq!(
+            committer_called.load(Ordering::SeqCst),
+            !downgrade || published
+        );
+        if downgrade && !published {
+            assert!(matches!(result, Err(KernelError::UnpublishedVersion(1))));
+            assert!(
+                !reporter.events()[events_before_commit..]
+                    .iter()
+                    .any(|event| matches!(
+                        event,
+                        MetricEvent::StorageListCompleted(_)
+                            | MetricEvent::StorageReadCompleted(_)
+                            | MetricEvent::StorageCopyCompleted(_)
+                            | MetricEvent::JsonReadCompleted(_)
+                            | MetricEvent::ParquetReadCompleted(_)
+                    ))
+            );
+            assert!(matches!(
+                store
+                    .head(&Path::from("_delta_log/00000000000000000002.json"))
+                    .await,
+                Err(crate::object_store::Error::NotFound { .. })
+            ));
+            add_commit(table_root, store.as_ref(), 1, actions).await?;
+            let stale = snapshot
+                .update_table(UpdateTableOperation::Write, "test-engine", true)
+                .build(&engine, Box::new(FileSystemCommitter::new()))?
+                .commit(&engine);
+            assert!(matches!(stale, Err(KernelError::UnpublishedVersion(1))));
+            let refreshed = Snapshot::builder_for(table_root).build(&engine)?;
+            refreshed
+                .update_table(UpdateTableOperation::Write, "test-engine", true)
+                .build(&engine, Box::new(FileSystemCommitter::new()))?
+                .commit(&engine)?
+                .unwrap_committed();
+        } else if downgrade {
+            result?.unwrap_committed();
+        } else {
+            assert!(matches!(result?, CommitResult::Conflicted(_)));
+        }
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn filesystem_commit_accepts_checkpoint_only_history()
+    -> KernelResult<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let snapshot = create_table(
+            "memory:///",
+            schema_ref! { nullable "id": INTEGER },
+            "test-engine",
+            true,
+        )
+        .build(&engine, Box::new(FileSystemCommitter::new()))?
+        .commit(&engine)?
+        .unwrap_post_commit_snapshot();
+        snapshot.checkpoint(&engine, None)?;
+        store
+            .delete(&Path::from("_delta_log/00000000000000000000.json"))
+            .await?;
+        Snapshot::builder_for("memory:///")
+            .build(&engine)?
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_committed();
+        Ok(())
     }
 
     /// Sets up a snapshot for a table with deletion vector support at version 1
