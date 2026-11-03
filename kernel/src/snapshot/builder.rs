@@ -265,9 +265,11 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// The caller must obtain this bound from the catalog, independently of which commits the
     /// catalog still stores. An empty tail does not remove the need to supply the catalog bound.
     /// A ratified downgrade can produce a non-catalog-managed snapshot at the bound, and explicit
-    /// time travel can select non-catalog-managed history below it. Both are accepted regardless of
-    /// publication or whether the catalog supplies the terminal commit. Kernel trusts the bound;
-    /// it does not load newer protocol state or independently verify a management-mode transition.
+    /// time travel can select non-catalog-managed history below it. Publication is not required,
+    /// provided unpublished commits are supplied through the log tail or retained in an existing
+    /// snapshot or complete hint. Published history can be discovered through the filesystem.
+    /// Kernel trusts the bound; it does not load newer protocol state or independently verify a
+    /// management-mode transition.
     ///
     /// To discover filesystem commits after a downgrade, refresh without the old catalog bound.
     /// Repeating a bounded request still returns the bounded version, even if newer commits exist.

@@ -194,7 +194,9 @@ pub unsafe extern "C" fn snapshot_builder_with_log_tail(
 /// snapshot version to what the catalog has ratified.
 ///
 /// Without an explicit target, this selects the catalog version even when the resulting snapshot
-/// is non-catalog-managed, such as a ratified downgrade. Publication does not affect acceptance.
+/// is non-catalog-managed, such as a ratified downgrade. Publication is not required, provided
+/// unpublished commits are supplied through the log tail or retained in an existing snapshot or
+/// complete hint. Published history can be discovered through the filesystem.
 /// An empty catalog tail does not remove the need to supply its bound. A latest request resolving
 /// to catalog-managed state without a bound fails with `MaxCatalogVersionError`.
 ///

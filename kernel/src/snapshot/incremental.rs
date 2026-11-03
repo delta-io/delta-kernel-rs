@@ -23,8 +23,10 @@ use crate::{Engine, KernelError, KernelResult, Version};
 ///
 /// See [`Snapshot::try_new_from`] for the case taxonomy these outcomes map onto.
 enum NewSegment {
-    /// No new segment to build; the caller returns the existing snapshot unchanged.
-    Unchanged,
+    /// Reuse resolved table state, retaining any publication evidence from the listing.
+    Reuse {
+        max_published_version: Option<Version>,
+    },
     /// A checkpoint ahead of the existing snapshot requires a full rebuild from it.
     Rebuild(LogSegment),
     /// New commits merged into the existing segment; ready for incremental P&M.
@@ -65,7 +67,7 @@ impl Snapshot {
     /// Case C.2:   C1 .. S1                        empty        -          return existing
     /// Case D.1:   C1 .. S1 .. C2 ===== S2         [C1+1, S2]   [C2, S2]   rebuild from C2
     /// Case D.2:   C1 . C2 .. S1 ====== S2         [C1+1, S2]   (S1, S2]   advance base, -> F
-    /// Case E:     C1 .. S1 (= S2)                 [C1+1, S1]   -          return existing
+    /// Case E:     C1 .. S1 (= S2)                 [C1+1, S1]   -          refresh publication
     /// Case F:     C1 .. S1 ====== S2              [C1+1, S2]   (S1, S2]   incremental update
     /// ```
     ///
@@ -89,8 +91,8 @@ impl Snapshot {
     ///       only commits `> S1` for P+M; the combined segment uses `C2` as its checkpoint base,
     ///       producing a better log segment with fewer deltas above the checkpoint (e.g. faster
     ///       distributed log replay).
-    ///   - **E.** Listing contains commits but no new checkpoint, and `S2 == S1`: return the
-    ///     existing snapshot.
+    ///   - **E.** Listing contains commits but no new checkpoint, and `S2 == S1`: reuse the
+    ///     existing table state, advancing its publication watermark from the listing.
     ///   - **F.** Listing contains new commits (no new checkpoint, or fall through from D.2): run
     ///     lightweight P+M replay on commits `> S1` and merge them into the existing log segment.
     ///
@@ -184,11 +186,14 @@ impl Snapshot {
         )
         .inspect_err(|_| emit_log_segment_load_failure(metric_context))?
         {
-            NewSegment::Unchanged => {
+            NewSegment::Reuse {
+                max_published_version,
+            } => {
                 return Self::reuse_with_build_metadata(
                     &existing_snapshot,
                     built_as_latest,
                     skipped_new_checkpoints,
+                    max_published_version,
                 );
             }
             NewSegment::Rebuild(new_log_segment) => {
@@ -348,7 +353,9 @@ impl Snapshot {
         };
         let Some(listing_start) = listing_base_version.checked_add(1) else {
             // No version can follow Version::MAX.
-            return Ok(NewSegment::Unchanged);
+            return Ok(NewSegment::Reuse {
+                max_published_version: None,
+            });
         };
         let new_listed_files = LogSegmentFiles::list_with_checkpoint_handling(
             storage.as_ref(),
@@ -371,7 +378,9 @@ impl Snapshot {
                 // no such commit exists in the log.
                 Some(_) => Err(KernelError::MissingVersion(existing_snapshot_version + 1)),
                 // Case C.2: no new commits and no explicit target; latest is existing.
-                None => Ok(NewSegment::Unchanged),
+                None => Ok(NewSegment::Reuse {
+                    max_published_version: new_listed_files.max_published_version,
+                }),
             };
         }
 
@@ -409,14 +418,16 @@ impl Snapshot {
         // checkpoint; otherwise Case F (including D.2: checkpoint at or below the existing
         // snapshot).
 
-        // Case E: no new checkpoint, version did not advance; return existing.
+        // Case E: reuse table state, but preserve publication observed at the same version.
         if new_end_version == existing_snapshot_version
             && new_log_segment.checkpoint_version.is_none()
         {
             // We must check checkpoint_version here: if a checkpoint at or below the existing
             // snapshot version was discovered, we still need to fall through to advance the
             // checkpoint base even though the version did not change.
-            return Ok(NewSegment::Unchanged);
+            return Ok(NewSegment::Reuse {
+                max_published_version: new_log_segment.listed.max_published_version,
+            });
         }
 
         // Case F: lightweight P+M replay on new commits, merge with existing segment.
@@ -512,21 +523,29 @@ impl Snapshot {
         Ok(NewSegment::Combined(combined_log_segment))
     }
 
-    /// Reuse `existing`, promoting its `built_as_latest` flag to `true` if this build confirmed
-    /// latest (and updating the checkpoint-retention flag).
+    /// Reuse resolved state, updating publication and build metadata without replaying the log.
     fn reuse_with_build_metadata(
         existing: &Arc<Snapshot>,
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
+        max_published_version: Option<Version>,
     ) -> KernelResult<Arc<Snapshot>> {
         let built_as_latest = existing.built_as_latest || built_as_latest;
+        let max_published_version = existing
+            .log_segment
+            .listed
+            .max_published_version
+            .max(max_published_version);
         if existing.built_as_latest == built_as_latest
             && existing.skipped_new_checkpoints == skipped_new_checkpoints
+            && existing.log_segment.listed.max_published_version == max_published_version
         {
             return Ok(existing.clone());
         }
+        let mut log_segment = existing.log_segment.clone();
+        log_segment.listed.max_published_version = max_published_version;
         Ok(Arc::new(Snapshot::new_with_crc(
-            existing.log_segment.clone(),
+            log_segment,
             existing.table_configuration.clone(),
             existing.base_crc().cloned(),
             built_as_latest,

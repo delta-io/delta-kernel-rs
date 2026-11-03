@@ -155,16 +155,6 @@ pub enum SnapshotHintError {
         /// The version described by the snapshot hint.
         hint: Version,
     },
-    /// A hint marked latest conflicts with a later catalog-ratified version.
-    #[error(
-        "Invalid snapshot hint: version {hint} is marked latest but max catalog version is {max_catalog_version}"
-    )]
-    LatestVersionConflict {
-        /// The version described by the snapshot hint.
-        hint: Version,
-        /// The latest version ratified by the catalog.
-        max_catalog_version: Version,
-    },
     /// The supplied log files contain log compaction files, which snapshot hints do not support.
     #[error("Invalid snapshot hint: log compaction files are not supported")]
     LogCompaction,

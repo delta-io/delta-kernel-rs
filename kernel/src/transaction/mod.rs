@@ -1966,6 +1966,7 @@ mod tests {
         #[values(false, true)] published: bool,
         #[values(false, true)] checkpointed: bool,
         #[values(false, true)] downgrade: bool,
+        #[values(false, true)] incremental_refresh: bool,
     ) -> KernelResult<(), Box<dyn std::error::Error>> {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -2082,13 +2083,75 @@ mod tests {
                     .await,
                 Err(crate::object_store::Error::NotFound { .. })
             ));
+            let unpublished = Snapshot::builder_from(snapshot.clone()).build(&engine)?;
+            assert!(Arc::ptr_eq(&unpublished, &snapshot));
             add_commit(table_root, store.as_ref(), 1, actions).await?;
+            let events_before_reuse = reporter.events().len();
+            let pinned = Snapshot::builder_from(snapshot.clone())
+                .at_version(1)
+                .build(&engine)?;
+            assert!(Arc::ptr_eq(&pinned, &snapshot));
+            assert!(
+                !reporter.events()[events_before_reuse..]
+                    .iter()
+                    .any(|event| matches!(
+                        event,
+                        MetricEvent::StorageListCompleted(_)
+                            | MetricEvent::StorageReadCompleted(_)
+                            | MetricEvent::JsonReadCompleted(_)
+                            | MetricEvent::ParquetReadCompleted(_)
+                    ))
+            );
             let stale = snapshot
+                .clone()
                 .update_table(UpdateTableOperation::Write, "test-engine", true)
                 .build(&engine, Box::new(FileSystemCommitter::new()))?
                 .commit(&engine);
             assert!(matches!(stale, Err(KernelError::UnpublishedVersion(1))));
-            let refreshed = Snapshot::builder_for(table_root).build(&engine)?;
+            let events_before_refresh = reporter.events().len();
+            let refreshed = if incremental_refresh {
+                Snapshot::builder_from(snapshot.clone()).build(&engine)?
+            } else {
+                Snapshot::builder_for(table_root).build(&engine)?
+            };
+            assert_eq!(refreshed.version(), snapshot.version());
+            assert_eq!(
+                refreshed.log_segment().listed.max_published_version,
+                Some(1)
+            );
+            assert_eq!(snapshot.log_segment().listed.max_published_version, Some(0));
+            if incremental_refresh {
+                assert_eq!(
+                    refreshed.log_segment().listed.ascending_commit_files,
+                    snapshot.log_segment().listed.ascending_commit_files,
+                );
+                let refresh_events = reporter.events();
+                let refresh_events = &refresh_events[events_before_refresh..];
+                assert_eq!(
+                    refresh_events
+                        .iter()
+                        .filter(|event| matches!(event, MetricEvent::StorageListCompleted(_)))
+                        .count(),
+                    1,
+                );
+                assert!(!refresh_events.iter().any(|event| matches!(
+                    event,
+                    MetricEvent::StorageReadCompleted(_)
+                        | MetricEvent::JsonReadCompleted(_)
+                        | MetricEvent::ParquetReadCompleted(_)
+                )));
+                let reused = Snapshot::builder_from(refreshed.clone()).build(&engine)?;
+                assert!(Arc::ptr_eq(&refreshed, &reused));
+                let skipped = Snapshot::builder_from(refreshed.clone())
+                    .skip_new_checkpoints()
+                    .build(&engine)?;
+                assert_eq!(skipped.log_segment().listed.max_published_version, Some(1));
+                let hinted = Snapshot::builder_for(table_root)
+                    .at_version(1)
+                    .with_snapshot_hint(refreshed.to_snapshot_hint()?)
+                    .build(&engine)?;
+                assert_eq!(hinted.log_segment().listed, refreshed.log_segment().listed);
+            }
             refreshed
                 .update_table(UpdateTableOperation::Write, "test-engine", true)
                 .build(&engine, Box::new(FileSystemCommitter::new()))?
