@@ -17,7 +17,7 @@ use crate::{ExpressionRef, KernelError, KernelResult};
 fn get_cdf_columns(
     logical_schema: &SchemaRef,
     scan_file: &CdfScanFile,
-) -> KernelResult<impl Iterator<Item = (usize, (String, Scalar))>> {
+) -> KernelResult<impl Iterator<Item = (usize, (String, Scalar))> + use<>> {
     // Handle _change_type
     let change_type_field = logical_schema.field_with_index(CHANGE_TYPE_COL_NAME);
     let change_type_metadata = match (change_type_field, &scan_file.scan_type) {

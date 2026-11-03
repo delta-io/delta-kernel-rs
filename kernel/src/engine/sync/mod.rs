@@ -264,7 +264,7 @@ fn read_files_arrow<F, I>(
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
     mut try_create_from_bytes: F,
-) -> impl KernelResultIterator<ArrowEngineData> + 'static
+) -> impl KernelResultIterator<ArrowEngineData> + 'static + use<F, I>
 where
     I: KernelResultIterator<ArrowEngineData> + 'static,
     F: FnMut(Bytes, SchemaRef, Option<PredicateRef>, String) -> KernelResult<I> + Send + 'static,

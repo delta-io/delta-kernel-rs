@@ -1,5 +1,7 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use std::fmt::Display;
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
@@ -919,7 +921,8 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
-    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch>>> {
+    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch> + use<>>>
+    {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
@@ -952,7 +955,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         action_schema: SchemaRef,
-    ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
         let result = self.read_actions_with_projected_checkpoint_actions(
             engine,
             action_schema.clone(),
@@ -976,31 +979,18 @@ impl LogSegment {
         engine: &dyn Engine,
         pointer: &LastManifestCommit,
     ) -> KernelResult<CheckpointAction> {
-        let inconsistent = |detail: String| {
-            KernelError::invalid_log_segment(format!(
-                "lastManifestCommit names manifest commit version {} as the source of content \
-                 root version {}, but {detail}",
-                pointer.version, pointer.content_root_version
-            ))
-        };
         let commit = self.find_pointed_commit(pointer).ok_or_else(|| {
-            inconsistent("this log segment does not list that commit".to_string())
+            last_manifest_commit_inconsistency(
+                pointer,
+                "this log segment does not list that commit",
+            )
         })?;
         let files = std::slice::from_ref(&commit.location);
         let batches =
             engine
                 .json_handler()
                 .read_json_files(files, LOG_CHECKPOINT_SCHEMA.clone(), None)?;
-        let action = first_checkpoint_action(batches)?
-            .ok_or_else(|| inconsistent("that commit carries no checkpoint action".to_string()))?;
-        require!(
-            action.content_root_version() == pointer.content_root_version,
-            inconsistent(format!(
-                "that commit's checkpoint action has content root version {}",
-                action.content_root_version()
-            ))
-        );
-        Ok(action)
+        require_pointed_checkpoint_action(pointer, first_checkpoint_action(batches)?)
     }
 
     /// The listed commit at `pointer`'s version, or `None` when this segment does not list it.
@@ -1027,7 +1017,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         schema: SchemaRef,
-    ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
         Self::read_commit_files(engine, &self.find_commit_cover(), schema)
     }
 
@@ -1096,7 +1086,7 @@ impl LogSegment {
         engine: &dyn Engine,
         commit_files: &[FileMeta],
         schema: SchemaRef,
-    ) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
         let actions = engine
             .json_handler()
             .read_json_files(commit_files, schema, None)?
@@ -1280,7 +1270,8 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
-    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch>>> {
+    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch> + use<>>>
+    {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
         let (file_actions_schema, sidecar_files) = if need_file_actions {
@@ -1756,6 +1747,42 @@ fn first_checkpoint_action(
         }
     }
     Ok(None)
+}
+
+/// Returns `action`, read from the manifest commit `pointer` names, after checking that it exists
+/// and has the pointer's content root version.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn require_pointed_checkpoint_action(
+    pointer: &LastManifestCommit,
+    action: Option<CheckpointAction>,
+) -> KernelResult<CheckpointAction> {
+    let action = action.ok_or_else(|| {
+        last_manifest_commit_inconsistency(pointer, "that commit carries no checkpoint action")
+    })?;
+    require!(
+        action.content_root_version() == pointer.content_root_version,
+        last_manifest_commit_inconsistency(
+            pointer,
+            format!(
+                "that commit's checkpoint action has content root version {}",
+                action.content_root_version()
+            )
+        )
+    );
+    Ok(action)
+}
+
+/// The error for a `pointer` that the log contradicts, as explained by `detail`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn last_manifest_commit_inconsistency(
+    pointer: &LastManifestCommit,
+    detail: impl Display,
+) -> KernelError {
+    KernelError::invalid_log_segment(format!(
+        "lastManifestCommit names manifest commit version {} as the source of content root \
+         version {}, but {detail}",
+        pointer.version, pointer.content_root_version
+    ))
 }
 
 fn validate_compaction_files(compactions: &[ParsedLogPath]) -> KernelResult<()> {

@@ -221,7 +221,7 @@ impl LogSegment {
     fn read_pm_batches_via_plan(
         &self,
         executor: &dyn PlanExecutor,
-    ) -> KernelResult<impl KernelResultIterator<VersionedBatch>> {
+    ) -> KernelResult<impl KernelResultIterator<VersionedBatch> + use<>> {
         let plan = self.build_pm_plan()?;
 
         let batches = executor
@@ -245,7 +245,7 @@ impl LogSegment {
     fn read_pm_batches(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<impl KernelResultIterator<VersionedBatch>> {
+    ) -> KernelResult<impl KernelResultIterator<VersionedBatch> + use<>> {
         let (commit_schema, checkpoint_schema) = pm_replay_schemas();
         // Commit schema only: `_file` in the checkpoint schema would break its skipping predicate.
         let file_column =

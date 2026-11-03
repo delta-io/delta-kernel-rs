@@ -1075,14 +1075,14 @@ impl Scan {
     pub fn scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
+    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<>> {
         self.with_cancellable_engine(engine, |engine| self.scan_metadata_with_engine(engine))
     }
 
     fn scan_metadata_with_engine(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
+    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<>> {
         let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
         self.scan_metadata_inner(engine, actions_with_checkpoint_info)
     }
@@ -1296,13 +1296,14 @@ impl Scan {
         operation(engine)
     }
 
-    fn scan_metadata_inner(
+    fn scan_metadata_inner<I>(
         &self,
         engine: &dyn Engine,
-        actions_with_checkpoint_info: ActionsWithCheckpointInfo<
-            impl KernelResultIterator<ActionsBatch>,
-        >,
-    ) -> KernelResult<impl KernelResultIterator<ScanMetadata>> {
+        actions_with_checkpoint_info: ActionsWithCheckpointInfo<I>,
+    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<I>>
+    where
+        I: KernelResultIterator<ActionsBatch>,
+    {
         let start = Instant::now();
         let operation_id = MetricId::new();
         let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
@@ -1402,7 +1403,8 @@ impl Scan {
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch>>> {
+    ) -> KernelResult<ActionsWithCheckpointInfo<impl KernelResultIterator<ActionsBatch> + use<>>>
+    {
         let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
@@ -1613,7 +1615,7 @@ impl Scan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>>> {
+    ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<>> {
         if self.state_info.skip_row_transforms {
             return Err(KernelError::unsupported(
                 "Scan::execute is not supported when row transforms are disabled by \
