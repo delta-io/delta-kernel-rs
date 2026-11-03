@@ -2332,8 +2332,8 @@ fn normalize_interval_type(s: &str) -> Option<PrimitiveType> {
 }
 
 // Custom Deserialize to provide clear error messages for unsupported types.
-// The derived impl would produce: "unknown variant `interval fortnight`, expected one of ..."
-// This impl produces: "Unsupported Delta table type: 'interval fortnight'"
+// The derived impl would produce: "unknown variant `unknown type`, expected one of ..."
+// This impl produces: "Unsupported Delta table type: 'unknown type'"
 impl<'de> serde::Deserialize<'de> for PrimitiveType {
     fn deserialize<D>(deserializer: D) -> KernelResult<Self, D::Error>
     where
@@ -3386,7 +3386,7 @@ mod tests {
 
     #[rstest]
     #[case("money")]
-    #[case("interval fortnight")]
+    #[case("unknown type")]
     // invalid orderings across year-month and day-time
     #[case("interval month to day")]
     #[case("interval year to second")]
