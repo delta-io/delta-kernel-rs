@@ -7,8 +7,9 @@ and the [writing standards](CLAUDE.md) when editing guide pages.
 ## Maintenance
 
 Update a guide page in the same PR as a user-visible change to the workflow it teaches. Fix examples
-affected by API changes in that PR. Use release audits to catch missed updates. Update
-[LAST_VALIDATED.md](LAST_VALIDATED.md) only after auditing all changes since its recorded commit.
+affected by API changes in that PR. Before a release, review the changes since the commit recorded
+in [LAST_VALIDATED.md](LAST_VALIDATED.md) and update affected guide pages. Advance that record only
+after reviewing the full range.
 
 ## prerequisites
 

@@ -550,3 +550,4 @@ Read these when relevant to the task at hand:
 **Keeping docs current:** Update the authoritative documentation for a changed fact, along with
 affected examples and cross-references. Use [Documentation Ownership](#documentation-ownership)
 to choose where the explanation belongs. Do not mirror a change across every agent file.
+If you notice stale names, paths, or data flows in docs outside the task, tell the user.

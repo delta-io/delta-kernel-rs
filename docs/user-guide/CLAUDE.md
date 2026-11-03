@@ -197,9 +197,9 @@ Kernel is for building connectors that need protocol-level control.").
 - MUST NOT: use emojis, exclamation marks, or marketing superlatives
   ("blazingly fast", "world-class", "cutting-edge").
 - SHOULD: sound like a knowledgeable colleague, not a textbook.
-- For **reference pages**, neutral/impersonal voice is acceptable where it
-  reads more naturally (e.g., "The handler resolves columns by field ID" rather
-  than forcing "You resolve columns by field ID" when the handler does it).
+- For **reference pages**, neutral/impersonal voice is acceptable where it reads more naturally
+  (e.g., "The `rustls` feature selects the TLS backend" rather than forcing "you" into a
+  configuration description).
 
 ## Sentence-level rules
 
