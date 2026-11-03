@@ -9,7 +9,7 @@ use url::Url;
 
 use super::LogSegment;
 use super::tests::add_checkpoint_to_store;
-use crate::actions::{CheckpointAction, CommitInfo, ContentRoot, LastManifestCommit, Protocol};
+use crate::actions::{CheckpointAction, ContentRoot, LastManifestCommit, Protocol};
 use crate::arrow::array::StringArray;
 use crate::committer::FileSystemCommitter;
 use crate::crc::{Crc, FileStats, FileStatsState};
@@ -22,7 +22,7 @@ use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    last_manifest_commit_info, protocol_and_metadata_lines,
+    commit_info_line, last_manifest_commit_info, protocol_and_metadata_lines,
 };
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, parse_json_batch, test_schema_flat_with_column_mapping,
@@ -85,15 +85,10 @@ fn carrying_pointer(last_manifest_commit: (i64, i64), commit: String) -> String 
 fn commit_info(last_manifest_commit: Option<(i64, i64)>) -> String {
     match last_manifest_commit {
         Some((version, content_root_version)) => {
-            last_manifest_commit_info(version, content_root_version)
+            last_manifest_commit_info(version, content_root_version).to_string()
         }
-        None => serde_json::json!({ "commitInfo": CommitInfo {
-            operation: Some("WRITE".to_string()),
-            in_commit_timestamp: Some(1),
-            ..Default::default()
-        } }),
+        None => commit_info_line(1, None),
     }
-    .to_string()
 }
 
 // Commits a root manifest commit at v0 (pointing at itself) followed by `later_commits`, and
