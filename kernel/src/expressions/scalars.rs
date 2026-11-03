@@ -2246,20 +2246,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case(3_600_000_001, IntervalDayToSecondType::IntervalHour)]
-    #[case(-86_400_000_001, IntervalDayToSecondType::IntervalDay)]
-    #[case(60_000_001, IntervalDayToSecondType::IntervalMinute)]
-    fn interval_day_time_constructor_rejects_unaligned_end_unit(
-        #[case] micros: i64,
-        #[case] dtype: IntervalDayToSecondType,
-    ) {
-        let err = Scalar::interval_day_time(micros, dtype).unwrap_err();
-        assert!(
-            matches!(err, KernelError::InvalidInterval(message) if message.contains("not divisible"))
-        );
-    }
-
-    #[rstest]
     fn interval_day_time_from_micros_preserves_full_range(
         #[values(0, 1, -1, 86_400_000_001, i64::MIN, i64::MAX)] micros: i64,
     ) {
@@ -2374,84 +2360,83 @@ mod tests {
     #[case(
         IntervalDayToSecondType::IntervalDay,
         "INTERVAL '1' DAY",
-        86_400_000_000
+        Some(86_400_000_000)
     )]
     #[case(
         IntervalDayToSecondType::IntervalHour,
         "INTERVAL '26' HOUR",
-        93_600_000_000
+        Some(93_600_000_000)
     )]
     #[case(
         IntervalDayToSecondType::IntervalMinute,
         "INTERVAL '1563' MINUTE",
-        93_780_000_000
+        Some(93_780_000_000)
     )]
     #[case(
         IntervalDayToSecondType::IntervalSecond,
         "INTERVAL '93784.5' SECOND",
-        93_784_500_000
+        Some(93_784_500_000)
     )]
     #[case(
         IntervalDayToSecondType::IntervalDayToHour,
         "INTERVAL '1 02' DAY TO HOUR",
-        93_600_000_000
+        Some(93_600_000_000)
     )]
     #[case(
         IntervalDayToSecondType::IntervalDayToMinute,
         "INTERVAL '1 02:03' DAY TO MINUTE",
-        93_780_000_000
+        Some(93_780_000_000)
     )]
     #[case(
         IntervalDayToSecondType::IntervalDayToSecond,
         "INTERVAL '1 02:03:04.5' DAY TO SECOND",
-        93_784_500_000
+        Some(93_784_500_000)
     )]
     #[case(
         IntervalDayToSecondType::IntervalHourToMinute,
         "INTERVAL '26:03' HOUR TO MINUTE",
-        93_780_000_000
+        Some(93_780_000_000)
     )]
     #[case(
         IntervalDayToSecondType::IntervalHourToSecond,
         "INTERVAL '26:03:04.5' HOUR TO SECOND",
-        93_784_500_000
+        Some(93_784_500_000)
     )]
     #[case(
         IntervalDayToSecondType::IntervalMinuteToSecond,
         "INTERVAL '1563:04.5' MINUTE TO SECOND",
-        93_784_500_000
+        Some(93_784_500_000)
+    )]
+    #[case::day_as_hour(IntervalDayToSecondType::IntervalDay, "INTERVAL '24' HOUR", None)]
+    #[case::hour_as_day(IntervalDayToSecondType::IntervalHour, "INTERVAL '1' DAY", None)]
+    #[case::day_to_second_as_second(
+        IntervalDayToSecondType::IntervalDayToSecond,
+        "INTERVAL '86400' SECOND",
+        None
+    )]
+    #[case::minute_to_second_as_minute(
+        IntervalDayToSecondType::IntervalMinuteToSecond,
+        "INTERVAL '1' MINUTE",
+        None
     )]
     fn interval_day_time_parser_requires_matching_qualifier(
         #[case] dtype: IntervalDayToSecondType,
         #[case] literal: &str,
-        #[case] micros: i64,
+        #[case] expected_micros: Option<i64>,
     ) {
-        assert_eq!(
-            PrimitiveType::interval_day_time(dtype)
-                .parse_scalar(literal)
-                .unwrap(),
-            Scalar::interval_day_time(micros, dtype).unwrap()
-        );
-    }
-
-    #[rstest]
-    #[case(IntervalDayToSecondType::IntervalDay, "INTERVAL '24' HOUR")]
-    #[case(IntervalDayToSecondType::IntervalHour, "INTERVAL '1' DAY")]
-    #[case(
-        IntervalDayToSecondType::IntervalDayToSecond,
-        "INTERVAL '86400' SECOND"
-    )]
-    #[case(IntervalDayToSecondType::IntervalMinuteToSecond, "INTERVAL '1' MINUTE")]
-    fn interval_day_time_parser_rejects_cross_qualifier_literal(
-        #[case] dtype: IntervalDayToSecondType,
-        #[case] literal: &str,
-    ) {
-        let err = PrimitiveType::interval_day_time(dtype)
-            .parse_scalar(literal)
-            .unwrap_err();
-        assert!(
-            matches!(err, KernelError::ParseError(raw, ty) if raw == literal && ty == DataType::interval_day_time(dtype))
-        );
+        let result = PrimitiveType::interval_day_time(dtype).parse_scalar(literal);
+        match expected_micros {
+            Some(micros) => assert_eq!(
+                result.unwrap(),
+                Scalar::interval_day_time(micros, dtype).unwrap()
+            ),
+            None => {
+                let err = result.unwrap_err();
+                assert!(
+                    matches!(err, KernelError::ParseError(raw, ty) if raw == literal && ty == DataType::interval_day_time(dtype))
+                );
+            }
+        }
     }
 
     #[test]
