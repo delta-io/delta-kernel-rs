@@ -1,10 +1,10 @@
-use delta_kernel::transaction::Transaction;
 use delta_kernel::KernelResult;
+use delta_kernel::transaction::Transaction;
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::transaction::{ExclusiveCreateTableTransaction, ExclusiveUpdateTableTransaction};
-use crate::{kernel_string_slice, KernelStringSlice, NullableCvoid, SharedExternEngine};
+use crate::{KernelStringSlice, NullableCvoid, SharedExternEngine, kernel_string_slice};
 
 /// Acknowledges that the connector generates and fills this table's Concurrent Identity Column
 /// values before writing data files.
@@ -135,7 +135,7 @@ mod tests {
     use crate::ffi_test_utils::{build_update_table_txn, ok_or_panic};
     use crate::tests::get_default_engine;
     use crate::transaction::free_update_table_txn;
-    use crate::{free_engine, TryFromStringSlice};
+    use crate::{TryFromStringSlice, free_engine};
 
     /// A table with column defaults but no concurrent identity columns.
     const NON_CIC_FIXTURE: &str = "../kernel/tests/data/table-with-column-defaults/";
