@@ -1879,7 +1879,7 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
                     let micros = if unit == 1 {
                         (seed * 1000) as i64
                     } else {
-                        (seed % 100) as i64 * unit
+                        seed as i64 * unit
                     };
                     Scalar::interval_day_time(micros, *dtype)
                         .expect("test seed produced invalid interval day-time")
