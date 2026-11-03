@@ -2217,7 +2217,7 @@ impl Display for IntervalDayToSecondType {
 fn serialize_interval_day_time<S: serde::Serializer>(
     dtype: &IntervalDayToSecondType,
     serializer: S,
-) -> Result<S::Ok, S::Error> {
+) -> KernelResult<S::Ok, S::Error> {
     serializer.serialize_str(&dtype.to_string())
 }
 
