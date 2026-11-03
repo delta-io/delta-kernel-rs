@@ -36,16 +36,18 @@ pub enum UpdateTableOperation {
     Optimize,
     /// An operation name recorded verbatim in commit history and successful transaction metrics.
     ///
-    /// The name must be nonempty and must not exactly match a typed operation's name or a reserved
-    /// operation name. `REORG` is reserved for log replay and cannot be used for custom
-    /// transactions. This comparison is case-sensitive. Kernel does not infer
-    /// built-in operation semantics from the name, but all other transaction and protocol
+    /// The name must be nonempty and must not match a reserved operation name, such as `REORG` or
+    /// `ALTER TABLE`. The full set consists of all [typed operation names](UpdateTableOperation)
+    /// and [`RESERVED_OPERATION_NAMES`][ops]. Name matching is case-sensitive. Kernel does not
+    /// infer built-in operation semantics from the name, but all other transaction and protocol
     /// checks still apply. Custom operations do not qualify for incremental version checksum
     /// construction.
     ///
     /// Custom names are not guaranteed to remain valid across Kernel versions. Adding a typed
     /// variant reserves its exact name. Callers using that custom name must select the typed
     /// variant before building a transaction.
+    ///
+    /// [ops]: https://github.com/delta-io/delta-kernel-rs/blob/main/kernel/src/transaction/operation.rs
     #[strum(disabled)]
     Custom(String),
 }
