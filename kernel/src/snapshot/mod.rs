@@ -52,6 +52,9 @@ use crate::{Engine, KernelError, KernelResult, LogCompactionWriter, Version};
 mod builder;
 #[cfg(test)]
 mod cancellation_tests;
+#[cfg(all(feature = "internal-api", feature = "declarative-plans"))]
+#[doc(hidden)]
+pub mod externalized;
 mod hint;
 mod incremental;
 mod reader;

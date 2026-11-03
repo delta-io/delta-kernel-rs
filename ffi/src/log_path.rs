@@ -10,6 +10,31 @@ use crate::{FfiSlice, KernelStringSlice, TryFromStringSlice, kernel_string_slice
 pub type LogPathArray = FfiSlice<FfiLogPath>;
 
 impl LogPathArray {
+    /// Decodes unchanged source-snapshot paths without cloning file metadata for diagnostics.
+    ///
+    /// # Safety
+    ///
+    /// The array and all nested strings must be readable for this call, and must contain the
+    /// unchanged paths exported by the source snapshot.
+    #[cfg(all(feature = "internal-api", feature = "declarative-plans"))]
+    pub(crate) unsafe fn trusted_snapshot_log_paths(
+        &self,
+        table_root: &Url,
+    ) -> KernelResult<Vec<LogPath>> {
+        let log_root = table_root.join("_delta_log/")?;
+        unsafe { self.try_as_slice() }?
+            .iter()
+            .map(|path| {
+                let location = unsafe { TryFromStringSlice::try_from_slice(&path.location) }?;
+                LogPath::try_new_from_trusted_snapshot(FileMeta {
+                    location: log_url(location, &log_root)?,
+                    last_modified: path.last_modified,
+                    size: path.size,
+                })
+            })
+            .collect()
+    }
+
     /// Decodes paths using the parsed table root for absolute URLs beneath its log directory.
     ///
     /// Filename classification and snapshot-hint validation are unchanged. Other locations use
