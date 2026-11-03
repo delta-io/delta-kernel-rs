@@ -321,6 +321,7 @@ mod tests {
             "UPDATE",
             "DELETE",
             "OPTIMIZE",
+            "REORG",
             "CREATE TABLE",
             "REPLACE TABLE",
             "CREATE TABLE AS SELECT",

@@ -106,6 +106,8 @@ pub(crate) enum TableFeature {
     Invariants,
     /// Check constraints on columns
     CheckConstraints,
+    /// Protects checkpoints and JSON logs.
+    CheckpointProtection,
     /// CDF on a table
     ChangeDataFeed,
     /// Columns with generated values
@@ -349,6 +351,32 @@ static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     #[cfg(feature = "check-constraints-in-dev")]
     kernel_support: KernelSupport::Supported,
     #[cfg(not(feature = "check-constraints-in-dev"))]
+    kernel_support: KernelSupport::NotSupported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+// checkpointProtection uses delta.requireCheckpointProtectionBeforeVersion as a protection
+// boundary:
+// - Metadata cleanup must preserve checkpoints before the boundary.
+// - Creating a checkpoint before the boundary requires support for all features in that version's
+//   protocol.
+// - History cleanup requires support for every removed version's protocol, unless a single cleanup
+//   operation removes all history before the boundary.
+// - Cleanup must remove commits before their associated checkpoints.
+//
+// The checkpoint write requirement is satisfied when creating a `CheckpointWriter`: Kernel
+// validates read and write support for the snapshot being checkpointed.
+// The metadata cleanup requirements are trivially satisfied because Kernel does not perform
+// metadata cleanup. Any future metadata cleanup implementation must follow the above writer
+// requirements. Reference:
+// https://github.com/delta-io/delta/blob/master/protocol_rfcs/checkpoint-protection.md
+static CHECKPOINT_PROTECTION_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    #[cfg(feature = "checkpoint-protection")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "checkpoint-protection"))]
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -793,6 +821,7 @@ impl TableFeature {
             | TableFeature::Invariants
             | TableFeature::RowTracking
             | TableFeature::CheckConstraints
+            | TableFeature::CheckpointProtection
             | TableFeature::ChangeDataFeed
             | TableFeature::GeneratedColumns
             | TableFeature::IdentityColumns
@@ -828,6 +857,7 @@ impl TableFeature {
             TableFeature::AppendOnly => &APPEND_ONLY_INFO,
             TableFeature::Invariants => &INVARIANTS_INFO,
             TableFeature::CheckConstraints => &CHECK_CONSTRAINTS_INFO,
+            TableFeature::CheckpointProtection => &CHECKPOINT_PROTECTION_INFO,
             TableFeature::ChangeDataFeed => &CHANGE_DATA_FEED_INFO,
             TableFeature::GeneratedColumns => &GENERATED_COLUMNS_INFO,
             TableFeature::IdentityColumns => &IDENTITY_COLUMNS_INFO,
@@ -1203,6 +1233,7 @@ mod tests {
                 TableFeature::AppendOnly => "appendOnly",
                 TableFeature::Invariants => "invariants",
                 TableFeature::CheckConstraints => "checkConstraints",
+                TableFeature::CheckpointProtection => "checkpointProtection",
                 TableFeature::ChangeDataFeed => "changeDataFeed",
                 TableFeature::GeneratedColumns => "generatedColumns",
                 TableFeature::IdentityColumns => "identityColumns",

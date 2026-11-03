@@ -106,6 +106,7 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   `Transaction::ack_check_constraints`. Kernel does not evaluate constraint SQL, so enforcement is
   the connector's responsibility. CREATE TABLE rejects `delta.constraints.*` properties in every
   build. Also gates the internal SQL tokenizer and parser.
+- `checkpoint-protection`: support for the `checkpointProtection` writer feature.
 - `adaptive-metadata-in-dev`: adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature. Without it, reads and writes to tables listing
@@ -156,6 +157,12 @@ transactions. `data_change` is never inferred from staged files, including for e
 `build()` rejects ALTER with `true` and blind append with `false`; `commit()` retains operation and
 staged-file checks. `UpdateTableOperation::AlterTable` records schema-changing DDL without
 introducing a separate transaction type.
+
+Incremental CRC replay trusts operation names in `INCREMENTAL_SAFE_OPS`
+(`kernel/src/crc/file_stats.rs`). Adding an operation requires both correct net Add/Remove file
+accounting and rejecting its exact name for `UpdateTableOperation::Custom`. Represent update-table
+operations with typed variants so name reservation is automatic, and mirror them in the FFI.
+
 Writers configure transaction intent before `build()`, then call
 `Transaction::write_state`, then bind partition values through the returned `WriteState` to get a
 `BoundWriteContext`. Distributed writers can encode and transport the state before binding it.
@@ -330,8 +337,8 @@ is the source of truth. Key concepts:
 **Table features**:
 
 - Writer: `allowColumnDefaults`, `appendOnly`, `changeDataFeed`, `checkConstraints`,
-  `clustering`, `domainMetadata`, `generatedColumns`, `icebergCompatV1`, `icebergCompatV2`,
-  `icebergCompatV3`, `identityColumns`, `inCommitTimestamp`, `invariants`,
+  `checkpointProtection`, `clustering`, `domainMetadata`, `generatedColumns`, `icebergCompatV1`,
+  `icebergCompatV2`, `icebergCompatV3`, `identityColumns`, `inCommitTimestamp`, `invariants`,
   `materializePartitionColumns`, `rowTracking`
 - Reader + writer: `adaptiveMetadata-preview`, `catalogManaged`, `catalogOwned-preview`,
   `columnMapping`, `deletionVectors`, `fileType`, `fileType-preview`, `geospatial`,
