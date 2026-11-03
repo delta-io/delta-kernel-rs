@@ -401,12 +401,7 @@ pub extern "C" fn visit_expression_literal_timestamp_ntz(
 /// Visit an interval year-month literal with its exact qualifier.
 ///
 /// `value` is a signed total-month count. `interval year` values must be divisible by 12.
-/// `kind` accepts the numeric values of
-/// [`FfiIntervalYearToMonthType`]: `1` for
-/// `interval year`, `2` for `interval month`, and `3` for `interval year to month`. Other values
-/// return an allocated [`FFIKernelError::SchemaError`](crate::error::FFIKernelError::SchemaError)
-/// before a literal is inserted. Unaligned `interval year` values return
-/// [`FFIKernelError::InvalidIntervalError`](crate::error::FFIKernelError::InvalidIntervalError).
+/// `kind` is the numeric value of [`FfiIntervalYearToMonthType`].
 /// On success the returned ID is owned by the builder state.
 ///
 /// # Safety
@@ -518,7 +513,10 @@ pub(crate) enum NullTypeTag {
     Timestamp = 10,
     /// Null of type `timestamp_ntz` (microseconds since epoch, no timezone).
     TimestampNtz = 11,
-    /// Null of type `decimal`. Requires valid precision and scale parameters.
+    /// Null of type `decimal`. Requires valid `precision` and `scale` parameters.
+    ///
+    /// WARNING: This variant MUST remain `= 12`. C consumers key on the value `12` directly for
+    /// decimal precision/scale handling.
     Decimal = 12,
     /// Null of type `interval year to month` (signed month count).
     IntervalYearMonth = 13,
@@ -537,7 +535,7 @@ pub(crate) enum NullTypeTag {
 /// Additional parameters for a decimal or year-month interval typed null.
 ///
 /// Decimal tag 12 uses `decimal_precision` and `decimal_scale`; year-month tag 13 uses
-/// `interval_year_month_kind` (1 = year, 2 = month, 3 = year to month). Unused fields are ignored.
+/// `interval_year_month_kind` (0 = year, 1 = month, 2 = year to month).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KernelNullTypeParameters {
@@ -546,7 +544,7 @@ pub struct KernelNullTypeParameters {
     /// Decimal scale, used only for tag 12.
     pub decimal_scale: u8,
     /// Year-month qualifier, used only for tag 13.
-    pub interval_year_month_kind: u32,
+    pub interval_year_month_kind: u8,
 }
 
 impl TryFrom<u8> for NullTypeTag {
@@ -606,8 +604,7 @@ impl NullTypeTag {
                 Self::Decimal
             }
             PrimitiveType::IntervalYearMonth(kind) => {
-                parameters.interval_year_month_kind =
-                    FfiIntervalYearToMonthType::from(*kind) as u32;
+                parameters.interval_year_month_kind = FfiIntervalYearToMonthType::from(*kind) as u8;
                 Self::IntervalYearMonth
             }
             PrimitiveType::IntervalDayTime => Self::IntervalDayTime,
@@ -620,7 +617,8 @@ impl NullTypeTag {
 
     /// Convert a null type tag back to a [`DataType`].
     ///
-    /// Decimal and year-month interval tags use their respective fields. Other fields are ignored.
+    /// Decimal tag 12 reads `decimal_precision` and `decimal_scale`; year-month tag 13 reads
+    /// `interval_year_month_kind`.
     ///
     /// Returns an error for [`NonPrimitive`](Self::NonPrimitive) since complex types cannot be
     /// reconstructed from a type tag alone.
@@ -642,8 +640,9 @@ impl NullTypeTag {
             Self::Timestamp => Ok(DataType::TIMESTAMP),
             Self::TimestampNtz => Ok(DataType::TIMESTAMP_NTZ),
             Self::IntervalYearMonth => {
-                let kind =
-                    FfiIntervalYearToMonthType::try_from(parameters.interval_year_month_kind)?;
+                let kind = FfiIntervalYearToMonthType::try_from(u32::from(
+                    parameters.interval_year_month_kind,
+                ))?;
                 Ok(DataType::Primitive(PrimitiveType::IntervalYearMonth(
                     kind.into(),
                 )))
@@ -1041,12 +1040,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case(DataType::INTERVAL_YEAR, 1)]
-    #[case(DataType::INTERVAL_MONTH, 2)]
-    #[case(DataType::INTERVAL_YEAR_MONTH, 3)]
+    #[case(DataType::INTERVAL_YEAR, 0)]
+    #[case(DataType::INTERVAL_MONTH, 1)]
+    #[case(DataType::INTERVAL_YEAR_MONTH, 2)]
     fn from_data_type_interval_year_month_preserves_kind(
         #[case] dt: DataType,
-        #[case] expected_kind: u32,
+        #[case] expected_kind: u8,
     ) {
         let (tag, parameters) = NullTypeTag::from_data_type(&dt);
         assert_eq!(tag, NullTypeTag::IntervalYearMonth);
@@ -1121,14 +1120,14 @@ mod tests {
     }
 
     #[rstest]
-    #[case::year(FfiIntervalYearToMonthType::IntervalYear as u32, DataType::INTERVAL_YEAR)]
-    #[case::month(FfiIntervalYearToMonthType::IntervalMonth as u32, DataType::INTERVAL_MONTH)]
+    #[case::year(FfiIntervalYearToMonthType::IntervalYear as u8, DataType::INTERVAL_YEAR)]
+    #[case::month(FfiIntervalYearToMonthType::IntervalMonth as u8, DataType::INTERVAL_MONTH)]
     #[case::year_to_month(
-        FfiIntervalYearToMonthType::IntervalYearToMonth as u32,
+        FfiIntervalYearToMonthType::IntervalYearToMonth as u8,
         DataType::INTERVAL_YEAR_MONTH,
     )]
     fn interval_year_month_null_tag_reconstructs_qualifier(
-        #[case] kind: u32,
+        #[case] kind: u8,
         #[case] expected: DataType,
     ) {
         let parameters = KernelNullTypeParameters {
@@ -1289,9 +1288,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case::unspecified(0)]
-    #[case::unknown(u32::MAX)]
-    fn interval_year_month_null_rejects_invalid_kind(#[case] invalid_kind: u32) {
+    #[case::first_invalid(3)]
+    #[case::out_of_range(u8::MAX)]
+    fn interval_year_month_null_rejects_invalid_kind(#[case] invalid_kind: u8) {
         let mut state = KernelExpressionVisitorState::default();
         let existing = visit_expression_literal_int(&mut state, 7);
         let result = visit_expression_literal_null(
@@ -1320,7 +1319,7 @@ mod tests {
             &mut state,
             NullTypeTag::IntervalYearMonth as u8,
             KernelNullTypeParameters {
-                interval_year_month_kind: FfiIntervalYearToMonthType::IntervalMonth as u32,
+                interval_year_month_kind: FfiIntervalYearToMonthType::IntervalMonth as u8,
                 ..KernelNullTypeParameters::default()
             },
             &TEST_ERROR_ALLOCATORS,
@@ -1406,7 +1405,7 @@ mod tests {
         let parameters = KernelNullTypeParameters {
             decimal_precision: 10,
             decimal_scale: 2,
-            interval_year_month_kind: 1,
+            interval_year_month_kind: 0,
         };
         for (tag, expected) in [
             (NullTypeTag::Boolean, DataType::BOOLEAN),
@@ -1456,7 +1455,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::literal_unspecified(0)]
+    #[case::literal_first_invalid(3)]
     #[case::literal_unknown(u32::MAX)]
     fn interval_year_month_literal_rejects_invalid_kind(#[case] invalid_kind: u32) {
         let mut state = KernelExpressionVisitorState::default();

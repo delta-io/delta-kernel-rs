@@ -157,8 +157,8 @@ pub struct EngineExpressionVisitor {
     /// Visits a typed null value belonging to the list identified by `sibling_list_id`.
     ///
     /// The `type_tag` identifies reconstructible primitive types with tags 0-14. Decimal tag 12
-    /// reads precision and scale from `parameters`; year-month tag 13 reads its qualifier.
-    /// Other fields are ignored. Non-primitive types and `void` use the sentinel tag 255.
+    /// reads precision and scale from `parameters`; year-month tag 13 reads its qualifier from
+    /// `parameters`. Non-primitive types and `void` use the sentinel tag 255.
     pub visit_literal_null: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
@@ -1119,6 +1119,7 @@ mod tests {
             kind: FfiIntervalYearToMonthType::IntervalYearToMonth,
         }
     )]
+    // The YEAR qualifier requires a whole number of years; this is the largest aligned i32 value.
     #[case(
         lit(Scalar::interval_year_month(i32::MAX - 7, IntervalYearToMonthType::IntervalYear).unwrap()),
         LiteralEvent::IntervalYearMonth {
@@ -1180,7 +1181,7 @@ mod tests {
                 sibling_list_id: 0,
                 tag: NullTypeTag::IntervalYearMonth as u8,
                 parameters: KernelNullTypeParameters {
-                    interval_year_month_kind: FfiIntervalYearToMonthType::from(dtype) as u32,
+                    interval_year_month_kind: FfiIntervalYearToMonthType::from(dtype) as u8,
                     ..KernelNullTypeParameters::default()
                 },
             }]
@@ -1215,7 +1216,7 @@ mod tests {
                     sibling_list_id: 1,
                     tag: NullTypeTag::IntervalYearMonth as u8,
                     parameters: KernelNullTypeParameters {
-                        interval_year_month_kind: FfiIntervalYearToMonthType::IntervalMonth as u32,
+                        interval_year_month_kind: FfiIntervalYearToMonthType::IntervalMonth as u8,
                         ..KernelNullTypeParameters::default()
                     },
                 },

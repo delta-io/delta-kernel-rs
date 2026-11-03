@@ -1932,7 +1932,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::unspecified(0)]
+    #[case::first_invalid(3)]
     #[case::unknown(u32::MAX)]
     fn interval_year_month_field_rejects_invalid_kind_before_metadata(#[case] invalid_kind: u32) {
         let mut metadata_source = TestMetadata::from([("visited", MetadataValue::Boolean(true))]);

@@ -626,9 +626,9 @@ mod tests {
             );
 
             for (name, kind, data_type) in [
-                ("year_null", 1, DataType::INTERVAL_YEAR),
-                ("month_null", 2, DataType::INTERVAL_MONTH),
-                ("year_month_null", 3, DataType::INTERVAL_YEAR_MONTH),
+                ("year_null", 0, DataType::INTERVAL_YEAR),
+                ("month_null", 1, DataType::INTERVAL_MONTH),
+                ("year_month_null", 2, DataType::INTERVAL_YEAR_MONTH),
             ] {
                 let parameters = KernelNullTypeParameters {
                     decimal_precision: 0,
@@ -666,16 +666,20 @@ mod tests {
                 )
             });
             assert_eq!(err, FFIKernelError::GenericError);
-            let err = expect_err(unsafe {
+            let default_year_name = "default_year";
+            ok_or_panic(unsafe {
                 partition_value_map_insert_null(
                     map.shallow_copy(),
-                    kernel_string_slice!(n),
+                    kernel_string_slice!(default_year_name),
                     NullTypeTag::IntervalYearMonth as u8,
                     KernelNullTypeParameters::default(),
                     engine.shallow_copy(),
                 )
             });
-            assert_eq!(err, FFIKernelError::SchemaError);
+            assert_eq!(
+                unsafe { map.as_ref() }.inner.get(default_year_name),
+                Some(&Scalar::Null(DataType::INTERVAL_YEAR))
+            );
             let invalid_kind = KernelNullTypeParameters {
                 decimal_precision: 0,
                 decimal_scale: 0,

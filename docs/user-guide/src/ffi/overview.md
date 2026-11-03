@@ -188,7 +188,7 @@ borrowed slices. Don't retain the callback's state.
 | `visit_field_void` | Build a void primitive `StructField` |
 | `visit_field_string` / `visit_field_binary` / `visit_field_date` / `visit_field_timestamp` / `visit_field_timestamp_ntz` | Build a string, binary, or date/time primitive `StructField` |
 | `visit_field_decimal` | Build a decimal `StructField` with explicit precision and scale |
-| `visit_field_interval_year_month` | Build an `interval year`, `interval month`, or `interval year to month` field with an explicit `FfiIntervalYearToMonthType` kind (`1`, `2`, or `3`) |
+| `visit_field_interval_year_month` | Build an `interval year`, `interval month`, or `interval year to month` field with an explicit `FfiIntervalYearToMonthType` kind (`0`, `1`, or `2`) |
 | `visit_field_geometry` / `visit_field_geography` | Build a geospatial `StructField` (geometry with a CRS; geography with a CRS and edge-interpolation algorithm) |
 | `visit_field_struct` / `visit_field_array` / `visit_field_map` / `visit_field_variant` | Build a complex `StructField` (struct, array, map, or variant) from previously created field or struct IDs |
 | `visit_metadata_value` | Insert a UTF-8 value tagged with `CMetadataValueKind` into the active field metadata map |
@@ -404,7 +404,7 @@ Most engines need only one of the two surfaces.
 | `visit_expression` / `visit_predicate` | Walk a Kernel expression or predicate with an `EngineExpressionVisitor` (Walk surface) |
 | `visit_expression_ref` / `visit_predicate_ref` | Walk a pre-interned expression or predicate reference (Walk surface) |
 | `visit_expression_column` / `visit_expression_struct` / `visit_expression_plus` / `visit_expression_literal_*` / ... | Builder functions the engine calls from inside `visit_engine_expression` to construct Kernel expression nodes; see `delta_kernel_ffi.h` for the full list |
-| `visit_expression_literal_interval_year_month` | Build a year-month interval literal with an explicit `FfiIntervalYearToMonthType` kind (`1`, `2`, or `3`) |
+| `visit_expression_literal_interval_year_month` | Build a year-month interval literal with an explicit `FfiIntervalYearToMonthType` kind (`0`, `1`, or `2`) |
 | `visit_expression_literal_null` | Build a typed null; decimal and year-month tags use their `KernelNullTypeParameters` fields, while other tags ignore the record |
 | `visit_predicate_eq` / `visit_predicate_and` / `visit_predicate_or` / ... | Builder functions the engine calls from inside `visit_engine_predicate` to construct Kernel predicate nodes |
 | `visit_expression_unknown` / `visit_predicate_unknown` | Builder helpers that bridge an opaque engine operator through Kernel unchanged |
