@@ -10,6 +10,8 @@ use url::Url;
 
 use super::LogSegment;
 #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+use super::{last_manifest_commit_inconsistency, require_pointed_checkpoint_action};
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
 use crate::actions::visitors::LastManifestCommitVisitor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{CHECKPOINT_ACTION_FIELD, CheckpointAction, LastManifestCommit};
@@ -653,9 +655,10 @@ impl PmCandidate {
         match &self.last_manifest_commit {
             Some(pointer) if pointer.version == version => self.require_pointed_checkpoint(),
             // The pointer names an older commit, yet this one carries an action of its own.
-            Some(pointer) if self.checkpoint.is_some() => {
-                Err(pointer.inconsistency(format!("commit {version} carries a checkpoint action")))
-            }
+            Some(pointer) if self.checkpoint.is_some() => Err(last_manifest_commit_inconsistency(
+                pointer,
+                format!("commit {version} carries a checkpoint action"),
+            )),
             None if self.checkpoint.is_some() => Err(KernelError::invalid_log_segment(format!(
                 "commit {version} carries a checkpoint action but no lastManifestCommit"
             ))),
@@ -670,8 +673,10 @@ impl PmCandidate {
         let Some(pointer) = &self.last_manifest_commit else {
             return Ok(self);
         };
-        let action =
-            pointer.require_checkpoint_action(self.checkpoint.take().map(|(_, action)| action))?;
+        let action = require_pointed_checkpoint_action(
+            pointer,
+            self.checkpoint.take().map(|(_, action)| action),
+        )?;
         self.checkpoint = Some((action.version(), action));
         Ok(self)
     }
