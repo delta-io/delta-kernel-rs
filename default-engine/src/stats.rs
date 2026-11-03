@@ -738,6 +738,19 @@ impl FileStatsAccumulator {
 /// | `minValues.n` | 1 | 2 | 1 |
 /// | `maxValues.n` | 5 | 9 | 9 |
 /// | `tightBounds` | true | true | true |
+///
+/// Keep string bounds raw during merges and truncate them only in `finish()`.
+///
+/// For example, let `m = "\u{10FFFF}".repeat(65)`. The max-string truncator returns a null upper
+/// bound for `m` because it's too long. Consider three batches:
+///
+/// 1. `[m]` retains `m` as its maximum.
+/// 2. Merging `["apple"]` still has maximum `m`, but truncating it would produce a null bound.
+/// 3. Merging `["banana"]` would then ignore that null and select `"banana"` as the maximum.
+///
+/// Since `m > "banana"`, this would underestimate the file's maximum and could incorrectly skip
+/// matching rows. Retaining `m` until `finish()` instead leaves the final maximum absent, which
+/// safely prevents data skipping from relying on an invalid upper bound.
 fn merge_raw_stats(left: &StructArray, right: &StructArray) -> KernelResult<StructArray> {
     // Equal batch schemas can hide different nested field names in the underlying arrays.
     if left.data_type() != right.data_type() {
