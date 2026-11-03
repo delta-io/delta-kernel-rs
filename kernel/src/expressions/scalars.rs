@@ -101,7 +101,10 @@ impl TryFrom<RawIntervalYearMonthData> for IntervalYearMonthData {
 }
 
 /// A day-time interval value stored as signed microseconds and an ANSI qualifier.
+/// Construction and deserialization reject values containing a fraction of the qualifier's
+/// end unit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawIntervalDayTimeData")]
 pub struct IntervalDayTimeData {
     micros: i64,
     ty: IntervalDayToSecondType,
@@ -111,7 +114,7 @@ impl IntervalDayTimeData {
     /// Creates a day-time payload from microseconds and its qualifier.
     ///
     /// Returns an error when the microseconds contain a fraction of the qualifier's last unit.
-    pub fn try_new(micros: i64, ty: IntervalDayToSecondType) -> Result<Self> {
+    pub fn try_new(micros: i64, ty: IntervalDayToSecondType) -> KernelResult<Self> {
         let unit = ty.unit_micros();
         require!(
             micros % unit == 0,
@@ -130,6 +133,31 @@ impl IntervalDayTimeData {
     /// Returns the day-time interval qualifier.
     pub fn ty(&self) -> &IntervalDayToSecondType {
         &self.ty
+    }
+}
+
+/// Creates a `DAY TO SECOND` payload from any signed microsecond count.
+impl From<i64> for IntervalDayTimeData {
+    fn from(micros: i64) -> Self {
+        Self {
+            micros,
+            ty: IntervalDayToSecondType::IntervalDayToSecond,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename = "IntervalDayTimeData")]
+struct RawIntervalDayTimeData {
+    micros: i64,
+    ty: IntervalDayToSecondType,
+}
+
+impl TryFrom<RawIntervalDayTimeData> for IntervalDayTimeData {
+    type Error = KernelError;
+
+    fn try_from(raw: RawIntervalDayTimeData) -> KernelResult<Self> {
+        Self::try_new(raw.micros, raw.ty)
     }
 }
 
@@ -541,7 +569,7 @@ impl Scalar {
     /// Constructs a day-time interval from signed microseconds and its ANSI qualifier.
     ///
     /// Returns an error when the microseconds contain a fraction of the qualifier's last unit.
-    pub fn interval_day_time(micros: i64, ty: IntervalDayToSecondType) -> Result<Self> {
+    pub fn interval_day_time(micros: i64, ty: IntervalDayToSecondType) -> KernelResult<Self> {
         Ok(Self::IntervalDayTime(IntervalDayTimeData::try_new(
             micros, ty,
         )?))
@@ -2229,6 +2257,79 @@ mod tests {
         assert!(
             matches!(err, KernelError::InvalidInterval(message) if message.contains("not divisible"))
         );
+    }
+
+    #[rstest]
+    fn interval_day_time_from_micros_preserves_full_range(
+        #[values(0, 1, -1, 86_400_000_001, i64::MIN, i64::MAX)] micros: i64,
+    ) {
+        let data = IntervalDayTimeData::from(micros);
+        assert_eq!(data.micros(), micros);
+        assert_eq!(data.ty(), &IntervalDayToSecondType::IntervalDayToSecond);
+    }
+
+    #[rstest]
+    #[case::day_positive(1, IntervalDayToSecondType::IntervalDay)]
+    #[case::day_negative(-1, IntervalDayToSecondType::IntervalDay)]
+    #[case::hour_negative(-1, IntervalDayToSecondType::IntervalHour)]
+    #[case::minute_positive(60_000_001, IntervalDayToSecondType::IntervalMinute)]
+    #[case::day_min(i64::MIN, IntervalDayToSecondType::IntervalDay)]
+    #[case::minute_max(i64::MAX, IntervalDayToSecondType::IntervalMinute)]
+    fn interval_day_time_deserialization_rejects_unaligned_end_units(
+        #[case] micros: i64,
+        #[case] ty: IntervalDayToSecondType,
+        #[values(false, true)] inside_scalar: bool,
+    ) {
+        let payload = serde_json::json!({ "micros": micros, "ty": ty });
+        let err = if inside_scalar {
+            serde_json::from_value::<Scalar>(serde_json::json!({ "IntervalDayTime": payload }))
+                .unwrap_err()
+        } else {
+            serde_json::from_value::<IntervalDayTimeData>(payload).unwrap_err()
+        };
+        assert!(err.to_string().contains("not divisible"));
+    }
+
+    #[rstest]
+    #[case::day_zero(0, IntervalDayToSecondType::IntervalDay)]
+    #[case::day_positive(86_400_000_000, IntervalDayToSecondType::IntervalDay)]
+    #[case::day_negative(-86_400_000_000, IntervalDayToSecondType::IntervalDay)]
+    #[case::day_min_aligned(
+        i64::MIN / 86_400_000_000 * 86_400_000_000,
+        IntervalDayToSecondType::IntervalDay
+    )]
+    #[case::day_max_aligned(
+        i64::MAX / 86_400_000_000 * 86_400_000_000,
+        IntervalDayToSecondType::IntervalDay
+    )]
+    #[case::hour(93_600_000_000, IntervalDayToSecondType::IntervalHour)]
+    #[case::minute(93_780_000_000, IntervalDayToSecondType::IntervalMinute)]
+    #[case::second(93_784_500_000, IntervalDayToSecondType::IntervalSecond)]
+    #[case::day_hour(93_600_000_000, IntervalDayToSecondType::IntervalDayToHour)]
+    #[case::day_minute(93_780_000_000, IntervalDayToSecondType::IntervalDayToMinute)]
+    #[case::day_second(93_784_500_000, IntervalDayToSecondType::IntervalDayToSecond)]
+    #[case::hour_minute(93_780_000_000, IntervalDayToSecondType::IntervalHourToMinute)]
+    #[case::hour_second(93_784_500_000, IntervalDayToSecondType::IntervalHourToSecond)]
+    #[case::minute_second(93_784_500_000, IntervalDayToSecondType::IntervalMinuteToSecond)]
+    #[case::second_min(i64::MIN, IntervalDayToSecondType::IntervalSecond)]
+    #[case::full_max(i64::MAX, IntervalDayToSecondType::IntervalDayToSecond)]
+    fn interval_day_time_serde_preserves_payload_and_qualifier(
+        #[case] micros: i64,
+        #[case] ty: IntervalDayToSecondType,
+        #[values(false, true)] inside_scalar: bool,
+    ) {
+        let payload = serde_json::json!({ "micros": micros, "ty": ty });
+        if inside_scalar {
+            let serialized = serde_json::json!({ "IntervalDayTime": payload });
+            let scalar: Scalar = serde_json::from_value(serialized.clone()).unwrap();
+            assert_eq!(scalar, Scalar::interval_day_time(micros, ty).unwrap());
+            assert_eq!(serde_json::to_value(scalar).unwrap(), serialized);
+        } else {
+            let data: IntervalDayTimeData = serde_json::from_value(payload.clone()).unwrap();
+            assert_eq!(data.micros(), micros);
+            assert_eq!(data.ty(), &ty);
+            assert_eq!(serde_json::to_value(data).unwrap(), payload);
+        }
     }
 
     #[rstest]

@@ -1109,9 +1109,9 @@ mod tests {
     };
     use crate::plans::{IoOperation, Operation};
     use crate::schema::{
-        schema, schema_ref, ArrayType, DataType, DecimalType, IntervalDayToSecondType,
-        IntervalYearToMonthType, MapType, MetadataValue, PrimitiveType, SchemaRef, StructField,
-        StructType, ToSchema as _,
+        ArrayType, DataType, DecimalType, IntervalDayToSecondType, IntervalYearToMonthType,
+        MapType, MetadataValue, PrimitiveType, SchemaRef, StructField, StructType, ToSchema as _,
+        schema, schema_ref,
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};

@@ -15,10 +15,10 @@
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::expressions::{
-    DecimalData, IntervalDayTimeData, IntervalYearMonthData, Scalar, MONTHS_PER_YEAR,
+    DecimalData, IntervalDayTimeData, IntervalYearMonthData, MONTHS_PER_YEAR, Scalar,
 };
 use crate::schema::{IntervalDayToSecondType, IntervalYearToMonthType};
-use crate::{KernelError, KernelResult, Result};
+use crate::{KernelError, KernelResult};
 
 /// The UNIX epoch (1970-01-01) expressed as a CE day number for chrono's
 /// `NaiveDate::from_num_days_from_ce_opt`, which counts from 0001-01-01.
@@ -220,7 +220,7 @@ fn format_year_month_interval(data: &IntervalYearMonthData) -> KernelResult<Stri
     }
 }
 
-fn format_day_time_interval(data: &IntervalDayTimeData) -> Result<String> {
+fn format_day_time_interval(data: &IntervalDayTimeData) -> KernelResult<String> {
     let micros = data.micros();
     let unit = data.ty().unit_micros();
     if micros % unit != 0 {
@@ -806,23 +806,6 @@ mod tests {
                 .unwrap(),
             input
         );
-    }
-
-    #[rstest]
-    #[case(1, IntervalDayToSecondType::IntervalDay)]
-    #[case(-1, IntervalDayToSecondType::IntervalHour)]
-    #[case(i64::MAX, IntervalDayToSecondType::IntervalMinute)]
-    fn test_day_time_interval_partition_serialization_rejects_unaligned_micros(
-        #[case] micros: i64,
-        #[case] qualifier: IntervalDayToSecondType,
-    ) {
-        let payload = serde_json::from_value(serde_json::json!({
-            "micros": micros,
-            "ty": qualifier
-        }))
-        .unwrap();
-        let err = serialize_partition_value(&Scalar::IntervalDayTime(payload)).unwrap_err();
-        assert!(matches!(err, KernelError::InvalidPartitionValues(_)));
     }
 
     /// Kernel formats the smallest subnormal double as "5.0E-324" while Delta-Spark

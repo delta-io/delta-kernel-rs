@@ -2191,11 +2191,6 @@ pub enum IntervalDayToSecondType {
 }
 
 impl IntervalDayToSecondType {
-    /// Returns true for the broad `INTERVAL DAY TO SECOND` qualifier.
-    pub fn is_full_range(&self) -> bool {
-        *self == Self::IntervalDayToSecond
-    }
-
     pub(crate) fn unit_micros(&self) -> i64 {
         use IntervalDayToSecondType::*;
         match self {
@@ -2644,6 +2639,43 @@ impl DataType {
     pub const INTERVAL_YEAR_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth(
         IntervalYearToMonthType::IntervalYearToMonth,
     ));
+    /// ANSI `INTERVAL DAY`, stored as microseconds aligned to whole days.
+    pub const INTERVAL_DAY: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalDay,
+    ));
+    /// ANSI `INTERVAL HOUR`, stored as microseconds aligned to whole hours.
+    pub const INTERVAL_HOUR: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalHour,
+    ));
+    /// ANSI `INTERVAL MINUTE`, stored as microseconds aligned to whole minutes.
+    pub const INTERVAL_MINUTE: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalMinute,
+    ));
+    /// ANSI `INTERVAL SECOND`, stored as signed microseconds.
+    pub const INTERVAL_SECOND: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalSecond,
+    ));
+    /// ANSI `INTERVAL DAY TO HOUR`, stored as microseconds aligned to whole hours.
+    pub const INTERVAL_DAY_HOUR: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalDayToHour,
+    ));
+    /// ANSI `INTERVAL DAY TO MINUTE`, stored as microseconds aligned to whole minutes.
+    pub const INTERVAL_DAY_MINUTE: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalDayToMinute,
+    ));
+    /// ANSI `INTERVAL HOUR TO MINUTE`, stored as microseconds aligned to whole minutes.
+    pub const INTERVAL_HOUR_MINUTE: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalHourToMinute,
+    ));
+    /// ANSI `INTERVAL HOUR TO SECOND`, stored as signed microseconds.
+    pub const INTERVAL_HOUR_SECOND: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalHourToSecond,
+    ));
+    /// ANSI `INTERVAL MINUTE TO SECOND`, stored as signed microseconds.
+    pub const INTERVAL_MINUTE_SECOND: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
+        IntervalDayToSecondType::IntervalMinuteToSecond,
+    ));
+    /// ANSI `INTERVAL DAY TO SECOND`, stored as signed microseconds.
     pub const INTERVAL_DAY_TIME: Self = DataType::Primitive(PrimitiveType::IntervalDayTime(
         IntervalDayToSecondType::IntervalDayToSecond,
     ));
@@ -3450,43 +3482,16 @@ mod tests {
     #[case("interval year", DataType::INTERVAL_YEAR)]
     #[case("interval month", DataType::INTERVAL_MONTH)]
     #[case("interval year to month", DataType::INTERVAL_YEAR_MONTH)]
-    #[case(
-        "interval day",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalDay)
-    )]
-    #[case(
-        "interval hour",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalHour)
-    )]
-    #[case(
-        "interval minute",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalMinute)
-    )]
-    #[case(
-        "interval second",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalSecond)
-    )]
-    #[case(
-        "interval day to hour",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalDayToHour)
-    )]
-    #[case(
-        "interval day to minute",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalDayToMinute)
-    )]
+    #[case("interval day", DataType::INTERVAL_DAY)]
+    #[case("interval hour", DataType::INTERVAL_HOUR)]
+    #[case("interval minute", DataType::INTERVAL_MINUTE)]
+    #[case("interval second", DataType::INTERVAL_SECOND)]
+    #[case("interval day to hour", DataType::INTERVAL_DAY_HOUR)]
+    #[case("interval day to minute", DataType::INTERVAL_DAY_MINUTE)]
     #[case("interval day to second", DataType::INTERVAL_DAY_TIME)]
-    #[case(
-        "interval hour to minute",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToMinute)
-    )]
-    #[case(
-        "interval hour to second",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToSecond)
-    )]
-    #[case(
-        "interval minute to second",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalMinuteToSecond)
-    )]
+    #[case("interval hour to minute", DataType::INTERVAL_HOUR_MINUTE)]
+    #[case("interval hour to second", DataType::INTERVAL_HOUR_SECOND)]
+    #[case("interval minute to second", DataType::INTERVAL_MINUTE_SECOND)]
     fn test_primitive_type_deserialization_still_works(
         #[case] type_str: &str,
         #[case] expected_type: DataType,
@@ -3577,43 +3582,16 @@ mod tests {
     #[case("\"interval year\"", DataType::INTERVAL_YEAR)]
     #[case("\"interval month\"", DataType::INTERVAL_MONTH)]
     #[case("\"interval year to month\"", DataType::INTERVAL_YEAR_MONTH)]
-    #[case(
-        "\"interval day\"",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalDay)
-    )]
-    #[case(
-        "\"interval hour\"",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalHour)
-    )]
-    #[case(
-        "\"interval minute\"",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalMinute)
-    )]
-    #[case(
-        "\"interval second\"",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalSecond)
-    )]
-    #[case(
-        "\"interval day to hour\"",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalDayToHour)
-    )]
-    #[case(
-        "\"interval day to minute\"",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalDayToMinute)
-    )]
+    #[case("\"interval day\"", DataType::INTERVAL_DAY)]
+    #[case("\"interval hour\"", DataType::INTERVAL_HOUR)]
+    #[case("\"interval minute\"", DataType::INTERVAL_MINUTE)]
+    #[case("\"interval second\"", DataType::INTERVAL_SECOND)]
+    #[case("\"interval day to hour\"", DataType::INTERVAL_DAY_HOUR)]
+    #[case("\"interval day to minute\"", DataType::INTERVAL_DAY_MINUTE)]
     #[case("\"interval day to second\"", DataType::INTERVAL_DAY_TIME)]
-    #[case(
-        "\"interval hour to minute\"",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToMinute)
-    )]
-    #[case(
-        "\"interval hour to second\"",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalHourToSecond)
-    )]
-    #[case(
-        "\"interval minute to second\"",
-        DataType::interval_day_time(IntervalDayToSecondType::IntervalMinuteToSecond)
-    )]
+    #[case("\"interval hour to minute\"", DataType::INTERVAL_HOUR_MINUTE)]
+    #[case("\"interval hour to second\"", DataType::INTERVAL_HOUR_SECOND)]
+    #[case("\"interval minute to second\"", DataType::INTERVAL_MINUTE_SECOND)]
     #[case("\"variant\"", DataType::unshredded_variant())]
     fn test_data_type_deserialization(#[case] type_json: &str, #[case] expected: DataType) {
         let data_type: DataType = serde_json::from_str(type_json).unwrap();
@@ -3710,26 +3688,11 @@ mod tests {
     #[test]
     fn test_nested_interval_day_time_schema_round_trips_exact_qualifiers() {
         let schema = StructType::try_new([
-            StructField::nullable(
-                "day",
-                PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDay),
-            ),
-            StructField::nullable(
-                "hour_array",
-                ArrayType::new(
-                    PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalHour),
-                    true,
-                ),
-            ),
+            StructField::nullable("day", DataType::INTERVAL_DAY),
+            StructField::nullable("hour_array", ArrayType::new(DataType::INTERVAL_HOUR, true)),
             StructField::nullable(
                 "minute_second_map",
-                MapType::new(
-                    DataType::STRING,
-                    PrimitiveType::interval_day_time(
-                        IntervalDayToSecondType::IntervalMinuteToSecond,
-                    ),
-                    true,
-                ),
+                MapType::new(DataType::STRING, DataType::INTERVAL_MINUTE_SECOND, true),
             ),
         ])
         .unwrap();
