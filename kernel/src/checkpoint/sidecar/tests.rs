@@ -7,24 +7,24 @@ use url::Url;
 use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState,
 };
-use crate::actions::{Add, ADD_NAME, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
+use crate::actions::{ADD_NAME, Add, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StructArray};
 use crate::arrow::datatypes::{ArrowPrimitiveType, Int32Type, Int64Type};
+use crate::checkpoint::CheckpointWriter;
 use crate::checkpoint::sidecar::{SidecarSplitter, SingleSidecarDataIterator};
 use crate::checkpoint::tests::{
     create_add_action, create_metadata_action, create_metadata_with_stats_config_and_partitions,
     create_remove_action, create_v2_checkpoint_protocol_action, new_in_memory_store,
     write_commit_to_store,
 };
-use crate::checkpoint::CheckpointWriter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::sync::SyncEngine;
+use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
-use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use crate::schema::{schema, schema_ref, DataType, StructType};
+use crate::schema::{DataType, StructType, schema, schema_ref};
 use crate::unit_test_utils::Action;
 use crate::{Engine, EngineData, KernelResult, Snapshot};
 
@@ -43,9 +43,8 @@ fn generate_checkpoint_parts(
     engine: &dyn Engine,
     file_actions_per_sidecar_hint: usize,
 ) -> KernelResult<CheckpointParts> {
-    let data_iter = writer.checkpoint_data(engine)?;
+    let (data_iter, output_schema) = writer.checkpoint_data_with_schema(engine)?;
     let iter_state = data_iter.state();
-    let output_schema = writer.output_schema.clone();
 
     let splitter = SidecarSplitter::new_mut_shared(
         data_iter,
@@ -557,7 +556,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> KernelResult<()>
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
-    let data_iter = writer.checkpoint_data(&engine)?;
+    let (data_iter, schema) = writer.checkpoint_data_with_schema(&engine)?;
     let mut all_batches = Vec::new();
     for batch_result in data_iter {
         let batch = batch_result?;
@@ -566,7 +565,6 @@ async fn test_generate_sidecars_stats_and_partition_values() -> KernelResult<()>
     }
 
     // Validate the checkpoint data schema
-    let schema = &writer.output_schema;
     let add_field = schema.field(ADD_NAME).expect("schema should have 'add'");
     if let DataType::Struct(ref add_struct) = add_field.data_type {
         assert!(
@@ -651,8 +649,7 @@ async fn test_splitter_no_file_actions() -> KernelResult<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
 
-    let data_iter = writer.checkpoint_data(&engine)?;
-    let output_schema = writer.output_schema.clone();
+    let (data_iter, output_schema) = writer.checkpoint_data_with_schema(&engine)?;
 
     let splitter = SidecarSplitter::new_mut_shared(
         data_iter,

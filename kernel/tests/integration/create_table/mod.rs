@@ -16,14 +16,14 @@ use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
-    schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+    ColumnMetadataKey, DataType, MetadataValue, StructField, StructType, schema_ref,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
-    TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
 };
 use delta_kernel::table_properties::TableProperties;
-use delta_kernel::transaction::create_table::{create_table, CreateTableTransaction};
+use delta_kernel::transaction::create_table::{CreateTableTransaction, create_table};
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{KernelError, KernelResult};
 use rstest::rstest;
@@ -234,7 +234,9 @@ async fn test_create_table_with_user_domain_metadata() -> KernelResult<()> {
     );
 
     // Verify domain metadata string was persisted correctly
-    let retrieved_config = snapshot.get_domain_metadata(domain, engine.as_ref())?;
+    let retrieved_config = snapshot
+        .reader()
+        .get_domain_metadata(domain, engine.as_ref())?;
     assert_eq!(
         retrieved_config,
         Some(config.to_string()),
@@ -247,7 +249,9 @@ async fn test_create_table_with_user_domain_metadata() -> KernelResult<()> {
     assert_eq!(parsed["enabled"], true);
 
     // Verify non-existent domain returns None
-    let missing = snapshot.get_domain_metadata("nonexistent.domain", engine.as_ref())?;
+    let missing = snapshot
+        .reader()
+        .get_domain_metadata("nonexistent.domain", engine.as_ref())?;
     assert!(missing.is_none(), "Non-existent domain should return None");
 
     Ok(())

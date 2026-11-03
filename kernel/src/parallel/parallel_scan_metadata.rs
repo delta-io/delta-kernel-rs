@@ -2,15 +2,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
-use tracing::{info_span, Span};
+use tracing::{Span, info_span};
 
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::parallel_phase::ParallelPhase;
 use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
-use crate::scan::log_replay::{ScanLogReplayProcessor, SerializableScanState};
 use crate::scan::ScanMetadata;
+use crate::scan::log_replay::{ScanLogReplayProcessor, SerializableScanState};
 use crate::schema::SchemaRef;
 use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult};
 
@@ -295,14 +295,14 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::CheckpointReadInfo;
     use crate::metrics::{MetricEvent, ScanType, TableType};
+    use crate::scan::PhysicalPredicate;
     use crate::scan::log_replay::{
         ScanLogReplayProcessor, ScanPartitionValuesOptions, ScanStatsOptions,
     };
     use crate::scan::state_info::StateInfo;
-    use crate::scan::PhysicalPredicate;
-    use crate::schema::{schema_ref, SchemaRef};
+    use crate::schema::{SchemaRef, schema_ref};
     use crate::table_features::ColumnMappingMode;
-    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
     #[test]
     fn test_parallel_state_log_metrics_carries_round_tripped_table_type() {

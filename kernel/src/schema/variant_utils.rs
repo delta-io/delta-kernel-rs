@@ -3,7 +3,7 @@
 use crate::schema::{Schema, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
@@ -43,7 +43,7 @@ pub(crate) fn validate_variant_type_feature_support(tc: &TableConfiguration) -> 
 #[cfg(test)]
 mod tests {
     use crate::actions::Protocol;
-    use crate::schema::{schema, DataType, StructField};
+    use crate::schema::{DataType, StructField, schema};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{
         assert_result_error_with_message, assert_schema_feature_validation,

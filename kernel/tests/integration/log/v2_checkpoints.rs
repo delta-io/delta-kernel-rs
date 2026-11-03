@@ -15,10 +15,10 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use delta_kernel::schema::{schema, schema_ref, StructType};
+use delta_kernel::schema::{StructType, schema, schema_ref};
+use delta_kernel::transaction::CommitResult;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Engine, KernelResult, Snapshot};
 use itertools::Itertools;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
@@ -529,17 +529,23 @@ async fn test_v2_checkpoint_with_sidecars() -> KernelResult<()> {
 
     // === Step 7: Verify domain metadata (including post-checkpoint update) ===
     assert_eq!(
-        fresh_snapshot.get_domain_metadata("app.settings", engine.as_ref())?,
+        fresh_snapshot
+            .reader()
+            .get_domain_metadata("app.settings", engine.as_ref())?,
         Some(r#"{"version":3}"#.to_string()),
         "app.settings domain metadata should reflect the post-checkpoint update"
     );
     assert_eq!(
-        fresh_snapshot.get_domain_metadata("app.feature_flags", engine.as_ref())?,
+        fresh_snapshot
+            .reader()
+            .get_domain_metadata("app.feature_flags", engine.as_ref())?,
         Some(r#"{"dark_mode":true}"#.to_string()),
         "app.feature_flags domain metadata should be preserved across checkpoint"
     );
     assert_eq!(
-        fresh_snapshot.get_domain_metadata("app.analytics", engine.as_ref())?,
+        fresh_snapshot
+            .reader()
+            .get_domain_metadata("app.analytics", engine.as_ref())?,
         Some(r#"{"tracking":false}"#.to_string()),
         "app.analytics domain metadata should be preserved across checkpoint"
     );

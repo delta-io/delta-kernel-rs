@@ -3,7 +3,7 @@ use delta_kernel::{KernelError, KernelResult};
 use tracing::warn;
 
 use crate::handle::Handle;
-use crate::{kernel_string_slice, ExclusiveRustString, ExternEngine, KernelStringSlice};
+use crate::{ExclusiveRustString, ExternEngine, KernelStringSlice, kernel_string_slice};
 
 // We explicitly assign integer values to the error codes here because C and Rust are inconsistent
 // about values for "typedefed" features. Rust reserves the numbers for them regardless, so
@@ -239,7 +239,7 @@ impl<T: ExternEngine + ?Sized> AllocateError for &T {
         etype: FFIKernelError,
         msg: KernelStringSlice,
     ) -> *mut EngineError {
-        self.error_allocator().allocate_error(etype, msg)
+        unsafe { self.error_allocator().allocate_error(etype, msg) }
     }
 }
 

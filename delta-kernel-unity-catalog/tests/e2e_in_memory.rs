@@ -5,14 +5,14 @@ use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
 use delta_kernel::commit_range::CommitRange;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::schema_ref;
-use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::UpdateTableOperation;
+use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{Engine, KernelError, Snapshot};
-use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
+use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_unity_catalog::{
-    get_required_properties_for_disk, log_tail_from_commits, snapshot_builder_from_load_table,
-    UCCommitter,
+    UCCommitter, get_required_properties_for_disk, log_tail_from_commits,
+    snapshot_builder_from_load_table,
 };
 use rstest::rstest;
 use test_utils::{insert_data_with, read_scan};

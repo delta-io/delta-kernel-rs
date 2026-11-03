@@ -23,7 +23,7 @@ use crate::expressions::ColumnName;
 use crate::schema::{
     ColumnMetadataKey, DataType, MetadataValue, PrimitiveType, StructField, StructType,
 };
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{KernelError, KernelResult};
 
 /// Field ID offsets for stats fields within a column's stats struct.
@@ -405,9 +405,9 @@ impl<'a> CategoryScopes<'a> {
                 SubSchema::Struct(s) => Some(s),
                 SubSchema::Mismatch => {
                     return Err(KernelError::generic(format!(
-                    "Delta stats schema invariant violation: category '{category}' is a scalar, \
+                        "Delta stats schema invariant violation: category '{category}' is a scalar, \
                          but it must be a struct mirroring the table"
-                )))
+                    )));
                 }
             };
         }
@@ -436,7 +436,7 @@ impl<'a> CategoryScopes<'a> {
                              '{name}' as a scalar, but the table nests a struct there",
                             ColumnName::new(path),
                             STAT_CATEGORIES[i],
-                        )))
+                        )));
                     }
                 },
             };
@@ -598,7 +598,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::scan::data_skipping::stats_schema::{expected_stats_schema, StatsConfig};
+    use crate::scan::data_skipping::stats_schema::{StatsConfig, expected_stats_schema};
     use crate::schema::{ArrayType, MapType};
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -1664,10 +1664,12 @@ mod tests {
         )]);
         // The unprojected path always emits the reserved-metadata leaf, regardless of the
         // projection.
-        assert!(stats_schema(&table)
-            .expect("stats_schema should succeed")
-            .field("_row_id")
-            .is_some());
+        assert!(
+            stats_schema(&table)
+                .expect("stats_schema should succeed")
+                .field("_row_id")
+                .is_some()
+        );
         let projected = projected_stats_schema(&table, &delta).expect("should succeed");
         assert_eq!(projected, expected);
     }

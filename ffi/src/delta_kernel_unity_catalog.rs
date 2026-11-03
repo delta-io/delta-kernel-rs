@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use delta_kernel::committer::Committer;
 use delta_kernel::{KernelResult, KernelResultIterator};
+use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
-use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_ffi::handle::Handle;
-use delta_kernel_ffi::{kernel_string_slice, KernelStringSlice, OptionalValue, TryFromStringSlice};
+use delta_kernel_ffi::{KernelStringSlice, OptionalValue, TryFromStringSlice, kernel_string_slice};
 use delta_kernel_ffi_macros::handle_descriptor;
 use delta_kernel_unity_catalog::UCCommitter;
 use tracing::debug;
@@ -104,7 +104,7 @@ impl UpdateTableClient for FfiUCCommitClient {
             match (self.commit_callback)(self.context, c_commit_request) {
                 OptionalValue::Some(e) => {
                     let boxed_str = unsafe { e.into_inner() }; // get the string back into
-                                                               // Box<String>
+                    // Box<String>
                     let s: String = *boxed_str; // move back onto the stack
                     Err(unity_catalog_delta_client_api::Error::Generic(s))
                 }
@@ -141,7 +141,7 @@ pub struct SharedFfiUCCommitClient;
 /// # Safety
 ///
 ///  Caller is responsible for passing a valid pointer for the callback and a valid context pointer
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_uc_commit_client(
     context: NullableCvoid,
     commit_callback: CCommit,
@@ -156,10 +156,10 @@ pub unsafe extern "C" fn get_uc_commit_client(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_uc_commit_client(commit_client: Handle<SharedFfiUCCommitClient>) {
     debug!("released uc commit client");
-    commit_client.drop_handle();
+    unsafe { commit_client.drop_handle() }
 }
 
 // we need our own struct here because we want to override the calls to enter the tokio runtime
@@ -215,7 +215,7 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
 ///  Caller is responsible for passing a valid pointer to a SharedFfiUCCommitClient, obtained via
 ///  calling [`get_uc_commit_client`], valid KernelStringSlices for `table_id`, `catalog`,
 ///  `schema`, and `table_name`, and a valid error function pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_uc_committer(
     commit_client: Handle<SharedFfiUCCommitClient>,
     table_id: KernelStringSlice,
@@ -224,8 +224,8 @@ pub unsafe extern "C" fn get_uc_committer(
     table_name: KernelStringSlice,
     error_fn: AllocateErrorFn,
 ) -> ExternResult<Handle<MutableCommitter>> {
-    get_uc_committer_impl(commit_client, table_id, catalog, schema, table_name)
-        .into_extern_result(&error_fn)
+    let result = get_uc_committer_impl(commit_client, table_id, catalog, schema, table_name);
+    unsafe { result.into_extern_result(&error_fn) }
 }
 
 fn get_uc_committer_impl(
@@ -259,10 +259,10 @@ fn get_uc_committer_impl(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle obtained via `get_uc_committer`
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_uc_committer(commit_client: Handle<MutableCommitter>) {
     debug!("released uc committer");
-    commit_client.drop_handle();
+    unsafe { commit_client.drop_handle() }
 }
 
 #[cfg(test)]
@@ -278,7 +278,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::ffi_test_utils::{allocate_err, ok_or_panic};
-    use crate::{allocate_kernel_string, kernel_string_slice, OptionalValue};
+    use crate::{OptionalValue, allocate_kernel_string, kernel_string_slice};
 
     pub(crate) struct TestContext {
         pub(crate) commit_called: bool,
@@ -308,7 +308,7 @@ pub(crate) mod tests {
         context.map(|ptr| unsafe { &mut *(ptr.as_ptr() as *mut TestContext) })
     }
 
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     extern "C" fn test_commit_callback(
         context: NullableCvoid,
         request: CommitRequest,

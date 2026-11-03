@@ -47,11 +47,19 @@ cargo check-no-default-kernel
 cargo check-no-default-engine
 cargo clippy-no-default-kernel-leaves
 
+# Download the latest upstream catalog and record its commit and hash.
+cargo xtask update-delta-error-catalog
+
+# Generate DeltaErrorCondition from the local catalog and selected-conditions.json.
+# --check fails if stale, writing nothing.
+cargo xtask generate-delta-error-conditions [--check]
+
 # Quick pre-push check (mimics CI)
 cargo +nightly fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
   && cargo doc --workspace --all-features --no-deps \
-  && cargo nextest run --workspace --all-features
+  && cargo nextest run --workspace --all-features \
+  && cargo test --workspace --all-features --doc
 ```
 
 ### Crate Names for `-p` Flag
@@ -73,6 +81,7 @@ cargo +nightly fmt \
 | `delta-kernel-unity-catalog`         | `delta-kernel-unity-catalog/`         | Unity Catalog integration (UCCommitter, snapshot + create-table helpers) |
 | `unity-catalog-delta-client-api`     | `unity-catalog-delta-client-api/`     | Transport-agnostic UC client traits + wire models                        |
 | `unity-catalog-delta-rest-client`    | `unity-catalog-delta-rest-client/`    | REST/HTTP client for the Unity Catalog Delta Tables API                  |
+| `xtask`                              | `xtask/`                              | Dev tasks (regenerates checked-in code from pinned inputs)               |
 
 Packages under `kernel/examples/` are also workspace members. Use the package name from the
 example's `Cargo.toml` with `-p`.
@@ -97,6 +106,7 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   `Transaction::ack_check_constraints`. Kernel does not evaluate constraint SQL, so enforcement is
   the connector's responsibility. CREATE TABLE rejects `delta.constraints.*` properties in every
   build. Also gates the internal SQL tokenizer and parser.
+- `checkpoint-protection`: support for the `checkpointProtection` writer feature.
 - `adaptive-metadata-in-dev`: adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature. Without it, reads and writes to tables listing
@@ -118,6 +128,10 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
 **Snapshot** is the primary entry point for existing-table operations: an immutable view of a
 table at a specific version. From it you build a `Scan` (reads) or `Transaction` (writes).
 
+**Snapshot metadata:** `snapshot.reader()` creates a `SnapshotReader` for metadata getters that may
+read storage. Its optional token scopes synchronous, blocking reads without changing the shared
+snapshot or the connector's engine. In-memory getters remain on `Snapshot`.
+
 **Read path:** `Snapshot` -> `ScanBuilder` -> `Scan` -> data. Execution paths:
 `execute()` (simple), `scan_metadata()` (advanced/distributed),
 `parallel_scan_metadata()` (two-phase distributed log replay).
@@ -129,6 +143,11 @@ create-table builder aliases `TransactionBuilder<CreateTable, MODE>`. The mode d
 `Imperative`. Both entry points return imperative builders; with `declarative-plans`,
 `with_execution_mode::<MODE>()` selects the mode returned by `build()`. Common setters have one
 generic implementation.
+`transaction::imperative` contains EngineData staging, staged-data validation, action encoding,
+and committer response handling. The feature-gated `transaction::declarative` contains relation
+staging and a commit entry point that currently returns an unsupported error. Transaction
+configuration, mode-independent validation, CRC construction, and post-commit snapshot logic
+remain shared.
 The sealed `TransactionType` trait selects opaque type-specific state; specialized implementations
 provide constructors, custom setters, and build validation.
 `Snapshot::update_table(operation, engine_info, data_change)` requires all three values at
@@ -138,6 +157,12 @@ transactions. `data_change` is never inferred from staged files, including for e
 `build()` rejects ALTER with `true` and blind append with `false`; `commit()` retains operation and
 staged-file checks. `UpdateTableOperation::AlterTable` records schema-changing DDL without
 introducing a separate transaction type.
+
+Incremental CRC replay trusts operation names in `INCREMENTAL_SAFE_OPS`
+(`kernel/src/crc/file_stats.rs`). Adding an operation requires both correct net Add/Remove file
+accounting and rejecting its exact name for `UpdateTableOperation::Custom`. Represent update-table
+operations with typed variants so name reservation is automatic, and mirror them in the FFI.
+
 Writers configure transaction intent before `build()`, then call
 `Transaction::write_state`, then bind partition values through the returned `WriteState` to get a
 `BoundWriteContext`. Distributed writers can encode and transport the state before binding it.
@@ -156,6 +181,10 @@ directly: ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` acce
 - **Unit tests** test internal APIs and module internals. It is fine to use public APIs
   like `create_table` in a unit test as setup (e.g. to create a table for testing reads,
   writes, or state loading).
+- **Test module layout:** keep short unit-test modules inline in the implementation file.
+  When tests grow large enough to warrant a separate file, use `module/mod.rs` for the
+  implementation and `module/tests.rs` for the tests. Avoid `module.rs` alongside a
+  `module/` directory containing only `tests.rs`.
 - **Integration tests** exercise only public APIs end-to-end. See `kernel/tests/README.md`
   for a catalog of available test tables (schema, protocol, features, and which tests use
   them). Consult it before creating new test data to avoid duplication.
@@ -308,8 +337,8 @@ is the source of truth. Key concepts:
 **Table features**:
 
 - Writer: `allowColumnDefaults`, `appendOnly`, `changeDataFeed`, `checkConstraints`,
-  `clustering`, `domainMetadata`, `generatedColumns`, `icebergCompatV1`, `icebergCompatV2`,
-  `icebergCompatV3`, `identityColumns`, `inCommitTimestamp`, `invariants`,
+  `checkpointProtection`, `clustering`, `domainMetadata`, `generatedColumns`, `icebergCompatV1`,
+  `icebergCompatV2`, `icebergCompatV3`, `identityColumns`, `inCommitTimestamp`, `invariants`,
   `materializePartitionColumns`, `rowTracking`
 - Reader + writer: `adaptiveMetadata-preview`, `catalogManaged`, `catalogOwned-preview`,
   `columnMapping`, `deletionVectors`, `fileType`, `fileType-preview`, `geospatial`,
@@ -340,9 +369,12 @@ Keep this list updated when new protocol features are added to kernel.
   parallel threads in one test binary, while nextest normally runs each test in a separate
   process. Tests for global tracing subscribers and callbacks must not share capture buffers with
   thread-local dispatch tests or assume no other thread can emit an event.
+- **Generated code:** files starting with ``//! Generated by `cargo xtask ...` `` are never edited by
+  hand. Change the generator in `xtask/` or its inputs and rerun the command.
 
 ## Code Style
 
+- For FFI module organization, follow the [source layout guidance](ffi/AGENTS.md#source-layout).
 - Line width is 100 characters. Wrap comments and string literals at 100, not 80.
 - Place `use` imports at the top of the file (for non-test code) or at the top of the
   `mod tests` block (for test code): never inside function bodies.
@@ -402,28 +434,62 @@ Keep this list updated when new protocol features are added to kernel.
 
 ## Comment & Doc Style
 
-- MUST include doc comments for all public functions, structs, enums, and methods.
-- MUST document function parameters, return values, and errors.
-- Doc comments focus on "what" (contract with caller) more than "how" (implementation),
-  unless the "how" meaningfully impacts the "what".
+### Doc comments
+
+- MUST include doc comments for all public functions, structs, enums, and methods;
+  see below for what to put in them.
+- Start with one concise sentence describing the caller-facing behavior. Add semantics and usage
+  details that help callers use the API correctly: preconditions, side effects, ownership, or edge
+  cases. Ask what the caller would do differently after reading each detail.
+- Rustdoc already displays the signature and links to types. Explain parameter meanings and
+  relationships in prose when needed; don't restate types or mention every parameter by rote.
+  `# Arguments`, `# Returns`, and `# Errors` sections are optional, not a checklist to fill in.
+- Document a function's errors only when the information changes how callers use or recover from
+  the API, is an intended part of its public contract, and is not already covered by the error
+  type's documentation. Don't enumerate propagated implementation errors or promise an exhaustive
+  set of failures.
+- Keep safety obligations explicit in `# Safety` sections for unsafe APIs, including relevant
+  ownership and lifetime requirements.
+- Type and module docs explain the abstraction, how to use it, and its relationships with other
+  abstractions. Don't inventory members that rustdoc already lists.
+- Keep implementation rationale and maintainer commentary in code comments unless callers need
+  the information to use the API.
+- Add small, runnable doctests for important entry points when they clarify usage or invariants.
+  Scale their number and size to the API's complexity and importance; prefer focused examples over
+  a monolithic one. An invariant tested by a doctest need not have a duplicate unit test. Don't add
+  examples just to have them.
+
+For example, this summary from `ColumnName::parent` explains when the result is absent:
+
+```rust
+/// Returns the parent of this column name, or `None` if this is a top-level column.
+pub fn parent(&self) -> Option<ColumnName>
+```
+
+A separate "Returns an `Option<ColumnName>`" section would add nothing to the signature.
+
+### Code comments
+
 - Code comments state intent and explain "why": don't restate what the code self-documents.
-- Be succinct. No verbose AI-slop comments. With well-written and well-named code,
-  verbose comments are worse than none.
-- Say each thing once, in the right place: don't repeat the same idea across
-  doc comment and inline comment.
 - Comments earn their place only for hidden invariants, real-bug workarounds, or
   constraints the reader can't see from the code itself.
 - Don't enumerate what grep can answer. Lists like `// Used by a, b, c` rot the
   moment `d` lands. Describe the shape; let the reader grep.
+- Use `==` as a visual section divider in comments (e.g. `// === Helpers ===` or
+  `// ============`).
+
+### Shared conventions
+
+- Be succinct. No verbose AI-slop comments. With well-written and well-named code,
+  verbose comments are worse than none.
+- Say each thing once, in the right place: don't repeat the same idea across
+  doc comment and inline comment.
 - No stale-prone anchors in durable docs or source comments: counts ("the 10
   variants", "5-arm match"), line numbers, or enumeration lists. Describe the
   shape; let the reader grep.
 - Comments MUST NOT include temporal references: only refer to current code and
   design, not past iterations.
 - Keep comments up-to-date with code changes.
-- Include examples in doc comments for complex functions only.
-- Use `==` as a visual section divider in comments (e.g. `// === Helpers ===` or
-  `// ============`).
 - NEVER use emoji or unicode in comments that emulates emoji (e.g. special arrows,
   checkmarks). Use ASCII equivalents (`->`, `=>`, etc.) instead.
 

@@ -7,6 +7,8 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,24 +27,48 @@ use delta_kernel::object_store::{DynObjectStore, ObjectStore, ObjectStoreExt};
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::path::ParsedLogPath;
-use delta_kernel::schema::{schema_ref, SchemaRef, StructType};
+use delta_kernel::schema::{SchemaRef, StructType, schema_ref};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::{
     BoundWriteContext, CommitResult, Transaction, UpdateTableOperation,
 };
 use delta_kernel::{Engine, KernelResult, Snapshot, Version};
 use serde_json::json;
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::{
-    create_add_files_metadata, create_table, engine_store_setup, into_record_batch,
-    modify_add_file_partition_keys, AddFilePartitionKeyModify,
+    AddFilePartitionKeyModify, create_add_files_metadata, create_table, engine_store_setup,
+    into_record_batch, modify_add_file_partition_keys,
 };
 use url::Url;
 use uuid::Uuid;
 
 /// Deterministic placeholder for test commit JSON comparisons.
 pub const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// Simulates an external writer by rewriting a complete local commit with `edit`.
+///
+/// Keeps action wrappers and unedited actions. Reload the snapshot after calling this helper.
+/// Returns I/O or JSON errors, including errors returned by `edit`.
+pub fn rewrite_commit(
+    table_path: &str,
+    version: Version,
+    mut edit: impl FnMut(&mut serde_json::Value) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::path::Path::new(table_path).join(format!("_delta_log/{version:020}.json"));
+    let mut actions = serde_json::Deserializer::from_reader(File::open(&path)?)
+        .into_iter::<serde_json::Value>()
+        .collect::<Result<Vec<_>, _>>()?;
+    for action in &mut actions {
+        edit(action)?;
+    }
+    let mut file = File::create(path)?;
+    for action in actions {
+        serde_json::to_writer(&mut file, &action)?;
+        file.write_all(b"\n")?;
+    }
+    Ok(())
+}
 
 /// Single-column nullable `id: int` schema.
 pub fn get_simple_schema() -> SchemaRef {
@@ -70,7 +96,7 @@ pub fn load_existing_single_file_checkpoint_path(
     for entry in std::fs::read_dir(&log_dir).expect("failed to read _delta_log") {
         let entry = entry.unwrap();
         let url = Url::from_file_path(entry.path()).expect("entry path to url");
-        let Some(parsed) = ParsedLogPath::try_from(url).expect("parse log path") else {
+        let Some(parsed) = ParsedLogPath::new(url) else {
             continue;
         };
         if parsed.is_checkpoint() && parsed.version == version {
@@ -200,9 +226,11 @@ pub async fn get_and_check_all_parquet_sizes(store: Arc<DynObjectStore>, path: &
         .collect::<Vec<_>>();
     assert_eq!(parquet_files.len(), 2);
     let size = parquet_files.first().unwrap().as_ref().unwrap().size;
-    assert!(parquet_files
-        .iter()
-        .all(|f| f.as_ref().unwrap().size == size));
+    assert!(
+        parquet_files
+            .iter()
+            .all(|f| f.as_ref().unwrap().size == size)
+    );
     size
 }
 

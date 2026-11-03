@@ -7,36 +7,36 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(feature = "internal-api")]
+use delta_kernel::LogPath;
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
 #[cfg(feature = "internal-api")]
 use delta_kernel::crc::Crc;
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::metrics::SnapshotLoadType;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::snapshot::IncrementalReplay;
 #[cfg(feature = "internal-api")]
 use delta_kernel::snapshot::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
+use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::UpdateTableOperation;
-#[cfg(feature = "internal-api")]
-use delta_kernel::LogPath;
 use delta_kernel::{KernelResult, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 #[cfg(feature = "internal-api")]
 use test_utils::table_builder::{FeatureSet, LastCheckpointHintState};
 use test_utils::{
-    insert_data, test_table_setup, test_table_setup_mt, CountingReporter, SnapshotCompletionStatus,
+    CountingReporter, SnapshotCompletionStatus, insert_data, test_table_setup, test_table_setup_mt,
 };
 use url::Url;
 
 use super::{
-    insert_rows, measuring_engine, setup_table_with_v1_checkpoint, simple_schema, LogState,
-    TestTableBuilder,
+    LogState, TestTableBuilder, insert_rows, measuring_engine, setup_table_with_v1_checkpoint,
+    simple_schema,
 };
 
 fn assert_full_snapshot_completed(reporter: &CountingReporter) {
@@ -580,7 +580,7 @@ async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> Kerne
 // Scenario 8: on-demand domain metadata query incurs additional log replay
 // ============================================================================
 
-/// `snapshot.get_domain_metadata()` always performs a full log replay when no CRC is
+/// `snapshot.reader().get_domain_metadata()` always performs a full log replay when no CRC is
 /// present at the target version. Calling it after a snapshot is already built generates
 /// a second round of JSON reads, demonstrating that on-demand metadata queries carry
 /// their own I/O cost.
@@ -602,7 +602,7 @@ fn get_domain_metadata_when_no_latest_crc_incurs_additional_log_replay() -> Kern
 
     // Reset so the domain metadata query cost is isolated
     reporter.reset();
-    let _ = snap.get_domain_metadata("myapp.config", &engine)?;
+    let _ = snap.reader().get_domain_metadata("myapp.config", &engine)?;
 
     assert_eq!(
         reporter.json_read_calls.get(),
@@ -691,7 +691,10 @@ async fn get_app_id_version_load_emits_loaded_metric(#[case] with_crc: bool) -> 
 
     // Hit on an app id with a committed transaction.
     reporter.reset();
-    assert_eq!(snap.get_app_id_version("my-app", &engine)?, Some(1));
+    assert_eq!(
+        snap.reader().get_app_id_version("my-app", &engine)?,
+        Some(1)
+    );
     assert_eq!(reporter.set_transaction_loads.get(), 1);
     assert_eq!(reporter.set_transaction_cache_hits.get(), with_crc as u64);
     assert_eq!(reporter.set_transaction_found.get(), 1);
@@ -699,7 +702,10 @@ async fn get_app_id_version_load_emits_loaded_metric(#[case] with_crc: bool) -> 
     // Miss on an unknown app id. A Complete CRC answers the miss from cache; without a CRC it
     // falls back to log replay.
     reporter.reset();
-    assert_eq!(snap.get_app_id_version("no-such-app", &engine)?, None);
+    assert_eq!(
+        snap.reader().get_app_id_version("no-such-app", &engine)?,
+        None
+    );
     assert_eq!(reporter.set_transaction_loads.get(), 1);
     assert_eq!(reporter.set_transaction_cache_hits.get(), with_crc as u64);
     assert_eq!(reporter.set_transaction_found.get(), 0);
@@ -719,7 +725,11 @@ async fn get_domain_metadata_load_emits_loaded_metric(#[case] with_crc: bool) ->
 
     // Hit on the user domain.
     reporter.reset();
-    assert!(snap.get_domain_metadata("myapp.config", &engine)?.is_some());
+    assert!(
+        snap.reader()
+            .get_domain_metadata("myapp.config", &engine)?
+            .is_some()
+    );
     assert_eq!(reporter.domain_metadata_loads.get(), 1);
     assert_eq!(reporter.domain_metadata_cache_hits.get(), with_crc as u64);
     assert_eq!(reporter.domain_metadata_domains_returned.get(), 1);
@@ -727,9 +737,11 @@ async fn get_domain_metadata_load_emits_loaded_metric(#[case] with_crc: bool) ->
     // Miss on a nonexistent domain. A Complete CRC answers the miss from cache; without a CRC it
     // falls back to log replay.
     reporter.reset();
-    assert!(snap
-        .get_domain_metadata("does.not.exist", &engine)?
-        .is_none());
+    assert!(
+        snap.reader()
+            .get_domain_metadata("does.not.exist", &engine)?
+            .is_none()
+    );
     assert_eq!(reporter.domain_metadata_loads.get(), 1);
     assert_eq!(reporter.domain_metadata_cache_hits.get(), with_crc as u64);
     assert_eq!(reporter.domain_metadata_domains_returned.get(), 0);
@@ -749,8 +761,12 @@ async fn failed_loads_emit_failure_metric() -> KernelResult<()> {
     std::fs::remove_file(log_dir.join("00000000000000000001.json")).unwrap();
 
     reporter.reset();
-    assert!(snap.get_domain_metadata("myapp.config", &engine).is_err());
-    assert!(snap.get_app_id_version("my-app", &engine).is_err());
+    assert!(
+        snap.reader()
+            .get_domain_metadata("myapp.config", &engine)
+            .is_err()
+    );
+    assert!(snap.reader().get_app_id_version("my-app", &engine).is_err());
     assert_eq!(reporter.domain_metadata_loads.get(), 0);
     assert_eq!(reporter.set_transaction_loads.get(), 0);
     assert_eq!(reporter.domain_metadata_load_failures.get(), 1);

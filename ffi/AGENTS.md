@@ -782,12 +782,20 @@ The host keeps `hint` and all reachable memory alive for the call. Rust validate
 full graph before changing the builder. One call avoids partial state and callback choreography.
 The setter consumes the builder on both success and error, returning its replacement on success.
 
+## Source layout
+
+Prefer mirroring the `kernel/src/` module hierarchy in `ffi/src/` for corresponding APIs.
+Snapshot hints live under `src/snapshot/hint/`, matching `kernel/src/snapshot/hint.rs`.
+Snapshot builders live in `src/snapshot/builder.rs`; snapshot accessors live in `src/lib.rs`.
+FFI-specific ownership, conversion, and engine support code can use its own modules.
+
 ## Key Files
 
 - `src/lib.rs` -- main FFI entry points and type definitions
 - `src/delta_types.rs` -- reusable borrowed C representations of Delta state and actions,
   with their backing storage and conversions colocated
-- `src/snapshot_hint/` -- typed snapshot-hint input and callback export
+- `src/snapshot/builder.rs` -- snapshot builders and their configuration
+- `src/snapshot/hint/` -- typed snapshot-hint input and callback export
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
@@ -804,7 +812,7 @@ The setter consumes the builder on both success and error, returning its replace
 get_default_engine() -> get_snapshot_builder() -> snapshot_builder_build() -> scan() -> scan_metadata() -> read + transform
 ```
 
-Snapshot builder API (`ffi/src/lib.rs` and `ffi/src/snapshot_hint/mod.rs`):
+Snapshot builder API (`ffi/src/snapshot/builder.rs` and `ffi/src/snapshot/hint/mod.rs`):
 - `get_snapshot_builder(path, engine)` -- fresh snapshot from a table path
 - `get_snapshot_builder_from(old_snapshot, engine)` -- incremental update reusing an existing snapshot (avoids re-reading the log)
 - `snapshot_builder_with_version(builder, version)` -- optional: pin to a specific version
@@ -847,12 +855,24 @@ publication watermark.
 When built with `adaptive-metadata-in-dev`, typed export rejects CRCs containing experimental
 adaptive-metadata `lastManifestCommit` or Add `backReference` state.
 
-Snapshot accessors (`ffi/src/lib.rs`) read a built `SharedSnapshot` without I/O -- e.g. `version`,
-`snapshot_timestamp`, and `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
+`snapshot_log_segment(snapshot, context, visitor)` exposes the existing retained segment without
+I/O through one borrowed `FfiLogSegment` callback. It includes commit, compaction, and top-level
+checkpoint files, optional latest commit/CRC metadata, checkpoint version, and the known publication
+watermark. It preserves staged paths independently of that watermark. The snapshot is borrowed;
+copy all retained values before the callback returns. It does not implement snapshot equivalence
+or establish freshness.
+
+Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
+`snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
 `num_files` / `table_size_bytes` from the CRC; `None` when the snapshot has no CRC, or its CRC lacks
 complete file stats). `visit_file_size_histogram` exposes the optional variable-length histogram in
 the same file stats: it invokes one callback with borrowed `i64` slices for bin boundaries, file
 counts, and total bytes; callers must copy values they retain after the callback.
+
+`snapshot_timestamp` uses a synchronous `SnapshotReader` and may read commit JSON when the
+In-Commit Timestamp is unavailable from retained CRC state. Domain-metadata and transaction-version
+FFI reads also use an unscoped reader, preserving the engine's cancellation and timeout behavior.
+The C API signatures do not expose reader state or a cancellation token.
 
 Domain-metadata reads live in `ffi/src/domain_metadata.rs`: `get_domain_metadata` /
 `visit_domain_metadata` for user domains, and `visit_clustering_columns`, which reports one

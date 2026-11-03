@@ -5,9 +5,9 @@ use std::sync::Arc;
 use itertools::Itertools;
 use url::Url;
 
-use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
+use super::log_replay::{TableChangesScanMetadata, table_changes_action_iter};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
-use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
+use super::resolve_dvs::{ResolvedCdfScanFile, resolve_scan_file_dv};
 use super::scan_file::scan_metadata_to_scan_file;
 use super::{CdfMode, TableChanges};
 use crate::actions::deletion_vector::split_vector;
@@ -367,17 +367,17 @@ mod tests {
 
     use rstest::rstest;
 
+    use crate::Predicate;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{col, lit};
     use crate::object_store::memory::InMemory;
-    use crate::scan::transform_spec::FieldTransformSpec;
     use crate::scan::PhysicalPredicate;
-    use crate::schema::{schema_ref, MetadataColumnSpec};
-    use crate::table_changes::{TableChanges, COMMIT_VERSION_COL_NAME};
+    use crate::scan::transform_spec::FieldTransformSpec;
+    use crate::schema::{MetadataColumnSpec, schema_ref};
+    use crate::table_changes::{COMMIT_VERSION_COL_NAME, TableChanges};
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::Predicate;
 
     #[test]
     fn simple_table_changes_scan_builder() {

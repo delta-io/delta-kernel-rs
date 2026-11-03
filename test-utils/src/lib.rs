@@ -196,9 +196,10 @@ use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 
 pub use counting_reporter::{
-    ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
     CapturingReporter, CountingReporter, RelaxedCounter, SnapshotCompletionStatus,
+    ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
 };
+use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
 use delta_kernel::actions::{
     LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
@@ -206,7 +207,7 @@ use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray,
     MapBuilder, RecordBatch, StringArray, StringBuilder, StructArray,
 };
-use delta_kernel::arrow::buffer::OffsetBuffer;
+use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
 use delta_kernel::arrow::compute::concat;
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema,
@@ -216,7 +217,7 @@ use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::committer::{
     CommitMetadata, CommitResponse, Committer, FileSystemCommitter, PublishMetadata,
 };
-use delta_kernel::engine::arrow_conversion::TryFromKernel;
+use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow};
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::local::LocalFileSystem;
@@ -227,29 +228,29 @@ use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{
-    schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType,
+    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType, ToSchema, schema_ref,
 };
 use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel::transaction::{
     CommitResult, Transaction, UpdateTableOperation, UpdateTableTransactionBuilder,
 };
 use delta_kernel::{
-    try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
+    CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
     FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData, JsonHandler, KernelError,
     KernelResult, KernelResultIterator, LogPath, ParquetFooter, ParquetHandler, PredicateRef,
-    Snapshot,
+    Snapshot, try_parse_uri,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
 pub use delta_kernel_default_engine;
+use delta_kernel_default_engine::executor::TaskExecutor;
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
-use delta_kernel_default_engine::executor::TaskExecutor;
 use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use itertools::Itertools;
-use serde_json::{json, to_vec, Deserializer};
+use serde_json::{Deserializer, json, to_vec};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use url::Url;
@@ -642,6 +643,70 @@ pub fn replace_array_row(column: &ArrayRef, replacement: ArrayRef, row: usize) -
     ];
     let arrays: Vec<&dyn Array> = slices.iter().map(|array| array.as_ref()).collect();
     concat(&arrays).expect("replacement value must match the modified column type")
+}
+
+/// Builds nullable deletion-vector values (`addFile.deletionVector` or `removeFile.deletionVector`)
+/// for tests.
+///
+/// Each entry supplies `pathOrInlineDv`; `None` produces a null descriptor. Present descriptors
+/// have no offset and use placeholder size and cardinality values.
+///
+/// # Panics
+///
+/// Panics if the deletion-vector schema cannot be converted to Arrow.
+pub fn deletion_vector_array(
+    storage_type: &str,
+    paths_or_inline_dvs: &[Option<&str>],
+) -> StructArray {
+    let schema: ArrowSchema = (&DeletionVectorDescriptor::to_schema())
+        .try_into_arrow()
+        .expect("deletion-vector schema should convert to Arrow");
+    let row_count = paths_or_inline_dvs.len();
+
+    StructArray::new(
+        schema.fields().clone(),
+        vec![
+            Arc::new(StringArray::from(
+                paths_or_inline_dvs
+                    .iter()
+                    .map(|path| path.map(|_| storage_type))
+                    .collect::<Vec<_>>(),
+            )), // storageType
+            Arc::new(StringArray::from(paths_or_inline_dvs.to_vec())), // pathOrInlineDv
+            Arc::new(Int32Array::from(vec![None; row_count])),         // offset
+            Arc::new(Int32Array::from(
+                paths_or_inline_dvs
+                    .iter()
+                    .map(|path| path.map(|_| 1))
+                    .collect::<Vec<_>>(),
+            )), // sizeInBytes
+            Arc::new(Int64Array::from(
+                paths_or_inline_dvs
+                    .iter()
+                    .map(|path| path.map(|_| 1))
+                    .collect::<Vec<_>>(),
+            )), // cardinality
+        ],
+        Some(NullBuffer::from(
+            paths_or_inline_dvs
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>(),
+        )),
+    )
+}
+
+/// Returns a copy of `batch` with `field` replaced by `column`.
+///
+/// # Panics
+///
+/// Panics if `field` does not exist or `column` is incompatible with the batch schema.
+pub fn replace_column(batch: &RecordBatch, field: &str, column: ArrayRef) -> RecordBatch {
+    let schema = batch.schema();
+    let index = schema.index_of(field).expect("field in schema");
+    let mut columns = batch.columns().to_vec();
+    columns[index] = column;
+    RecordBatch::try_new(schema, columns).expect("replacement column must match the batch schema")
 }
 
 pub fn create_default_engine(
@@ -1229,6 +1294,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
         "UPDATE" => UpdateTableOperation::Update,
         "MERGE" => UpdateTableOperation::Merge,
         "OPTIMIZE" => UpdateTableOperation::Optimize,
+        "REORG" => UpdateTableOperation::Reorg,
         operation => UpdateTableOperation::Custom(operation.to_string()),
     };
     let mut builder = snapshot.update_table(operation, "test-utils", data_change);
@@ -2099,6 +2165,7 @@ pub fn read_actions_from_commit(
 }
 
 /// Row tracking fields extracted from a single add action in a commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AddActionRowTracking {
     /// The base row ID assigned to the first row in the file.
     pub base_row_id: Option<i64>,
@@ -2148,10 +2215,10 @@ pub fn get_materialized_row_tracking_column_names(
         row_id_column_name: config["delta.rowTracking.materializedRowIdColumnName"]
             .as_str()
             .map(str::to_owned),
-        row_commit_version_column_name: config
-            ["delta.rowTracking.materializedRowCommitVersionColumnName"]
-            .as_str()
-            .map(str::to_owned),
+        row_commit_version_column_name:
+            config["delta.rowTracking.materializedRowCommitVersionColumnName"]
+                .as_str()
+                .map(str::to_owned),
     })
 }
 

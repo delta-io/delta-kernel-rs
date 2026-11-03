@@ -2,6 +2,13 @@
 
 This crate provides a C foreign function interface (ffi) for delta-kernel-rs.
 
+## Source layout
+
+Snapshot builders live in [`src/snapshot/builder.rs`](src/snapshot/builder.rs), with typed hint bindings
+in [`src/snapshot/hint/`](src/snapshot/hint/). Snapshot accessors live in
+[`src/lib.rs`](src/lib.rs). See the [source layout guidance](AGENTS.md#source-layout) for module
+organization conventions.
+
 ## Selecting scan statistics
 
 Pass `FfiStatsOptions` to `scan_builder_with_stats` to choose JSON output, indexed structured
@@ -64,6 +71,12 @@ schema changes use `update_table_txn_builder_add_column_at` and
 `update_table_txn_builder_set_nullable` with segmented `FfiColumnName` paths. A snapshot returned
 by `committed_transaction_post_commit_snapshot` is independently owned and must be released with
 `free_snapshot`.
+
+`create_table_txn_builder_with_clustering_columns` accepts `FfiColumnNameArray`, with each column
+represented by literal UTF-8 field-name segments. This supports nested paths and preserves dots
+inside field names. It replaces the flat string-array and count arguments, changing the C ABI.
+Rebuild connectors against the generated headers and update their calls together with the native
+library. Partition columns remain top-level names.
 
 The Rust builders share a generic `TransactionBuilder<T>` implementation, but the C API uses
 distinct create-table and update-table handles and function families. Shared setters call the

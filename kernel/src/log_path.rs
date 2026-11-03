@@ -2,7 +2,7 @@
 
 use url::Url;
 
-use crate::path::{ParsedLogPath, DELTA_LOG_DIR_WITH_SLASH, STAGED_COMMITS_DIR};
+use crate::path::{DELTA_LOG_DIR_WITH_SLASH, ParsedLogPath, STAGED_COMMITS_DIR};
 use crate::utils::require;
 use crate::{FileMeta, FileSize, KernelError, KernelResult, Version};
 
@@ -25,7 +25,7 @@ impl LogPath {
     /// valid log path.
     pub fn try_new(file_meta: FileMeta) -> KernelResult<Self> {
         // TODO: we should avoid the clone
-        let parsed = ParsedLogPath::try_from(file_meta.clone())?
+        let parsed = ParsedLogPath::new(file_meta.clone())
             .ok_or_else(|| KernelError::invalid_log_path(&file_meta.location))?;
 
         require!(

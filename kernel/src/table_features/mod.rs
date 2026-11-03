@@ -1,24 +1,23 @@
+pub use column_mapping::ColumnMappingMode;
 #[internal_api]
 pub(crate) use column_mapping::get_any_level_column_physical_name;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
 pub use column_mapping::validate_schema_column_mapping;
-pub use column_mapping::ColumnMappingMode;
-#[internal_api]
-pub(crate) use column_mapping::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 pub(crate) use column_mapping::{
-    column_mapping_mode, get_column_mapping_mode_from_properties,
+    StaleAnnotationPolicy, column_mapping_mode, get_column_mapping_mode_from_properties,
     physical_to_logical_column_name_and_type, schema_has_column_mapping_metadata,
     strip_stray_column_mapping_metadata, try_assign_flat_column_mapping_info,
     validate_and_extract_column_mapping_annotations, validate_column_mapping_id,
-    StaleAnnotationPolicy,
 };
+#[internal_api]
+pub(crate) use column_mapping::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel_derive::internal_api;
 #[cfg(feature = "geo-type-in-dev")]
 pub(crate) use geospatial::validate_geospatial_feature_support;
 pub(crate) use iceberg_compat::v2::V2_VALIDATOR;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
 pub(crate) use iceberg_compat::{
-    validate_iceberg_compat_if_needed, IcebergCompatValidationContext,
+    IcebergCompatValidationContext, validate_iceberg_compat_if_needed,
 };
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -30,7 +29,7 @@ pub(crate) use timestamp_ntz::{
 use crate::actions::Protocol;
 use crate::expressions::Scalar;
 use crate::schema::derive_macro_utils::ToDataType;
-use crate::schema::DataType;
+use crate::schema::{DataType, Schema, schema_has_invariants};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
@@ -107,6 +106,8 @@ pub(crate) enum TableFeature {
     Invariants,
     /// Check constraints on columns
     CheckConstraints,
+    /// Protects checkpoints and JSON logs.
+    CheckpointProtection,
     /// CDF on a table
     ChangeDataFeed,
     /// Columns with generated values
@@ -239,6 +240,9 @@ pub(crate) enum EnablementCheck {
     /// Feature is enabled if supported AND the provided function returns true when checking table
     /// properties
     EnabledIf(fn(&TableProperties) -> bool),
+    /// Feature is enabled if supported AND the provided function returns true when checking the
+    /// logical table schema
+    EnabledIfSchema(fn(&Schema) -> bool),
 }
 
 /// Represents the type of operation being performed on a table
@@ -329,13 +333,14 @@ static APPEND_ONLY_INFO: FeatureInfo = FeatureInfo {
 // Although kernel marks invariants as "Supported", invariants must NOT actually be present in the
 // table schema. Kernel will fail to write to any table that actually uses invariants (see check in
 // TableConfiguration::ensure_write_supported). This is to allow legacy tables with the Invariants
-// feature enabled but not in use.
+// feature supported but not in use. It is enabled only if the schema has invariant metadata, since
+// it has no table property.
 static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 2)),
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
-    enablement_check: EnablementCheck::AlwaysIfSupported,
+    enablement_check: EnablementCheck::EnabledIfSchema(schema_has_invariants),
 };
 
 // Enabled whenever the writer protocol supports it, even if the table declares no constraint.
@@ -346,6 +351,32 @@ static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     #[cfg(feature = "check-constraints-in-dev")]
     kernel_support: KernelSupport::Supported,
     #[cfg(not(feature = "check-constraints-in-dev"))]
+    kernel_support: KernelSupport::NotSupported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+// checkpointProtection uses delta.requireCheckpointProtectionBeforeVersion as a protection
+// boundary:
+// - Metadata cleanup must preserve checkpoints before the boundary.
+// - Creating a checkpoint before the boundary requires support for all features in that version's
+//   protocol.
+// - History cleanup requires support for every removed version's protocol, unless a single cleanup
+//   operation removes all history before the boundary.
+// - Cleanup must remove commits before their associated checkpoints.
+//
+// The checkpoint write requirement is satisfied when creating a `CheckpointWriter`: Kernel
+// validates read and write support for the snapshot being checkpointed.
+// The metadata cleanup requirements are trivially satisfied because Kernel does not perform
+// metadata cleanup. Any future metadata cleanup implementation must follow the above writer
+// requirements. Reference:
+// https://github.com/delta-io/delta/blob/master/protocol_rfcs/checkpoint-protection.md
+static CHECKPOINT_PROTECTION_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    #[cfg(feature = "checkpoint-protection")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "checkpoint-protection"))]
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -530,7 +561,6 @@ static ICEBERG_NATIVE_V4_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-// TODO(#3553): Support writing clusteringProvider to AddFile actions.
 static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
@@ -791,6 +821,7 @@ impl TableFeature {
             | TableFeature::Invariants
             | TableFeature::RowTracking
             | TableFeature::CheckConstraints
+            | TableFeature::CheckpointProtection
             | TableFeature::ChangeDataFeed
             | TableFeature::GeneratedColumns
             | TableFeature::IdentityColumns
@@ -826,6 +857,7 @@ impl TableFeature {
             TableFeature::AppendOnly => &APPEND_ONLY_INFO,
             TableFeature::Invariants => &INVARIANTS_INFO,
             TableFeature::CheckConstraints => &CHECK_CONSTRAINTS_INFO,
+            TableFeature::CheckpointProtection => &CHECKPOINT_PROTECTION_INFO,
             TableFeature::ChangeDataFeed => &CHANGE_DATA_FEED_INFO,
             TableFeature::GeneratedColumns => &GENERATED_COLUMNS_INFO,
             TableFeature::IdentityColumns => &IDENTITY_COLUMNS_INFO,
@@ -1201,6 +1233,7 @@ mod tests {
                 TableFeature::AppendOnly => "appendOnly",
                 TableFeature::Invariants => "invariants",
                 TableFeature::CheckConstraints => "checkConstraints",
+                TableFeature::CheckpointProtection => "checkpointProtection",
                 TableFeature::ChangeDataFeed => "changeDataFeed",
                 TableFeature::GeneratedColumns => "generatedColumns",
                 TableFeature::IdentityColumns => "identityColumns",

@@ -12,10 +12,10 @@ use super::file_stats::FileStatsDelta;
 use super::{
     Crc, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
 };
+use crate::Version;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::LastManifestCommit;
 use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
-use crate::Version;
 
 /// CRC-relevant changes aggregated over commits `(X, Y]`.
 #[derive(Debug, Clone, Default)]
@@ -39,8 +39,10 @@ pub(crate) struct CrcDelta {
     pub(crate) last_manifest_commit: Option<LastManifestCommit>,
     /// Whether the file-stats portion of this delta can be applied incrementally. When `false`,
     /// [`Crc::apply`] transitions [`FileStatsState`] to `Indeterminate`. Producers set this to
-    /// `false` whenever they observe a signal that makes incremental tracking unsound (for
-    /// example, a non-incremental operation such as `ANALYZE STATS`).
+    /// `false` when file-stat changes cannot be tracked safely or their policy excludes
+    /// incremental construction. Replay rejects unknown operations only when their commit
+    /// contains file actions; transactions exclude custom operations even without file
+    /// actions.
     pub(crate) is_incremental_safe: bool,
 }
 
@@ -240,8 +242,8 @@ mod tests {
     use super::*;
     use crate::actions::{Add, DomainMetadata, Metadata, Protocol};
     use crate::crc::{
-        is_incremental_safe_operation, DeletedRecordCountsHistogram, FileSizeHistogram,
-        SetTransactionState,
+        DeletedRecordCountsHistogram, FileSizeHistogram, SetTransactionState,
+        is_incremental_safe_operation,
     };
 
     fn base_crc() -> Crc {
@@ -319,6 +321,7 @@ mod tests {
             "UPDATE",
             "DELETE",
             "OPTIMIZE",
+            "REORG",
             "CREATE TABLE",
             "REPLACE TABLE",
             "CREATE TABLE AS SELECT",

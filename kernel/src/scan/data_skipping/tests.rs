@@ -1673,8 +1673,8 @@ fn single_unsupported_pred_in_junction_disables_checkpoint_pushdown() {
 
 use std::path::PathBuf;
 
-use crate::engine::sync::SyncEngine;
 use crate::Snapshot;
+use crate::engine::sync::SyncEngine;
 
 /// Counts files selected after data skipping for the given predicate and table.
 fn count_selected(table_dir: &str, pred: PredicateRef) -> usize {

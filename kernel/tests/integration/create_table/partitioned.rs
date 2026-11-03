@@ -2,12 +2,12 @@
 //!
 //! TODO(#2201): Add end-to-end tests for insert + scan + checkpoint on partitioned tables.
 
+use delta_kernel::KernelResult;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::KernelResult;
 use rstest::rstest;
 use test_utils::test_table_setup;
 
@@ -32,7 +32,9 @@ fn test_create_table_partitioned_basic(#[case] partition_col: &str) -> KernelRes
     let partition_cols = snapshot.table_configuration().logical_partition_columns();
     assert_eq!(partition_cols, &["date"]);
 
-    let clustering = snapshot.get_physical_clustering_columns(engine.as_ref())?;
+    let clustering = snapshot
+        .reader()
+        .get_physical_clustering_columns(engine.as_ref())?;
     assert!(
         clustering.is_none(),
         "Partitioned table should not have clustering columns"

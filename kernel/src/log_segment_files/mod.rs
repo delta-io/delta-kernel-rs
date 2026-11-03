@@ -21,7 +21,7 @@ use url::Url;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{
-    may_begin_listable_log_path, CheckpointInstance, LogPathFileType, ParsedLogPath,
+    CheckpointInstance, LogPathFileType, ParsedLogPath, may_begin_listable_log_path,
 };
 use crate::{KernelError, KernelResult, KernelResultIterator, StorageHandler, Version};
 
@@ -91,7 +91,7 @@ pub(crate) fn list_delta_log_from_storage(
                 .is_none_or(may_begin_listable_log_path),
             Err(_) => true,
         })
-        .map(|meta| ParsedLogPath::try_from(meta?))
+        .map_ok(ParsedLogPath::new)
         // NOTE: this filters out .crc files etc which start with "." - some engines
         // produce `.something.parquet.crc` corresponding to `something.parquet`. Kernel
         // doesn't care about these files. Critically, note these are _different_ than
@@ -719,10 +719,9 @@ impl LogSegmentFiles {
         };
         if latest_checkpoint.version != checkpoint_metadata.version {
             info!(
-            "_last_checkpoint hint is out of date. _last_checkpoint version: {}. Using actual most recent: {}",
-            checkpoint_metadata.version,
-            latest_checkpoint.version
-        );
+                "_last_checkpoint hint is out of date. _last_checkpoint version: {}. Using actual most recent: {}",
+                checkpoint_metadata.version, latest_checkpoint.version
+            );
         } else if !checkpoint_metadata.applies_to(&listed_files.checkpoint_parts) {
             // Expected whenever a writer checkpoints a version another writer already checkpointed
             // and leaves the hint alone. `applies_to` also makes `LogSegment::checkpoint_hint`
