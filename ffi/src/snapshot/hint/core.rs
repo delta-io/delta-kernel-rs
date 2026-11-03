@@ -8,12 +8,10 @@ use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
 #[cfg(feature = "declarative-plans")]
-use super::state::BorrowedSnapshotScanState;
-#[cfg(feature = "declarative-plans")]
 use super::FfiSnapshotScanState;
-use super::{
-    BorrowedSnapshotState, FfiSnapshotHint, invalid, validate_handoff,
-};
+#[cfg(feature = "declarative-plans")]
+use super::state::BorrowedSnapshotScanState;
+use super::{BorrowedSnapshotState, FfiSnapshotHint, invalid, validate_handoff};
 use crate::delta_types::{FfiMetadata, MetadataBacking};
 use crate::error::{AllocateErrorFn, ExternResult, IntoExternResult};
 use crate::handle::Handle;
@@ -135,7 +133,7 @@ pub unsafe extern "C" fn snapshot_externalize_core(
     let engine_ref = unsafe { engine.as_ref() };
     let result = validate_handoff(owned, &state)
         .map(|_| unsafe { core_from_snapshot(&snapshot, generation, false) }.into());
-    result.into_extern_result(&engine_ref)
+    unsafe { result.into_extern_result(&engine_ref) }
 }
 
 /// Construct a small core after the connector has proven that its immutable state was the exact
@@ -182,7 +180,7 @@ pub unsafe extern "C" fn snapshot_externalize_trusted_core(
 /// `core` must be a valid, owned handle and must not be used after this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_snapshot_core(core: Handle<SharedSnapshotCore>) {
-    core.drop_handle();
+    unsafe { core.drop_handle() };
 }
 
 /// The validated version held in the small native core.
@@ -231,7 +229,7 @@ pub unsafe extern "C" fn snapshot_core_logical_schema(
     let result = borrowed_state(core, value, generation)
         .and_then(|state| state.logical_schema())
         .map(Into::into);
-    result.into_extern_result(&allocate_error)
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 /// Read the protocol from connector-owned state for this call only.
@@ -248,10 +246,10 @@ pub unsafe extern "C" fn snapshot_core_get_protocol(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<Handle<SharedProtocol>> {
     let core = unsafe { core.as_ref() };
-    borrowed_state(core, value, generation)
+    let result = borrowed_state(core, value, generation)
         .and_then(|state| state.protocol())
-        .map(|protocol| Arc::new(protocol).into())
-        .into_extern_result(&allocate_error)
+        .map(|protocol| Arc::new(protocol).into());
+    unsafe { result.into_extern_result(&allocate_error) }
 }
 
 /// Visit metadata reconstructed from connector-owned state, returning true on success.
@@ -301,7 +299,7 @@ pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan(
     let extern_engine = unsafe { engine.as_ref() };
     let inner_engine = extern_engine.engine();
     let result = metadata_plan(core, value, generation, inner_engine.as_ref(), None);
-    result.into_extern_result(&extern_engine)
+    unsafe { result.into_extern_result(&extern_engine) }
 }
 
 #[cfg(feature = "declarative-plans")]
@@ -364,7 +362,7 @@ pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan_trusted(
         None,
         extern_engine.engine().as_ref(),
     );
-    result.into_extern_result(&extern_engine)
+    unsafe { result.into_extern_result(&extern_engine) }
 }
 
 #[cfg(feature = "declarative-plans")]
@@ -472,7 +470,7 @@ pub unsafe extern "C" fn snapshot_schema_upload_append(
 pub unsafe extern "C" fn free_snapshot_schema_upload(
     upload: Handle<ExclusiveSnapshotSchemaUpload>,
 ) {
-    upload.drop_handle();
+    unsafe { upload.drop_handle() };
 }
 
 impl SnapshotSchemaUpload {
@@ -523,7 +521,7 @@ pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan_with_schema(
             Some(metadata),
         )
     })();
-    result.into_extern_result(&engine)
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Trusted planning variant that consumes a transferred schema.
@@ -562,7 +560,7 @@ pub unsafe extern "C" fn snapshot_core_declarative_metadata_plan_trusted_with_sc
             engine.engine().as_ref(),
         )
     })();
-    result.into_extern_result(&engine)
+    unsafe { result.into_extern_result(&engine) }
 }
 
 #[cfg(test)]

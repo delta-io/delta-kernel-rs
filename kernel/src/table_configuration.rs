@@ -1446,17 +1446,27 @@ mod test {
             ColumnMappingMode::Id
         )]
         mode: ColumnMappingMode,
+        #[values(false, true)] file_column: bool,
     ) {
         let schema = test_schema_nested_with_column_mapping();
+        let schema = if file_column {
+            let field = StructField {
+                data_type: DataType::file_type(),
+                ..schema.fields().next().unwrap().clone()
+            };
+            schema_ref! { (field) }
+        } else {
+            schema
+        };
         let expected = schema.make_physical(mode).unwrap();
+        let mut features = vec![TableFeature::ColumnMapping];
+        if file_column {
+            features.push(TableFeature::FileType);
+        }
         let config = MockTableConfigurationBuilder::new()
             .with_schema(schema)
             .with_column_mapping(Some(mode))
-            .with_protocol(
-                MockProtocolBuilder::new()
-                    .with_features([TableFeature::ColumnMapping])
-                    .build(),
-            )
+            .with_protocol(MockProtocolBuilder::new().with_features(features).build())
             .build();
         let untouched = config.clone();
         assert!(config.physical_schema.get().is_none());

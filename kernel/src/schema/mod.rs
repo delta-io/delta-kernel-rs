@@ -2912,6 +2912,10 @@ impl<'a> SchemaTransform<'a> for MaterializePhysical {
     fn transform_variant(&mut self, stype: &'a StructType) -> Cow<'a, StructType> {
         Cow::Borrowed(stype)
     }
+
+    fn transform_file(&mut self, stype: &'a StructType) -> Cow<'a, StructType> {
+        Cow::Borrowed(stype)
+    }
 }
 
 #[cfg(test)]

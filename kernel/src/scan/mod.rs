@@ -17,6 +17,8 @@ use crate::actions::deletion_vector::{
 };
 use crate::actions::{ADD_FIELD, ADD_NAME, Add, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
+#[cfg(feature = "declarative-plans")]
+use crate::checkpoint::CheckpointShape;
 use crate::engine::CancellableEngine;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{
@@ -222,6 +224,7 @@ fn metadata_plan_with_validated_configuration(
     scan_plan::MetadataScanPlan {
         log_segment: &log_segment,
         skip_all: state_info
+            .as_ref()
             .is_some_and(|state| state.physical_predicate == PhysicalPredicate::StaticSkipAll),
     }
     .build_metadata_scan_plan_with_commits(base, &planner, commit_files)

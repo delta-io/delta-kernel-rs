@@ -12,7 +12,7 @@ use url::Url;
 
 #[cfg(feature = "declarative-plans")]
 use super::FfiSnapshotScanState;
-use super::{invalid_crc, invalid_with_source, FfiSnapshotHint};
+use super::{FfiSnapshotHint, invalid_crc, invalid_with_source};
 
 /// The connector owns every pointer reachable from `hint` for this call only.
 pub(super) struct BorrowedSnapshotState<'a> {

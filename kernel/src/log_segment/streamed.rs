@@ -34,12 +34,14 @@ impl LogSegment {
         validate: bool,
     ) -> KernelResult<(Self, Vec<ScanFile>)> {
         let result = (|| {
-            let paths = scan_paths(paths, validate).filter_map(|result| match result {
-                Ok(path) if path.is_commit() => None,
-                other => Some(other),
-            });
+            let paths = scan_paths(paths, validate)
+                .filter_map(|result| match result {
+                    Ok(path) if path.is_commit() => None,
+                    other => Some(other),
+                })
+                .collect::<KernelResult<Vec<_>>>()?;
             let mut listed = LogSegmentFiles::build_log_segment_files(
-                paths,
+                paths.into_iter().map(Ok),
                 Vec::new(),
                 0,
                 None,
@@ -150,7 +152,7 @@ fn scan_paths(
             )
         );
         previous = Some(key);
-        let reparsed = ParsedLogPath::try_from(path.location.clone())?
+        let reparsed = ParsedLogPath::new(path.location.clone())
             .ok_or_else(|| KernelError::invalid_log_path(path.location.location.as_str()))?;
         require!(
             reparsed == path,
