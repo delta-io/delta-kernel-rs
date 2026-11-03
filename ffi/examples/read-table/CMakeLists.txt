@@ -43,17 +43,6 @@ set(TestRunner "../../../tests/read-table-testing/run_test.sh")
 set(DatPath "../../../../acceptance/tests/dat/out/reader_tests/generated")
 set(ExpectedPath "../../../tests/read-table-testing/expected-data")
 set(KernelTestPath "../../../../kernel/tests/data")
-if(PRINT_DATA)
-  # PRINT_DATA=ON supports -a, which avoids reading interval Parquet values; its output includes
-  # a [No data] line. PRINT_DATA=OFF cannot use -a and omits that line.
-  set(
-    IntervalYearMonthSchemaExpected
-    "${ExpectedPath}/interval-year-month-schema-arrow.expected")
-  set(IntervalYearMonthSchemaOptions "-a -cid,period -s")
-else()
-  set(IntervalYearMonthSchemaExpected "${ExpectedPath}/interval-year-month-schema.expected")
-  set(IntervalYearMonthSchemaOptions "-cid,period -s")
-endif()
 add_test(NAME read_and_print_all_prim COMMAND ${TestRunner} ${DatPath}/all_primitive_types/delta/ ${ExpectedPath}/all-prim-types.expected)
 add_test(NAME read_and_print_all_prim_cols COMMAND ${TestRunner} ${DatPath}/all_primitive_types/delta/ ${ExpectedPath}/all-prim-types-cols.expected -cdecimal,float64)
 add_test(NAME read_and_print_nested COMMAND ${TestRunner} ${DatPath}/nested_types/delta/ ${ExpectedPath}/nested-types.expected)
@@ -78,7 +67,7 @@ add_test(NAME commit_range_commit_files_basic_partitioned
   "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/expected-data/commit-range-commit-files-basic-partitioned.expected")
 add_test(NAME read_interval_year_month_schema COMMAND ${TestRunner}
   ../../../../acceptance/workloads/interval_types_intv_001_interval_ym_basic/delta/
-  ${IntervalYearMonthSchemaExpected} "${IntervalYearMonthSchemaOptions}")
+  ${ExpectedPath}/interval-year-month-schema-data.expected "-cid,period -s")
 if(GEO_TYPE_IN_DEV)
   target_compile_definitions(read_table PUBLIC DEFINE_GEO_TYPE_IN_DEV)
   add_test(NAME read_and_print_geo COMMAND ${TestRunner} ${KernelTestPath}/table-with-geo/ ${ExpectedPath}/table-with-geo.expected)

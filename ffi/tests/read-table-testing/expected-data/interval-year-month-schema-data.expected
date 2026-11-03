@@ -8,3 +8,14 @@ Schema:
 Scan schema:
 ├─ id: integer
 └─ period: interval year to month
+
+id:  [
+  2,
+  3,
+  1
+]
+period:  [
+  27,
+  9,
+  18
+]
