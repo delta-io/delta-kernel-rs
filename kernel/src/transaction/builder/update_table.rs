@@ -713,6 +713,7 @@ mod tests {
             UpdateTableOperation::Update,
             UpdateTableOperation::Merge,
             UpdateTableOperation::Optimize,
+            UpdateTableOperation::Reorg,
             UpdateTableOperation::Custom("UNKNOWN".to_string())
         )]
         operation: UpdateTableOperation,

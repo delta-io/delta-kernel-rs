@@ -34,14 +34,16 @@ pub enum UpdateTableOperation {
     Merge,
     /// A data-file reorganization.
     Optimize,
+    /// A data-file reorganization that preserves logical table data.
+    Reorg,
     /// An operation name recorded verbatim in commit history and successful transaction metrics.
     ///
     /// The name must be nonempty and must not match a reserved operation name, such as `REORG` or
     /// `ALTER TABLE`. The full set consists of all [typed operation names](UpdateTableOperation)
-    /// and [`RESERVED_OPERATION_NAMES`][ops]. Name matching is case-sensitive. Kernel does not
-    /// infer built-in operation semantics from the name, but all other transaction and protocol
-    /// checks still apply. Custom operations do not qualify for incremental version checksum
-    /// construction.
+    /// and [`RESERVED_TABLE_OPERATION_NAMES`][ops]. Name matching is case-sensitive. Kernel does
+    /// not infer built-in operation semantics from the name, but all other transaction and
+    /// protocol checks still apply. Custom operations do not qualify for incremental version
+    /// checksum construction.
     ///
     /// Custom names are not guaranteed to remain valid across Kernel versions. Adding a typed
     /// variant reserves its exact name. Callers using that custom name must select the typed
@@ -63,6 +65,7 @@ impl UpdateTableOperation {
             Self::Update => "UPDATE",
             Self::Merge => "MERGE",
             Self::Optimize => "OPTIMIZE",
+            Self::Reorg => "REORG",
             Self::Custom(operation) => operation,
         }
     }
@@ -129,9 +132,7 @@ impl From<UpdateTableOperation> for CommitOperation {
     }
 }
 
-const RESERVED_OPERATION_NAMES: &[&str] = &[
-    // Replay trusts REORG's file accounting, so custom transactions cannot use its name.
-    "REORG",
+const RESERVED_TABLE_OPERATION_NAMES: &[&str] = &[
     "CREATE TABLE",
     "REPLACE TABLE",
     "CREATE TABLE AS SELECT",
@@ -144,7 +145,7 @@ fn validate_custom_name(name: &str) -> Result<(), String> {
         return Err("custom operation name cannot be empty".to_string());
     }
     if UpdateTableOperation::iter().any(|operation| operation.as_str() == name)
-        || RESERVED_OPERATION_NAMES.contains(&name)
+        || RESERVED_TABLE_OPERATION_NAMES.contains(&name)
     {
         return Err(format!("custom operation name '{name}' is reserved"));
     }
@@ -171,6 +172,7 @@ mod tests {
             ("UPDATE", UpdateTableOperation::Update, true),
             ("MERGE", UpdateTableOperation::Merge, true),
             ("OPTIMIZE", UpdateTableOperation::Optimize, true),
+            ("REORG", UpdateTableOperation::Reorg, true),
         ];
         for (name, operation, incremental_safe) in cases {
             assert_eq!(operation.as_str(), name);
@@ -200,7 +202,6 @@ mod tests {
             .map(|operation| operation.as_str().to_owned())
             .chain(
                 [
-                    "REORG",
                     "CREATE TABLE",
                     "REPLACE TABLE",
                     "CREATE TABLE AS SELECT",

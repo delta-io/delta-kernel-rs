@@ -1294,6 +1294,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
         "UPDATE" => UpdateTableOperation::Update,
         "MERGE" => UpdateTableOperation::Merge,
         "OPTIMIZE" => UpdateTableOperation::Optimize,
+        "REORG" => UpdateTableOperation::Reorg,
         operation => UpdateTableOperation::Custom(operation.to_string()),
     };
     let mut builder = snapshot.update_table(operation, "test-utils", data_change);
