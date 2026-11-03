@@ -612,7 +612,8 @@ mod tests {
 
     /// Pins the stats sub-field IDs to the Iceberg v4 spec's "Content Stats in Manifests" example
     /// (a required int `id` with field ID 2 and an optional string `data` with field ID 3), with
-    /// literal IDs so that a change to the offset constants fails loudly.
+    /// literal IDs so that a change to the offset constants fails loudly. The double and variant
+    /// cases go beyond the example to pin `nan_value_count` (offset 5) and the variant layout.
     #[rstest]
     #[case::required_int(DataType::INTEGER, false, 2, &[
         (LOWER_BOUND, 10_401),
@@ -633,6 +634,13 @@ mod tests {
         (VALUE_COUNT, 10_603),
         (NULL_VALUE_COUNT, 10_604),
         (NAN_VALUE_COUNT, 10_605),
+    ])]
+    #[case::optional_variant(DataType::unshredded_variant(), true, 3, &[
+        (LOWER_BOUND, 10_601),
+        (UPPER_BOUND, 10_602),
+        (VALUE_COUNT, 10_603),
+        (NULL_VALUE_COUNT, 10_604),
+        (TOTAL_BYTES, 10_606),
     ])]
     fn stats_schema_matches_spec_field_ids(
         #[case] data_type: DataType,
