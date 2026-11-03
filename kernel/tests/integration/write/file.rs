@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::KernelResult;
 use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, BinaryArray, Int32Array, Int64Array, ListArray, MapArray,
     RecordBatch, StringArray, StructArray,
@@ -12,15 +13,14 @@ use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
-use delta_kernel::engine::{file_groups, FileGroup};
+use delta_kernel::engine::{FileGroup, file_groups};
 use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
 };
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::KernelResult;
 use rstest::rstest;
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::{
     create_table_and_load_snapshot, read_add_infos, read_scan, test_table_setup,
     test_table_setup_mt, write_batch_to_table,
@@ -240,10 +240,11 @@ async fn test_write_and_read_nested_file_column(
         Some(MetadataValue::String(name)) => name.clone(),
         _ => "c".to_string(),
     };
-    assert!(root
-        .get_fields()
-        .iter()
-        .any(|field| field.name() == physical_name));
+    assert!(
+        root.get_fields()
+            .iter()
+            .any(|field| field.name() == physical_name)
+    );
     // Under column mapping, a `file` struct field has its column mapping id. An array element or
     // map value has an id only under Iceberg compatibility, which does not allow `file` (see
     // `test_create_table_with_iceberg_compat_rejects_file_column`), so here it has none.

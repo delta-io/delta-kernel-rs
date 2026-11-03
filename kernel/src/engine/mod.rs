@@ -57,7 +57,7 @@ mod parquet_file_type;
     feature = "arrow-60",
     feature = "test-utils"
 ))]
-pub use parquet_file_type::{file_groups, FileGroup};
+pub use parquet_file_type::{FileGroup, file_groups};
 
 #[cfg(feature = "arrow-conversion")]
 pub mod arrow_conversion;

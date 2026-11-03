@@ -9,7 +9,7 @@
 #[cfg(feature = "arrow-60")]
 pub(super) use supported::with_file_columns;
 #[cfg(all(feature = "arrow-60", any(test, feature = "test-utils")))]
-pub use supported::{file_groups, FileGroup};
+pub use supported::{FileGroup, file_groups};
 #[cfg(not(feature = "arrow-60"))]
 pub(super) use unsupported::with_file_columns;
 
@@ -21,12 +21,12 @@ mod supported {
 
     use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::expressions::ColumnName;
-    use crate::parquet::arrow::arrow_writer::ArrowWriterOptions;
     use crate::parquet::arrow::ArrowSchemaConverter;
+    use crate::parquet::arrow::arrow_writer::ArrowWriterOptions;
     use crate::parquet::basic::LogicalType;
     use crate::parquet::schema::types::{SchemaDescriptor, Type, TypePtr};
     use crate::schema::file_utils::FilePaths;
-    use crate::schema::{StructType, FILE_FIELDS};
+    use crate::schema::{FILE_FIELDS, StructType};
     use crate::{KernelError, KernelResult};
 
     /// Returns `options` set up to write batches of `arrow_schema` as a data file with
@@ -303,8 +303,8 @@ mod unsupported {
     use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::expressions::ColumnName;
     use crate::parquet::arrow::arrow_writer::ArrowWriterOptions;
-    use crate::schema::file_utils::FilePaths;
     use crate::schema::StructType;
+    use crate::schema::file_utils::FilePaths;
     use crate::{KernelError, KernelResult};
 
     /// Returns `options` unchanged, or an error if `physical_kernel_schema` has a `file` column,
@@ -345,15 +345,16 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::KernelResult;
     use crate::arrow::array::RecordBatch;
     use crate::arrow::datatypes::Schema as ArrowSchema;
     #[cfg(feature = "arrow-60")]
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
     use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::engine::writer_options;
-    use crate::parquet::arrow::arrow_writer::ArrowWriter;
     #[cfg(feature = "arrow-60")]
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::parquet::file::reader::{FileReader as _, SerializedFileReader};
     #[cfg(feature = "arrow-60")]
     use crate::parquet::schema::types::Type;
@@ -362,7 +363,6 @@ mod tests {
     use crate::schema::{
         ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
     };
-    use crate::KernelResult;
 
     fn with_field_ids(
         field: StructField,

@@ -9,8 +9,8 @@ use crate::arrow::compute::cast;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Int64Type};
 use crate::engine::arrow_utils::make_arrow_error;
 use crate::expressions::ColumnName;
-use crate::schema::file_utils::FilePaths;
 use crate::schema::StructType;
+use crate::schema::file_utils::FilePaths;
 use crate::{KernelError, KernelResult};
 
 /// Fails if a non-null `file` value in `data` is invalid under the Parquet `FILE` specification,
@@ -192,10 +192,9 @@ fn string_at(array: &dyn Array, row: usize) -> Option<&str> {
 }
 
 /// Applies `check` to each present `file` value in `data`, whose columns are matched to
-/// `kernel_schema` by name, and fails with the first problem it reports. It handles the schema
-/// navigation, Arrow decoding and null and container handling, so the read and write rules are
-/// only checks on one value. A `file` column missing
-/// from `data` is an error.
+/// `kernel_schema` by name. It traverses nested structs, arrays, and maps, handling dictionary
+/// decoding and nulls. Returns an error if `check` fails, a required column is missing, an array
+/// has an unexpected type, or dictionary decoding fails.
 fn visit_file_values(
     data: &StructArray,
     kernel_schema: &StructType,
@@ -950,7 +949,7 @@ mod tests {
         let mut fields: Vec<_> = fields.iter().map(|f| f.as_ref().clone()).collect();
         fields[index] = Field::new(name, dictionary.data_type().clone(), true);
         columns[index] = Arc::new(dictionary);
-        // Keep the other locator set, so only the null value decides the result.
+        // Keep the other locator set: a null locator is allowed when the other is present.
         let file = StructArray::try_new(fields.into(), columns, nulls).unwrap();
         let (data, schema) = top_level(file);
         validate_file_values_for_read(&data, &schema).unwrap();

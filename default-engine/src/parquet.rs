@@ -621,8 +621,7 @@ mod tests {
     };
     use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use delta_kernel::schema::{
-        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
-        schema, schema_ref,
+        ColumnMetadataKey, DataType, MetadataValue, StructField, StructType, schema, schema_ref,
     };
     use delta_kernel_default_engine_test_utils::{
         assert_result_error_with_message, current_time_ms,
