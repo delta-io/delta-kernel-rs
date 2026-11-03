@@ -358,15 +358,18 @@ async fn adding_a_column_with_a_generation_expression_fails(
     // The table supports `generatedColumns` but has no generated columns, so other schema changes
     // pass.
     let table_url = write_table(&table_path, GENERATED_COLUMNS_FEATURE, &[]).await?;
-    let generated = StructField::nullable("next_age", DataType::INTEGER).add_metadata([(
-        ColumnMetadataKey::GenerationExpression.as_ref(),
-        MetadataValue::String("age + 1".to_string()),
-    )]);
-    let added = if nested {
-        let details = StructType::try_new([generated]).expect("test schema must be valid");
-        StructField::nullable("details", details)
+    let field_with_generation_expression = StructField::nullable("next_age", DataType::INTEGER)
+        .add_metadata([(
+            ColumnMetadataKey::GenerationExpression.as_ref(),
+            MetadataValue::String("age + 1".to_string()),
+        )]);
+    let column_to_add = if nested {
+        let struct_with_generation_expression =
+            StructType::try_new([field_with_generation_expression])
+                .expect("test schema must be valid");
+        StructField::nullable("details", struct_with_generation_expression)
     } else {
-        generated
+        field_with_generation_expression
     };
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -376,7 +379,7 @@ async fn adding_a_column_with_a_generation_expression_fails(
         operation,
         "Test/1.0",
         data_change,
-        |builder| builder.add_column(added),
+        |builder| builder.add_column(column_to_add),
     );
 
     let key = ColumnMetadataKey::GenerationExpression.as_ref();
