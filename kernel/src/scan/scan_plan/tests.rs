@@ -832,10 +832,26 @@ fn declarative_metadata_crc_plan_is_sparse_and_prunes(
         .expect("CRC values source");
     assert_eq!(values.schema.num_fields(), 1);
     assert!(values.rows.iter().all(|row| row.len() == 1));
-    assert!(plan.nodes.iter().all(|node| match &node.op {
-        Operator::Project(project) => matches!(project.expr.as_ref(), Expr::StructPatch(_)),
-        _ => true,
-    }));
+    // Replay packs and unpacks whole action rows; stats shaping itself stays a sparse patch.
+    let stats_projection = plan
+        .nodes
+        .iter()
+        .find_map(|node| match &node.op {
+            Operator::Project(project)
+                if project
+                    .schema
+                    .field_at(&column_name!("add.stats_parsed"))
+                    .is_ok() =>
+            {
+                Some(project)
+            }
+            _ => None,
+        })
+        .expect("stats parsing projection");
+    assert!(matches!(
+        stats_projection.expr.as_ref(),
+        Expr::StructPatch(_)
+    ));
     let actual = declarative_metadata(&scan, engine.as_ref())?;
     assert_eq!(metadata_row_count(&actual), expected_count);
     for batch in actual {

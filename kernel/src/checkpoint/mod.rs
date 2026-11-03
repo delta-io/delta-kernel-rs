@@ -138,6 +138,8 @@ use crate::{
 mod checkpoint_shape;
 mod checkpoint_transform;
 pub(crate) mod collation_stats;
+#[cfg(feature = "declarative-plans")]
+mod plan;
 mod sidecar;
 
 #[cfg(feature = "declarative-plans")]

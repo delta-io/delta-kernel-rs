@@ -23,6 +23,8 @@ use crate::table_properties::TableProperties;
 use crate::{KernelError, KernelResult};
 
 pub(crate) mod log_replay;
+#[cfg(feature = "declarative-plans")]
+pub(crate) mod plan;
 
 pub use log_replay::{ActionReconciliationIterator, ActionReconciliationIteratorState};
 
