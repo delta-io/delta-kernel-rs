@@ -368,10 +368,20 @@ async fn test_write_rejects_qualifier_mismatch(
     Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap(),
     "INTERVAL '1 02' DAY TO HOUR"
 )]
+#[case::day_hour_negative(
+    DataType::INTERVAL_DAY_HOUR,
+    Scalar::interval_day_time(-93_600_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap(),
+    "INTERVAL '-1 02' DAY TO HOUR"
+)]
 #[case::day_minute(
     DataType::INTERVAL_DAY_MINUTE,
     Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalDayToMinute).unwrap(),
     "INTERVAL '1 02:03' DAY TO MINUTE"
+)]
+#[case::day_minute_negative(
+    DataType::INTERVAL_DAY_MINUTE,
+    Scalar::interval_day_time(-93_780_000_000, IntervalDayToSecondType::IntervalDayToMinute).unwrap(),
+    "INTERVAL '-1 02:03' DAY TO MINUTE"
 )]
 #[case::hour_minute(
     DataType::INTERVAL_HOUR_MINUTE,
