@@ -108,6 +108,9 @@ use itertools::Itertools;
 use tracing::info;
 use url::Url;
 
+#[cfg(feature = "declarative-plans")]
+#[allow(unused_imports)]
+pub(crate) use crate::action_reconciliation::checkpoint_shape::{CheckpointShape, CheckpointType};
 use crate::action_reconciliation::file_metadata::{
     StatsTransformConfig, build_checkpoint_read_schema, build_checkpoint_transform,
 };
@@ -137,19 +140,14 @@ use crate::{
     version_as_i64,
 };
 
-#[cfg(feature = "declarative-plans")]
-mod checkpoint_shape;
 pub(crate) mod collation_stats;
 #[cfg(feature = "declarative-plans")]
 mod plan;
 mod sidecar;
 
-#[cfg(feature = "declarative-plans")]
-#[allow(unused_imports)]
-pub(crate) use checkpoint_shape::{CheckpointShape, CheckpointType};
 use sidecar::{SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch};
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Information about a freshly-written checkpoint. Pass it to
 /// [`CheckpointWriter::finalize`] to produce the `_last_checkpoint` hint file.
@@ -336,7 +334,7 @@ static CHECKPOINT_ACTIONS_SCHEMA_V1: LazyLock<SchemaRef> =
 
 /// Schema for V2 checkpoints (includes checkpointMetadata action). JSON checkpoints do not embed
 /// a schema, so readers assume this schema for them.
-static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = lazy_schema_ref! {
+pub(crate) static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = lazy_schema_ref! {
     ..(base_checkpoint_action_fields()),
     (&CHECKPOINT_METADATA_FIELD),
 };
