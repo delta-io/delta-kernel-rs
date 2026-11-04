@@ -323,13 +323,11 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Arc<CheckpointAction>>> {
-        if let Some(cached) = self.checkpoint_action.get() {
-            return Ok(cached.clone());
-        }
-        // Checked before `last_manifest_commit` opens its span, so non-AMT reads never create a
-        // child of `self.span`, which may belong to another subscriber.
         if !self.has_adaptive_metadata() {
             return Ok(None);
+        }
+        if let Some(cached) = self.checkpoint_action.get() {
+            return Ok(cached.clone());
         }
         let found = match self.last_manifest_commit(engine)? {
             Some(pointer) => Some(Arc::new(
