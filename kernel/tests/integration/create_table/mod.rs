@@ -1,5 +1,6 @@
 //! Integration tests for the CreateTable API
 
+mod adaptive_metadata;
 mod clustering;
 mod column_mapping;
 mod ctas;
