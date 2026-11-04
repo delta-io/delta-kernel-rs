@@ -104,19 +104,16 @@ pub extern "C" fn new_deletion_vector() -> Handle<ExclusiveDeletionVector> {
 /// The caller must additionally check indexes against the target file's physical row count.
 ///
 /// # Safety
-/// A non-null `vector` must point to a live, exclusively borrowed handle. For nonzero length,
+/// `vector` must reference a live, exclusively borrowed handle. For nonzero length,
 /// `indexes` must address that many aligned, initialized u64 values readable for this call.
 /// The error allocator must be valid. No input memory is retained after the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn deletion_vector_add_indexes(
-    vector: *mut Handle<ExclusiveDeletionVector>,
+    vector: &mut Handle<ExclusiveDeletionVector>,
     indexes: FfiSlice<u64>,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<bool> {
     let result: KernelResult<_> = (|| {
-        // SAFETY: a non-null input references a valid handle exclusively available for this call.
-        let handle = unsafe { vector.as_mut() }
-            .ok_or_else(|| KernelError::generic("Deletion vector pointer must not be null"))?;
         // SAFETY: a nonempty input is aligned, initialized, and readable for this call.
         let rows = unsafe { indexes.try_as_slice() }?;
         if rows.iter().any(|index| *index > i64::MAX as u64) {
@@ -125,7 +122,7 @@ pub unsafe extern "C" fn deletion_vector_add_indexes(
             ));
         }
         // SAFETY: the caller prevents concurrent access; validation completed before mutation.
-        unsafe { handle.as_mut() }.add_deleted_row_indexes(rows);
+        unsafe { vector.as_mut() }.add_deleted_row_indexes(rows);
         Ok(true)
     })();
     // SAFETY: the allocator is valid for this call and copies any error message.
@@ -150,22 +147,19 @@ pub unsafe extern "C" fn free_deletion_vector(vector: Handle<ExclusiveDeletionVe
 /// `allocate_error` allocates errors for this standalone serializer call; no Engine is required.
 ///
 /// # Errors
-/// Returns an error if `output` is null or either callback is missing.
+/// Returns an error if either callback is missing.
 ///
 /// # Safety
-/// A non-null `output` must be aligned, initialized, and readable for this call only. Its callbacks
-/// and context must satisfy `FfiDvWriterOutput`'s lifetime and threading contract for any returned
+/// `output` must reference an initialized record readable for this call. Its callbacks and
+/// context must satisfy `FfiDvWriterOutput`'s lifetime and threading contract for any returned
 /// handle. No caller record is retained, including when it was stack-allocated in a helper.
 /// The error allocator must be valid for this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn new_dv_writer(
-    output: *const FfiDvWriterOutput,
+    output: &FfiDvWriterOutput,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<Handle<ExclusiveDvWriter>> {
     let result: KernelResult<_> = (|| {
-        // SAFETY: a non-null input points to an aligned, initialized record valid for this call.
-        let output = unsafe { output.as_ref() }
-            .ok_or_else(|| KernelError::generic("DV writer output must not be null"))?;
         if output.write.is_none() || output.flush.is_none() {
             return Err(KernelError::generic(
                 "DV writer requires write and flush callbacks",
@@ -197,28 +191,25 @@ pub unsafe extern "C" fn new_dv_writer(
 /// vector to the writer's output and consumes its vector handle on both success and error.
 ///
 /// # Errors
-/// A null writer pointer or an already failed writer still consumes the vector. After a
+/// An already failed writer still consumes the vector. After a
 /// serialization/output failure, abandon the output and free the writer; it cannot be resumed.
 ///
 /// # Safety
-/// A non-null `writer` must point to a valid, exclusively borrowed writer handle. `vector` must be
+/// `writer` must reference a valid, exclusively borrowed writer handle. `vector` must be
 /// a valid owned handle created with `new_deletion_vector`; do not use or free it after this call.
 /// The output's lifetime/threading contract applies and the error allocator must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dv_writer_write(
-    writer: *mut Handle<ExclusiveDvWriter>,
+    writer: &mut Handle<ExclusiveDvWriter>,
     vector: Handle<ExclusiveDeletionVector>,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<FfiDvWriteResult> {
     // SAFETY: the caller transfers the live vector exactly once. Consume before any fallible check
-    // so it is dropped on null-pointer, failed-writer, serialization, and output errors alike.
+    // so it is dropped on failed-writer, serialization, and output errors alike.
     let vector = unsafe { vector.into_inner() };
     let result: KernelResult<_> = (|| {
-        // SAFETY: a non-null pointer references a live, exclusively borrowed handle for this call.
-        let handle = unsafe { writer.as_mut() }
-            .ok_or_else(|| KernelError::generic("DV writer pointer must not be null"))?;
         // SAFETY: the caller supplies a valid handle and prevents concurrent/re-entrant access.
-        let writer = unsafe { handle.as_mut() };
+        let writer = unsafe { writer.as_mut() };
         if writer.failed {
             return Err(KernelError::invalid_transaction_state(
                 "DV writer has failed",
@@ -716,27 +707,6 @@ mod tests {
             ok_or_panic(unsafe { dv_writer_write(&mut writer, vector(&[1, 3]), allocate_err) });
         assert_eq!(result, serialize(&[&[1, 3]]).1[0]);
         ok_or_panic(unsafe { dv_writer_finalize(writer, allocate_err) });
-    }
-
-    #[test]
-    fn null_output_and_writer_pointers_return_errors() {
-        assert_extern_result_error_with_message(
-            unsafe { new_dv_writer(ptr::null_mut(), allocate_err) },
-            FFIKernelError::GenericError,
-            None,
-        );
-        assert_extern_result_error_with_message(
-            unsafe { dv_writer_write(ptr::null_mut(), vector(&[1, 7]), allocate_err) },
-            FFIKernelError::GenericError,
-            None,
-        );
-        assert_extern_result_error_with_message(
-            unsafe {
-                deletion_vector_add_indexes(ptr::null_mut(), FfiSlice::empty(), allocate_err)
-            },
-            FFIKernelError::GenericError,
-            None,
-        );
     }
 
     #[rstest]

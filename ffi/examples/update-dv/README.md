@@ -91,9 +91,16 @@ allocator for its FFI result. The host retains ownership of the output and conte
 Callbacks must not unwind or re-enter the same writer. If the handle moves between
 threads, the output must support those sequential calls.
 
+The output-record argument to `new_dv_writer` and the borrowed handle arguments to
+`deletion_vector_add_indexes` and `dv_writer_write` are Rust references. C and other
+FFI callers must supply valid, non-null, aligned pointers, with exclusive access for
+mutable handle arguments. Invalid reference arguments are undefined behavior, not
+recoverable FFI errors. Null stateless callback contexts and empty index slices
+with `{NULL, 0}` remain valid.
+
 `dv_writer_finalize` consumes the handle on success or error. `free_dv_writer`
 abandons it without flushing. `dv_writer_write` consumes the vector on success and
-error, including when the writer pointer is null or the writer has already failed.
+error for valid arguments, including when the writer has already failed.
 Use `free_deletion_vector` to release a vector abandoned before writing.
 Invalid chunks leave the vector unchanged; serialization or output failures make
 the writer unusable. Abandon failed output
