@@ -64,7 +64,7 @@ static bool check_round_trip(const char* table_path)
   CSchema* original = NULL;
   CSchema* rebuilt = NULL;
   KernelStringSlice path = { table_path, strlen(table_path) };
-  ExternResultHandleExclusiveEngineBuilder builder = get_engine_builder(path, allocate_error);
+  ExternResultHandleExclusiveEngineBuilder builder = get_engine_builder(path, &error_allocators);
   if (builder.tag != OkHandleExclusiveEngineBuilder) {
     free_error((Error*)builder.err);
     goto cleanup;
