@@ -178,8 +178,6 @@ impl StatCategories {
 /// - offset 6: `total_bytes` (long) - total uncompressed size of the column's values; for
 ///   string/binary `bounds_type`, or any variant
 ///
-/// Stats tightness is not recorded here: it is the entry-level `tight_stats` flag.
-///
 /// `bounds_type` is the type the bounds are recorded at: the column's own type for primitives, or
 /// an unshredded variant type for variant columns.
 ///

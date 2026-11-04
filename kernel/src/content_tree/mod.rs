@@ -288,8 +288,14 @@ pub(super) struct ContentTreeNodeEntry {
     #[field_id = 146]
     pub(crate) content_stats: Option<StructData>,
 
-    /// Whether [`Self::content_stats`] are tight: exact for the entry's live rows. Readers must
-    /// treat `None` as not tight.
+    /// Whether [`Self::content_stats`] are tight: `value_count`, `null_value_count`, and
+    /// `nan_value_count` are exact over the entry's live rows, as are `lower_bound` and
+    /// `upper_bound` for fixed-length types. String and binary bounds may be truncated and
+    /// geospatial bounds are bounding boxes, so they are never tight. Variant bounds are judged
+    /// per path by the bound's value type. `total_bytes` is not part of tightness. Readers must
+    /// treat `None` as not tight. See the Iceberg spec on stats [tightness].
+    ///
+    /// [tightness]: https://github.com/apache/iceberg/blob/main/format/spec.md#stats-tightness
     #[field_id = 151]
     pub(crate) tight_stats: Option<bool>,
 
