@@ -97,9 +97,6 @@ pub(crate) fn build_checkpoint_transform(
         // stats_parsed)
         patch_builder =
             patch_builder.replace_expr_at([ADD_NAME], STATS_FIELD, STATS_JSON_EXPR.clone());
-    } else {
-        // Drop stats field when not writing as JSON
-        patch_builder = patch_builder.drop_at([ADD_NAME], STATS_FIELD);
     }
 
     // Handle stats_parsed field
@@ -120,27 +117,39 @@ pub(crate) fn build_checkpoint_transform(
             stats_field,
             stats_parsed_expr,
         );
-    } else {
-        // Drop stats_parsed field when not writing as struct
-        patch_builder = patch_builder.drop_at([ADD_NAME], STATS_PARSED_FIELD);
     }
 
     // Handle partitionValues_parsed field (only for partitioned tables)
-    if partition_schema.is_some() {
-        if config.write_stats_as_struct {
-            let pv_parsed_expr = build_partition_values_parsed_expr();
-            patch_builder = patch_builder.replace_expr_at(
-                [ADD_NAME],
-                PARTITION_VALUES_PARSED_FIELD,
-                pv_parsed_expr,
-            );
-        } else {
-            // Drop partitionValues_parsed since it was added to read schema
-            patch_builder = patch_builder.drop_at([ADD_NAME], PARTITION_VALUES_PARSED_FIELD);
-        }
+    if partition_schema.is_some() && config.write_stats_as_struct {
+        patch_builder = patch_builder.replace_expr_at(
+            [ADD_NAME],
+            PARTITION_VALUES_PARSED_FIELD,
+            build_partition_values_parsed_expr(),
+        );
     }
 
-    patch_builder.build()
+    project_checkpoint_fields(config, patch_builder).build()
+}
+
+/// Selects persisted metadata representations according to checkpoint table properties.
+pub(crate) fn project_checkpoint_fields<'a>(
+    config: &StatsTransformConfig,
+    mut patch: ProjectionStructPatchBuilder<'a>,
+) -> ProjectionStructPatchBuilder<'a> {
+    if !config.write_stats_as_json {
+        patch = patch.drop_at([ADD_NAME], STATS_FIELD);
+    }
+    if !config.write_stats_as_struct {
+        let has_partitions = patch
+            .input_schema()
+            .field_at(&column_name!(ADD_NAME, PARTITION_VALUES_PARSED_FIELD))
+            .is_ok();
+        patch = patch.drop_at([ADD_NAME], STATS_PARSED_FIELD);
+        if has_partitions {
+            patch = patch.drop_at([ADD_NAME], PARTITION_VALUES_PARSED_FIELD);
+        }
+    }
+    patch
 }
 
 /// Builds a read schema that includes `stats_parsed` and optionally `partitionValues_parsed`
@@ -200,11 +209,29 @@ pub(crate) fn build_checkpoint_read_schema(
 /// contain JSON stats, so `stats_parsed` will be null for commit-sourced rows).
 ///
 /// Column paths are relative to the full batch, not the nested Add struct.
-fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
+pub(crate) fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
     Arc::new(Expression::coalesce([
         col!(ADD_NAME, STATS_PARSED_FIELD),
         Expression::parse_json(col!(ADD_NAME, STATS_FIELD), stats_schema.clone()),
     ]))
+}
+
+/// Combines native and parsed JSON stats, checking raw JSON before preferring its parsed value.
+#[cfg(feature = "declarative-plans")]
+pub(crate) fn stats_with_json_fallback(
+    native: Expression,
+    parsed: Expression,
+    prefer_json: bool,
+) -> Expression {
+    if prefer_json {
+        // Parsing NULL JSON can produce an all-null struct, so test the raw value before parsing.
+        Expression::case_when(
+            [(col!(ADD_NAME, STATS_FIELD).is_not_null(), parsed)],
+            native,
+        )
+    } else {
+        Expression::coalesce([native, parsed])
+    }
 }
 
 /// Builds expression: `partitionValues_parsed = COALESCE(partitionValues_parsed,
@@ -227,7 +254,7 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
 /// transformation, while the raw `partitionValues` map remains unchanged.
 ///
 /// Column paths are relative to the full batch, not the nested Add struct.
-fn build_partition_values_parsed_expr() -> ExpressionRef {
+pub(crate) fn build_partition_values_parsed_expr() -> ExpressionRef {
     Arc::new(Expression::coalesce([
         col!(ADD_NAME, PARTITION_VALUES_PARSED_FIELD),
         Expression::map_to_struct(
@@ -241,7 +268,7 @@ fn build_partition_values_parsed_expr() -> ExpressionRef {
 ///
 /// This expression prefers existing JSON stats, falling back to converting stats_parsed.
 /// Column paths are relative to the full batch, not the nested Add struct.
-static STATS_JSON_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
+pub(crate) static STATS_JSON_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
     Arc::new(Expression::coalesce([
         col!(ADD_NAME, STATS_FIELD),
         Expression::unary(

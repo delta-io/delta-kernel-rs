@@ -1,23 +1,123 @@
-//! Reads checkpoint roots and their optional V2 sidecars as one action relation.
+//! Physical action reads with a shared plan/options contract.
 
 use std::sync::LazyLock;
 
 use url::Url;
 
-use super::VERSION;
-use crate::actions::{ADD_NAME, REMOVE_NAME, SIDECAR_FIELD, SIDECAR_NAME, action_presence_leaf};
+use super::{ActionOptions, VERSION, presence_predicate, read_source};
+use crate::actions::{
+    ADD_NAME, ActionKind, Add, LOG_ADD_SCHEMA, REMOVE_NAME, SIDECAR_FIELD, SIDECAR_NAME,
+    get_all_actions_schema,
+};
 use crate::checkpoint::{CheckpointShape, CheckpointType};
-use crate::expressions::{Expression as Expr, Predicate, col, column_name};
+use crate::expressions::{Expression as Expr, col, column_name, lit};
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
-use crate::schema::{SchemaRef, lazy_schema_ref};
-use crate::{KernelResult, PlanBuilder};
+use crate::schema::{DataType, SchemaRef, StructField, lazy_schema_ref};
+use crate::table_configuration::TableConfiguration;
+use crate::{KernelError, KernelResult, PlanBuilder, Version, version_as_i64};
 
-/// Reads inline actions, or file actions from sidecars plus non-file actions from the root.
+/// Reads CRC live adds; retained tombstones and non-file actions are unavailable.
+pub(crate) fn crc_actions(
+    version: Version,
+    files: Vec<Add>,
+    options: &ActionOptions,
+) -> KernelResult<(PlanBuilder, ActionOptions)> {
+    let version = version_as_i64(version)?;
+    let options = ActionOptions {
+        actions: vec![ActionKind::FileActions {
+            includes_removes: false,
+        }],
+        ..options.clone()
+    };
+    read_source(None, &options, &LOG_ADD_SCHEMA, |schema| {
+        PlanBuilder::values(
+            LOG_ADD_SCHEMA.clone(),
+            files.into_iter().map(|add| vec![add.into()]).collect(),
+        )?
+        .project_patch(|patch| {
+            let patch = if schema.field_at(&column_name!(ADD_NAME, "stats")).is_ok() {
+                patch
+            } else {
+                patch.drop_at([ADD_NAME], "stats")
+            };
+            patch.append(StructField::not_null(VERSION, DataType::LONG), lit(version))
+        })
+    })
+}
+
+/// Reads selected checkpoint actions. Non-file reads use the root without sidecar discovery.
+/// File reads require a checkpoint shape; parsed metadata types come from table configuration.
 pub(crate) fn checkpoint_actions(
     segment: &LogSegment,
-    shape: &CheckpointShape,
+    shape: Option<&CheckpointShape>,
+    table_config: Option<&TableConfiguration>,
+    options: &ActionOptions,
+) -> KernelResult<(PlanBuilder, ActionOptions)> {
+    let selection = CheckpointSelection::for_options(options);
+    read_source(
+        table_config,
+        options,
+        shape
+            .and_then(|shape| shape.leaf_checkpoint_schema.as_deref())
+            .unwrap_or(get_all_actions_schema()),
+        |schema| {
+            read_checkpoint(segment, shape, schema.clone(), selection)?
+                .filter(presence_predicate(schema.fields()))
+        },
+    )
+}
+
+/// Reads selected JSON commits strictly newer than the base, with raw metadata for later parsing.
+pub(crate) fn commit_actions(
+    segment: &LogSegment,
+    after_version: Option<Version>,
+    options: &ActionOptions,
+) -> KernelResult<(PlanBuilder, ActionOptions)> {
+    let files = match after_version {
+        Some(version) => segment
+            .segment_after_version(version)
+            .commit_cover_version_tagged_scan_files()?,
+        None => segment.commit_cover_version_tagged_scan_files()?,
+    };
+    read_source(None, options, get_all_actions_schema(), |schema| {
+        PlanBuilder::scan_json(files, &[VERSION], schema.clone())?
+            .filter(presence_predicate(schema.fields()))
+    })
+}
+
+/// Requested portions of a checkpoint; content means add/remove actions stored in V2 sidecars.
+#[derive(Clone, Copy)]
+pub(super) enum CheckpointSelection {
+    ContentOnly,
+    NonContentOnly,
+    Mixed,
+}
+
+impl CheckpointSelection {
+    fn for_options(options: &ActionOptions) -> Self {
+        let content = options
+            .actions
+            .iter()
+            .any(|kind| matches!(kind, ActionKind::FileActions { .. }));
+        let non_content = options
+            .actions
+            .iter()
+            .any(|kind| !matches!(kind, ActionKind::FileActions { .. }));
+        match (content, non_content) {
+            (true, false) => Self::ContentOnly,
+            (false, _) => Self::NonContentOnly,
+            (true, true) => Self::Mixed,
+        }
+    }
+}
+
+/// Reads inline actions, or file actions from sidecars plus non-file actions from the root.
+pub(super) fn read_checkpoint(
+    segment: &LogSegment,
+    shape: Option<&CheckpointShape>,
     schema: SchemaRef,
+    selection: CheckpointSelection,
 ) -> KernelResult<PlanBuilder> {
     let Some((file_type, parts)) = segment.checkpoint_version_tagged_scan_files()? else {
         return PlanBuilder::values(schema, vec![]);
@@ -26,30 +126,37 @@ pub(crate) fn checkpoint_actions(
         FileType::Json => PlanBuilder::scan_json,
         FileType::Parquet => PlanBuilder::scan_parquet,
     };
-    if shape.checkpoint_type != CheckpointType::Manifest {
-        return scan(parts, &[VERSION], schema);
-    }
-    let files = match segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
-        Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema.clone()),
-        None => sidecar_actions(file_type, parts.clone(), schema.clone(), &segment.log_root),
-    }?;
-    let non_file_presence = Predicate::or_from(schema.fields().filter_map(|field| {
-        if [ADD_NAME, REMOVE_NAME, SIDECAR_NAME, "checkpointMetadata"]
-            .contains(&field.name().as_str())
-        {
-            return None;
+    if matches!(
+        selection,
+        CheckpointSelection::ContentOnly | CheckpointSelection::Mixed
+    ) {
+        let shape =
+            shape.ok_or_else(|| KernelError::schema("File reads require a checkpoint shape"))?;
+        // V1 and inline V2 keep file and non-file actions in the same root read.
+        if shape.checkpoint_type != CheckpointType::Manifest {
+            return scan(parts, &[VERSION], schema);
         }
-        action_presence_leaf(field.name())
-            .map(|leaf| Expr::column([field.name().as_str(), leaf]).is_not_null())
-    }));
-    // File-only scans do not need the manifest's non-file actions.
-    if non_file_presence == Predicate::FALSE {
-        return Ok(files);
     }
-    PlanBuilder::union_all([
-        files,
-        scan(parts, &[VERSION], schema)?.filter(non_file_presence)?,
-    ])
+    let read_content =
+        |parts, schema| match segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
+            Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
+            None => sidecar_actions(file_type, parts, schema, &segment.log_root),
+        };
+    match selection {
+        CheckpointSelection::ContentOnly => read_content(parts, schema),
+        CheckpointSelection::NonContentOnly => scan(parts, &[VERSION], schema),
+        CheckpointSelection::Mixed => {
+            let non_file_presence = presence_predicate(
+                schema
+                    .fields()
+                    .filter(|field| !matches!(field.name().as_str(), ADD_NAME | REMOVE_NAME)),
+            );
+            PlanBuilder::union_all([
+                read_content(parts.clone(), schema.clone())?,
+                scan(parts, &[VERSION], schema)?.filter(non_file_presence)?,
+            ])
+        }
+    }
 }
 
 /// Read actions from V2 checkpoint sidecars.

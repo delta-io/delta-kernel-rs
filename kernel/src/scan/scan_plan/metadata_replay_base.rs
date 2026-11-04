@@ -66,6 +66,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::action_reconciliation::plan::ReplayStrategy;
     use crate::crc::Crc;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::test_delegating::DelegatingEngine;
@@ -121,6 +122,8 @@ mod tests {
         #[case] target_version: Version,
         #[case] empty_crc: bool,
         #[case] expected_rows: usize,
+        #[values(ReplayStrategy::AggregateAll, ReplayStrategy::AggregateTailAndAntiJoin)]
+        strategy: ReplayStrategy,
     ) -> KernelResult<()> {
         let (engine, latest, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
@@ -147,9 +150,14 @@ mod tests {
         let config = target.table_configuration().clone();
         let snapshot = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?);
         let scan = snapshot.scan_builder().build()?;
-        let plan = scan.declarative_metadata_scan_plan(
+        let mut planner = MetadataPlanner::try_new(&scan)?;
+        planner.replay_strategy = strategy;
+        let base = MetadataReplayBase::try_new(
+            &scan.snapshot,
             &DelegatingEngine::new(engine.clone()).without_plan_executor(),
+            &planner,
         )?;
+        let plan = scan.build_metadata_scan_plan_with(base, &planner)?;
         if expected_rows == 0 {
             assert!(plan.is_none());
             return Ok(());

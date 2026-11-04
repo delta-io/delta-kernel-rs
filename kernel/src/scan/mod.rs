@@ -1392,12 +1392,6 @@ impl Scan {
         self.build_metadata_scan_plan_with(base, &planner)
     }
 
-    #[cfg(feature = "declarative-plans")]
-    /// Whether JSON stats synthesis requires the checkpoint's collation stats schema.
-    fn needs_collation_stats_schema(&self) -> bool {
-        self.stats.synthesize_json && self.snapshot.table_configuration().has_collations_feature()
-    }
-
     // Factored out to facilitate testing
     fn replay_for_scan_metadata(
         &self,

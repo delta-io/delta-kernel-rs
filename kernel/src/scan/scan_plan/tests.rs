@@ -99,7 +99,24 @@ pub(super) fn declarative_metadata(
     scan: &Scan,
     engine: &dyn Engine,
 ) -> KernelResult<Vec<RecordBatch>> {
-    let Some(plan) = scan.declarative_metadata_scan_plan(engine)? else {
+    declarative_metadata_with_strategy(scan, engine, ReplayStrategy::AggregateTailAndAntiJoin)
+}
+
+fn declarative_metadata_with_strategy(
+    scan: &Scan,
+    engine: &dyn Engine,
+    strategy: ReplayStrategy,
+) -> KernelResult<Vec<RecordBatch>> {
+    let plan = match strategy {
+        ReplayStrategy::AggregateTailAndAntiJoin => scan.declarative_metadata_scan_plan(engine)?,
+        ReplayStrategy::AggregateAll => {
+            let mut planner = MetadataPlanner::try_new(scan)?;
+            planner.replay_strategy = strategy;
+            let base = MetadataReplayBase::try_new(&scan.snapshot, engine, &planner)?;
+            scan.build_metadata_scan_plan_with(base, &planner)?
+        }
+    };
+    let Some(plan) = plan else {
         return Ok(vec![]);
     };
     let output_schema: ArrowSchema = plan.schema.as_ref().try_into_arrow()?;
@@ -228,6 +245,8 @@ fn declarative_metadata_matches_imperative_scan(
         Some(col!("id").is_not_null())
     )]
     predicate: Option<Pred>,
+    #[values(ReplayStrategy::AggregateAll, ReplayStrategy::AggregateTailAndAntiJoin)]
+    strategy: ReplayStrategy,
 ) -> KernelResult<()> {
     let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
     let predicate = predicate.map(Arc::new);
@@ -252,7 +271,7 @@ fn declarative_metadata_matches_imperative_scan(
         None => declarative_builder,
     };
     let scan = declarative_builder.build()?;
-    let actual = declarative_metadata(&scan, engine.as_ref())?;
+    let actual = declarative_metadata_with_strategy(&scan, engine.as_ref(), strategy)?;
 
     if table.contains("struct-stats-only") {
         assert_metadata_eq(
@@ -310,6 +329,8 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
 fn declarative_metadata_matches_imperative_across_stats_options(
     #[case] stats: StatsOptions,
     #[case] expected_stats_field_groups: &[&[&str]],
+    #[values(ReplayStrategy::AggregateAll, ReplayStrategy::AggregateTailAndAntiJoin)]
+    strategy: ReplayStrategy,
 ) -> KernelResult<()> {
     let (engine, snapshot, _tempdir) = load_test_table("parsed-stats")?;
     let struct_stats = stats.struct_stats.clone();
@@ -333,7 +354,7 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         .with_partition_values(PartitionValuesOptions::with_struct())
         .with_predicate(predicate);
     let scan = builder.build()?;
-    let actual = declarative_metadata(&scan, engine.as_ref())?;
+    let actual = declarative_metadata_with_strategy(&scan, engine.as_ref(), strategy)?;
     let actual_fields = leaf_paths(&actual);
     let imperative_fields = leaf_paths(&expected);
     let unexpected_fields: Vec<_> = actual_fields
@@ -1131,8 +1152,11 @@ fn expected_stats_row(id: i64, partition: i32) -> String {
     )
 }
 
-#[test]
-fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> KernelResult<()> {
+#[rstest]
+fn declarative_metadata_reconciles_checkpoint_with_later_commits(
+    #[values(ReplayStrategy::AggregateAll, ReplayStrategy::AggregateTailAndAntiJoin)]
+    strategy: ReplayStrategy,
+) -> KernelResult<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(4).with_checkpoint_at([2]))
         .build()
@@ -1156,20 +1180,23 @@ fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> KernelResu
         .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
-    let actual = declarative_metadata(&scan, &engine)?;
+    let actual = declarative_metadata_with_strategy(&scan, &engine, strategy)?;
 
     assert_metadata_eq(&actual, &expected, "checkpoint with later commits")
 }
 
-#[test]
-fn declarative_metadata_pruning_keeps_remove_for_checkpoint_reconciliation() -> KernelResult<()> {
+#[rstest]
+fn declarative_metadata_pruning_keeps_remove_for_checkpoint_reconciliation(
+    #[values(ReplayStrategy::AggregateAll, ReplayStrategy::AggregateTailAndAntiJoin)]
+    strategy: ReplayStrategy,
+) -> KernelResult<()> {
     let (engine, snapshot, _tempdir) = load_test_table("with_checkpoint_no_last_checkpoint")?;
     let scan = snapshot
         .scan_builder()
         .with_predicate(Arc::new(col!("int").gt(lit(0i64))))
         .with_stats(StatsOptions::all_struct())
         .build()?;
-    let actual = declarative_metadata(&scan, engine.as_ref())?;
+    let actual = declarative_metadata_with_strategy(&scan, engine.as_ref(), strategy)?;
     let formatted = pretty_format_batches(&actual)?.to_string();
 
     assert_eq!(metadata_row_count(&actual), 1, "{formatted}");

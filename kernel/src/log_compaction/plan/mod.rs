@@ -1,12 +1,13 @@
 //! Declarative reconciliation of a bounded commit interval.
 
-use crate::action_reconciliation::plan::{ActionReplay, ReplayGroup, VERSION};
-use crate::actions::{ADD_NAME, REMOVE_NAME};
+use crate::action_reconciliation::plan::sources::commit_actions;
+use crate::action_reconciliation::plan::{ActionOptions, VERSION, replay_commits};
+use crate::actions::{ADD_NAME, ActionKind, REMOVE_NAME};
 use crate::expressions::lit;
 use crate::log_segment::LogSegment;
 use crate::plans::Plan;
 use crate::table_features::TableFeature;
-use crate::{Engine, KernelError, KernelResult, PlanBuilder, Snapshot, Version};
+use crate::{Engine, KernelError, KernelResult, Snapshot, Version};
 
 impl Snapshot {
     /// Builds the rows for a JSON log compaction of `[start_version, end_version]` (inclusive).
@@ -43,24 +44,28 @@ impl Snapshot {
             Some(end_version),
         )?;
         segment.validate_published()?;
-        let replay = ActionReplay::new(&[
-            ReplayGroup::Files,
-            ReplayGroup::Protocol,
-            ReplayGroup::Metadata,
-            ReplayGroup::Transactions,
-            ReplayGroup::Domains,
-        ]);
-        let commits = PlanBuilder::scan_json(
-            segment.commit_cover_version_tagged_scan_files()?,
-            &[VERSION],
-            replay.read_schema()?,
-        )?;
-        replay
-            .replay_commits(commits)?
+        let options = ActionOptions {
+            actions: vec![
+                ActionKind::FileActions {
+                    includes_removes: true,
+                },
+                ActionKind::Protocol,
+                ActionKind::Metadata,
+                ActionKind::SetTransaction,
+                ActionKind::DomainMetadata,
+            ],
+            json_stats: true,
+            parsed_stats: None,
+            parsed_partition_values: false,
+        };
+        let commits = commit_actions(&segment, None, &options)?;
+        replay_commits(commits)?
+            .0
             .project_patch(|patch| {
                 patch
                     .replace_expr_at([ADD_NAME], "dataChange", lit(false))
                     .replace_expr_at([REMOVE_NAME], "dataChange", lit(false))
+                    .drop(VERSION)
             })?
             .build()
     }
