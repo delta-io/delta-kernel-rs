@@ -346,6 +346,8 @@ mod tests {
         let shrunk_layout = Layout::from_size_align(32, 8).unwrap();
         let zeroed_layout = Layout::from_size_align(16, 8).unwrap();
 
+        // SAFETY: checked allocations are reallocated or freed with their current layout;
+        // zeroed reads stay within the allocation.
         unsafe {
             let ptr = allocator.alloc(initial_layout);
             assert!(!ptr.is_null());
@@ -551,13 +553,16 @@ mod tests {
                 let allocator = Arc::clone(&allocator);
                 let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
+                    // SAFETY: layout is valid and nonzero.
                     let ptr = unsafe { allocator.alloc(layout) };
                     assert!(!ptr.is_null());
                     barrier.wait();
                     barrier.wait();
+                    // SAFETY: ptr is non-null, live, and freed once with its allocation layout.
                     unsafe { allocator.dealloc(ptr, layout) };
                     barrier.wait();
                     for _ in 0..32 {
+                        // SAFETY: each checked allocation is freed once with its allocation layout.
                         unsafe {
                             let ptr = allocator.alloc(layout);
                             assert!(!ptr.is_null());
