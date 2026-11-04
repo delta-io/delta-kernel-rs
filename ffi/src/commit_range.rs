@@ -11,8 +11,8 @@ use crate::engine_funcs::{ExclusiveFileReadResultIterator, FileReadResultIterato
 use crate::handle::Handle;
 use crate::log_path::{FfiLogPath, LogPathArray};
 use crate::{
-    unwrap_and_parse_path_as_url, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
-    NullableCvoid, SharedExternEngine, SharedSnapshot,
+    ExternEngine, ExternResult, IntoExternResult, KernelStringSlice, NullableCvoid,
+    SharedExternEngine, SharedSnapshot, unwrap_and_parse_path_as_url,
 };
 
 /// An opaque, shared handle owning a [`CommitRange`] produced by
@@ -665,24 +665,24 @@ mod tests {
     use std::ptr::NonNull;
     use std::sync::Arc;
 
-    use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::KernelResult;
+    use delta_kernel::object_store::memory::InMemory;
     use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
-    use test_utils::{actions_to_string, add_commit, TestAction};
+    use test_utils::{TestAction, actions_to_string, add_commit};
 
     use super::*;
     use crate::engine_data::engine_data_length;
     use crate::engine_funcs::{free_read_result_iter, read_result_next};
     use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
-        assert_extern_result_error_with_message, assert_timestamp_is_recent, build_snapshot,
-        error_only_engine_handle, ok_or_panic, TEST_ERROR_ALLOCATORS,
+        TEST_ERROR_ALLOCATORS, assert_extern_result_error_with_message, assert_timestamp_is_recent,
+        build_snapshot, error_only_engine_handle, ok_or_panic,
     };
     use crate::log_path::LogPathArray;
     use crate::{
-        engine_to_handle, free_engine, free_engine_data, free_snapshot, kernel_string_slice,
-        ExclusiveEngineData, TryFromStringSlice,
+        ExclusiveEngineData, TryFromStringSlice, engine_to_handle, free_engine, free_engine_data,
+        free_snapshot, kernel_string_slice,
     };
 
     /// Build an in-memory engine handle pre-loaded with a metadata-only commit at each version in

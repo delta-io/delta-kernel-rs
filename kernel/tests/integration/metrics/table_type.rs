@@ -12,8 +12,8 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{Engine, KernelResult, Snapshot};
 use rstest::rstest;
 use test_utils::{
-    add_commit, engine_store_setup, insert_data_with, install_thread_local_metrics_reporter,
-    test_table_setup_mt, CapturingReporter, TestCatalogCommitter,
+    CapturingReporter, TestCatalogCommitter, add_commit, engine_store_setup, insert_data_with,
+    install_thread_local_metrics_reporter, test_table_setup_mt,
 };
 
 use super::simple_schema;

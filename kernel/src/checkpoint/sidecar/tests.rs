@@ -7,24 +7,24 @@ use url::Url;
 use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState,
 };
-use crate::actions::{Add, ADD_NAME, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
+use crate::actions::{ADD_NAME, Add, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StructArray};
 use crate::arrow::datatypes::{ArrowPrimitiveType, Int32Type, Int64Type};
+use crate::checkpoint::CheckpointWriter;
 use crate::checkpoint::sidecar::{SidecarSplitter, SingleSidecarDataIterator};
 use crate::checkpoint::tests::{
     create_add_action, create_metadata_action, create_metadata_with_stats_config_and_partitions,
     create_remove_action, create_v2_checkpoint_protocol_action, new_in_memory_store,
     write_commit_to_store,
 };
-use crate::checkpoint::CheckpointWriter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::sync::SyncEngine;
+use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
-use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use crate::schema::{schema, schema_ref, DataType, StructType};
+use crate::schema::{DataType, StructType, schema, schema_ref};
 use crate::unit_test_utils::Action;
 use crate::{Engine, EngineData, KernelResult, Snapshot};
 
@@ -200,50 +200,50 @@ fn verify_non_file_batches(batches: &[Box<dyn EngineData>], expected: &ExpectedN
         let rb = arrow.record_batch();
         for row in 0..rb.num_rows() {
             let mut has_non_file_action = false;
-            if let Some(col) = rb.column_by_name("protocol") {
-                if col.is_valid(row) {
-                    has_non_file_action = true;
-                    protocol_count += 1;
-                    let parent_struct = col.as_struct();
-                    let reader_v =
-                        struct_field_value::<Int32Type>(parent_struct, "minReaderVersion", row);
-                    let writer_v =
-                        struct_field_value::<Int32Type>(parent_struct, "minWriterVersion", row);
-                    assert_eq!(
-                        reader_v, expected.reader_version,
-                        "protocol minReaderVersion mismatch"
-                    );
-                    assert_eq!(
-                        writer_v, expected.writer_version,
-                        "protocol minWriterVersion mismatch"
-                    );
-                }
+            if let Some(col) = rb.column_by_name("protocol")
+                && col.is_valid(row)
+            {
+                has_non_file_action = true;
+                protocol_count += 1;
+                let parent_struct = col.as_struct();
+                let reader_v =
+                    struct_field_value::<Int32Type>(parent_struct, "minReaderVersion", row);
+                let writer_v =
+                    struct_field_value::<Int32Type>(parent_struct, "minWriterVersion", row);
+                assert_eq!(
+                    reader_v, expected.reader_version,
+                    "protocol minReaderVersion mismatch"
+                );
+                assert_eq!(
+                    writer_v, expected.writer_version,
+                    "protocol minWriterVersion mismatch"
+                );
             }
 
-            if let Some(col) = rb.column_by_name("metaData") {
-                if col.is_valid(row) {
-                    has_non_file_action = true;
-                    metadata_count += 1;
-                    let ms = col.as_struct();
-                    assert_eq!(
-                        struct_field_string(ms, "name", row),
-                        expected.table_name,
-                        "metadata name mismatch"
-                    );
-                }
+            if let Some(col) = rb.column_by_name("metaData")
+                && col.is_valid(row)
+            {
+                has_non_file_action = true;
+                metadata_count += 1;
+                let ms = col.as_struct();
+                assert_eq!(
+                    struct_field_string(ms, "name", row),
+                    expected.table_name,
+                    "metadata name mismatch"
+                );
             }
 
-            if let Some(col) = rb.column_by_name("checkpointMetadata") {
-                if col.is_valid(row) {
-                    has_non_file_action = true;
-                    checkpoint_metadata_count += 1;
-                    let cs = col.as_struct();
-                    let version = struct_field_value::<Int64Type>(cs, "version", row);
-                    assert_eq!(
-                        version, expected.checkpoint_version,
-                        "checkpointMetadata version mismatch"
-                    );
-                }
+            if let Some(col) = rb.column_by_name("checkpointMetadata")
+                && col.is_valid(row)
+            {
+                has_non_file_action = true;
+                checkpoint_metadata_count += 1;
+                let cs = col.as_struct();
+                let version = struct_field_value::<Int64Type>(cs, "version", row);
+                assert_eq!(
+                    version, expected.checkpoint_version,
+                    "checkpointMetadata version mismatch"
+                );
             }
 
             if let Some(add_col) = rb.column_by_name("add") {

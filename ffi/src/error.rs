@@ -88,6 +88,7 @@ pub enum FFIKernelError {
     MaxCatalogVersionError = 53,
     TableAlreadyExistsAtPath = 54,
     CommitRangeError = 55,
+    InvalidIntervalError = 56,
 }
 
 impl From<KernelError> for FFIKernelError {
@@ -145,6 +146,7 @@ impl From<&KernelError> for FFIKernelError {
             }
             KernelError::InvalidTableLocation(_) => FFIKernelError::InvalidTableLocationError,
             KernelError::InvalidDecimal(_) => FFIKernelError::InvalidDecimalError,
+            KernelError::InvalidInterval(_) => FFIKernelError::InvalidIntervalError,
             KernelError::InvalidGeoParams(_) => FFIKernelError::InvalidGeoParamsError,
             KernelError::InvalidStructData(_) => FFIKernelError::InvalidStructDataError,
             KernelError::InternalError(_) => FFIKernelError::InternalError,
@@ -341,6 +343,7 @@ impl From<EngineExecError> for KernelError {
             }
             FFIKernelError::InvalidTableLocationError => KernelError::InvalidTableLocation(message),
             FFIKernelError::InvalidDecimalError => KernelError::InvalidDecimal(message),
+            FFIKernelError::InvalidIntervalError => KernelError::InvalidInterval(message),
             FFIKernelError::InvalidGeoParamsError => KernelError::InvalidGeoParams(message),
             FFIKernelError::InvalidStructDataError => KernelError::InvalidStructData(message),
             FFIKernelError::InvalidExpression => KernelError::InvalidExpressionEvaluation(message),
@@ -566,6 +569,18 @@ mod error_code_tests {
             err,
             KernelError::TableAlreadyExistsAtPath(path) if path == "memory:///table"
         ));
+    }
+
+    #[test]
+    fn invalid_interval_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            FFIKernelError::from(KernelError::InvalidInterval("invalid".to_string())),
+            FFIKernelError::InvalidIntervalError
+        );
+        assert_eq!(FFIKernelError::InvalidIntervalError as i32, 56);
+
+        let err: KernelError = exec_error(FFIKernelError::InvalidIntervalError, "invalid").into();
+        assert!(matches!(err, KernelError::InvalidInterval(message) if message == "invalid"));
     }
 }
 

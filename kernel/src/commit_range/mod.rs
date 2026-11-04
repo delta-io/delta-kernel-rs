@@ -61,15 +61,15 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::actions::{
-    Metadata, Protocol, ADD_FIELD, CDC_FIELD, CHECKPOINT_METADATA_FIELD, COMMIT_INFO_FIELD,
-    DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
+    ADD_FIELD, CDC_FIELD, CHECKPOINT_METADATA_FIELD, COMMIT_INFO_FIELD, DOMAIN_METADATA_FIELD,
+    METADATA_FIELD, Metadata, PROTOCOL_FIELD, Protocol, REMOVE_FIELD, SET_TRANSACTION_FIELD,
     SIDECAR_FIELD,
 };
 use crate::path::ParsedLogPath;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
 use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Version};
 
@@ -136,7 +136,9 @@ impl CommitRange {
     /// [`CommitOrdering::AscendingOrder`].
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn commit_files(&self) -> KernelResult<impl KernelResultIterator<ParsedLogPath>> {
+    pub(crate) fn commit_files(
+        &self,
+    ) -> KernelResult<impl KernelResultIterator<ParsedLogPath> + use<>> {
         require!(
             self.supports_commit_files,
             KernelError::CommitRange(
@@ -181,7 +183,7 @@ impl CommitRange {
         engine: Arc<dyn Engine>,
         start_snapshot: Option<SnapshotRef>,
         actions: &[DeltaAction],
-    ) -> KernelResult<impl KernelResultIterator<CommitAction>> {
+    ) -> KernelResult<impl KernelResultIterator<CommitAction> + use<>> {
         require!(
             self.supports_commit_actions,
             KernelError::CommitRange(
@@ -427,17 +429,17 @@ mod tests {
     use test_utils::{add_commit, assert_result_error_with_message};
 
     use super::*;
+    use crate::Snapshot;
     use crate::actions::visitors::{AddVisitor, RemoveVisitor};
     use crate::actions::{Add, Remove};
     use crate::arrow::array::{Array, AsArray, MapArray, StringArray, StructArray};
+    use crate::engine::CancellableEngine;
     use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
     use crate::engine::sync::SyncEngine;
-    use crate::engine::CancellableEngine;
     use crate::engine_data::RowVisitor;
     use crate::object_store::memory::InMemory;
     use crate::unit_test_utils::TestCancellationToken;
     use crate::utils::FoldWithOption as _;
-    use crate::Snapshot;
 
     /// Open a `CommitRange` over `table-with-dv-small` with a matching anchor snapshot.
     /// `start_version` drives both the range's start version and the snapshot's version.

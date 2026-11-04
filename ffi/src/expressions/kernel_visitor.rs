@@ -2,19 +2,19 @@
 //! engine's native expressions into kernel's [`Expression`] and [`Predicate`] types.
 use std::sync::Arc;
 
+use delta_kernel::KernelResult;
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
 use delta_kernel::expressions::{
-    lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
-    JunctionPredicateOp, Predicate, Scalar, UnaryPredicateOp,
+    BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp, Predicate,
+    Scalar, UnaryPredicateOp, lit, null_lit,
 };
 use delta_kernel::schema::{DataType, PrimitiveType};
-use delta_kernel::KernelResult;
 
 #[cfg(feature = "default-engine-base")]
-use crate::expressions::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
-#[cfg(feature = "default-engine-base")]
 use crate::expressions::FfiOpaquePredicateOp;
+#[cfg(feature = "default-engine-base")]
+use crate::expressions::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
 use crate::expressions::{FfiMapToStructOptions, SharedExpression, SharedPredicate};
 use crate::handle::Handle;
 use crate::scan::{EngineExpression, EnginePredicate};
@@ -397,13 +397,15 @@ pub extern "C" fn visit_expression_literal_timestamp_ntz(
     wrap_expression(state, lit(Scalar::TimestampNtz(value)))
 }
 
-/// Visit an interval year-month literal (signed month count).
+/// Registers a `YEAR TO MONTH` literal containing `value` total months in `state`.
+///
+/// Returns its expression ID. Every `i32` month count is valid.
 #[unsafe(no_mangle)]
 pub extern "C" fn visit_expression_literal_interval_year_month(
     state: &mut KernelExpressionVisitorState,
     value: i32,
 ) -> usize {
-    wrap_expression(state, lit(Scalar::IntervalYearMonth(value)))
+    wrap_expression(state, lit(Scalar::IntervalYearMonth(value.into())))
 }
 
 /// Visit an interval day-time literal (signed microsecond count).
@@ -565,7 +567,7 @@ impl NullTypeTag {
                 PrimitiveType::Date => (Self::Date, 0, 0),
                 PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
                 PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
-                PrimitiveType::IntervalYearMonth => (Self::IntervalYearMonth, 0, 0),
+                PrimitiveType::IntervalYearMonth(_) => (Self::IntervalYearMonth, 0, 0),
                 PrimitiveType::IntervalDayTime => (Self::IntervalDayTime, 0, 0),
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
                 // Void has no dedicated FFI tag. The current predicate-construction path is
@@ -908,8 +910,8 @@ fn visit_predicate_opaque_with_eval_impl(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use delta_kernel::expressions::{col, lit, MapToStructOptions, Scalar};
-    use delta_kernel::schema::{schema, ArrayType, DataType, MapType};
+    use delta_kernel::expressions::{MapToStructOptions, Scalar, col, lit};
+    use delta_kernel::schema::{ArrayType, DataType, IntervalYearToMonthType, MapType, schema};
     use rstest::rstest;
 
     use super::*;
@@ -1050,6 +1052,14 @@ mod tests {
     }
 
     #[test]
+    fn interval_year_month_null_tag_reconstructs_full_range() {
+        assert_eq!(
+            NullTypeTag::IntervalYearMonth.to_data_type(0, 0).unwrap(),
+            DataType::INTERVAL_YEAR_MONTH
+        );
+    }
+
+    #[test]
     fn to_data_type_decimal() {
         let dt = NullTypeTag::Decimal.to_data_type(10, 2).unwrap();
         assert_eq!(dt, DataType::decimal(10, 2).unwrap());
@@ -1175,19 +1185,19 @@ mod tests {
     }
 
     #[rstest]
-    #[case(Scalar::IntervalYearMonth(17))]
+    #[case(Scalar::interval_year_month(17, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
     #[case(Scalar::IntervalDayTime(1_234_567))]
-    #[case(Scalar::IntervalYearMonth(-13))]
-    #[case(Scalar::IntervalYearMonth(i32::MIN))]
-    #[case(Scalar::IntervalYearMonth(i32::MAX))]
+    #[case(Scalar::interval_year_month(-13, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
+    #[case(Scalar::interval_year_month(i32::MIN, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
+    #[case(Scalar::interval_year_month(i32::MAX, IntervalYearToMonthType::IntervalYearToMonth).unwrap())]
     #[case(Scalar::IntervalDayTime(-86_400_000_000))]
     #[case(Scalar::IntervalDayTime(i64::MIN))]
     #[case(Scalar::IntervalDayTime(i64::MAX))]
     fn interval_literal_visitors_build_interval_scalars(#[case] expected: Scalar) {
         let mut state = KernelExpressionVisitorState::default();
         let id = match expected {
-            Scalar::IntervalYearMonth(value) => {
-                visit_expression_literal_interval_year_month(&mut state, value)
+            Scalar::IntervalYearMonth(ref value) => {
+                visit_expression_literal_interval_year_month(&mut state, value.months())
             }
             Scalar::IntervalDayTime(value) => {
                 visit_expression_literal_interval_day_time(&mut state, value)
@@ -1339,7 +1349,7 @@ mod tests {
 
     use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
-        assert_extern_result_error_with_message, ok_or_panic, TEST_ERROR_ALLOCATORS,
+        TEST_ERROR_ALLOCATORS, assert_extern_result_error_with_message, ok_or_panic,
     };
     use crate::kernel_string_slice;
 
@@ -1457,16 +1467,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn opaque_predicate_prunes_files_end_to_end() {
         use std::ffi::c_void;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use delta_kernel::arrow::array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
+        use delta_kernel::Snapshot;
+        use delta_kernel::arrow::array::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
         use delta_kernel::arrow::array::{
             Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, StructArray,
         };
         use delta_kernel::object_store::memory::InMemory;
         use delta_kernel::scan::state::ScanFile;
-        use delta_kernel::Snapshot;
         use delta_kernel_default_engine::DefaultEngineBuilder;
         use test_utils::add_commit;
 
@@ -1616,11 +1626,11 @@ mod tests {
         use std::ffi::c_void;
         use std::sync::Arc;
 
-        use delta_kernel::arrow::array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
+        use delta_kernel::Snapshot;
+        use delta_kernel::arrow::array::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
         use delta_kernel::arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, StructArray};
         use delta_kernel::object_store::memory::InMemory;
         use delta_kernel::scan::state::ScanFile;
-        use delta_kernel::Snapshot;
         use delta_kernel_default_engine::DefaultEngineBuilder;
         use test_utils::add_commit;
 

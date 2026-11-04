@@ -8,12 +8,23 @@ use url::Url;
 /// Encodes manifest deletion vector positions as a Mumbling bitmap.
 pub(crate) use crate::content_tree::mumbling::tests::encode_positions as mumbling_bitmap;
 use crate::content_tree::{
-    ContentTreeNodeEntry, DataContentType, DataFileFormat, ManifestInfo, TrackingInfo,
-    TrackingStatus, AMT_FORMAT_VERSION,
+    AMT_FORMAT_VERSION, ContentTreeNodeEntry, DataContentType, DataFileFormat, DeletionVectorInfo,
+    ManifestInfo, TrackingInfo, TrackingStatus,
 };
 use crate::expressions::{Scalar, StructData};
 use crate::schema::ToSchema as _;
 use crate::{Engine, EngineData, FileMeta};
+
+/// A valid relative AMT deletion vector, convertible to a `DeletionVectorDescriptor`.
+pub(crate) fn test_dv_info() -> DeletionVectorInfo {
+    DeletionVectorInfo {
+        location: "dv.bin".to_string(),
+        offset: 1,
+        size_in_bytes: 48,
+        cardinality: 6,
+        key_metadata: None,
+    }
+}
 
 /// A minimal-root `Data`/`Added` entry with the given path, size, and row-tracking numbers.
 pub(crate) fn added_data_entry(
@@ -44,6 +55,7 @@ pub(crate) fn added_data_entry(
         record_count: num_records,
         file_size_in_bytes: size,
         content_stats: None,
+        tight_stats: None,
         manifest_info: None,
         key_metadata: None,
         split_offsets: None,
@@ -137,10 +149,15 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
 
+    /// Covers `tight_stats` as `Some(true)`, `Some(false)`, and `None`.
     fn manifest_entries() -> Vec<ContentTreeNodeEntry> {
+        let mut tight = added_data_entry("a.parquet", 100, 10, 0, 5);
+        tight.tight_stats = Some(true);
+        let mut loose = added_data_entry("b.parquet", 200, 20, 10, 5);
+        loose.tight_stats = Some(false);
         vec![
-            added_data_entry("a.parquet", 100, 10, 0, 5),
-            added_data_entry("b.parquet", 200, 20, 10, 5),
+            tight,
+            loose,
             data_manifest_entry("leaf.parquet", 300, TrackingStatus::Existing),
         ]
     }

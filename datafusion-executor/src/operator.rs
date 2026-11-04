@@ -17,9 +17,9 @@ use datafusion::common::{DFSchema, DataFusionError, NullEquality, Result as DFRe
 use datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
 use datafusion::functions_aggregate::first_last::first_value_udaf;
 use datafusion::logical_expr::{
-    col as df_col, lit as df_lit, Aggregate as DFAggregate, EmptyRelation, Expr as DFExpr,
-    ExprFunctionExt, ExprSchemable, Filter as DFFilter, Join as DFJoin, JoinConstraint, JoinType,
-    LogicalPlan as DFLogicalPlan, LogicalPlanBuilder, Projection as DFProjection, Union as DFUnion,
+    Aggregate as DFAggregate, EmptyRelation, Expr as DFExpr, ExprFunctionExt, ExprSchemable,
+    Filter as DFFilter, Join as DFJoin, JoinConstraint, JoinType, LogicalPlan as DFLogicalPlan,
+    LogicalPlanBuilder, Projection as DFProjection, Union as DFUnion, col as df_col, lit as df_lit,
 };
 use delta_kernel::engine::arrow_conversion::{TryIntoArrow, TryIntoKernel};
 use delta_kernel::expressions::{ColumnName as KernelColumnName, Scalar as KernelScalar};
@@ -379,20 +379,21 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::ScalarValue as DFScalarValue;
-    use datafusion::logical_expr::{col as df_col, Case};
+    use datafusion::logical_expr::{Case, col as df_col};
     use datafusion::prelude::SessionContext;
     use datafusion::{assert_batches_eq, assert_batches_sorted_eq};
+    use delta_kernel::PlanBuilder;
     use delta_kernel::expressions::{
-        col, column_name, lit as kernel_lit, null_lit, ArrayData as KernelArrayData,
-        BinaryPredicateOp as KernelBinaryPredicateOp, Expression as KernelExpr, ExpressionRef,
-        ExpressionStructPatchBuilder, JunctionPredicateOp as KernelJunctionPredicateOp,
-        MapData as KernelMapData, Predicate as KernelPredicate, StructData as KernelStructData,
+        ArrayData as KernelArrayData, BinaryPredicateOp as KernelBinaryPredicateOp,
+        Expression as KernelExpr, ExpressionRef, ExpressionStructPatchBuilder,
+        JunctionPredicateOp as KernelJunctionPredicateOp, MapData as KernelMapData,
+        Predicate as KernelPredicate, StructData as KernelStructData, col, column_name,
+        lit as kernel_lit, null_lit,
     };
     use delta_kernel::schema::{
-        schema, ArrayType, DataType, MapType, SchemaRef, StructField, StructType,
+        ArrayType, DataType, MapType, SchemaRef, StructField, StructType, schema,
     };
     use delta_kernel::struct_patch::ProjectionStructPatchBuilder;
-    use delta_kernel::PlanBuilder;
     use rstest::rstest;
 
     use super::*;

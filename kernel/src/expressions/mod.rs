@@ -6,24 +6,27 @@ use std::sync::Arc;
 
 use derive_more::From;
 use itertools::Itertools;
-use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
 
 #[doc(hidden)]
 pub use self::column_names::{__require_valid_simple_column_segment, column_expr};
 pub use self::column_names::{
-    col, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
-    ColumnName,
+    ColumnName, col, column_expr_ref, column_name, column_pred, joined_column_expr,
+    joined_column_name,
 };
 #[doc(inline)]
 pub use self::macros::expr;
-pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
+pub(crate) use self::scalars::MONTHS_PER_YEAR;
+pub use self::scalars::{
+    ArrayData, DecimalData, IntervalYearMonthData, MapData, Scalar, StructData,
+};
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
 use crate::schema::SchemaRef;
 pub use crate::struct_patch::{ExpressionFieldPatch, ExpressionStructPatch};
-use crate::transforms::{transform_output_type, ExpressionTransform};
+use crate::transforms::{ExpressionTransform, transform_output_type};
 use crate::utils::CollectInto;
 use crate::{DataType, DynPartialEq, KernelError, KernelResult};
 
@@ -1391,11 +1394,11 @@ impl<'a> ExpressionTransform<'a> for GetColumnReferences<'a> {
 mod tests {
     use std::fmt::Debug;
 
-    use serde::de::DeserializeOwned;
     use serde::Serialize;
+    use serde::de::DeserializeOwned;
 
     use super::{
-        col, column_pred, lit, DataType, Expression as Expr, MapToStructOptions, Predicate as Pred,
+        DataType, Expression as Expr, MapToStructOptions, Predicate as Pred, col, column_pred, lit,
     };
 
     /// Helper function to verify roundtrip serialization/deserialization
@@ -1507,9 +1510,9 @@ mod tests {
         use super::assert_roundtrip;
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
-            col, column_name, lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
-            Expression, ExpressionStructPatchBuilder, MapToStructOptions, Predicate, Scalar,
-            UnaryExpressionOp,
+            BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
+            ExpressionStructPatchBuilder, MapToStructOptions, Predicate, Scalar, UnaryExpressionOp,
+            col, column_name, lit, null_lit,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
         use crate::unit_test_utils::assert_result_error_with_message;
@@ -1906,8 +1909,8 @@ mod tests {
 
         #[test]
         fn test_opaque_expression_serialize_fails() {
-            use crate::expressions::{OpaqueExpressionOp, ScalarExpressionEvaluator};
             use crate::KernelResult;
+            use crate::expressions::{OpaqueExpressionOp, ScalarExpressionEvaluator};
 
             #[derive(Debug, PartialEq)]
             struct TestOpaqueExprOp;
@@ -1932,12 +1935,12 @@ mod tests {
 
         #[test]
         fn test_opaque_predicate_serialize_fails() {
+            use crate::KernelResult;
             use crate::expressions::{OpaquePredicateOp, ScalarExpressionEvaluator};
             use crate::kernel_predicates::{
                 DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
                 IndirectDataSkippingPredicateEvaluator,
             };
-            use crate::KernelResult;
 
             #[derive(Debug, PartialEq)]
             struct TestOpaquePredOp;

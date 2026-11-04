@@ -13,24 +13,24 @@ use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, Scan};
 use crate::actions::{
-    get_all_actions_schema, Add, ADD_FIELD, ADD_NAME, ADD_SCHEMA, LOG_ADD_SCHEMA, REMOVE_FIELD,
-    REMOVE_NAME, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
+    ADD_FIELD, ADD_NAME, ADD_SCHEMA, Add, LOG_ADD_SCHEMA, REMOVE_FIELD, REMOVE_NAME, SIDECAR_FIELD,
+    SIDECAR_NAME, STATS_PARSED, get_all_actions_schema,
 };
 use crate::checkpoint::collation_stats::source_collation_stats;
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
-    col, column_name, joined_column_expr, lit, ColumnName, Expression as Expr, Predicate,
-    UnaryExpressionOp,
+    ColumnName, Expression as Expr, Predicate, UnaryExpressionOp, col, column_name,
+    joined_column_expr, lit,
 };
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
 use crate::schema::{
-    lazy_schema_ref, schema, schema_ref, CheckpointFieldKind, DataType, SchemaRef,
-    SchemaStructPatchBuilder, StructField, StructType,
+    CheckpointFieldKind, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
+    lazy_schema_ref, schema, schema_ref,
 };
 use crate::struct_patch::ProjectionStructPatchBuilder;
-use crate::transforms::{transform_output_type, ExpressionTransform};
+use crate::transforms::{ExpressionTransform, transform_output_type};
 use crate::utils::FoldWithOption as _;
 use crate::{KernelError, KernelResult, PlanBuilder, Version};
 
@@ -729,18 +729,18 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
     use crate::log_segment_files::LogSegmentFiles;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStoreExt as _;
-    use crate::plans::ir::nodes::Operator;
     use crate::plans::Operation as PlanOperation;
+    use crate::plans::ir::nodes::Operator;
     use crate::scan::data_skipping::stats_schema::expected_stats_schema;
     use crate::scan::{PartitionValuesOptions, StatsOptions};
     use crate::schema::StructType;
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{
-        create_log_path, MockProtocolBuilder, MockTableConfigurationBuilder,
+        MockProtocolBuilder, MockTableConfigurationBuilder, create_log_path,
     };
     use crate::{Engine as _, KernelResult};
 
@@ -821,6 +821,23 @@ mod tests {
 
     fn tags(plan: &Plan) -> Vec<String> {
         plan.nodes.iter().map(|node| node.op.to_string()).collect()
+    }
+
+    // Inspect the leaf read schema to verify collation bounds survive checkpoint projection.
+    fn leaf_read_schema<'plan>(plan: &'plan Plan, shape: &CheckpointShape) -> &'plan SchemaRef {
+        plan.nodes
+            .iter()
+            .find_map(|node| match &node.op {
+                Operator::ScanParquet(scan) if shape.checkpoint_type == CheckpointType::Leaf => {
+                    Some(&scan.schema)
+                }
+                Operator::DynamicScan(scan) => {
+                    assert!(scan.dv_column.is_none(), "sidecar scan sets no dv column");
+                    Some(&scan.schema)
+                }
+                _ => None,
+            })
+            .expect("checkpoint leaf scan")
     }
 
     fn add_struct(schema: &SchemaRef) -> &StructType {
@@ -996,20 +1013,7 @@ mod tests {
             .build_metadata_scan_plan(&shape, &MetadataPlanner::try_new(&scan)?)?
             .expect("non-empty");
 
-        let checkpoint_schema = plan
-            .nodes
-            .iter()
-            .find_map(|node| match &node.op {
-                Operator::ScanParquet(scan) if shape.checkpoint_type == CheckpointType::Leaf => {
-                    Some(&scan.schema)
-                }
-                Operator::DynamicScan(scan) => {
-                    assert!(scan.dv_column.is_none(), "sidecar scan sets no dv column");
-                    Some(&scan.schema)
-                }
-                _ => None,
-            })
-            .expect("checkpoint leaf scan");
+        let checkpoint_schema = leaf_read_schema(&plan, &shape);
         assert_eq!(
             add_struct(checkpoint_schema).field(STATS_PARSED).is_some(),
             parsed_stats.is_some(),
@@ -1037,6 +1041,61 @@ mod tests {
             !expect_native_partitions
         );
         assert!(!normalization.contains("COALESCE"));
+        Ok(())
+    }
+
+    // On a struct-only checkpoint, only JSON requests synthesize stats and read collation bounds.
+    #[rstest::rstest]
+    #[case::json(StatsOptions::json_only(), true)]
+    #[case::both(StatsOptions::all(), true)]
+    #[case::struct_only(StatsOptions::all_struct(), false)]
+    #[case::none(StatsOptions::none(), false)]
+    fn metadata_plan_reads_full_collation_source_only_for_json(
+        #[case] stats: StatsOptions,
+        #[case] preserve_json: bool,
+        #[values(CheckpointType::Leaf, CheckpointType::Manifest)] checkpoint_type: CheckpointType,
+    ) -> KernelResult<()> {
+        let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(partitioned_schema())
+            .with_partition_columns(["p"])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_writer_features([TableFeature::Collations])
+                    .build(),
+            )
+            .with_table_root("memory:///")
+            .try_build()?;
+        let scan = Arc::new(Snapshot::new(segment, config)?)
+            .scan_builder()
+            .with_stats(stats)
+            .build()?;
+        let source = Arc::new(SchemaStructPatchBuilder::new()
+            .append(StructField::nullable("statsWithCollation", schema! {
+                nullable "test.ASCII_CI.1": { nullable "minValues": { nullable "nested": { nullable "leaf": STRING } } },
+                nullable "test.ASCII_CI.2": { nullable "maxValues": { nullable "nested": { nullable "leaf": STRING } } },
+            }))
+            .build(&struct_stats_schema())?);
+        let checkpoint_schema = parquet_read_schema(Some(&source), None)?;
+        let leaf_checkpoint_schema = SchemaStructPatchBuilder::new()
+            .drop_at([ADD_NAME], STATS)
+            .build(&checkpoint_schema)?;
+        let shape = CheckpointShape {
+            checkpoint_type,
+            leaf_checkpoint_schema: Some(Arc::new(leaf_checkpoint_schema)),
+        };
+        let plan = scan
+            .build_metadata_scan_plan(&shape, &MetadataPlanner::try_new(&scan)?)?
+            .unwrap();
+        let read_schema = leaf_read_schema(&plan, &shape);
+        assert_eq!(source_collation_stats(read_schema).is_some(), preserve_json);
+        assert_eq!(
+            plan.nodes.iter().any(|node| match &node.op {
+                Operator::Project(project) => project.expr.to_string().contains("TO_JSON"),
+                _ => false,
+            }),
+            preserve_json
+        );
         Ok(())
     }
 
@@ -1089,9 +1148,10 @@ mod tests {
     fn metadata_plan_empty_is_none() -> KernelResult<()> {
         let segment = log_segment(log_root(), &[], None);
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
-        assert!(scan
-            .build_metadata_scan_plan(&no_checkpoint(), &MetadataPlanner::try_new(&scan)?)?
-            .is_none());
+        assert!(
+            scan.build_metadata_scan_plan(&no_checkpoint(), &MetadataPlanner::try_new(&scan)?)?
+                .is_none()
+        );
         Ok(())
     }
 
@@ -1106,12 +1166,13 @@ mod tests {
             scan.state_info.physical_predicate,
             PhysicalPredicate::StaticSkipAll
         );
-        assert!(scan
-            .build_metadata_scan_plan(
+        assert!(
+            scan.build_metadata_scan_plan(
                 &shape(CheckpointType::Leaf, None),
                 &MetadataPlanner::try_new(&scan)?,
             )?
-            .is_none());
+            .is_none()
+        );
         Ok(())
     }
 

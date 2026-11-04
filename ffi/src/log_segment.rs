@@ -5,8 +5,8 @@ use delta_kernel::log_segment::LogSegment;
 use crate::handle::Handle;
 use crate::log_path::{FfiLogPath, LogPathArray};
 use crate::{
-    kernel_string_slice, optional_pointer, FfiSlice, KernelStringSlice, NullableCvoid,
-    OptionalValue, SharedSnapshot,
+    FfiSlice, KernelStringSlice, NullableCvoid, OptionalValue, SharedSnapshot, kernel_string_slice,
+    optional_pointer,
 };
 
 /// The files and publication state retained by a snapshot's log segment.
@@ -52,7 +52,7 @@ pub type LogSegmentVisitor = extern "C" fn(context: NullableCvoid, segment: *con
 ///
 /// `snapshot` must be a valid handle for the entire call. The callback must not free or consume
 /// the snapshot, retain borrowed pointers, or unwind across the FFI boundary.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_log_segment(
     snapshot: Handle<SharedSnapshot>,
     context: NullableCvoid,
@@ -112,7 +112,7 @@ mod tests {
     use test_utils::{compacted_log_path_for_versions, create_log_path};
 
     use super::*;
-    use crate::{free_snapshot, TryFromStringSlice};
+    use crate::{TryFromStringSlice, free_snapshot};
 
     #[derive(Default)]
     struct CapturedLogSegment {

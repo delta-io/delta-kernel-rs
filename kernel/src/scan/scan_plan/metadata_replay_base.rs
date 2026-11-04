@@ -69,8 +69,8 @@ mod tests {
     use crate::crc::Crc;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::test_delegating::DelegatingEngine;
-    use crate::plans::ir::nodes::Operator;
     use crate::plans::Operation as PlanOperation;
+    use crate::plans::ir::nodes::Operator;
     use crate::scan::scan_plan::tests::log_segment;
     use crate::unit_test_utils::load_test_table;
 

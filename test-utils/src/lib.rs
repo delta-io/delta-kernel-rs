@@ -196,8 +196,8 @@ use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 
 pub use counting_reporter::{
-    ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
     CapturingReporter, CountingReporter, RelaxedCounter, SnapshotCompletionStatus,
+    ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
 };
 use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
 use delta_kernel::actions::{
@@ -228,29 +228,29 @@ use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{
-    schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType, ToSchema,
+    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructType, ToSchema, schema_ref,
 };
 use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel::transaction::{
     CommitResult, Transaction, UpdateTableOperation, UpdateTableTransactionBuilder,
 };
 use delta_kernel::{
-    try_parse_uri, CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
+    CancellationToken, CancellationTokenRef, CancelledFuture, Engine, EngineData,
     FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData, JsonHandler, KernelError,
     KernelResult, KernelResultIterator, LogPath, ParquetFooter, ParquetHandler, PredicateRef,
-    Snapshot,
+    Snapshot, try_parse_uri,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
 pub use delta_kernel_default_engine;
+use delta_kernel_default_engine::executor::TaskExecutor;
 use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
-use delta_kernel_default_engine::executor::TaskExecutor;
 use delta_kernel_default_engine::storage::store_from_url;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use itertools::Itertools;
-use serde_json::{json, to_vec, Deserializer};
+use serde_json::{Deserializer, json, to_vec};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use url::Url;
@@ -1294,6 +1294,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
         "UPDATE" => UpdateTableOperation::Update,
         "MERGE" => UpdateTableOperation::Merge,
         "OPTIMIZE" => UpdateTableOperation::Optimize,
+        "REORG" => UpdateTableOperation::Reorg,
         operation => UpdateTableOperation::Custom(operation.to_string()),
     };
     let mut builder = snapshot.update_table(operation, "test-utils", data_change);
@@ -2164,6 +2165,7 @@ pub fn read_actions_from_commit(
 }
 
 /// Row tracking fields extracted from a single add action in a commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AddActionRowTracking {
     /// The base row ID assigned to the first row in the file.
     pub base_row_id: Option<i64>,
@@ -2213,10 +2215,10 @@ pub fn get_materialized_row_tracking_column_names(
         row_id_column_name: config["delta.rowTracking.materializedRowIdColumnName"]
             .as_str()
             .map(str::to_owned),
-        row_commit_version_column_name: config
-            ["delta.rowTracking.materializedRowCommitVersionColumnName"]
-            .as_str()
-            .map(str::to_owned),
+        row_commit_version_column_name:
+            config["delta.rowTracking.materializedRowCommitVersionColumnName"]
+                .as_str()
+                .map(str::to_owned),
     })
 }
 
@@ -2239,11 +2241,11 @@ pub async fn read_metadata_configuration_from_store(
     let mut config = HashMap::new();
     for line in std::str::from_utf8(&bytes)?.lines() {
         let v: serde_json::Value = serde_json::from_str(line)?;
-        if let Some(c) = v.get("metaData").and_then(|m| m.get("configuration")) {
-            if c.is_object() {
-                let entries: HashMap<String, String> = serde_json::from_value(c.clone())?;
-                config.extend(entries);
-            }
+        if let Some(c) = v.get("metaData").and_then(|m| m.get("configuration"))
+            && c.is_object()
+        {
+            let entries: HashMap<String, String> = serde_json::from_value(c.clone())?;
+            config.extend(entries);
         }
     }
     Ok(config)

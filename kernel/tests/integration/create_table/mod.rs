@@ -5,6 +5,7 @@ mod column_mapping;
 mod ctas;
 mod file;
 mod iceberg_compat;
+mod iceberg_native_v4;
 mod ict;
 mod interval;
 mod partitioned;
@@ -16,14 +17,14 @@ use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
-    schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+    ColumnMetadataKey, DataType, MetadataValue, StructField, StructType, schema_ref,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
-    TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
 };
 use delta_kernel::table_properties::TableProperties;
-use delta_kernel::transaction::create_table::{create_table, CreateTableTransaction};
+use delta_kernel::transaction::create_table::{CreateTableTransaction, create_table};
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{KernelError, KernelResult};
 use rstest::rstest;
@@ -676,6 +677,7 @@ async fn test_create_table_txn_debug() -> KernelResult<()> {
 #[case("changeDataFeed", TableFeature::ChangeDataFeed, false, false, false)]
 #[case("rowTracking", TableFeature::RowTracking, false, false, true)]
 #[case("domainMetadata", TableFeature::DomainMetadata, false, true, true)]
+#[case("collations", TableFeature::Collations, false, true, true)]
 // WriterOnly features (AlwaysIfSupported)
 #[case(
     "materializePartitionColumns",
@@ -731,6 +733,32 @@ fn test_create_table_with_feature_signal(
         );
     }
 
+    Ok(())
+}
+
+#[rstest]
+fn create_table_rejects_preview_feature_signals(
+    #[values(
+        "collations-preview",
+        "typeWidening-preview",
+        "variantType-preview",
+        "variantShredding-preview",
+        "catalogOwned-preview",
+        "adaptiveMetadata-preview"
+    )]
+    feature_name: &str,
+) -> KernelResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let key = format!("delta.feature.{feature_name}");
+    let result = create_table(&table_path, simple_schema()?, "Test/1.0", false)
+        .with_table_properties([(key.as_str(), "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+    assert_result_error_with_message(
+        result,
+        &format!(
+            "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
+        ),
+    );
     Ok(())
 }
 

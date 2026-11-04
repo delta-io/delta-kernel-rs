@@ -4,7 +4,7 @@ use super::{ExecutionMode, Transaction};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::error::KernelError;
 use crate::row_tracking::{
-    RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK,
+    ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK, RowTrackingDomainMetadata,
 };
 use crate::table_features::TableFeature;
 use crate::{Engine, KernelResult};
@@ -142,12 +142,12 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         };
 
         // If the domain requires a feature, validate it's supported
-        if let Some(feature) = required_feature {
-            if !table_config.is_feature_supported(&feature) {
-                return Err(KernelError::generic(format!(
-                    "System domain '{domain}' requires the '{feature}' feature to be enabled"
-                )));
-            }
+        if let Some(feature) = required_feature
+            && !table_config.is_feature_supported(&feature)
+        {
+            return Err(KernelError::generic(format!(
+                "System domain '{domain}' requires the '{feature}' feature to be enabled"
+            )));
         }
 
         Ok(())

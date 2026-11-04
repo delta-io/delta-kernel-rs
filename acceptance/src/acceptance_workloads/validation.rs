@@ -10,8 +10,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    new_null_array, Array, ArrayRef, ListArray, MapArray, RecordBatch, StructArray,
-    TimestampNanosecondArray,
+    Array, ArrayRef, ListArray, MapArray, RecordBatch, StructArray, TimestampNanosecondArray,
+    new_null_array,
 };
 use delta_kernel::arrow::compute::{cast, concat_batches};
 use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef};
@@ -125,21 +125,20 @@ fn align_array(array: &ArrayRef, data_type: &DataType) -> KernelResult<ArrayRef>
         DataType::Timestamp(delta_kernel::arrow::datatypes::TimeUnit::Nanosecond, None),
         DataType::Timestamp(delta_kernel::arrow::datatypes::TimeUnit::Microsecond, Some(timezone)),
     ) = (array.data_type(), data_type)
+        && timezone.as_ref() == "UTC"
     {
-        if timezone.as_ref() == "UTC" {
-            // The workload generator uses Spark TimestampType, whose precision is microseconds.
-            // Arrow infers its expected Parquet output as nanoseconds without a timezone.
-            let source = array
-                .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .ok_or_else(|| Error::internal_error("Timestamp array has an unexpected type"))?;
-            if source.iter().flatten().any(|value| value % 1_000 != 0) {
-                return Err(Error::generic(
-                    "Expected Spark timestamp has sub-microsecond precision",
-                ));
-            }
-            return Ok(cast(array, data_type)?);
+        // The workload generator uses Spark TimestampType, whose precision is microseconds.
+        // Arrow infers its expected Parquet output as nanoseconds without a timezone.
+        let source = array
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .ok_or_else(|| Error::internal_error("Timestamp array has an unexpected type"))?;
+        if source.iter().flatten().any(|value| value % 1_000 != 0) {
+            return Err(Error::generic(
+                "Expected Spark timestamp has sub-microsecond precision",
+            ));
         }
+        return Ok(cast(array, data_type)?);
     }
     Err(Error::generic(format!(
         "Expected data type {:?} does not match result type {data_type:?}",
@@ -164,13 +163,13 @@ fn require_matching_field_order(source: &Fields, target: &Fields) -> KernelResul
         )));
     }
     for target_field in target {
-        if let Some((_, source_field)) = source.find(target_field.name()) {
-            if source_field.is_nullable() != target_field.is_nullable() {
-                return Err(Error::generic(format!(
-                    "Expected nullability for field '{}' does not match the result",
-                    target_field.name()
-                )));
-            }
+        if let Some((_, source_field)) = source.find(target_field.name())
+            && source_field.is_nullable() != target_field.is_nullable()
+        {
+            return Err(Error::generic(format!(
+                "Expected nullability for field '{}' does not match the result",
+                target_field.name()
+            )));
         }
     }
     Ok(())
@@ -528,13 +527,15 @@ mod tests {
     fn expected_error_rejects_unrelated_kernel_error() {
         let expected = expected_error("DELTA_STATE_RECOVER_ERROR");
         assert!(validate_expected_error(&Error::MissingMetadata, &expected).is_ok());
-        assert!(validate_expected_error(
-            &Error::InvalidCheckpoint(
-                "Had a _last_checkpoint hint but didn't find any checkpoints".to_string()
-            ),
-            &expected
-        )
-        .is_ok());
+        assert!(
+            validate_expected_error(
+                &Error::InvalidCheckpoint(
+                    "Had a _last_checkpoint hint but didn't find any checkpoints".to_string()
+                ),
+                &expected
+            )
+            .is_ok()
+        );
 
         let error = validate_expected_error(&Error::FileNotFound("x".into()), &expected)
             .expect_err("wrong error category must fail");
@@ -769,9 +770,11 @@ mod tests {
 
         let nullability_error =
             require_map_compatibility(false, false, &nullable, &required).unwrap_err();
-        assert!(nullability_error
-            .to_string()
-            .contains("map entry nullability"));
+        assert!(
+            nullability_error
+                .to_string()
+                .contains("map entry nullability")
+        );
     }
 
     #[test]

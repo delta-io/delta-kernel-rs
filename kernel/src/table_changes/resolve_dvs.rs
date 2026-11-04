@@ -37,7 +37,7 @@ pub(crate) fn resolve_scan_file_dv(
     engine: &dyn Engine,
     table_root: &Url,
     scan_file: CdfScanFile,
-) -> KernelResult<impl Iterator<Item = ResolvedCdfScanFile>> {
+) -> KernelResult<impl Iterator<Item = ResolvedCdfScanFile> + use<>> {
     let add_dv = scan_file.dv_info.get_treemap(engine, table_root)?;
     let rm_dv = scan_file
         .remove_dv
@@ -163,11 +163,11 @@ mod tests {
     use roaring::RoaringTreemap;
 
     use super::resolve_scan_file_dv;
+    use crate::KernelError;
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::engine::sync::SyncEngine;
     use crate::scan::state::DvInfo;
     use crate::table_changes::scan_file::{CdfScanFile, CdfScanFileType};
-    use crate::KernelError;
 
     fn treemap_to_dv_descriptor(map: RoaringTreemap) -> DeletionVectorDescriptor {
         let buf = Vec::new();

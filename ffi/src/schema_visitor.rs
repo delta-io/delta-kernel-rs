@@ -25,8 +25,8 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 
 use delta_kernel::schema::{
-    ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
-    StructType,
+    ArrayType, DataType, DecimalType, IntervalYearToMonthType, MapType, MetadataValue,
+    PrimitiveType, StructField, StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use delta_kernel::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -526,7 +526,7 @@ pub unsafe extern "C" fn visit_field_interval_year_month(
     let result = visit_field_primitive_impl(
         state,
         name_str,
-        PrimitiveType::IntervalYearMonth,
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
         nullable,
         metadata,
     );
@@ -1047,7 +1047,7 @@ fn create_variant_data_type(
 #[cfg(test)]
 mod tests {
     use std::ffi::c_void;
-    use std::ptr::{null, NonNull};
+    use std::ptr::{NonNull, null};
 
     use delta_kernel::schema::{DataType, MetadataValue, PrimitiveType};
     use rstest::rstest;
@@ -1055,8 +1055,8 @@ mod tests {
     use super::*;
     use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{
-        assert_extern_result_error_contains, assert_extern_result_error_with_message, ok_or_panic,
-        TEST_ERROR_ALLOCATORS,
+        TEST_ERROR_ALLOCATORS, assert_extern_result_error_contains,
+        assert_extern_result_error_with_message, ok_or_panic,
     };
     use crate::scan::visit_metadata_map;
     use crate::{KernelStringSlice, NullableCvoid};
@@ -2327,7 +2327,10 @@ mod tests {
             ("col_date", PrimitiveType::Date),
             ("col_timestamp", PrimitiveType::Timestamp),
             ("col_timestamp_ntz", PrimitiveType::TimestampNtz),
-            ("col_interval_year_month", PrimitiveType::IntervalYearMonth),
+            (
+                "col_interval_year_month",
+                PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
+            ),
             ("col_interval_day_time", PrimitiveType::IntervalDayTime),
             ("col_void", PrimitiveType::Void),
         ];

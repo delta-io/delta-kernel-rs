@@ -9,12 +9,12 @@ use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionV
 use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
 use delta_kernel::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use delta_kernel::arrow::array::{
-    new_null_array, Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray,
-    StructArray,
+    Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+    new_null_array,
 };
 use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    DataType as ArrowDataType, Field as ArrowField, Int64Type, Schema as ArrowSchema,
 };
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::committer::FileSystemCommitter;
@@ -22,14 +22,14 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::{
-    col, lit, null_lit, ExpressionStructPatchBuilder, MapData, Scalar,
+    ExpressionStructPatchBuilder, MapData, Scalar, col, lit, null_lit,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::log_replay::FileActionKey;
-use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::scan::{scan_row_schema, PartitionValuesOptions, StatsOptions};
-use delta_kernel::schema::{schema_ref, DataType, MapType};
+use delta_kernel::object_store::path::Path;
+use delta_kernel::scan::{PartitionValuesOptions, StatsOptions, scan_row_schema};
+use delta_kernel::schema::{DataType, MapType, schema_ref};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel::{
@@ -37,14 +37,16 @@ use delta_kernel::{
 };
 use itertools::Itertools;
 use rstest::rstest;
+use rstest_reuse::{apply, template};
 use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
-    assert_result_error_with_message, begin_transaction, begin_transaction_with, copy_directory,
-    create_add_files_metadata, create_default_engine, create_default_engine_mt_executor,
-    create_table_with_column_mapping_mode, deletion_vector_array, engine_store_setup, insert_data,
-    into_record_batch, load_and_begin_transaction_with, read_actions_from_commit,
-    replace_array_row, replace_column, setup_test_table_p37, setup_test_tables, test_table_setup,
+    AddActionRowTracking, assert_result_error_with_message, begin_transaction,
+    begin_transaction_with, copy_directory, create_add_files_metadata, create_default_engine,
+    create_default_engine_mt_executor, create_table_with_column_mapping_mode,
+    deletion_vector_array, engine_store_setup, insert_data, into_record_batch,
+    load_and_begin_transaction_with, read_actions_from_commit, replace_array_row, replace_column,
+    setup_test_table_p37, setup_test_tables, test_table_setup,
 };
 use url::Url;
 
@@ -932,8 +934,8 @@ async fn test_remove_files_adds_expected_entries() -> KernelResult<()> {
 /// `test_remove_files_adds_expected_entries` covers the timestamped, conditionally-extended shape.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[tokio::test]
-async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_extended_metadata(
-) -> KernelResult<()> {
+async fn remove_on_adaptive_metadata_table_nulls_deletion_timestamp_and_forces_extended_metadata()
+-> KernelResult<()> {
     // v1: create a `number: INTEGER` adaptiveMetadata table and append a data file.
     let (_tmp_dir, table_url, engine, snapshot) =
         create_number_table(vec!["adaptiveMetadata-preview"], vec![], "id", true).await?;
@@ -1529,20 +1531,22 @@ fn modify_scan_file(
         .nth(modification.row_id)
         .expect("modified selected row must exist in scan-file batch");
 
-    if modification.field_name == "partitionValues" {
+    if ["partitionValues", "baseRowId", "defaultRowCommitVersion"]
+        .contains(&modification.field_name)
+    {
         let constants_index = schema
             .index_of("fileConstantValues")
             .expect("fileConstantValues field in scan data");
         let constants = columns[constants_index].as_struct();
-        let partition_values_index = constants
+        let field_index = constants
             .fields()
             .iter()
-            .position(|field| field.name() == "partitionValues")
-            .expect("partitionValues field in fileConstantValues");
-        let partition_values = constants.column(partition_values_index);
+            .position(|field| field.name() == modification.field_name)
+            .expect("modified field in fileConstantValues");
+        let value = constants.column(field_index);
         let mut constant_columns = constants.columns().to_vec();
-        constant_columns[partition_values_index] =
-            replace_array_row(partition_values, modification.value.clone(), row_index);
+        constant_columns[field_index] =
+            replace_array_row(value, modification.value.clone(), row_index);
         columns[constants_index] = Arc::new(StructArray::new(
             constants.fields().clone(),
             constant_columns,
@@ -2532,8 +2536,8 @@ fn setup_table_with_dv_small() -> KernelResult<DvSmallTableSetup> {
 /// remove under the id that [`DeletionVectorDescriptor::unique_id_for`] derives for the add's DV.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[tokio::test]
-async fn adaptive_metadata_remove_cancels_add_across_dv_storage_types(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn adaptive_metadata_remove_cancels_add_across_dv_storage_types()
+-> Result<(), Box<dyn std::error::Error>> {
     // v1: create an adaptiveMetadata table with one data file.
     let (_tmp_dir, table_url, engine, snapshot) =
         create_number_table(vec!["adaptiveMetadata-preview"], vec![], "id", true).await?;
@@ -2652,4 +2656,316 @@ async fn create_number_table(
     .await?
     .unwrap_post_commit_snapshot();
     Ok((temp_dir, table_url, engine, snapshot))
+}
+
+#[template]
+#[rstest]
+#[case::enabled_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Enabled,
+    selection_vector: &[true, true, true],
+    expected_error: Some("row-tracking field"),
+})]
+#[case::supported_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Supported,
+    selection_vector: &[true, true, true],
+    expected_error: None,
+})]
+#[case::suspended_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Suspended,
+    selection_vector: &[true, true, true],
+    expected_error: None,
+})]
+#[case::unsupported_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Unsupported,
+    selection_vector: &[true, true, true],
+    expected_error: None,
+})]
+#[case::enabled_implicitly_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Enabled,
+    selection_vector: &[false],
+    expected_error: Some("row-tracking field"),
+})]
+#[case::supported_implicitly_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Supported,
+    selection_vector: &[false],
+    expected_error: None,
+})]
+#[case::enabled_invalid_row_unselected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Enabled,
+    selection_vector: &[true, false, true],
+    expected_error: None,
+})]
+#[case::supported_invalid_row_unselected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Supported,
+    selection_vector: &[true, false, true],
+    expected_error: None,
+})]
+#[case::enabled_none_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Enabled,
+    selection_vector: &[false, false, false],
+    expected_error: None,
+})]
+#[case::supported_none_selected(RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState::Supported,
+    selection_vector: &[false, false, false],
+    expected_error: None,
+})]
+fn row_tracking_metadata_cases(
+    #[case] case: RowTrackingMetadataCase,
+    #[values(None, Some(-1))] value: Option<i64>,
+    #[values("baseRowId", "defaultRowCommitVersion")] field: &'static str,
+    #[values("none", "name", "id")] cm_mode: &str,
+) {
+}
+
+#[apply(row_tracking_metadata_cases)]
+#[tokio::test]
+async fn commit_validates_remove_row_tracking_metadata(
+    case: RowTrackingMetadataCase,
+    value: Option<i64>,
+    field: &'static str,
+    cm_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let RowTrackingMetadataCase {
+        row_tracking_state,
+        selection_vector,
+        expected_error,
+    } = case;
+    // === Given a table with row tracking in the requested state ===
+    let (_temp_dir, engine, snapshot) = create_row_tracking_table(row_tracking_state, cm_mode)?;
+    let (original, corrupted) = batch_with_invalid_row_tracking_meta(
+        snapshot.clone(),
+        engine.as_ref(),
+        ScanFileModification {
+            field_name: field,
+            value: Arc::new(Int64Array::from(vec![value])),
+            row_id: 1,
+        },
+    )?;
+    let selected_paths = selected_file_paths(&original, selection_vector);
+    let mut expected = row_tracking_file_metadata(&original);
+    for path in &selected_paths {
+        expected.remove(path);
+    }
+
+    // === When committing removals of the selected files ===
+    let corrupted = FilteredEngineData::try_new(
+        Box::new(ArrowEngineData::new(corrupted)),
+        selection_vector.to_vec(),
+    )?;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
+    txn.ack_row_tracking_preservation();
+    txn.remove_files(corrupted);
+    let result = txn.commit(engine.as_ref());
+
+    // === Expect a validation error or the exact surviving file metadata ===
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, &format!("{expected_error} '{field}'"));
+    } else {
+        assert_row_tracking_files(
+            result?.unwrap_post_commit_snapshot(),
+            engine.as_ref(),
+            &expected,
+        )?;
+    }
+    Ok(())
+}
+
+#[apply(row_tracking_metadata_cases)]
+#[tokio::test]
+async fn commit_validates_dv_row_tracking_metadata(
+    case: RowTrackingMetadataCase,
+    value: Option<i64>,
+    field: &'static str,
+    cm_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let RowTrackingMetadataCase {
+        row_tracking_state,
+        selection_vector,
+        expected_error,
+    } = case;
+    // === Given a table with row tracking in the requested state ===
+    let (_temp_dir, engine, snapshot) = create_row_tracking_table(row_tracking_state, cm_mode)?;
+    let (original, corrupted) = batch_with_invalid_row_tracking_meta(
+        snapshot.clone(),
+        engine.as_ref(),
+        ScanFileModification {
+            field_name: field,
+            value: Arc::new(Int64Array::from(vec![value])),
+            row_id: 1,
+        },
+    )?;
+    let selected_paths = selected_file_paths(&original, selection_vector);
+    let mut expected = row_tracking_file_metadata(&original);
+    let corrupted_metadata = row_tracking_file_metadata(&corrupted);
+    for path in &selected_paths {
+        expected.insert(path.clone(), corrupted_metadata[path]);
+    }
+
+    // === When committing DV updates for the selected files ===
+    let corrupted = FilteredEngineData::try_new(
+        Box::new(ArrowEngineData::new(corrupted)),
+        selection_vector.to_vec(),
+    )?;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
+    txn.ack_row_tracking_preservation();
+    txn.update_deletion_vectors(
+        sequential_dv_descriptors(&selected_paths),
+        std::iter::once(Ok(corrupted)),
+    )?;
+    let result = txn.commit(engine.as_ref());
+
+    // === Expect a validation error or the exact surviving file metadata ===
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, &format!("{expected_error} '{field}'"));
+    } else {
+        assert_row_tracking_files(
+            result?.unwrap_post_commit_snapshot(),
+            engine.as_ref(),
+            &expected,
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct RowTrackingMetadataCase {
+    row_tracking_state: RowTrackingState,
+    selection_vector: &'static [bool],
+    expected_error: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowTrackingState {
+    Enabled,
+    Supported,
+    Suspended,
+    Unsupported,
+}
+
+type RowTrackingTableSetup = (tempfile::TempDir, Arc<dyn Engine>, Arc<Snapshot>);
+
+fn create_row_tracking_table(
+    row_tracking_state: RowTrackingState,
+    cm_mode: &str,
+) -> Result<RowTrackingTableSetup, Box<dyn std::error::Error>> {
+    let (temp_dir, table_path, engine) = test_table_setup()?;
+    let mut properties = vec![
+        ("delta.enableDeletionVectors", "true"),
+        ("delta.columnMapping.mode", cm_mode),
+    ];
+    match row_tracking_state {
+        RowTrackingState::Enabled => properties.push(("delta.enableRowTracking", "true")),
+        RowTrackingState::Supported | RowTrackingState::Suspended => {
+            properties.push(("delta.feature.rowTracking", "supported"));
+        }
+        RowTrackingState::Unsupported => {}
+    }
+    let snapshot = create_table(
+        &table_path,
+        schema_ref! { nullable "id": INTEGER },
+        "Test/1.0",
+        true,
+    )
+    .with_table_properties(properties)
+    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+    .commit(engine.as_ref())?
+    .unwrap_post_commit_snapshot();
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
+    txn.add_files(create_add_files_metadata(
+        txn.add_files_schema(),
+        vec![
+            ("file0.parquet", 10, 1, Some(3)),
+            ("file1.parquet", 10, 1, Some(3)),
+            ("file2.parquet", 10, 1, Some(3)),
+        ],
+    )?);
+    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    // Create-table does not support suspension; suspend after assigning the original metadata.
+    let snapshot = if row_tracking_state == RowTrackingState::Suspended {
+        let table_url = Url::from_directory_path(&table_path).unwrap();
+        set_table_properties(
+            &table_path,
+            &table_url,
+            engine.as_ref(),
+            snapshot.version(),
+            &[("delta.rowTrackingSuspended", "true")],
+        )?
+    } else {
+        snapshot
+    };
+    Ok((temp_dir, engine, snapshot))
+}
+
+fn batch_with_invalid_row_tracking_meta(
+    snapshot: Arc<Snapshot>,
+    engine: &dyn Engine,
+    modification: ScanFileModification,
+) -> KernelResult<(RecordBatch, RecordBatch)> {
+    let scan_file = selected_scan_file_batch(snapshot, engine)?;
+    assert_eq!(scan_file.data().len(), 3);
+    let original = into_record_batch(scan_file.apply_selection_vector()?);
+    let scan_file = FilteredEngineData::with_all_rows_selected(Box::new(ArrowEngineData::new(
+        original.clone(),
+    )));
+    let (corrupted, _) = modify_scan_file(scan_file, &modification).into_parts();
+    Ok((original, into_record_batch(corrupted)))
+}
+
+fn selected_file_paths(batch: &RecordBatch, selection_vector: &[bool]) -> Vec<String> {
+    batch
+        .column_by_name("path")
+        .unwrap()
+        .as_string::<i32>()
+        .iter()
+        .enumerate()
+        .filter(|(row, _)| selection_vector.get(*row).copied().unwrap_or(true))
+        .map(|(_, path)| path.unwrap().to_owned())
+        .collect()
+}
+
+fn row_tracking_file_metadata(batch: &RecordBatch) -> HashMap<String, AddActionRowTracking> {
+    let constants = batch
+        .column_by_name("fileConstantValues")
+        .unwrap()
+        .as_struct();
+    let base_row_ids = constants
+        .column_by_name("baseRowId")
+        .unwrap()
+        .as_primitive::<Int64Type>();
+    let versions = constants
+        .column_by_name("defaultRowCommitVersion")
+        .unwrap()
+        .as_primitive::<Int64Type>();
+    batch
+        .column_by_name("path")
+        .unwrap()
+        .as_string::<i32>()
+        .iter()
+        .zip(base_row_ids.iter())
+        .zip(versions.iter())
+        .map(|((path, base_row_id), default_row_commit_version)| {
+            (
+                path.unwrap().to_owned(),
+                AddActionRowTracking {
+                    base_row_id,
+                    default_row_commit_version,
+                },
+            )
+        })
+        .collect()
+}
+
+fn assert_row_tracking_files(
+    snapshot: Arc<Snapshot>,
+    engine: &dyn Engine,
+    expected: &HashMap<String, AddActionRowTracking>,
+) -> KernelResult<()> {
+    let mut actual = HashMap::new();
+    for scan_files in get_scan_files(snapshot, engine)? {
+        let batch = into_record_batch(scan_files.apply_selection_vector()?);
+        actual.extend(row_tracking_file_metadata(&batch));
+    }
+    assert_eq!(&actual, expected);
+    Ok(())
 }

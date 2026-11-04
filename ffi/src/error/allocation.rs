@@ -11,7 +11,7 @@ use delta_kernel::{Error, KernelError};
 
 use super::FFIKernelError;
 use crate::delta_types::{FfiStringMap, FfiStringMapEntry};
-use crate::{kernel_string_slice, FfiSlice, KernelStringSlice, OptionalValue};
+use crate::{FfiSlice, KernelStringSlice, OptionalValue, kernel_string_slice};
 
 /// Kernel error code and diagnostic message.
 #[repr(C)]
@@ -143,7 +143,7 @@ mod tests {
     use super::{DeltaErrorInfo, ErrorAllocators, KernelErrorInfo};
     use crate::error::{AllocateError, ExternResult, IntoExternResult};
     use crate::{
-        allocate_kernel_string, kernel_string_slice, ExternEngine, KernelStringSlice, OptionalValue,
+        ExternEngine, KernelStringSlice, OptionalValue, allocate_kernel_string, kernel_string_slice,
     };
 
     #[derive(Default)]

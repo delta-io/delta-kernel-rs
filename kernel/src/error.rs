@@ -5,13 +5,13 @@ use std::convert::Infallible;
 use std::num::ParseIntError;
 use std::str::Utf8Error;
 
+use crate::Version;
 #[cfg(feature = "default-engine-base")]
 use crate::arrow::error::ArrowError;
 #[cfg(feature = "default-engine-base")]
 use crate::object_store;
 use crate::schema::{DataType, StructType};
 use crate::table_properties::ParseIntervalError;
-use crate::Version;
 
 mod delta_error;
 mod delta_error_condition;
@@ -193,9 +193,7 @@ pub enum SnapshotHintError {
     #[error("Invalid snapshot hint: snapshot history does not start at version 0")]
     MissingHistoryAnchor,
     /// The supplied CRC describes a different table version.
-    #[error(
-        "Invalid snapshot hint: CRC version {crc} does not match snapshot hint version {hint}"
-    )]
+    #[error("Invalid snapshot hint: CRC version {crc} does not match snapshot hint version {hint}")]
     CrcVersion {
         /// The version described by the CRC.
         crc: Version,
@@ -431,6 +429,10 @@ pub enum KernelError {
     #[error("Invalid decimal: {0}")]
     InvalidDecimal(String),
 
+    /// Interval value cannot be represented by its declared qualifier
+    #[error("Invalid interval: {0}")]
+    InvalidInterval(String),
+
     /// Invalid CRS or other parameter for a Geometry / Geography type
     #[error("Invalid geo parameters: {0}")]
     InvalidGeoParams(String),
@@ -512,7 +514,9 @@ pub enum KernelError {
     LogHistory(#[from] Box<crate::history_manager::error::LogHistoryError>),
 
     #[cfg(feature = "declarative-plans")]
-    #[error("Declarative plan execution yielded the incorrect type: expected PlanResult::{expected}, got PlanResult::{actual}")]
+    #[error(
+        "Declarative plan execution yielded the incorrect type: expected PlanResult::{expected}, got PlanResult::{actual}"
+    )]
     PlanResultTypeMismatch {
         expected: &'static str,
         actual: &'static str,
@@ -579,6 +583,11 @@ impl KernelError {
     }
     pub fn invalid_decimal(msg: impl ToString) -> Self {
         Self::InvalidDecimal(msg.to_string())
+    }
+    /// Creates an InvalidInterval error. The message explains why the interval value cannot be
+    /// represented by its qualifier.
+    pub fn invalid_interval(msg: impl ToString) -> Self {
+        Self::InvalidInterval(msg.to_string())
     }
     #[cfg(feature = "geo-type-in-dev")]
     pub fn invalid_geo_params(msg: impl ToString) -> Self {

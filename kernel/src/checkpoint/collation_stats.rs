@@ -13,13 +13,13 @@ use crate::action_reconciliation::log_replay::ActionReconciliationBatch;
 use crate::actions::{NUM_RECORDS, TIGHT_BOUNDS};
 use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData};
 use crate::expressions::{
-    col, column_name, ColumnName, Expression, ExpressionRef, UnaryExpressionOp,
+    ColumnName, Expression, ExpressionRef, UnaryExpressionOp, col, column_name,
 };
 use crate::schema::{
-    schema, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
+    DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType, schema,
 };
 use crate::struct_patch::ProjectionStructPatchBuilder;
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{KernelError, KernelResult, Snapshot};
 
 const COLLATION_STATS: &str = "statsWithCollation";
@@ -229,16 +229,16 @@ mod tests {
     use crate::actions::{Metadata, Protocol};
     use crate::arrow::array::StringArray;
     use crate::checkpoint::checkpoint_transform::build_checkpoint_read_schema;
-    use crate::checkpoint::{CheckpointWriter, CHECKPOINT_ACTIONS_SCHEMA_V1};
+    use crate::checkpoint::{CHECKPOINT_ACTIONS_SCHEMA_V1, CheckpointWriter};
     use crate::engine::arrow_utils::to_json_bytes;
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::FilteredEngineData;
-    use crate::object_store::memory::InMemory;
     use crate::object_store::DynObjectStore;
+    use crate::object_store::memory::InMemory;
     use crate::scan::StatsOptions;
-    use crate::schema::{schema, schema_ref, ColumnMetadataKey, MetadataValue};
+    use crate::schema::{ColumnMetadataKey, MetadataValue, schema, schema_ref};
     use crate::snapshot::SnapshotRef;
-    use crate::{version_as_i64, Engine, EngineData};
+    use crate::{Engine, EngineData, version_as_i64};
 
     #[rstest]
     #[case::missing(None, vec![])]
@@ -554,9 +554,11 @@ mod tests {
         let source =
             StructField::nullable(COLLATION_STATS, schema! { nullable "custom.ci.1": STRING });
         let requested = schema! { nullable "add": { nullable "stats": STRING } };
-        assert!(build_collation_stats_read_transform(&requested, None)
-            .unwrap()
-            .is_none());
+        assert!(
+            build_collation_stats_read_transform(&requested, None)
+                .unwrap()
+                .is_none()
+        );
         let requested = schema! { nullable "add": { nullable "path": STRING } };
         assert!(
             build_collation_stats_read_transform(&requested, Some(&source))

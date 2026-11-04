@@ -10,7 +10,7 @@ use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
 };
-use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
+use crate::engine::arrow_data::{ArrowEngineData, extract_record_batch};
 use crate::engine::arrow_utils::apply_schema::{apply_schema, apply_schema_to};
 use crate::error::{KernelError, KernelResult};
 use crate::expressions::{ArrayData, Expression, ExpressionRef, PredicateRef, Scalar};
@@ -103,7 +103,7 @@ impl Scalar {
                 // timezone was already set at builder construction time
                 append_val_n_as!(array::TimestampMicrosecondBuilder, *val)
             }
-            IntervalYearMonth(val) => append_val_n_as!(array::Int32Builder, *val),
+            IntervalYearMonth(val) => append_val_n_as!(array::Int32Builder, val.months()),
             IntervalDayTime(val) => append_val_n_as!(array::Int64Builder, *val),
             Date(val) => append_val_n_as!(array::Date32Builder, *val),
             Binary(val) => append_val_as!(array::BinaryBuilder, val),
@@ -224,7 +224,9 @@ impl Scalar {
             }
             DataType::VOID => append_nulls_as!(array::NullBuilder),
             // Intervals are exposed as their physical integer (i32 months / i64 microseconds).
-            DataType::INTERVAL_YEAR_MONTH => append_nulls_as!(array::Int32Builder),
+            DataType::Primitive(PrimitiveType::IntervalYearMonth(_)) => {
+                append_nulls_as!(array::Int32Builder)
+            }
             DataType::INTERVAL_DAY_TIME => append_nulls_as!(array::Int64Builder),
             #[cfg(feature = "geo-type-in-dev")]
             DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
@@ -517,7 +519,7 @@ fn primitive_types_compatible(expected: &PrimitiveType, data_type: &ArrowDataTyp
             ),
         ) => true,
         (PrimitiveType::Void, ArrowDataType::Null) => true,
-        (PrimitiveType::IntervalYearMonth, ArrowDataType::Int32 | ArrowDataType::UInt32) => true,
+        (PrimitiveType::IntervalYearMonth(_), ArrowDataType::Int32 | ArrowDataType::UInt32) => true,
         (PrimitiveType::IntervalDayTime, ArrowDataType::Int64 | ArrowDataType::UInt64) => true,
         _ => false,
     }

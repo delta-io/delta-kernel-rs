@@ -19,14 +19,14 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::schema::{schema_ref, SchemaRef};
+use delta_kernel::schema::{SchemaRef, schema_ref};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{KernelResult, Snapshot};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{
-    insert_data, install_thread_local_metrics_reporter, test_table_setup_mt, CountingReporter,
+    CountingReporter, insert_data, install_thread_local_metrics_reporter, test_table_setup_mt,
 };
 use url::Url;
 

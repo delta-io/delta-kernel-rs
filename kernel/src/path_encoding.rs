@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 
-use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 
 /// Characters encoded by [`uri_encode_path`]: `%`, space, and ASCII chars illegal in a
 /// URI path, plus all ASCII controls via [`CONTROLS`]. Non-ASCII UTF-8 bytes are ALSO
