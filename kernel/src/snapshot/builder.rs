@@ -13,6 +13,7 @@ use crate::log_segment_files::CheckpointHandling;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::metrics::{MetricId, SnapshotLoadMetricContext, SnapshotLoadType};
 use crate::path::DELTA_LOG_DIR_WITH_SLASH;
+use crate::snapshot::incremental::{SnapshotUpdate, UpdateTarget};
 use crate::snapshot::{SnapshotHint, SnapshotRef};
 use crate::utils::{PhantomType, require, try_parse_uri};
 use crate::{Engine, KernelError, KernelResult, Snapshot, Version};
@@ -423,16 +424,19 @@ impl<Mode> SnapshotBuilder<Mode> {
                         "SnapshotBuilder should have either table_root or existing_snapshot",
                     ));
                 };
-                Snapshot::try_new_from(
-                    existing_snapshot,
+                let target = match (effective_version, built_as_latest) {
+                    (None, _) => UpdateTarget::Latest,
+                    (Some(version), true) => UpdateTarget::CatalogLatest(version),
+                    (Some(version), false) => UpdateTarget::Version(version),
+                };
+                SnapshotUpdate {
+                    existing: existing_snapshot,
+                    target,
                     log_tail,
-                    engine,
-                    effective_version,
-                    metric_context,
-                    incremental_replay,
                     checkpoint_handling,
-                    built_as_latest,
-                )?
+                    crc_replay: incremental_replay,
+                }
+                .execute(engine, metric_context)?
             }
         };
 

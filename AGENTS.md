@@ -132,6 +132,12 @@ table at a specific version. From it you build a `Scan` (reads) or `Transaction`
 read storage. Its optional token scopes synchronous, blocking reads without changing the shared
 snapshot or the connector's engine. In-memory getters remain on `Snapshot`.
 
+**Incremental snapshot construction:** `snapshot/incremental/` separates `SnapshotUpdate` inputs,
+`LogUpdate` file selection, and state resolution. The selected checkpoint controls retained history;
+the existing snapshot remains the protocol/metadata baseline unless that checkpoint is ahead of its
+version. CRC replay has its own optional baseline and budget. Keep file planning independent of
+action reads so checkpoint and catalog-tail combinations can be tested without storage.
+
 **Read path:** `Snapshot` -> `ScanBuilder` -> `Scan` -> data. Execution paths:
 `execute()` (simple), `scan_metadata()` (advanced/distributed),
 `parallel_scan_metadata()` (two-phase distributed log replay).
