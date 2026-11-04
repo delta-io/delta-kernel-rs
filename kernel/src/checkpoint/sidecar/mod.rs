@@ -194,10 +194,10 @@ impl SidecarSplitter {
         // Filters out rows where both add and remove are null.
         let file_actions_null_row_filter = eval_handler.new_predicate_evaluator(
             sidecar_output_schema,
-            Arc::new(Predicate::from_expr(expr!(or(
-                is_not_null(path(ADD_NAME)),
-                is_not_null(path(REMOVE_NAME)),
-            )))),
+            Arc::new(Predicate::or(
+                col!(ADD_NAME).is_not_null(),
+                col!(REMOVE_NAME).is_not_null(),
+            )),
         )?;
 
         // Nulls out add/remove instead of dropping them so the data schema stays the

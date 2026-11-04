@@ -18,7 +18,7 @@ use super::CHECKPOINT_ACTIONS_SCHEMA_V2;
 use crate::actions::SIDECAR_NAME;
 use crate::actions::visitors::SidecarVisitor;
 use crate::engine_data::RowVisitor;
-use crate::expressions::{Predicate, expr};
+use crate::expressions::col;
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
@@ -291,10 +291,7 @@ fn collect_single_sidecar(
         FileType::Parquet => PlanBuilder::scan_parquet([file.clone()], &[], read_schema),
         FileType::Json => PlanBuilder::scan_json([file.clone()], &[], read_schema),
     }?
-    .filter(Predicate::from_expr(expr!(is_not_null(path(
-        SIDECAR_NAME,
-        "path"
-    )))))?
+    .filter(col!(SIDECAR_NAME, "path").is_not_null())?
     .build()?;
     let data = exec.execute_op(Operation::QueryPlan(plan))?.into_data()?;
 
@@ -325,7 +322,6 @@ mod tests {
     };
     use crate::engine::sync::SyncEngine;
     use crate::engine::sync::plan::SyncPlanExecutor;
-    use crate::expressions::expr;
     use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
     use crate::log_segment_files::LogSegmentFiles;
     use crate::plans::ir::nodes::Operator;
@@ -360,13 +356,7 @@ mod tests {
                         Operator::Filter(filter) => Some(filter.predicate.as_ref()),
                         _ => None,
                     });
-                    assert_eq!(
-                        predicate,
-                        Some(&Predicate::from_expr(expr!(is_not_null(path(
-                            SIDECAR_NAME,
-                            "path"
-                        )))))
-                    );
+                    assert_eq!(predicate, Some(&col!(SIDECAR_NAME, "path").is_not_null()));
                     _ = self.query_scans.fetch_add(1, Ordering::Relaxed);
                 }
                 Operation::IoOperation(IoOperation::ParquetFooter { .. }) => {

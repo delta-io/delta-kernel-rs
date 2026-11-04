@@ -23,7 +23,7 @@ use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
 use crate::engine::sync::SyncEngine;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::test_delegating::DelegatingEngine;
-use crate::expressions::{column_name, expr};
+use crate::expressions::{col, column_name};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::last_checkpoint_hint::{AmtCheckpoint, CheckpointType};
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
@@ -1423,12 +1423,8 @@ async fn test_reading_sidecar_files_with_predicate() -> KernelResult<()> {
     );
 
     // Filter out sidecar files that do not contain remove actions
-    let remove_predicate: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
-        Some(Arc::new(Predicate::from_expr(expr!(is_not_null(path(
-            REMOVE_NAME,
-            "path"
-        ))))))
-    });
+    let remove_predicate: LazyLock<Option<PredicateRef>> =
+        LazyLock::new(|| Some(Arc::new(col!(REMOVE_NAME, "path").is_not_null())));
 
     let mut iter = process_sidecars(
         engine.parquet_handler(),
@@ -5502,13 +5498,13 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
 #[case::add_field(
     schema! { nullable ADD_NAME: {} },
     Some(Arc::new(
-        Predicate::from_expr(expr!(is_not_null(path(ADD_NAME, "path")))),
+        col!(ADD_NAME, "path").is_not_null(),
     )),
 )]
 #[case::remove_field(
     schema! { nullable REMOVE_NAME: {} },
     Some(Arc::new(
-        Predicate::from_expr(expr!(is_not_null(path(REMOVE_NAME, "path")))),
+        col!(REMOVE_NAME, "path").is_not_null(),
     )),
 )]
 #[case::action_without_required_leaf_returns_none(
@@ -5520,10 +5516,10 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
         nullable ADD_NAME: {},
         nullable REMOVE_NAME: {},
     },
-    Some(Arc::new(Predicate::from_expr(expr!(or(
-        is_not_null(path(ADD_NAME, "path")),
-        is_not_null(path(REMOVE_NAME, "path")),
-    ))))),
+    Some(Arc::new(Predicate::or(
+        col!(ADD_NAME, "path").is_not_null(),
+        col!(REMOVE_NAME, "path").is_not_null(),
+    ))),
 )]
 #[case::witness_and_witnessless_field_returns_none(
     schema! {
@@ -5555,12 +5551,8 @@ fn test_combine_checkpoint_predicates(
     #[case] include_projection: bool,
     #[case] include_metadata: bool,
 ) {
-    let projection = Arc::new(Predicate::from_expr(expr!(is_not_null(path(
-        ADD_NAME, "path"
-    )))));
-    let metadata = Arc::new(Predicate::from_expr(expr!(is_not_null(path(
-        ADD_NAME, "size"
-    )))));
+    let projection = Arc::new(col!(ADD_NAME, "path").is_not_null());
+    let metadata = Arc::new(col!(ADD_NAME, "size").is_not_null());
     let expected = match (include_projection, include_metadata) {
         (false, false) => None,
         (true, false) => Some(projection.clone()),

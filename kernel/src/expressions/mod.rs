@@ -1458,9 +1458,9 @@ mod tests {
     use serde::de::DeserializeOwned;
 
     use super::{
-        DataType, Expression as Expr, MapToStructOptions, Predicate as Pred, col, column_pred, lit,
+        DataType, Expression as Expr, MapToStructOptions, Predicate as Pred, col, column_pred,
+        expr, lit,
     };
-    use crate::expressions::expr;
 
     /// Helper function to verify roundtrip serialization/deserialization
     fn assert_roundtrip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: &T) {

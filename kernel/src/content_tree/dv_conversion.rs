@@ -97,10 +97,10 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
     Expression::struct_with_nullability_from(
         [
             Expression::column([DV_STORAGE_TYPE_HELPER]),
-            expr!(coalesce(
-                path(DV_ABSOLUTE_PATH_HELPER),
-                path(DV_INFO, LOCATION)
-            )),
+            Expression::coalesce([
+                Expression::column([DV_ABSOLUTE_PATH_HELPER]),
+                dv_field(LOCATION),
+            ]),
             // TODO(#3750): use a cast that fails on overflow. Until then these would null out an
             // out-of-range value, which `try_push` rejects up front.
             Expression::cast(dv_field(DV_INFO_OFFSET), DataType::INTEGER),

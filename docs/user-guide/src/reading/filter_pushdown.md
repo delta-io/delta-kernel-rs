@@ -16,6 +16,9 @@ Use the `expr!` macro to build expressions with infix comparisons and `col("name
 column references. Convert its `Expression` result with `Predicate::from_expr` when
 an API requires a `Predicate`.
 
+Inside `expr!`, `col` requires a string literal. Use `path(name)` for a constant or
+computed column-name segment.
+
 ### Comparison operators
 
 ```rust,no_run
@@ -70,7 +73,7 @@ let pred = Predicate::from_expr(expr!(or(
     col("status") == "pending",
 )));
 
-// NOT (archived)
+// NOT (archived == true)
 let pred = Predicate::from_expr(expr!(not(col("archived") == true)));
 ```
 

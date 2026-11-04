@@ -132,10 +132,7 @@ impl<'a> MetadataPlanner<'a> {
         let (plan, current_stats_kind) =
             self.prepare_metadata(plan, current_stats_kind, has_struct_partitions)?;
         let plan = plan.try_fold_with(self.stats_filter.as_ref(), |plan, predicate| {
-            plan.filter(Predicate::or(
-                Predicate::from_expr(expr!(is_null(path(ADD_NAME)))),
-                predicate.clone(),
-            ))
+            plan.filter(Predicate::or(col!(ADD_NAME).is_null(), predicate.clone()))
         })?;
         self.project_output(plan, current_stats_kind)
     }
@@ -594,10 +591,7 @@ fn sidecar_actions(
         FileType::Parquet => PlanBuilder::scan_parquet,
     };
     let sidecar_files = scan(root_parts, &[VERSION], SIDECAR_READ_SCHEMA.clone())?
-        .filter(Predicate::from_expr(expr!(is_not_null(path(
-            SIDECAR_NAME,
-            FILE_PATH
-        )))))?
+        .filter(col!(SIDECAR_NAME, FILE_PATH).is_not_null())?
         .project(
             Expr::struct_from([
                 col!(SIDECAR_NAME, FILE_PATH),

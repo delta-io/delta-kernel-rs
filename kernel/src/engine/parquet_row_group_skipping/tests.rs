@@ -1574,16 +1574,16 @@ fn checkpoint_filter_nested_struct_column_stats() {
     let metadata = checkpoint_row_group_metadata(&tmp);
     let row_group = metadata.row_group(0);
 
-    let col = column_name!("a.b");
+    let column = column_name!("a.b");
     let predicate = Predicate::from_expr(expr!(col("a.b") > 500i64));
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
 
     assert_eq!(
-        filter.get_min_stat(&col, &DataType::LONG),
+        filter.get_min_stat(&column, &DataType::LONG),
         Some(10i64.into())
     );
     assert_eq!(
-        filter.get_max_stat(&col, &DataType::LONG),
+        filter.get_max_stat(&column, &DataType::LONG),
         Some(200i64.into())
     );
     // max(x) = 200 < 500 -> can prune.
