@@ -13,12 +13,10 @@ use crate::{Engine, EngineData, ExpressionEvaluator, KernelError, KernelResult};
 ///
 /// For example, projecting `add` batches onto a read schema of `{add, remove}` keeps each row's
 /// `add` and makes its `remove` null.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ActionProjector {
     evaluator: Arc<dyn ExpressionEvaluator>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ActionProjector {
     /// Builds a projector from `source`, the schema of the batches to project, onto `read_schema`.
     /// Fields of `read_schema.<action>` that `source.<action>` has are copied; every other nullable
