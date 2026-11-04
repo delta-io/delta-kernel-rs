@@ -30,6 +30,14 @@ pub(crate) enum ReplayGroup {
     Domains,
 }
 
+/// Equivalent reconciliation strategies; retention is applied by the caller afterward.
+#[derive(Clone, Copy)]
+pub(crate) enum ReplayStrategy {
+    #[cfg_attr(not(test), allow(dead_code))]
+    AggregateAll,
+    AggregateTailAndAntiJoin,
+}
+
 /// Compiles selected action groups into a schema, presence predicate, and identity lanes.
 pub(crate) struct ActionReplay {
     groups: Vec<ReplayGroup>,
@@ -62,6 +70,15 @@ impl ActionReplay {
     /// to serve as a scan base. The caller must choose a base complete for its requested state:
     /// CRC active adds cannot supply checkpoint tombstones. Output contains selected actions only.
     pub(crate) fn replay(&self, base: PlanBuilder, tail: PlanBuilder) -> KernelResult<PlanBuilder> {
+        self.replay_with_strategy(base, tail, ReplayStrategy::AggregateTailAndAntiJoin)
+    }
+
+    pub(crate) fn replay_with_strategy(
+        &self,
+        base: PlanBuilder,
+        tail: PlanBuilder,
+        strategy: ReplayStrategy,
+    ) -> KernelResult<PlanBuilder> {
         let payload_schema =
             Arc::new(StructType::try_new(self.fields().map(|field| {
                 tail.schema().field(field.name()).cloned().unwrap_or(field)
@@ -69,15 +86,13 @@ impl ActionReplay {
         let base = self.pack(base, &payload_schema)?;
         let tail = self.pack(tail, &payload_schema)?;
 
+        if matches!(strategy, ReplayStrategy::AggregateAll) {
+            return latest_by_key(PlanBuilder::union_all([base, tail])?)?
+                .project(col!(PAYLOAD), payload_schema);
+        }
         // Aggregate the whole action row atomically. A remove or domain deletion remains a
         // winning payload and its key cancels the corresponding base value before filtering.
-        let winners = tail.aggregate_by([column_name!(ACTION_KEY)], |a| {
-            a.max_non_null_by(
-                column_name!(PAYLOAD),
-                column_name!(ACTION_KEY),
-                column_name!(VERSION),
-            )
-        })?;
+        let winners = latest_by_key(tail)?;
         let surviving_base = base
             .anti_join(
                 winners.clone(),
@@ -87,6 +102,13 @@ impl ActionReplay {
             .project(col!(PAYLOAD), payload_schema.clone())?;
         let tail = winners.project(col!(PAYLOAD), payload_schema)?;
         PlanBuilder::union_all([tail, surviving_base])
+    }
+
+    /// Replays only a bounded commit interval, preserving winning tombstones without retention.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn replay_commits(&self, commits: PlanBuilder) -> KernelResult<PlanBuilder> {
+        let schema = Arc::new(StructType::try_new(self.fields())?);
+        latest_by_key(self.pack(commits, &schema)?)?.project(col!(PAYLOAD), schema)
     }
 
     fn fields(&self) -> impl Iterator<Item = StructField> + '_ {
@@ -148,6 +170,16 @@ impl ActionReplay {
     }
 }
 
+fn latest_by_key(tail: PlanBuilder) -> KernelResult<PlanBuilder> {
+    tail.aggregate_by([column_name!(ACTION_KEY)], |a| {
+        a.max_non_null_by(
+            column_name!(PAYLOAD),
+            column_name!(ACTION_KEY),
+            column_name!(VERSION),
+        )
+    })
+}
+
 /// Each lane is NULL on other action kinds. Singleton lanes use markers, not changing values.
 fn lane(group: ReplayGroup) -> (StructField, Expr) {
     match group {
@@ -206,5 +238,80 @@ fn lane(group: ReplayGroup) -> (StructField, Expr) {
             StructField::nullable("domain", DataType::STRING),
             col!("domainMetadata.domain"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Engine as _;
+    use crate::engine::arrow_data::EngineDataArrowExt as _;
+    use crate::engine::sync::SyncEngine;
+    use crate::plans::Operation;
+    use crate::schema::schema_ref;
+
+    #[rstest::rstest]
+    fn replay_strategies_keep_winning_domain_deletions(
+        #[values(false, true)] aggregate_all: bool,
+        #[values(false, true)] commits_only: bool,
+    ) -> KernelResult<()> {
+        let replay = ActionReplay::new(&[ReplayGroup::Domains]);
+        let input = |version: i64, removed: bool| {
+            PlanBuilder::values(
+                schema_ref! {
+                    nullable "domainMetadata": { not_null "domain": STRING, not_null "configuration": STRING, not_null "removed": BOOLEAN },
+                    nullable VERSION: LONG,
+                },
+                vec![vec![
+                    crate::expressions::StructData::try_new(
+                        vec![
+                            StructField::not_null("domain", DataType::STRING),
+                            StructField::not_null("configuration", DataType::STRING),
+                            StructField::not_null("removed", DataType::BOOLEAN),
+                        ],
+                        vec!["example".into(), "{}".into(), removed.into()],
+                    )?
+                    .into(),
+                    version.into(),
+                ]],
+            )
+        };
+        let tail = PlanBuilder::union_all([input(1, false)?, input(2, true)?])?;
+        let plan = if commits_only {
+            replay.replay_commits(tail)?
+        } else {
+            replay.replay_with_strategy(
+                input(0, false)?,
+                tail,
+                if aggregate_all {
+                    ReplayStrategy::AggregateAll
+                } else {
+                    ReplayStrategy::AggregateTailAndAntiJoin
+                },
+            )?
+        };
+        let engine = SyncEngine::new();
+        let mut batches = engine
+            .require_plan_executor()?
+            .execute_op(Operation::QueryPlan(plan.build()?))?
+            .into_data()?;
+        use crate::arrow::array::AsArray as _;
+        let mut rows = 0;
+        for batch in &mut batches {
+            let batch = batch?.try_into_record_batch()?;
+            let domain = batch.column_by_name("domainMetadata").unwrap().as_struct();
+            for index in 0..batch.num_rows() {
+                assert!(
+                    domain
+                        .column_by_name("removed")
+                        .unwrap()
+                        .as_boolean()
+                        .value(index)
+                );
+            }
+            rows += batch.num_rows();
+        }
+        assert_eq!(rows, 1);
+        Ok(())
     }
 }
