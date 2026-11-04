@@ -95,13 +95,12 @@ fn transform_struct(
             if let (Some(input_id), Some(target_id)) = (
                 input_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
                 arrow_metadata.get(PARQUET_FIELD_ID_META_KEY),
-            ) {
-                if input_id != target_id {
-                    return Err(KernelError::generic(format!(
-                        "Field '{}': input field ID {} conflicts with target field ID {}",
-                        target_field.name, input_id, target_id
-                    )));
-                }
+            ) && input_id != target_id
+            {
+                return Err(KernelError::generic(format!(
+                    "Field '{}': input field ID {} conflicts with target field ID {}",
+                    target_field.name, input_id, target_id
+                )));
             }
             let transformed_field = new_field_with_metadata(
                 &target_field.name,

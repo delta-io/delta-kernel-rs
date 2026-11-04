@@ -660,13 +660,12 @@ pub fn evaluate_predicate(
 
                     let right = evaluate_expression(right, batch, None)?;
                     let right = arrow_convert_to_non_view_type(right)?;
-                    if let Some(string_arr) = left.as_string_opt::<i32>() {
-                        if let Some(list_arr) = right.as_list_opt::<i32>() {
-                            if list_arr.value_type() == ArrowDataType::Utf8 {
-                                let result = in_list_utf8(string_arr, list_arr)?;
-                                return Ok(result);
-                            }
-                        }
+                    if let Some(string_arr) = left.as_string_opt::<i32>()
+                        && let Some(list_arr) = right.as_list_opt::<i32>()
+                        && list_arr.value_type() == ArrowDataType::Utf8
+                    {
+                        let result = in_list_utf8(string_arr, list_arr)?;
+                        return Ok(result);
                     }
 
                     use ArrowDataType::*;

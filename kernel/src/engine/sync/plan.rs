@@ -499,12 +499,13 @@ fn dynamic_scan_files(
             if path.is_null(row) {
                 return Err(KernelError::generic("DynamicScan path must not be null"));
             }
-            if let Some((dv, dv_ancestors)) = &dv {
-                if dv.is_valid(row) && dv_ancestors.iter().all(|ancestor| ancestor.is_valid(row)) {
-                    return Err(KernelError::unsupported(
-                        "SyncPlanExecutor DynamicScan with deletion vectors",
-                    ));
-                }
+            if let Some((dv, dv_ancestors)) = &dv
+                && dv.is_valid(row)
+                && dv_ancestors.iter().all(|ancestor| ancestor.is_valid(row))
+            {
+                return Err(KernelError::unsupported(
+                    "SyncPlanExecutor DynamicScan with deletion vectors",
+                ));
             }
             let path = path.value(row);
             let location = dynamic_scan.base_url.join(path)?;

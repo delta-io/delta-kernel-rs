@@ -451,27 +451,27 @@ impl<STATE> Transaction<STATE, Imperative> {
             // one pass.
             stats_verifier::verify_num_records_present(add_files)?;
         }
-        if let Some(ref clustering_cols) = self.physical_clustering_columns {
-            if !clustering_cols.is_empty() {
-                let physical_schema = self.effective_table_config.physical_schema();
-                let columns_with_types: Vec<(ColumnName, DataType)> = clustering_cols
-                    .iter()
-                    .map(|col| {
-                        let data_type = physical_schema
-                            .fields_of_path(col)?
-                            .last()
-                            .map(|field| field.data_type().clone())
-                            .ok_or_else(|| {
-                                KernelError::internal_error(format!(
-                                    "Required column '{col}' not found in table schema"
-                                ))
-                            })?;
-                        Ok((col.clone(), data_type))
-                    })
-                    .collect::<KernelResult<_>>()?;
-                let verifier = StatsColumnVerifier::new(columns_with_types);
-                verifier.verify(add_files)?;
-            }
+        if let Some(ref clustering_cols) = self.physical_clustering_columns
+            && !clustering_cols.is_empty()
+        {
+            let physical_schema = self.effective_table_config.physical_schema();
+            let columns_with_types: Vec<(ColumnName, DataType)> = clustering_cols
+                .iter()
+                .map(|col| {
+                    let data_type = physical_schema
+                        .fields_of_path(col)?
+                        .last()
+                        .map(|field| field.data_type().clone())
+                        .ok_or_else(|| {
+                            KernelError::internal_error(format!(
+                                "Required column '{col}' not found in table schema"
+                            ))
+                        })?;
+                    Ok((col.clone(), data_type))
+                })
+                .collect::<KernelResult<_>>()?;
+            let verifier = StatsColumnVerifier::new(columns_with_types);
+            verifier.verify(add_files)?;
         }
         Ok(())
     }
@@ -726,10 +726,10 @@ where
             add_files_batch.has_field(&column_name!(TAGS_NAME)),
             add_files_batch.has_field(&column_name!(CLUSTERING_PROVIDER_NAME)),
         );
-        if let Some((cached_columns, evaluator)) = &last_evaluator {
-            if *cached_columns == optional_columns {
-                return evaluator.evaluate(add_files_batch.deref());
-            }
+        if let Some((cached_columns, evaluator)) = &last_evaluator
+            && *cached_columns == optional_columns
+        {
+            return evaluator.evaluate(add_files_batch.deref());
         }
         let input_schema = add_files_schema_with(optional_columns.0, optional_columns.1);
         let input_schema = if row_tracking {

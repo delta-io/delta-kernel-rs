@@ -167,10 +167,10 @@ async fn live_create_table() {
     // logically without creating the directory; kernel lists the table root during create-table and
     // `LocalFileSystem` errors on a missing path (a cloud object store returns empty). Create it
     // for file:// locations so the create-table build can proceed.
-    if table_root.scheme() == "file" {
-        if let Ok(path) = table_root.to_file_path() {
-            std::fs::create_dir_all(&path).expect("failed to create local table directory");
-        }
+    if table_root.scheme() == "file"
+        && let Ok(path) = table_root.to_file_path()
+    {
+        std::fs::create_dir_all(&path).expect("failed to create local table directory");
     }
 
     // ===== Step 3: Define the schema =====
