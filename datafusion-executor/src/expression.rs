@@ -78,6 +78,10 @@ pub fn to_df_expr(
             )),
         },
 
+        KernelExpression::CaseWhen(_) => Err(KernelError::unsupported(
+            "converting a CaseWhen expression is not yet supported",
+        )),
+
         // TODO(#3007): implement once kernel's Cast semantics are clarified.
         KernelExpression::Cast(_) => Err(KernelError::unsupported(
             "converting a Cast expression is not yet supported",
