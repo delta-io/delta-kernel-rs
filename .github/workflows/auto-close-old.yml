@@ -1,0 +1,22 @@
+name: Close inactive PRs
+on:
+  workflow_dispatch:
+
+jobs:
+  preview-inactive-prs:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/stale@1e223db275d687790206a7acac4d1a11bd6fe629 # v10.4.0
+        with:
+          days-before-issue-stale: -1
+          days-before-issue-close: -1
+          days-before-pr-stale: 30
+          days-before-pr-close: 14
+          stale-pr-label: "stale"
+          stale-pr-message: "This PR has had no activity for 30 days and has been marked stale."
+          close-pr-message: "This PR was closed after 14 days with no activity since being marked stale."
+          operations-per-run: 1000
+          debug-only: true
