@@ -1,7 +1,15 @@
 # delta kernel mdbook
 
-This book serves as a user guide + developer guide + overall docs for the kernel. In addition to our
-docs.rs and top-level README, the three provide comprehensive documentation for the project.
+This book teaches developers how to build Delta Lake connectors with Kernel. Follow
+[documentation ownership](../../AGENTS.md#documentation-ownership) when deciding what belongs here
+and the [writing standards](CLAUDE.md) when editing guide pages.
+
+## Maintenance
+
+Update a guide page in the same PR as a user-visible change to the workflow it teaches. Fix examples
+affected by API changes in that PR. Before a release, review the changes since the commit recorded
+in [LAST_VALIDATED.md](LAST_VALIDATED.md) and update affected guide pages. Advance that record only
+after reviewing the full range.
 
 ## prerequisites
 
