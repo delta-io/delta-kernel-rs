@@ -923,8 +923,7 @@ mod tests {
             let write_dir_str = recover_string(
                 unsafe { get_write_dir(write_context.shallow_copy(), allocate_str) }.unwrap(),
             );
-            let write_dir_url =
-                Url::parse(&write_dir_str).map_err(delta_kernel::KernelError::from)?;
+            let write_dir_url = Url::parse(&write_dir_str).unwrap();
             assert!(
                 write_dir_url.path().ends_with("part=100/"),
                 "unexpected write dir: {write_dir_str}"
@@ -956,30 +955,23 @@ mod tests {
             ])
             .unwrap();
             let dir_path = write_dir_url.to_file_path().unwrap();
-            std::fs::create_dir_all(&dir_path).map_err(delta_kernel::KernelError::from)?;
+            std::fs::create_dir_all(&dir_path).unwrap();
             let file_name = "my_file.parquet";
             let file_fs_path = dir_path.join(file_name);
-            let parquet_file =
-                std::fs::File::create(&file_fs_path).map_err(delta_kernel::KernelError::from)?;
+            let parquet_file = std::fs::File::create(&file_fs_path).unwrap();
             let mut writer = ArrowWriter::try_new(
                 parquet_file,
                 batch.schema(),
                 Some(WriterProperties::builder().build()),
             )
-            .map_err(delta_kernel::KernelError::from)?;
-            writer
-                .write(&batch)
-                .map_err(delta_kernel::KernelError::from)?;
-            let parquet_meta = writer.close().map_err(delta_kernel::KernelError::from)?;
+            .unwrap();
+            writer.write(&batch).unwrap();
+            let parquet_meta = writer.close().unwrap();
             let num_rows = parquet_meta.file_metadata().num_rows();
-            let size = std::fs::metadata(&file_fs_path)
-                .map_err(delta_kernel::KernelError::from)?
-                .len();
+            let size = std::fs::metadata(&file_fs_path).unwrap().len();
 
             // Resolve the relative add.path from the absolute file URL.
-            let file_url = write_dir_url
-                .join(file_name)
-                .map_err(delta_kernel::KernelError::from)?;
+            let file_url = write_dir_url.join(file_name).unwrap();
             let file_url_str = file_url.as_str();
             let add_path = recover_string(
                 ok_or_panic(unsafe {
@@ -1001,7 +993,7 @@ mod tests {
             let metadata_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() }
                 .as_ref()
                 .try_into_arrow()
-                .map_err(delta_kernel::KernelError::from)?;
+                .unwrap();
             let file_info = create_arrow_ffi_from_json(metadata_schema, &metadata_json)?;
             let file_info_engine_data = ok_or_panic(unsafe {
                 get_engine_data(file_info.array, &file_info.schema, &TEST_ERROR_ALLOCATORS)
@@ -1019,16 +1011,11 @@ mod tests {
             let commit1 = store
                 .get(&Path::from_url_path(commit1_url.path()).unwrap())
                 .await
-                .map_err(delta_kernel::KernelError::from)?;
-            let parsed_commits: Vec<_> = Deserializer::from_slice(
-                &commit1
-                    .bytes()
-                    .await
-                    .map_err(delta_kernel::KernelError::from)?,
-            )
-            .into_iter::<serde_json::Value>()
-            .try_collect()
-            .map_err(delta_kernel::KernelError::from)?;
+                .unwrap();
+            let parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await.unwrap())
+                .into_iter::<serde_json::Value>()
+                .try_collect()
+                .unwrap();
             let add = &parsed_commits[1]["add"];
             assert_eq!(add["path"], json!("part=100/my_file.parquet"));
             assert_eq!(add["partitionValues"], json!({ "part": "100" }));
@@ -4748,21 +4735,18 @@ mod tests {
             "id",
             Arc::new(Int32Array::from(vec![10, 20, 30, 40])) as ArrayRef,
         )])
-        .map_err(delta_kernel::KernelError::from)?;
+        .unwrap();
         let parquet_bytes = record_batch_to_bytes(&batch);
         let parquet_len = parquet_bytes.len();
         let data_file_path = "data_file.parquet".to_string();
-        let data_url = table_url
-            .join(&data_file_path)
-            .map_err(delta_kernel::KernelError::from)?;
+        let data_url = table_url.join(&data_file_path).unwrap();
         store
             .put(
-                &ObjectStorePath::from_url_path(data_url.path())
-                    .map_err(delta_kernel::KernelError::from)?,
+                &ObjectStorePath::from_url_path(data_url.path()).unwrap(),
                 parquet_bytes.into(),
             )
             .await
-            .map_err(delta_kernel::KernelError::from)?;
+            .unwrap();
 
         // Add the file via a kernel transaction so the table has something to scan.
         // Build the kernel engine over the seeded store: `create_default_engine` resolves a fresh
@@ -4791,17 +4775,14 @@ mod tests {
         let mut dv_writer = StreamingDeletionVectorWriter::new(&mut dv_bytes);
         let dv_write_result = dv_writer.write_deletion_vector(dv)?;
         dv_writer.finalize()?;
-        let dv_url = table_url
-            .join("connector_dv.bin")
-            .map_err(delta_kernel::KernelError::from)?;
+        let dv_url = table_url.join("connector_dv.bin").unwrap();
         store
             .put(
-                &ObjectStorePath::from_url_path(dv_url.path())
-                    .map_err(delta_kernel::KernelError::from)?,
+                &ObjectStorePath::from_url_path(dv_url.path()).unwrap(),
                 dv_bytes.into(),
             )
             .await
-            .map_err(delta_kernel::KernelError::from)?;
+            .unwrap();
 
         // === FFI surface under test ===
         let table_path_str = table_url.as_str();

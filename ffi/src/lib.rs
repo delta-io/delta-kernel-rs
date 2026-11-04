@@ -2442,8 +2442,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_row_tracking_high_water_mark_present() -> Result<()> {
-        let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")
-            .map_err(delta_kernel::KernelError::from)?;
+        let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/").unwrap();
         let table_root = Url::from_directory_path(&table_path)
             .map_err(|()| delta_kernel::KernelError::generic("invalid table path"))?
             .to_string();
@@ -3120,15 +3119,9 @@ mod tests {
         let last_checkpoint = storage
             .get(&Path::from("_delta_log/_last_checkpoint"))
             .await
-            .map_err(delta_kernel::KernelError::from)?;
-        let v: Value = serde_json::from_slice(
-            last_checkpoint
-                .bytes()
-                .await
-                .map_err(delta_kernel::KernelError::from)?
-                .as_ref(),
-        )
-        .map_err(delta_kernel::KernelError::from)?;
+            .unwrap();
+        let v: Value =
+            serde_json::from_slice(last_checkpoint.bytes().await.unwrap().as_ref()).unwrap();
         assert_eq!(v["version"].as_u64(), Some(2));
         // 2 adds at versions 1..=2, no removes => 2 live add files.
         assert_eq!(v["numOfAddFiles"].as_u64(), Some(2));
@@ -3136,11 +3129,7 @@ mod tests {
         assert_eq!(v["size"].as_u64(), Some(4));
         // Cross-check the checkpoint parquet file size against `_last_checkpoint.sizeInBytes`.
         let checkpoint_path = Path::from("_delta_log/00000000000000000002.checkpoint.parquet");
-        let checkpoint_size = storage
-            .head(&checkpoint_path)
-            .await
-            .map_err(delta_kernel::KernelError::from)?
-            .size;
+        let checkpoint_size = storage.head(&checkpoint_path).await.unwrap().size;
         assert_eq!(v["sizeInBytes"].as_u64(), Some(checkpoint_size));
 
         // (c) chain a second checkpoint_snapshot(returned_snap, engine, None) =>
@@ -3177,7 +3166,7 @@ mod tests {
         use delta_kernel::object_store::local::LocalFileSystem;
         use tempfile::tempdir;
 
-        let tmp_dir = tempdir().map_err(delta_kernel::KernelError::from)?;
+        let tmp_dir = tempdir().unwrap();
         let tmp_path = tmp_dir.path();
         let table_root = tmp_path
             .to_str()
@@ -3187,7 +3176,7 @@ mod tests {
         // Use a temporary runtime for async setup, then drop it before the FFI calls so the engine
         // built below drives all async work through its own (FFI-configured) executor.
         {
-            let rt = tokio::runtime::Runtime::new().map_err(delta_kernel::KernelError::from)?;
+            let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(seed_v1_table(storage.as_ref(), table_root, 2))?;
         } // runtime dropped here, before FFI calls
 
@@ -3240,7 +3229,7 @@ mod tests {
         use delta_kernel::object_store::local::LocalFileSystem;
         use tempfile::tempdir;
 
-        let tmp_dir = tempdir().map_err(delta_kernel::KernelError::from)?;
+        let tmp_dir = tempdir().unwrap();
         let tmp_path = tmp_dir.path();
         let table_root = tmp_path
             .to_str()
@@ -3254,7 +3243,7 @@ mod tests {
             .join("\n");
 
         {
-            let rt = tokio::runtime::Runtime::new().map_err(delta_kernel::KernelError::from)?;
+            let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 add_commit(&table_root, storage.as_ref(), 0, protocol_and_metadata).await?;
                 add_commit(

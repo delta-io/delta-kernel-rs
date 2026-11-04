@@ -507,16 +507,13 @@ mod tests {
     fn builder_applies_optional_transaction_intent() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let commit_info_schema = schema_ref! { nullable "tag": STRING };
-        let arrow_schema: ArrowSchema = commit_info_schema
-            .as_ref()
-            .try_into_arrow()
-            .map_err(crate::KernelError::from)?;
+        let arrow_schema: ArrowSchema = commit_info_schema.as_ref().try_into_arrow().unwrap();
         let commit_info = Box::new(ArrowEngineData::new(
             RecordBatch::try_new(
                 Arc::new(arrow_schema),
                 vec![Arc::new(StringArray::from(vec![Some("value")]))],
             )
-            .map_err(crate::KernelError::from)?,
+            .unwrap(),
         ));
         let mut transaction = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", false)
@@ -551,16 +548,13 @@ mod tests {
     fn builder_rejects_non_single_row_commit_info(#[case] row_count: usize) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let commit_info_schema = schema_ref! { nullable "tag": STRING };
-        let arrow_schema: ArrowSchema = commit_info_schema
-            .as_ref()
-            .try_into_arrow()
-            .map_err(crate::KernelError::from)?;
+        let arrow_schema: ArrowSchema = commit_info_schema.as_ref().try_into_arrow().unwrap();
         let commit_info = Box::new(ArrowEngineData::new(
             RecordBatch::try_new(
                 Arc::new(arrow_schema),
                 vec![Arc::new(StringArray::from(vec![Some("value"); row_count]))],
             )
-            .map_err(crate::KernelError::from)?,
+            .unwrap(),
         ));
 
         let error = snapshot
@@ -1099,8 +1093,7 @@ mod tests {
             .staged_data_changes
             .add_files_metadata
             .push(Box::new(ArrowEngineData::new(
-                RecordBatch::try_from_iter([("value", values)])
-                    .map_err(crate::KernelError::from)?,
+                RecordBatch::try_from_iter([("value", values)]).unwrap(),
             )));
         assert_eq!(transaction.data_change, data_change);
         Ok(())

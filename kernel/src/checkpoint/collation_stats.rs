@@ -381,8 +381,7 @@ mod tests {
             let add = &adds[path];
             assert_sampled_bounds(&add["stats_parsed"], &bounds);
             if write_json {
-                let json: Value = serde_json::from_str(add["stats"].as_str().unwrap())
-                    .map_err(crate::KernelError::from)?;
+                let json: Value = serde_json::from_str(add["stats"].as_str().unwrap()).unwrap();
                 assert_eq!(json[COLLATION_STATS], bounds);
             } else {
                 assert!(add.get("stats").is_none());
@@ -422,8 +421,7 @@ mod tests {
                     .map(|batch| Ok(batch?.scan_files)),
             )?);
             for (path, bounds) in samples() {
-                let stats = serde_json::from_str(rows[path]["stats"].as_str().unwrap())
-                    .map_err(crate::KernelError::from)?;
+                let stats = serde_json::from_str(rows[path]["stats"].as_str().unwrap()).unwrap();
                 assert_sampled_bounds(&stats, &bounds);
             }
         }
@@ -639,10 +637,7 @@ mod tests {
         )?;
         assert_eq!(rows.len(), 1);
         let stats_json = rows[0]["stats"].as_str().unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(stats_json).map_err(crate::KernelError::from)?,
-            expected
-        );
+        assert_eq!(serde_json::from_str::<Value>(stats_json).unwrap(), expected);
         if has_json {
             assert_eq!(stats_json, expected.to_string());
         }
@@ -666,7 +661,7 @@ mod tests {
             assert_eq!(actual.len(), 1);
             let stats_json = actual[0]["add"]["stats"].as_str().unwrap();
             assert_eq!(
-                serde_json::from_str::<Value>(stats_json).map_err(crate::KernelError::from)?,
+                serde_json::from_str::<Value>(stats_json).unwrap(),
                 if has_json {
                     expected.clone()
                 } else {

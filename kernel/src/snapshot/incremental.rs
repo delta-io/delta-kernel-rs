@@ -768,7 +768,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_new_from_latest_commit_preservation() -> Result<()> {
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///").map_err(crate::KernelError::from)?;
+        let url = Url::parse("memory:///").unwrap();
         let engine = SyncEngine::new_with_store(store.clone());
 
         // Create commits 0-2
@@ -820,9 +820,9 @@ mod tests {
         // Create log_tail with FileMeta for version 2
         let commit_2_url = url
             .join("_delta_log/")
-            .map_err(crate::KernelError::from)?
+            .unwrap()
             .join("00000000000000000002.json")
-            .map_err(crate::KernelError::from)?;
+            .unwrap();
         let file_meta = crate::FileMeta {
             location: commit_2_url,
             last_modified: 1234567890,
@@ -1039,7 +1039,7 @@ mod tests {
             ctx.store
                 .delete(&delta_path_for_version(version, "json"))
                 .await
-                .map_err(crate::KernelError::from)?;
+                .unwrap();
         }
         commit(table_root, &ctx.store, 7, vec![add_action("file7.parquet")]).await;
         let updated_again = Snapshot::builder_from(updated)
@@ -1247,7 +1247,7 @@ mod tests {
         ctx.store
             .delete(&delta_path_for_version(3, "json"))
             .await
-            .map_err(crate::KernelError::from)?;
+            .unwrap();
 
         // ===== WHEN =====
         // A normal update may use the checkpoint to bridge the missing pre-checkpoint commit.
@@ -1593,7 +1593,7 @@ mod tests {
             }
         });
         checkpoint1[2]["partitionColumns"] =
-            serde_json::to_value(["some_partition_column"]).map_err(crate::KernelError::from)?;
+            serde_json::to_value(["some_partition_column"]).unwrap();
 
         let handler = engine.json_handler();
         let json_strings: StringArray = checkpoint1
@@ -1612,12 +1612,9 @@ mod tests {
 
         // Write the record batch to a Parquet file
         let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new(&mut buffer, checkpoint.schema(), None)
-            .map_err(crate::KernelError::from)?;
-        writer
-            .write(&checkpoint)
-            .map_err(crate::KernelError::from)?;
-        writer.close().map_err(crate::KernelError::from)?;
+        let mut writer = ArrowWriter::try_new(&mut buffer, checkpoint.schema(), None).unwrap();
+        writer.write(&checkpoint).unwrap();
+        writer.close().unwrap();
 
         store_3a
             .put(
@@ -1638,8 +1635,7 @@ mod tests {
                 "minWriterVersion": 5
             }
         });
-        commit1[2]["partitionColumns"] =
-            serde_json::to_value(["some_partition_column"]).map_err(crate::KernelError::from)?;
+        commit1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"]).unwrap();
         commit(table_root, store_3c_i.as_ref(), 1, commit1).await;
         test_new_from(store_3c_i.clone())?;
 
@@ -1671,8 +1667,7 @@ mod tests {
         // iii. commits have (no protocol, new metadata)
         let store_3c_iii = store.fork();
         let mut commit1 = commit0.clone();
-        commit1[2]["partitionColumns"] =
-            serde_json::to_value(["some_partition_column"]).map_err(crate::KernelError::from)?;
+        commit1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"]).unwrap();
         commit1.remove(1); // remove protocol
         commit(table_root, &store_3c_iii, 1, commit1).await;
         test_new_from(store_3c_iii.into())?;
@@ -1729,7 +1724,7 @@ mod tests {
                 make_test_crc_json(300, 3).to_string().into(),
             )
             .await
-            .map_err(crate::KernelError::from)?;
+            .unwrap();
 
         let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
             .at_version(3)
@@ -1761,7 +1756,7 @@ mod tests {
                     make_test_crc_json(400, 4).to_string().into(),
                 )
                 .await
-                .map_err(crate::KernelError::from)?;
+                .unwrap();
         }
 
         let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
@@ -1807,7 +1802,7 @@ mod tests {
                 make_test_crc_json(200, 2).to_string().into(),
             )
             .await
-            .map_err(crate::KernelError::from)?;
+            .unwrap();
 
         let snapshot_a = Snapshot::builder_for(ctx.url.as_str())
             .at_version(3)
@@ -1888,7 +1883,7 @@ mod tests {
                 make_test_crc_json(200, 2).to_string().into(),
             )
             .await
-            .map_err(crate::KernelError::from)?;
+            .unwrap();
 
         let snapshot_v3 = Snapshot::builder_for(table_root)
             .at_version(3)
@@ -1976,7 +1971,7 @@ mod tests {
                 make_test_crc_json(200, 2).to_string().into(),
             )
             .await
-            .map_err(crate::KernelError::from)?;
+            .unwrap();
 
         let snapshot_v3 = Snapshot::builder_for(table_root)
             .at_version(3)
@@ -2034,7 +2029,7 @@ mod tests {
                 make_test_crc_json(600, 6).to_string().into(),
             )
             .await
-            .map_err(crate::KernelError::from)?;
+            .unwrap();
 
         // Hop 1: snapshot at v0.
         let snapshot_v0 = Snapshot::builder_for(ctx.url.as_str())
@@ -2139,10 +2134,7 @@ mod tests {
 
         // put the old crc
         let path = delta_path_for_version(0, "crc");
-        store
-            .put(&path, crc.to_string().into())
-            .await
-            .map_err(crate::KernelError::from)?;
+        store.put(&path, crc.to_string().into()).await.unwrap();
 
         // base snapshot is at version 0
         let base_snapshot = Snapshot::builder_for(table_root)
@@ -2174,10 +2166,7 @@ mod tests {
             "metadata": metadata,
             "protocol": protocol(1, 2),
         });
-        store
-            .put(&path, crc.to_string().into())
-            .await
-            .map_err(crate::KernelError::from)?;
+        store.put(&path, crc.to_string().into()).await.unwrap();
         let snapshot = Snapshot::builder_from(base_snapshot.clone())
             .at_version(1)
             .build(&engine)?;
@@ -2459,7 +2448,7 @@ mod tests {
                     make_test_crc_json(200, 2).to_string().into(),
                 )
                 .await
-                .map_err(crate::KernelError::from)?;
+                .unwrap();
         }
 
         let reporter = Arc::new(CapturingReporter::default());
@@ -2537,7 +2526,7 @@ mod tests {
                     make_test_crc_json(200, 2).to_string().into(),
                 )
                 .await
-                .map_err(crate::KernelError::from)?;
+                .unwrap();
         }
 
         let reporter = Arc::new(CapturingReporter::default());
@@ -2628,7 +2617,7 @@ mod tests {
         ctx.store
             .put(&delta_path_for_version(4, "json"), "{ not json".into())
             .await
-            .map_err(crate::KernelError::from)?;
+            .unwrap();
 
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -2669,11 +2658,11 @@ mod tests {
         ctx.store
             .delete(&delta_path_for_version(5, "json"))
             .await
-            .map_err(crate::KernelError::from)?;
+            .unwrap();
         ctx.store
             .delete(&delta_path_for_version(4, "json"))
             .await
-            .map_err(crate::KernelError::from)?;
+            .unwrap();
 
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());

@@ -617,7 +617,7 @@ mod tests {
             vec![],
             &RecordBatchOptions::new().with_row_count(Some(row_count)),
         )
-        .map_err(crate::KernelError::from)?;
+        .unwrap();
         let empty_schema = schema_ref! {};
         let (engine, txn) = make_txn(Some((
             Box::new(ArrowEngineData::new(empty_batch)),

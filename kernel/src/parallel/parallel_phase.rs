@@ -231,7 +231,7 @@ mod tests {
         expected_paths: &[&str],
     ) -> Result<()> {
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///").map_err(crate::KernelError::from)?;
+        let url = Url::parse("memory:///").unwrap();
         let engine = SyncEngine::new_with_store(store.clone());
 
         // Create sidecar with add actions
@@ -257,7 +257,7 @@ mod tests {
 
         // Create FileMeta for the sidecar
         let file_meta = FileMeta {
-            location: url.join(sidecar_path).map_err(crate::KernelError::from)?,
+            location: url.join(sidecar_path).unwrap(),
             last_modified: 0,
             size: get_file_size(&store, sidecar_path).await,
         };
@@ -318,7 +318,7 @@ mod tests {
     async fn test_parallel_phase_multiple_sidecars() -> Result<()> {
         // This test uses multiple sidecar files, so we need custom logic
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///").map_err(crate::KernelError::from)?;
+        let url = Url::parse("memory:///").unwrap();
         let engine = SyncEngine::new_with_store(store.clone());
 
         // Create two sidecars
@@ -342,12 +342,12 @@ mod tests {
 
         let file_metas = vec![
             FileMeta {
-                location: url.join(sidecar1_path).map_err(crate::KernelError::from)?,
+                location: url.join(sidecar1_path).unwrap(),
                 last_modified: 0,
                 size: get_file_size(&store, sidecar1_path).await,
             },
             FileMeta {
-                location: url.join(sidecar2_path).map_err(crate::KernelError::from)?,
+                location: url.join(sidecar2_path).unwrap(),
                 last_modified: 0,
                 size: get_file_size(&store, sidecar2_path).await,
             },

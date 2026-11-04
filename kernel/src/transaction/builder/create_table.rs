@@ -1290,9 +1290,9 @@ mod tests {
         #[values(false, true)] expected_data_change: bool,
         #[values(false, true)] skip_dedup_validation: bool,
     ) -> Result<()> {
-        let tempdir = tempfile::tempdir().map_err(KernelError::from)?;
+        let tempdir = tempfile::tempdir().unwrap();
         let table_path = tempdir.path().join("table");
-        std::fs::create_dir(&table_path).map_err(KernelError::from)?;
+        std::fs::create_dir(&table_path).unwrap();
         let engine = SyncEngine::new();
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -2823,9 +2823,9 @@ mod tests {
         schema: SchemaRef,
         properties: &[(&str, &str)],
     ) -> Result<CreateTableTransaction> {
-        let tempdir = tempfile::tempdir().map_err(KernelError::from)?;
+        let tempdir = tempfile::tempdir().unwrap();
         let table_path = tempdir.path().join("table");
-        std::fs::create_dir(&table_path).map_err(KernelError::from)?;
+        std::fs::create_dir(&table_path).unwrap();
         CreateTableTransactionBuilder::new(
             table_path.to_string_lossy(),
             schema,

@@ -452,3 +452,127 @@ impl SchemaSeed<'_, DataType> {
             .map_err(serde_json::Error::custom)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::Debug;
+
+    use rstest::rstest;
+    use serde::de::{DeserializeOwned, DeserializeSeed};
+    use serde_json::json;
+
+    use super::*;
+
+    fn assert_serde_compatibility<T>(input: &str)
+    where
+        T: DeserializeOwned + Debug + PartialEq,
+        for<'a, 'de> SchemaSeed<'a, T>: DeserializeSeed<'de, Value = T>,
+    {
+        let diagnostic = RefCell::new(None);
+        let seeded = SchemaSeed::<T>::new(&diagnostic)
+            .deserialize(&mut serde_json::Deserializer::from_str(input));
+        let ordinary = serde_json::from_str::<T>(input);
+        match (seeded, ordinary) {
+            (Ok(actual), Ok(expected)) => assert_eq!(actual, expected),
+            (Err(actual), Err(expected)) => {
+                assert_eq!(actual.classify(), expected.classify());
+                assert_eq!(
+                    (actual.line(), actual.column()),
+                    (expected.line(), expected.column())
+                );
+                assert_eq!(
+                    actual.to_string().split(", expected").next(),
+                    expected.to_string().split(", expected").next(),
+                );
+            }
+            (actual, expected) => panic!("seeded: {actual:?}, ordinary: {expected:?}"),
+        }
+    }
+
+    #[test]
+    fn sequence_struct_duplicate_fields_retain_typed_diagnostic() {
+        let (error, diagnostic) =
+            decode_schema(r#"["struct",[["a","long",true,{}],["a","long",true,{}]]]"#).unwrap_err();
+        assert!(matches!(
+            diagnostic,
+            Some(SchemaDiagnostic::DuplicateField(_))
+        ));
+        assert!(error.to_string().to_lowercase().contains("duplicate"));
+    }
+
+    #[rstest]
+    #[case::structure("struct", r#"{"type":"struct","fields":[]}"#)]
+    #[case::field("field", r#"{"name":"a","type":"long","nullable":true,"metadata":{}}"#)]
+    #[case::array(
+        "array",
+        r#"{"type":"array","elementType":"long","containsNull":true}"#
+    )]
+    #[case::map(
+        "map",
+        r#"{"type":"map","keyType":"string","valueType":"long","valueContainsNull":false}"#
+    )]
+    fn seeded_decoding_preserves_missing_duplicate_and_unknown_field_behavior(
+        #[case] kind: &str,
+        #[case] input: &str,
+    ) {
+        let object: serde_json::Map<String, Value> = serde_json::from_str(input).unwrap();
+        let check = |input: &str| match kind {
+            "struct" => assert_serde_compatibility::<StructType>(input),
+            "field" => assert_serde_compatibility::<StructField>(input),
+            "array" => assert_serde_compatibility::<ArrayType>(input),
+            "map" => assert_serde_compatibility::<MapType>(input),
+            _ => unreachable!(),
+        };
+        check(input);
+        check(&format!("{},true}}", &input[..input.len() - 1]));
+        for (key, value) in &object {
+            let mut wrong_type = object.clone();
+            wrong_type.insert(key.clone(), Value::Null);
+            check(&serde_json::to_string(&wrong_type).unwrap());
+            let mut missing = object.clone();
+            missing.remove(key);
+            check(&serde_json::to_string(&missing).unwrap());
+            let duplicate = format!(r#"{{"{key}":{value},{}"#, &input[1..]);
+            check(&duplicate);
+        }
+        let mut extended = object;
+        extended.insert("unknown".into(), json!({"nested": [1, null]}));
+        check(&serde_json::to_string(&extended).unwrap());
+        check("null");
+    }
+
+    #[rstest]
+    #[case::structure("struct", r#"["struct",[]]"#, 2)]
+    #[case::field("field", r#"["a","long",true,{}]"#, 4)]
+    #[case::array("array", r#"["array","long",true]"#, 3)]
+    #[case::map("map", r#"["map","string","long",false]"#, 4)]
+    fn seeded_decoding_preserves_sequence_fields_and_truncation_errors(
+        #[case] kind: &str,
+        #[case] input: &str,
+        #[case] length: usize,
+    ) {
+        let values: Vec<Value> = serde_json::from_str(input).unwrap();
+        for index in 0..length {
+            let mut wrong_type = values.clone();
+            wrong_type[index] = Value::Null;
+            let invalid = serde_json::to_string(&wrong_type).unwrap();
+            match kind {
+                "struct" => assert_serde_compatibility::<StructType>(&invalid),
+                "field" => assert_serde_compatibility::<StructField>(&invalid),
+                "array" => assert_serde_compatibility::<ArrayType>(&invalid),
+                "map" => assert_serde_compatibility::<MapType>(&invalid),
+                _ => unreachable!(),
+            }
+        }
+        for end in 0..=length {
+            let truncated = serde_json::to_string(&values[..end]).unwrap();
+            match kind {
+                "struct" => assert_serde_compatibility::<StructType>(&truncated),
+                "field" => assert_serde_compatibility::<StructField>(&truncated),
+                "array" => assert_serde_compatibility::<ArrayType>(&truncated),
+                "map" => assert_serde_compatibility::<MapType>(&truncated),
+                _ => unreachable!(),
+            }
+        }
+    }
+}

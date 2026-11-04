@@ -1177,7 +1177,7 @@ mod tests {
     fn create_table_add_actions_preserve_data_change(
         #[values(false, true)] data_change: bool,
     ) -> Result<()> {
-        let tempdir = tempfile::tempdir().map_err(crate::KernelError::from)?;
+        let tempdir = tempfile::tempdir().unwrap();
         let engine = SyncEngine::new();
         let mut transaction = create_table(
             tempdir.path().to_string_lossy(),

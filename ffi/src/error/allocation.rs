@@ -399,6 +399,33 @@ mod tests {
     }
     #[cfg(feature = "default-engine-base")]
     #[test]
+    fn default_engine_retains_error_callback_context() {
+        let mut output = Box::<Capture>::default();
+        let context = std::ptr::from_mut(output.as_mut()).cast();
+        let allocators = ErrorAllocators {
+            context,
+            allocate_kernel_error: kernel,
+            allocate_delta_error: delta,
+        };
+        let path = "memory:///";
+        let handle = unsafe { crate::get_default_engine(kernel_string_slice!(path), &allocators) };
+        let ExternResult::Ok(handle) = handle else {
+            panic!("expected a default engine")
+        };
+        let bytes = [0xff];
+        let invalid_utf8 = KernelStringSlice {
+            ptr: bytes.as_ptr().cast(),
+            len: bytes.len(),
+        };
+        let result = unsafe { crate::get_snapshot_builder(invalid_utf8, handle.shallow_copy()) };
+        assert!(matches!(result, ExternResult::Err(pointer) if pointer == context));
+        assert_eq!(output.calls, 1);
+        assert_eq!(output.fields[0], ("code".into(), "Utf8Error".into()));
+        unsafe { crate::free_engine(handle) };
+    }
+
+    #[cfg(feature = "default-engine-base")]
+    #[test]
     fn absent_snapshot_dispatches_condition_and_parameters_through_registered_engine() {
         let mut output = Box::new(Capture {
             fail: true,

@@ -1244,7 +1244,7 @@ mod tests {
             .with_table_root("memory:///")
             .with_version(1)
             .try_build()?;
-        let all_files = serde_json::from_value(json!(adds)).map_err(crate::KernelError::from)?;
+        let all_files = serde_json::from_value(json!(adds)).unwrap();
         let crc = crc_base.then(|| {
             Arc::new(Crc {
                 version: 0,
@@ -1341,7 +1341,7 @@ mod tests {
             &Path::from("_delta_log/00000000000000000000.checkpoint.parquet"),
             record_batch_to_bytes(&batch).into(),
         ))
-        .map_err(crate::KernelError::from)?;
+        .unwrap();
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
         let scan = Arc::new(Snapshot::new(segment, config)?)
             .scan_builder()
@@ -1354,8 +1354,7 @@ mod tests {
         for batch in batches {
             let json = batch.column_by_name(STATS).unwrap().as_string::<i32>();
             assert_eq!(
-                serde_json::from_str::<serde_json::Value>(json.value(0))
-                    .map_err(crate::KernelError::from)?,
+                serde_json::from_str::<serde_json::Value>(json.value(0)).unwrap(),
                 stats(expected.into())
             );
             assert_eq!(
@@ -1418,9 +1417,9 @@ mod tests {
             &Path::from("_delta_log/00000000000000000000.checkpoint.parquet"),
             record_batch_to_bytes(&batch).into(),
         ))
-        .map_err(crate::KernelError::from)?;
+        .unwrap();
         let segment = log_segment(
-            Url::parse("memory:///_delta_log/").map_err(crate::KernelError::from)?,
+            Url::parse("memory:///_delta_log/").unwrap(),
             &[],
             Some("memory:///_delta_log/00000000000000000000.checkpoint.parquet"),
         );

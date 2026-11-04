@@ -527,7 +527,7 @@ mod tests {
     #[test]
     fn scan_non_content_metadata_uses_crc_fast_path_with_existing_checkpoint() -> Result<()> {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
-        let table_root = url::Url::parse("memory:///").map_err(crate::KernelError::from)?;
+        let table_root = url::Url::parse("memory:///").unwrap();
         let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let commit_info = |ict: i64, last_manifest_commit: Option<i64>| {
             let mut commit_info = serde_json::json!({ "timestamp": ict, "inCommitTimestamp": ict });
@@ -565,15 +565,11 @@ mod tests {
                 serde_json::json!({ "txn": { "appId": "app-1", "version": 5 } }),
             ],
         ];
-        let log_root = table_root
-            .join("_delta_log/")
-            .map_err(crate::KernelError::from)?;
+        let log_root = table_root.join("_delta_log/").unwrap();
         for (version, actions) in commits.iter().enumerate() {
             let lines = actions.iter().map(|action| action.to_string()).join("\n");
             engine.storage_handler().put(
-                &log_root
-                    .join(&format!("{version:020}.json"))
-                    .map_err(crate::KernelError::from)?,
+                &log_root.join(&format!("{version:020}.json")).unwrap(),
                 lines.into(),
                 false,
             )?;

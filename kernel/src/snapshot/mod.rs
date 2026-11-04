@@ -1912,7 +1912,7 @@ mod tests {
             ParsedLogPath::new(crate::FileMeta {
                 location: url
                     .join("_delta_log/00000000000000000000.checkpoint.parquet")
-                    .map_err(crate::KernelError::from)?,
+                    .unwrap(),
                 last_modified: 0,
                 size: 100,
             })
@@ -1926,7 +1926,7 @@ mod tests {
 
         let log_segment = LogSegment::try_new(
             listed_files,
-            url.join("_delta_log/").map_err(crate::KernelError::from)?,
+            url.join("_delta_log/").unwrap(),
             Some(0),
             None,
         )?;
@@ -2501,7 +2501,7 @@ mod tests {
         // When ICT is enabled but commit file is not found in log segment,
         // get_in_commit_timestamp should return an error
 
-        let url = Url::parse("memory:///").map_err(crate::KernelError::from)?;
+        let url = Url::parse("memory:///").unwrap();
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
 
@@ -2587,18 +2587,12 @@ mod tests {
         let checkpoint: RecordBatch = checkpoint.into();
 
         let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new(&mut buffer, checkpoint.schema(), None)
-            .map_err(crate::KernelError::from)?;
-        writer
-            .write(&checkpoint)
-            .map_err(crate::KernelError::from)?;
-        writer.close().map_err(crate::KernelError::from)?;
+        let mut writer = ArrowWriter::try_new(&mut buffer, checkpoint.schema(), None).unwrap();
+        writer.write(&checkpoint).unwrap();
+        writer.close().unwrap();
 
         let checkpoint_path = delta_path_for_version(1, "checkpoint.parquet");
-        store
-            .put(&checkpoint_path, buffer.into())
-            .await
-            .map_err(crate::KernelError::from)?;
+        store.put(&checkpoint_path, buffer.into()).await.unwrap();
 
         // Create 00000000000000000001.json with ICT
         let expected_ict = 1587968586200i64;
@@ -2663,7 +2657,7 @@ mod tests {
     async fn test_get_timestamp_errors_when_commit_file_missing(
         #[case] ict_enabled: bool,
     ) -> Result<()> {
-        let url = Url::parse("memory:///").map_err(crate::KernelError::from)?;
+        let url = Url::parse("memory:///").unwrap();
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
 
@@ -2736,7 +2730,7 @@ mod tests {
         store
             .delete(&delta_path_for_version(0, "json"))
             .await
-            .map_err(crate::KernelError::from)?;
+            .unwrap();
 
         let result = snapshot.get_timestamp(&engine);
         assert!(
@@ -2791,27 +2785,44 @@ mod tests {
         assert_eq!(snap.version(), 2);
     }
 
-    #[test]
-    fn test_new_post_commit_simple() {
+    #[rstest]
+    #[case::next_version(false, 1, None)]
+    #[case::same_version(false, 0, Some("does not equal Snapshot version"))]
+    #[case::crc_file(true, 1, Some("not a commit file"))]
+    fn test_new_post_commit_validates_file_type_and_successor(
+        #[case] use_crc: bool,
+        #[case] version_offset: Version,
+        #[case] expected_error: Option<&str>,
+    ) {
         // GIVEN
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
         let base_snapshot = Snapshot::builder_for(url.clone()).build(&engine).unwrap();
-        let next_version = base_snapshot.version() + 1;
+        let next_version = base_snapshot.version() + version_offset;
 
         // WHEN
-        let fake_new_commit = ParsedLogPath::create_parsed_published_commit(&url, next_version);
-        let post_commit_snapshot = base_snapshot
-            .new_post_commit(
-                fake_new_commit,
-                CrcDelta::default(),
-                #[cfg(feature = "adaptive-metadata-in-dev")]
-                None,
-            )
-            .unwrap();
+        let fake_new_commit = if use_crc {
+            ParsedLogPath::create_parsed_crc(&url, next_version)
+        } else {
+            ParsedLogPath::create_parsed_published_commit(&url, next_version)
+        };
+        let result = base_snapshot.new_post_commit(
+            fake_new_commit,
+            CrcDelta::default(),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            None,
+        );
 
         // THEN
+        if let Some(message) = expected_error {
+            let crate::Error::Kernel(error) = result.unwrap_err() else {
+                panic!("invalid post-commit input must retain its Kernel error")
+            };
+            assert_result_error_with_message::<(), _>(Err(error), message);
+            return;
+        }
+        let post_commit_snapshot = result.unwrap();
         assert_eq!(post_commit_snapshot.version(), next_version);
         assert_eq!(post_commit_snapshot.log_segment().end_version, next_version);
     }

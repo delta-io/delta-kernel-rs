@@ -418,10 +418,7 @@ mod tests {
         version: u64,
         file: String,
     ) -> Result<()> {
-        let metadata = storage
-            .head(&Path::from(file.as_ref()))
-            .await
-            .map_err(delta_kernel::KernelError::from)?;
+        let metadata = storage.head(&Path::from(file.as_ref())).await.unwrap();
         add_commit(
             table_root,
             storage,
@@ -443,10 +440,7 @@ mod tests {
         version: u64,
         file: String,
     ) -> Result<()> {
-        let metadata = storage
-            .head(&Path::from(file.as_ref()))
-            .await
-            .map_err(delta_kernel::KernelError::from)?;
+        let metadata = storage.head(&Path::from(file.as_ref())).await.unwrap();
         add_commit(
             table_root,
             storage,
@@ -541,9 +535,9 @@ mod tests {
     async fn test_table_changes_getters() -> Result<()> {
         let storage = Arc::new(InMemory::new());
 
-        let batch = generate_batch_with_id(1).map_err(delta_kernel::KernelError::from)?;
+        let batch = generate_batch_with_id(1).unwrap();
         put_file(storage.as_ref(), PARQUET_FILE1.to_string(), &batch).await?;
-        let batch = generate_batch_with_id(4).map_err(delta_kernel::KernelError::from)?;
+        let batch = generate_batch_with_id(4).unwrap();
         put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
 
         let table_root = "memory:///";
@@ -629,9 +623,9 @@ mod tests {
     async fn test_table_changes_scan() -> Result<()> {
         let storage = Arc::new(InMemory::new());
 
-        let batch = generate_batch_with_id(1).map_err(delta_kernel::KernelError::from)?;
+        let batch = generate_batch_with_id(1).unwrap();
         put_file(storage.as_ref(), PARQUET_FILE1.to_string(), &batch).await?;
-        let batch = generate_batch_with_id(4).map_err(delta_kernel::KernelError::from)?;
+        let batch = generate_batch_with_id(4).unwrap();
         put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
 
         let table_root = "memory:///";
@@ -658,12 +652,7 @@ mod tests {
         let table_schema = get_batch_schema();
         let expected = &ArrowEngineData::new(
             RecordBatch::try_new(
-                Arc::new(
-                    table_schema
-                        .as_ref()
-                        .try_into_arrow()
-                        .map_err(delta_kernel::KernelError::from)?,
-                ),
+                Arc::new(table_schema.as_ref().try_into_arrow().unwrap()),
                 vec![
                     Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])),
                     Arc::new(StringArray::from(vec!["a", "b", "c", "a", "b", "c"])),
@@ -673,7 +662,7 @@ mod tests {
                     Arc::new(Int32Array::from(vec![0, 0, 0, 1, 1, 1])),
                 ],
             )
-            .map_err(delta_kernel::KernelError::from)?,
+            .unwrap(),
         );
 
         let formatted = pretty_format_batches(&filtered_batches)
@@ -694,9 +683,9 @@ mod tests {
     async fn test_table_changes_scan_iterator() -> Result<()> {
         let storage = Arc::new(InMemory::new());
 
-        let batch = generate_batch_with_id(1).map_err(delta_kernel::KernelError::from)?;
+        let batch = generate_batch_with_id(1).unwrap();
         put_file(storage.as_ref(), PARQUET_FILE1.to_string(), &batch).await?;
-        let batch = generate_batch_with_id(4).map_err(delta_kernel::KernelError::from)?;
+        let batch = generate_batch_with_id(4).unwrap();
         put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
 
         let table_root = "memory:///";
@@ -746,12 +735,7 @@ mod tests {
         let table_schema = get_batch_schema();
         let expected = &ArrowEngineData::new(
             RecordBatch::try_new(
-                Arc::new(
-                    table_schema
-                        .as_ref()
-                        .try_into_arrow()
-                        .map_err(delta_kernel::KernelError::from)?,
-                ),
+                Arc::new(table_schema.as_ref().try_into_arrow().unwrap()),
                 vec![
                     Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])),
                     Arc::new(StringArray::from(vec!["a", "b", "c", "a", "b", "c"])),
@@ -761,7 +745,7 @@ mod tests {
                     Arc::new(Int32Array::from(vec![0, 0, 0, 1, 1, 1])),
                 ],
             )
-            .map_err(delta_kernel::KernelError::from)?,
+            .unwrap(),
         );
 
         let expected = pretty_format_batches(&[expected.record_batch().clone()])
@@ -784,9 +768,9 @@ mod tests {
     async fn test_table_changes_between_commits() -> Result<()> {
         let storage = Arc::new(InMemory::new());
 
-        let batch = generate_batch_with_id(1).map_err(delta_kernel::KernelError::from)?;
+        let batch = generate_batch_with_id(1).unwrap();
         put_file(storage.as_ref(), PARQUET_FILE1.to_string(), &batch).await?;
-        let batch = generate_batch_with_id(4).map_err(delta_kernel::KernelError::from)?;
+        let batch = generate_batch_with_id(4).unwrap();
         put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
 
         let table_root = "memory:///";
@@ -825,12 +809,7 @@ mod tests {
         };
         let expected = &ArrowEngineData::new(
             RecordBatch::try_new(
-                Arc::new(
-                    table_schema
-                        .as_ref()
-                        .try_into_arrow()
-                        .map_err(delta_kernel::KernelError::from)?,
-                ),
+                Arc::new(table_schema.as_ref().try_into_arrow().unwrap()),
                 vec![
                     Arc::new(Int32Array::from(vec![4, 5, 6, 1, 2, 3])),
                     Arc::new(StringArray::from(vec!["a", "b", "c", "a", "b", "c"])),
@@ -840,7 +819,7 @@ mod tests {
                     Arc::new(Int32Array::from(vec![1, 1, 1, 2, 2, 2])),
                 ],
             )
-            .map_err(delta_kernel::KernelError::from)?,
+            .unwrap(),
         );
 
         let formatted = pretty_format_batches(&filtered_batches)

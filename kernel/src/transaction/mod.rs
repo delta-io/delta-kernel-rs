@@ -1957,7 +1957,7 @@ mod tests {
         let commit_path = Path::from("_delta_log/00000000000000000000.json");
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(storage.put(&commit_path, actions.into()))
-            .map_err(KernelError::from)?;
+            .unwrap();
         let engine: Arc<dyn Engine> = engine;
         let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
         Ok((engine, snapshot))
@@ -2455,7 +2455,7 @@ mod tests {
                 Arc::new(Float64Array::from(vec![1.5])),
             ],
         )
-        .map_err(KernelError::from)?;
+        .unwrap();
         let rb = eval_logical_to_physical(&wc, batch)?;
 
         let rb_schema = rb.schema();
@@ -2529,7 +2529,7 @@ mod tests {
                 Arc::new(Int32Array::from(vec![20])),
             ],
         )
-        .map_err(KernelError::from)?;
+        .unwrap();
         let rb = eval_logical_to_physical(&wc, batch)?;
 
         // With void stripped and partition literals inserted, the output names/order must match
@@ -2894,9 +2894,9 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn test_ctas_rejected_on_iceberg_native_v4_table() -> Result<()> {
-        let tempdir = tempfile::tempdir().map_err(KernelError::from)?;
+        let tempdir = tempfile::tempdir().unwrap();
         let table_path = tempdir.path().join("table");
-        std::fs::create_dir(&table_path).map_err(KernelError::from)?;
+        std::fs::create_dir(&table_path).unwrap();
         let engine = SyncEngine::new();
         let mut txn = create_table(
             table_path.to_string_lossy(),
@@ -2954,7 +2954,7 @@ mod tests {
     ) -> Result<()> {
         // Public builders reject these states. Mutate private intent to test the runtime guard.
         let result = if is_create_table {
-            let tempdir = tempfile::tempdir().map_err(KernelError::from)?;
+            let tempdir = tempfile::tempdir().unwrap();
             let engine = SyncEngine::new();
             let mut txn = create_table(
                 tempdir.path().to_string_lossy(),
@@ -3049,7 +3049,7 @@ mod tests {
 
     #[test]
     fn test_validate_blind_append_rejects_create_table() -> Result<()> {
-        let tempdir = tempfile::tempdir().map_err(KernelError::from)?;
+        let tempdir = tempfile::tempdir().unwrap();
         let schema = schema_ref! { nullable "id": INTEGER };
         let engine = Arc::new(crate::engine::sync::SyncEngine::new());
         let mut txn = create_table(
@@ -3262,10 +3262,7 @@ mod tests {
         let result_batch = result.record_batch();
 
         // Verify: all field names, types, and metadata match the physical schema
-        let expected_arrow_schema: ArrowSchema = physical_schema
-            .as_ref()
-            .try_into_arrow()
-            .map_err(KernelError::from)?;
+        let expected_arrow_schema: ArrowSchema = physical_schema.as_ref().try_into_arrow().unwrap();
         assert_eq!(result_batch.schema().as_ref(), &expected_arrow_schema);
 
         // Verify: data is preserved (id values)
