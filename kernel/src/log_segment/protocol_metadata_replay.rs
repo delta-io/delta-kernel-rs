@@ -356,8 +356,9 @@ impl LogSegment {
         }))
     }
 
-    /// The commit at `end_version`, if this segment lists it (it does not when the segment ends
-    /// on a checkpoint).
+    /// The commit at `end_version`, if this segment lists it. Unlike `listed.latest_commit_file`,
+    /// this is `None` when the segment ends on a checkpoint, so P&M replay never reads a commit
+    /// that the checkpoint already covers.
     #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
     fn newest_commit(&self) -> Option<&ParsedLogPath> {
         self.listed
