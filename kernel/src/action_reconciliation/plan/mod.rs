@@ -105,7 +105,6 @@ impl ActionReplay {
     }
 
     /// Replays only a bounded commit interval, preserving winning tombstones without retention.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn replay_commits(&self, commits: PlanBuilder) -> KernelResult<PlanBuilder> {
         let schema = Arc::new(StructType::try_new(self.fields())?);
         latest_by_key(self.pack(commits, &schema)?)?.project(col!(PAYLOAD), schema)
