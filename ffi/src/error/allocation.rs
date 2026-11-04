@@ -104,9 +104,9 @@ impl ErrorAllocators {
     /// The context and callbacks must satisfy [`ErrorAllocators`]'s lifetime and concurrency
     /// requirements. Each callback must follow its field's memory access and ownership rules.
     pub unsafe fn allocate_error(&self, error: Error) -> *mut c_void {
-        error.dispatch(
-            |error| unsafe { self.allocate_kernel_error(error) },
-            |error| {
+        match error {
+            Error::Kernel(error) => unsafe { self.allocate_kernel_error(error) },
+            Error::Delta(error) => {
                 let message = error.message();
                 let parameters: Vec<_> = error
                     .parameters()
@@ -126,8 +126,9 @@ impl ErrorAllocators {
                     message: kernel_string_slice!(message),
                 };
                 unsafe { (self.allocate_delta_error)(self.context, &descriptor) }
-            },
-        )
+            }
+            error => unsafe { self.allocate_kernel_error(KernelError::generic(error)) },
+        }
     }
 }
 
