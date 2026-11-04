@@ -28,7 +28,6 @@ pub(crate) const VERSION: &str = "version";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReplayStrategy {
     /// Aggregate the union of base and commit rows by action identity.
-    #[cfg_attr(not(test), allow(dead_code))]
     AggregateAll,
     /// Aggregate commits, cancel matching base keys, then union the surviving base rows.
     AggregateTailAndAntiJoin,
@@ -117,6 +116,14 @@ pub(crate) fn replay_commits(
     let plan =
         latest_by_key(pack(commits, &options.actions, &schema)?)?.project(col!(PAYLOAD), schema)?;
     Ok((plan, options))
+}
+
+/// Converts to an output schema, padding missing fields with typed NULLs.
+pub(crate) fn project_action_schema(
+    input: PlanBuilder,
+    schema: SchemaRef,
+) -> KernelResult<PlanBuilder> {
+    align_schema(input, schema)
 }
 
 /// Projects a field to the target type, padding missing fields while preserving parent nulls.
@@ -347,70 +354,3 @@ fn lane(kind: ActionKind) -> (StructField, Expr) {
 
 #[cfg(test)]
 mod tests;
-
-// Transitional callers still select ReplayGroup; removed by the checkpoint migration.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReplayGroup {
-    Files,
-    Protocol,
-    Metadata,
-    Transactions,
-    Domains,
-}
-pub(crate) struct ActionReplay {
-    actions: Vec<ActionKind>,
-}
-impl ActionReplay {
-    pub(crate) fn new(groups: &[ReplayGroup]) -> Self {
-        Self {
-            actions: groups
-                .iter()
-                .map(|group| match group {
-                    ReplayGroup::Files => ActionKind::FileActions {
-                        includes_removes: true,
-                    },
-                    ReplayGroup::Protocol => ActionKind::Protocol,
-                    ReplayGroup::Metadata => ActionKind::Metadata,
-                    ReplayGroup::Transactions => ActionKind::SetTransaction,
-                    ReplayGroup::Domains => ActionKind::DomainMetadata,
-                })
-                .collect(),
-        }
-    }
-    pub(crate) fn read_schema(&self) -> KernelResult<SchemaRef> {
-        action_schema(&self.actions)
-    }
-    pub(crate) fn replay(
-        &self,
-        base: PlanBuilder,
-        commits: PlanBuilder,
-    ) -> KernelResult<PlanBuilder> {
-        let options = ActionOptions {
-            actions: self.actions.clone(),
-            json_stats: false,
-            parsed_stats: None,
-            parsed_partition_values: false,
-        };
-        Ok(replay(
-            (commits, options.clone()),
-            (base, options),
-            ReplayStrategy::AggregateTailAndAntiJoin,
-        )?
-        .0)
-    }
-}
-pub(crate) fn checkpoint_actions(
-    segment: &crate::log_segment::LogSegment,
-    shape: &crate::checkpoint::CheckpointShape,
-    schema: SchemaRef,
-) -> KernelResult<PlanBuilder> {
-    let selection = if schema
-        .fields()
-        .all(|field| matches!(field.name().as_str(), ADD_NAME | REMOVE_NAME | VERSION))
-    {
-        sources::CheckpointSelection::ContentOnly
-    } else {
-        sources::CheckpointSelection::Mixed
-    };
-    sources::read_checkpoint(segment, Some(shape), schema, selection)
-}

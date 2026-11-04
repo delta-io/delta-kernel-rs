@@ -88,7 +88,7 @@ pub(crate) fn commit_actions(
 
 /// Requested portions of a checkpoint; content means add/remove actions stored in V2 sidecars.
 #[derive(Clone, Copy)]
-pub(super) enum CheckpointSelection {
+enum CheckpointSelection {
     ContentOnly,
     NonContentOnly,
     Mixed,
@@ -113,7 +113,7 @@ impl CheckpointSelection {
 }
 
 /// Reads inline actions, or file actions from sidecars plus non-file actions from the root.
-pub(super) fn read_checkpoint(
+fn read_checkpoint(
     segment: &LogSegment,
     shape: Option<&CheckpointShape>,
     schema: SchemaRef,
