@@ -14,8 +14,8 @@ use super::{COMMIT_READ_SCHEMA, PhysicalPredicate, ScanMetadata, map_to_struct_o
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
-    ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, UnaryExpressionOp, col,
-    column_expr_ref, column_name, null_lit,
+    ColumnName, Expression, ExpressionRef, PredicateRef, UnaryExpressionOp, col, column_expr_ref,
+    column_name, expr, null_lit,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
@@ -323,7 +323,7 @@ impl ScanLogReplayProcessor {
                 column_expr_ref!("partitionValues_parsed"),
                 // The transform flattens `add.*` to top-level columns, so `path` is non-null
                 // exactly for Add rows.
-                Arc::new(Predicate::is_not_null(col!("path")).into()),
+                Arc::new(expr!(is_not_null(col("path")))),
                 output_schema.clone(),
                 &state_info.eligible_physical_stats_columns,
                 Some(metrics.clone()),

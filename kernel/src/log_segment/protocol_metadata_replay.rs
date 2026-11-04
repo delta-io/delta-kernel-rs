@@ -19,7 +19,7 @@ use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::Crc;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 #[cfg(feature = "declarative-plans")]
-use crate::expressions::{Predicate, col};
+use crate::expressions::{Predicate, expr};
 use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
 #[cfg(feature = "declarative-plans")]
@@ -152,13 +152,15 @@ impl LogSegment {
 
         // Required fields are non-null exactly when their Protocol or Metadata action is present.
         // Filter on required leaf fields so readers can use row group skipping.
-        let relevant_action = Predicate::or(
-            col!(PROTOCOL_NAME, "minReaderVersion").is_not_null(),
-            col!(METADATA_NAME, "id").is_not_null(),
-        );
+        let relevant_action = Predicate::from_expr(expr!(or(
+            is_not_null(path(PROTOCOL_NAME, "minReaderVersion")),
+            is_not_null(path(METADATA_NAME, "id")),
+        )));
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let relevant_action =
-            Predicate::or(relevant_action, col!(CHECKPOINT_ACTION_NAME).is_not_null());
+        let relevant_action = Predicate::or(
+            relevant_action,
+            Predicate::from_expr(expr!(is_not_null(path(CHECKPOINT_ACTION_NAME)))),
+        );
 
         PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
             .filter(relevant_action)?

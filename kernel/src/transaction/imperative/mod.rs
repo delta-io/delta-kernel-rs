@@ -28,7 +28,7 @@ use crate::error::KernelError;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
     ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, col, column_name,
-    lit, null_lit,
+    expr, lit, null_lit,
 };
 use crate::log_replay::HasSelectionVector;
 use crate::metrics::CommitFailureReason;
@@ -49,7 +49,7 @@ use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
     DataType, Engine, EngineData, Expression, ExpressionEvaluator, KernelResult,
-    KernelResultIterator, Predicate, RowVisitor, Version, create_row, version_as_i64,
+    KernelResultIterator, RowVisitor, Version, create_row, version_as_i64,
 };
 
 mod update_table;
@@ -779,17 +779,17 @@ fn build_remove_struct_patch(
     // Note: The Delta protocol requires `partitionValues`, `size`, and `tags` when
     // `extendedFileMetadata` is true. We require only `partitionValues` and `size` to match Spark.
     // Under adaptiveMetadata both are guaranteed present
-    let extended_file_metadata = Predicate::and_from([
-        col!(SIZE_NAME).is_not_null(),
-        col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME).is_not_null(),
-    ]);
+    let extended_file_metadata = expr!(and(
+        is_not_null(path(SIZE_NAME)),
+        is_not_null(path(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME)),
+    ));
     let mut patch = ExpressionStructPatchBuilder::new()
         // deletionTimestamp
         .insert_after("path", deletion_timestamp)
         // dataChange
         .insert_after("path", lit(data_change))
         // extended_file_metadata
-        .insert_after("path", Expression::from(extended_file_metadata))
+        .insert_after("path", extended_file_metadata)
         .insert_after(
             "path",
             col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME),
@@ -858,7 +858,7 @@ mod tests {
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
     use crate::engine::test_delegating::DelegatingEngine;
-    use crate::expressions::{ExpressionRef, MapData, PredicateRef, Scalar, StructData};
+    use crate::expressions::{ExpressionRef, MapData, Predicate, PredicateRef, Scalar, StructData};
     use crate::scan::log_replay::PATH_NAME;
     use crate::schema::{MapType, column_name, schema};
     use crate::table_configuration::TableConfiguration;

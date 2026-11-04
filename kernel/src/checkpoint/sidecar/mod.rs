@@ -6,7 +6,7 @@ use crate::action_reconciliation::ActionReconciliationIterator;
 use crate::actions::{ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::filter_by_predicate;
 use crate::expressions::{
-    Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData, col, null_lit,
+    Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData, col, expr, null_lit,
 };
 use crate::schema::{DataType, SchemaRef, StructField, try_schema};
 use crate::{
@@ -194,10 +194,10 @@ impl SidecarSplitter {
         // Filters out rows where both add and remove are null.
         let file_actions_null_row_filter = eval_handler.new_predicate_evaluator(
             sidecar_output_schema,
-            Arc::new(Predicate::or(
-                Predicate::is_not_null(col!(ADD_NAME)),
-                Predicate::is_not_null(col!(REMOVE_NAME)),
-            )),
+            Arc::new(Predicate::from_expr(expr!(or(
+                is_not_null(path(ADD_NAME)),
+                is_not_null(path(REMOVE_NAME)),
+            )))),
         )?;
 
         // Nulls out add/remove instead of dropping them so the data schema stays the
@@ -218,7 +218,7 @@ impl SidecarSplitter {
                 checkpoint_data_schema
                     .fields()
                     .filter(|f| f.name != ADD_NAME && f.name != REMOVE_NAME)
-                    .map(|f| Expression::column([&f.name]).is_not_null()),
+                    .map(|f| Predicate::from_expr(expr!(is_not_null(path(&f.name))))),
             );
             eval_handler.new_predicate_evaluator(checkpoint_data_schema, Arc::new(predicate))?
         };

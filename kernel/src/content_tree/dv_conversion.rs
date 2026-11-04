@@ -10,7 +10,7 @@ use crate::content_tree::{
     DeletionVectorInfo, KEY_METADATA, LOCATION,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{ArrayData, Expression, Scalar, lit};
+use crate::expressions::{ArrayData, Expression, Scalar, expr, lit};
 use crate::schema::{ArrayType, ColumnName, DataType, SchemaRef, column_name, lazy_schema_ref};
 use crate::{EngineData, KernelError, KernelResult};
 
@@ -97,10 +97,10 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
     Expression::struct_with_nullability_from(
         [
             Expression::column([DV_STORAGE_TYPE_HELPER]),
-            Expression::coalesce([
-                Expression::column([DV_ABSOLUTE_PATH_HELPER]),
-                dv_field(LOCATION),
-            ]),
+            expr!(coalesce(
+                path(DV_ABSOLUTE_PATH_HELPER),
+                path(DV_INFO, LOCATION)
+            )),
             // TODO(#3750): use a cast that fails on overflow. Until then these would null out an
             // out-of-range value, which `try_push` rejects up front.
             Expression::cast(dv_field(DV_INFO_OFFSET), DataType::INTEGER),
@@ -114,7 +114,7 @@ pub(crate) fn add_deletion_vector_expression() -> Expression {
         // Keyed off the storage type helper, not `deletionVector`: row visitors read leaves
         // without the parent's null mask, so the descriptor must be null exactly where its
         // `storageType` leaf is, including for entries the caller drops.
-        Expression::from_pred(Expression::column([DV_STORAGE_TYPE_HELPER]).is_not_null()),
+        expr!(is_not_null(path(DV_STORAGE_TYPE_HELPER))),
     )
 }
 

@@ -10,7 +10,9 @@ use std::sync::Arc;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::expressions::{Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar, lit};
+use crate::expressions::{
+    Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar, expr, lit,
+};
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::table_features::ColumnMappingMode;
 use crate::{KernelError, KernelResult};
@@ -171,10 +173,10 @@ pub(crate) fn get_transform_expr(
                         "reconstruction",
                     ))
                 })?;
-                let expr = Arc::new(Expression::coalesce([
-                    Expression::column([field_name]),
-                    lit(default_row_commit_version),
-                ]));
+                let expr = Arc::new(expr!(coalesce(
+                    path(field_name),
+                    lit(default_row_commit_version)
+                )));
                 patch.replace(field_name.clone(), expr)
             }
             MetadataDerivedColumn {
