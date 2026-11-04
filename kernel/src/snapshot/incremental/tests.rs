@@ -12,6 +12,7 @@ use test_utils::{add_commit, add_staged_commit};
 use url::Url;
 
 use super::log_update::{LogUpdate, StateBaseline, listing_start};
+use crate::actions::Protocol;
 use crate::engine::sync::SyncEngine;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_segment::LogSegment;
@@ -22,6 +23,7 @@ use crate::snapshot::builder::tests::catalog_managed_tests::{
     create_log_path, setup_catalog_managed_test,
 };
 use crate::snapshot::{IncrementalReplay, Snapshot};
+use crate::table_features::TableFeature;
 use crate::unit_test_utils::recording_reads::{Read, RecordingReads};
 use crate::{KernelError, Version};
 
@@ -388,6 +390,80 @@ fn crc_budget_starts_at_selected_crc_version(
         updated.crc_at_version().map(|crc| crc.version),
         (expected_crc == 4).then_some(4)
     );
+    let fresh = Snapshot::builder_for(table.table_root())
+        .build(&engine)
+        .unwrap();
+    assert_eq!(updated.table_configuration(), fresh.table_configuration());
+}
+
+#[rstest]
+#[case::unchanged(false, false)]
+#[case::metadata_changes(true, false)]
+#[case::protocol_changes(false, true)]
+#[tokio::test]
+async fn newer_crc_reuses_schema_only_when_protocol_and_metadata_match(
+    #[case] change_metadata: bool,
+    #[case] change_protocol: bool,
+) {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(0).with_crc_at([0]))
+        .build()
+        .unwrap();
+    let engine = SyncEngine::new_with_store(table.store().clone());
+    let base = Snapshot::builder_for(table.table_root())
+        .build(&engine)
+        .unwrap();
+    let base_schema = base.schema();
+    let mut expected_metadata = base.table_configuration().metadata().clone();
+    let mut expected_protocol = base.table_configuration().protocol().clone();
+    let mut actions = vec![json!({})];
+    if change_metadata {
+        expected_metadata = expected_metadata.with_configuration_entry("test.state", "changed");
+        actions.push(json!({"metaData": expected_metadata}));
+    }
+    if change_protocol {
+        expected_protocol = Protocol::try_new_modern(
+            [TableFeature::TimestampWithoutTimezone],
+            [
+                TableFeature::TimestampWithoutTimezone,
+                TableFeature::DomainMetadata,
+            ],
+        )
+        .unwrap();
+        assert_ne!(&expected_protocol, base.table_configuration().protocol());
+        actions.push(json!({"protocol": expected_protocol}));
+    }
+    let commit = actions
+        .into_iter()
+        .map(|action| action.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    add_commit(table.table_root(), table.store().as_ref(), 1, commit)
+        .await
+        .unwrap();
+    Snapshot::builder_for(table.table_root())
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(&engine)
+        .unwrap()
+        .write_checksum(&engine)
+        .unwrap();
+    add_commit(table.table_root(), table.store().as_ref(), 2, "{}".into())
+        .await
+        .unwrap();
+
+    let updated = Snapshot::builder_from(base)
+        .with_incremental_crc_replay(IncrementalReplay::Disabled)
+        .build(&engine)
+        .unwrap();
+    assert_eq!(updated.version(), 2);
+    assert_eq!(updated.base_crc().unwrap().version, 1);
+    assert!(updated.crc_at_version().is_none());
+    assert_eq!(
+        Arc::ptr_eq(&updated.schema(), &base_schema),
+        !change_metadata && !change_protocol
+    );
+    assert_eq!(updated.table_configuration().metadata(), &expected_metadata);
+    assert_eq!(updated.table_configuration().protocol(), &expected_protocol);
     let fresh = Snapshot::builder_for(table.table_root())
         .build(&engine)
         .unwrap();

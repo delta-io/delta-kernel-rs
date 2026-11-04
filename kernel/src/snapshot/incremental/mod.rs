@@ -210,20 +210,8 @@ fn resolve_incremental_state(
     let base_crc = segment.pick_latest_base_crc(engine, existing.base_crc())?;
     let crc_at_version =
         segment.try_build_crc_within_budget(engine, base_crc.as_ref(), crc_replay)?;
-    let resolution = match &crc_at_version {
-        Some((crc, source)) => {
-            let mut resolution = PmResolution::from_crc(crc, *source);
-            // None preserves the existing configuration, including its parsed schema
-            // and properties.
-            let existing_config = existing.table_configuration();
-            resolution
-                .metadata
-                .take_if(|metadata| metadata == existing_config.metadata());
-            resolution
-                .protocol
-                .take_if(|protocol| protocol == existing_config.protocol());
-            resolution
-        }
+    let mut resolution = match &crc_at_version {
+        Some((crc, source)) => PmResolution::from_crc(crc, *source),
         None => {
             let newer_crc = base_crc
                 .as_ref()
@@ -234,6 +222,15 @@ fn resolve_incremental_state(
             }
         }
     };
+
+    // None preserves the existing configuration, including its parsed schema and properties.
+    let existing_config = existing.table_configuration();
+    resolution
+        .metadata
+        .take_if(|metadata| metadata == existing_config.metadata());
+    resolution
+        .protocol
+        .take_if(|protocol| protocol == existing_config.protocol());
     Ok((resolution, crc_at_version.map(|(crc, _)| crc).or(base_crc)))
 }
 
