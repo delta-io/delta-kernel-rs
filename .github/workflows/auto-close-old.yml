@@ -15,6 +15,7 @@ jobs:
           days-before-issue-close: -1
           days-before-pr-stale: 30
           days-before-pr-close: 14
+          exempt-draft-pr: true
           stale-pr-label: "stale"
           stale-pr-message: "This PR has had no activity for 30 days and has been marked stale."
           close-pr-message: "This PR was closed after 14 days with no activity since being marked stale."
