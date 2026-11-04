@@ -36,6 +36,7 @@ use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandl
 /// resolve.
 pub struct PlanBasedEngine {
     executor: Arc<dyn PlanExecutor>,
+    declarative_protocol_metadata: bool,
     evaluation: Arc<dyn EvaluationHandler>,
     storage: Arc<PlanBasedStorageHandler>,
     json: Arc<PlanBasedJsonHandler>,
@@ -66,7 +67,16 @@ impl PlanBasedEngine {
                 fallback.as_ref().map(|engine| engine.parquet_handler()),
             )),
             executor: plan_executor,
+            declarative_protocol_metadata: false,
         }
+    }
+    /// Enables declarative Protocol and Metadata replay when `enabled` is true.
+    ///
+    /// The executor must support the complete replay plan, including filters and aggregates.
+    /// Defaults to false; file reads still use the executor in either mode.
+    pub fn with_declarative_protocol_metadata(mut self, enabled: bool) -> Self {
+        self.declarative_protocol_metadata = enabled;
+        self
     }
 }
 
@@ -89,6 +99,10 @@ impl Engine for PlanBasedEngine {
 
     fn plan_executor(&self) -> Option<Arc<dyn PlanExecutor>> {
         Some(self.executor.clone())
+    }
+
+    fn use_declarative_protocol_metadata(&self) -> bool {
+        self.declarative_protocol_metadata
     }
 }
 

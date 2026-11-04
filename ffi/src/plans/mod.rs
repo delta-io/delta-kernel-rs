@@ -50,7 +50,8 @@ pub unsafe extern "C" fn free_plan_executor(executor: Handle<SharedPlanExecutor>
 /// `free_engine`. The returned plan-based engine clones the handlers it needs from the fallback,
 /// so it remains valid independently of when the caller frees its fallback handle. When
 /// `fallback_engine` is [`OptionalValue::None`], unimplemented operations return an unsupported
-/// error.
+/// error. Protocol and Metadata replay uses imperative execution by default; use
+/// [`get_plan_based_engine_with_options`] to opt into declarative replay.
 ///
 /// # Safety
 ///
@@ -63,12 +64,36 @@ pub unsafe extern "C" fn get_plan_based_engine(
     fallback_engine: OptionalValue<Handle<SharedExternEngine>>,
     allocate_error: AllocateErrorFn,
 ) -> Handle<SharedExternEngine> {
+    unsafe {
+        get_plan_based_engine_with_options(plan_executor, fallback_engine, false, allocate_error)
+    }
+}
+
+/// Constructs a plan-based engine, opting into declarative P&M replay when the flag is true.
+///
+/// File-read plans are delegated in both modes. Enabling declarative P&M requires support for
+/// filters and aggregates as well. Consumes `plan_executor`, borrows `fallback_engine`, and returns
+/// an owned engine that must be released with `free_engine`.
+///
+/// # Safety
+/// The executor, optional fallback, and error allocator must satisfy [`get_plan_based_engine`]'s
+/// requirements. The caller must not reuse the consumed executor handle.
+#[no_mangle]
+pub unsafe extern "C" fn get_plan_based_engine_with_options(
+    plan_executor: Handle<SharedPlanExecutor>,
+    fallback_engine: OptionalValue<Handle<SharedExternEngine>>,
+    declarative_protocol_metadata: bool,
+    allocate_error: AllocateErrorFn,
+) -> Handle<SharedExternEngine> {
     let executor: Arc<dyn PlanExecutor> = unsafe { plan_executor.into_inner() };
     let fallback = match fallback_engine {
         OptionalValue::Some(engine) => Some(unsafe { engine.as_ref() }.engine()),
         OptionalValue::None => None,
     };
-    let engine: Arc<dyn Engine> = Arc::new(PlanBasedEngine::new(fallback, executor));
+    let engine: Arc<dyn Engine> = Arc::new(
+        PlanBasedEngine::new(fallback, executor)
+            .with_declarative_protocol_metadata(declarative_protocol_metadata),
+    );
     engine_to_handle(engine, allocate_error)
 }
 
@@ -156,8 +181,25 @@ mod tests {
             unsafe { get_plan_based_engine(executor, OptionalValue::None, allocate_err) };
 
         assert_is_plan_based_engine(&engine_handle);
+        assert!(!unsafe { engine_handle.as_ref() }
+            .engine()
+            .use_declarative_protocol_metadata());
 
         unsafe { free_engine(engine_handle) };
+    }
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    fn protocol_metadata_replay_is_explicitly_configured(#[case] enabled: bool) {
+        let executor = unsafe { get_plan_executor(None, unreachable_callback) };
+        let handle = unsafe {
+            get_plan_based_engine_with_options(executor, OptionalValue::None, enabled, allocate_err)
+        };
+        let engine = unsafe { handle.as_ref() }.engine();
+        assert_eq!(engine.use_declarative_protocol_metadata(), enabled);
+        assert!(engine.plan_executor().is_some());
+        unsafe { free_engine(handle) };
     }
 
     /// Without a fallback, an operation the plan-execution path does not implement reports that
