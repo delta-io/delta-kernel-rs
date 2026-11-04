@@ -1240,9 +1240,19 @@ mod tests {
     }
 
     /// `prefix_sum` appends the exclusive-prefix column and records a unary PrefixSum node.
-    #[test]
-    fn prefix_sum_appends_output_column() -> KernelResult<()> {
-        let plan = vals(x_schema()).prefix_sum(column_name!("x"), "offset")?;
+    #[rstest::rstest]
+    #[case::default_start(None, 0)]
+    #[case::explicit_start(Some(7), 7)]
+    fn prefix_sum_appends_output_column(
+        #[case] start: Option<i64>,
+        #[case] expected_start: i64,
+    ) -> KernelResult<()> {
+        let plan = match start {
+            None => vals(x_schema()).prefix_sum(column_name!("x"), "offset")?,
+            Some(start) => {
+                vals(x_schema()).prefix_sum_with_start(column_name!("x"), "offset", start)?
+            }
+        };
         let schema = plan.schema();
         assert_eq!(
             schema
@@ -1257,18 +1267,7 @@ mod tests {
         };
         assert_eq!(node.input, column_name!("x"));
         assert_eq!(node.output, "offset");
-        assert_eq!(node.start, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn prefix_sum_with_start_records_start() -> KernelResult<()> {
-        let plan = vals(x_schema()).prefix_sum_with_start(column_name!("x"), "offset", 7)?;
-        let built = assert_plan(plan, &[(&[], "values"), (&[0], "prefix_sum")]);
-        let Operator::PrefixSum(node) = &built.nodes[1].op else {
-            panic!("expected PrefixSum");
-        };
-        assert_eq!(node.start, 7);
+        assert_eq!(node.start, expected_start);
         Ok(())
     }
 

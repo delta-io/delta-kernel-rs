@@ -151,7 +151,7 @@ message PrefixSumNode {
   delta.kernel.expressions.ColumnName input = 1;
   string output = 2;
   delta.kernel.schema.StructType schema = 3;
-  // Value of the first non-NULL output.
+  // Initial value of the running sum, fixed when the plan is built.
   int64 start = 4;
 }
 
