@@ -547,7 +547,21 @@ impl PlanBuilder {
         input: impl Into<ColumnName>,
         output: impl Into<String>,
     ) -> KernelResult<Self> {
-        let prefix_sum = PrefixSum::try_new(self.schema(), input, output)?;
+        self.prefix_sum_with_start(input, output, 0)
+    }
+
+    /// Like [`Self::prefix_sum`], with offsets starting at `start` instead of `0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`PrefixSum::try_new`].
+    pub fn prefix_sum_with_start(
+        self,
+        input: impl Into<ColumnName>,
+        output: impl Into<String>,
+        start: i64,
+    ) -> KernelResult<Self> {
+        let prefix_sum = PrefixSum::try_new(self.schema(), input, output)?.with_start(start);
         let schema = Arc::clone(&prefix_sum.schema);
         Ok(self.unary_op_or_absent(schema, prefix_sum))
     }
@@ -1243,6 +1257,18 @@ mod tests {
         };
         assert_eq!(node.input, column_name!("x"));
         assert_eq!(node.output, "offset");
+        assert_eq!(node.start, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_sum_with_start_records_start() -> KernelResult<()> {
+        let plan = vals(x_schema()).prefix_sum_with_start(column_name!("x"), "offset", 7)?;
+        let built = assert_plan(plan, &[(&[], "values"), (&[0], "prefix_sum")]);
+        let Operator::PrefixSum(node) = &built.nodes[1].op else {
+            panic!("expected PrefixSum");
+        };
+        assert_eq!(node.start, 7);
         Ok(())
     }
 

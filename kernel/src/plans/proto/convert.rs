@@ -320,6 +320,7 @@ impl From<&PrefixSum> for proto_plan::PrefixSumNode {
             input: Some((&node.input).into()),
             output: node.output.clone(),
             schema: Some(node.schema.as_ref().into()),
+            start: node.start,
         }
     }
 }
@@ -1427,6 +1428,7 @@ mod tests {
         Operator::PrefixSum(PrefixSum {
             input: ColumnName::new(["n"]),
             output: "offset".to_string(),
+            start: 0,
             schema: sample_schema(),
         }),
         "prefix_sum"
@@ -1654,11 +1656,13 @@ mod tests {
         let node = PrefixSum {
             input: ColumnName::new(["n"]),
             output: "offset".to_string(),
+            start: 42,
             schema: sample_schema(),
         };
         let proto = proto_plan::PrefixSumNode::from(&node);
         assert_eq!(proto.input.expect("input").path, ["n"]);
         assert_eq!(proto.output, "offset");
+        assert_eq!(proto.start, 42);
         assert!(proto.schema.is_some());
     }
 

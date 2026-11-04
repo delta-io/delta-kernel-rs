@@ -151,6 +151,8 @@ message PrefixSumNode {
   delta.kernel.expressions.ColumnName input = 1;
   string output = 2;
   delta.kernel.schema.StructType schema = 3;
+  // Value of the first non-NULL output.
+  int64 start = 4;
 }
 
 // ============================================================================

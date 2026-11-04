@@ -1123,10 +1123,10 @@ impl TryFrom<AggregateBuilder> for Aggregate {
 ///
 /// # Semantics
 ///
-/// The output for row `i` is `SUM(input[0..i])`, or `0` for `i=0`. NULL inputs do not contribute
-/// and produce NULL outputs for their respective rows. Zero-valued inputs are valid but produce
-/// duplicate outputs (because they do not increase the value of the sum). Input rows are consumed
-/// exactly once in any order and output rows can be produced in any order.
+/// The output for row `i` is `start + SUM(input[0..i])`, or `start` for `i=0`. NULL inputs do not
+/// contribute and produce NULL outputs for their respective rows. Zero-valued inputs are valid but
+/// produce duplicate outputs (because they do not increase the value of the sum). Input rows are
+/// consumed exactly once in any order and output rows can be produced in any order.
 ///
 /// # Output schema
 ///
@@ -1166,12 +1166,17 @@ impl TryFrom<AggregateBuilder> for Aggregate {
 ///  e   |          5 |     20
 /// ```
 /// This produces the ranges `[0..20, 20..20, 20..25, 25..25, 25..35]`.
+///
+/// With `start: 100`, every non-NULL offset above shifts by 100, producing the ranges
+/// `[100..120, 120..120, 120..125, 125..125, 125..135]`.
 #[derive(Debug, Clone)]
 pub struct PrefixSum {
     /// LONG column to accumulate. May be nested (e.g. `stats.numRecords`).
     pub input: ColumnName,
     /// Name of the new top-level LONG column holding exclusive prefixes.
     pub output: String,
+    /// Value of the first non-NULL output. Defaults to `0`.
+    pub start: i64,
     /// Input schema with [`Self::output`] appended.
     pub schema: SchemaRef,
 }
@@ -1206,8 +1211,14 @@ impl PrefixSum {
         Ok(Self {
             input,
             output,
+            start: 0,
             schema,
         })
+    }
+
+    /// Sets [`Self::start`].
+    pub fn with_start(self, start: i64) -> Self {
+        Self { start, ..self }
     }
 }
 
@@ -1558,6 +1569,17 @@ mod tests {
         assert_eq!(offset.nullable, leaf_nullable || ancestor_nullable);
         assert_eq!(prefix.output, "offset");
         assert_eq!(prefix.input, column);
+        assert_eq!(prefix.start, 0);
+    }
+
+    #[test]
+    fn prefix_sum_with_start_keeps_schema() {
+        let input = schema(&[("n", true)]);
+        let prefix = PrefixSum::try_new(input.as_ref(), column_name!("n"), "off").unwrap();
+        let schema = Arc::clone(&prefix.schema);
+        let prefix = prefix.with_start(42);
+        assert_eq!(prefix.start, 42);
+        assert_eq!(prefix.schema, schema);
     }
 
     #[test]
