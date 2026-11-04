@@ -9,13 +9,13 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Int32Array, RecordBatch, StringArray};
-use delta_kernel::expressions::{col, column_name, lit, Predicate};
-use delta_kernel::schema::{schema_ref, DataType};
+use delta_kernel::expressions::{Predicate, col, column_name, lit};
+use delta_kernel::schema::{DataType, schema_ref};
 use rstest::rstest;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use test_utils::{read_add_infos, read_scan, test_table_setup};
 
-use super::{annotated_field, create_fixture, simple_batch, CollationStats, CollationTable};
+use super::{CollationStats, CollationTable, annotated_field, create_fixture, simple_batch};
 
 const SYNTHETIC_ID: &str = "test.ASCII_CI.1";
 

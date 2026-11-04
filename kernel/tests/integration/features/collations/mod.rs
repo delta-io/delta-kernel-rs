@@ -13,14 +13,14 @@ use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::schema::{
-    schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType, schema_ref,
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{Snapshot, SnapshotRef};
-use serde_json::{json, Value};
-use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
+use serde_json::{Value, json};
 use test_utils::delta_kernel_default_engine::DefaultEngine;
-use test_utils::{generate_batch, write_batch_to_table, IntoArray};
+use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
+use test_utils::{IntoArray, generate_batch, write_batch_to_table};
 
 use crate::common::write_utils::rewrite_commit;
 

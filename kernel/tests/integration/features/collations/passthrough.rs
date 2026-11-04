@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::Snapshot;
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
@@ -17,16 +18,15 @@ use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::engine::arrow_conversion::{TryFromArrow, TryIntoArrow};
 use delta_kernel::expressions::{col, column_name, lit};
 use delta_kernel::schema::{
-    schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
-    StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+    schema_ref,
 };
 use delta_kernel::snapshot::{CheckpointWriteResult, ChecksumWriteResult};
 use delta_kernel::table_features::TableFeature;
-use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::UpdateTableOperation;
-use delta_kernel::Snapshot;
+use delta_kernel::transaction::create_table::create_table;
 use rstest::rstest;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use test_utils::{
     add_commit, assert_result_error_with_message, read_add_infos, read_scan, test_table_setup,
     test_table_setup_mt, write_batch_to_table,
@@ -101,11 +101,13 @@ async fn reads_all_collation_bounds_and_annotations(
     assert!(config.is_feature_supported(&TableFeature::Collations));
     assert!(!config.is_feature_supported(&TableFeature::CollationsPreview));
     assert!(config.is_feature_supported(&TableFeature::DomainMetadata));
-    assert!(!config
-        .protocol()
-        .reader_features()
-        .unwrap()
-        .contains(&TableFeature::Collations));
+    assert!(
+        !config
+            .protocol()
+            .reader_features()
+            .unwrap()
+            .contains(&TableFeature::Collations)
+    );
     let scan = snapshot.clone().scan_builder().build()?;
     assert_annotations(&fixture.schema, &snapshot.schema(), false);
     assert_annotations(&snapshot.schema(), scan.physical_schema(), true);
@@ -247,13 +249,17 @@ async fn create_stable_tables_and_preserve_existing_features_on_append(
         rewrite_as_preview_table(&path)?;
         snapshot = Snapshot::builder_for(&path).build(engine.as_ref())?;
     }
-    assert!(snapshot
-        .table_configuration()
-        .is_feature_supported(&feature));
+    assert!(
+        snapshot
+            .table_configuration()
+            .is_feature_supported(&feature)
+    );
     assert!(!snapshot.table_configuration().is_feature_supported(&absent));
-    assert!(snapshot
-        .table_configuration()
-        .is_feature_supported(&TableFeature::DomainMetadata));
+    assert!(
+        snapshot
+            .table_configuration()
+            .is_feature_supported(&TableFeature::DomainMetadata)
+    );
     let protocol = snapshot.table_configuration().protocol().clone();
     let schema = snapshot.schema();
     let snapshot = write_batch_to_table(
@@ -316,9 +322,11 @@ async fn arrow_round_trip_schema_can_create_table(
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
     assert_eq!(snapshot.schema(), schema);
-    assert!(snapshot
-        .table_configuration()
-        .is_feature_supported(&TableFeature::Collations));
+    assert!(
+        snapshot
+            .table_configuration()
+            .is_feature_supported(&TableFeature::Collations)
+    );
     Ok(())
 }
 
@@ -361,11 +369,13 @@ async fn alter_requires_existing_feature_without_upgrade(
         assert_eq!(reloaded.table_configuration().protocol(), &protocol);
         assert_eq!(reloaded.schema().field("name"), Some(&collated_field));
     } else {
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("requires the 'collations'"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("requires the 'collations'")
+        );
         assert_eq!(
             Snapshot::builder_for(&path)
                 .build(engine.as_ref())?
@@ -404,22 +414,28 @@ async fn annotations_inside_container_structs_auto_enable_feature(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup()?;
     let schema = schema_ref! { nullable "items": (container) };
-    assert!(schema
-        .field("items")
-        .unwrap()
-        .get_config_value(&ColumnMetadataKey::Collations)
-        .is_none());
+    assert!(
+        schema
+            .field("items")
+            .unwrap()
+            .get_config_value(&ColumnMetadataKey::Collations)
+            .is_none()
+    );
     let snapshot = create_table(&path, schema.clone(), "test", false)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
     assert_eq!(snapshot.schema(), schema);
-    assert!(snapshot
-        .table_configuration()
-        .is_feature_supported(&TableFeature::Collations));
-    assert!(snapshot
-        .table_configuration()
-        .is_feature_supported(&TableFeature::DomainMetadata));
+    assert!(
+        snapshot
+            .table_configuration()
+            .is_feature_supported(&TableFeature::Collations)
+    );
+    assert!(
+        snapshot
+            .table_configuration()
+            .is_feature_supported(&TableFeature::DomainMetadata)
+    );
     Ok(())
 }
 
@@ -434,9 +450,11 @@ async fn crc_and_time_travel_keep_schema_and_protocol_at_each_version(
     let before = create_fixture(&path, engine.as_ref(), &fixture, &[]).await?;
     let old_schema = before.schema();
     let old_protocol = before.table_configuration().protocol().clone();
-    assert!(!before
-        .table_configuration()
-        .is_feature_supported(&TableFeature::Collations));
+    assert!(
+        !before
+            .table_configuration()
+            .is_feature_supported(&TableFeature::Collations)
+    );
     assert_eq!(
         before.write_checksum(engine.as_ref())?.0,
         ChecksumWriteResult::Written
@@ -473,9 +491,11 @@ async fn crc_and_time_travel_keep_schema_and_protocol_at_each_version(
     .await?;
     let after = Snapshot::builder_for(&path).build(engine.as_ref())?;
     assert_eq!(after.schema(), collated.schema);
-    assert!(after
-        .table_configuration()
-        .is_feature_supported(&TableFeature::Collations));
+    assert!(
+        after
+            .table_configuration()
+            .is_feature_supported(&TableFeature::Collations)
+    );
     assert_eq!(
         after.write_checksum(engine.as_ref())?.0,
         ChecksumWriteResult::Written
