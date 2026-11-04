@@ -1019,6 +1019,8 @@ impl LogSegment {
         )?;
         Ok(ActionsWithCheckpointInfo {
             actions: Box::new(commits.chain(checkpoint_actions)),
+            // TODO(#2866): the content tree reader produces neither `stats_parsed` nor
+            // `partitionValues_parsed`, so replay parses the JSON stats.
             checkpoint_info: CheckpointReadInfo {
                 has_stats_parsed: false,
                 has_partition_values_parsed: false,

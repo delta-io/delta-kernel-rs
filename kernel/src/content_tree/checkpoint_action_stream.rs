@@ -86,7 +86,7 @@ mod tests {
         ADD_SCHEMA, Add, ContentRoot, LOG_TXN_SCHEMA, REMOVE_FIELD, SET_TRANSACTION_NAME,
         get_commit_schema,
     };
-    use crate::arrow::array::{AsArray as _, RecordBatch};
+    use crate::arrow::array::{Array as _, AsArray as _, RecordBatch};
     use crate::arrow::datatypes::Int64Type;
     use crate::content_tree::test_utils::{added_data_entry, write_manifest};
     use crate::content_tree::{ContentTreeNodeEntry, TrackingStatus};
@@ -324,6 +324,35 @@ mod tests {
         let data_change = add.column_by_name("dataChange").unwrap().as_boolean();
         assert_eq!(modification_time.as_primitive::<Int64Type>().value(0), 1);
         assert!(!data_change.value(0));
+    }
+
+    #[test]
+    fn tree_adds_read_null_stats_and_stats_parsed() {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let checkpoint =
+            checkpoint_with_tree(&engine, &[added_data_entry("a.parquet", 1, 5, 0, 0)], 1);
+        let read_schema = schema_ref! {
+            nullable ADD_NAME: {
+                nullable "path": STRING,
+                nullable "stats": STRING,
+                nullable "stats_parsed": { nullable "numRecords": LONG },
+            },
+        };
+
+        let batches: Vec<_> =
+            read_checkpoint_action(&engine, &checkpoint, &log_root(), read_schema)
+                .unwrap()
+                .map(|batch| batch.unwrap().actions.try_into_record_batch().unwrap())
+                .collect();
+
+        let [batch] = batches.as_slice() else {
+            panic!("expected one batch, got {}", batches.len());
+        };
+        let add = batch.column_by_name(ADD_NAME).unwrap().as_struct();
+        assert!(add.is_valid(0));
+        // TODO(#2866): expect `numRecords` 5 in both once the tree's stats are carried over.
+        assert!(add.column_by_name("stats").unwrap().is_null(0));
+        assert!(add.column_by_name("stats_parsed").unwrap().is_null(0));
     }
 
     #[test]
