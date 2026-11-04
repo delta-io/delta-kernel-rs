@@ -395,9 +395,6 @@ Kernel's expression system is exposed through two parallel surfaces:
 
 Most engines need only one of the two surfaces.
 
-`EngineExpressionVisitor.visit_literal_null` receives the type tag and
-`KernelNullTypeParameters` by value. Year-month nulls carry their qualifier in the parameter record.
-
 | Function | Purpose |
 |----------|---------|
 | `visit_engine_expression` / `visit_engine_predicate` | Build a Kernel `SharedExpression` / `SharedPredicate` from an engine-side AST (Build surface) |
