@@ -488,6 +488,12 @@ impl ScanBuilder {
     /// to the engine by default. Use [`with_stats`](Self::with_stats) if the engine
     /// also wants stats in the scan metadata output.
     ///
+    /// String comparisons use UTF-8 binary semantics, including on columns with `__COLLATIONS`.
+    /// Kernel's pruning ignores `statsWithCollation`. For collation-aware queries, the connector
+    /// must derive a conservative predicate whose TRUE rows include every match of the original
+    /// filter, and apply the original filter after reading. Unsupported comparisons must not
+    /// discard rows through Kernel or underlying-reader pushdown.
+    ///
     /// [`StructType::add_metadata_column`]: crate::schema::StructType::add_metadata_column
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();

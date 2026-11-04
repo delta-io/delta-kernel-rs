@@ -21,6 +21,7 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     StatsConfig, StripFieldMetadataTransform, expected_stats_schema, stats_column_names,
 };
+use crate::schema::collation_utils::validate_collations_feature_support;
 pub(crate) use crate::schema::file_utils::validate_file_type_feature_support;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
@@ -431,6 +432,7 @@ impl TableConfiguration {
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
         validate_file_type_feature_support(&table_config)?;
+        validate_collations_feature_support(&table_config)?;
         // Reject corrupt column-default metadata (a non-string `CURRENT_DEFAULT`, or a non-`NULL`
         // default on a Variant column) and retain whether the validated schema declares any column
         // defaults.
@@ -834,10 +836,10 @@ impl TableConfiguration {
 
     /// Returns whether the protocol declares stable or preview collation support.
     pub(crate) fn has_collations_feature(&self) -> bool {
-        self.protocol.has_table_feature(&"collations".into())
+        self.protocol.has_table_feature(&TableFeature::Collations)
             || self
                 .protocol
-                .has_table_feature(&"collations-preview".into())
+                .has_table_feature(&TableFeature::CollationsPreview)
     }
 
     /// Returns `true` if the schema has generation expressions.
@@ -1309,7 +1311,8 @@ mod test {
     use crate::KernelError;
     use crate::actions::{MIN_VALUES, Metadata, Protocol};
     use crate::schema::{
-        ColumnName, DataType, SchemaRef, StructField, column_name, schema, schema_ref,
+        ColumnMetadataKey, ColumnName, DataType, MetadataValue, SchemaRef, StructField,
+        column_name, schema, schema_ref,
     };
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TABLE_FEATURES_MIN_READER_VERSION,
@@ -1322,11 +1325,58 @@ mod test {
     };
     use crate::unit_test_utils::{
         MockProtocolBuilder, MockTableConfigurationBuilder, assert_result_error_with_message,
-        field_with_generation_expression, test_schema_flat, test_schema_flat_with_column_mapping,
-        test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
+        assert_schema_feature_validation, field_with_generation_expression, test_schema_flat,
+        test_schema_flat_with_column_mapping, test_schema_nested,
+        test_schema_nested_with_column_mapping, test_schema_with_array,
         test_schema_with_array_and_column_mapping, test_schema_with_map,
         test_schema_with_map_and_column_mapping,
     };
+
+    #[rstest]
+    fn collations_feature_without_annotations_requires_only_domain_metadata_for_writes(
+        #[values(TableFeature::Collations, TableFeature::CollationsPreview)] feature: TableFeature,
+        #[values(false, true)] domain_metadata: bool,
+    ) {
+        let features =
+            std::iter::once(feature).chain(domain_metadata.then_some(TableFeature::DomainMetadata));
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(schema! { nullable "value": STRING })
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_writer_features(features)
+                    .build(),
+            )
+            .build();
+        config.ensure_operation_supported(Operation::Scan).unwrap();
+        let write = config.ensure_operation_supported(Operation::Write);
+        if domain_metadata {
+            write.unwrap();
+        } else {
+            assert_result_error_with_message(write, "domainMetadata");
+        }
+    }
+
+    #[rstest]
+    #[case::stable(TableFeature::Collations)]
+    #[case::preview(TableFeature::CollationsPreview)]
+    fn collated_schema_requires_feature_on_snapshot_load(#[case] feature: TableFeature) {
+        let annotated = schema! {
+            (StructField::nullable("value", DataType::STRING).with_metadata([(
+                ColumnMetadataKey::Collations.as_ref(),
+                MetadataValue::Other(serde_json::json!({ "value": "test.ASCII_CI" })),
+            )])),
+        };
+        assert_schema_feature_validation(
+            &annotated,
+            &schema! { nullable "value": STRING },
+            &MockProtocolBuilder::new()
+                .with_writer_features([feature])
+                .build(),
+            &MockProtocolBuilder::new().build(),
+            &[],
+            "requires the 'collations' or 'collations-preview' table feature",
+        );
+    }
 
     #[test]
     fn stats_output_schemas_allow_aligned_physical_names() {
