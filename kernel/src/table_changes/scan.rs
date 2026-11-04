@@ -47,7 +47,7 @@ pub struct TableChangesScan {
 /// Construct a [`TableChangesScan`] from `table_changes` with a given schema and predicate
 /// ```rust
 /// # use std::sync::Arc;
-/// # use delta_kernel::expressions::{col, lit};
+/// # use delta_kernel::expressions::expr;
 /// # use delta_kernel::Predicate;
 /// # use delta_kernel::table_changes::TableChanges;
 /// # let path = "./tests/data/table-with-cdf";
@@ -59,7 +59,7 @@ pub struct TableChangesScan {
 ///     .schema()
 ///     .project(&["id", "_commit_version"])
 ///     .unwrap();
-/// let predicate = Arc::new(Predicate::gt(col!("id"), lit(10)));
+/// let predicate = Arc::new(Predicate::from_expr(expr!(col("id") > 10)));
 /// let scan = table_changes
 ///     .into_scan_builder()
 ///     .with_schema(schema)
@@ -370,7 +370,7 @@ mod tests {
     use crate::Predicate;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{col, lit};
+    use crate::expressions::expr;
     use crate::object_store::memory::InMemory;
     use crate::scan::PhysicalPredicate;
     use crate::scan::transform_spec::FieldTransformSpec;
@@ -450,7 +450,7 @@ mod tests {
             .schema()
             .project(&["id", COMMIT_VERSION_COL_NAME])
             .unwrap();
-        let predicate = Arc::new(Predicate::gt(col!("id"), lit(10)));
+        let predicate = Arc::new(Predicate::from_expr(expr!(col("id") > 10)));
         let scan = table_changes
             .into_scan_builder()
             .with_schema(schema.clone())
@@ -551,7 +551,7 @@ mod tests {
 
         // Project only "part"; predicate references unprojected "id".
         let schema = table_changes.schema().project(&["part"]).unwrap();
-        let predicate = Arc::new(Predicate::gt(col!("id"), lit(10)));
+        let predicate = Arc::new(Predicate::from_expr(expr!(col("id") > 10)));
         let scan = table_changes
             .into_scan_builder()
             .with_schema(schema)
@@ -574,7 +574,7 @@ mod tests {
 
         // Project only "id"; predicate references unprojected `_commit_version`.
         let schema = table_changes.schema().project(&["id"]).unwrap();
-        let predicate = Arc::new(Predicate::ge(col!("_commit_version"), lit(0_i64)));
+        let predicate = Arc::new(Predicate::from_expr(expr!(col("_commit_version") >= 0_i64)));
         let scan = table_changes
             .into_scan_builder()
             .with_schema(schema)

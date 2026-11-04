@@ -196,8 +196,8 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::expressions::{
-        ArrayData as KernelArrayData, Expression as KernelExpr, Predicate as KernelPred, col, lit,
-        null_lit,
+        ArrayData as KernelArrayData, Expression as KernelExpr, Predicate as KernelPred, col, expr,
+        lit, null_lit,
     };
     use delta_kernel::schema::{ArrayType, DataType, schema};
     use rstest::rstest;
@@ -280,20 +280,20 @@ mod tests {
 
     #[rstest]
     // Primitive comparisons lower to a native binary op.
-    #[case::eq(col!("a").eq(lit(1i64)), "a = Int64(1)")]
-    #[case::lt(col!("a").lt(lit(1i64)), "a < Int64(1)")]
-    #[case::gt(col!("a").gt(lit(1i64)), "a > Int64(1)")]
+    #[case::eq(KernelPred::from_expr(expr!(col("a") == 1i64)), "a = Int64(1)")]
+    #[case::lt(KernelPred::from_expr(expr!(col("a") < 1i64)), "a < Int64(1)")]
+    #[case::gt(KernelPred::from_expr(expr!(col("a") > 1i64)), "a > Int64(1)")]
     #[case::distinct(
-        col!("a").distinct(lit(1i64)),
+        KernelPred::from_expr(expr!(distinct(col("a"), 1i64))),
         "a IS DISTINCT FROM Int64(1)"
     )]
     // Kernel has no <=/>=/!= ops: each is `Not` of a comparison, so it renders negated.
-    #[case::ne(col!("a").ne(lit(1i64)), "NOT a = Int64(1)")]
-    #[case::le(col!("a").le(lit(1i64)), "NOT a > Int64(1)")]
-    #[case::ge(col!("a").ge(lit(1i64)), "NOT a < Int64(1)")]
+    #[case::ne(KernelPred::from_expr(expr!(col("a") != 1i64)), "NOT a = Int64(1)")]
+    #[case::le(KernelPred::from_expr(expr!(col("a") <= 1i64)), "NOT a > Int64(1)")]
+    #[case::ge(KernelPred::from_expr(expr!(col("a") >= 1i64)), "NOT a < Int64(1)")]
     // Unary.
-    #[case::is_null(col!("a").is_null(), "a IS NULL")]
-    #[case::is_not_null(col!("a").is_not_null(), "NOT a IS NULL")]
+    #[case::is_null(KernelPred::from_expr(expr!(is_null(col("a")))), "a IS NULL")]
+    #[case::is_not_null(KernelPred::from_expr(expr!(is_not_null(col("a")))), "NOT a IS NULL")]
     // IN / NOT IN. Kernel requires a literal needle. `IS TRUE` turns DataFusion's null into
     // kernel's false, and sits inside the `Not` so a null value gives `NOT false` instead of
     // `NOT NULL`.
@@ -330,19 +330,15 @@ mod tests {
     )]
     // Junctions fold left-associatively.
     #[case::and(
-        KernelPred::and(col!("a").is_null(), col!("b").is_null()),
+        KernelPred::from_expr(expr!(and(is_null(col("a")), is_null(col("b"))))),
         "a IS NULL AND b IS NULL"
     )]
     #[case::or(
-        KernelPred::or(col!("a").is_null(), col!("b").is_null()),
+        KernelPred::from_expr(expr!(or(is_null(col("a")), is_null(col("b"))))),
         "a IS NULL OR b IS NULL"
     )]
     #[case::multi_and(
-        KernelPred::and_from([
-            col!("a").is_null(),
-            col!("b").is_null(),
-            col!("c").is_null(),
-        ]),
+        KernelPred::from_expr(expr!(and(is_null(col("a")), is_null(col("b")), is_null(col("c"))))),
         "a IS NULL AND b IS NULL AND c IS NULL"
     )]
     // A bare boolean expression goes straight to the expression converter.
@@ -350,21 +346,18 @@ mod tests {
     // Nested predicates. DataFusion's Display omits parens around the junction under a `Not`, but
     // the `Expr` tree is still `Not(And(..))`.
     #[case::not_of_junction(
-        KernelPred::not(KernelPred::and(col!("a").is_null(), col!("b").is_null())),
+        KernelPred::from_expr(expr!(not(and(is_null(col("a")), is_null(col("b")))))),
         "NOT a IS NULL AND b IS NULL"
     )]
     #[case::junction_of_junction(
-        KernelPred::or(
-            KernelPred::and(col!("a").is_null(), col!("b").is_null()),
-            col!("c").is_null(),
-        ),
+        KernelPred::from_expr(expr!(or(
+            and(is_null(col("a")), is_null(col("b"))),
+            is_null(col("c")),
+        ))),
         "a IS NULL AND b IS NULL OR c IS NULL"
     )]
     #[case::and_of_comparisons(
-        KernelPred::and(
-            col!("a").eq(lit(1i64)),
-            col!("b").gt(lit(2i64)),
-        ),
+        KernelPred::from_expr(expr!(and(col("a") == 1i64, col("b") > 2i64))),
         "a = Int64(1) AND b > Int64(2)"
     )]
     fn predicate_lowers_to_expected(#[case] kernel: KernelPred, #[case] expected: &str) {

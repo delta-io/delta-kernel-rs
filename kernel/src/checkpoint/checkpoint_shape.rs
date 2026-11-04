@@ -325,7 +325,7 @@ mod tests {
     };
     use crate::engine::sync::SyncEngine;
     use crate::engine::sync::plan::SyncPlanExecutor;
-    use crate::expressions::col;
+    use crate::expressions::expr;
     use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
     use crate::log_segment_files::LogSegmentFiles;
     use crate::plans::ir::nodes::Operator;
@@ -360,7 +360,13 @@ mod tests {
                         Operator::Filter(filter) => Some(filter.predicate.as_ref()),
                         _ => None,
                     });
-                    assert_eq!(predicate, Some(&col!(SIDECAR_NAME, "path").is_not_null()));
+                    assert_eq!(
+                        predicate,
+                        Some(&Predicate::from_expr(expr!(is_not_null(path(
+                            SIDECAR_NAME,
+                            "path"
+                        )))))
+                    );
                     _ = self.query_scans.fetch_add(1, Ordering::Relaxed);
                 }
                 Operation::IoOperation(IoOperation::ParquetFooter { .. }) => {

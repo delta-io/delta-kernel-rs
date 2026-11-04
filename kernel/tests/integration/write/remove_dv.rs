@@ -22,7 +22,7 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::{
-    ExpressionStructPatchBuilder, MapData, Scalar, col, lit, null_lit,
+    ExpressionStructPatchBuilder, MapData, Scalar, expr, lit, null_lit,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::log_replay::FileActionKey;
@@ -2263,8 +2263,8 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
             .scan_builder()
             .with_stats(StatsOptions::all());
         if use_predicate {
-            scan_builder =
-                scan_builder.with_predicate(Arc::new(Pred::gt(col!("number"), lit(0_i32))));
+            scan_builder = scan_builder
+                .with_predicate(Arc::new(Pred::from_expr(expr!(col("number") > 0_i32))));
         }
         let scan = scan_builder.build()?;
 
@@ -2329,14 +2329,14 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
 #[case::data_predicate(
     StatsOptions::all(),
     PartitionValuesOptions::string_map_only(),
-    Some(Pred::gt(col!("id"), lit(0_i32))),
+    Some(Pred::from_expr(expr!(col("id") > 0_i32))),
     &["usa", "japan"],
     true /* expect_stats */,
 )]
 #[case::partition_predicate(
     StatsOptions::all(),
     PartitionValuesOptions::string_map_only(),
-    Some(Pred::eq(col!("country"), lit("usa".to_string()))),
+    Some(Pred::from_expr(expr!(col("country") == lit("usa".to_string())))),
     &["usa"],
     true /* expect_stats */,
 )]

@@ -932,7 +932,7 @@ mod tests {
         mock_snapshot(segment)
             .unwrap()
             .scan_builder()
-            .with_predicate(Arc::new(col!("x").gt(lit(5i64))))
+            .with_predicate(Arc::new(Predicate::from_expr(expr!(col("x") > 5i64))))
             .with_stats(StatsOptions::all())
             .build()
             .unwrap()
@@ -1007,7 +1007,7 @@ mod tests {
         let scan = mock_snapshot(segment)?
             .scan_builder()
             .with_stats(stats)
-            .with_predicate(Arc::new(col!("x").gt(lit(5i64))))
+            .with_predicate(Arc::new(Predicate::from_expr(expr!(col("x") > 5i64))))
             .with_partition_values(partition_values)
             .build()?;
         let shape = CheckpointShape {
@@ -1434,7 +1434,9 @@ mod tests {
         let scan = mock_snapshot(segment)?
             .scan_builder()
             .with_stats(stats)
-            .with_predicate(Arc::new(col!("x").gt(lit(lower_bound))))
+            .with_predicate(Arc::new(Predicate::from_expr(expr!(
+                col("x") > lit(lower_bound)
+            ))))
             .build()?;
         let (read_schema, kind, _) =
             MetadataPlanner::try_new(&scan)?.read_schema(&file_schema, false)?;
@@ -1482,7 +1484,9 @@ mod tests {
         let scan = mock_snapshot(segment)?
             .scan_builder()
             .with_stats(stats)
-            .with_predicate(Arc::new(col!("x").gt(lit(lower_bound))))
+            .with_predicate(Arc::new(Predicate::from_expr(expr!(
+                col("x") > lit(lower_bound)
+            ))))
             .build()?;
         let plan = scan
             .build_metadata_scan_plan(

@@ -858,7 +858,7 @@ mod tests {
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
     use crate::engine::test_delegating::DelegatingEngine;
-    use crate::expressions::{ExpressionRef, MapData, Predicate, PredicateRef, Scalar, StructData};
+    use crate::expressions::{ExpressionRef, MapData, PredicateRef, Scalar, StructData, expr};
     use crate::scan::log_replay::PATH_NAME;
     use crate::schema::{MapType, column_name, schema};
     use crate::table_configuration::TableConfiguration;
@@ -1054,10 +1054,10 @@ mod tests {
         } else {
             lit(commit_timestamp)
         };
-        let expected_extended_file_metadata = Expression::from_pred(Predicate::and_from([
-            col!(SIZE_NAME).is_not_null(),
-            col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME).is_not_null(),
-        ]));
+        let expected_extended_file_metadata = expr!(and(
+            is_not_null(path(SIZE_NAME)),
+            is_not_null(path(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME))
+        ));
         assert_eq!(deletion_timestamp.as_ref(), &expected_deletion_timestamp);
         assert_eq!(
             extended_file_metadata.as_ref(),

@@ -1312,7 +1312,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
         BinaryExpressionOp, Expression, OpaquePredicateOp, Predicate, Scalar,
-        ScalarExpressionEvaluator, UnaryExpressionOp, col, column_name, lit, null_lit,
+        ScalarExpressionEvaluator, UnaryExpressionOp, col, column_name, expr, lit, null_lit,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -1723,10 +1723,10 @@ mod tests {
                 .expect("Should have row_commit_version_col patch");
             assert_eq!(
                 row_commit_version_patch.insertions,
-                [Arc::new(Expr::coalesce([
-                    col!("row_commit_version_col"),
-                    lit(5i64),
-                ]))]
+                [Arc::new(expr!(coalesce(
+                    col("row_commit_version_col"),
+                    5i64
+                )))]
             );
         }
         Ok(())
@@ -1793,7 +1793,7 @@ mod tests {
             nullable "id": INTEGER,
             nullable "name": STRING,
         };
-        let predicate = Arc::new(Predicate::gt(col!("id"), lit(0i32)));
+        let predicate = Arc::new(Predicate::from_expr(expr!(col("id") > 0i32)));
         let state_info = Arc::new(
             get_state_info_with_stats(
                 schema,
@@ -1842,7 +1842,7 @@ mod tests {
             nullable "id": INTEGER,
             nullable "value": STRING,
         };
-        let predicate = Arc::new(crate::expressions::Predicate::eq(col!("id"), lit(10i32)));
+        let predicate = Arc::new(Predicate::from_expr(expr!(col("id") == 10i32)));
         let state_info = Arc::new(
             get_state_info(
                 schema.clone(),
@@ -1890,7 +1890,9 @@ mod tests {
             nullable "value": INTEGER,
         };
         // Keep timestamps after 2024-01-15 16:00 UTC.
-        let predicate = Arc::new(col!("ts").gt(lit(Scalar::Timestamp(1_705_334_400_000_000))));
+        let predicate = Arc::new(Predicate::from_expr(expr!(
+            col("ts") > lit(Scalar::Timestamp(1_705_334_400_000_000))
+        )));
         let mut state_info = get_state_info(
             schema,
             vec!["ts".to_string()],
@@ -2374,22 +2376,22 @@ mod tests {
     #[case::stats_only(
         schema_ref! { nullable "value": INTEGER },
         vec![],
-        Arc::new(col!("value").gt(lit(5i32))),
+        Arc::new(Predicate::from_expr(expr!(col("value") > 5i32))),
         false, // use batch without partition column
     )]
     #[case::partition_predicate(
         schema_ref! { nullable "value": INTEGER, nullable "date": DATE },
         vec!["date".to_string()],
-        Arc::new(col!("date").eq(lit(Scalar::Date(17_510)))),
+        Arc::new(Predicate::from_expr(expr!(col("date") == lit(Scalar::Date(17_510))))),
         true, // use batch with partition column
     )]
     #[case::mixed_stats_and_partition(
         schema_ref! { nullable "value": INTEGER, nullable "date": DATE },
         vec!["date".to_string()],
-        Arc::new(Predicate::and(
-            col!("value").gt(lit(5i32)),
-            col!("date").eq(lit(Scalar::Date(17_510))),
-        )),
+        Arc::new(Predicate::from_expr(expr!(and(
+            col("value") > 5i32,
+            col("date") == lit(Scalar::Date(17_510)),
+        )))),
         true, // use batch with partition column
     )]
     fn data_skipping_does_not_prune_remove_actions(

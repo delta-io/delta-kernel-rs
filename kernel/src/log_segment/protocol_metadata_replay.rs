@@ -563,7 +563,7 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     use crate::engine::test_delegating::DelegatingEngine;
     #[cfg(feature = "declarative-plans")]
-    use crate::expressions::{Predicate, col};
+    use crate::expressions::{Predicate, expr};
     #[cfg(feature = "declarative-plans")]
     use crate::plans::ir::nodes::Operator;
     #[cfg(feature = "declarative-plans")]
@@ -643,12 +643,15 @@ mod tests {
             })
             .expect("P&M plan must filter irrelevant actions");
 
-        let expected = Predicate::or(
-            col!("protocol.minReaderVersion").is_not_null(),
-            col!("metaData.id").is_not_null(),
-        );
+        let expected = Predicate::from_expr(expr!(or(
+            is_not_null(col("protocol.minReaderVersion")),
+            is_not_null(col("metaData.id"))
+        )));
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let expected = Predicate::or(expected, col!("checkpoint").is_not_null());
+        let expected = Predicate::or(
+            expected,
+            Predicate::from_expr(expr!(is_not_null(col("checkpoint")))),
+        );
         assert_eq!(filter.predicate.as_ref(), &expected);
     }
 

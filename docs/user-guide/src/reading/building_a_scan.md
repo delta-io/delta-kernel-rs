@@ -85,16 +85,14 @@ Pass a predicate expression to skip files that cannot contain matching rows:
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::expressions::{col, lit, Predicate};
+# use delta_kernel::expressions::{expr, Predicate};
 # use delta_kernel::{KernelResult, Snapshot};
 # fn example() -> KernelResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
-let predicate = Arc::new(
-    Predicate::lt(col!("age"), lit(30))
-);
+let predicate = Arc::new(Predicate::from_expr(expr!(col("age") < 30)));
 
 let scan = snapshot
     .scan_builder()

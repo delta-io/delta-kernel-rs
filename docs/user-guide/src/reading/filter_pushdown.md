@@ -12,46 +12,47 @@ Before reading this page, make sure you understand
 A **predicate** is a boolean expression that describes which rows you want. Kernel
 evaluates predicates against file-level statistics to skip files before reading them.
 
-Predicates are built from the `Predicate` type and `Expression` values. The simplest way
-is to use the `col!` macro for column references and `lit()` for literal values.
+Use the `expr!` macro to build expressions with infix comparisons and `col("name")`
+column references. Convert its `Expression` result with `Predicate::from_expr` when
+an API requires a `Predicate`.
 
 ### Comparison operators
 
 ```rust,no_run
 # extern crate delta_kernel;
-use delta_kernel::expressions::{col, lit, Predicate};
+use delta_kernel::expressions::{expr, Predicate};
 
 // age < 30
-let pred = Predicate::lt(col!("age"), lit(30));
+let pred = Predicate::from_expr(expr!(col("age") < 30));
 
 // price >= 100.0
-let pred = Predicate::ge(col!("price"), lit(100.0_f64));
+let pred = Predicate::from_expr(expr!(col("price") >= 100.0_f64));
 
 // name == "Alice"
-let pred = Predicate::eq(col!("name"), lit("Alice"));
+let pred = Predicate::from_expr(expr!(col("name") == "Alice"));
 
 // status != "deleted"
-let pred = Predicate::ne(col!("status"), lit("deleted"));
+let pred = Predicate::from_expr(expr!(col("status") != "deleted"));
 ```
 
-The full set of comparison constructors:
+The full set of comparisons inside `expr!`:
 
-| Constructor | SQL equivalent |
+| Expression | SQL equivalent |
 |-------------|----------------|
-| `Predicate::eq(a, b)` | `a = b` |
-| `Predicate::ne(a, b)` | `a != b` |
-| `Predicate::lt(a, b)` | `a < b` |
-| `Predicate::le(a, b)` | `a <= b` |
-| `Predicate::gt(a, b)` | `a > b` |
-| `Predicate::ge(a, b)` | `a >= b` |
-| `Predicate::distinct(a, b)` | `a IS DISTINCT FROM b` |
+| `col("a") == col("b")` | `a = b` |
+| `col("a") != col("b")` | `a != b` |
+| `col("a") < col("b")` | `a < b` |
+| `col("a") <= col("b")` | `a <= b` |
+| `col("a") > col("b")` | `a > b` |
+| `col("a") >= col("b")` | `a >= b` |
+| `distinct(col("a"), col("b"))` | `a IS DISTINCT FROM b` |
 
 `distinct` is a NULL-safe inequality: it returns true when `a` and `b` differ, even when
 one or both are NULL. The other comparisons follow SQL NULL semantics and produce NULL when
 either input is NULL.
 
-Each constructor takes `impl Into<Expression>` for both arguments, so you can pass
-`col!()` / `lit()` results, `Scalar` values, or any `Expression` directly.
+Literals retain their Rust types: `30` is INTEGER and `30_i64` is LONG. Use
+`lit(value)` inside `expr!` for a computed scalar value.
 
 ### Combining predicates
 
@@ -59,85 +60,75 @@ Use `and`, `or`, and `not` to build compound predicates:
 
 ```rust,no_run
 # extern crate delta_kernel;
-use delta_kernel::expressions::{col, lit, Predicate};
+use delta_kernel::expressions::{expr, Predicate};
 
 // age >= 18 AND age < 65
-let pred = Predicate::and(
-    Predicate::ge(col!("age"), lit(18)),
-    Predicate::lt(col!("age"), lit(65)),
-);
+let pred = Predicate::from_expr(expr!(and(col("age") >= 18, col("age") < 65)));
 
 // status == "active" OR status == "pending"
-let pred = Predicate::or(
-    Predicate::eq(col!("status"), lit("active")),
-    Predicate::eq(col!("status"), lit("pending")),
-);
+let pred = Predicate::from_expr(expr!(or(
+    col("status") == "active",
+    col("status") == "pending",
+)));
 
 // NOT (archived)
-let pred = Predicate::not(
-    Predicate::eq(col!("archived"), lit(true)),
-);
+let pred = Predicate::from_expr(expr!(not(col("archived") == true)));
 ```
 
-For combining more than two predicates, use `and_from` or `or_from`:
+The `and` and `or` forms accept more than two predicates:
 
 ```rust,no_run
 # extern crate delta_kernel;
-use delta_kernel::expressions::{col, lit, Predicate};
+use delta_kernel::expressions::{expr, Predicate};
 
 // age >= 18 AND country == "US" AND active == true
-let pred = Predicate::and_from([
-    Predicate::ge(col!("age"), lit(18)),
-    Predicate::eq(col!("country"), lit("US")),
-    Predicate::eq(col!("active"), lit(true)),
-]);
+let pred = Predicate::from_expr(expr!(and(
+    col("age") >= 18,
+    col("country") == "US",
+    col("active") == true,
+)));
 ```
 
 ### NULL checks
 
 ```rust,no_run
 # extern crate delta_kernel;
-use delta_kernel::expressions::{col, lit, Predicate};
+use delta_kernel::expressions::{expr, Predicate};
 
 // email IS NULL
-let pred = Predicate::is_null(col!("email"));
+let pred = Predicate::from_expr(expr!(is_null(col("email"))));
 
 // email IS NOT NULL
-let pred = Predicate::is_not_null(col!("email"));
+let pred = Predicate::from_expr(expr!(is_not_null(col("email"))));
 ```
 
 ### Nested columns
 
-The `col!` macro supports dot-separated paths for nested struct fields:
+Inside `expr!`, `col` supports dot-separated paths for nested struct fields:
 
 ```rust,no_run
 # extern crate delta_kernel;
-use delta_kernel::expressions::{col, lit, Predicate};
+use delta_kernel::expressions::{expr, Predicate};
 
 // address.city == "Seattle"
-let pred = Predicate::eq(
-    col!("address.city"),
-    lit("Seattle"),
-);
+let pred = Predicate::from_expr(expr!(col("address.city") == "Seattle"));
 ```
 
-### Method syntax
+### Computed values and column names
 
-You can also build predicates using method syntax on `Expression`:
+Use `lit` for computed scalar values and `path` for explicit column-name segments:
 
 ```rust,no_run
 # extern crate delta_kernel;
-use delta_kernel::expressions::{col, lit};
+use delta_kernel::expressions::{expr, Predicate};
 
-// age < 30
-let pred = col!("age").lt(lit(30));
-
-// name == "Alice"
-let pred = col!("name").eq(lit("Alice"));
-
-// email IS NOT NULL
-let pred = col!("email").is_not_null();
+let cutoff = 30;
+let column = "age";
+let pred = Predicate::from_expr(expr!(path(column) < lit(cutoff)));
 ```
+
+`path("address.city")` addresses one field whose name contains a dot.
+`path("address", "city")` addresses the nested `city` field under `address`.
 
 ## Applying a predicate to a scan
 
@@ -149,19 +140,17 @@ Pass the predicate to `ScanBuilder::with_predicate`:
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::expressions::{col, lit, Predicate};
+# use delta_kernel::expressions::{expr, Predicate};
 # use delta_kernel::{KernelResult, Snapshot};
 # fn example() -> KernelResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
-let predicate = Arc::new(
-    Predicate::and(
-        Predicate::ge(col!("age"), lit(18)),
-        Predicate::lt(col!("age"), lit(65)),
-    )
-);
+let predicate = Arc::new(Predicate::from_expr(expr!(and(
+    col("age") >= 18,
+    col("age") < 65,
+))));
 
 let scan = snapshot
     .scan_builder()

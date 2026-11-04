@@ -1460,6 +1460,7 @@ mod tests {
     use super::{
         DataType, Expression as Expr, MapToStructOptions, Predicate as Pred, col, column_pred, lit,
     };
+    use crate::expressions::expr;
 
     /// Helper function to verify roundtrip serialization/deserialization
     fn assert_roundtrip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: &T) {
@@ -1549,25 +1550,24 @@ mod tests {
     fn test_predicate_format() {
         let cases = [
             (column_pred!("x"), "Column(x)"),
-            (col!("x").eq(lit(2)), "Column(x) = 2"),
+            (Pred::from_expr(expr!(col("x") == 2)), "Column(x) = 2"),
             ((col!("x") - lit(4)).lt(lit(10)), "Column(x) - 4 < 10"),
             (
-                Pred::and(col!("x").ge(lit(2)), col!("x").le(lit(10))),
+                Pred::from_expr(expr!(and(col("x") >= 2, col("x") <= 10))),
                 "AND(NOT(Column(x) < 2), NOT(Column(x) > 10))",
             ),
             (
-                Pred::and_from([
-                    col!("x").ge(lit(2)),
-                    col!("x").le(lit(10)),
-                    col!("x").le(lit(100)),
-                ]),
+                Pred::from_expr(expr!(and(col("x") >= 2, col("x") <= 10, col("x") <= 100))),
                 "AND(NOT(Column(x) < 2), NOT(Column(x) > 10), NOT(Column(x) > 100))",
             ),
             (
-                Pred::or(col!("x").gt(lit(2)), col!("x").lt(lit(10))),
+                Pred::from_expr(expr!(or(col("x") > 2, col("x") < 10))),
                 "OR(Column(x) > 2, Column(x) < 10)",
             ),
-            (col!("x").eq(lit("foo")), "Column(x) = 'foo'"),
+            (
+                Pred::from_expr(expr!(col("x") == "foo")),
+                "Column(x) = 'foo'",
+            ),
         ];
 
         for (pred, expected) in cases {
@@ -1586,7 +1586,7 @@ mod tests {
         use crate::expressions::{
             BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
             ExpressionStructPatchBuilder, MapToStructOptions, Predicate, Scalar, UnaryExpressionOp,
-            col, column_name, lit, null_lit,
+            col, column_name, expr, lit, null_lit,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
         use crate::unit_test_utils::assert_result_error_with_message;
@@ -1720,7 +1720,7 @@ mod tests {
 
         #[test]
         fn test_variadic_expression_roundtrip() {
-            let expr = Expression::coalesce([col!("a"), col!("b"), lit("default")]);
+            let expr = expr!(coalesce(col("a"), col("b"), "default"));
             assert_roundtrip(&expr);
         }
 
@@ -1824,7 +1824,7 @@ mod tests {
 
         #[test]
         fn test_expression_wrapping_predicate_roundtrip() {
-            let pred = Predicate::eq(col!("x"), lit(10));
+            let pred = Predicate::from_expr(expr!(col("x") == 10));
             let expr = Expression::from_pred(pred);
             assert_roundtrip(&expr);
         }
@@ -1885,14 +1885,14 @@ mod tests {
                 Predicate::TRUE,
                 Predicate::FALSE,
                 // NOT
-                Predicate::not(Predicate::from_expr(col!("x"))),
+                Predicate::from_expr(expr!(not(col("x")))),
                 // Nested NOT
-                Predicate::not(Predicate::not(Predicate::gt(col!("x"), lit(5)))),
+                Predicate::from_expr(expr!(not(not(col("x") > 5)))),
                 // Unknown
                 Predicate::unknown("some_unknown_predicate()"),
                 // Unary predicates
-                Predicate::is_null(col!("nullable_col")),
-                Predicate::is_not_null(col!("nullable_col")),
+                Predicate::from_expr(expr!(is_null(col("nullable_col")))),
+                Predicate::from_expr(expr!(is_not_null(col("nullable_col")))),
             ];
 
             for pred in &cases {
@@ -1908,13 +1908,13 @@ mod tests {
         #[test]
         fn test_predicate_comparisons_roundtrip() {
             let cases: Vec<Predicate> = vec![
-                Predicate::eq(col!("x"), lit(42)),
-                Predicate::ne(col!("status"), lit("active")),
-                Predicate::lt(col!("age"), lit(18)),
-                Predicate::le(col!("price"), lit(100)),
-                Predicate::gt(col!("score"), lit(90)),
-                Predicate::ge(col!("quantity"), lit(1)),
-                Predicate::distinct(col!("a"), col!("b")),
+                Predicate::from_expr(expr!(col("x") == 42)),
+                Predicate::from_expr(expr!(col("status") != "active")),
+                Predicate::from_expr(expr!(col("age") < 18)),
+                Predicate::from_expr(expr!(col("price") <= 100)),
+                Predicate::from_expr(expr!(col("score") > 90)),
+                Predicate::from_expr(expr!(col("quantity") >= 1)),
+                Predicate::from_expr(expr!(distinct(col("a"), col("b")))),
             ];
 
             for pred in &cases {
@@ -1941,35 +1941,29 @@ mod tests {
         fn test_predicate_junctions_roundtrip() {
             let cases: Vec<Predicate> = vec![
                 // Simple AND
-                Predicate::and(
-                    Predicate::gt(col!("x"), lit(0)),
-                    Predicate::lt(col!("x"), lit(100)),
-                ),
+                Predicate::from_expr(expr!(and(col("x") > 0, col("x") < 100))),
                 // Simple OR
-                Predicate::or(
-                    Predicate::eq(col!("status"), lit("active")),
-                    Predicate::eq(col!("status"), lit("pending")),
-                ),
+                Predicate::from_expr(expr!(or(
+                    col("status") == "active",
+                    col("status") == "pending"
+                ))),
                 // Multiple AND
-                Predicate::and_from([
-                    Predicate::gt(col!("x"), lit(0)),
-                    Predicate::lt(col!("x"), lit(100)),
-                    Predicate::is_not_null(col!("x")),
-                ]),
+                Predicate::from_expr(expr!(and(
+                    col("x") > 0,
+                    col("x") < 100,
+                    is_not_null(col("x"))
+                ))),
                 // Multiple OR
-                Predicate::or_from([
-                    Predicate::eq(col!("type"), lit("A")),
-                    Predicate::eq(col!("type"), lit("B")),
-                    Predicate::eq(col!("type"), lit("C")),
-                ]),
+                Predicate::from_expr(expr!(or(
+                    col("type") == "A",
+                    col("type") == "B",
+                    col("type") == "C"
+                ))),
                 // Nested: (a > 0 AND b < 100) OR (c = 'special')
-                Predicate::or(
-                    Predicate::and(
-                        Predicate::gt(col!("a"), lit(0)),
-                        Predicate::lt(col!("b"), lit(100)),
-                    ),
-                    Predicate::eq(col!("c"), lit("special")),
-                ),
+                Predicate::from_expr(expr!(or(
+                    and(col("a") > 0, col("b") < 100),
+                    col("c") == "special"
+                ))),
             ];
 
             for pred in &cases {
@@ -1990,7 +1984,7 @@ mod tests {
 
             // Expression wrapping a predicate that references expressions
             let inner_pred = Predicate::and(
-                Predicate::eq(col!("x"), lit(1)),
+                Predicate::from_expr(expr!(col("x") == 1)),
                 Predicate::gt(
                     Expression::binary(BinaryExpressionOp::Plus, col!("y"), col!("z")),
                     lit(10),
