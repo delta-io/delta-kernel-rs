@@ -97,6 +97,9 @@ message StructData {
 
 // `Null` carries a `DataType` so the evaluator can produce a NULL of the right type.
 message Scalar {
+  reserved 18;
+  reserved "interval_year_month";
+
   oneof value {
     int32 integer = 1;
     int64 long = 2;
