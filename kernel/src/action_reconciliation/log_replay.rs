@@ -536,14 +536,13 @@ impl ActionReconciliationVisitor<'_> {
 
         // Exclude the winner when retention has expired it. A txn without last_updated never
         // expires (kept for backward compatibility).
-        if let Some(retention_ts) = self.txn_expiration_timestamp {
-            if let Some(last_updated) =
+        if let Some(retention_ts) = self.txn_expiration_timestamp
+            && let Some(last_updated) =
                 getters[Self::TXN_LAST_UPDATED.index].get_opt(i, Self::TXN_LAST_UPDATED.name)?
-            {
-                let last_updated: i64 = last_updated;
-                if last_updated <= retention_ts {
-                    return Ok(Some(false));
-                }
+        {
+            let last_updated: i64 = last_updated;
+            if last_updated <= retention_ts {
+                return Ok(Some(false));
             }
         }
 

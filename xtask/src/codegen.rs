@@ -19,10 +19,10 @@ pub(crate) fn ensure_file_contents(
     contents: &str,
     check: bool,
 ) -> anyhow::Result<()> {
-    if let Ok(existing) = fs::read_to_string(path) {
-        if normalize_newlines(&existing) == normalize_newlines(contents) {
-            return Ok(());
-        }
+    if let Ok(existing) = fs::read_to_string(path)
+        && normalize_newlines(&existing) == normalize_newlines(contents)
+    {
+        return Ok(());
     }
     if check {
         bail!(

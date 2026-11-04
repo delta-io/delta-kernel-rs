@@ -985,10 +985,10 @@ pub(crate) fn auto_enable_property_driven_features(
     writer_features: &mut Vec<TableFeature>,
 ) {
     for table_feature in allowed_table_features {
-        if let EnablementCheck::EnabledIf(check) = table_feature.info().enablement_check {
-            if check(table_properties) {
-                add_feature_to_lists(table_feature.clone(), reader_features, writer_features);
-            }
+        if let EnablementCheck::EnabledIf(check) = table_feature.info().enablement_check
+            && check(table_properties)
+        {
+            add_feature_to_lists(table_feature.clone(), reader_features, writer_features);
         }
     }
 }
