@@ -39,6 +39,7 @@ pub(crate) const SORT_ORDER_ID: &str = "sortOrderId";
 pub(crate) const RECORD_COUNT: &str = "recordCount";
 pub(crate) const FILE_SIZE_IN_BYTES: &str = "fileSizeInBytes";
 pub(crate) const CONTENT_STATS_FIELD_NAME: &str = "content_stats";
+pub(crate) const TIGHT_STATS: &str = "tightStats";
 pub(crate) const MANIFEST_INFO: &str = "manifestInfo";
 pub(crate) const KEY_METADATA: &str = "keyMetadata";
 pub(crate) const SPLIT_OFFSETS: &str = "splitOffsets";
@@ -85,7 +86,6 @@ pub(crate) const FIELD_IDS: &str = "fieldIds";
 /// Field names for the different fields within content_stats.
 pub(crate) const LOWER_BOUND: &str = "lower_bound";
 pub(crate) const UPPER_BOUND: &str = "upper_bound";
-pub(crate) const TIGHT_BOUNDS: &str = "tight_bounds";
 pub(crate) const VALUE_COUNT: &str = "value_count";
 pub(crate) const NULL_VALUE_COUNT: &str = "null_value_count";
 pub(crate) const NAN_VALUE_COUNT: &str = "nan_value_count";
@@ -287,6 +287,17 @@ pub(super) struct ContentTreeNodeEntry {
     #[skip_schema]
     #[field_id = 146]
     pub(crate) content_stats: Option<StructData>,
+
+    /// Whether [`Self::content_stats`] are tight: `value_count`, `null_value_count`, and
+    /// `nan_value_count` are exact over the entry's live rows, as are `lower_bound` and
+    /// `upper_bound` for fixed-length types. String and binary bounds may be truncated and
+    /// geospatial bounds are bounding boxes, so they are never tight. Variant bounds are judged
+    /// per path by the bound's value type. `total_bytes` is not part of tightness. Readers must
+    /// treat `None` as not tight. See the Iceberg spec on stats [tightness].
+    ///
+    /// [tightness]: https://github.com/apache/iceberg/blob/main/format/spec.md#stats-tightness
+    #[field_id = 151]
+    pub(crate) tight_stats: Option<bool>,
 
     /// Must be set if content_type is {Data,Delete}Manifest, otherwise `None`.
     #[field_id = 150]
@@ -700,6 +711,7 @@ mod tests {
         (SORT_ORDER_ID, Some(140), true),
         (RECORD_COUNT, Some(103), false),
         (FILE_SIZE_IN_BYTES, Some(104), false),
+        (TIGHT_STATS, Some(151), true),
         (MANIFEST_INFO, Some(150), true),
         (KEY_METADATA, Some(131), true),
         (SPLIT_OFFSETS, Some(132), true),
