@@ -103,11 +103,10 @@ impl AuthHeaderProvider for RefreshingHeaderProvider {
     fn headers(&self) -> ObjectStoreResult<HeaderMap> {
         // Hold the lock across the (rare) produce call so concurrent refreshes are single-flight.
         let mut cached = self.cached.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((headers, deadline)) = cached.as_ref() {
-            if deadline.saturating_duration_since(std::time::Instant::now()) > HEADER_REFRESH_BUFFER
-            {
-                return Ok(headers.clone());
-            }
+        if let Some((headers, deadline)) = cached.as_ref()
+            && deadline.saturating_duration_since(std::time::Instant::now()) > HEADER_REFRESH_BUFFER
+        {
+            return Ok(headers.clone());
         }
         let (headers, ttl) = (self.produce)()?;
         // Skip caching if an absurd TTL overflows `Instant`, rather than panicking.

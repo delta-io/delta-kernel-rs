@@ -142,12 +142,12 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         };
 
         // If the domain requires a feature, validate it's supported
-        if let Some(feature) = required_feature {
-            if !table_config.is_feature_supported(&feature) {
-                return Err(KernelError::generic(format!(
-                    "System domain '{domain}' requires the '{feature}' feature to be enabled"
-                )));
-            }
+        if let Some(feature) = required_feature
+            && !table_config.is_feature_supported(&feature)
+        {
+            return Err(KernelError::generic(format!(
+                "System domain '{domain}' requires the '{feature}' feature to be enabled"
+            )));
         }
 
         Ok(())

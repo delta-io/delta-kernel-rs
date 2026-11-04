@@ -123,15 +123,15 @@ impl BenchRegistry {
                     workload.case_name
                 )
             })?;
-            if self.lookup(table, &workload.case_name).is_some() {
-                if let Spec::SnapshotConstruction(_) = &workload.spec {
-                    return Err(format!(
-                        "registry entry '{table}/{}' provides read configs for a {} workload",
-                        workload.case_name,
-                        workload.spec.as_str()
-                    )
-                    .into());
-                }
+            if self.lookup(table, &workload.case_name).is_some()
+                && let Spec::SnapshotConstruction(_) = &workload.spec
+            {
+                return Err(format!(
+                    "registry entry '{table}/{}' provides read configs for a {} workload",
+                    workload.case_name,
+                    workload.spec.as_str()
+                )
+                .into());
             }
         }
         Ok(())

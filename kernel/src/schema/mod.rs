@@ -914,12 +914,12 @@ impl StructType {
             }
 
             // Check for duplicate metadata columns
-            if let Some(metadata_column_spec) = field.get_metadata_column_spec() {
-                if metadata_columns.insert(metadata_column_spec, i).is_some() {
-                    return Err(KernelError::schema(format!(
-                        "Duplicate metadata column: {metadata_column_spec:?}",
-                    )));
-                }
+            if let Some(metadata_column_spec) = field.get_metadata_column_spec()
+                && metadata_columns.insert(metadata_column_spec, i).is_some()
+            {
+                return Err(KernelError::schema(format!(
+                    "Duplicate metadata column: {metadata_column_spec:?}",
+                )));
             }
 
             // Delta column names are case-insensitive; reject schemas with duplicates that differ
@@ -1154,6 +1154,7 @@ impl StructType {
     }
 
     /// Gets a mutable reference to the underlying field map.
+    #[internal_api]
     pub(crate) fn field_map_mut(&mut self) -> &mut IndexMap<String, StructField> {
         &mut self.fields
     }
@@ -1985,15 +1986,8 @@ pub enum PrimitiveType {
     #[serde(rename = "timestamp_ntz")]
     TimestampNtz,
     Void,
-    /// Year-month interval: a signed count of months (ANSI `INTERVAL YEAR TO MONTH` and its
-    /// narrowed `YEAR` / `MONTH` spellings). The serde rename is the `schemaString` type-name
-    /// string -- spelled with spaces, unlike the single-word siblings, so the mapping is not
-    /// self-evident.
-    #[serde(rename = "interval year to month")]
-    IntervalYearMonth,
     /// Day-time interval: a signed count of microseconds (ANSI `INTERVAL DAY TO SECOND` and
-    /// its narrowed `DAY` / `HOUR` / `MINUTE` / `SECOND` spellings). As with the year-month
-    /// variant above, the serde rename is the multi-word `schemaString` type-name string.
+    /// its narrowed `DAY` / `HOUR` / `MINUTE` / `SECOND` spellings).
     #[serde(rename = "interval day to second")]
     IntervalDayTime,
     #[from]
@@ -2009,6 +2003,10 @@ pub enum PrimitiveType {
     #[from(GeographyType)]
     #[serde(serialize_with = "serialize_geotype", untagged)]
     Geography(Box<GeographyType>),
+    /// Year-month interval: a signed count of months (ANSI `INTERVAL YEAR TO MONTH` and its
+    /// narrowed `YEAR` / `MONTH` spellings).
+    #[serde(serialize_with = "serialize_interval_year_month", untagged)]
+    IntervalYearMonth(IntervalYearToMonthType),
 }
 
 impl PrimitiveType {
@@ -2016,11 +2014,16 @@ impl PrimitiveType {
         Ok(DecimalType::try_new(precision, scale)?.into())
     }
 
+    /// Constructs a year-month interval primitive with the given ANSI qualifier.
+    pub fn interval_year_month(ty: IntervalYearToMonthType) -> Self {
+        Self::IntervalYearMonth(ty)
+    }
+
     /// Returns whether this is one of the ANSI interval primitive types.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn is_interval(&self) -> bool {
-        matches!(self, Self::IntervalYearMonth | Self::IntervalDayTime)
+        matches!(self, Self::IntervalYearMonth(_) | Self::IntervalDayTime)
     }
 
     /// Returns `true` if this primitive type can be widened to the `target` type.
@@ -2110,6 +2113,37 @@ fn serialize_decimal<S: serde::Serializer>(
     serializer.serialize_str(&format!("decimal({},{})", dtype.precision(), dtype.scale()))
 }
 
+/// The supported qualifiers for Delta's year-month interval family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum IntervalYearToMonthType {
+    /// ANSI `INTERVAL YEAR`, stored as a signed count of months.
+    #[serde(rename = "interval year")]
+    IntervalYear,
+    /// ANSI `INTERVAL MONTH`, stored as a signed count of months.
+    #[serde(rename = "interval month")]
+    IntervalMonth,
+    /// ANSI `INTERVAL YEAR TO MONTH`, stored as a signed count of months.
+    #[serde(rename = "interval year to month")]
+    IntervalYearToMonth,
+}
+
+impl Display for IntervalYearToMonthType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IntervalYear => write!(f, "interval year"),
+            Self::IntervalMonth => write!(f, "interval month"),
+            Self::IntervalYearToMonth => write!(f, "interval year to month"),
+        }
+    }
+}
+
+fn serialize_interval_year_month<S: serde::Serializer>(
+    dtype: &IntervalYearToMonthType,
+    serializer: S,
+) -> KernelResult<S::Ok, S::Error> {
+    serializer.serialize_str(&dtype.to_string())
+}
+
 #[cfg(feature = "geo-type-in-dev")]
 fn serialize_geotype<T: std::fmt::Display, S: serde::Serializer>(
     value: &T,
@@ -2146,13 +2180,25 @@ pub(crate) struct IntervalFieldRange {
 }
 
 impl IntervalFieldRange {
-    fn primitive_type(self) -> PrimitiveType {
-        match self.start {
-            IntervalField::Year | IntervalField::Month => PrimitiveType::IntervalYearMonth,
-            IntervalField::Day
-            | IntervalField::Hour
-            | IntervalField::Minute
-            | IntervalField::Second => PrimitiveType::IntervalDayTime,
+    fn primitive_type(self) -> Option<PrimitiveType> {
+        match (self.start, self.end) {
+            (IntervalField::Year, IntervalField::Year) => Some(PrimitiveType::IntervalYearMonth(
+                IntervalYearToMonthType::IntervalYear,
+            )),
+            (IntervalField::Month, IntervalField::Month) => Some(PrimitiveType::IntervalYearMonth(
+                IntervalYearToMonthType::IntervalMonth,
+            )),
+            (IntervalField::Year, IntervalField::Month) => Some(PrimitiveType::IntervalYearMonth(
+                IntervalYearToMonthType::IntervalYearToMonth,
+            )),
+            (
+                IntervalField::Day
+                | IntervalField::Hour
+                | IntervalField::Minute
+                | IntervalField::Second,
+                _,
+            ) => Some(PrimitiveType::IntervalDayTime),
+            _ => None,
         }
     }
 }
@@ -2180,7 +2226,7 @@ pub(crate) fn parse_interval_type(s: &str) -> Option<IntervalFieldRange> {
 }
 
 fn normalize_interval_type(s: &str) -> Option<PrimitiveType> {
-    parse_interval_type(s).map(IntervalFieldRange::primitive_type)
+    parse_interval_type(s).and_then(IntervalFieldRange::primitive_type)
 }
 
 // Custom Deserialize to provide clear error messages for unsupported types.
@@ -2288,7 +2334,7 @@ impl Display for PrimitiveType {
             PrimitiveType::Date => write!(f, "date"),
             PrimitiveType::Timestamp => write!(f, "timestamp"),
             PrimitiveType::TimestampNtz => write!(f, "timestamp_ntz"),
-            PrimitiveType::IntervalYearMonth => write!(f, "interval year to month"),
+            PrimitiveType::IntervalYearMonth(dtype) => write!(f, "{dtype}"),
             PrimitiveType::IntervalDayTime => write!(f, "interval day to second"),
             PrimitiveType::Decimal(dtype) => {
                 write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
@@ -2388,25 +2434,25 @@ impl<'de> serde::Deserialize<'de> for DataType {
         }
 
         // Object values are complex types - dispatch based on "type" field
-        if let Value::Object(map) = &value {
-            if let Some(Value::String(type_str)) = map.get("type") {
-                return match type_str.as_str() {
-                    "array" => ArrayType::deserialize(value)
-                        .map(DataType::from)
-                        .map_err(|e| Error::custom(e.to_string())),
-                    "struct" => StructType::deserialize(value)
-                        .map(DataType::from)
-                        .map_err(|e| Error::custom(e.to_string())),
-                    "map" => MapType::deserialize(value)
-                        .map(DataType::from)
-                        .map_err(|e| Error::custom(e.to_string())),
-                    #[cfg(feature = "udt-in-dev")]
-                    "udt" => UserDefinedType::deserialize(value)
-                        .map(DataType::UserDefined)
-                        .map_err(Error::custom),
-                    _ => Err(unsupported_delta_type_error(type_str)),
-                };
-            }
+        if let Value::Object(map) = &value
+            && let Some(Value::String(type_str)) = map.get("type")
+        {
+            return match type_str.as_str() {
+                "array" => ArrayType::deserialize(value)
+                    .map(DataType::from)
+                    .map_err(|e| Error::custom(e.to_string())),
+                "struct" => StructType::deserialize(value)
+                    .map(DataType::from)
+                    .map_err(|e| Error::custom(e.to_string())),
+                "map" => MapType::deserialize(value)
+                    .map(DataType::from)
+                    .map_err(|e| Error::custom(e.to_string())),
+                #[cfg(feature = "udt-in-dev")]
+                "udt" => UserDefinedType::deserialize(value)
+                    .map(DataType::UserDefined)
+                    .map_err(Error::custom),
+                _ => Err(unsupported_delta_type_error(type_str)),
+            };
         }
 
         // Fallback error with the actual value that failed
@@ -2444,7 +2490,18 @@ impl DataType {
     pub const TIMESTAMP: Self = DataType::Primitive(PrimitiveType::Timestamp);
     pub const TIMESTAMP_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNtz);
     pub const VOID: Self = DataType::Primitive(PrimitiveType::Void);
-    pub const INTERVAL_YEAR_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth);
+    /// ANSI `INTERVAL YEAR`, stored as a signed month count aligned to whole years.
+    pub const INTERVAL_YEAR: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth(
+        IntervalYearToMonthType::IntervalYear,
+    ));
+    /// ANSI `INTERVAL MONTH`, stored as a signed month count.
+    pub const INTERVAL_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth(
+        IntervalYearToMonthType::IntervalMonth,
+    ));
+    /// ANSI `INTERVAL YEAR TO MONTH`, stored as a signed month count.
+    pub const INTERVAL_YEAR_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth(
+        IntervalYearToMonthType::IntervalYearToMonth,
+    ));
     pub const INTERVAL_DAY_TIME: Self = DataType::Primitive(PrimitiveType::IntervalDayTime);
 
     /// Resolves a path to a mutable nested struct.
@@ -2517,6 +2574,11 @@ impl DataType {
     /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> KernelResult<Self> {
         Ok(PrimitiveType::decimal(precision, scale)?.into())
+    }
+
+    /// Constructs a year-month interval data type with the given ANSI qualifier.
+    pub fn interval_year_month(ty: IntervalYearToMonthType) -> Self {
+        PrimitiveType::interval_year_month(ty).into()
     }
 
     /// Create a new struct type with the given fields.
@@ -2780,13 +2842,17 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         }
 
         self.transform_inner(field.name(), |this| {
-            let field = this.recurse_into_struct_field(field)?;
             if this.mode == MakePhysicalMode::ValidateStrict {
-                return Ok(field);
+                return this.recurse_into_struct_field(field);
             }
+            let data_type = this.transform(field.data_type())?.into_owned();
             let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
-            let name = physical_name.to_owned();
-            Ok(Cow::Owned(field.with_name(name).with_metadata(metadata)))
+            Ok(Cow::Owned(StructField {
+                name: physical_name.to_owned(),
+                data_type,
+                nullable: field.nullable,
+                metadata,
+            }))
         })
     }
 
@@ -3208,6 +3274,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_invalid_interval_field_range_has_no_primitive_type() {
+        let range = IntervalFieldRange {
+            start: IntervalField::Month,
+            end: IntervalField::Year,
+        };
+        assert_eq!(range.primitive_type(), None);
+    }
+
     #[rstest]
     #[case("string", DataType::STRING)]
     #[case("long", DataType::LONG)]
@@ -3221,8 +3296,8 @@ mod tests {
     #[case("date", DataType::DATE)]
     #[case("timestamp", DataType::TIMESTAMP)]
     #[case("timestamp_ntz", DataType::TIMESTAMP_NTZ)]
-    #[case("interval year", DataType::INTERVAL_YEAR_MONTH)]
-    #[case("interval month", DataType::INTERVAL_YEAR_MONTH)]
+    #[case("interval year", DataType::INTERVAL_YEAR)]
+    #[case("interval month", DataType::INTERVAL_MONTH)]
     #[case("interval year to month", DataType::INTERVAL_YEAR_MONTH)]
     #[case("interval day", DataType::INTERVAL_DAY_TIME)]
     #[case("interval hour", DataType::INTERVAL_DAY_TIME)]
@@ -3321,6 +3396,8 @@ mod tests {
     #[case("\"date\"", DataType::DATE)]
     #[case("\"timestamp\"", DataType::TIMESTAMP)]
     #[case("\"timestamp_ntz\"", DataType::TIMESTAMP_NTZ)]
+    #[case("\"interval year\"", DataType::INTERVAL_YEAR)]
+    #[case("\"interval month\"", DataType::INTERVAL_MONTH)]
     #[case("\"interval year to month\"", DataType::INTERVAL_YEAR_MONTH)]
     #[case("\"interval day to second\"", DataType::INTERVAL_DAY_TIME)]
     #[case("\"variant\"", DataType::unshredded_variant())]
@@ -3330,7 +3407,18 @@ mod tests {
     }
 
     #[rstest]
-    #[case(PrimitiveType::IntervalYearMonth, "interval year to month")]
+    #[case(
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYear),
+        "interval year"
+    )]
+    #[case(
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
+        "interval month"
+    )]
+    #[case(
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
+        "interval year to month"
+    )]
     #[case(PrimitiveType::IntervalDayTime, "interval day to second")]
     fn test_interval_type_name_round_trips(#[case] ptype: PrimitiveType, #[case] name: &str) {
         assert_eq!(ptype.to_string(), name);
@@ -3342,6 +3430,28 @@ mod tests {
             serde_json::from_str::<PrimitiveType>(&format!("\"{name}\"")).unwrap(),
             ptype
         );
+    }
+
+    #[test]
+    fn test_nested_interval_year_month_schema_round_trips_exact_qualifiers() {
+        let schema = StructType::try_new([
+            StructField::nullable("year", DataType::INTERVAL_YEAR),
+            StructField::nullable(
+                "month_array",
+                ArrayType::new(DataType::INTERVAL_MONTH, true),
+            ),
+            StructField::nullable(
+                "full_map",
+                MapType::new(DataType::STRING, DataType::INTERVAL_YEAR_MONTH, true),
+            ),
+        ])
+        .unwrap();
+
+        let json = serde_json::to_string(&schema).unwrap();
+        assert!(json.contains(r#""type":"interval year""#));
+        assert!(json.contains(r#""elementType":"interval month""#));
+        assert!(json.contains(r#""valueType":"interval year to month""#));
+        assert_eq!(serde_json::from_str::<StructType>(&json).unwrap(), schema);
     }
 
     #[test]

@@ -439,7 +439,7 @@ pub unsafe extern "C" fn free_scan_builder(builder: Handle<ExclusiveScanBuilder>
 /// # Safety
 ///
 /// `scan` must be a valid, live [`SharedScan`] handle for the duration of the call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_snapshot(scan: Handle<SharedScan>) -> Handle<SharedSnapshot> {
     let scan = unsafe { scan.as_ref() };
     Arc::clone(scan.snapshot()).into()

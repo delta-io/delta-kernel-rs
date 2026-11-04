@@ -120,10 +120,10 @@ fn scan_columns(columns: &[String], predicate: Option<&Predicate>) -> Vec<String
     let mut scan_columns = columns.to_vec();
     if let Some(predicate) = predicate {
         for reference in predicate.references() {
-            if let Some(column) = reference.path().first() {
-                if !scan_columns.contains(column) {
-                    scan_columns.push(column.clone());
-                }
+            if let Some(column) = reference.path().first()
+                && !scan_columns.contains(column)
+            {
+                scan_columns.push(column.clone());
             }
         }
     }

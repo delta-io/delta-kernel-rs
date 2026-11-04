@@ -36,7 +36,7 @@ const WRITER_FEATURES: &[&str] = &[
 /// for the table's lifetime.
 async fn setup_adaptive_metadata_table(
     table_name: &str,
-) -> Result<(impl Engine, TempDir, Url, SnapshotRef), Box<dyn std::error::Error>> {
+) -> Result<(impl Engine + use<>, TempDir, Url, SnapshotRef), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let dir_url = Url::from_directory_path(temp_dir.path()).expect("valid directory url");
     let (store, engine, table_url) = engine_store_setup(table_name, Some(&dir_url));

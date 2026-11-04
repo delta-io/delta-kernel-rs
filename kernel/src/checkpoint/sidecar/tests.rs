@@ -200,50 +200,50 @@ fn verify_non_file_batches(batches: &[Box<dyn EngineData>], expected: &ExpectedN
         let rb = arrow.record_batch();
         for row in 0..rb.num_rows() {
             let mut has_non_file_action = false;
-            if let Some(col) = rb.column_by_name("protocol") {
-                if col.is_valid(row) {
-                    has_non_file_action = true;
-                    protocol_count += 1;
-                    let parent_struct = col.as_struct();
-                    let reader_v =
-                        struct_field_value::<Int32Type>(parent_struct, "minReaderVersion", row);
-                    let writer_v =
-                        struct_field_value::<Int32Type>(parent_struct, "minWriterVersion", row);
-                    assert_eq!(
-                        reader_v, expected.reader_version,
-                        "protocol minReaderVersion mismatch"
-                    );
-                    assert_eq!(
-                        writer_v, expected.writer_version,
-                        "protocol minWriterVersion mismatch"
-                    );
-                }
+            if let Some(col) = rb.column_by_name("protocol")
+                && col.is_valid(row)
+            {
+                has_non_file_action = true;
+                protocol_count += 1;
+                let parent_struct = col.as_struct();
+                let reader_v =
+                    struct_field_value::<Int32Type>(parent_struct, "minReaderVersion", row);
+                let writer_v =
+                    struct_field_value::<Int32Type>(parent_struct, "minWriterVersion", row);
+                assert_eq!(
+                    reader_v, expected.reader_version,
+                    "protocol minReaderVersion mismatch"
+                );
+                assert_eq!(
+                    writer_v, expected.writer_version,
+                    "protocol minWriterVersion mismatch"
+                );
             }
 
-            if let Some(col) = rb.column_by_name("metaData") {
-                if col.is_valid(row) {
-                    has_non_file_action = true;
-                    metadata_count += 1;
-                    let ms = col.as_struct();
-                    assert_eq!(
-                        struct_field_string(ms, "name", row),
-                        expected.table_name,
-                        "metadata name mismatch"
-                    );
-                }
+            if let Some(col) = rb.column_by_name("metaData")
+                && col.is_valid(row)
+            {
+                has_non_file_action = true;
+                metadata_count += 1;
+                let ms = col.as_struct();
+                assert_eq!(
+                    struct_field_string(ms, "name", row),
+                    expected.table_name,
+                    "metadata name mismatch"
+                );
             }
 
-            if let Some(col) = rb.column_by_name("checkpointMetadata") {
-                if col.is_valid(row) {
-                    has_non_file_action = true;
-                    checkpoint_metadata_count += 1;
-                    let cs = col.as_struct();
-                    let version = struct_field_value::<Int64Type>(cs, "version", row);
-                    assert_eq!(
-                        version, expected.checkpoint_version,
-                        "checkpointMetadata version mismatch"
-                    );
-                }
+            if let Some(col) = rb.column_by_name("checkpointMetadata")
+                && col.is_valid(row)
+            {
+                has_non_file_action = true;
+                checkpoint_metadata_count += 1;
+                let cs = col.as_struct();
+                let version = struct_field_value::<Int64Type>(cs, "version", row);
+                assert_eq!(
+                    version, expected.checkpoint_version,
+                    "checkpointMetadata version mismatch"
+                );
             }
 
             if let Some(add_col) = rb.column_by_name("add") {

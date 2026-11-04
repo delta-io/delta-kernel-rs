@@ -530,6 +530,7 @@ impl Metadata {
     /// # Errors
     ///
     /// Returns an error if schema serialization fails.
+    #[internal_api]
     pub(crate) fn with_schema(self, schema: SchemaRef) -> KernelResult<Self> {
         Ok(Self {
             schema_string: serde_json::to_string(&schema)?,
@@ -539,6 +540,7 @@ impl Metadata {
 
     /// Returns a new Metadata with a single configuration entry inserted (or replaced),
     /// preserving all other configuration entries and metadata fields.
+    #[internal_api]
     pub(crate) fn with_configuration_entry(
         mut self,
         key: impl Into<String>,

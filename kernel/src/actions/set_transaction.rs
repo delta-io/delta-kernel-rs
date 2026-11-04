@@ -89,7 +89,7 @@ fn scan_application_transactions(
 fn replay_for_app_ids(
     log_segment: &LogSegment,
     engine: &dyn Engine,
-) -> KernelResult<impl KernelResultIterator<ActionsBatch>> {
+) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
     log_segment.read_actions(engine, LOG_TXN_SCHEMA.clone())
 }
 

@@ -983,12 +983,11 @@ mod tests {
     }
 
     fn events_to_string(events: Vec<(String, tracing::Level)>) -> String {
-        let events_str = events
+        events
             .iter()
             .map(|(s, lvl)| format!("{s}:{lvl}"))
             .collect::<Vec<_>>()
-            .join(", ");
-        events_str
+            .join(", ")
     }
 
     fn convert_level(level: Level) -> tracing::Level {

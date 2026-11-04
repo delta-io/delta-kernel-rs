@@ -136,7 +136,9 @@ impl CommitRange {
     /// [`CommitOrdering::AscendingOrder`].
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn commit_files(&self) -> KernelResult<impl KernelResultIterator<ParsedLogPath>> {
+    pub(crate) fn commit_files(
+        &self,
+    ) -> KernelResult<impl KernelResultIterator<ParsedLogPath> + use<>> {
         require!(
             self.supports_commit_files,
             KernelError::CommitRange(
@@ -181,7 +183,7 @@ impl CommitRange {
         engine: Arc<dyn Engine>,
         start_snapshot: Option<SnapshotRef>,
         actions: &[DeltaAction],
-    ) -> KernelResult<impl KernelResultIterator<CommitAction>> {
+    ) -> KernelResult<impl KernelResultIterator<CommitAction> + use<>> {
         require!(
             self.supports_commit_actions,
             KernelError::CommitRange(
