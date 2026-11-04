@@ -1,31 +1,37 @@
 //! Selects the files retained by an updated snapshot and the state baseline they support.
 //!
-//! Discovery merges storage listings with the catalog tail. Planning and file assembly use only
-//! those paths and the existing segment; they neither read actions nor resolve CRC contents.
+//! [`LogUpdate::discover`] lists storage and merges the catalog tail. [`LogUpdate::from_listing`]
+//! then combines those paths with the existing segment without I/O. The returned segment has
+//! validated version coverage; the caller still needs to resolve its protocol, metadata, and CRC.
 
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::path::ParsedLogPath;
 use crate::{KernelError, KernelResult, StorageHandler, Version};
 
-/// The files for an update, and whether their retained history can extend the existing state.
+/// A validated file selection from discovery, ready for snapshot state resolution.
 #[derive(Debug)]
 pub(super) struct LogUpdate {
+    /// Files retained for scans and later updates; may include commits below the existing version.
     pub(super) segment: LogSegment,
     pub(super) baseline: StateBaseline,
 }
 
-/// Which state remains usable after checkpoint selection discards covered commits.
+/// Whether retained history lets protocol and metadata start from the existing snapshot.
+/// CRC baseline selection happens later, during state resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StateBaseline {
+    /// Every commit after the existing snapshot remains available for incremental replay.
     ExistingSnapshot,
     /// A checkpoint ahead of the snapshot replaces commits needed to extend the existing state.
     NewCheckpoint,
 }
 
 impl LogUpdate {
-    /// Discovers files and plans an update after the caller has rejected equal or older targets.
-    /// Returns `None` when the existing files can be reused unchanged.
+    /// Discovers retained history for `target`, or the latest version when `target` is `None`.
+    ///
+    /// A supplied target must exceed the existing version. Returns `None` when the existing files
+    /// can be reused; otherwise the caller resolves state using the returned baseline.
     pub(super) fn discover(
         existing: &LogSegment,
         log_tail: Vec<ParsedLogPath>,
@@ -47,8 +53,11 @@ impl LogUpdate {
         Self::from_listing(existing, listed, target)
     }
 
-    /// Assembles discovered paths without I/O. `target`, when set, must exceed the existing
-    /// version.
+    /// Merges discovered paths with retained history and validates coverage without I/O.
+    ///
+    /// `listed` must come from listing under the chosen checkpoint policy and target bound.
+    /// Its commits may have gaps that the existing segment can fill. `target`, when set, must
+    /// exceed the existing version and must be reached by the merged history.
     ///
     /// Returns `None` to preserve the existing segment. An empty listing permits this only for an
     /// unbounded latest request. A checkpoint at or below the existing version can change retained
@@ -79,6 +88,8 @@ impl LogUpdate {
             )));
         }
         if checkpoint.is_some_and(|v| v > existing.end_version) {
+            // Listing discarded commits through this checkpoint. The checkpoint and its later
+            // commits must therefore supply complete state without the existing snapshot.
             return Ok(Some(Self {
                 segment: LogSegment::try_new(listed, existing.log_root.clone(), target, None)?,
                 baseline: StateBaseline::NewCheckpoint,
@@ -87,8 +98,8 @@ impl LogUpdate {
         if discovered_end == existing.end_version && checkpoint.is_none() && target.is_none() {
             return Ok(None);
         }
-        // A catalog tail may start after the cached snapshot while publication still lags behind
-        // it. Validate continuity only after cached commits have filled that gap.
+        // Publication can lag behind the cached snapshot: storage may end at v1, the snapshot at
+        // v2, and the catalog tail start at v3. Merge cached v2 before validating continuity.
         Ok(Some(Self {
             segment: merge_files(existing, listed, target)?,
             baseline: StateBaseline::ExistingSnapshot,
@@ -96,8 +107,11 @@ impl LogUpdate {
     }
 }
 
-/// Adopt searches for checkpoints after the retained checkpoint. Ignore needs only newer commits.
-/// `None` means the retained starting version is `Version::MAX` and cannot be advanced.
+/// Chooses the first version to list under the checkpoint policy.
+///
+/// `Adopt` starts after the retained checkpoint so it can find checkpoints below the snapshot.
+/// With no checkpoint it starts at v1, since the snapshot already covers v0. `Ignore` needs only
+/// commits after the snapshot. Returns `None` when the version to list after is `Version::MAX`.
 pub(super) fn listing_start(
     existing: &LogSegment,
     checkpoint_handling: CheckpointHandling,
@@ -112,7 +126,7 @@ pub(super) fn listing_start(
 /// Keeps existing paths above the adopted checkpoint and appends only newly discovered versions.
 ///
 /// Existing paths win in the overlap, including staged commits that have since been published.
-/// The publication watermark still advances from discovery independently of those retained paths.
+/// `max_published_version` still advances from storage discovery even when staged paths are kept.
 fn merge_files(
     existing: &LogSegment,
     mut discovered: LogSegmentFiles,
@@ -160,8 +174,8 @@ fn merge_files(
     )
 }
 
-/// Prefers the discovered CRC file, retaining the existing one only if the checkpoint permits it.
-/// This selects a file path; state resolution separately selects the in-memory CRC baseline.
+/// Prefers the discovered CRC path; keeps the existing one only if no checkpoint is ahead of it.
+/// This keeps only a path; state resolution reads CRC contents and compares with the in-memory CRC.
 fn resolve_crc_file(discovered: &LogSegmentFiles, existing: &LogSegment) -> Option<ParsedLogPath> {
     discovered.latest_crc_file.clone().or_else(|| {
         existing.listed.latest_crc_file.clone().filter(|crc| {

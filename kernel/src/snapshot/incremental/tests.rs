@@ -1,4 +1,7 @@
 //! Contracts for selecting retained log files and resolving snapshot state independently.
+//!
+//! Path-only tests call `LogUpdate::from_listing` to isolate file selection and continuity checks.
+//! Builder tests use real table histories to check resolved state and which files the engine reads.
 
 use std::sync::Arc;
 
@@ -61,6 +64,8 @@ fn checkpoint_position_selects_state_baseline_and_retained_files(
     #[case] expected_commits: &[Version],
 ) {
     let mut existing = segment(listed(&[1, 2, 3], Some(0), None));
+    // Distinguish cached metadata from the listing so replacing a retained path fails the
+    // assertion.
     existing.listed.ascending_commit_files[2].location.size = 999;
     let update =
         LogUpdate::from_listing(&existing, listed(commits, checkpoint, None), None).unwrap();
@@ -72,7 +77,6 @@ fn checkpoint_position_selects_state_baseline_and_retained_files(
             assert_eq!(commit_versions(&segment), expected_commits);
             assert_eq!(segment.checkpoint_version, checkpoint.or(Some(0)));
             if expected_commits.contains(&3) {
-                // Relisting may return different file metadata; retained commits keep their source.
                 let retained = segment
                     .listed
                     .ascending_commit_files

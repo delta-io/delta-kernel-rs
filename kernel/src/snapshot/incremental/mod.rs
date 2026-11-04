@@ -1,12 +1,17 @@
-//! Updates an existing snapshot from newly discovered log files.
+//! Advances an existing snapshot to a requested version or to the latest available version.
 //!
-//! [`SnapshotUpdate`] receives the builder's resolved target and validated catalog log tail.
-//! [`LogUpdate`] selects the retained files and determines whether the existing snapshot can
-//! supply the table state. A checkpoint at or below the existing version changes the retained
-//! files but leaves that state usable. A checkpoint ahead of it requires rebuilding state.
+//! The builder normalizes its options into [`SnapshotUpdate`], which coordinates the update:
+//! 1. [`LogUpdate::discover`] merges storage listings with the catalog log tail and selects the
+//!    retained files. Its [`StateBaseline`] says whether those files can extend the existing state.
+//! 2. [`prepare_incremental`] resolves protocol, metadata, and CRC from that state. If an adopted
+//!    checkpoint is ahead of the existing snapshot, the fresh-build resolver supplies state
+//!    instead.
+//! 3. The resolved state and selected files become the returned snapshot.
 //!
-//! CRC replay is an optional optimization within state resolution. A stale CRC may be retained
-//! for future updates, but only a CRC newer than the existing snapshot may replace its metadata.
+//! Retained history and state replay have different starting versions. For a snapshot at v10,
+//! adopting a checkpoint at v8 keeps commits from v9 onward for subsequent scans. Protocol and
+//! metadata can still start from the existing v10 state. CRC replay has a separate baseline and
+//! budget, described in [`prepare_incremental`].
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,11 +37,13 @@ mod legacy_tests;
 #[cfg(test)]
 mod tests;
 
-/// Inputs for an incremental build after the builder validates catalog version and tail inputs.
+/// An incremental build request after the builder validates catalog version and log-tail inputs.
 pub(super) struct SnapshotUpdate {
+    /// Supplies resolved table state and retained log paths, including unpublished staged commits.
     pub(super) existing: Arc<Snapshot>,
     pub(super) target: UpdateTarget,
-    /// Catalog-supplied commits merged with storage listings, which also supply checkpoints/CRCs.
+    /// Catalog-supplied commit paths; may start after the existing snapshot's version.
+    /// Discovery merges these with storage listings and retained paths before checking continuity.
     pub(super) log_tail: Vec<ParsedLogPath>,
     /// Whether discovery may replace the existing checkpoint and discard the history it covers.
     pub(super) checkpoint_handling: CheckpointHandling,
@@ -44,7 +51,9 @@ pub(super) struct SnapshotUpdate {
     pub(super) crc_replay: IncrementalReplay,
 }
 
-/// A version requirement and its meaning for the snapshot's `built_as_latest` flag.
+/// Which version to build and whether the request identifies it as latest.
+///
+/// The builder uses `CatalogLatest` even for explicit time travel to the catalog's latest version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum UpdateTarget {
     /// Time travel to this exact version, without claiming it is latest.
@@ -58,9 +67,9 @@ pub(super) enum UpdateTarget {
 impl SnapshotUpdate {
     /// Builds the requested snapshot, reusing the input state whenever the selected files allow it.
     ///
-    /// An equal target returns the input `Arc` without I/O or build-flag changes; an older target
-    /// is rejected. An unbounded latest request may refresh files and build flags at the same
-    /// version.
+    /// `Version` and `CatalogLatest` return the input `Arc` unchanged when their version equals
+    /// the existing version, and reject older versions. Neither path performs I/O. `Latest` still
+    /// discovers files and may refresh the checkpoint or build flags without advancing the version.
     #[instrument(name = "try_new_from", skip_all, fields(path = %self.existing.table_root(), enable_call_frame, version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""), incremental_replay = ?self.crc_replay, built_as_latest = self.target.is_latest()))]
     pub(super) fn execute(
         self,
@@ -100,6 +109,8 @@ impl SnapshotUpdate {
             }
         }
 
+        // Select retained history before resolving state: checkpoint adoption decides whether
+        // every commit after the existing snapshot remains available for incremental replay.
         let start = Instant::now();
         let update = LogUpdate::discover(
             &existing.log_segment,
@@ -113,6 +124,7 @@ impl SnapshotUpdate {
             report_failure(error, &existing.log_segment);
         })?;
         let Some(LogUpdate { segment, baseline }) = update else {
+            // An unchanged file set can still record a latest-version request or checkpoint policy.
             return reuse_with_build_metadata(
                 existing,
                 self.target.is_latest(),
@@ -174,10 +186,13 @@ impl UpdateTarget {
     }
 }
 
-/// Resolves state above `existing` using a segment whose checkpoint is at or below its version.
+/// Resolves state at `segment.end_version` while reusing the existing table configuration.
 ///
-/// CRC construction uses the newest eligible CRC, even if it predates `existing`. Protocol and
-/// metadata instead start from `existing` or a newer CRC so an older CRC cannot rewind table state.
+/// The segment's checkpoint must be at or below `existing.version()`, with every later commit
+/// retained. CRC replay starts from the newest usable disk or in-memory CRC and measures its budget
+/// from that CRC's version, which may predate the snapshot. Without a target CRC, protocol and
+/// metadata start from the existing snapshot or a newer CRC. A stale CRC may still be retained for
+/// future updates; it cannot replace newer protocol or metadata.
 fn prepare_incremental(
     existing: &Snapshot,
     segment: &LogSegment,
@@ -188,13 +203,15 @@ fn prepare_incremental(
     let start = Instant::now();
     let existing_config = existing.table_configuration();
     let (resolution, crc) = (|| {
+        // The CRC budget controls advancing the checksum, not the replay needed to resolve state.
         let base_crc = segment.pick_latest_base_crc(engine, existing.base_crc())?;
         let crc_at_version =
             segment.try_build_crc_within_budget(engine, base_crc.as_ref(), crc_replay)?;
         let resolution = match &crc_at_version {
             Some((crc, source)) => {
                 let mut resolution = PmResolution::from_crc(crc, *source);
-                // Unchanged values let TableConfiguration reuse its derived schema and properties.
+                // None means "keep the existing value" to TableConfiguration::try_new_from,
+                // avoiding schema and property reconstruction when the CRC confirms no change.
                 resolution
                     .metadata
                     .take_if(|m| m == existing_config.metadata());
@@ -236,7 +253,10 @@ fn prepare_incremental(
     })
 }
 
-/// Records a latest-version refresh and checkpoint policy without changing table state.
+/// Reuses unchanged table state, returning the same `Arc` when the build flags also match.
+///
+/// A latest-version request can set `built_as_latest` but cannot clear it. The checkpoint flag
+/// records the current request's policy even when discovery found no new files.
 fn reuse_with_build_metadata(
     existing: &Arc<Snapshot>,
     built_as_latest: bool,

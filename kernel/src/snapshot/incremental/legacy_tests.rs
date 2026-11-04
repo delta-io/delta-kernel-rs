@@ -148,7 +148,7 @@ fn make_test_crc_json(table_size_bytes: i64, num_files: i64) -> serde_json::Valu
 }
 
 // ============================================================================
-// Tests: try_new_from direct API
+// Tests: SnapshotUpdate requests
 // ============================================================================
 
 #[test]
@@ -238,7 +238,7 @@ async fn test_try_new_from_latest_commit_preservation() -> KernelResult<()> {
         .ok_or_else(|| KernelError::Generic("Failed to parse log path".to_string()))?;
     let log_tail = vec![parsed_path];
 
-    // Create new snapshot from base to version 2 using try_new_from directly
+    // Execute the supplied log tail through SnapshotUpdate.
     let new_snapshot = SnapshotUpdate {
         existing: base_snapshot.clone(),
         target: UpdateTarget::Version(2),
@@ -325,7 +325,7 @@ async fn test_try_new_from_version_boundary_cases() -> KernelResult<()> {
 }
 
 // ============================================================================
-// Tests: incremental builder paths (Cases A/B/C/D.1/D.2/E/F)
+// Tests: incremental builder version boundaries and checkpoint retention
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -851,7 +851,7 @@ async fn test_checkpoint_at_or_below_snapshot_version_preserves_pm_from_commits_
     Ok(())
 }
 
-// interesting cases for testing Snapshot::new_from:
+// Scenarios for Snapshot::builder_from:
 // 1. new version < existing version
 // 2. new version == existing version
 // 3. new version > existing version AND
@@ -889,15 +889,8 @@ async fn test_snapshot_new_from() -> KernelResult<()> {
     let expected = old_snapshot.clone();
     assert_eq!(snapshot, expected);
 
-    // tests Snapshot::new_from by:
-    // 1. creating a snapshot with new API for commits 0..=2 (based on old snapshot at 0)
-    // 2. comparing with a snapshot created directly at version 2
-    //
-    // the commits tested are:
-    // - commit 0 -> base snapshot at this version
-    // - commit 1 -> final snapshots at this version
-    //
-    // in each test we will modify versions 1 and 2 to test different scenarios
+    // Compare an update from v0 to v1 with a fresh build at v1. Callers vary the protocol,
+    // metadata, and checkpoint supplied at v1.
     fn test_new_from(store: Arc<InMemory>) -> KernelResult<()> {
         let table_root = "memory:///";
         let engine = SyncEngine::new_with_store(store);
@@ -1647,9 +1640,8 @@ async fn test_incremental_snapshot_ignores_compaction_files() -> KernelResult<()
     Ok(())
 }
 
-/// The incremental snapshot path (`try_new_from_impl`) re-lists files from the checkpoint
-/// version onwards. We must ensure that it deduplicates compaction files, since producing
-/// duplicates violated the sort invariant in LogSegmentFilesBuilder::build().
+/// Relisting can discover compaction paths already retained by the snapshot. The merged segment
+/// must keep each path once, with compactions ordered by start and end version.
 #[tokio::test]
 #[ignore = "log compaction disabled (#2337)"]
 async fn test_incremental_snapshot_with_compaction_files() -> KernelResult<()> {
@@ -1684,7 +1676,7 @@ async fn test_incremental_snapshot_with_compaction_files() -> KernelResult<()> {
     )
     .await;
 
-    // Build v3 incrementally - before the fix, this panicked due to duplicate compaction files
+    // Updating to v3 must retain the existing compactions without duplicating them.
     let snapshot_v3 = Snapshot::builder_from(snapshot_v2)
         .at_version(3)
         .build(&engine)?;
@@ -2058,7 +2050,7 @@ async fn test_incremental_version_regression_emits_log_segment_load_failure() ->
     Ok(())
 }
 
-// Case C.1: requesting a version beyond the log errors and emits a LogSegmentLoadFailure,
+// Requesting a version beyond the log errors and emits a LogSegmentLoadFailure,
 // matching the fresh path (which also fails a request for an unavailable version).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_incremental_unavailable_version_emits_log_segment_load_failure() -> KernelResult<()> {
@@ -2071,7 +2063,7 @@ async fn test_incremental_unavailable_version_emits_log_segment_load_failure() -
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
-    // Request a version beyond the log: the listing above v2 is empty (case C.1).
+    // The log ends at v2, so the first missing version is v3.
     let result = Snapshot::builder_from(base)
         .at_version(5)
         .build(ctx.engine.as_ref());
@@ -2095,8 +2087,8 @@ async fn test_incremental_unavailable_version_emits_log_segment_load_failure() -
     Ok(())
 }
 
-// Case D.1 (checkpoint strictly ahead of the base) rebuilds via the fresh emitter, but the
-// load was requested incrementally, so both events must still report Incremental.
+// Rebuilding from a checkpoint still reports the caller's incremental load type in both
+// the log-segment and protocol/metadata metrics.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_incremental_rebuild_reports_incremental_load_type() -> KernelResult<()> {
     let ctx = setup_incremental_snapshot_test()?;
@@ -2106,8 +2098,7 @@ async fn test_incremental_rebuild_reports_incremental_load_type() -> KernelResul
         .at_version(1)
         .build(ctx.engine.as_ref())?;
 
-    // Checkpoint at v3, strictly ahead of the base at v1: the incremental update takes the
-    // Case D.1 rebuild path.
+    // A checkpoint ahead of the v1 snapshot selects a full state rebuild.
     Snapshot::builder_for(ctx.url.as_str())
         .at_version(3)
         .build(ctx.engine.as_ref())?

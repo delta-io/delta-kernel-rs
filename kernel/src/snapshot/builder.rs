@@ -424,6 +424,8 @@ impl<Mode> SnapshotBuilder<Mode> {
                         "SnapshotBuilder should have either table_root or existing_snapshot",
                     ));
                 };
+                // When the selected version equals the catalog's latest ratified version,
+                // preserve the latest-version claim alongside the exact target.
                 let target = match (effective_version, built_as_latest) {
                     (None, _) => UpdateTarget::Latest,
                     (Some(version), true) => UpdateTarget::CatalogLatest(version),

@@ -315,6 +315,8 @@ async fn assert_incremental_checkpoint_pm<E: Engine>(
     has_new_pm: bool,
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
 ) {
+    // Update from v2 to v4. The v4 checkpoint action embeds state at checkpoint_version, while
+    // top-level Protocol and Metadata change at pm_change_version.
     let original = adaptive_metadata_table_configuration(one_column_schema(), &[]);
     let new_protocol = adaptive_metadata_table_configuration(
         one_column_schema(),
