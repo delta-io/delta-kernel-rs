@@ -103,7 +103,7 @@ impl LogSegment {
                 .into_resolution(
                     ProtocolMetadataSource::CrcSeededPmOnlyReplay,
                     #[cfg(feature = "adaptive-metadata-in-dev")]
-                    pruned.newest_commit().is_some(),
+                    pruned.newest_commit_after_checkpoint().is_some(),
                 );
             if resolution.metadata.is_some() && resolution.protocol.is_some() {
                 info!("Found P&M from pruned log replay");
@@ -133,7 +133,7 @@ impl LogSegment {
         Ok(candidate.into_resolution(
             ProtocolMetadataSource::FullReplay,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            self.newest_commit().is_some(),
+            self.newest_commit_after_checkpoint().is_some(),
         ))
     }
 
