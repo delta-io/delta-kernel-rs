@@ -14,7 +14,7 @@
 //! ```
 //! use std::sync::Arc;
 //! use delta_kernel::PlanBuilder;
-//! use delta_kernel::expressions::{Predicate, expr};
+//! use delta_kernel::expressions::col;
 //! use delta_kernel::plans::ir::nodes::Operator;
 //! use delta_kernel::schema::{DataType, StructField, StructType};
 //!
@@ -24,7 +24,7 @@
 //! // eliminates it as dead code, collapsing the plan to its minimal correct shape. Downstream
 //! // transforms still validate and chain exactly as they would over a populated source.
 //! let scan = PlanBuilder::values(schema, vec![])?
-//!     .filter(Predicate::from_expr(expr!(is_not_null(col("id")))))?;
+//!     .filter(col!("id").is_not_null())?;
 //!
 //! // `build_opt` reports the eliminated plan as `None` ...
 //! assert!(scan.clone().build_opt()?.is_none());
@@ -256,7 +256,7 @@ impl PlanBuilder {
     /// ```
     /// # use std::sync::Arc;
     /// # use delta_kernel::{KernelResult, PlanBuilder};
-    /// # use delta_kernel::expressions::{Predicate, expr};
+    /// # use delta_kernel::expressions::col;
     /// # use delta_kernel::plans::ScopedPlanExecutor;
     /// # use delta_kernel::schema::{DataType, StructField, StructType};
     /// # fn build_plan(scoped: &dyn ScopedPlanExecutor) -> KernelResult<()> {
@@ -266,7 +266,7 @@ impl PlanBuilder {
     /// let source = PlanBuilder::values(schema, vec![vec![1i32.into()]])?.build()?;
     /// let relation_ref = scoped.execute_and_retain("example", source)?;
     /// let plan = PlanBuilder::relation_source(relation_ref)
-    ///     .filter(Predicate::from_expr(expr!(is_not_null(col("id")))))?
+    ///     .filter(col!("id").is_not_null())?
     ///     .build()?;
     /// # let _ = plan;
     /// # Ok(())
@@ -337,11 +337,11 @@ impl PlanBuilder {
     /// ```
     /// # use std::sync::Arc;
     /// # use delta_kernel::PlanBuilder;
-    /// # use delta_kernel::expressions::{Predicate, expr};
+    /// # use delta_kernel::expressions::col;
     /// # use delta_kernel::schema::{DataType, StructField, StructType};
     /// let schema = Arc::new(StructType::try_new([StructField::not_null("id", DataType::INTEGER)])?);
     /// let plan = PlanBuilder::values(schema, vec![vec![1.into()], vec![2.into()]])?
-    ///     .filter(Predicate::from_expr(expr!(is_not_null(col("id")))))?
+    ///     .filter(col!("id").is_not_null())?
     ///     .build()?;
     /// # Ok::<(), delta_kernel::KernelError>(())
     /// ```

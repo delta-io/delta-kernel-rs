@@ -9,7 +9,7 @@
 //! ```rust
 //! # use std::sync::Arc;
 //! # use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
-//! # use delta_kernel::expressions::expr;
+//! # use delta_kernel::expressions::{col, lit};
 //! # use delta_kernel::{Predicate, Snapshot, SnapshotRef, KernelError, Engine};
 //! # use delta_kernel::table_changes::TableChanges;
 //! # let path = "./tests/data/table-with-cdf";
@@ -23,7 +23,7 @@
 //! let schema = table_changes
 //!     .schema()
 //!     .project(&["id", "_commit_version"])?;
-//! let predicate = Arc::new(Predicate::from_expr(expr!(col("id") > 10)));
+//! let predicate = Arc::new(Predicate::gt(col!("id"), lit(10)));
 //!
 //! // Construct the table changes scan
 //! let table_changes_scan = table_changes
