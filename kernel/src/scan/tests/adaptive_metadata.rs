@@ -19,7 +19,7 @@ use crate::engine::sync::SyncEngine;
 use crate::expressions::{Predicate as Pred, Scalar, col, lit};
 use crate::object_store::memory::InMemory;
 use crate::scan::{Scan, ScanMetadata};
-use crate::schema::{schema_ref, SchemaRef};
+use crate::schema::{SchemaRef, schema_ref};
 use crate::table_features::ColumnMappingMode;
 use crate::transaction::BASE_ADD_FILES_SCHEMA;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
