@@ -120,6 +120,7 @@ impl SnapshotUpdate {
             )
             .inspect_err(|error| report_failure(error, &existing.log_segment));
         };
+        tracing::Span::current().record("version", segment.end_version);
         emit_log_segment_load(&metric_context, &segment, start.elapsed());
 
         let prepared = match baseline {
@@ -145,7 +146,6 @@ impl SnapshotUpdate {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit,
         } = prepared;
-        tracing::Span::current().record("version", table_configuration.version());
         Ok(Arc::new(Snapshot::new_with_validated_crc(
             segment,
             table_configuration,
@@ -184,7 +184,6 @@ fn prepare_incremental(
         resolution.protocol,
         segment.end_version,
     )?;
-    tracing::Span::current().record("version", table_configuration.version());
     let crc = Snapshot::validate_configuration_and_crc(segment, &table_configuration, crc)?;
     Ok(PreparedSnapshot {
         table_configuration,
