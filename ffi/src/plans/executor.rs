@@ -103,7 +103,6 @@ fn decode_parquet_footer(footer: CParquetFooter) -> KernelResult<ParquetFooter> 
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::c_void;
     use std::ptr::NonNull;
     use std::sync::{Arc, Mutex};
 
