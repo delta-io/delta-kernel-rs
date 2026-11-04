@@ -506,12 +506,6 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
 
 /// Visit an interval year-month field with its exact qualifier.
 ///
-/// `kind` accepts the numeric values of [`FfiIntervalYearToMonthType`]: `1` for `interval year`,
-/// `2` for `interval month`, and `3` for `interval year to month`. Invalid values return a schema
-/// error before metadata callbacks run or a field is inserted. On success the returned ID is
-/// owned by the builder state. When non-null, `metadata` is borrowed for this call; Kernel copies
-/// its entries and does not retain it.
-///
 /// # Safety
 ///
 /// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
