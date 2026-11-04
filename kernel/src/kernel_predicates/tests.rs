@@ -1141,21 +1141,22 @@ fn test_sql_where() {
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 }
 
+// A NULL or unresolved WHEN leaves the whole CASE unknown during pruning.
 #[rstest::rstest]
 #[case::literal_true(Pred::TRUE, Some(true), Some(true))]
 #[case::literal_false(Pred::FALSE, Some(false), Some(false))]
-#[case::literal_null(Pred::NULL, Some(false), Some(false))]
-#[case::not_null(Pred::not(Pred::NULL), Some(false), Some(false))]
+#[case::literal_null(Pred::NULL, None, None)]
+#[case::not_null(Pred::not(Pred::NULL), None, None)]
 #[case::column(column_pred!("flag"), Some(true), None)]
-#[case::null_column(column_pred!("null_flag"), Some(false), None)]
+#[case::null_column(column_pred!("null_flag"), None, None)]
 #[case::missing_column(column_pred!("missing"), None, None)]
 #[case::non_boolean(column_pred!("a"), None, None)]
 #[case::comparison(col!("a").gt(lit(1)), Some(true), None)]
-#[case::null_comparison(col!("null_a").eq(lit(1)), Some(false), None)]
-#[case::null_and_true(Pred::and(Pred::NULL, Pred::TRUE), Some(false), Some(false))]
-#[case::null_or_false(Pred::or(Pred::NULL, Pred::FALSE), Some(false), Some(false))]
+#[case::null_comparison(col!("null_a").eq(lit(1)), None, None)]
+#[case::null_and_true(Pred::and(Pred::NULL, Pred::TRUE), None, None)]
+#[case::null_or_false(Pred::or(Pred::NULL, Pred::FALSE), None, None)]
 #[case::not_null_and_false(Pred::not(Pred::and(Pred::NULL, Pred::FALSE)), Some(true), Some(true))]
-#[case::not_null_or_false(Pred::not(Pred::or(Pred::NULL, Pred::FALSE)), Some(false), Some(false))]
+#[case::not_null_or_false(Pred::not(Pred::or(Pred::NULL, Pred::FALSE)), None, None)]
 #[case::missing_and_false(
     Pred::and(column_pred!("missing"), Pred::FALSE), Some(false), Some(false)
 )]
@@ -1166,17 +1167,17 @@ fn test_sql_where() {
 #[case::nested_null_result(
     Pred::from_expr(Expr::case_when(
         [(Pred::TRUE, Pred::NULL.into())], lit(true),
-    )), Some(false), Some(false)
+    )), None, None
 )]
 #[case::nested_null_predicate(
     Pred::from_expr(Expr::case_when(
         [(Pred::TRUE, Pred::not(Pred::or(Pred::NULL, Pred::FALSE)).into())], lit(true),
-    )), Some(false), Some(false)
+    )), None, None
 )]
 #[case::cast_null_boolean(
     Pred::from_expr(Expr::cast(null_lit(DataType::STRING), DataType::BOOLEAN)),
-    Some(false),
-    Some(false)
+    None,
+    None
 )]
 #[case::cast_missing_boolean(
     Pred::from_expr(Expr::cast(col!("missing"), DataType::BOOLEAN)), None, None

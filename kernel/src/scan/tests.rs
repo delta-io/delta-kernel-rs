@@ -117,7 +117,7 @@ fn test_static_skipping() {
             )),
         ),
         (
-            true,
+            false, // A NULL condition does not establish ELSE during static pruning.
             Pred::from_expr(Expr::case_when([(Pred::NULL, lit(true))], lit(false))),
         ),
         (

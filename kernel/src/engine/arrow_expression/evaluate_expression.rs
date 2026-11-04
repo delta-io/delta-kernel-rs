@@ -4012,6 +4012,25 @@ mod tests {
         [Expr::case_when([(column_pred!("flag"), lit(1))], lit(2))],
         Ok(Int32Array::from(vec![Some(1), Some(2), Some(2)]).to_data()),
     )]
+    #[case::null_expressions_use_else(
+        [
+            Predicate::NULL,
+            Predicate::not(Predicate::NULL),
+            Predicate::and(Predicate::NULL, Predicate::TRUE),
+            Predicate::or(Predicate::NULL, Predicate::FALSE),
+            Predicate::not(Predicate::or(Predicate::NULL, Predicate::FALSE)),
+            Predicate::from_expr(Expr::cast(null_lit(DataType::STRING), DataType::BOOLEAN)),
+            Predicate::from_expr(Expr::case_when(
+                [(Predicate::TRUE, Predicate::NULL.into())], lit(true),
+            )),
+            Predicate::from_expr(Expr::case_when(
+                [(Predicate::TRUE, Predicate::not(Predicate::or(
+                    Predicate::NULL, Predicate::FALSE,
+                )).into())], lit(true),
+            )),
+        ].map(|condition| Expr::case_when([(condition, lit(1))], lit(2))),
+        Ok(Int32Array::from(vec![Some(2); 3]).to_data()),
+    )]
     #[case::typed_null_else(
         [Expr::case_when(
             [(col!("a").gt(lit(2)), lit(10))],
