@@ -6,9 +6,9 @@ use super::action_projector::ActionProjector;
 use super::checkpoint_sidecar::read_sidecar_actions;
 use super::reader::{ReadContext, read_add_actions_from_amt};
 use crate::actions::{
-    CheckpointAction, Sidecar, ADD_NAME, DOMAIN_METADATA_NAME, LOG_ADD_SCHEMA,
-    LOG_DOMAIN_METADATA_SCHEMA, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_TXN_SCHEMA,
-    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
+    ADD_NAME, CheckpointAction, DOMAIN_METADATA_NAME, LOG_ADD_SCHEMA, LOG_DOMAIN_METADATA_SCHEMA,
+    LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_TXN_SCHEMA, METADATA_NAME, PROTOCOL_NAME,
+    REMOVE_NAME, SET_TRANSACTION_NAME, Sidecar,
 };
 use crate::expressions::Scalar;
 use crate::log_replay::ActionsBatch;
@@ -178,8 +178,8 @@ mod tests {
 
     use super::*;
     use crate::actions::{
-        get_commit_schema, Add, ContentRoot, DomainMetadata, Metadata, Protocol, SetTransaction,
-        ADD_SCHEMA, COMMIT_INFO_NAME, REMOVE_FIELD,
+        ADD_SCHEMA, Add, COMMIT_INFO_NAME, ContentRoot, DomainMetadata, Metadata, Protocol,
+        REMOVE_FIELD, SetTransaction, get_commit_schema,
     };
     use crate::arrow::array::{Array as _, AsArray as _, RecordBatch};
     use crate::arrow::datatypes::Int64Type;

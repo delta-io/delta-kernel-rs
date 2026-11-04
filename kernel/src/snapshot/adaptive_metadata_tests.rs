@@ -6,8 +6,8 @@ use rstest::rstest;
 use url::Url;
 
 use crate::actions::{
-    CheckpointAction, ContentRoot, DomainMetadata, LastManifestCommit, SetTransaction,
-    LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA,
+    CheckpointAction, ContentRoot, DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA,
+    LastManifestCommit, SetTransaction,
 };
 use crate::engine::sync::SyncEngine;
 use crate::unit_test_utils::Action;

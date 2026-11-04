@@ -33,7 +33,7 @@ use crate::log_replay::ActionsBatch;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::log_segment::LastManifestCommitResolution;
 use crate::log_segment::{
-    scan_domain_metadata_actions, DomainMetadataMap, LogSegment, PmResolution,
+    DomainMetadataMap, LogSegment, PmResolution, scan_domain_metadata_actions,
 };
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::{
