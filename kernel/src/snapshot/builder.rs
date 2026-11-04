@@ -13,7 +13,7 @@ use crate::log_segment_files::CheckpointHandling;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::metrics::{MetricId, SnapshotLoadMetricContext, SnapshotLoadType};
 use crate::path::DELTA_LOG_DIR_WITH_SLASH;
-use crate::snapshot::incremental::{SnapshotUpdate, UpdateTarget};
+use crate::snapshot::incremental::SnapshotUpdate;
 use crate::snapshot::{SnapshotHint, SnapshotRef};
 use crate::utils::{PhantomType, require, try_parse_uri};
 use crate::{Engine, KernelError, KernelResult, Snapshot, Version};
@@ -391,14 +391,7 @@ impl<Mode> SnapshotBuilder<Mode> {
             // Pre-build validations for catalog-managed tables
             Self::validate_catalog_managed_build_inputs(version, max_catalog_version, &log_tail)?;
 
-            // Use time-travel version if set, otherwise fall back to max_catalog_version. Passing
-            // this as the version to LogSegment::for_snapshot does NOT skip the _last_checkpoint
-            // hint -- the hint is still used when its version <= effective_version.
-            let effective_version = version.or(max_catalog_version);
-
-            // A snapshot is latest when no explicit time-travel version is requested, or when the
-            // requested version is exactly the max_catalog_version.
-            let built_as_latest = version.is_none() || version == max_catalog_version;
+            let target = SnapshotTarget::from_versions(version, max_catalog_version);
 
             if let Some(table_root) = table_root {
                 let table_url = try_parse_uri(table_root)?;
@@ -406,7 +399,7 @@ impl<Mode> SnapshotBuilder<Mode> {
                     engine.storage_handler().as_ref(),
                     table_url.join(DELTA_LOG_DIR_WITH_SLASH)?,
                     log_tail,
-                    effective_version,
+                    target.version(),
                     metric_context.clone(),
                 )?;
                 Snapshot::try_new_from_log_segment(
@@ -415,7 +408,7 @@ impl<Mode> SnapshotBuilder<Mode> {
                     engine,
                     metric_context,
                     incremental_replay,
-                    built_as_latest,
+                    target.is_latest(),
                 )
                 .map(Into::into)?
             } else {
@@ -423,13 +416,6 @@ impl<Mode> SnapshotBuilder<Mode> {
                     return Err(KernelError::internal_error(
                         "SnapshotBuilder should have either table_root or existing_snapshot",
                     ));
-                };
-                // When the selected version equals the catalog's latest ratified version,
-                // preserve the latest-version claim alongside the exact target.
-                let target = match (effective_version, built_as_latest) {
-                    (None, _) => UpdateTarget::Latest,
-                    (Some(version), true) => UpdateTarget::CatalogLatest(version),
-                    (Some(version), false) => UpdateTarget::Version(version),
                 };
                 SnapshotUpdate {
                     existing: existing_snapshot,
@@ -528,6 +514,44 @@ impl<Mode> SnapshotBuilder<Mode> {
         self.version
             .map(|v| v.to_string())
             .unwrap_or_else(|| "LATEST".into())
+    }
+}
+
+/// The version and latest-version status requested by a fresh or incremental snapshot build.
+///
+/// Explicit time travel to the catalog's latest ratified version is also `CatalogLatest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SnapshotTarget {
+    /// Build this exact historical version, without claiming it is latest.
+    TimeTravel(Version),
+    /// Discover the latest version from storage.
+    Latest,
+    /// Build at the catalog's latest ratified version, even if storage contains later commits.
+    CatalogLatest(Version),
+}
+
+impl SnapshotTarget {
+    /// The required end version; `None` lets discovery determine the latest version.
+    pub(super) fn version(self) -> Option<Version> {
+        match self {
+            Self::TimeTravel(version) | Self::CatalogLatest(version) => Some(version),
+            Self::Latest => None,
+        }
+    }
+
+    /// Whether the request identifies its target as the latest version.
+    pub(super) fn is_latest(self) -> bool {
+        !matches!(self, Self::TimeTravel(_))
+    }
+
+    /// Normalizes version options after the builder validates the original inputs and log tail.
+    fn from_versions(version: Option<Version>, max_catalog_version: Option<Version>) -> Self {
+        match (version, max_catalog_version) {
+            (None, None) => Self::Latest,
+            (Some(version), Some(max)) if version == max => Self::CatalogLatest(version),
+            (None, Some(max)) => Self::CatalogLatest(max),
+            (Some(version), _) => Self::TimeTravel(version),
+        }
     }
 }
 

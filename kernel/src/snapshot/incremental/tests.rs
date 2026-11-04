@@ -64,8 +64,7 @@ fn checkpoint_position_selects_state_baseline_and_retained_files(
     #[case] expected_commits: &[Version],
 ) {
     let mut existing = segment(listed(&[1, 2, 3], Some(0), None));
-    // Distinguish cached metadata from the listing so replacing a retained path fails the
-    // assertion.
+    // Give cached v3 distinct metadata so replacing it with the relisted path fails.
     existing.listed.ascending_commit_files[2].location.size = 999;
     let update =
         LogUpdate::from_listing(&existing, listed(commits, checkpoint, None), None).unwrap();
@@ -86,6 +85,45 @@ fn checkpoint_position_selects_state_baseline_and_retained_files(
             }
         }
     }
+}
+
+#[rstest]
+fn checkpoint_listing_retains_its_commit_outside_replay(
+    #[values(false, true)] published_commit_at_checkpoint: bool,
+) {
+    let existing = segment(listed(&[1, 2, 3], Some(0), None));
+    let checkpoint = parse_log_path("00000000000000000003.checkpoint.parquet", 100);
+    let commit =
+        published_commit_at_checkpoint.then(|| parse_log_path("00000000000000000003.json", 100));
+    let filesystem = std::iter::once(checkpoint.clone())
+        .chain(commit.clone())
+        .map(Ok);
+    let discovered = LogSegmentFiles::build_log_segment_files(
+        filesystem,
+        vec![],
+        1,
+        None,
+        CheckpointHandling::Adopt,
+    )
+    .unwrap();
+    assert!(discovered.ascending_commit_files.is_empty());
+    assert_eq!(discovered.latest_commit_file, commit);
+    assert_eq!(
+        discovered.max_published_version,
+        published_commit_at_checkpoint.then_some(3)
+    );
+
+    let update = LogUpdate::from_listing(&existing, discovered, None)
+        .unwrap()
+        .expect("the checkpoint changes retained files at the existing version");
+    assert_eq!(update.baseline, StateBaseline::ExistingSnapshot);
+    assert_eq!(update.segment.end_version, 3);
+    assert!(update.segment.listed.ascending_commit_files.is_empty());
+    assert_eq!(update.segment.listed.checkpoint_parts, vec![checkpoint]);
+    assert_eq!(update.segment.listed.latest_commit_file, commit);
+    // The cached snapshot already observed published v3, even if discovery finds only its
+    // checkpoint.
+    assert_eq!(update.segment.listed.max_published_version, Some(3));
 }
 
 #[rstest]

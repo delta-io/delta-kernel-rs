@@ -118,6 +118,8 @@ pub(super) fn listing_start(
 ) -> Option<Version> {
     let after = match checkpoint_handling {
         CheckpointHandling::Adopt => existing.checkpoint_version.unwrap_or(0),
+        // TODO(#3269): Retaining ignored checkpoints requires listing after the active checkpoint
+        // and filtering commits already retained by the snapshot.
         CheckpointHandling::Ignore => existing.end_version,
     };
     after.checked_add(1)

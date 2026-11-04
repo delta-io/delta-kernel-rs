@@ -11,7 +11,7 @@
 //! Retained history and state replay have different starting versions. For a snapshot at v10,
 //! adopting a checkpoint at v8 keeps commits from v9 onward for subsequent scans. Protocol and
 //! metadata can still start from the existing v10 state. CRC replay has a separate baseline and
-//! budget, described in [`prepare_incremental`].
+//! budget, described in [`resolve_incremental_state`].
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,7 +19,9 @@ use std::time::Instant;
 use log_update::{LogUpdate, StateBaseline};
 use tracing::{error, instrument};
 
+use super::builder::SnapshotTarget;
 use super::{IncrementalReplay, PreparedSnapshot, Snapshot};
+use crate::crc::Crc;
 use crate::log_segment::{LogSegment, PmResolution};
 use crate::log_segment_files::CheckpointHandling;
 use crate::metrics::{
@@ -28,7 +30,7 @@ use crate::metrics::{
 };
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
-use crate::{Engine, KernelError, KernelResult, Version};
+use crate::{Engine, KernelError, KernelResult};
 
 mod log_update;
 
@@ -41,33 +43,19 @@ mod tests;
 pub(super) struct SnapshotUpdate {
     /// Supplies resolved table state and retained log paths, including unpublished staged commits.
     pub(super) existing: Arc<Snapshot>,
-    pub(super) target: UpdateTarget,
+    pub(super) target: SnapshotTarget,
     /// Catalog-supplied commit paths; may start after the existing snapshot's version.
-    /// Discovery merges these with storage listings and retained paths before checking continuity.
     pub(super) log_tail: Vec<ParsedLogPath>,
     /// Whether discovery may replace the existing checkpoint and discard the history it covers.
     pub(super) checkpoint_handling: CheckpointHandling,
-    /// Budget for advancing a CRC; does not limit protocol/metadata replay needed for correctness.
+    /// Budget for advancing a stale CRC. Protocol and metadata replay runs as needed.
     pub(super) crc_replay: IncrementalReplay,
-}
-
-/// Which version to build and whether the request identifies it as latest.
-///
-/// The builder uses `CatalogLatest` even for explicit time travel to the catalog's latest version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum UpdateTarget {
-    /// Time travel to this exact version, without claiming it is latest.
-    Version(Version),
-    /// Discover the latest version from storage.
-    Latest,
-    /// Build at the catalog's latest ratified version, even if storage contains later commits.
-    CatalogLatest(Version),
 }
 
 impl SnapshotUpdate {
     /// Builds the requested snapshot, reusing the input state whenever the selected files allow it.
     ///
-    /// `Version` and `CatalogLatest` return the input `Arc` unchanged when their version equals
+    /// `TimeTravel` and `CatalogLatest` return the input `Arc` unchanged when their version equals
     /// the existing version, and reject older versions. Neither path performs I/O. `Latest` still
     /// discovers files and may refresh the checkpoint or build flags without advancing the version.
     #[instrument(name = "try_new_from", skip_all, fields(path = %self.existing.table_root(), enable_call_frame, version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""), incremental_replay = ?self.crc_replay, built_as_latest = self.target.is_latest()))]
@@ -172,27 +160,11 @@ impl SnapshotUpdate {
     }
 }
 
-impl UpdateTarget {
-    /// The required end version; `None` lets discovery determine the latest version.
-    fn version(self) -> Option<Version> {
-        match self {
-            Self::Version(version) | Self::CatalogLatest(version) => Some(version),
-            Self::Latest => None,
-        }
-    }
-
-    fn is_latest(self) -> bool {
-        !matches!(self, Self::Version(_))
-    }
-}
-
 /// Resolves state at `segment.end_version` while reusing the existing table configuration.
 ///
 /// The segment's checkpoint must be at or below `existing.version()`, with every later commit
-/// retained. CRC replay starts from the newest usable disk or in-memory CRC and measures its budget
-/// from that CRC's version, which may predate the snapshot. Without a target CRC, protocol and
-/// metadata start from the existing snapshot or a newer CRC. A stale CRC may still be retained for
-/// future updates; it cannot replace newer protocol or metadata.
+/// retained. State resolution supplies protocol/metadata replacements and an optional CRC;
+/// configuration and CRC validation must succeed before the caller can construct the snapshot.
 fn prepare_incremental(
     existing: &Snapshot,
     segment: &LogSegment,
@@ -202,37 +174,8 @@ fn prepare_incremental(
 ) -> KernelResult<PreparedSnapshot> {
     let start = Instant::now();
     let existing_config = existing.table_configuration();
-    let (resolution, crc) = (|| {
-        // The CRC budget controls advancing the checksum, not the replay needed to resolve state.
-        let base_crc = segment.pick_latest_base_crc(engine, existing.base_crc())?;
-        let crc_at_version =
-            segment.try_build_crc_within_budget(engine, base_crc.as_ref(), crc_replay)?;
-        let resolution = match &crc_at_version {
-            Some((crc, source)) => {
-                let mut resolution = PmResolution::from_crc(crc, *source);
-                // None means "keep the existing value" to TableConfiguration::try_new_from,
-                // avoiding schema and property reconstruction when the CRC confirms no change.
-                resolution
-                    .metadata
-                    .take_if(|m| m == existing_config.metadata());
-                resolution
-                    .protocol
-                    .take_if(|p| p == existing_config.protocol());
-                resolution
-            }
-            None => {
-                let newer_crc = base_crc
-                    .as_ref()
-                    .filter(|crc| crc.version > existing.version());
-                match newer_crc {
-                    Some(crc) => segment.read_protocol_metadata_opt(engine, Some(crc))?,
-                    None => segment.read_protocol_metadata_after(engine, existing.version())?,
-                }
-            }
-        };
-        Ok((resolution, crc_at_version.map(|(crc, _)| crc).or(base_crc)))
-    })()
-    .inspect_err(|_: &KernelError| emit_protocol_metadata_load_failure(metric_context))?;
+    let (resolution, crc) = resolve_incremental_state(existing, segment, engine, crc_replay)
+        .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
     emit_protocol_metadata_load(metric_context, resolution.source, start.elapsed());
 
     let table_configuration = TableConfiguration::try_new_from(
@@ -251,6 +194,48 @@ fn prepare_incremental(
         #[cfg(feature = "adaptive-metadata-in-dev")]
         last_manifest_commit: resolution.last_manifest_commit,
     })
+}
+
+/// Resolves protocol/metadata changes and the CRC to retain for the updated snapshot.
+///
+/// CRC replay starts from the newest usable disk or in-memory CRC and measures its budget from
+/// that CRC's version, which may predate the snapshot. Without a target CRC, protocol and metadata
+/// start from the existing snapshot or a newer CRC. A stale CRC may still be retained for future
+/// updates; it cannot replace newer protocol or metadata.
+fn resolve_incremental_state(
+    existing: &Snapshot,
+    segment: &LogSegment,
+    engine: &dyn Engine,
+    crc_replay: IncrementalReplay,
+) -> KernelResult<(PmResolution, Option<Arc<Crc>>)> {
+    let base_crc = segment.pick_latest_base_crc(engine, existing.base_crc())?;
+    let crc_at_version =
+        segment.try_build_crc_within_budget(engine, base_crc.as_ref(), crc_replay)?;
+    let resolution = match &crc_at_version {
+        Some((crc, source)) => {
+            let mut resolution = PmResolution::from_crc(crc, *source);
+            // None preserves the existing configuration, including its parsed schema
+            // and properties.
+            let existing_config = existing.table_configuration();
+            resolution
+                .metadata
+                .take_if(|metadata| metadata == existing_config.metadata());
+            resolution
+                .protocol
+                .take_if(|protocol| protocol == existing_config.protocol());
+            resolution
+        }
+        None => {
+            let newer_crc = base_crc
+                .as_ref()
+                .filter(|crc| crc.version > existing.version());
+            match newer_crc {
+                Some(crc) => segment.read_protocol_metadata_opt(engine, Some(crc))?,
+                None => segment.read_protocol_metadata_after(engine, existing.version())?,
+            }
+        }
+    };
+    Ok((resolution, crc_at_version.map(|(crc, _)| crc).or(base_crc)))
 }
 
 /// Reuses unchanged table state, returning the same `Arc` when the build flags also match.

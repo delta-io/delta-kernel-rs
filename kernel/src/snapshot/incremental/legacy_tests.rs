@@ -162,7 +162,7 @@ fn test_try_new_from_empty_log_tail() -> KernelResult<()> {
 
     let result = SnapshotUpdate {
         existing: base_snapshot.clone(),
-        target: UpdateTarget::Latest,
+        target: SnapshotTarget::Latest,
         log_tail: vec![],
         checkpoint_handling: CheckpointHandling::Adopt,
         crc_replay: IncrementalReplay::Disabled,
@@ -241,8 +241,8 @@ async fn test_try_new_from_latest_commit_preservation() -> KernelResult<()> {
     // Execute the supplied log tail through SnapshotUpdate.
     let new_snapshot = SnapshotUpdate {
         existing: base_snapshot.clone(),
-        target: UpdateTarget::Version(2),
-        log_tail: log_tail,
+        target: SnapshotTarget::TimeTravel(2),
+        log_tail,
         checkpoint_handling: CheckpointHandling::Adopt,
         crc_replay: IncrementalReplay::Disabled,
     }
@@ -299,7 +299,7 @@ async fn test_try_new_from_version_boundary_cases() -> KernelResult<()> {
     // Test requesting same version - should return same snapshot
     let same_version = SnapshotUpdate {
         existing: base_snapshot.clone(),
-        target: UpdateTarget::Version(1),
+        target: SnapshotTarget::TimeTravel(1),
         log_tail: vec![],
         checkpoint_handling: CheckpointHandling::Adopt,
         crc_replay: IncrementalReplay::Disabled,
@@ -310,7 +310,7 @@ async fn test_try_new_from_version_boundary_cases() -> KernelResult<()> {
     // Test requesting older version - should error
     let older_version = SnapshotUpdate {
         existing: base_snapshot.clone(),
-        target: UpdateTarget::Version(0),
+        target: SnapshotTarget::TimeTravel(0),
         log_tail: vec![],
         checkpoint_handling: CheckpointHandling::Adopt,
         crc_replay: IncrementalReplay::Disabled,
