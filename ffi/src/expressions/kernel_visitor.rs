@@ -1292,15 +1292,17 @@ mod tests {
     fn interval_year_month_null_rejects_invalid_kind(#[case] invalid_kind: u8) {
         let mut state = KernelExpressionVisitorState::default();
         let existing = visit_expression_literal_int(&mut state, 7);
-        let result = visit_expression_literal_null(
-            &mut state,
-            NullTypeTag::IntervalYearMonth as u8,
-            KernelNullTypeParameters {
-                interval_year_month_kind: invalid_kind,
-                ..KernelNullTypeParameters::default()
-            },
-            &TEST_ERROR_ALLOCATORS,
-        );
+        let result = unsafe {
+            visit_expression_literal_null(
+                &mut state,
+                NullTypeTag::IntervalYearMonth as u8,
+                KernelNullTypeParameters {
+                    interval_year_month_kind: invalid_kind,
+                    ..KernelNullTypeParameters::default()
+                },
+                &TEST_ERROR_ALLOCATORS,
+            )
+        };
 
         assert_extern_result_error_contains(
             result,
@@ -1314,15 +1316,17 @@ mod tests {
         );
         assert!(state.inflight_ids.is_empty());
 
-        let id = ok_or_panic(visit_expression_literal_null(
-            &mut state,
-            NullTypeTag::IntervalYearMonth as u8,
-            KernelNullTypeParameters {
-                interval_year_month_kind: FfiIntervalYearToMonthType::IntervalMonth as u8,
-                ..KernelNullTypeParameters::default()
-            },
-            &TEST_ERROR_ALLOCATORS,
-        ));
+        let id = ok_or_panic(unsafe {
+            visit_expression_literal_null(
+                &mut state,
+                NullTypeTag::IntervalYearMonth as u8,
+                KernelNullTypeParameters {
+                    interval_year_month_kind: FfiIntervalYearToMonthType::IntervalMonth as u8,
+                    ..KernelNullTypeParameters::default()
+                },
+                &TEST_ERROR_ALLOCATORS,
+            )
+        });
         assert_eq!(
             unwrap_kernel_expression(&mut state, id),
             Some(null_lit(DataType::INTERVAL_MONTH))
@@ -1349,12 +1353,9 @@ mod tests {
     fn null_parameters_preserve_type(#[case] data_type: DataType) {
         let (tag, parameters) = NullTypeTag::from_data_type(&data_type);
         let mut state = KernelExpressionVisitorState::default();
-        let id = ok_or_panic(visit_expression_literal_null(
-            &mut state,
-            tag as u8,
-            parameters,
-            &TEST_ERROR_ALLOCATORS,
-        ));
+        let id = ok_or_panic(unsafe {
+            visit_expression_literal_null(&mut state, tag as u8, parameters, &TEST_ERROR_ALLOCATORS)
+        });
         assert_eq!(
             unwrap_kernel_expression(&mut state, id),
             Some(null_lit(data_type))
@@ -1369,32 +1370,38 @@ mod tests {
             ..KernelNullTypeParameters::default()
         };
         assert_extern_result_error_contains(
-            visit_expression_literal_null(
-                &mut state,
-                NullTypeTag::IntervalYearMonth as u8,
-                invalid_interval_parameters,
-                &TEST_ERROR_ALLOCATORS,
-            ),
+            unsafe {
+                visit_expression_literal_null(
+                    &mut state,
+                    NullTypeTag::IntervalYearMonth as u8,
+                    invalid_interval_parameters,
+                    &TEST_ERROR_ALLOCATORS,
+                )
+            },
             FFIKernelError::SchemaError,
             "invalid interval year-month kind",
         );
         assert_extern_result_error_contains(
-            visit_expression_literal_null(
-                &mut state,
-                NullTypeTag::Decimal as u8,
-                KernelNullTypeParameters::default(),
-                &TEST_ERROR_ALLOCATORS,
-            ),
+            unsafe {
+                visit_expression_literal_null(
+                    &mut state,
+                    NullTypeTag::Decimal as u8,
+                    KernelNullTypeParameters::default(),
+                    &TEST_ERROR_ALLOCATORS,
+                )
+            },
             FFIKernelError::InvalidDecimalError,
             "precision",
         );
         assert_extern_result_error_contains(
-            visit_expression_literal_null(
-                &mut state,
-                15,
-                KernelNullTypeParameters::default(),
-                &TEST_ERROR_ALLOCATORS,
-            ),
+            unsafe {
+                visit_expression_literal_null(
+                    &mut state,
+                    15,
+                    KernelNullTypeParameters::default(),
+                    &TEST_ERROR_ALLOCATORS,
+                )
+            },
             FFIKernelError::GenericError,
             "Unrecognized null type tag",
         );
@@ -1414,12 +1421,14 @@ mod tests {
             (NullTypeTag::Decimal, DataType::decimal(10, 2).unwrap()),
             (NullTypeTag::IntervalYearMonth, DataType::INTERVAL_YEAR),
         ] {
-            let id = ok_or_panic(visit_expression_literal_null(
-                &mut state,
-                tag as u8,
-                parameters,
-                &TEST_ERROR_ALLOCATORS,
-            ));
+            let id = ok_or_panic(unsafe {
+                visit_expression_literal_null(
+                    &mut state,
+                    tag as u8,
+                    parameters,
+                    &TEST_ERROR_ALLOCATORS,
+                )
+            });
             assert_eq!(
                 unwrap_kernel_expression(&mut state, id),
                 Some(null_lit(expected))
