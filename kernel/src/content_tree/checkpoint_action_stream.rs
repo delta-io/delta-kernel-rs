@@ -3,8 +3,8 @@
 use std::iter;
 
 use super::action_projector::ActionProjector;
-use super::reader::{read_add_actions_from_amt, ReadContext};
-use crate::actions::{CheckpointAction, ADD_NAME, LOG_ADD_SCHEMA, REMOVE_NAME};
+use super::reader::{ReadContext, read_add_actions_from_amt};
+use crate::actions::{ADD_NAME, CheckpointAction, LOG_ADD_SCHEMA, REMOVE_NAME};
 use crate::log_replay::ActionsBatch;
 use crate::path::LogRoot;
 use crate::schema::SchemaRef;
@@ -35,7 +35,7 @@ pub(crate) fn read_checkpoint_action(
                 return Err(KernelError::unsupported(format!(
                     "reading `{other}` actions from an adaptiveMetadata checkpoint action is not \
                      yet supported"
-                )))
+                )));
             }
         }
     }
@@ -83,31 +83,31 @@ mod tests {
 
     use super::*;
     use crate::actions::{
-        get_commit_schema, Add, ContentRoot, ADD_SCHEMA, LOG_TXN_SCHEMA, REMOVE_FIELD,
-        SET_TRANSACTION_NAME,
+        ADD_SCHEMA, Add, ContentRoot, LOG_TXN_SCHEMA, REMOVE_FIELD, SET_TRANSACTION_NAME,
+        get_commit_schema,
     };
     use crate::arrow::array::{AsArray as _, RecordBatch};
     use crate::arrow::datatypes::Int64Type;
     use crate::content_tree::test_utils::{added_data_entry, write_manifest};
     use crate::content_tree::{ContentTreeNodeEntry, TrackingStatus};
+    use crate::engine::CancellableEngine;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
-    use crate::engine::CancellableEngine;
-    use crate::log_segment::tests::add_checkpoint_to_store;
     use crate::log_segment::LogSegment;
+    use crate::log_segment::tests::add_checkpoint_to_store;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStoreExt as _;
     use crate::scan::test_utils::add_batch_simple;
     use crate::scan::{CHECKPOINT_READ_SCHEMA, COMMIT_READ_SCHEMA};
-    use crate::schema::{schema_ref, StructType};
+    use crate::schema::{StructType, schema_ref};
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
         adaptive_metadata_pm, adaptive_metadata_protocol_and_metadata, checkpoint_action_with_root,
         commit_files, create_adaptive_metadata_table,
     };
     use crate::unit_test_utils::{
-        assert_result_error_with_message, create_log_path_with_size,
-        test_schema_flat_with_column_mapping, Action, TestCancellationToken,
+        Action, TestCancellationToken, assert_result_error_with_message, create_log_path_with_size,
+        test_schema_flat_with_column_mapping,
     };
     use crate::{CancellationTokenRef, Version};
 
