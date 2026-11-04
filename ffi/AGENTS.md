@@ -265,8 +265,9 @@ Feature flags:
 - `delta-kernel-unity-catalog`
 - `tracing`
 - `alloc-tracking` -- installs the native-memory tracking global allocator; enables meaningful
-  `*_native_bytes` / `alloc_tracking_enabled` getters (cdylib only; conflicts with
-  another `#[global_allocator]` if linked as an rlib); requires native 64-bit atomics
+  `*_native_bytes`, `get_native_memory_stats`, and `reset_native_memory_stats` results;
+  `alloc_tracking_enabled` reports whether tracking is enabled (cdylib only; conflicts with another
+  `#[global_allocator]` if linked as an rlib); requires native 64-bit atomics
 
 `get_native_memory_stats` samples without resetting; `reset_native_memory_stats` also rebases the
 measurement window. Both return `NativeMemoryStats` by value and normalize returned bounds to satisfy

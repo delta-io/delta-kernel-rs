@@ -87,8 +87,10 @@ geo-type-in-dev = ["delta_kernel/geo-type-in-dev"]
 # Experimental, in-development feature flag gating Iceberg V4 adaptive metadata tree support.
 adaptive-metadata-in-dev = ["delta_kernel/adaptive-metadata-in-dev"]
 
-# Tracking global allocator for process-wide native current/minimum/maximum bytes, readable via the
-# `*_native_bytes` FFI getters. Off by default. Only enable when building the cdylib:
+# Tracking global allocator for process-wide native current/minimum/maximum bytes, readable via
+# `*_native_bytes`, `get_native_memory_stats`, and `reset_native_memory_stats`;
+# `alloc_tracking_enabled` reports whether tracking is enabled. Off by default.
+# Only enable when building the cdylib:
 # this crate is also an rlib, so `#[global_allocator]` applies to any Rust binary that
 # links it and conflicts with a binary that installs its own (jemalloc, dhat, ...).
 alloc-tracking = []

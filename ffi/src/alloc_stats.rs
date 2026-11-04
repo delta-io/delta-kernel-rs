@@ -15,9 +15,9 @@
 #[cfg(all(feature = "alloc-tracking", not(target_has_atomic = "64")))]
 compile_error!("alloc-tracking requires native 64-bit atomics");
 
-#[cfg(feature = "alloc-tracking")]
+#[cfg(any(test, feature = "alloc-tracking"))]
 use std::alloc::{GlobalAlloc, Layout, System};
-#[cfg(feature = "alloc-tracking")]
+#[cfg(any(test, feature = "alloc-tracking"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "alloc-tracking")]
@@ -138,14 +138,14 @@ pub extern "C" fn get_native_memory_stats() -> NativeMemoryStats {
     }
 }
 
-#[cfg(feature = "alloc-tracking")]
+#[cfg(any(test, feature = "alloc-tracking"))]
 struct TrackingAlloc {
     current: AtomicU64,
     min: AtomicU64,
     max: AtomicU64,
 }
 
-#[cfg(feature = "alloc-tracking")]
+#[cfg(any(test, feature = "alloc-tracking"))]
 impl TrackingAlloc {
     const fn new() -> Self {
         Self {
@@ -222,7 +222,7 @@ impl TrackingAlloc {
     }
 }
 
-#[cfg(feature = "alloc-tracking")]
+#[cfg(any(test, feature = "alloc-tracking"))]
 // SAFETY: pointers, layouts, and realloc's new_size are forwarded to `System` unchanged.
 // Bookkeeping must not allocate or unwind: it only uses atomics and guarded or saturating
 // arithmetic, without accessing the allocated memory.
@@ -280,25 +280,37 @@ mod disabled_tests {
     }
 }
 
-#[cfg(all(test, feature = "alloc-tracking"))]
-mod global_allocator_tests {
+#[cfg(test)]
+mod tests {
     use std::alloc::{GlobalAlloc, Layout, System};
+    use std::mem::{align_of, offset_of, size_of};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Barrier};
     use std::thread;
 
     use rstest::rstest;
 
+    #[cfg(feature = "alloc-tracking")]
     use super::{
         alloc_tracking_enabled, current_native_bytes, get_native_memory_stats, max_native_bytes,
-        min_native_bytes, reset_native_memory_stats, NativeMemoryStats, TrackingAlloc,
+        min_native_bytes, reset_native_memory_stats,
+    };
+    use super::{NativeMemoryStats, TrackingAlloc};
+
+    const _: () = {
+        assert!(size_of::<NativeMemoryStats>() == 24);
+        assert!(align_of::<NativeMemoryStats>() == align_of::<u64>());
+        assert!(offset_of!(NativeMemoryStats, min_bytes) == 0);
+        assert!(offset_of!(NativeMemoryStats, current_bytes) == 8);
+        assert!(offset_of!(NativeMemoryStats, max_bytes) == 16);
     };
 
-    // Far above incidental harness allocation, so the bounds below cannot be met by noise.
-    const N: usize = 8 * 1024 * 1024;
-
+    #[cfg(feature = "alloc-tracking")]
     #[test]
     fn installed_global_allocator_accounts_a_large_allocation() {
+        // Far above incidental harness allocation, so the bounds below cannot be met by noise.
+        const N: usize = 8 * 1024 * 1024;
+
         // This must be the only test in this binary that resets GLOBAL_ALLOC: the initial minimum
         // assertion relies on no other test rebasing it when cargo test runs tests concurrently.
         assert!(alloc_tracking_enabled());
@@ -408,16 +420,23 @@ mod global_allocator_tests {
     }
 
     #[rstest]
-    fn failed_realloc_does_not_change_usage(#[values(32, 64, 128)] new_size: u64) {
+    #[case::failed_shrink(false, 32)]
+    #[case::failed_same_size(false, 64)]
+    #[case::failed_grow(false, 128)]
+    #[case::successful_same_size(true, 64)]
+    fn unchanged_realloc_preserves_usage(#[case] succeeded: bool, #[case] new_size: u64) {
         let allocator = TrackingAlloc::new();
-        allocator.grow_usage(64);
-        let before = allocator.reset_stats();
+        allocator.grow_usage(128);
+        allocator.reset_stats();
+        allocator.shrink_usage(96);
+        allocator.grow_usage(32);
+        let before = allocator.stats();
 
-        allocator.record_realloc(false, 64, new_size);
+        allocator.record_realloc(succeeded, 64, new_size);
 
         assert_eq!(allocator.current_usage(), before.current_bytes);
-        assert_eq!(allocator.min_usage(), before.current_bytes);
-        assert_eq!(allocator.max_usage(), before.current_bytes);
+        assert_eq!(allocator.min_usage(), before.min_bytes);
+        assert_eq!(allocator.max_usage(), before.max_bytes);
     }
 
     #[test]
@@ -483,9 +502,7 @@ mod global_allocator_tests {
     }
 
     #[rstest]
-    fn sampled_bounds_remain_ordered_during_concurrent_accounting_and_resets(
-        #[values(false, true)] reset: bool,
-    ) {
+    fn concurrent_accounting_and_resets_balance_current_usage(#[values(false, true)] reset: bool) {
         let allocator = TrackingAlloc::new();
         let barrier = Barrier::new(5);
         thread::scope(|scope| {
