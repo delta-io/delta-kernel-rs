@@ -31,7 +31,7 @@ use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
     add_commit, begin_transaction_with, copy_directory, insert_data, insert_data_with,
-    test_table_setup, test_table_setup_mt,
+    read_actions_from_commit, read_scan, test_table_setup, test_table_setup_mt,
 };
 use url::Url;
 
@@ -654,7 +654,7 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> KernelResult<(
 #[rstest]
 #[tokio::test]
 async fn test_post_commit_crc_metadata_only_custom_op_makes_file_stats_indeterminate(
-    #[values("ANALYZE STATS", "VACUUM END", "SET TBLPROPERTIES")] operation: &str,
+    #[values("vendor.metadata.update", "VACUUM END", "SET TBLPROPERTIES")] operation: &str,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
@@ -765,7 +765,13 @@ async fn test_write_checksum_double_write_returns_already_exists(
 async fn test_write_checksum_preserves_stats_across_metadata_only_commits(
     #[case] root: WriteRoot,
     #[case] checkpoint: Option<CheckpointSpec>,
-    #[values("VACUUM START", "VACUUM END", "SET TBLPROPERTIES", "ANALYZE STATS")] operation: &str,
+    #[values(
+        "VACUUM START",
+        "VACUUM END",
+        "SET TBLPROPERTIES",
+        "vendor.metadata.update"
+    )]
+    operation: &str,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let mut builder = create_table(
@@ -1247,6 +1253,124 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
 }
 
 #[rstest]
+#[case::full_history(WriteRoot::VersionZero)]
+#[case::stale_crc(WriteRoot::StaleCrcIncrementalBuild)]
+#[case::checkpoint(WriteRoot::CheckpointWithTail)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_write_checksum_ignores_metadata_readds_and_counts_subsequent_unknown_writes(
+    #[case] root: WriteRoot,
+    #[values(
+        "COMPUTE STATS",
+        "ANALYZE STATS",
+        "ROW TRACKING BACKFILL",
+        "ROW TRACKING UNBACKFILL",
+        "DROP FEATURE",
+        "LIQUID BACKFILL",
+        "LIQUID TAGGING",
+        "REPLACE PARTITIONED BY WITH CLUSTER BY"
+    )]
+    operation: &str,
+    #[values(false, true)] commit_info_first: bool,
+) -> KernelResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snap = create_table_and_commit(&table_path, engine.as_ref())?
+        .post_commit_snapshot()
+        .unwrap()
+        .clone();
+    let snap = insert_data(
+        snap,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_post_commit_snapshot();
+    let expected = snap.get_file_stats_if_present().unwrap();
+    match root {
+        WriteRoot::StaleCrcIncrementalBuild => {
+            snap.write_checksum(engine.as_ref())?;
+        }
+        WriteRoot::CheckpointWithTail => {
+            snap.checkpoint(engine.as_ref(), None)?;
+        }
+        WriteRoot::VersionZero => {}
+        _ => unreachable!(),
+    }
+
+    // In-place metadata updates cannot be expressed through Kernel's transaction API.
+    let table_url = snap.table_root().clone();
+    let mut existing = read_actions_from_commit(&table_url, 1, "add")?;
+    assert_eq!(existing.len(), 1);
+    existing[0]["dataChange"] = serde_json::json!(false);
+    existing[0]["tags"] = serde_json::json!({"test.tag": "updated"});
+    let mut actions = [
+        serde_json::json!({"add": existing[0]}),
+        serde_json::json!({"commitInfo": {"operation": operation}}),
+    ];
+    if commit_info_first {
+        actions.reverse();
+    }
+    let commit = actions
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    add_commit(table_url.as_str(), &LocalFileSystem::new(), 2, commit).await?;
+
+    let replay = if root == WriteRoot::StaleCrcIncrementalBuild {
+        IncrementalReplay::Unlimited
+    } else {
+        IncrementalReplay::Disabled
+    };
+    let snap = Snapshot::builder_for(&table_path)
+        .with_incremental_crc_replay(replay)
+        .build(engine.as_ref())?;
+    assert_eq!(snap.version(), 2);
+    assert_eq!(
+        snap.write_checksum(engine.as_ref())?.0,
+        ChecksumWriteResult::Written
+    );
+    let snap = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(snap.get_file_stats_if_present(), Some(expected));
+
+    insert_data_with(
+        snap,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+        Box::new(FileSystemCommitter::new()),
+        "FUTURE WRITE OPERATION",
+        true,
+        false,
+    )
+    .await?
+    .unwrap_committed();
+    let snap = Snapshot::builder_for(&table_path)
+        .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+        .build(engine.as_ref())?;
+    assert_eq!(snap.version(), 3);
+    let sizes = parquet_file_sizes_on_disk(&table_path);
+    assert_eq!(sizes.len(), 2);
+    let stats = snap.get_file_stats_if_present().unwrap();
+    assert_eq!(stats.num_files(), 2);
+    assert_eq!(stats.table_size_bytes(), sizes.iter().sum::<i64>());
+    assert_histogram_totals(&stats, 2, sizes.iter().sum());
+    assert_eq!(
+        snap.write_checksum(engine.as_ref())?.0,
+        ChecksumWriteResult::Written
+    );
+
+    let scan = snap.scan_builder().build()?;
+    let batches = read_scan(&scan, engine.clone())?;
+    test_utils::assert_batches_sorted_eq!(
+        vec![
+            "+----+", "| id |", "+----+", "| 1  |", "| 2  |", "| 3  |", "| 4  |", "| 5  |",
+            "| 6  |", "+----+"
+        ],
+        &batches
+    );
+    Ok(())
+}
+
+#[rstest]
 #[case::checkpoint(true)]
 #[case::stale_crc(false)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1276,7 +1400,7 @@ async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
         &engine,
         vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
         Box::new(FileSystemCommitter::new()),
-        "ANALYZE STATS",
+        "Manual Update",
         true,
         false,
     )
@@ -2455,7 +2579,9 @@ async fn test_file_histogram_with_bin_type_and_operation_type(
         let committed = begin_transaction_with(
             fresh_v1,
             engine.as_ref(),
-            delta_kernel::transaction::UpdateTableOperation::Custom("ANALYZE STATS".to_string()),
+            delta_kernel::transaction::UpdateTableOperation::Custom(
+                "vendor.metadata.update".to_string(),
+            ),
             "test-engine",
             true,
             |builder| builder,
