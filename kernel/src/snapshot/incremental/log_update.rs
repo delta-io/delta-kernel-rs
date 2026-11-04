@@ -177,9 +177,12 @@ fn files_after_checkpoint(
     files: &[ParsedLogPath],
     checkpoint: Option<Version>,
 ) -> Vec<ParsedLogPath> {
-    files
-        .iter()
-        .filter(|file| checkpoint.is_none_or(|v| file.version > v))
-        .cloned()
-        .collect()
+    match checkpoint {
+        Some(version) => files
+            .iter()
+            .filter(|file| file.version > version)
+            .cloned()
+            .collect(),
+        None => files.to_vec(),
+    }
 }
