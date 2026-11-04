@@ -114,7 +114,7 @@ set), `data_skipping.rs` (rewrite predicates against min/max/nullCount stats and
   `internal-api` feature)
 - `scan.declarative_metadata_scan_plan(engine)`: builds a live-add relation using shared
   `action_reconciliation::plan` sources, metadata conversion, and replay. Sources return
-  `(PlanBuilder, ActionOptions)` with actual action/statistics/partition representations.
+  `ActionPlan { plan, options }` with actual action/statistics/partition representations.
   Options are a plain struct; planning steps update them explicitly. Replay supports full
   aggregation and commit aggregation plus a base anti join, preserving winning versions.
   Checkpoints parse after replay and retention; scans parse before pruning. JSON synthesis must

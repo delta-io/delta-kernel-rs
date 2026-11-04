@@ -20,7 +20,8 @@ use crate::action_reconciliation::plan::sources::{
     checkpoint_actions, commit_actions, crc_actions,
 };
 use crate::action_reconciliation::plan::{
-    ActionOptions, ReplayStrategy, align_field, parse_file_metadata, replay, synthesize_json_stats,
+    ActionOptions, ActionPlan, ReplayStrategy, align_field, parse_file_metadata, replay,
+    synthesize_json_stats,
 };
 #[cfg(test)]
 use crate::actions::ADD_SCHEMA;
@@ -99,18 +100,14 @@ impl<'a> MetadataPlanner<'a> {
     }
 
     /// Materializes metadata before pruning, retaining every remove through the filter.
-    fn prepare(
-        &self,
-        input: (crate::PlanBuilder, ActionOptions),
-    ) -> KernelResult<(crate::PlanBuilder, ActionOptions)> {
-        let input = parse_file_metadata(
+    fn prepare(&self, input: ActionPlan) -> KernelResult<ActionPlan> {
+        let mut input = parse_file_metadata(
             &self.scan.snapshot,
             input,
             &self.options,
             self.scan.stats.synthesize_json,
         )?;
-        let (input, options) = input;
-        let input = input.project_patch(|patch| {
+        input.plan = input.plan.project_patch(|patch| {
             patch.fold_with(self.stats_filter.as_ref(), |patch, _| {
                 patch.append(
                     StructField::not_null(IS_ADD, DataType::BOOLEAN),
@@ -118,38 +115,34 @@ impl<'a> MetadataPlanner<'a> {
                 )
             })
         })?;
-        let input = match self.stats_filter.as_ref() {
-            Some(predicate) => {
-                input.filter(Predicate::or(col!(ADD_NAME).is_null(), predicate.clone()))?
-            }
-            None => input,
+        input.plan = match self.stats_filter.as_ref() {
+            Some(predicate) => input
+                .plan
+                .filter(Predicate::or(col!(ADD_NAME).is_null(), predicate.clone()))?,
+            None => input.plan,
         };
-        self.project_output((input, options))
+        self.project_output(input)
     }
 
     /// Projects metadata to the scan's requested shape after pruning.
-    fn project_output(
-        &self,
-        input: (crate::PlanBuilder, ActionOptions),
-    ) -> KernelResult<(crate::PlanBuilder, ActionOptions)> {
-        let input = if self.scan.stats.synthesize_json {
+    fn project_output(&self, input: ActionPlan) -> KernelResult<ActionPlan> {
+        let mut input = if self.scan.stats.synthesize_json {
             synthesize_json_stats(input)?
         } else {
             input
         };
         let output_stats_schema = self.scan.state_info.physical_stats_output_schema();
-        let has_struct = input.1.parsed_stats.is_some();
-        let stats_projection = match (input.1.parsed_stats.as_ref(), output_stats_schema) {
+        let has_struct = input.options.parsed_stats.is_some();
+        let stats_projection = match (input.options.parsed_stats.as_ref(), output_stats_schema) {
             (Some(read), Some(output)) if read != output => {
                 let field = StructField::nullable(STATS_PARSED, output.clone());
                 let path = column_name!(ADD_NAME, STATS_PARSED);
-                let expr = align_field(input.0.schema().field_at(&path).ok(), &field, path)?;
+                let expr = align_field(input.plan.schema().field_at(&path).ok(), &field, path)?;
                 Some((field, expr))
             }
             _ => None,
         };
-        let (input, mut actual) = input;
-        let input = input.project_patch(|mut patch| {
+        input.plan = input.plan.project_patch(|mut patch| {
             if output_stats_schema.is_none() && has_struct {
                 patch = patch.drop_at([ADD_NAME], STATS_PARSED);
             }
@@ -166,10 +159,10 @@ impl<'a> MetadataPlanner<'a> {
             }
             patch.fold_with(self.stats_filter.as_ref(), |patch, _| patch.drop(IS_ADD))
         })?;
-        actual.parsed_stats = output_stats_schema.cloned();
-        actual.json_stats = self.scan.stats.synthesize_json;
-        actual.parsed_partition_values &= self.scan.partition_values_options.parsed_struct;
-        Ok((input, actual))
+        input.options.parsed_stats = output_stats_schema.cloned();
+        input.options.json_stats = self.scan.stats.synthesize_json;
+        input.options.parsed_partition_values &= self.scan.partition_values_options.parsed_struct;
+        Ok(input)
     }
 
     #[cfg(test)]
@@ -190,7 +183,7 @@ impl<'a> MetadataPlanner<'a> {
                 available,
                 source,
             )?)?
-            .0)
+            .plan)
     }
 }
 
@@ -240,7 +233,7 @@ impl Scan {
             planner.replay_strategy,
         )?;
         result
-            .0
+            .plan
             .filter(col!("add.path").is_not_null())?
             .project_patch(|patch| patch.drop(REMOVE_NAME).drop(VERSION))?
             .build_opt()
@@ -453,73 +446,6 @@ mod tests {
     }
 
     // One add with JSON stats and no `stats_parsed`.
-    fn write_parquet_checkpoint(store: &Arc<InMemory>, path: &str) -> KernelResult<()> {
-        use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-        use crate::arrow::array::{
-            Array, BooleanArray, Int64Array, RecordBatch, StringArray as SA,
-        };
-        use crate::arrow::datatypes::{DataType as ADT, Field, Fields, Schema};
-        use crate::parquet::arrow::arrow_writer::ArrowWriter;
-
-        // An empty (non-null) `partitionValues` map for the single row; the canonical add schema
-        // requires the field, so the checkpoint file must physically carry it. The inner field
-        // names must match kernel's map convention (`key_value` / `key` / `value`).
-        let map_names = MapFieldNames {
-            entry: "key_value".to_string(),
-            key: "key".to_string(),
-            value: "value".to_string(),
-        };
-        let mut map = MapBuilder::new(Some(map_names), StringBuilder::new(), StringBuilder::new());
-        map.append(true).unwrap();
-        let partition_values = map.finish();
-
-        // The reader null-fills missing *nullable* add fields, but the canonical add schema's
-        // non-null scalars (`path`, `size`, `modificationTime`, `dataChange`) and `partitionValues`
-        // must be present in the file. `stats` carries the JSON string parsed in the
-        // no-parsed-stats path; there is deliberately no `stats_parsed` column.
-        let add_fields = Fields::from(vec![
-            Field::new("path", ADT::Utf8, true),
-            Field::new("stats", ADT::Utf8, true),
-            Field::new(
-                "partitionValues",
-                partition_values.data_type().clone(),
-                true,
-            ),
-            Field::new("size", ADT::Int64, true),
-            Field::new("modificationTime", ADT::Int64, true),
-            Field::new("dataChange", ADT::Boolean, true),
-        ]);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(ADD_NAME, ADT::Struct(add_fields.clone()), true),
-            Field::new(VERSION, ADT::Int64, true),
-        ]));
-        let add = StructArray::new(
-            add_fields,
-            vec![
-                Arc::new(SA::from(vec!["c.parquet"])),
-                Arc::new(SA::from(vec![
-                    r#"{"numRecords":1,"minValues":{"x":10},"maxValues":{"x":10}}"#,
-                ])),
-                Arc::new(partition_values),
-                Arc::new(Int64Array::from(vec![1i64])),
-                Arc::new(Int64Array::from(vec![1i64])),
-                Arc::new(BooleanArray::from(vec![true])),
-            ],
-            None,
-        );
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(add), Arc::new(Int64Array::from(vec![0i64]))],
-        )?;
-
-        let mut buf = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut buf, schema, None)?;
-        writer.write(&batch)?;
-        writer.close()?;
-        futures::executor::block_on(store.put(&Path::from(path), buf.into()))?;
-        Ok(())
-    }
-
     fn struct_stats_schema() -> SchemaRef {
         let segment = log_segment(log_root(), &[], None);
         mock_snapshot(segment)
@@ -539,50 +465,72 @@ mod tests {
     const COMMIT_ARM_TAGS: &[&str] = &[
         "scan_json", // commits
         "filter",    // keep file actions
-        "project",   // normalize payload columns
         "filter",    // select requested replay groups
-        "project",   // pack key and payload
+        "project",   // append action key
         "aggregate", // newest action per key
-        "project",   // unpack winning payload
+        "project",   // drop action key
     ];
     const LIVE_ADD_TAGS: &[&str] = &["filter", "project"];
 
     #[rstest::rstest]
-    #[case::leaf_parquet(shape(CheckpointType::Leaf, None), FileType::Parquet,
-        vec!["scan_parquet", "filter", "project", "filter", "project", "semi_join", "project"])]
-    #[case::leaf_json(shape(CheckpointType::Leaf, None), FileType::Json,
-        vec!["scan_json", "filter", "project", "filter", "project", "semi_join", "project"])]
-    #[case::manifest(shape(CheckpointType::Manifest, None), FileType::Parquet,
-        vec!["scan_parquet", "filter", "project", "dynamic_scan", "filter", "project",
-            "filter", "project", "semi_join", "project"])]
+    #[case::leaf_parquet(shape(CheckpointType::Leaf, None), Some(FileType::Parquet),
+        &["scan_parquet", "filter", "project", "filter", "project"])]
+    #[case::leaf_json(shape(CheckpointType::Leaf, None), Some(FileType::Json),
+        &["scan_json", "filter", "project", "filter", "project"])]
+    #[case::manifest(shape(CheckpointType::Manifest, None), Some(FileType::Parquet),
+        &["scan_parquet", "filter", "project", "dynamic_scan", "filter", "project", "filter", "project"])]
     #[case::checkpoint_without_add(
         CheckpointShape {
             checkpoint_type: CheckpointType::Leaf,
             leaf_checkpoint_schema: Some(schema_ref! {}),
         },
-        FileType::Parquet,
-        vec!["scan_parquet", "filter", "project", "filter", "project", "semi_join", "project"]
+        Some(FileType::Parquet),
+        &["scan_parquet", "filter", "project", "filter", "project"]
     )]
-    fn metadata_plan_checkpoint_arm_shape(
+    #[case::no_checkpoint(no_checkpoint(), None, &[])]
+    fn metadata_plan_shape(
         #[case] shape: CheckpointShape,
-        #[case] file_type: FileType,
-        #[case] checkpoint_arm_tags: Vec<&'static str>,
+        #[case] file_type: Option<FileType>,
+        #[case] checkpoint_tags: &[&str],
+        #[values(false, true)] with_commits: bool,
+        #[values(false, true)] skip_all: bool,
     ) -> KernelResult<()> {
-        let segment = log_segment(
-            log_root(),
-            &["file:///_delta_log/00000000000000000001.json"],
-            Some(checkpoint_path(file_type)),
-        );
-        let scan = mock_snapshot(segment)?.scan_builder().build()?;
-        let plan = scan
-            .build_metadata_scan_plan(&shape, &MetadataPlanner::try_new(&scan)?)?
-            .expect("non-empty");
-
-        let mut expected: Vec<&str> = COMMIT_ARM_TAGS.to_vec();
-        expected.extend(checkpoint_arm_tags);
-        expected.push("union_all");
-        expected.extend(LIVE_ADD_TAGS);
-        assert_eq!(tags(&plan), expected);
+        let commits = with_commits
+            .then_some("file:///_delta_log/00000000000000000001.json")
+            .into_iter()
+            .collect::<Vec<_>>();
+        let checkpoint = file_type.map(checkpoint_path);
+        let segment = log_segment(log_root(), &commits, checkpoint);
+        let mut builder = mock_snapshot(segment)?.scan_builder();
+        if skip_all {
+            builder = builder.with_predicate(Arc::new(Predicate::FALSE));
+        }
+        let scan = builder.build()?;
+        if skip_all {
+            assert_eq!(
+                scan.state_info.physical_predicate,
+                PhysicalPredicate::StaticSkipAll
+            );
+        }
+        let plan = scan.build_metadata_scan_plan(&shape, &MetadataPlanner::try_new(&scan)?)?;
+        if skip_all || (!with_commits && checkpoint.is_none()) {
+            assert!(plan.is_none());
+            return Ok(());
+        }
+        let mut expected = Vec::new();
+        if with_commits {
+            expected.extend_from_slice(COMMIT_ARM_TAGS);
+        }
+        expected.extend_from_slice(checkpoint_tags);
+        if checkpoint.is_some() {
+            if with_commits {
+                expected.extend(["semi_join", "project", "union_all"]);
+            } else {
+                expected.push("project");
+            }
+        }
+        expected.extend_from_slice(LIVE_ADD_TAGS);
+        assert_eq!(tags(&plan.unwrap()), expected);
         Ok(())
     }
 
@@ -668,85 +616,6 @@ mod tests {
             _ => false,
         });
         assert_eq!(native_stats_fallback, parsed_stats.is_some());
-        Ok(())
-    }
-
-    #[test]
-    fn metadata_plan_commits_only() -> KernelResult<()> {
-        let segment = log_segment(
-            log_root(),
-            &["file:///_delta_log/00000000000000000001.json"],
-            None,
-        );
-        let scan = mock_snapshot(segment)?.scan_builder().build()?;
-        let plan = scan
-            .build_metadata_scan_plan(&no_checkpoint(), &MetadataPlanner::try_new(&scan)?)?
-            .expect("non-empty");
-        let mut expected = COMMIT_ARM_TAGS.to_vec();
-        expected.extend(LIVE_ADD_TAGS);
-        assert_eq!(tags(&plan), expected);
-        Ok(())
-    }
-
-    #[rstest::rstest]
-    #[case::leaf_parquet(shape(CheckpointType::Leaf, None), FileType::Parquet,
-        vec!["scan_parquet", "filter", "project", "filter", "project", "project", "filter", "project"])]
-    #[case::leaf_json(shape(CheckpointType::Leaf, None), FileType::Json,
-        vec!["scan_json", "filter", "project", "filter", "project", "project", "filter", "project"])]
-    #[case::manifest(shape(CheckpointType::Manifest, None), FileType::Parquet,
-        vec!["scan_parquet", "filter", "project", "dynamic_scan", "filter", "project",
-            "filter", "project", "project", "filter", "project"])]
-    #[case::checkpoint_without_add(
-        CheckpointShape {
-            checkpoint_type: CheckpointType::Leaf,
-            leaf_checkpoint_schema: Some(schema_ref! {}),
-        },
-        FileType::Parquet,
-        vec!["scan_parquet", "filter", "project", "filter", "project", "project", "filter", "project"]
-    )]
-    fn metadata_plan_checkpoint_only(
-        #[case] shape: CheckpointShape,
-        #[case] file_type: FileType,
-        #[case] checkpoint_arm_tags: Vec<&'static str>,
-    ) -> KernelResult<()> {
-        let segment = log_segment(log_root(), &[], Some(checkpoint_path(file_type)));
-        let scan = mock_snapshot(segment)?.scan_builder().build()?;
-        let plan = scan
-            .build_metadata_scan_plan(&shape, &MetadataPlanner::try_new(&scan)?)?
-            .expect("non-empty");
-        assert_eq!(tags(&plan), checkpoint_arm_tags);
-        Ok(())
-    }
-
-    #[test]
-    fn metadata_plan_empty_is_none() -> KernelResult<()> {
-        let segment = log_segment(log_root(), &[], None);
-        let scan = mock_snapshot(segment)?.scan_builder().build()?;
-        assert!(
-            scan.build_metadata_scan_plan(&no_checkpoint(), &MetadataPlanner::try_new(&scan)?)?
-                .is_none()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn metadata_plan_static_skip_all_is_none() -> KernelResult<()> {
-        let segment = log_segment(log_root(), &[], None);
-        let scan = mock_snapshot(segment)?
-            .scan_builder()
-            .with_predicate(Arc::new(Predicate::FALSE))
-            .build()?;
-        assert_eq!(
-            scan.state_info.physical_predicate,
-            PhysicalPredicate::StaticSkipAll
-        );
-        assert!(
-            scan.build_metadata_scan_plan(
-                &shape(CheckpointType::Leaf, None),
-                &MetadataPlanner::try_new(&scan)?,
-            )?
-            .is_none()
-        );
         Ok(())
     }
 
@@ -964,21 +833,31 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::keeps_matching_file(StatsOptions::all_struct(), 5, 1)]
-    #[case::prunes_non_matching_file(StatsOptions::all_struct(), 20, 0)]
+    #[case::keeps_struct(StatsOptions::all_struct(), 5, 1)]
+    #[case::prunes_struct(StatsOptions::all_struct(), 20, 0)]
+    #[case::keeps_json_and_struct(StatsOptions::all(), 5, 1)]
+    #[case::prunes_json_and_struct(StatsOptions::all(), 20, 0)]
     #[case::json_ignores_predicate(StatsOptions::json_only(), 20, 1)]
-    fn metadata_planner_falls_back_to_json_for_incompatible_stats(
+    fn metadata_planner_falls_back_to_json_stats(
         #[case] stats: StatsOptions,
         #[case] lower_bound: i64,
         #[case] expected_rows: usize,
+        #[values(false, true)] incompatible_stats: bool,
     ) -> KernelResult<()> {
-        let stats_json =
-            r#"{"numRecords":1,"minValues":{"x":10},"maxValues":{"x":10},"nullCount":{"x":0}}"#;
-        let file_schema = schema_ref! {
-            nullable ADD_NAME: {
-                ..(ADD_SCHEMA.fields()),
-                nullable STATS_PARSED: { nullable "minValues": { nullable "x": STRING } },
-            },
+        let stats_json = if incompatible_stats {
+            r#"{"numRecords":1,"minValues":{"x":10},"maxValues":{"x":10},"nullCount":{"x":0}}"#
+        } else {
+            r#"{"numRecords":1,"minValues":{"x":10},"maxValues":{"x":10}}"#
+        };
+        let file_schema = if incompatible_stats {
+            schema_ref! {
+                nullable ADD_NAME: {
+                    ..(ADD_SCHEMA.fields()),
+                    nullable STATS_PARSED: { nullable "minValues": { nullable "x": STRING } },
+                },
+            }
+        } else {
+            schema_ref! { nullable ADD_NAME: (ADD_SCHEMA.clone()) }
         };
         let add = serde_json::json!({ "add": {
             "path": "a.parquet", "partitionValues": {}, "size": 1,
@@ -1013,7 +892,7 @@ mod tests {
             &file_schema,
             |schema| PlanBuilder::values(schema, vec![]),
         )?;
-        let read_schema = source.0.schema();
+        let read_schema = source.plan.schema();
         assert_eq!(add_struct(read_schema), &*ADD_SCHEMA);
         let batches = declarative_metadata(&scan, &SyncEngine::new_with_store(store))?;
         assert_eq!(metadata_row_count(&batches), expected_rows);
@@ -1032,50 +911,6 @@ mod tests {
                 assert_eq!(json.value(0), stats_json);
             }
         }
-        Ok(())
-    }
-
-    #[rstest::rstest]
-    #[case::keeps_matching_file(StatsOptions::all(), 5, 1)]
-    #[case::prunes_non_matching_file(StatsOptions::all(), 20, 0)]
-    #[case::json_ignores_predicate(StatsOptions::json_only(), 20, 1)]
-    fn metadata_plan_executes_leaf_without_stats_parsed(
-        #[case] stats: StatsOptions,
-        #[case] lower_bound: i64,
-        #[case] expected_rows: usize,
-    ) -> KernelResult<()> {
-        let store = Arc::new(InMemory::new());
-        // A single-row parquet checkpoint carrying an `add` with a JSON `stats` string but no
-        // `stats_parsed` column.
-        write_parquet_checkpoint(&store, "_delta_log/00000000000000000000.checkpoint.parquet")?;
-
-        let segment = log_segment(
-            Url::parse("memory:///_delta_log/").unwrap(),
-            &[],
-            Some("memory:///_delta_log/00000000000000000000.checkpoint.parquet"),
-        );
-        let scan = mock_snapshot(segment)?
-            .scan_builder()
-            .with_stats(stats)
-            .with_predicate(Arc::new(col!("x").gt(lit(lower_bound))))
-            .build()?;
-        let plan = scan
-            .build_metadata_scan_plan(
-                &shape(CheckpointType::Leaf, None),
-                &MetadataPlanner::try_new(&scan)?,
-            )?
-            .expect("non-empty");
-
-        let engine = SyncEngine::new_with_store(store);
-        let mut batches = engine
-            .plan_executor()
-            .unwrap()
-            .execute_op(PlanOperation::QueryPlan(plan))?
-            .into_data()?;
-        let actual_rows = batches.try_fold(0, |rows, batch| {
-            Ok::<_, crate::KernelError>(rows + batch?.try_into_record_batch()?.num_rows())
-        })?;
-        assert_eq!(actual_rows, expected_rows);
         Ok(())
     }
 }

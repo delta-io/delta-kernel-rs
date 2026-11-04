@@ -94,7 +94,10 @@ fn reconstructed_state(root: &Url) -> KernelResult<Vec<Value>> {
         .checkpoint_data(&engine)?
         .map(|data| data?.apply_selection_vector()?.try_into_record_batch())
         .collect::<KernelResult<Vec<_>>>()?;
-    let mut state = rows(&batches)?;
+    Ok(normalize_compaction_rows(rows(&batches)?))
+}
+
+fn normalize_compaction_rows(mut state: Vec<Value>) -> Vec<Value> {
     for action in &mut state {
         // Compaction changes dataChange without changing reconstructed table state.
         for kind in [ADD_NAME, REMOVE_NAME] {
@@ -105,7 +108,7 @@ fn reconstructed_state(root: &Url) -> KernelResult<Vec<Value>> {
         action.sort_all_objects();
     }
     state.sort_by_cached_key(Value::to_string);
-    Ok(state)
+    state
 }
 
 #[rstest]
@@ -173,14 +176,6 @@ fn compaction_retains_interval_winners_without_checkpoint_retention(
         commits[3].extend([protocol.clone(), metadata.clone()]);
         expected.extend([protocol, metadata]);
     }
-    for action in &mut expected {
-        for kind in [ADD_NAME, REMOVE_NAME] {
-            if action[kind].is_object() {
-                action[kind]["dataChange"] = json!(false);
-            }
-        }
-        action.sort_all_objects();
-    }
     let (snapshot, _temp) = fixture(&commits)?;
     // Planning and execution must ignore unrelated commits, even if they later disappear.
     for version in [0, 4] {
@@ -193,11 +188,10 @@ fn compaction_retains_interval_winners_without_checkpoint_retention(
                 .unwrap(),
         )?;
     }
-    let mut actual = output(&snapshot, 1, 3)?;
-    actual.iter_mut().for_each(Value::sort_all_objects);
-    actual.sort_by_cached_key(Value::to_string);
-    expected.sort_by_cached_key(Value::to_string);
-    assert_eq!(actual, expected);
+    assert_eq!(
+        normalize_compaction_rows(output(&snapshot, 1, 3)?),
+        normalize_compaction_rows(expected)
+    );
     Ok(())
 }
 

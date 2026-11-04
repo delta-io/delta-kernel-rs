@@ -60,7 +60,7 @@ impl Snapshot {
         };
         let commits = commit_actions(&segment, None, &options)?;
         replay_commits(commits)?
-            .0
+            .plan
             .project_patch(|patch| {
                 patch
                     .replace_expr_at([ADD_NAME], "dataChange", lit(false))

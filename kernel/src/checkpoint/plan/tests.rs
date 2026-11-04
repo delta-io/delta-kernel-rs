@@ -289,52 +289,34 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
     );
     assert_eq!(rows(&actual)?, rows(&expected)?);
     let result = rows(&actual)?;
-    let adds: Vec<_> = result
-        .iter()
-        .filter_map(|row| row["add"]["path"].as_str())
-        .collect();
-    assert_eq!(adds.len(), 2);
-    assert!(adds.contains(&"keep.parquet"));
-    assert!(adds.contains(&"same-path.parquet"));
-    assert_eq!(
-        result.iter().filter(|row| !row["remove"].is_null()).count(),
-        1
-    );
-    assert_eq!(
-        result
+    for (kind, field, expected) in [
+        (
+            "add",
+            "path",
+            vec![json!("keep.parquet"), json!("same-path.parquet")],
+        ),
+        ("remove", "path", vec![json!("same-path.parquet")]),
+        ("protocol", "minReaderVersion", vec![json!(3)]),
+        ("metaData", "id", vec![json!("new")]),
+        (
+            "txn",
+            "appId",
+            if txn_cutoff.is_none() {
+                vec![json!("app"), json!("legacy")]
+            } else {
+                vec![json!("legacy")]
+            },
+        ),
+        ("domainMetadata", "configuration", vec![json!("new")]),
+    ] {
+        let mut actual = result
             .iter()
-            .filter(|row| !row["protocol"].is_null())
-            .count(),
-        1
-    );
-    assert_eq!(
-        result
-            .iter()
-            .filter(|row| !row["metaData"].is_null())
-            .count(),
-        1
-    );
-    assert!(result.iter().any(|row| row["metaData"]["id"] == "new"));
-    assert!(result.iter().any(|row| row["txn"]["appId"] == "legacy"));
-    assert_eq!(
-        result
-            .iter()
-            .filter(|row| row["txn"]["appId"] == "app")
-            .count(),
-        usize::from(txn_cutoff.is_none())
-    );
-    assert_eq!(
-        result
-            .iter()
-            .filter(|row| !row["domainMetadata"].is_null())
-            .count(),
-        1
-    );
-    assert!(
-        result
-            .iter()
-            .any(|row| row["domainMetadata"]["configuration"] == "new")
-    );
+            .filter(|row| !row[kind].is_null())
+            .map(|row| row[kind][field].clone())
+            .collect::<Vec<_>>();
+        actual.sort_by_cached_key(Value::to_string);
+        assert_eq!(actual, expected, "{kind}");
+    }
 
     // The relation is directly writable using the existing ParquetHandler. Reload the resulting
     // checkpoint with the imperative reader and compare the reconstructed state again.
@@ -459,41 +441,41 @@ async fn checkpoint_and_scan_share_native_metadata_fallback(
         Some(snapshot.table_configuration()),
         &options,
     )?;
-    assert!(base.1.actions.contains(&ActionKind::FileActions {
+    assert!(base.options.actions.contains(&ActionKind::FileActions {
         includes_removes: true
     }));
-    assert_eq!(base.1.parsed_stats.is_some(), compatible);
-    assert!(base.1.json_stats);
-    assert_eq!(base.1.parsed_partition_values, compatible);
+    assert_eq!(base.options.parsed_stats.is_some(), compatible);
+    assert!(base.options.json_stats);
+    assert_eq!(base.options.parsed_partition_values, compatible);
     let crc = crc_actions(0, vec![], &options)?;
     assert_eq!(
-        crc.1.actions,
+        crc.options.actions,
         [ActionKind::FileActions {
             includes_removes: false
         }]
         .into_iter()
         .collect::<Vec<_>>()
     );
-    let padded = project_action_schema(crc.0, writer.read_schema.clone())?;
+    let padded = project_action_schema(crc.plan, writer.read_schema.clone())?;
     assert!(padded.schema().contains("remove"));
     assert!(padded.schema().contains("sidecar"));
     let tail = commit_actions(snapshot.log_segment(), Some(0), &options)?;
-    assert!(tail.1.json_stats);
-    assert!(tail.1.parsed_stats.is_none());
-    assert!(!tail.1.parsed_partition_values);
+    assert!(tail.options.json_stats);
+    assert!(tail.options.parsed_stats.is_none());
+    assert!(!tail.options.parsed_partition_values);
     // No caller-side schema alignment is needed for native checkpoints and JSON commits.
     let state = replay(tail, base, strategy)?;
-    assert_eq!(state.1.parsed_stats.is_some(), compatible);
-    assert_eq!(state.1.parsed_partition_values, compatible);
-    assert!(state.1.actions.contains(&ActionKind::FileActions {
+    assert_eq!(state.options.parsed_stats.is_some(), compatible);
+    assert_eq!(state.options.parsed_partition_values, compatible);
+    assert!(state.options.actions.contains(&ActionKind::FileActions {
         includes_removes: true
     }));
     let state = parse_file_metadata(&snapshot, state, &options, false)?;
-    assert!(state.1.parsed_stats.is_some());
-    assert!(state.1.parsed_partition_values);
-    assert!(state.1.actions.contains(&ActionKind::Protocol));
-    assert!(state.1.actions.contains(&ActionKind::Metadata));
-    for row in rows(&execute(&engine, state.0.build()?)?)? {
+    assert!(state.options.parsed_stats.is_some());
+    assert!(state.options.parsed_partition_values);
+    assert!(state.options.actions.contains(&ActionKind::Protocol));
+    assert!(state.options.actions.contains(&ActionKind::Metadata));
+    for row in rows(&execute(&engine, state.plan.build()?)?)? {
         let expected_version = if row["add"]["path"] == "tail.parquet" {
             1
         } else {
@@ -536,27 +518,16 @@ async fn checkpoint_and_scan_share_native_metadata_fallback(
             assert_eq!(stats["minValues"]["id"], id);
         }
     }
-    assert_eq!(
-        actual_rows
-            .iter()
-            .filter(|row| !row["add"].is_null())
-            .count(),
-        3
-    );
-    assert_eq!(
-        actual_rows
-            .iter()
-            .filter(|row| !row["protocol"].is_null())
-            .count(),
-        1
-    );
-    assert_eq!(
-        actual_rows
-            .iter()
-            .filter(|row| !row["metaData"].is_null())
-            .count(),
-        1
-    );
+    for (kind, count) in [("add", 3), ("protocol", 1), ("metaData", 1)] {
+        assert_eq!(
+            actual_rows
+                .iter()
+                .filter(|row| !row[kind].is_null())
+                .count(),
+            count,
+            "{kind}"
+        );
+    }
 
     let scan = snapshot
         .scan_builder()
@@ -640,8 +611,8 @@ fn non_file_checkpoint_source_never_reads_sidecars(#[case] table: &str) -> Kerne
         parsed_partition_values: false,
     };
     let source = checkpoint_actions(snapshot.log_segment(), None, None, &options)?;
-    assert_eq!(source.1, options);
-    let plan = source.0.build()?;
+    assert_eq!(source.options, options);
+    let plan = source.plan.build()?;
     for node in &plan.nodes {
         let files = match &node.op {
             Operator::DynamicScan(_) => panic!("non-file read discovered sidecars"),
@@ -693,11 +664,11 @@ fn parsed_partition_option_uses_snapshot_physical_names() -> KernelResult<()> {
         parsed_partition_values: true,
     };
     let source = commit_actions(snapshot.log_segment(), Some(0), &options)?;
-    assert!(!source.1.parsed_partition_values);
+    assert!(!source.options.parsed_partition_values);
     let parsed = parse_file_metadata(&snapshot, source, &options, false)?;
-    assert!(parsed.1.parsed_partition_values);
+    assert!(parsed.options.parsed_partition_values);
     let field = parsed
-        .0
+        .plan
         .schema()
         .field_at(&crate::expressions::column_name!(
             "add.partitionValues_parsed"
@@ -706,7 +677,7 @@ fn parsed_partition_option_uses_snapshot_physical_names() -> KernelResult<()> {
         field.data_type(),
         &crate::schema::DataType::from(partition_schema.clone())
     );
-    let actual = rows(&execute(&engine, parsed.0.build()?)?)?;
+    let actual = rows(&execute(&engine, parsed.plan.build()?)?)?;
     assert_eq!(actual.len(), 1);
     assert_eq!(
         actual[0]["add"]["partitionValues_parsed"][physical_name],

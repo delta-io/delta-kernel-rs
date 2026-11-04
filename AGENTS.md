@@ -137,7 +137,7 @@ snapshot or the connector's engine. In-memory getters remain on `Snapshot`.
 
 With `declarative-plans`, scans, checkpoint reconstruction, protocol/metadata loading, and
 minor log compaction share `action_reconciliation::plan`. Source functions return
-`(PlanBuilder, ActionOptions)`: selected actions, actual JSON/parsed stats, and a boolean for
+`ActionPlan { plan, options }`: selected actions, actual JSON/parsed stats, and a boolean for
 snapshot-typed parsed partition values. `FileActions { includes_removes }` records possible rows,
 independently of null padding. Replay selects whole actions by identity using aggregate-all or
 commit aggregation plus a base anti join. Consumers update representation facts explicitly, parse

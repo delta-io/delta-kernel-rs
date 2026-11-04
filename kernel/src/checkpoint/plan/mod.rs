@@ -77,7 +77,7 @@ impl CheckpointWriter {
             &options,
         )?;
         let commits = commit_actions(segment, segment.checkpoint_version, &options)?;
-        let state = replay(commits, base, replay_strategy)?;
+        let mut state = replay(commits, base, replay_strategy)?;
 
         // Retention must follow both latest-action selection and cancellation of base values.
         // In particular, an expired remove or a deleted domain still suppresses older state.
@@ -90,24 +90,20 @@ impl CheckpointWriter {
             ),
             None => Predicate::TRUE,
         };
-        let state = (
-            state.0.filter(Predicate::or_from([
-                col!("add.path").is_not_null(),
-                Predicate::and(
-                    col!("remove.path").is_not_null(),
-                    Expr::coalesce([col!("remove.deletionTimestamp"), lit(0i64)])
-                        .gt(lit(file_cutoff)),
-                ),
-                col!("protocol.minReaderVersion").is_not_null(),
-                col!("metaData.id").is_not_null(),
-                Predicate::and(col!("txn.appId").is_not_null(), txn_retained),
-                Predicate::and(
-                    col!("domainMetadata.domain").is_not_null(),
-                    Expr::coalesce([col!("domainMetadata.removed"), lit(false)]).eq(lit(false)),
-                ),
-            ]))?,
-            state.1,
-        );
+        state.plan = state.plan.filter(Predicate::or_from([
+            col!("add.path").is_not_null(),
+            Predicate::and(
+                col!("remove.path").is_not_null(),
+                Expr::coalesce([col!("remove.deletionTimestamp"), lit(0i64)]).gt(lit(file_cutoff)),
+            ),
+            col!("protocol.minReaderVersion").is_not_null(),
+            col!("metaData.id").is_not_null(),
+            Predicate::and(col!("txn.appId").is_not_null(), txn_retained),
+            Predicate::and(
+                col!("domainMetadata.domain").is_not_null(),
+                Expr::coalesce([col!("domainMetadata.removed"), lit(false)]).eq(lit(false)),
+            ),
+        ]))?;
 
         // Parse only surviving actions. The same materializer runs before pruning for scans.
         let state = if context.stats_config.write_stats_as_struct {
@@ -121,7 +117,7 @@ impl CheckpointWriter {
             state
         };
         // Output padding is terminal: references are NULL columns, not available replay actions.
-        let state = project_action_schema(state.0, self.read_schema.clone())?
+        let state = project_action_schema(state.plan, self.read_schema.clone())?
             .project_patch(|patch| project_checkpoint_fields(&context.stats_config, patch))?;
         let output_schema = state.schema().clone();
         if !context.is_v2 {

@@ -18,10 +18,9 @@ mod metadata;
 mod options;
 pub(crate) mod sources;
 pub(crate) use metadata::{parse_file_metadata, read_source, synthesize_json_stats};
-pub(crate) use options::ActionOptions;
+pub(crate) use options::{ActionOptions, ActionPlan};
 
 const ACTION_KEY: &str = "action_key";
-const PAYLOAD: &str = "payload";
 pub(crate) const VERSION: &str = "version";
 
 /// Equivalent ways to reconcile a complete checkpoint or CRC base with its newer commit actions.
@@ -40,12 +39,12 @@ pub(crate) enum ReplayStrategy {
 /// union of input representations and the winning version. Missing fields are padded with NULL;
 /// JSON parsing and retention are deferred to the consumer.
 pub(crate) fn replay(
-    (commits, commit_options): (PlanBuilder, ActionOptions),
-    (checkpoint, checkpoint_options): (PlanBuilder, ActionOptions),
+    commits: ActionPlan,
+    checkpoint: ActionPlan,
     strategy: ReplayStrategy,
-) -> KernelResult<(PlanBuilder, ActionOptions)> {
-    let mut actions = commit_options.actions.clone();
-    for kind in checkpoint_options.actions {
+) -> KernelResult<ActionPlan> {
+    let mut actions = commits.options.actions.clone();
+    for kind in checkpoint.options.actions {
         match kind {
             ActionKind::FileActions { includes_removes } => {
                 if let Some(ActionKind::FileActions {
@@ -67,8 +66,8 @@ pub(crate) fn replay(
     for kind in actions.iter() {
         for name in kind.names() {
             let field = match (
-                checkpoint.schema().field(name),
-                commits.schema().field(name),
+                checkpoint.plan.schema().field(name),
+                commits.plan.schema().field(name),
             ) {
                 (Some(base), Some(tail)) => merge_field(base, tail)?,
                 (Some(field), None) | (None, Some(field)) => field.clone(),
@@ -82,14 +81,14 @@ pub(crate) fn replay(
         }
     }
     fields.push(StructField::nullable(VERSION, DataType::LONG));
-    let payload_schema = Arc::new(StructType::try_new(fields)?);
-    let mut options = metadata::read_options(&commit_options, &payload_schema, &payload_schema);
+    let schema = Arc::new(StructType::try_new(fields)?);
+    let mut options = metadata::read_options(&commits.options, &schema, &schema);
     options.actions = actions.clone();
-    let base = pack(checkpoint, &actions, &payload_schema)?;
-    let tail = pack(commits, &actions, &payload_schema)?;
+    let base = with_action_key(checkpoint.plan, &actions, &schema)?;
+    let tail = with_action_key(commits.plan, &actions, &schema)?;
     let plan = match strategy {
         ReplayStrategy::AggregateAll => latest_by_key(PlanBuilder::union_all([base, tail])?)?
-            .project(col!(PAYLOAD), payload_schema)?,
+            .project_patch(|patch| patch.drop(ACTION_KEY))?,
         ReplayStrategy::AggregateTailAndAntiJoin => {
             // Winning deletions cancel base keys even if retention will later expire them.
             let winners = latest_by_key(tail)?;
@@ -99,23 +98,28 @@ pub(crate) fn replay(
                     [column_name!(ACTION_KEY)],
                     [column_name!(ACTION_KEY)],
                 )?
-                .project(col!(PAYLOAD), payload_schema.clone())?;
-            let tail = winners.project(col!(PAYLOAD), payload_schema)?;
+                .project_patch(|patch| patch.drop(ACTION_KEY))?;
+            let tail = winners.project_patch(|patch| patch.drop(ACTION_KEY))?;
             PlanBuilder::union_all([tail, base])?
         }
     };
-    Ok((plan, options))
+    Ok(ActionPlan { plan, options })
 }
 
 /// Selects the latest whole action per identity in a version-tagged commit interval.
 /// Retains winning deletions and transaction records without applying retention.
-pub(crate) fn replay_commits(
-    (commits, options): (PlanBuilder, ActionOptions),
-) -> KernelResult<(PlanBuilder, ActionOptions)> {
-    let schema = commits.schema().clone();
-    let plan =
-        latest_by_key(pack(commits, &options.actions, &schema)?)?.project(col!(PAYLOAD), schema)?;
-    Ok((plan, options))
+pub(crate) fn replay_commits(commits: ActionPlan) -> KernelResult<ActionPlan> {
+    let schema = commits.plan.schema().clone();
+    let plan = latest_by_key(with_action_key(
+        commits.plan,
+        &commits.options.actions,
+        &schema,
+    )?)?
+    .project_patch(|patch| patch.drop(ACTION_KEY))?;
+    Ok(ActionPlan {
+        plan,
+        options: commits.options,
+    })
 }
 
 /// Converts to an output schema, padding missing fields with typed NULLs.
@@ -229,6 +233,9 @@ fn merge_field(left: &StructField, right: &StructField) -> KernelResult<StructFi
 }
 
 fn align_schema(input: PlanBuilder, schema: SchemaRef) -> KernelResult<PlanBuilder> {
+    if input.schema() == &schema {
+        return Ok(input);
+    }
     let values = schema
         .fields()
         .map(|field| {
@@ -242,52 +249,50 @@ fn align_schema(input: PlanBuilder, schema: SchemaRef) -> KernelResult<PlanBuild
     input.project(Expr::struct_from(values), schema)
 }
 
-fn pack(
+fn with_action_key(
     input: PlanBuilder,
     actions: &[ActionKind],
-    payload_schema: &SchemaRef,
+    schema: &SchemaRef,
 ) -> KernelResult<PlanBuilder> {
     if input.schema().field(VERSION).map(StructField::data_type) != Some(&DataType::LONG) {
         return Err(KernelError::schema(
             "Replay sources must carry a long version column",
         ));
     }
-    let input = align_schema(input, payload_schema.clone())?;
-    let lanes = actions.iter().copied().map(lane).collect::<Vec<_>>();
+    let input = align_schema(input, schema.clone())?;
+    let lanes = actions
+        .iter()
+        .copied()
+        .map(get_action_key)
+        .collect::<Vec<_>>();
     let key_schema = StructType::try_new(lanes.iter().map(|(field, _)| field.clone()))?;
-    let schema = Arc::new(StructType::try_new([
-        StructField::not_null(ACTION_KEY, key_schema),
-        StructField::not_null(PAYLOAD, payload_schema.clone()),
-        StructField::nullable(VERSION, DataType::LONG),
-    ])?);
     input
-        .filter(presence_predicate(payload_schema.fields()))?
-        .project(
-            Expr::struct_from([
+        .filter(presence_predicate(schema.fields()))?
+        .project_patch(|patch| {
+            patch.append(
+                StructField::not_null(ACTION_KEY, key_schema),
                 Expr::struct_from(lanes.into_iter().map(|(_, expr)| expr)),
-                Expr::struct_from(
-                    payload_schema
-                        .fields()
-                        .map(|field| Expr::column([field.name()])),
-                ),
-                col!(VERSION),
-            ]),
-            schema,
-        )
+            )
+        })
 }
 
 fn latest_by_key(input: PlanBuilder) -> KernelResult<PlanBuilder> {
-    input.aggregate_by([column_name!(ACTION_KEY)], |a| {
-        a.max_non_null_by(
-            column_name!(PAYLOAD),
-            column_name!(ACTION_KEY),
-            column_name!(VERSION),
-        )
+    let columns = input
+        .schema()
+        .fields()
+        .filter(|field| field.name() != ACTION_KEY)
+        .map(|field| ColumnName::new([field.name()]))
+        .collect::<Vec<_>>();
+    input.aggregate_by([column_name!(ACTION_KEY)], |aggs| {
+        columns.into_iter().fold(aggs, |aggs, column| {
+            // Use the same sentinel for every column so a winning remove also clears add.
+            aggs.max_non_null_by(column, column_name!(ACTION_KEY), column_name!(VERSION))
+        })
     })
 }
 
 /// Each lane is NULL on other action kinds. Singleton lanes use markers, not changing values.
-fn lane(kind: ActionKind) -> (StructField, Expr) {
+fn get_action_key(kind: ActionKind) -> (StructField, Expr) {
     match kind {
         ActionKind::FileActions { includes_removes } => {
             let key_col = |name: &str| {

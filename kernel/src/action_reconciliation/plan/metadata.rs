@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::{ActionOptions, action_schema, merge_field, merge_schema};
+use super::{ActionOptions, ActionPlan, action_schema, merge_field, merge_schema};
 use crate::action_reconciliation::file_metadata::{
     PARTITION_VALUES_FIELD, PARTITION_VALUES_PARSED_FIELD, STATS_FIELD, STATS_JSON_EXPR,
     stats_with_json_fallback,
@@ -24,27 +24,31 @@ pub(crate) fn read_source(
     options: &ActionOptions,
     available: &StructType,
     source: impl FnOnce(SchemaRef) -> KernelResult<crate::PlanBuilder>,
-) -> KernelResult<(crate::PlanBuilder, ActionOptions)> {
+) -> KernelResult<ActionPlan> {
     let read_schema = read_schema(table_config, options, available)?;
     let actual = read_options(options, &read_schema, available);
-    Ok((source(read_schema)?, actual))
+    Ok(ActionPlan {
+        plan: source(read_schema)?,
+        options: actual,
+    })
 }
 
 /// Populates typed file metadata while retaining raw fields and compatible native extensions.
 pub(crate) fn parse_file_metadata(
     snapshot: &Snapshot,
-    (mut input, mut actual): (crate::PlanBuilder, ActionOptions),
+    mut input: ActionPlan,
     options: &ActionOptions,
     prefer_json_stats: bool,
-) -> KernelResult<(crate::PlanBuilder, ActionOptions)> {
+) -> KernelResult<ActionPlan> {
     let (stats_schema, partition_schema) =
         metadata_schemas(Some(snapshot.table_configuration()), options)?;
-    if !actual
+    if !input
+        .options
         .actions
         .iter()
         .any(|kind| matches!(kind, crate::actions::ActionKind::FileActions { .. }))
     {
-        return Ok((input, actual));
+        return Ok(input);
     }
     for (name, anchor, requested) in [
         (
@@ -62,6 +66,7 @@ pub(crate) fn parse_file_metadata(
     ] {
         let Some(requested) = requested else { continue };
         let original = input
+            .plan
             .schema()
             .field_at(&ColumnName::new([ADD_NAME, name]))
             .ok()
@@ -70,7 +75,7 @@ pub(crate) fn parse_file_metadata(
             DataType::Struct(schema) => Some(Arc::new(schema.as_ref().clone())),
             _ => None,
         });
-        let has_json = actual.json_stats;
+        let has_json = input.options.json_stats;
         let (target, native) = match native {
             Some(native) => match merge_schema(requested, &native) {
                 Ok(target) => (target, Some(native)),
@@ -91,7 +96,7 @@ pub(crate) fn parse_file_metadata(
         let widened = native.as_ref().is_some_and(|native| native != &target);
         let helper = "_kernel_metadata_fallback";
         if widened {
-            input = input.project_patch(|patch| {
+            input.plan = input.plan.project_patch(|patch| {
                 patch.append(
                     StructField::nullable(helper, target.clone()),
                     fallback.clone(),
@@ -120,7 +125,7 @@ pub(crate) fn parse_file_metadata(
         } else {
             native_expr
         };
-        input = input.project_patch(|patch| {
+        input.plan = input.plan.project_patch(|patch| {
             let field = StructField::nullable(name, target.clone());
             let patch = if original.is_some() {
                 patch.replace_at([ADD_NAME], name, field, expr)
@@ -130,24 +135,22 @@ pub(crate) fn parse_file_metadata(
             if widened { patch.drop(helper) } else { patch }
         })?;
         if name == STATS_PARSED {
-            actual.parsed_stats = Some(target);
+            input.options.parsed_stats = Some(target);
         } else {
-            actual.parsed_partition_values = true;
+            input.options.parsed_partition_values = true;
         }
     }
-    Ok((input, actual))
+    Ok(input)
 }
 
 /// Fills missing JSON from complete structured stats, preserving existing JSON.
 /// Call before pruning structured fields to the requested output schema.
-pub(crate) fn synthesize_json_stats(
-    (input, mut actual): (crate::PlanBuilder, ActionOptions),
-) -> KernelResult<(crate::PlanBuilder, ActionOptions)> {
-    if actual.parsed_stats.is_none() {
-        return Ok((input, actual));
+pub(crate) fn synthesize_json_stats(mut input: ActionPlan) -> KernelResult<ActionPlan> {
+    if input.options.parsed_stats.is_none() {
+        return Ok(input);
     }
-    let plan = input.project_patch(|patch| {
-        if actual.json_stats {
+    input.plan = input.plan.project_patch(|patch| {
+        if input.options.json_stats {
             patch.replace_expr_at([ADD_NAME], STATS_FIELD, STATS_JSON_EXPR.clone())
         } else {
             patch.insert_after_at(
@@ -161,8 +164,8 @@ pub(crate) fn synthesize_json_stats(
             )
         }
     })?;
-    actual.json_stats = true;
-    Ok((plan, actual))
+    input.options.json_stats = true;
+    Ok(input)
 }
 
 /// Records the representation actually read, including fallback JSON and physical remove rows.

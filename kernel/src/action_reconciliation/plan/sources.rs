@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 
 use url::Url;
 
-use super::{ActionOptions, VERSION, presence_predicate, read_source};
+use super::{ActionOptions, ActionPlan, VERSION, presence_predicate, read_source};
 use crate::actions::{
     ADD_NAME, ActionKind, Add, LOG_ADD_SCHEMA, REMOVE_NAME, SIDECAR_FIELD, SIDECAR_NAME,
     get_all_actions_schema,
@@ -22,7 +22,7 @@ pub(crate) fn crc_actions(
     version: Version,
     files: Vec<Add>,
     options: &ActionOptions,
-) -> KernelResult<(PlanBuilder, ActionOptions)> {
+) -> KernelResult<ActionPlan> {
     let version = version_as_i64(version)?;
     let options = ActionOptions {
         actions: vec![ActionKind::FileActions {
@@ -53,7 +53,7 @@ pub(crate) fn checkpoint_actions(
     shape: Option<&CheckpointShape>,
     table_config: Option<&TableConfiguration>,
     options: &ActionOptions,
-) -> KernelResult<(PlanBuilder, ActionOptions)> {
+) -> KernelResult<ActionPlan> {
     let selection = CheckpointSelection::for_options(options);
     read_source(
         table_config,
@@ -73,7 +73,7 @@ pub(crate) fn commit_actions(
     segment: &LogSegment,
     after_version: Option<Version>,
     options: &ActionOptions,
-) -> KernelResult<(PlanBuilder, ActionOptions)> {
+) -> KernelResult<ActionPlan> {
     let files = match after_version {
         Some(version) => segment
             .segment_after_version(version)

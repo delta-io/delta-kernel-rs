@@ -1,3 +1,4 @@
+use crate::PlanBuilder;
 use crate::actions::ActionKind;
 use crate::schema::SchemaRef;
 
@@ -12,4 +13,10 @@ pub(crate) struct ActionOptions {
     pub(crate) json_stats: bool,
     pub(crate) parsed_stats: Option<SchemaRef>,
     pub(crate) parsed_partition_values: bool,
+}
+
+/// An action relation and its available representations.
+pub(crate) struct ActionPlan {
+    pub(crate) plan: PlanBuilder,
+    pub(crate) options: ActionOptions,
 }

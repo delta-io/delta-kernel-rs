@@ -186,7 +186,7 @@ impl LogSegment {
         let commits = commit_actions(self, self.checkpoint_version, &options)?;
         let checkpoint = checkpoint_actions(self, None, None, &options)?;
         let state = replay(commits, checkpoint, strategy)?;
-        pm_result_plan(state.0)
+        pm_result_plan(state.plan)
     }
 
     // AMT checkpoint actions carry embedded P&M at their own versions, requiring nested-action
@@ -612,7 +612,6 @@ mod tests {
     use super::{PmCandidate, VersionedBatch, pm_versions_from_plan_output, resolve_pm_batches};
     #[cfg(feature = "declarative-plans")]
     use crate::Engine;
-    use crate::Snapshot;
     #[cfg(feature = "declarative-plans")]
     use crate::action_reconciliation::plan::ReplayStrategy;
     use crate::engine::sync::SyncEngine;
@@ -632,6 +631,7 @@ mod tests {
     use crate::unit_test_utils::{copy_test_table, load_test_table};
     #[cfg(feature = "declarative-plans")]
     use crate::{KernelError, KernelResult};
+    use crate::{Snapshot, Version};
 
     #[cfg(feature = "declarative-plans")]
     struct FailingPlanExecutor;
@@ -714,43 +714,24 @@ mod tests {
         assert_eq!(filter.predicate.as_ref(), &expected);
     }
 
-    // With the `declarative-plans` feature flag on, `SyncEngine` resolves P&M through the
-    // declarative plan.
-    //
-    // This fixture's checkpoint names its map entry fields `entries` where kernel expects
-    // `key_value`. Parquet takes that name from the writer's Arrow schema unless the writer sets
-    // `WriterProperties::coerce_types`, which is off by default, and Arrow's own
-    // `MapFieldNames::default()` is `entries`. So a writer that builds its maps from Arrow defaults
-    // produces a file kernel must translate on read. Spark and kernel both write `key_value`,
-    // covered by
-    // `scan_plan::execution_tests::declarative_metadata_reconciles_checkpoint_with_later_commits`.
+    // Arrow writers can name map entries `entries` instead of `key_value`, or array
+    // elements `item` instead of `element`. P&M replay must accept both physical layouts.
+    #[rstest::rstest]
+    #[case::entries_named_maps("app-txn-checkpoint", 1, 3)]
+    #[case::item_named_arrays("parsed-stats", 5, 5)]
     #[test_log::test]
-    fn test_snapshot_build_via_plan_over_parquet_checkpoint_with_entries_named_maps() {
-        let path =
-            std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
+    fn snapshot_build_accepts_checkpoint_collection_field_names(
+        #[case] table: &str,
+        #[case] version: Version,
+        #[case] fields: usize,
+    ) {
+        let path = std::fs::canonicalize(PathBuf::from("tests/data").join(table)).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine = SyncEngine::new();
-
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-
-        assert_eq!(snapshot.version(), 1);
-        assert_eq!(snapshot.schema().fields().count(), 3);
-    }
-
-    // The array counterpart of the test above. This fixture's checkpoint names its array element
-    // fields `item` where kernel expects `element`, so it covers the other half of the naming
-    // disagreement. `metaData.partitionColumns` is the array in question, and it is present in
-    // every `metaData` action, so its element name is checked on every P&M replay.
-    #[test_log::test]
-    fn test_snapshot_build_via_plan_over_parquet_checkpoint_with_item_named_arrays() {
-        let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let engine = SyncEngine::new();
-
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-
-        assert_eq!(snapshot.version(), 5);
-        assert_eq!(snapshot.schema().fields().count(), 5);
+        let snapshot = Snapshot::builder_for(url)
+            .build(&SyncEngine::new())
+            .unwrap();
+        assert_eq!(snapshot.version(), version);
+        assert_eq!(snapshot.schema().fields().count(), fields);
     }
 
     #[cfg(feature = "declarative-plans")]
