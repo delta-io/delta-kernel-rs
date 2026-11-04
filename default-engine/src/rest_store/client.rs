@@ -5,9 +5,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use delta_kernel::object_store::Result as ObjectStoreResult;
+use reqwest::Client;
 #[cfg(any(feature = "rustls", feature = "native-tls"))]
-use reqwest::{Certificate, Identity};
-use reqwest::{Client, ClientBuilder};
+use reqwest::{Certificate, ClientBuilder, Identity};
 
 use super::generic_error;
 
@@ -83,6 +83,7 @@ fn pin_tls_backend(
     }
     #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
     {
+        let _ = opts;
         builder = builder.use_native_tls();
     }
     Ok(builder)
