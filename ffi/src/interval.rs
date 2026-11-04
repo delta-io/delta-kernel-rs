@@ -11,9 +11,9 @@ use delta_kernel::{KernelError, KernelResult};
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FfiIntervalYearToMonthType {
-    IntervalYear,
-    IntervalMonth,
-    IntervalYearToMonth,
+    IntervalYear = 0,
+    IntervalMonth = 1,
+    IntervalYearToMonth = 2,
 }
 
 impl From<IntervalYearToMonthType> for FfiIntervalYearToMonthType {
@@ -48,5 +48,21 @@ impl TryFrom<u8> for FfiIntervalYearToMonthType {
                 "invalid interval year-month kind: {other}"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::FfiIntervalYearToMonthType;
+
+    #[rstest]
+    #[case::year(FfiIntervalYearToMonthType::IntervalYear, 0)]
+    #[case::month(FfiIntervalYearToMonthType::IntervalMonth, 1)]
+    #[case::year_to_month(FfiIntervalYearToMonthType::IntervalYearToMonth, 2)]
+    fn discriminants_match_try_from(#[case] kind: FfiIntervalYearToMonthType, #[case] value: u8) {
+        assert_eq!(kind as u8, value);
+        assert_eq!(FfiIntervalYearToMonthType::try_from(value).unwrap(), kind);
     }
 }
