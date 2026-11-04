@@ -229,8 +229,9 @@ fn emit_call(call: &ExprCall, kernel: &Path) -> syn::Result<TokenStream> {
     }
 }
 
-// syn rejects `struct(...)`, so parse it as `r#struct(...)`. Keep Rust arguments of lit() and
-// path() verbatim: their macros may depend on the original tokens.
+// syn rejects `struct(...)`, so parse it as `r#struct(...)`.
+// Only lit() and path() forward Rust arguments in emit_call. Keep their argument groups
+// verbatim so caller macros receive the original tokens.
 fn escape_struct_constructor(input: TokenStream) -> TokenStream {
     let mut tokens = input.into_iter().peekable();
     let mut escaped = TokenStream::new();

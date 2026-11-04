@@ -3384,6 +3384,7 @@ mod tests {
     }
 
     #[rstest]
+    // A guard without NULLs lets the struct reuse the guard's values bitmap.
     #[case::fast_path(
         expr!(guarded_struct(col("is_valid"), col("a"))),
         vec![Some(1), Some(2), Some(3)],
@@ -3391,6 +3392,7 @@ mod tests {
         vec![true, false, true],
         vec![Some(1), Some(2), Some(3)],
     )]
+    // A guard with NULLs combines values and validity so NULL guards yield NULL structs.
     #[case::slow_path(
         expr!(guarded_struct(col("is_valid"), col("a"))),
         vec![Some(1), Some(2), Some(3), Some(4)],
