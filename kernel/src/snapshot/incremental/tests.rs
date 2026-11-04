@@ -47,9 +47,11 @@ fn listing_bounds_follow_checkpoint_policy(
 #[rstest]
 #[case::already_current(&[1, 2, 3], None, None, &[1, 2, 3])]
 #[case::commits_advance(&[1, 2, 3, 4], None, Some(StateBaseline::ExistingSnapshot), &[1, 2, 3, 4])]
+#[case::cached_commits_fill_listing_gap(&[1, 4], None, Some(StateBaseline::ExistingSnapshot), &[1, 2, 3, 4])]
 #[case::checkpoint_below_snapshot(&[2, 3], Some(1), Some(StateBaseline::ExistingSnapshot), &[2, 3])]
 #[case::checkpoint_at_snapshot(&[], Some(3), Some(StateBaseline::ExistingSnapshot), &[])]
 #[case::checkpoint_and_commits(&[3, 4], Some(2), Some(StateBaseline::ExistingSnapshot), &[3, 4])]
+#[case::cached_commits_fill_checkpoint_gap(&[4], Some(1), Some(StateBaseline::ExistingSnapshot), &[2, 3, 4])]
 #[case::checkpoint_ahead(&[], Some(4), Some(StateBaseline::NewCheckpoint), &[])]
 #[case::commits_after_new_checkpoint(&[5], Some(4), Some(StateBaseline::NewCheckpoint), &[5])]
 fn checkpoint_position_selects_state_baseline_and_retained_files(
@@ -85,9 +87,17 @@ fn checkpoint_position_selects_state_baseline_and_retained_files(
 #[rstest]
 #[case::latest(None)]
 #[case::unavailable_exact_version(Some(4))]
-fn empty_listing_distinguishes_latest_from_required_version(#[case] target: Option<Version>) {
+fn unchanged_history_distinguishes_latest_from_required_version(
+    #[case] target: Option<Version>,
+    #[values(false, true)] relisted_cached_commits: bool,
+) {
     let existing = segment(listed(&[0, 1, 2, 3], None, None));
-    let result = LogUpdate::from_listing(&existing, LogSegmentFiles::default(), target);
+    let discovered = if relisted_cached_commits {
+        listed(&[1, 3], None, None)
+    } else {
+        LogSegmentFiles::default()
+    };
+    let result = LogUpdate::from_listing(&existing, discovered, target);
     if target.is_some() {
         assert!(matches!(result, Err(KernelError::MissingVersion(4))));
     } else {
@@ -96,14 +106,18 @@ fn empty_listing_distinguishes_latest_from_required_version(#[case] target: Opti
 }
 
 #[rstest]
-#[case::gap_in_listing(&[4, 6], 5)]
-#[case::gap_between_snapshot_and_listing(&[5], 4)]
+#[case::gap_in_listing(&[4, 6], None, 5)]
+#[case::gap_between_snapshot_and_listing(&[5], None, 4)]
+#[case::gap_after_adopted_checkpoint(&[5], Some(2), 4)]
+#[case::gap_after_rebuild_checkpoint(&[6], Some(4), 5)]
+#[case::gap_in_rebuild_commits(&[5, 7], Some(4), 6)]
 fn missing_commits_cannot_be_hidden_by_retained_history(
     #[case] commits: &[Version],
+    #[case] checkpoint: Option<Version>,
     #[case] missing_version: Version,
 ) {
     let existing = segment(listed(&[1, 2, 3], Some(0), None));
-    let result = LogUpdate::from_listing(&existing, listed(commits, None, None), None);
+    let result = LogUpdate::from_listing(&existing, listed(commits, checkpoint, None), None);
     assert!(matches!(result, Err(KernelError::MissingVersion(v)) if v == missing_version));
 }
 
@@ -164,7 +178,7 @@ fn checkpoint_adoption_controls_crc_and_hint_retention(
 
 #[rstest]
 fn catalog_updates_preserve_cached_paths_and_publication_watermark(
-    #[values(0, 2, 3)] published_through: Version,
+    #[values(0, 1, 2, 3)] published_through: Version,
 ) {
     let root = Url::parse("memory:///").unwrap();
     let cached_tail: Vec<_> = (1..=2)
@@ -426,39 +440,44 @@ async fn metadata_uses_the_newest_state_with_or_without_crc_replay(
 }
 
 #[rstest]
-#[case::time_travel(Some(2), 2, false)]
-#[case::catalog_latest(None, 3, true)]
-#[case::exact_catalog_latest(Some(3), 3, true)]
+#[case::time_travel(Some(3), 3, false)]
+#[case::catalog_latest(None, 4, true)]
+#[case::exact_catalog_latest(Some(4), 4, true)]
 #[tokio::test]
 async fn catalog_tail_respects_target_and_publication_watermark(
     #[case] target: Option<Version>,
     #[case] expected_version: Version,
     #[case] expected_latest: bool,
-    #[values(false, true)] publish_overlap: bool,
+    #[values(0, 1, 2, 3, 4)] published_through: Version,
 ) {
     let (engine, store, root) = setup_catalog_managed_test().await;
-    add_commit(&root, store.as_ref(), 1, "{}".into())
-        .await
-        .unwrap();
+    let mut cached_tail = Vec::new();
+    for version in 1..=2 {
+        let path = add_staged_commit(&root, store.as_ref(), version, "{}".into())
+            .await
+            .unwrap();
+        cached_tail.push(create_log_path(&root, path));
+    }
     let base = Snapshot::builder_for(&root)
-        .with_max_catalog_version(1)
+        .with_log_tail(cached_tail)
+        .with_max_catalog_version(2)
         .build(engine.as_ref())
         .unwrap();
     let mut tail = Vec::new();
-    for version in 2..=3 {
+    for version in 3..=4 {
         let path = add_staged_commit(&root, store.as_ref(), version, "{}".into())
             .await
             .unwrap();
         tail.push(create_log_path(&root, path));
     }
-    if publish_overlap {
-        add_commit(&root, store.as_ref(), 2, "{}".into())
+    for version in 1..=published_through {
+        add_commit(&root, store.as_ref(), version, "{}".into())
             .await
             .unwrap();
     }
     let builder = Snapshot::builder_from(base)
         .with_log_tail(tail)
-        .with_max_catalog_version(3);
+        .with_max_catalog_version(4);
     let builder = if let Some(target) = target {
         builder.at_version(target)
     } else {
@@ -469,7 +488,7 @@ async fn catalog_tail_respects_target_and_publication_watermark(
     assert_eq!(updated.is_built_as_latest(), expected_latest);
     assert_eq!(
         updated.log_segment.listed.max_published_version,
-        Some(if publish_overlap { 2 } else { 1 })
+        Some(published_through.min(expected_version))
     );
     let staged_versions: Vec<_> = updated
         .log_segment
@@ -477,7 +496,7 @@ async fn catalog_tail_respects_target_and_publication_watermark(
         .staged_commits()
         .map(|p| p.version)
         .collect();
-    assert_eq!(staged_versions, (2..=expected_version).collect::<Vec<_>>());
+    assert_eq!(staged_versions, (1..=expected_version).collect::<Vec<_>>());
 }
 
 fn listed(
