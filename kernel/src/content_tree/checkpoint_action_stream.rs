@@ -94,7 +94,7 @@ mod tests {
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
-    use crate::log_segment::tests::add_checkpoint_to_store;
+    use crate::log_segment::tests::{add_checkpoint_to_store, latest_log_segment};
     use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
@@ -102,8 +102,8 @@ mod tests {
     use crate::scan::{CHECKPOINT_READ_SCHEMA, COMMIT_READ_SCHEMA};
     use crate::schema::{StructType, schema_ref};
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
-        adaptive_metadata_pm, adaptive_metadata_protocol_and_metadata, checkpoint_action_with_root,
-        commit_files, create_adaptive_metadata_table,
+        adaptive_metadata_pm, checkpoint_action_with_root, commit_files,
+        create_adaptive_metadata_table,
     };
     use crate::unit_test_utils::{
         Action, TestCancellationToken, assert_result_error_with_message, create_log_path_with_size,
@@ -154,17 +154,6 @@ mod tests {
     ) -> CheckpointAction {
         let root = write_manifest(engine, table_root().join(ROOT_PATH).unwrap(), entries);
         checkpoint_action_with_root(ROOT_PATH, root.size as i64, version).unwrap()
-    }
-
-    fn log_segment(engine: &SyncEngine) -> LogSegment {
-        LogSegment::for_snapshot_impl(
-            engine.storage_handler().as_ref(),
-            log_root().log_root().clone(),
-            vec![],
-            None,
-            None,
-        )
-        .unwrap()
     }
 
     /// The non-null `<action>.path` leaf values of `batch`, as replay reads them, or none if it
@@ -239,7 +228,7 @@ mod tests {
 
         let batches = read_paths(
             &engine,
-            &log_segment(&engine),
+            &latest_log_segment(&table_root(), &engine),
             &checkpoint,
             COMMIT_READ_SCHEMA.clone(),
             CHECKPOINT_READ_SCHEMA.clone(),
@@ -289,7 +278,7 @@ mod tests {
         .unwrap();
         let path = Path::from(format!("_delta_log/{name}"));
         store.put(&path, compacted.clone().into()).await.unwrap();
-        let mut log_segment = log_segment(&engine);
+        let mut log_segment = latest_log_segment(&table_root(), &engine);
         // Listing skips compacted deltas while log compaction is disabled (#2337).
         log_segment
             .listed
@@ -347,7 +336,7 @@ mod tests {
 
         let batches = read_paths(
             &engine,
-            &log_segment(&engine),
+            &latest_log_segment(&table_root(), &engine),
             &checkpoint,
             removes.clone(),
             removes,
@@ -378,7 +367,7 @@ mod tests {
 
         let result = read_paths(
             &engine,
-            &log_segment(&engine),
+            &latest_log_segment(&table_root(), &engine),
             &checkpoint,
             COMMIT_READ_SCHEMA.clone(),
             CHECKPOINT_READ_SCHEMA.clone(),
@@ -401,19 +390,15 @@ mod tests {
     ) {
         let store = Arc::new(InMemory::new());
         let engine = two_adds_then_add_and_remove(&store);
-        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
-        let checkpoint = CheckpointAction::new(
+        let checkpoint = CheckpointAction {
             version,
-            ContentRoot::new(ROOT_PATH.to_string(), 1, content_root_version),
-            protocol,
-            metadata,
-            vec![],
-            vec![],
-        );
+            content_root: ContentRoot::new(ROOT_PATH.to_string(), 1, content_root_version),
+            ..checkpoint_action_with_root(ROOT_PATH, 1, 0).unwrap()
+        };
 
         let result = read_paths(
             &engine,
-            &log_segment(&engine),
+            &latest_log_segment(&table_root(), &engine),
             &checkpoint,
             COMMIT_READ_SCHEMA.clone(),
             CHECKPOINT_READ_SCHEMA.clone(),
@@ -472,16 +457,11 @@ mod tests {
     #[test]
     fn partitioned_checkpoint_action_rejects_add_reads() {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
-        let (protocol, metadata) =
-            adaptive_metadata_pm(test_schema_flat_with_column_mapping(), &["id"]);
-        let checkpoint = CheckpointAction::new(
-            1,
-            ContentRoot::new(ROOT_PATH.to_string(), 1, 1),
-            protocol,
+        let (_, metadata) = adaptive_metadata_pm(test_schema_flat_with_column_mapping(), &["id"]);
+        let checkpoint = CheckpointAction {
             metadata,
-            vec![],
-            vec![],
-        );
+            ..checkpoint_action_with_root(ROOT_PATH, 1, 1).unwrap()
+        };
         assert_result_error_with_message(
             read_checkpoint_action(
                 &engine,

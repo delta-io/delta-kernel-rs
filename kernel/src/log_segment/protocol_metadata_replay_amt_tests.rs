@@ -5,10 +5,8 @@ use std::sync::Arc;
 
 use rstest::rstest;
 use test_utils::{add_commit, assert_result_error_with_message, delta_path_for_version};
-use url::Url;
 
-use super::LogSegment;
-use super::tests::add_checkpoint_to_store;
+use super::tests::{add_checkpoint_to_store, latest_log_segment};
 use crate::actions::{CheckpointAction, ContentRoot, LastManifestCommit, Protocol};
 use crate::arrow::array::StringArray;
 use crate::committer::FileSystemCommitter;
@@ -117,13 +115,6 @@ async fn commit_table(commits: &[String]) -> (Arc<InMemory>, url::Url) {
         .unwrap();
     }
     (store, table_root)
-}
-
-// Lists the log segment for the latest version of the table at `table_root`.
-fn latest_log_segment(table_root: &Url, engine: &impl Engine) -> LogSegment {
-    let log_root = table_root.join("_delta_log/").unwrap();
-    let storage = engine.storage_handler();
-    LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap()
 }
 
 // Removes SyncEngine's plan executor so replay uses the non-plan path even when

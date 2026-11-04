@@ -161,6 +161,13 @@ async fn write_parquet_to_store(
     write_multi_row_group_parquet_to_store(store, vec![data], &path).await
 }
 
+/// Lists the log segment for the latest version of the table at `table_root`.
+pub(crate) fn latest_log_segment(table_root: &Url, engine: &dyn Engine) -> LogSegment {
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let storage = engine.storage_handler();
+    LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap()
+}
+
 /// Writes all actions to a _delta_log parquet checkpoint file in the store.
 /// This function formats the provided filename into the _delta_log directory.
 pub(crate) async fn add_checkpoint_to_store(

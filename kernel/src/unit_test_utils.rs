@@ -329,7 +329,7 @@ pub(crate) mod adaptive_metadata_fixtures {
     use super::*;
     use crate::actions::{
         CheckpointAction, ContentRoot, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA,
-        LastManifestCommit, Sidecar, get_commit_schema,
+        LastManifestCommit, Sidecar,
     };
     use crate::arrow::array::{Array as _, AsArray as _};
     use crate::engine_data::FilteredEngineData;
@@ -600,14 +600,7 @@ pub(crate) mod adaptive_metadata_fixtures {
             .chain(actions.lines())
             .collect::<Vec<_>>()
             .into();
-        let data = engine
-            .json_handler()
-            .parse_json(
-                string_array_to_engine_data(lines),
-                get_commit_schema().clone(),
-            )
-            .unwrap();
-        write_commit(engine, table_root, version, data).unwrap();
+        write_commit(engine, table_root, version, parse_json_batch(lines)).unwrap();
     }
 
     /// Commits a transaction on the latest snapshot of the table at `table_root` that adds a
