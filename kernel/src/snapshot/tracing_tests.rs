@@ -10,12 +10,16 @@ use tracing_subscriber::registry::LookupSpan;
 
 use super::SnapshotBuilder;
 use crate::FileMeta;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::Snapshot;
 use crate::engine::sync::SyncEngine;
 use crate::log_path::LogPath;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::unit_test_utils::adaptive_metadata_fixtures::setup_table;
 use crate::utils::try_parse_uri;
 
 const FRESH_CONSTRUCTOR_SPAN: &str = "try_new_from_log_segment";
@@ -452,4 +456,21 @@ async fn snapshot_rebuild_failure_emits_inner_and_outer_constructor_errors()
     assert!(outer["log_segment"].contains("00000000000000000001.checkpoint.parquet"));
 
     Ok(())
+}
+
+/// A snapshot built under one subscriber and read under another must not open a child of its
+/// span when the table has no adaptiveMetadata: the second registry does not know that span.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[test]
+fn latest_checkpoint_action_on_non_amt_table_under_another_subscriber_is_none() {
+    let (engine, table_root) = setup_table().unwrap();
+    let snapshot = tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+        Snapshot::builder_for(table_root).build(&engine).unwrap()
+    });
+
+    let action = tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+        snapshot.latest_checkpoint_action(&engine)
+    });
+
+    assert!(action.unwrap().is_none());
 }

@@ -326,6 +326,11 @@ impl Snapshot {
         if let Some(cached) = self.checkpoint_action.get() {
             return Ok(cached.clone());
         }
+        // Checked before `last_manifest_commit` opens its span, so non-AMT reads never create a
+        // child of `self.span`, which may belong to another subscriber.
+        if !self.has_adaptive_metadata() {
+            return Ok(None);
+        }
         let found = match self.last_manifest_commit(engine)? {
             Some(pointer) => Some(Arc::new(
                 self.log_segment
@@ -1159,16 +1164,19 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<LastManifestCommit>> {
-        if !self
-            .table_configuration()
-            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
-        {
+        if !self.has_adaptive_metadata() {
             return Ok(None);
         }
         if let Some(resolved) = self.last_manifest_commit.get() {
             return Ok(resolved.clone());
         }
         Ok(self.read_ict_and_last_manifest_commit(engine)?.1)
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn has_adaptive_metadata(&self) -> bool {
+        self.table_configuration()
+            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
     }
 
     /// Reads the In-Commit Timestamp and `lastManifestCommit` from this version's commit file,
