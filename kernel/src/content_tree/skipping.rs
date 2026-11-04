@@ -7,7 +7,7 @@
 
 use crate::KernelResult;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, STATS_PARSED};
-use crate::content_tree::stats::{content_stats_read_field, get_field_id, stats_schema};
+use crate::content_tree::stats::{content_stats_read_field, get_field_id};
 use crate::content_tree::{LOWER_BOUND, NAN_VALUE_COUNT, NULL_VALUE_COUNT, UPPER_BOUND};
 use crate::expressions::{ColumnName, Predicate};
 use crate::schema::{StructField, StructType};
@@ -22,6 +22,7 @@ use crate::schema::{StructField, StructType};
 /// requests `nan_value_count`, because AMT bounds exclude NaN values; only floating point leaves
 /// have it. `numRecords` comes from the entry's `recordCount`, so it needs no stats.
 ///
+/// Only the referenced columns are inspected, and one without a usable field ID gets no stats.
 /// Returns `None` when the predicate references no stats an AMT manifest records, e.g. when it
 /// only prunes by partition values or record counts.
 pub(crate) fn content_stats_read_field_for_predicate(
@@ -38,13 +39,7 @@ pub(crate) fn content_stats_read_field_for_predicate(
         };
         requested.extend(stats.iter().map(|stat| (field_id, *stat)));
     }
-    if requested.is_empty() {
-        return Ok(None);
-    }
-    Ok(content_stats_read_field(
-        &stats_schema(physical_schema)?,
-        requested,
-    ))
+    content_stats_read_field(physical_schema, requested)
 }
 
 /// The physical column and AMT stats behind a skipping predicate reference such as
@@ -77,6 +72,8 @@ mod tests {
     use crate::expressions::{col, column_name, lit};
     use crate::scan::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
     use crate::schema::DataType;
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema::GeometryType;
 
     /// Leaves `x` (long, ID 1), `d` (double, ID 2), `n.y` (long, ID 4), and `p` (long, ID 5).
     fn physical_schema() -> StructType {
@@ -176,6 +173,30 @@ mod tests {
         let pred = col!("stats_parsed.maxValues.x").gt(lit(5i64));
         let read_field = content_stats_read_field_for_predicate(&schema, &pred).unwrap();
         assert_eq!(read_field, None);
+    }
+
+    /// Asserts that `unreferenced`, a column the predicate does not reference, does not affect
+    /// the read field of a predicate on `x`.
+    fn assert_unreferenced_column_is_ignored(unreferenced: StructField) {
+        let schema =
+            StructType::new_unchecked(physical_schema().fields().cloned().chain([unreferenced]));
+        let pred = col!("stats_parsed.maxValues.x").gt(lit(5i64));
+        let read_field = content_stats_read_field_for_predicate(&schema, &pred).unwrap();
+        let content_stats = StructType::new_unchecked([leaf("x", 1, DataType::LONG, &[UPPER])]);
+        let expected = field_with_id(CONTENT_STATS_FIELD_NAME, content_stats.into(), true, 146);
+        assert_eq!(read_field, Some(expected));
+    }
+
+    #[test]
+    fn read_field_ignores_unreferenced_column_without_field_id() {
+        assert_unreferenced_column_is_ignored(StructField::nullable("no_id", DataType::LONG));
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn read_field_ignores_unreferenced_geospatial_column() {
+        let geometry = GeometryType::try_new("EPSG:4326").unwrap();
+        assert_unreferenced_column_is_ignored(field_with_id("g", geometry.into(), true, 6));
     }
 
     #[test]

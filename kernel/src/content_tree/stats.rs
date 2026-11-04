@@ -526,16 +526,18 @@ pub(crate) fn stats_schema(table_struct: &StructType) -> KernelResult<StructType
 }
 
 /// Builds the nullable `content_stats` column of a manifest read that needs only the `requested`
-/// stats of `stats`, a [`stats_schema`]. Each request is `(field_id, stat)`: the Parquet field ID
-/// of a table leaf column and a stat name such as [`LOWER_BOUND`]. Manifests are read by field ID,
-/// so the other stats are never read.
+/// stats of `table_struct`. Each request is `(field_id, stat)`: the Parquet field ID of a table
+/// leaf column and a stat name such as [`LOWER_BOUND`]. Manifests are read by field ID, so the
+/// other stats are never read.
 ///
-/// Stats are looked up by field ID, never by name. Requests whose stat is absent from `stats` are
+/// `table_struct` is a physical schema, as for [`stats_schema`], but only leaves with a requested
+/// stat are inspected: an unrequested leaf without a usable field ID, or of a type without stats
+/// support, does not fail the call. Requests whose stat the leaf's type does not have are
 /// ignored, and `None` is returned when no request matches.
 pub(crate) fn content_stats_read_field<'a>(
-    stats: &StructType,
+    table_struct: &StructType,
     requested: impl IntoIterator<Item = (i32, &'a str)>,
-) -> Option<StructField> {
+) -> KernelResult<Option<StructField>> {
     // Each leaf's stats occupy their own range of field IDs, so a stat's field ID alone identifies
     // both its leaf and the stat.
     let wanted: HashSet<i32> = requested
@@ -544,24 +546,31 @@ pub(crate) fn content_stats_read_field<'a>(
             Some(field_id_to_statistics_base(field_id)? + stat_offset(stat)?)
         })
         .collect();
-    let leaves: Vec<_> = stats
-        .fields()
-        .filter_map(|leaf| {
-            let DataType::Struct(leaf_stats) = leaf.data_type() else {
-                return None;
-            };
-            let leaf_stats: Vec<_> = leaf_stats
-                .fields()
-                .filter(|stat| get_field_id(stat).is_some_and(|id| wanted.contains(&id)))
-                .cloned()
-                .collect();
-            let leaf_stats =
-                (!leaf_stats.is_empty()).then(|| StructType::new_unchecked(leaf_stats))?;
-            let field = StructField::new(leaf.name(), leaf_stats, leaf.is_nullable());
-            Some(field.with_metadata(leaf.metadata().clone()))
-        })
-        .collect();
-    (!leaves.is_empty()).then(|| {
+    if wanted.is_empty() {
+        return Ok(None);
+    }
+    let mut leaves = Vec::new();
+    {
+        let mut walker = StatsLeafWalker {
+            path: Vec::new(),
+            projection: None,
+            on_leaf: |field: &StructField, path: &[String], _| {
+                let is_requested = get_field_id(field)
+                    .and_then(field_id_to_statistics_base)
+                    .is_some_and(|base| {
+                        STATS
+                            .iter()
+                            .any(|(_, offset)| wanted.contains(&(base + offset)))
+                    });
+                if is_requested && let Some(leaf) = leaf_stats_field(field, path, None)? {
+                    leaves.extend(requested_leaf_stats(&leaf, &wanted));
+                }
+                Ok(())
+            },
+        };
+        walker.transform_struct(table_struct)?;
+    }
+    Ok((!leaves.is_empty()).then(|| {
         let stats = StructType::new_unchecked(leaves);
         field_with_id(
             CONTENT_STATS_FIELD_NAME,
@@ -569,7 +578,7 @@ pub(crate) fn content_stats_read_field<'a>(
             true,
             CONTENT_STATS_FIELD_ID,
         )
-    })
+    }))
 }
 
 /// Generates the AMT `content_stats` schema projected to the leaves that carry Delta stats.
@@ -621,6 +630,22 @@ fn collect_stats_schema<'a>(
     // `new_unchecked` skips name dedup; safe because `ColumnName`'s `Display` is lossless -- a leaf
     // whose name contains a dot is backtick-escaped, so it never collides with a nested path.
     Ok(StructType::new_unchecked(fields))
+}
+
+/// `leaf`, a leaf's stats field, narrowed to the stats whose field IDs are in `wanted`, or `None`
+/// when it holds none of them.
+fn requested_leaf_stats(leaf: &StructField, wanted: &HashSet<i32>) -> Option<StructField> {
+    let DataType::Struct(leaf_stats) = leaf.data_type() else {
+        return None;
+    };
+    let leaf_stats: Vec<_> = leaf_stats
+        .fields()
+        .filter(|stat| get_field_id(stat).is_some_and(|id| wanted.contains(&id)))
+        .cloned()
+        .collect();
+    let leaf_stats = (!leaf_stats.is_empty()).then(|| StructType::new_unchecked(leaf_stats))?;
+    let field = StructField::new(leaf.name(), leaf_stats, leaf.is_nullable());
+    Some(field.with_metadata(leaf.metadata().clone()))
 }
 
 #[cfg(test)]
@@ -1753,7 +1778,6 @@ mod tests {
             field_with_id("unused", DataType::LONG, true, 2),
             field_with_id("n", nested.into(), true, 3),
         ]);
-        let stats = stats_schema(&table).unwrap();
         let requested = [
             (4, NAN_VALUE_COUNT),
             (1, UPPER_BOUND),
@@ -1763,7 +1787,9 @@ mod tests {
             (1, "missing"),
         ];
 
-        let field = content_stats_read_field(&stats, requested).unwrap();
+        let field = content_stats_read_field(&table, requested)
+            .unwrap()
+            .unwrap();
 
         // Leaves and stats keep their schema order and field IDs.
         let leaf = |name: &str, base: i32, stats: &[(&str, i32, DataType)]| {
@@ -1790,25 +1816,19 @@ mod tests {
         assert_eq!(field, expected);
     }
 
+    // A requested geospatial leaf still errors, so its missing stats support is not silently
+    // dropped; unrequested ones are not inspected (see `content_tree::skipping` tests).
+    #[cfg(feature = "geo-type-in-dev")]
     #[test]
-    fn content_stats_read_field_matches_stats_by_field_id_not_name() {
-        let leaf_stats = StructType::new_unchecked([
-            field_with_id("lo", DataType::LONG, true, 10_201),
-            field_with_id(LOWER_BOUND, DataType::LONG, true, 10_202),
-        ]);
-        let leaf = field_with_id("renamed", leaf_stats.into(), true, 10_200);
-        let stats = StructType::new_unchecked([leaf]);
-
-        let field = content_stats_read_field(&stats, [(1, LOWER_BOUND)]).unwrap();
-
-        let expected = StructType::new_unchecked([field_with_id(
-            "renamed",
-            StructType::new_unchecked([field_with_id("lo", DataType::LONG, true, 10_201)]).into(),
-            true,
-            10_200,
-        )]);
-        let expected = field_with_id(CONTENT_STATS_FIELD_NAME, expected.into(), true, 146);
-        assert_eq!(field, expected);
+    fn content_stats_read_field_errors_for_requested_geospatial_leaf() {
+        let geometry = GeometryType::try_new("EPSG:4326").expect("valid crs");
+        let table = StructType::new_unchecked([field_with_id("g", geometry.into(), true, 1)]);
+        let err = content_stats_read_field(&table, [(1, NULL_VALUE_COUNT)])
+            .expect_err("geospatial columns are not yet supported");
+        assert!(
+            err.to_string().contains("geospatial"),
+            "unexpected error: {err}"
+        );
     }
 
     #[rstest]
@@ -1819,7 +1839,7 @@ mod tests {
     #[case::field_id_out_of_stats_range(&[(-1, LOWER_BOUND)])]
     fn content_stats_read_field_is_none_without_requested_stats(#[case] requested: &[(i32, &str)]) {
         let table = StructType::new_unchecked([field_with_id("c", DataType::LONG, true, 1)]);
-        let stats = stats_schema(&table).unwrap();
-        assert!(content_stats_read_field(&stats, requested.iter().copied()).is_none());
+        let field = content_stats_read_field(&table, requested.iter().copied()).unwrap();
+        assert!(field.is_none());
     }
 }
