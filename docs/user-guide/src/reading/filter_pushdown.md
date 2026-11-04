@@ -47,9 +47,8 @@ The full set of comparisons inside `expr!`:
 | `col("a") >= col("b")` | `a >= b` |
 | `distinct(col("a"), col("b"))` | `a IS DISTINCT FROM b` |
 
-`distinct` is a NULL-safe inequality: it returns true when `a` and `b` differ, even when
-one or both are NULL. The other comparisons follow SQL NULL semantics and produce NULL when
-either input is NULL.
+`distinct` returns true when non-NULL operands differ or exactly one operand is NULL.
+It returns false for two NULL operands. Other comparisons produce NULL when either operand is NULL.
 
 Literals retain their Rust types: `30` is INTEGER and `30_i64` is LONG. Use
 `lit(value)` inside `expr!` for a computed scalar value.
