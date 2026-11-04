@@ -3724,6 +3724,14 @@ mod test {
         vec![TableFeature::AdaptiveMetadataPreview, TableFeature::IcebergNativeV4Preview],
         None
     )]
+    #[case::checkpoint_protection(
+        vec![
+            TableFeature::AdaptiveMetadataPreview,
+            TableFeature::IcebergNativeV4Preview,
+            TableFeature::CheckpointProtection,
+        ],
+        None
+    )]
     #[case::missing_adaptive_metadata(
         vec![TableFeature::IcebergNativeV4Preview],
         Some("requires 'adaptiveMetadata-preview' to be enabled")

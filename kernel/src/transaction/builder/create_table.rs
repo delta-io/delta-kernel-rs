@@ -2029,8 +2029,7 @@ mod tests {
             "variantType-preview",
             "variantShredding-preview",
             "catalogOwned-preview",
-            "adaptiveMetadata-preview",
-            "icebergNativeV4-preview"
+            "adaptiveMetadata-preview"
         )]
         feature_name: &str,
     ) {

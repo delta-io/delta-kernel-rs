@@ -601,6 +601,7 @@ const ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURES: &[TableFeature] = &[
     TableFeature::GeospatialType,
     TableFeature::CatalogManaged,
     TableFeature::CatalogOwnedPreview,
+    TableFeature::CheckpointProtection,
     // Allowed only while inactive. The `NotEnabled` requirements check this.
     TableFeature::AppendOnly,
     TableFeature::ChangeDataFeed,

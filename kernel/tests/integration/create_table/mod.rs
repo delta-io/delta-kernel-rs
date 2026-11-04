@@ -744,8 +744,7 @@ fn create_table_rejects_preview_feature_signals(
         "variantType-preview",
         "variantShredding-preview",
         "catalogOwned-preview",
-        "adaptiveMetadata-preview",
-        "icebergNativeV4-preview"
+        "adaptiveMetadata-preview"
     )]
     feature_name: &str,
 ) -> KernelResult<()> {
